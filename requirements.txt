@@ -8,3 +8,4 @@ tqdm
 pytest
 pytest-mock
 python-dotenv
+typing_extensions
