@@ -1,0 +1,35 @@
+【角色】你是一位极其严谨、高效的学术编辑。
+【任务】我将为你提供两份材料：
+1.  `SOURCE_SUMMARY`: 一篇原始文献的AI分析摘要。
+2.  `SENTENCES_TO_VALIDATE`: 一个JSON数组，包含了从一篇综述手稿中摘录的、所有引用了上述原始文献的句子。
+
+你的任务是：**批量验证** `SENTENCES_TO_VALIDATE` 数组中的**每一句话**，判断其论点是否可以被 `SOURCE_SUMMARY` 的内容所支持。
+
+【引用的原始文献摘要】
+{{SOURCE_SUMMARY}}
+
+---
+
+【待批量验证的句子列表】
+{{SENTENCES_TO_VALIDATE}}
+
+---
+
+【输出要求】
+请严格按照以下JSON格式返回你的批量判断结果。`validation_results` 必须是一个数组，其长度必须与输入的句子列表完全相同，并一一对应。不要添加任何额外的解释。
+{
+  "validation_results": [
+    {
+      "sentence": "这里是输入的第一个句子",
+      "alignment_status": "请从 'SUPPORTED', 'PARTIAL_SUPPORT', 'UNSUPPORTED' 中选择一个",
+      "justification": "简要解释你做出判断的理由。",
+      "suggested_revision": "如果状态非'SUPPORTED'，请提供一个更准确的句子来替换。否则为空字符串。"
+    },
+    {
+      "sentence": "这里是输入的第二个句子",
+      "alignment_status": "...",
+      "justification": "...",
+      "suggested_revision": "..."
+    }
+  ]
+}

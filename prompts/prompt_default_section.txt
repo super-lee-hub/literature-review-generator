@@ -1,0 +1,10 @@
+基于以下文献摘要信息和大纲，请撰写指定章节的内容。
+
+【全部论文分析数据】
+{{SUMMARIES_JSON_ARRAY}}
+
+【综述完整大纲】
+{{REVIEW_OUTLINE}}
+
+【当前需要撰写的章节标题】
+{{SECTION_TITLE}}

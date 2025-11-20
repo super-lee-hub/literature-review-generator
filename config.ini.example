@@ -1,0 +1,120 @@
+# =============================================================================
+# llm_reviewer_generator 配置文件模板
+# =============================================================================
+#
+# 安全说明：
+# 强烈建议使用 .env 文件来存储 API 密钥，而不是直接写在配置文件中。
+# .env 文件不会被提交到版本控制系统，更安全。
+#
+# .env 文件格式示例：
+# LLM_PRIMARY_READER_API=your_primary_api_key_here
+# LLM_BACKUP_READER_API=your_backup_api_key_here
+# LLM_WRITER_API=your_writer_api_key_here
+# LLM_VALIDATOR_API=your_validator_api_key_here
+#
+# 如果 .env 文件存在，其中的 API 密钥将覆盖配置文件中的值。
+# =============================================================================
+
+[Paths]
+# [必填] 您的完整Zotero报告路径
+zotero_report = D:\zotero_report\Zotero 报告.txt
+
+# [必填] 您的Zotero文献库存放路径
+library_path = D:\zotero_library\Zotero\storage
+
+# [建议] 最终产出的文件夹，程序会自动创建
+output_path = ./output
+
+[Primary_Reader_API]
+# [建议] 主阅读引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_PRIMARY_READER_API_KEY_HERE
+model = Pro/moonshotai/Kimi-K2-Instruct-0905
+api_base = https://api.siliconflow.cn/v1
+
+[Backup_Reader_API]
+# [建议] 备用阅读引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_BACKUP_READER_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Writer_API]
+# [建议] 写作引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_WRITER_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Performance]
+# 并发处理的最大工作线程数
+# 推荐值为2-3，以平衡速度和API的TPM限制
+# 建议不要超过3，以避免触发API频率限制
+max_workers = 3
+# API调用失败时的重试次数（增强到5次）
+api_retry_attempts = 5
+# 主阅读引擎速率限制配置（可选，设置为API限制的90%，留出安全边际）
+# 如果您的API服务商未提供此信息，请设置为0或留空，系统将自动切换到忍者模式
+# TPM: Tokens Per Minute，每分钟令牌数限制
+primary_tpm_limit = 900000
+# RPM: Requests Per Minute，每分钟请求数限制
+primary_rpm_limit = 9000
+# 备用阅读引擎速率限制配置（可选，通常比主引擎更高，处理超长论文）
+# 如果您的API服务商未提供此信息，请设置为0或留空，系统将自动切换到忍者模式
+backup_tpm_limit = 2000000
+# RPM: Requests Per Minute，每分钟请求数限制
+backup_rpm_limit = 9000
+# 启用/禁用验证模块 (true/false)
+enable_stage1_validation = false
+enable_stage2_validation = false
+
+[Styling]
+# [可选] 文档样式配置
+# 字体名称（建议使用常见字体如Times New Roman, Arial, Calibri）
+font_name = Times New Roman
+# 正文字体大小（磅）
+font_size_body = 12
+# 一级标题字体大小（磅）
+font_size_heading1 = 16
+# 二级标题字体大小（磅）
+font_size_heading2 = 14
+
+[Validator_API]
+# [可选] 验证者AI引擎 - 建议使用与Reader/Writer不同的强大模型以保证交叉验证的独立性
+# 仅在启用验证功能时需要
+# [建议] 验证引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_VALIDATOR_API_KEY_HERE
+model = gpt-4-turbo-preview
+api_base = https://api.openai.com/v1
+
+[API_Parameters]
+# API调用参数配置 - 可根据您的模型和需求调整这些参数
+
+# 主阅读引擎参数（用于分析单篇文献）
+primary_max_tokens = 3000
+primary_temperature = 0.3
+
+# 备用阅读引擎参数（用于处理长文档）
+backup_max_tokens = 8192
+backup_temperature = 0.3
+
+# 概念分析引擎参数
+concept_max_tokens = 4000
+concept_temperature = 0.3
+
+# 写作引擎参数（用于生成文献综述）
+writer_max_tokens = 8000
+writer_temperature = 0.5
+
+# 验证引擎参数（用于交叉验证）
+validator_max_tokens = 4096
+validator_temperature = 0.3
+
+# 观点验证引擎参数（用于批量验证引用）
+claims_max_tokens = 8192
+claims_temperature = 0.3

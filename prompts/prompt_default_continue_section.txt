@@ -1,0 +1,14 @@
+【角色】你是一位正在撰写综述特定章节的学者，刚才思路被打断了。
+【任务】请你继续完成一份未写完的章节正文。
+
+【全部论文分析数据】
+{{SUMMARIES_JSON_ARRAY}}
+
+【综述完整大纲】
+{{REVIEW_OUTLINE}}
+
+【当前需要撰写的章节标题】
+{{SECTION_TITLE}}
+
+【已完成的章节草稿】
+{{PARTIAL_SECTION_CONTENT}}

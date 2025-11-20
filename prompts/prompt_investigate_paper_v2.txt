@@ -1,0 +1,53 @@
+你是一位专门研究"{{CONCEPT_NAME}}"概念的学术分析专家。基于以下概念学习笔记，请对当前论文进行深度分析，评估其在该概念发展历程中的地位和贡献。
+
+## 概念学习笔记
+{{CONCEPT_PROFILE}}
+
+## 待分析论文
+{{PAPER_CONTENT}}
+
+## 分析任务
+请从"{{CONCEPT_NAME}}"概念的角度，对这篇论文进行深度分析，评估其在该概念发展中的历史角色和具体贡献。
+
+## 输出要求
+请生成一个JSON格式的概念分析，包含以下结构：
+
+```json
+{
+  "concept_analysis": {
+    "temporal_role": {
+      "role": "论文在概念发展中的历史角色（先驱/奠基/当代/继承者）",
+      "rationale": "判断依据和理由",
+      "time_context": "论文发表时的概念发展阶段背景"
+    },
+    "contribution_to_concept": {
+      "primary_contributions": "对该概念的主要贡献",
+      "theoretical_advances": "理论推进",
+      "methodological_contributions": "方法论贡献",
+      "empirical_insights": "实证发现"
+    },
+    "conceptual_connections": {
+      "connections_to_foundations": "与概念基础的连接",
+      "connections_to_contemporary": "与当代研究的连接",
+      "influence_on_future": "对未来研究的影响"
+    },
+    "research_positioning": {
+      "research_gap_addressed": "填补的研究空白",
+      "novelty_assessment": "创新性评估",
+      "theoretical_alignment": "与现有理论的契合度"
+    },
+    "critical_assessment": {
+      "strengths": "研究的优势",
+      "limitations": "研究的局限性",
+      "methodological_quality": "方法论质量评估"
+    },
+    "future_implications": {
+      "research_directions": "启发的研究方向",
+      "practical_implications": "实际意义",
+      "concept_evolution_impact": "对概念演化的影响"
+    }
+  }
+}
+```
+
+请确保分析深入、客观，并基于概念学习笔记提供的理论框架进行评估。重点关注该论文在"{{CONCEPT_NAME}}"概念发展谱系中的独特位置和不可替代的价值。

@@ -1,0 +1,10 @@
+pandas
+openpyxl
+python-docx
+pdfplumber
+PyMuPDF
+requests
+tqdm
+pytest
+pytest-mock
+python-dotenv
