@@ -32,6 +32,12 @@ python main.py --setup
 #### 场景 A：我是 Zotero 用户 (推荐 🌟)
 如果你平时用 Zotero 管理文献，请先导出文献报告（右键选中文献 -> 导出条目 -> 格式选 Zotero Reports/报告 -> 保存为 txt）。
 
+**重要配置**：使用Zotero模式前，请确保在 `config.ini` 文件中配置以下路径：
+1. `zotero_report`：你导出的Zotero报告文件路径（如 `D:\zotero_report\Zotero 报告.txt`）
+2. `library_path`：Zotero文献库存放PDF的路径（如 `D:\zotero_library\Zotero\storage`）
+
+*提示：运行 `python main.py --setup` 可使用交互式向导完成配置*
+
 **一键执行（推荐新手）：**
 ```bash
 # 格式：python main.py --project-name "你的项目名" --run-all
