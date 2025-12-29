@@ -302,6 +302,9 @@ def generate_apa_references(generator_instance: Any) -> List[str]:
 
             references.append(" ".join(ref_parts))
         
+        # 去除重复的参考文献条目
+        references = list(dict.fromkeys(references))
+        
         # 按第一作者姓氏排序
         references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
         

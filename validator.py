@@ -410,10 +410,53 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
                 
                 valid_citation_map[standard_citation] = summary
                 
-                # 创建et al.格式的映射
-                if len(authors) > 1:
+                # 创建多种引用格式的映射，支持中文和英文格式变体
+                if len(authors) == 1:
+                    # 单作者：只有一种格式
+                    citation_to_key[f"({authors[0]}, {year})"] = standard_citation
+                    
+                elif len(authors) == 2:
+                    # 双作者：多种格式变体
+                    standard_citation = f"({authors[0]} & {authors[1]}, {year})"
+                    valid_citation_map[standard_citation] = summary
+                    
+                    # 英文格式变体
+                    citation_to_key[f"({authors[0]}, {authors[1]}, {year})"] = standard_citation
+                    
+                    # 中文格式变体
+                    citation_to_key[f"({authors[0]} 和 {authors[1]}, {year})"] = standard_citation
+                    citation_to_key[f"({authors[0]}、{authors[1]}, {year})"] = standard_citation
+                    
+                    # 标准格式本身
+                    citation_to_key[f"({authors[0]} & {authors[1]}, {year})"] = standard_citation
+                    
+                    # et al. 格式映射
                     et_al_citation: str = f"({authors[0]} et al., {year})"
                     citation_to_key[et_al_citation] = standard_citation
+                    
+                elif len(authors) == 3:
+                    # 三作者：多种格式变体
+                    standard_citation = f"({authors[0]}, {authors[1]} & {authors[2]}, {year})"
+                    valid_citation_map[standard_citation] = summary
+                    
+                    # 英文格式变体
+                    citation_to_key[f"({authors[0]}, {authors[1]}, {authors[2]}, {year})"] = standard_citation
+                    
+                    # 中文格式变体
+                    citation_to_key[f"({authors[0]}、{authors[1]}和{authors[2]}, {year})"] = standard_citation
+                    
+                    # 标准格式本身
+                    citation_to_key[f"({authors[0]}, {authors[1]} & {authors[2]}, {year})"] = standard_citation
+                    
+                    # et al. 格式映射
+                    et_al_citation = f"({authors[0]} et al., {year})"
+                    citation_to_key[et_al_citation] = standard_citation
+                    
+                else:
+                    # 四位及以上作者
+                    standard_citation = f"({authors[0]} et al., {year})"
+                    valid_citation_map[standard_citation] = summary
+                    citation_to_key[standard_citation] = standard_citation
 
         # 从Word文档中提取所有引用
         full_text: str = "\n".join([p.text for p in doc.paragraphs])
