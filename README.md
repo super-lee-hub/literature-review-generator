@@ -35,7 +35,7 @@ python main.py --project-name "消费者行为研究" --run-all
 如果您只有PDF文件，请使用此模式：
 ```bash
 # 一键完成所有步骤
-python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --run-all
+python main.py --pdf-folder "D:\MyDocuments\Papers\ResearchProject" --run-all
 ```
 **优势**：系统会自动使用文件夹名称作为项目名，无需额外设置。
 
@@ -263,12 +263,12 @@ python main.py --project-name "消费者行为研究" --generate-review   # 阶�
 
 ```bash
 # 一键执行所有阶段（推荐新手使用）
-python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --run-all
+python main.py --pdf-folder "D:\MyDocuments\Papers\ResearchProject" --run-all
 
 # 分阶段执行（适合高级用户）
-python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析"              # 阶段一：文献分析
-python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --generate-outline  # 阶段二第一步：生成大纲
-python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --generate-review   # 阶段二第二步：生成完整综述
+python main.py --pdf-folder "D:\MyDocuments\Papers\ResearchProject"              # 阶段一：文献分析
+python main.py --pdf-folder "D:\MyDocuments\Papers\ResearchProject" --generate-outline  # 阶段二第一步：生成大纲
+python main.py --pdf-folder "D:\MyDocuments\Papers\ResearchProject" --generate-review   # 阶段二第二步：生成完整综述
 ```
 
 #### 💡 参数选择建议
