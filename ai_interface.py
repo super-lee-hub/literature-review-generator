@@ -36,6 +36,10 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
                 logger.error("API配置缺少必要的参数: api_key 或 model")
             return None
         
+        # 从配置文件加载超时设置
+        config = load_config()
+        timeout_seconds = int(config.get('API_Parameters', {}).get('timeout_seconds', 600))
+        
         api_url = f"{api_base.rstrip('/')}/chat/completions"
         
         headers = {
@@ -72,7 +76,7 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
                     api_url,
                     headers=headers,
                     json=payload,
-                    timeout=300
+                    timeout=timeout_seconds
                 )
                 
                 response.raise_for_status()
@@ -850,6 +854,66 @@ try:
 except Exception as e:
     # 注意：模块初始化时没有logger，所以不打印
     rate_limiter = RateLimiter(900000, 9000, 2000000, 9000)
+
+
+def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,
+                                      logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """
+    调用AI API并返回结构化摘要，支持主引擎失败时自动切换到备用引擎
+    
+    Args:
+        prompt_text: 完整的提示词文本
+        primary_api_config: 主引擎API配置字典
+        backup_api_config: 备用引擎API配置字典
+        logger: 日志记录器实例（可选）
+        config: 配置字典（可选）
+    
+    Returns:
+        Optional[Dict[str, Any]]: 结构化摘要，如果调用失败则返回None
+    """
+    # 首先尝试主引擎
+    if logger:
+        logger.debug("尝试使用主引擎生成摘要...")
+    
+    result = get_summary_from_ai(prompt_text, primary_api_config, backup_api_config, 
+                                engine_type='primary', logger=logger, config=config)
+    
+    if result is not None:
+        # 检查结果是否有效（不是全为"未提供"）
+        if 'common_core' in result:
+            # 检查是否有实际内容
+            has_content = any(
+                value and value != "未提供相关信息" and value != "..."
+                for key, value in result['common_core'].items()
+                if key != 'key_points'  # key_points可以是空列表
+            )
+            if has_content:
+                if logger:
+                    logger.debug("主引擎返回有效结果")
+                return result
+            else:
+                if logger:
+                    logger.warning("主引擎返回结果无有效内容，尝试备用引擎")
+        else:
+            if logger:
+                logger.debug("主引擎返回有效结果")
+            return result
+    
+    # 主引擎失败或返回无效结果，尝试备用引擎
+    if logger:
+        logger.info("主引擎失败，切换到备用引擎...")
+    
+    result = get_summary_from_ai(prompt_text, primary_api_config, backup_api_config,
+                                engine_type='backup', logger=logger, config=config)
+    
+    if result is not None:
+        if logger:
+            logger.info("备用引擎成功返回结果")
+        return result
+    else:
+        if logger:
+            logger.error("主引擎和备用引擎都失败了")
+        return None
 
 
 def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,

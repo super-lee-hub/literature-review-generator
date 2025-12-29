@@ -19,17 +19,25 @@ python main.py --setup
 
 ### 第二步：选择您的使用模式
 
+> **⚠️ 重要提醒**：
+> - `--project-name` 参数应该使用**简洁的项目名称**（如"消费者行为研究"）
+> - **不要**将完整文件路径用作项目名称，这会导致输出目录错误
+> - 如果需要处理特定文件夹的PDF，请使用 `--pdf-folder` 参数
+
 #### 🔥 Zotero模式（推荐用于学术研究）
+如果您有Zotero文献库，请使用此模式：
 ```bash
-# 一键完成所有步骤
-python main.py --project-name "我的研究项目" --run-all
+# 一键完成所有步骤（请使用简洁的项目名称）
+python main.py --project-name "消费者行为研究" --run-all
 ```
 
 #### 📁 直接PDF文件夹模式（快速处理）
+如果您只有PDF文件，请使用此模式：
 ```bash
 # 一键完成所有步骤
-python main.py --pdf-folder "D:\我的PDF文献" --run-all
+python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --run-all
 ```
+**优势**：系统会自动使用文件夹名称作为项目名，无需额外设置。
 
 ### 第三步：查看结果
 所有输出文件保存在 `output/项目名称/` 目录下，包括：
@@ -220,31 +228,54 @@ font_size_heading2 = 14
 
 ## 🎮 使用方式详解
 
-### 基本使用方式
+### 📝 命令行参数详解
+
+#### 🔑 核心参数说明
+
+| 参数 | 用途 | 使用场景 | 重要说明 |
+|------|------|----------|----------|
+| `--project-name` | 指定项目名称 | 所有模式都可用 | 应该是简洁的项目名称（如"案例分析"），**不要使用完整文件路径** |
+| `--pdf-folder` | 指定PDF文件夹路径 | 直接PDF模式 | 直接指定包含PDF文件的文件夹，支持中文路径 |
+
+#### ⚠️ 常见错误用法
+
+❌ **错误示例：把完整路径当作项目名称**
+```bash
+python main.py --project-name "C:\Users\Documents\My Papers\Research Project"
+```
+**错误原因**：系统会错误地将完整路径当作项目名称，导致输出目录嵌套错误。
+
+✅ **正确用法示例**
 
 #### Zotero模式（推荐用于学术研究）
 
 ```bash
 # 一键执行所有阶段（推荐新手使用）
-python main.py --project-name "我的研究项目" --run-all
+python main.py --project-name "消费者行为研究" --run-all
 
 # 分阶段执行（适合高级用户）
-python main.py --project-name "我的研究项目"              # 阶段一：文献分析
-python main.py --project-name "我的研究项目" --generate-outline  # 阶段二第一步：生成大纲
-python main.py --project-name "我的研究项目" --generate-review   # 阶段二第二步：生成完整综述
+python main.py --project-name "消费者行为研究"              # 阶段一：文献分析
+python main.py --project-name "消费者行为研究" --generate-outline  # 阶段二第一步：生成大纲
+python main.py --project-name "消费者行为研究" --generate-review   # 阶段二第二步：生成完整综述
 ```
 
 #### 直接PDF文件夹模式（快速处理）
 
 ```bash
 # 一键执行所有阶段（推荐新手使用）
-python main.py --pdf-folder "D:\我的PDF文献" --run-all
+python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --run-all
 
 # 分阶段执行（适合高级用户）
-python main.py --pdf-folder "D:\我的PDF文献"              # 阶段一：文献分析
-python main.py --pdf-folder "D:\我的PDF文献" --generate-outline  # 阶段二第一步：生成大纲
-python main.py --pdf-folder "D:\我的PDF文献" --generate-review   # 阶段二第二步：生成完整综述
+python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析"              # 阶段一：文献分析
+python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --generate-outline  # 阶段二第一步：生成大纲
+python main.py --pdf-folder "C:\Users\12130\Desktop\新建文件夹\硕good good study\2025大创\案例分析" --generate-review   # 阶段二第二步：生成完整综述
 ```
+
+#### 💡 参数选择建议
+
+- **如果您有Zotero库**：使用`--project-name`参数，先在配置文件中设置Zotero报告路径
+- **如果您只有PDF文件夹**：直接使用`--pdf-folder`参数，系统会自动使用文件夹名作为项目名
+- **项目名称命名规范**：使用简洁的中文名称，如"案例分析"、"文献综述"、"研究项目"等
 
 ### 🔍 AI验证功能详解
 
@@ -308,8 +339,28 @@ python main.py --project-name "消费者研究" --concept "消费者成熟度" -
 
 ### 🛠 高级功能
 
-#### 合并处理结果
+#### 🔄 重试失败的文献
+
+当文献分析过程中有论文处理失败时，系统提供了便捷的重试功能：
+
 ```bash
+# Zotero模式：重试失败论文
+python main.py --project-name "我的研究项目" --retry-failed
+
+# 直接PDF模式：重试失败论文  
+python main.py --pdf-folder "D:\我的PDF文献" --retry-failed
+```
+
+**重试功能工作原理**：
+- **Zotero模式**：自动查找并重试在 `[项目名称]_zotero_report_for_retry.txt` 中记录的失败论文
+- **直接PDF模式**：从 `summaries.json` 和失败报告中识别需要重试的论文
+- **智能匹配**：自动匹配PDF文件，无需手动指定文件路径
+
+**重试成功标志**：当所有失败论文都成功处理后，系统会自动删除重跑报告文件。
+
+#### 📊 合并处理结果
+```bash
+# 合并额外的文献分析结果
 # Zotero模式
 python main.py --project-name "我的研究项目" --merge ./additional_summaries.json
 
@@ -317,17 +368,9 @@ python main.py --project-name "我的研究项目" --merge ./additional_summarie
 python main.py --pdf-folder "D:\我的PDF文献" --merge ./additional_summaries.json
 ```
 
-#### 重试失败的文献
+#### ⚙️ 指定自定义配置文件
 ```bash
-# Zotero模式
-python main.py --project-name "我的研究项目" --retry-failed
-
-# 直接PDF模式
-python main.py --pdf-folder "D:\我的PDF文献" --retry-failed
-```
-
-#### 指定自定义配置文件
-```bash
+# 使用自定义配置文件
 python main.py --project-name "我的研究项目" --config custom_config.ini --run-all
 ```
 
@@ -396,6 +439,21 @@ A:
 
 **Q: 如何在Zotero模式下使用概念增强模式？**
 A: 分两步进行：1) 使用`--prime-with-folder`和`--concept`参数进行概念学习；2) 使用`--project-name`和`--concept`参数进行概念增强分析。
+
+**Q: --project-name 和 --pdf-folder 参数有什么区别？应该如何使用？**
+A: 
+- `--project-name`：指定项目的名称，用于创建独立的输出文件夹。应该是简洁的名称，如"消费者行为研究"，**不要使用完整文件路径**
+- `--pdf-folder`：直接指定包含PDF文件的文件夹路径，系统会自动使用文件夹名作为项目名
+- **选择建议**：如果您的文献在Zotero中，使用`--project-name`；如果只有PDF文件夹，直接使用`--pdf-folder`
+
+**Q: 为什么重试功能提示找不到重跑报告文件？**
+A: 这通常是由于之前使用了错误的参数格式导致的。请确保：
+1. 使用正确的参数格式，不要把完整路径当作`--project-name`
+2. 确保输出目录路径正确
+3. 清理错误的输出目录后重新运行
+
+**Q: 可以在同一个项目中混合使用两种模式吗？**
+A: 不建议混合使用。建议为不同类型的文献创建独立的项目，使用不同的项目名称进行区分。
 
 ---
 
@@ -480,6 +538,21 @@ llm_reviewer_generator/
   1. 检查config.ini中的`enable_stage1_validation`和`enable_stage2_validation`设置
   2. 确认[Validator_API]配置正确
   3. 第二阶段验证需要先运行完整的综述生成流程
+
+#### 7. 重试功能问题
+- **问题**：重试功能提示找不到重跑报告文件
+- **解决方案**：
+  1. 检查是否使用了正确的参数格式（不要把完整路径当作`--project-name`）
+  2. 确认输出目录路径是否正确
+  3. 清理错误的输出目录后重新运行
+
+#### 8. 参数使用错误
+- **问题**：程序报错"未找到重跑报告文件"或输出目录异常
+- **常见原因**：错误地将完整文件路径用作`--project-name`参数
+- **解决方案**：
+  1. 使用简洁的项目名称，如"案例分析"而不是完整路径
+  2. 如果需要处理特定文件夹的PDF，使用`--pdf-folder`参数
+  3. 清理错误生成的输出目录
 
 ### 性能优化建议
 - 设置 `max_workers = 2-3`，避免API限制

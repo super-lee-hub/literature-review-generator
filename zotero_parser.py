@@ -35,8 +35,21 @@ def parse_zotero_report(filepath: str) -> List[PaperInfo]:
             logger.error(f"文件不存在: {file_path}")
             return []
         
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # 添加robust编码处理
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            # 如果UTF-8失败，尝试其他编码
+            try:
+                with open(file_path, 'r', encoding='gbk') as f:
+                    content = f.read()
+                # 转换为UTF-8
+                content = content.encode('gbk').decode('utf-8')
+            except (UnicodeDecodeError, UnicodeError):
+                # 最后尝试忽略错误
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
     except Exception as e:
         logger.error(f"无法读取文件: {filepath} - {e}")
         return []

@@ -5,16 +5,35 @@
 
 import os
 import json
-from typing import Any
+from typing import Any, Dict, List
 from datetime import datetime
-from typing import Any
 import pandas as pd  # type: ignore
 
 
-def generate_excel_report(generator_instance: Any) -> bool:  # type: ignore
-    """生成Excel格式的分析报告，适配两段式JSON结构"""
+def read_json_robust(file_path: str) -> Any:
+    """
+    鲁棒性JSON读取函数，替代encoding_utils中的函数
+    """
     try:
-        generator_instance.logger.info("正在生成Excel分析报告（适配新JSON结构）...")  # type: ignore
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except UnicodeDecodeError:
+        try:
+            with open(file_path, 'r', encoding='gbk') as f:
+                content = f.read()
+                return json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                return json.loads(content)
+    except Exception:
+        return []
+
+
+def generate_excel_report(generator_instance: Any) -> bool:  # type: ignore
+    """生成Excel格式的分析报告（优化版本 - 去除重复列）"""
+    try:
+        generator_instance.logger.info("正在生成Excel分析报告（优化版本 - 去除重复列）...")  # type: ignore
         
         # 添加summary_file None安全检查
         summary_file = getattr(generator_instance, 'summary_file', None)  # type: ignore
@@ -22,56 +41,118 @@ def generate_excel_report(generator_instance: Any) -> bool:  # type: ignore
             generator_instance.logger.error("summary_file属性不存在或为空")  # type: ignore
             return False
         
-        # 读取summaries.json文件
-        with open(summary_file, 'r', encoding='utf-8') as f:
-            summaries = json.load(f)
+        # 读取summaries.json文件（使用robust编码处理）
+        summaries = read_json_robust(summary_file)
         
         if not summaries:
             generator_instance.logger.warn("没有找到任何摘要数据")  # type: ignore
             return False
         
-        # 提取common_core数据并保存type_specific_details
-        common_cores = []
-        type_specific_details = []
+        # 提取并优化common_core数据
+        optimized_data: list[dict[str, Any]] = []
         
         for summary in summaries:
-            # 检查是否为新的两段式结构
-            if 'common_core' in summary and 'type_specific_details' in summary:
+            # 检查是否为新的两段式结构（正确的路径）
+            if 'ai_summary' in summary and 'common_core' in summary['ai_summary']:
                 # 新的两段式结构
+                common_core = summary['ai_summary']['common_core']
+                type_specific = summary['ai_summary'].get('type_specific_details', {})
+            elif 'common_core' in summary:
+                # 兼容旧的单段式结构（直接字段）
                 common_core = summary['common_core']
-                type_specific = summary['type_specific_details']
+                type_specific = summary.get('type_specific_details', {})
             else:
-                # 兼容旧的单段式结构，将整个summary作为common_core
+                # 兼容旧的单段式结构
                 common_core = summary
                 type_specific = {}
             
-            # 添加元数据
-            common_core['processing_date'] = summary.get('processing_date', '')
-            common_core['text_length'] = summary.get('text_length', 0)
-            common_core['status'] = summary.get('status', '')
-            common_core['engine_used'] = summary.get('engine_used', '')
+            # 创建优化的记录，避免重复信息，优先从paper_info提取
+            optimized_record: dict[str, Any] = {
+                # 论文基本信息（核心字段）- 优先从paper_info提取，备选从common_core提取
+                '论文标题': summary.get('paper_info', {}).get('title', '') or common_core.get('title', ''),
+                '作者': ', '.join(summary.get('paper_info', {}).get('authors', [])) if summary.get('paper_info', {}).get('authors') else (', '.join(common_core.get('authors', [])) if common_core.get('authors') else ''),
+                '发表年份': summary.get('paper_info', {}).get('year', '') or common_core.get('year', ''),
+                '期刊名称': summary.get('paper_info', {}).get('journal', '') or common_core.get('journal', ''),
+                '文本长度': summary.get('text_length', 0),
+                
+                # 核心分析内容
+                '研究摘要': common_core.get('summary', ''),
+                '研究方法': common_core.get('methodology', ''),
+                '主要发现': common_core.get('findings', ''),
+                '研究结论': common_core.get('conclusions', ''),
+                '理论贡献': common_core.get('relevance', ''),
+                '研究局限': common_core.get('limitations', ''),
+                
+                # 处理状态信息
+                '处理状态': summary.get('status', ''),
+                '处理时间': summary.get('processing_time', ''),
+                '处理引擎': summary.get('engine_used', ''),
+                
+                # 详细信息（JSON格式）
+                '详细信息': json.dumps(type_specific, ensure_ascii=False, indent=2)
+            }
             
-            common_cores.append(common_core)  # type: ignore
-            type_specific_details.append(json.dumps(type_specific, ensure_ascii=False, indent=2))  # type: ignore
-        
-        # 使用pandas对common_core部分进行扁平化处理
-        df_common = pd.json_normalize(common_cores, sep='_')  # type: ignore
-        
-        # 添加type_specific_details_json列
-        df_common['type_specific_details_json'] = type_specific_details
+            optimized_data.append(optimized_record)
         
         # 生成Excel文件路径（添加项目名称前缀）
-        if generator_instance.project_name:  # type: ignore  # type: ignore  # type: ignore  # type: ignore  # type: ignore  # type: ignore
+        if generator_instance.project_name:  # type: ignore
             excel_file = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_analyzed_papers.xlsx')  # type: ignore
         else:
             excel_file = os.path.join(generator_instance.output_dir, 'analyzed_papers.xlsx')  # type: ignore
         
-        # 将DataFrame保存为Excel文件
-        df_common.to_excel(excel_file, index=False, engine='openpyxl')  # type: ignore
+        # 创建主数据框
+        df_main: pd.DataFrame = pd.DataFrame(optimized_data)
+        
+        # 创建项目统计信息
+        success_count = len([s for s in summaries if s.get('status') == 'success'])
+        failed_count = len([s for s in summaries if s.get('status') == 'failed'])
+        total_count = len(summaries)
+        
+        stats_data: Dict[str, List[Any]] = {
+            '统计项目': [
+                '总论文数',
+                '成功处理',
+                '失败处理', 
+                '成功率(%)',
+                '项目名称',
+                '生成时间'
+            ],
+            '数值': [
+                total_count,
+                success_count,
+                failed_count,
+                f"{success_count / total_count * 100:.1f}%" if total_count > 0 else "0%",
+                generator_instance.project_name or "未命名项目",  # type: ignore
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            ]
+        }
+        df_stats: pd.DataFrame = pd.DataFrame(stats_data)
+        
+        # 保存到Excel（包含多个工作表）
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:  # type: ignore
+            # 主工作表：论文分析摘要
+            df_main.to_excel(writer, sheet_name='论文分析摘要', index=False)  # type: ignore
+            
+            # 统计工作表：项目概览
+            df_stats.to_excel(writer, sheet_name='项目统计', index=False)  # type: ignore
+            
+            # 格式化工作表
+            worksheet = writer.sheets['论文分析摘要']
+            for column in worksheet.columns:
+                max_length = 0
+                column = [cell for cell in column]
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)  # 最大宽度50
+                worksheet.column_dimensions[column[0].column_letter].width = adjusted_width
         
         generator_instance.logger.success(f"Excel分析报告已生成: {excel_file}")  # type: ignore
-        generator_instance.logger.info(f"共包含 {len(df_common)} 篇论文，{len(df_common.columns)} 个字段")  # type: ignore
-        generator_instance.logger.info("包含通用核心字段和type_specific_details_json列")  # type: ignore
+        generator_instance.logger.info(f"共包含 {len(df_main)} 篇论文，{len(df_main.columns)} 个核心字段")  # type: ignore
+        generator_instance.logger.info("已去除重复列，包含2个工作表：论文分析摘要 + 项目统计")  # type: ignore
         return True
         
     except Exception as e:

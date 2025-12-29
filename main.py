@@ -34,12 +34,15 @@ from config_loader import load_config, ConfigDict
 from zotero_parser import parse_zotero_report
 from file_finder import create_file_index, FileIndex, find_pdf
 from pdf_extractor import extract_text_from_pdf  # type: ignore
-from ai_interface import get_summary_from_ai, get_concept_analysis, _call_ai_api  # type: ignore
+from ai_interface import get_summary_from_ai, get_summary_from_ai_with_fallback, get_concept_analysis, _call_ai_api  # type: ignore
 from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from utils import ensure_dir, sanitize_path_component
 from setup_wizard import run_setup_wizard
 import validator
+
+# 导入上下文管理模块
+from context_manager import validate_summary_quality, optimize_context_for_synthesis
 
 
 
@@ -719,19 +722,21 @@ class LiteratureReviewGenerator:
             
             # 构建完整的分析提示词
             try:
-                with open('prompts/prompt_analyze.txt', 'r', encoding='utf-8') as f:
+                # 🆕 直接使用优化的分析提示词
+                with open('prompts/optimized_prompt_analyze.txt', 'r', encoding='utf-8') as f:
                     prompt_template = f.read()
+                self.logger.info("使用优化后的分析提示词")
                 
                 # 替换占位符
-                analysis_prompt = prompt_template.replace('{{PAPER_FULL_TEXT}}', pdf_text)
+                analysis_prompt: str = prompt_template.replace('{{PAPER_FULL_TEXT}}', pdf_text)
                 
             except Exception as e:
-                self.logger.warning(f"无法加载分析提示词模板，使用简化提示词: {e}")
+                self.logger.warning(f"无法加载优化分析提示词模板，使用简化提示词: {e}")
                 # 简化提示词
                 analysis_prompt = f"请分析以下论文内容，生成结构化摘要：\n\n{pdf_text}"
             
             # 调用AI接口生成摘要（自动处理引擎切换）
-            ai_result = get_summary_from_ai(analysis_prompt, reader_api_config, backup_api_config, logger=self.logger, config=self.config)
+            ai_result = get_summary_from_ai_with_fallback(analysis_prompt, reader_api_config, backup_api_config, logger=self.logger, config=self.config)
             
             if not ai_result:
                 failure_reason = "AI摘要生成失败"
@@ -745,32 +750,23 @@ class LiteratureReviewGenerator:
             self.logger.success("AI摘要生成成功")
             
             # =================== CONTENT QUALITY CHECK ===================
-            # 检查AI生成内容的质量，如果质量不达标则标记为失败
-            quality_issues: List[str] = []
+            # 使用新的上下文管理模块进行质量检查，如果质量不达标则标记为失败
             
-            # 确保ai_result有基本结构
-            if not ai_result or 'common_core' not in ai_result:
-                quality_issues.append("AI结果结构不完整")
-            else:
-                common_core: Dict[str, Any] = ai_result['common_core']  # type: ignore
-                # 检查关键字段的内容质量
-                key_fields: List[str] = ['methodology', 'findings', 'conclusions']
-                empty_fields: List[str] = []
-                
-                for field in key_fields:
-                    value: Any = common_core.get(field, '')
-                    # 检查是否为空、null或"未提及"等无效值
-                    if not value or value in [None, 'null', 'NULL', '未提及', '未提供', '']:
-                        empty_fields.append(field)
-                
-                # 如果有2个或以上关键字段为空，则判定为质量不达标
-                if len(empty_fields) >= 2:
-                    quality_issues.append(f"关键字段内容缺失: {', '.join(empty_fields)}")
+            # 构建模拟的ProcessingResult对象用于质量检查
+            temp_result: Dict[str, Any] = {
+                'paper_info': paper,
+                'status': 'success',
+                'ai_summary': ai_result
+            }
             
-            # 如果发现质量问题，标记为失败
-            if quality_issues:
-                failure_reason = f"内容质量检查失败: {'; '.join(quality_issues)}"
+            # 使用context_manager的质量检查功能
+            is_quality_ok, quality_reason = validate_summary_quality(temp_result)
+            
+            if not is_quality_ok:
+                # 🚨 空内容熔断 - 直接返回失败，触发重试机制
+                failure_reason = f"AI生成内容为空或不完整: {quality_reason}"
                 self.logger.warning(failure_reason)
+                self.logger.info("跳过验证阶段，直接返回失败以触发重试机制")
                 
                 # 返回失败结果，触发重试机制
                 failed_result: ProcessingResult = {
@@ -1216,6 +1212,14 @@ class LiteratureReviewGenerator:
             if self.failed_papers:
                 self.logger.warning(f"有{len(self.failed_papers)}篇论文处理失败，启动自动重试循环...")
                 
+                # 读取重试配置
+                retry_config: Dict[str, str] = self.config.get('Retry_Settings', {}) if self.config else {}
+                max_retry_rounds: int = int(retry_config.get('max_retry_rounds', 2))
+                base_retry_delay: int = int(retry_config.get('base_retry_delay', 30))
+                max_retry_delay: int = int(retry_config.get('max_retry_delay', 120))
+                
+                self.logger.info(f"🔄 重试配置: 最大重试轮数={max_retry_rounds}, 基础间隔={base_retry_delay}秒, 最大间隔={max_retry_delay}秒")
+                
                 # 定义可重试的失败类型关键词
                 retriable_keywords = ['api', 'network', 'http', 'timeout', '500', '502', '503', '504', '429', '连接', '超时', '错误', '失败']
                 
@@ -1238,12 +1242,30 @@ class LiteratureReviewGenerator:
                 self.logger.info(f"可重试失败论文: {len(retriable_failures)}篇")
                 self.logger.info(f"永久失败论文: {len(permanent_failures)}篇")
                 
-                # 执行最多2轮重试
-                max_retry_rounds = 2
+                # 执行自动重试（使用配置中的参数）
                 for retry_round in range(1, max_retry_rounds + 1):
                     if not retriable_failures:
                         self.logger.info("没有可重试的失败论文，结束重试循环")
                         break
+                    
+                    # 如果不是第一轮重试，添加延迟等待API限制恢复
+                    if retry_round > 1:
+                        # 使用配置的重试间隔，支持上限控制
+                        calculated_delay = retry_round * base_retry_delay
+                        retry_delay = min(calculated_delay, max_retry_delay)
+                        self.logger.info(f"第 {retry_round-1} 轮重试失败，等待 {retry_delay} 秒让API限制恢复...")
+                        self.logger.info(f"⏰ 间隔计算: {retry_round} × {base_retry_delay} = {calculated_delay}秒，已限制上限为 {max_retry_delay}秒")
+                        self.logger.info("⏳ 等待中... 这有助于避免API频率限制，提高重试成功率")
+                        
+                        # 显示倒计时
+                        for i in range(retry_delay, 0, -5):
+                            if i > 5:
+                                self.logger.info(f"⏰ 剩余等待时间: {i} 秒...")
+                                time.sleep(5)
+                            else:
+                                break
+                        time.sleep(retry_delay % 5)  # 完成剩余等待时间
+                        self.logger.info("✅ 等待完成，开始重试...")
                     
                     self.logger.info(f"正在对 {len(retriable_failures)} 篇失败文献进行第 {retry_round} 轮自动重试...")
                     
@@ -1355,7 +1377,9 @@ class LiteratureReviewGenerator:
                 # 更新失败计数
                 self.failed_count.set(len(self.failed_papers))
                 
-                self.logger.info(f"自动重试循环完成！最终失败论文数: {len(self.failed_papers)}篇")
+                self.logger.info(f"🔄 自动重试循环完成！")
+                self.logger.info(f"📊 使用配置: {max_retry_rounds}轮重试，基础间隔{base_retry_delay}秒，上限{max_retry_delay}秒")
+                self.logger.info(f"📈 最终失败论文数: {len(self.failed_papers)}篇")
             
             # 生成失败报告
             if self.failed_papers:
@@ -1532,15 +1556,30 @@ class LiteratureReviewGenerator:
             return False
 
     def generate_review_section_content(self, section_title: str, outline_content: str) -> Optional[str]:
-        """生成指定章节的内容（带智能续写循环）"""
+        """生成指定章节的内容（带智能续写循环和上下文优化）"""
         try:
-            # 将整个summaries列表转换为格式化的JSON字符串（包含两段式结构）
-            summaries_string = json.dumps(self.summaries, ensure_ascii=False, indent=2)
-            self.logger.success(f"生成摘要JSON字符串: {len(summaries_string)}字符")
+            # 🆕 使用context_manager优化上下文数据
+            self.logger.info("正在优化综述生成上下文...")
+            
+            # 优化上下文并智能截断
+            optimized_context: str = optimize_context_for_synthesis(
+                self.summaries, 
+                outline_content, 
+                max_tokens=100000
+            )
+            
+            self.logger.info(f"上下文优化完成：原始数据 -> 优化后格式")
+            
+            # 直接使用优化的prompt文件
+            with open('prompts/optimized_prompt_synthesize_section.txt', 'r', encoding='utf-8') as f:
+                prompt_template = f.read()
+            
+            # 替换占位符
+            section_prompt: str = prompt_template.replace('{{SUMMARIES_JSON_ARRAY}}', optimized_context)
+            section_prompt = section_prompt.replace('{{SECTION_TITLE}}', section_title)
+            section_prompt = section_prompt.replace('{{REVIEW_OUTLINE}}', outline_content)
 
-            # 将完整的大纲内容作为字符串
-            outline_string = outline_content
-            self.logger.success(f"生成大纲字符串: {len(outline_string)}字符")
+            self.logger.info(f"生成综述提示词: {len(section_prompt)}字符")
 
             # 提取写作引擎API配置
             writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
@@ -1559,22 +1598,18 @@ class LiteratureReviewGenerator:
 
             while continuation_attempts <= max_continuation_attempts:
                 if continuation_attempts == 0:
-                    # 首次调用，使用原始章节提示词
+                    # 首次调用，使用优化后的提示词
                     self.logger.info(f"[章节生成] 首次调用生成章节: {section_title}")
-                    result = self._call_section_api(
-                        section_title, 
-                        summaries_string, 
-                        outline_string, 
+                    result = self._call_section_api_optimized(
+                        section_prompt,
                         writer_api_config, 
                         is_continuation=False
                     )
                 else:
                     # 续写调用，使用续写提示词
                     self.logger.info(f"[章节续写] 第{continuation_attempts}次续写: {section_title}")
-                    result = self._call_section_api(
-                        section_title, 
-                        summaries_string, 
-                        outline_string, 
+                    result = self._call_section_api_optimized(
+                        section_prompt,
                         writer_api_config, 
                         is_continuation=True,
                         partial_content=partial_section_content
@@ -1698,6 +1733,66 @@ class LiteratureReviewGenerator:
 
         except Exception as e:
             self.logger.error(f"调用章节API失败: {e}")
+            return None
+
+    def _call_section_api_optimized(self, section_prompt: str, writer_api_config: 'APIConfig', 
+                                   is_continuation: bool = False, partial_content: str = "") -> Optional[Dict[str, Any]]:
+        """🆕 优化的章节生成API调用（使用预处理的提示词）"""
+        try:
+            # Determine system prompt
+            try:
+                with open('prompts/prompt_system_section.txt', 'r', encoding='utf-8') as f:
+                    system_prompt = f.read()
+                self.logger.success(f"加载章节系统提示词模板: {len(system_prompt)}字符")
+            except Exception as e:
+                self.logger.warning(f"无法加载章节系统提示词模板，使用默认提示词: {e}")
+                system_prompt = """你是一个学术文献综述专家。请基于提供的文献分析结果和完整大纲，撰写指定章节的正文内容。
+
+要求：
+1. 深度综合不同学者的观点，对比异同
+2. 每个论点必须引用至少1-2篇文献，格式为(作者, 年份)
+3. 逻辑连贯，段落间有过渡
+4. 避免流水账式写法，按主题组织内容"""
+
+            # 对于续写调用，添加续写标记
+            if is_continuation and partial_content:
+                continuation_prompt = f"""请继续撰写上文的章节内容。上文内容：
+{partial_content}
+
+请继续上文的内容，保持逻辑连贯，确保：
+1. 与上文风格一致
+2. 内容自然衔接
+3. 继续深化主题分析
+
+继续内容："""
+                final_prompt = f"{section_prompt}\n\n{continuation_prompt}"
+            else:
+                final_prompt = section_prompt
+
+            self.logger.success(f"生成最终章节提示词: {len(final_prompt)}字符")
+
+            # Call unified AI API function
+            ai_response = _call_ai_api(
+                prompt=final_prompt,
+                api_config=writer_api_config,
+                system_prompt=system_prompt,
+                max_tokens=6000,
+                temperature=0.7,
+                response_format="text" # Expecting plain text
+            )
+
+            if ai_response:
+                # _call_ai_api returns content directly for text format
+                return {
+                    'content': ai_response,
+                    'finish_reason': 'stop' # _call_ai_api doesn't return finish_reason for text, assume stop
+                }
+            else:
+                self.logger.error(f"章节内容生成失败: _call_ai_api 返回空值")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"调用优化章节API失败: {e}")
             return None
 
     def append_section_to_word_document(self, section_number: int, section_title: str, section_text: str, word_file: str) -> bool:
@@ -2597,7 +2692,7 @@ class LiteratureReviewGenerator:
                         analysis_prompt = f"请分析以下论文内容，生成结构化摘要：\n\n{pdf_text}"
                     
                     # 调用AI分析
-                    ai_result = get_summary_from_ai(analysis_prompt, reader_api_config, backup_api_config, logger=self.logger, config=self.config)
+                    ai_result = get_summary_from_ai_with_fallback(analysis_prompt, reader_api_config, backup_api_config, logger=self.logger, config=self.config)
                     if ai_result:
                         self.logger.success(f"种子论文分析成功: {os.path.basename(pdf_path)}")
                         return {
@@ -2812,6 +2907,20 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
         if not args.project_name and not args.pdf_folder:
             logging.error("必须指定--project-name或--pdf-folder参数中的一个")
             sys.exit(1)
+        
+        # 验证project_name格式
+        if args.project_name:
+            # 检查是否可能是完整路径（常见错误）
+            if len(args.project_name) > 100 or '\\' in args.project_name or '/' in args.project_name:
+                logging.error("❌ --project-name 参数错误")
+                logging.error("💡 请不要使用完整路径，应该使用简洁的项目名称")
+                logging.error("📝 示例：--project-name \"案例分析\" 而非 --project-name \"C:\\Users\\123\\Desktop\\我的项目\"")
+                logging.error("🔄 或者使用 --pdf-folder 指定PDF文件夹路径")
+                sys.exit(1)
+            
+            # 检查project_name长度
+            if len(args.project_name) > 50:
+                logging.warning(f"⚠️  项目名称过长（{len(args.project_name)}字符），建议使用更简洁的名称")
             
         generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
         
@@ -3019,6 +3128,14 @@ def handle_retry_failed(args: argparse.Namespace):  # type: ignore
     if not args.project_name and not args.pdf_folder:
         logging.error("使用--retry-failed命令时必须提供--project-name或--pdf-folder参数中的一个")
         sys.exit(1)
+    
+    # 验证project_name格式
+    if args.project_name:
+        if len(args.project_name) > 100 or '\\' in args.project_name or '/' in args.project_name:
+            logging.error("❌ --project-name 参数错误")
+            logging.error("💡 请不要使用完整路径，应该使用简洁的项目名称")
+            logging.error("📝 示例：--project-name \"案例分析\" 而非 --project-name \"C:\\Users\\123\\Desktop\\我的项目\"")
+            sys.exit(1)
 
     generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
     generator.logger.info("*** 失败论文重试模式已启动 ***")
@@ -3140,6 +3257,14 @@ def handle_merge_mode(args: argparse.Namespace):  # type: ignore
         logging.error("使用--merge命令时必须提供--project-name或--pdf-folder参数中的一个")
         sys.exit(1)
     
+    # 验证project_name格式
+    if args.project_name:
+        if len(args.project_name) > 100 or '\\' in args.project_name or '/' in args.project_name:
+            logging.error("❌ --project-name 参数错误")
+            logging.error("💡 请不要使用完整路径，应该使用简洁的项目名称")
+            logging.error("📝 示例：--project-name \"案例分析\" 而非 --project-name \"C:\\Users\\123\\Desktop\\我的项目\"")
+            sys.exit(1)
+    
     generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
     generator.logger.info("*** 合并模式已启动 ***")
     generator.logger.info("=" * 60)
@@ -3168,12 +3293,32 @@ def handle_merge_mode(args: argparse.Namespace):  # type: ignore
             generator.logger.error(f"合并文件不存在: {merge_file}")
             return
         
-        # 读取两个文件
-        with open(main_file, 'r', encoding='utf-8') as f:  # type: ignore
-            main_data = json.load(f)  # type: ignore
+        # 读取两个文件（添加robust编码处理）
+        try:
+            with open(main_file, 'r', encoding='utf-8') as f:  # type: ignore
+                main_data = json.load(f)  # type: ignore
+        except UnicodeDecodeError:
+            try:
+                with open(main_file, 'r', encoding='gbk') as f:  # type: ignore
+                    content = f.read()
+                content = content.encode('gbk').decode('utf-8')
+                main_data = json.loads(content)  # type: ignore
+            except (UnicodeDecodeError, UnicodeError):
+                with open(main_file, 'r', encoding='utf-8', errors='ignore') as f:  # type: ignore
+                    main_data = json.load(f)  # type: ignore
         
-        with open(merge_file, 'r', encoding='utf-8') as f:  # type: ignore
-            merge_data = json.load(f)  # type: ignore
+        try:
+            with open(merge_file, 'r', encoding='utf-8') as f:  # type: ignore
+                merge_data = json.load(f)  # type: ignore
+        except UnicodeDecodeError:
+            try:
+                with open(merge_file, 'r', encoding='gbk') as f:  # type: ignore
+                    content = f.read()
+                content = content.encode('gbk').decode('utf-8')
+                merge_data = json.loads(content)  # type: ignore
+            except (UnicodeDecodeError, UnicodeError):
+                with open(merge_file, 'r', encoding='utf-8', errors='ignore') as f:  # type: ignore
+                    merge_data = json.load(f)  # type: ignore
         
         if not isinstance(main_data, list) or not isinstance(merge_data, list):  # type: ignore
             generator.logger.error("文件格式错误，必须是JSON数组")
