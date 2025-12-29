@@ -139,3 +139,6 @@ debug_*.py
 check_*.py
 find_*.py
 nul
+
+# iFlow CLI generated files
+IFLOW.md
