@@ -42,7 +42,7 @@ from setup_wizard import run_setup_wizard
 import validator
 
 # 导入上下文管理模块
-from context_manager import validate_summary_quality, optimize_context_for_synthesis
+from context_manager import validate_summary_quality, optimize_context_for_synthesis, optimize_context_for_outline, estimate_tokens
 
 
 
@@ -318,6 +318,7 @@ class LiteratureReviewGenerator:
     def _init_logger(self):
         """初始化日志记录器"""
         import logging
+        import os
         from datetime import datetime
         
         # 创建日志记录器
@@ -337,8 +338,31 @@ class LiteratureReviewGenerator:
                                     datefmt='%H:%M:%S')
         console_handler.setFormatter(formatter)
         
-        # 添加处理器到记录器
-        self.logger.addHandler(console_handler)
+        # 创建文件处理器
+        try:
+            # 创建logs目录（如果不存在）
+            logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+            os.makedirs(logs_dir, exist_ok=True)
+            
+            # 生成日志文件名：使用时间戳确保唯一性
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_file = os.path.join(logs_dir, f'llm_reviewer_{timestamp}.log')
+            
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(formatter)
+            
+            # 添加处理器到记录器
+            self.logger.addHandler(console_handler)
+            self.logger.addHandler(file_handler)
+            
+            # 记录日志文件位置
+            self.logger.info(f"日志文件已创建: {log_file}")
+            
+        except Exception as e:
+            # 如果文件日志失败，只使用控制台日志
+            self.logger.warning(f"无法创建文件日志，仅使用控制台日志: {e}")
+            self.logger.addHandler(console_handler)
     
     def load_configuration(self) -> bool:
         """加载配置文件"""
@@ -763,18 +787,62 @@ class LiteratureReviewGenerator:
             is_quality_ok, quality_reason = validate_summary_quality(temp_result)
             
             if not is_quality_ok:
-                # 🚨 空内容熔断 - 直接返回失败，触发重试机制
+                # 🚨 内容质量检查失败，尝试备用引擎
                 failure_reason = f"AI生成内容为空或不完整: {quality_reason}"
                 self.logger.warning(failure_reason)
-                self.logger.info("跳过验证阶段，直接返回失败以触发重试机制")
                 
-                # 返回失败结果，触发重试机制
-                failed_result: ProcessingResult = {
-                    'paper_info': paper,
-                    'status': 'failed',
-                    'failure_reason': failure_reason
-                }
-                return failed_result
+                # 检查是否配置了备用引擎
+                backup_api_key = backup_api_config.get('api_key', '')
+                if backup_api_key and backup_api_key.strip():
+                    self.logger.info("主引擎内容质量检查失败，尝试备用引擎...")
+                    
+                    # 使用备用引擎直接调用（绕过主引擎）
+                    backup_result = get_summary_from_ai(analysis_prompt, reader_api_config, backup_api_config,
+                                                       engine_type='backup', logger=self.logger, config=self.config)
+                    
+                    if backup_result:
+                        self.logger.success("备用引擎AI摘要生成成功")
+                        
+                        # 检查备用引擎结果的质量
+                        temp_result_backup: Dict[str, Any] = {
+                            'paper_info': paper,
+                            'status': 'success',
+                            'ai_summary': backup_result
+                        }
+                        
+                        is_quality_ok_backup, quality_reason_backup = validate_summary_quality(temp_result_backup)
+                        
+                        if is_quality_ok_backup:
+                            self.logger.info("备用引擎内容质量检查通过")
+                            ai_result = backup_result  # 使用备用引擎的结果
+                            # 继续后续处理
+                        else:
+                            self.logger.warning(f"备用引擎内容质量检查也失败: {quality_reason_backup}")
+                            # 备用引擎也失败，返回失败结果
+                            failed_result: ProcessingResult = {
+                                'paper_info': paper,
+                                'status': 'failed',
+                                'failure_reason': f"主引擎和备用引擎都失败: {quality_reason}; 备用引擎: {quality_reason_backup}"
+                            }
+                            return failed_result
+                    else:
+                        self.logger.error("备用引擎AI摘要生成失败")
+                        # 返回失败结果
+                        failed_result: ProcessingResult = {
+                            'paper_info': paper,
+                            'status': 'failed',
+                            'failure_reason': f"主引擎和备用引擎都失败: {quality_reason}; 备用引擎调用失败"
+                        }
+                        return failed_result
+                else:
+                    # 没有配置备用引擎，直接返回失败
+                    self.logger.info("未配置备用引擎，直接返回失败以触发重试机制")
+                    failed_result: ProcessingResult = {
+                        'paper_info': paper,
+                        'status': 'failed',
+                        'failure_reason': failure_reason
+                    }
+                    return failed_result
             
             self.logger.info("内容质量检查通过")
             # ================================================================
@@ -1279,11 +1347,15 @@ class LiteratureReviewGenerator:
                         for i, original_paper in enumerate(self.papers):
 
                             if LiteratureReviewGenerator.get_paper_key(original_paper) == LiteratureReviewGenerator.get_paper_key(paper_info):
-
+                                # 计算论文key
+                                paper_key = LiteratureReviewGenerator.get_paper_key(original_paper)
+                                # 关键修复：从失败集合中移除，避免被process_paper跳过
+                                if paper_key in self._checkpoint_failed_papers:
+                                    self._checkpoint_failed_papers.discard(paper_key)
+                                    self.logger.info(f"已从失败集合中移除论文以便重试: {original_paper.get('title', '未知标题')}")
+                                
                                 retry_papers.append((i, original_paper))  # type: ignore  # 使用original_paper而不是paper_info
-
                                 retry_indices.append(i)
-
                                 break
                     
                     if not retry_papers:
@@ -1315,6 +1387,8 @@ class LiteratureReviewGenerator:
                                     with self.save_lock:
                                         self.summaries.append(result)
                                         self._checkpoint_processed_papers.add(paper_key)
+                                        # 从失败集合中移除，保持状态一致性
+                                        self._checkpoint_failed_papers.discard(paper_key)
                                         # 从失败列表中移除
                                         self.failed_papers = [fp for fp in self.failed_papers  # type: ignore
                                                           if LiteratureReviewGenerator.get_paper_key(fp.get('paper_info', {})) != paper_key]
@@ -1562,10 +1636,11 @@ class LiteratureReviewGenerator:
             self.logger.info("正在优化综述生成上下文...")
             
             # 优化上下文并智能截断
+            # Gemini 3 Pro有1M token上下文，使用950000作为安全阈值（仅在最极端情况下触发截断）
             optimized_context: str = optimize_context_for_synthesis(
                 self.summaries, 
                 outline_content, 
-                max_tokens=100000
+                max_tokens=950000
             )
             
             self.logger.info(f"上下文优化完成：原始数据 -> 优化后格式")
@@ -2232,6 +2307,19 @@ class LiteratureReviewGenerator:
             summaries_string = json.dumps(self.summaries, ensure_ascii=False, indent=2)
             self.logger.success(f"生成摘要JSON字符串: {len(summaries_string)}字符")
 
+            # 始终使用优化后的高密度格式（去除JSON结构开销），仅在最极端情况下触发截断
+            # Gemini 3 Pro有1M token上下文，使用950000作为安全阈值
+            estimated_tokens = estimate_tokens(summaries_string)
+            max_tokens_for_optimization = 950000  # 优化时最大token数（仅在最极端情况下触发截断）
+            
+            self.logger.info(f"上下文token数({estimated_tokens})，使用高密度压缩格式...")
+            optimized_context = optimize_context_for_outline(self.summaries, max_tokens=max_tokens_for_optimization)
+            self.logger.success(f"优化后的上下文长度: {len(optimized_context)}字符 (原长度: {len(summaries_string)}字符)")
+            self.logger.info(f"压缩率: {len(optimized_context)/len(summaries_string):.1%}")
+            
+            # 使用优化后的上下文
+            summaries_string = optimized_context
+
             # 提取写作引擎API配置
             writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
             writer_api_config: APIConfig = {
@@ -2283,7 +2371,8 @@ class LiteratureReviewGenerator:
                         system_prompt=system_prompt,
                         max_tokens=8192,
                         temperature=0.7,
-                        response_format="text"
+                        response_format="text",
+                        logger=self.logger  # 添加logger参数以记录详细错误信息
                     )
                     
                     if ai_response_text is None:
@@ -3027,55 +3116,88 @@ def parse_failure_report(failure_report_file: str, pdf_folder: Optional[str] = N
                     for pdf_file in all_pdfs:
                         pdf_filename = os.path.splitext(os.path.basename(pdf_file))[0]
                         
-                        # 简化的匹配逻辑：检查作者姓名和关键内容
-                        # 直接检查作者姓名（通常是最可靠的匹配方式）
+                        # 通用的匹配逻辑：检查标题和PDF文件名的相似度
+                        # 方法1：检查作者姓名（如果标题中有下划线分隔作者）
                         author_match = False
-                        title_keywords: List[str] = []
-                        
-                        # 提取论文标题中的作者姓名（通常在最后，用下划线分隔）
                         if '_' in title:
                             possible_authors = title.split('_')[-1].strip()
                             if possible_authors and possible_authors in pdf_filename:
                                 author_match = True
                                 logging.info(f"基于作者姓名匹配: {possible_authors}")
                         
-                        # 提取关键内容词汇
-                        if "中国农田建设政策" in title:
-                            title_keywords.extend(["中国农田建设政策", "农田建设政策"])
-                        if "一号文件" in title:
-                            title_keywords.append("一号文件")
-                        if "三农" in title:
-                            title_keywords.append("三农")
-                        if "朱华东" in title:
-                            title_keywords.append("朱华东")
+                        # 方法2：提取标题中的关键词进行匹配
+                        # 去除常见停用词，提取有意义的词汇
+                        def extract_keywords(text: str) -> List[str]:
+                            """从文本中提取关键词（去除停用词）"""
+                            # 常见停用词（中英文）
+                            stop_words = {'的', '与', '和', '及', '在', '对', '为', '了', '中', '是', '有', '也', '就', '都',
+                                         'the', 'and', 'or', 'in', 'on', 'at', 'for', 'to', 'of', 'a', 'an', 'the',
+                                         '研究', '分析', '探讨', '初探', '思考', '基于', '视角'}
+                            
+                            # 分割成词汇（按非字母数字字符分割）
+                            import re
+                            words = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z]+', text)
+                            
+                            # 过滤停用词，保留长度>=2的词汇
+                            keywords = [word for word in words if len(word) >= 2 and word not in stop_words]
+                            return keywords
                         
-                        # 检查PDF文件名是否包含关键词
-                        keyword_matches = 0
+                        title_keywords = extract_keywords(title)
+                        filename_keywords = extract_keywords(pdf_filename)
+                        
+                        # 计算关键词重叠度（使用提取的关键词进行更准确的匹配）
+                        keyword_overlap = 0
                         matched_words: List[str] = []
                         for keyword in title_keywords:
-                            if keyword in pdf_filename:
-                                keyword_matches += 1
-                                matched_words.append(keyword)
+                            # 方法1：检查精确匹配（关键词在文件名关键词列表中）
+                            if keyword in filename_keywords:
+                                keyword_overlap += 1
+                                matched_words.append(f"[精确]{keyword}")
+                            # 方法2：检查子字符串匹配（关键词在PDF文件名中）
+                            elif keyword in pdf_filename:
+                                keyword_overlap += 1
+                                matched_words.append(f"[包含]{keyword}")
                         
-                        # 如果作者姓名匹配或关键词匹配足够多，则认为匹配成功
-                        if author_match or keyword_matches >= 2:
+                        # 方法3：计算文本相似度（简单版本）
+                        def calculate_similarity(str1: str, str2: str) -> float:
+                            """计算两个字符串的相似度（基于重叠字符）"""
+                            # 转换为集合（去除重复字符）
+                            set1 = set(str1)
+                            set2 = set(str2)
+                            if not set1 or not set2:
+                                return 0.0
+                            # Jaccard相似度
+                            intersection = len(set1.intersection(set2))
+                            union = len(set1.union(set2))
+                            return intersection / union if union > 0 else 0.0
+                        
+                        similarity_score = calculate_similarity(title, pdf_filename)
+                        
+                        # 匹配条件：作者匹配 或 关键词匹配>=2 或 相似度>0.5
+                        if author_match or keyword_overlap >= 2 or similarity_score > 0.5:
                             pdf_path = pdf_file
                             logging.info(f"成功匹配PDF文件: {pdf_file}")
                             if author_match:
                                 logging.info("匹配原因: 作者姓名")
-                            if keyword_matches > 0:
-                                logging.info(f"匹配到 {keyword_matches} 个关键词: {matched_words}")
+                            if keyword_overlap > 0:
+                                logging.info(f"匹配到 {keyword_overlap} 个关键词: {matched_words}")
+                            if similarity_score > 0.5:
+                                logging.info(f"文本相似度: {similarity_score:.2f}")
                             break
                         
-                        # 最后的备选方案：直接比较（去除特殊字符）
+                        # 方法4：直接包含检查（如果PDF文件名包含标题的主要部分）
                         else:
                             clean_title = title.replace('——', '').replace('_', '').replace('"', '').replace('（', '').replace('）', '')
                             clean_filename = pdf_filename.replace('_', '').replace('"', '').replace('（', '').replace('）', '')
                             
-                            # 如果标题中的大部分内容在文件名中
+                            # 如果标题长度>10且被文件名包含，或相反
                             if len(clean_title) > 10 and clean_title in clean_filename:
                                 pdf_path = pdf_file
                                 logging.info(f"基于整体字符串匹配找到PDF文件: {pdf_file}")
+                                break
+                            elif len(clean_filename) > 10 and clean_filename in clean_title:
+                                pdf_path = pdf_file
+                                logging.info(f"基于反向包含匹配找到PDF文件: {pdf_file}")
                                 break
                 
                 # 如果找到了PDF文件，创建论文信息
@@ -3227,6 +3349,9 @@ def handle_retry_failed(args: argparse.Namespace):  # type: ignore
                     else:
                         # 如果没有找到原始条目，则添加新条目
                         generator.summaries.append(failed_paper)  # type: ignore
+                    
+                    # 确保失败的论文也被添加到failed_papers列表，以便生成失败报告
+                    generator.failed_papers.append(failed_paper)  # type: ignore
                 else:
                     # Zotero模式下，直接添加到失败列表
                     generator.failed_papers.append(failed_paper)  # type: ignore

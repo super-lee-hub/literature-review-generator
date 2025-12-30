@@ -111,13 +111,13 @@ def convert_json_to_markdown(summaries_data: Union[List[Dict[str, Any]], List[Pr
     return markdown_content
 
 
-def truncate_context_if_needed(text: str, max_tokens: int = 120000) -> Tuple[str, bool]:
+def truncate_context_if_needed(text: str, max_tokens: int = 950000) -> Tuple[str, bool]:
     """
     智能截断上下文，防止API超时
     
     Args:
         text: 原始文本
-        max_tokens: 最大token数限制
+        max_tokens: 最大token数限制（Gemini 3 Pro有1M token，使用950000作为安全阈值，仅在最极端情况下触发）
         
     Returns:
         Tuple[截断后的文本, 是否被截断]
@@ -177,7 +177,7 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
         # 获取AI摘要数据
         ai_summary = summary_data.get('ai_summary', {})  # type: ignore
         
-        common_core = ai_summary.get('common_core', {}) if ai_summary else {}  # type: ignore
+        common_core: Any = ai_summary.get('common_core', {}) if ai_summary else {}
         
         # 定义无效内容的关键词黑名单（扩展版本）
         PLACEHOLDER_KEYWORDS = [
@@ -277,21 +277,20 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
         return False, f"质量检查异常: {str(e)}"
 
 
-def optimize_context_for_synthesis(summaries_data: Union[List[Dict[str, Any]], List[ProcessingResult]], 
+def optimize_context_for_synthesis(summaries_data: Union[List[Dict[str, Any]], List[ProcessingResult]],
                                    outline: str, 
-                                   max_tokens: int = 100000) -> str:
+                                   max_tokens: int = 950000) -> str:
     """
     优化综述生成的上下文数据
     
     Args:
         summaries_data: 文献摘要列表
         outline: 综述大纲
-        max_tokens: 最大token数
+        max_tokens: 最大token数（Gemini 3 Pro有1M token，使用950000作为安全阈值）
         
     Returns:
         优化后的上下文文本
-    """
-    # 转换为Markdown
+    """    # 转换为Markdown
     markdown_data = convert_json_to_markdown(summaries_data)
     
     # 构建完整上下文
@@ -310,6 +309,45 @@ def optimize_context_for_synthesis(summaries_data: Union[List[Dict[str, Any]], L
     
     # 智能截断
     optimized_context, _ = truncate_context_if_needed(full_context, max_tokens)
+    
+    return optimized_context
+
+
+def optimize_context_for_outline(summaries_data: List[ProcessingResult], max_tokens: int = 950000) -> str:
+    """
+    优化大纲生成的上下文数据（使用高密度Markdown格式，提取全部有效字段）
+    
+    Args:
+        summaries_data: 文献摘要列表（ProcessingResult格式）
+        max_tokens: 最大令牌数限制（Gemini 3 Pro有1M token，使用950000作为安全阈值）
+        
+    Returns:
+        优化后的上下文字符串
+    """
+    # 转换为高密度Markdown格式（与综述生成使用相同的压缩策略）
+    markdown_data = convert_json_to_markdown(summaries_data)
+    
+    # 构建优化后的上下文（去除JSON结构开销，使用纯文本格式）
+    optimized_context = f"""# 文献综述大纲生成数据
+
+## 文献分析摘要（共{len([s for s in summaries_data if s.get('status') == 'success'])}篇成功文献）
+{markdown_data}
+
+## 大纲生成要求
+请基于上述文献分析数据，生成一份结构完整的文献综述大纲。
+
+大纲应包含：
+1. 清晰的章节结构（使用#、##、###等Markdown标题）
+2. 每个章节下列出核心论点和分析要点
+3. 合理组织文献，体现研究主题的发展脉络
+4. 突出关键概念、理论框架和研究方法
+"""
+    
+    # 智能截断（仅当绝对必要时）
+    optimized_context, was_truncated = truncate_context_if_needed(optimized_context, max_tokens)
+    
+    if was_truncated:
+        warnings.warn(f"大纲生成上下文被截断，原始token数可能超过{max_tokens}")
     
     return optimized_context
 

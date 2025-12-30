@@ -266,29 +266,25 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
                             original_len = len(original_value)
                             corrected_len = len(corrected_value)
                             
-                            # 情况A：完全替换 - 修正值长度与原值相当，或者原值为空/占位符
-                            if is_original_empty or corrected_len > original_len * 0.6:
+                            # 情况A：完全替换 - 修正值长度显著大于原值（>80%），或者原值为空/占位符
+                            # 提高阈值从0.6到0.8，避免过短修正导致信息丢失
+                            if is_original_empty or corrected_len > original_len * 0.8:
                                 temp_dict[field_name] = corrected_value
                                 generator_instance.logger.info(f"✅ 字段 '{field_to_correct}' 执行完全替换 (修正长度: {corrected_len}, 原长度: {original_len})")
                                 
-                            # 情况B：智能追加 - 修正值较短，认为是局部修正或补充
+                            # 情况B：精准替换 - 修正值较短，直接替换（不再追加验证元数据）
                             else:
-                                # 获取修正依据
+                                # 直接使用修正值替换原值，避免验证元数据污染摘要
+                                temp_dict[field_name] = corrected_value
+                                # 记录修正依据供调试参考（不存储到摘要中）
                                 justification = ""
                                 for correction in corrections:
                                     if correction.get("field") == field_to_correct:
                                         justification = correction.get("justification", "")
                                         break
-                                
-                                # 追加修正格式：原值文本... [数据核查]: 建议修正为"修正值文本"，依据："修正依据"
                                 if justification:
-                                    combined_value = f"{original_value}... [数据核查]: 建议修正为\"{corrected_value}\"，依据：\"{justification}\""
-                                else:
-                                    # 如果没有justification，使用简单的追加格式
-                                    combined_value = f"{original_value} (修正/补充: {corrected_value})"
-                                
-                                temp_dict[field_name] = combined_value
-                                generator_instance.logger.info(f"✅ 字段 '{field_to_correct}' 执行智能追加 (修正: {corrected_len}字符追加到原值: {original_len}字符，包含证据链: {bool(justification)})")
+                                    generator_instance.logger.debug(f"🔧 修正依据: {justification}")
+                                generator_instance.logger.info(f"✅ 字段 '{field_to_correct}' 执行精准替换 (修正: {corrected_len}字符替换原值: {original_len}字符)")
                                 
                         elif is_corrected_valid:
                             # 非字符串类型修正，直接替换
@@ -411,65 +407,197 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
                 valid_citation_map[standard_citation] = summary
                 
                 # 创建多种引用格式的映射，支持中文和英文格式变体
+                # 首先定义标准化函数（局部使用）
+                def normalize_citation_for_mapping(citation: str) -> str:
+                    """标准化引用字符串用于映射键"""
+                    # 移除多余空格，将多个空格合并为一个
+                    citation = re.sub(r'\s+', ' ', citation).strip()
+                    # 统一标点：中文标点替换为英文标点
+                    citation = citation.replace('；', ';').replace('，', ',').replace('、', ',')
+                    # 移除常见的中文前缀（如"支持文献:"、"参见:"、"来源:"等）
+                    # 处理括号内的前缀，例如"(支持文献: 作者, 年份)" -> "(作者, 年份)"
+                    citation = re.sub(r'\(支持文献[:：]\s*', '(', citation)
+                    citation = re.sub(r'\(参见[:：]\s*', '(', citation)
+                    citation = re.sub(r'\(来源[:：]\s*', '(', citation)
+                    citation = re.sub(r'\(引用自[:：]\s*', '(', citation)
+                    # 统一“和”与“&”
+                    citation = citation.replace(' 和 ', ' & ').replace('和', ' & ')
+                    # 统一“等”与“et al.” - 使用与normalize_citation一致的逻辑
+                    citation = re.sub(r'等\s*,', ' et al.,', citation)
+                    citation = re.sub(r'等\s*;', ' et al.;', citation)
+                    citation = re.sub(r'等\s*\)', ' et al.)', citation)
+                    citation = re.sub(r'\s等\s*,', ' et al.,', citation)
+                    # 确保年份前有空格
+                    citation = re.sub(r',(\d{4})', r', \1', citation)
+                    # 清理可能产生的双逗号
+                    citation = re.sub(r',\s*,', ', ', citation)
+                    citation = re.sub(r'et al\.\s*,', 'et al.,', citation)
+                    return citation
+                
+                # 生成所有可能的引用格式变体
+                citation_variants = []
+                
                 if len(authors) == 1:
-                    # 单作者：只有一种格式
-                    citation_to_key[f"({authors[0]}, {year})"] = standard_citation
+                    # 单作者变体（包括AI可能错误生成的'等'格式）
+                    base_formats = [
+                        f"({authors[0]}, {year})",
+                        f"({authors[0]} 等, {year})",
+                        f"({authors[0]}等, {year})",
+                        f"({authors[0]} et al., {year})",
+                        f"({authors[0]}, {year})",  # 原始格式
+                        f"({authors[0]}, {year})",  # 无空格变体
+                        f"({authors[0]}, {year})",  # 全角逗号变体（标准化后会处理）
+                    ]
+                    citation_variants.extend(base_formats)
                     
                 elif len(authors) == 2:
-                    # 双作者：多种格式变体
-                    standard_citation = f"({authors[0]} & {authors[1]}, {year})"
-                    valid_citation_map[standard_citation] = summary
-                    
-                    # 英文格式变体
-                    citation_to_key[f"({authors[0]}, {authors[1]}, {year})"] = standard_citation
-                    
-                    # 中文格式变体
-                    citation_to_key[f"({authors[0]} 和 {authors[1]}, {year})"] = standard_citation
-                    citation_to_key[f"({authors[0]}、{authors[1]}, {year})"] = standard_citation
-                    
-                    # 标准格式本身
-                    citation_to_key[f"({authors[0]} & {authors[1]}, {year})"] = standard_citation
-                    
-                    # et al. 格式映射
-                    et_al_citation: str = f"({authors[0]} et al., {year})"
-                    citation_to_key[et_al_citation] = standard_citation
+                    # 双作者变体
+                    base_formats = [
+                        f"({authors[0]} & {authors[1]}, {year})",
+                        f"({authors[0]}, {authors[1]}, {year})",
+                        f"({authors[0]} 和 {authors[1]}, {year})",
+                        f"({authors[0]}、{authors[1]}, {year})",
+                        f"({authors[0]}和{authors[1]}, {year})",
+                        f"({authors[0]} & {authors[1]}, {year})",
+                        f"({authors[0]} et al., {year})"
+                    ]
+                    citation_variants.extend(base_formats)
                     
                 elif len(authors) == 3:
-                    # 三作者：多种格式变体
-                    standard_citation = f"({authors[0]}, {authors[1]} & {authors[2]}, {year})"
-                    valid_citation_map[standard_citation] = summary
-                    
-                    # 英文格式变体
-                    citation_to_key[f"({authors[0]}, {authors[1]}, {authors[2]}, {year})"] = standard_citation
-                    
-                    # 中文格式变体
-                    citation_to_key[f"({authors[0]}、{authors[1]}和{authors[2]}, {year})"] = standard_citation
-                    
-                    # 标准格式本身
-                    citation_to_key[f"({authors[0]}, {authors[1]} & {authors[2]}, {year})"] = standard_citation
-                    
-                    # et al. 格式映射
-                    et_al_citation = f"({authors[0]} et al., {year})"
-                    citation_to_key[et_al_citation] = standard_citation
+                    # 三作者变体
+                    base_formats = [
+                        f"({authors[0]}, {authors[1]} & {authors[2]}, {year})",
+                        f"({authors[0]}, {authors[1]}, {authors[2]}, {year})",
+                        f"({authors[0]}、{authors[1]}和{authors[2]}, {year})",
+                        f"({authors[0]}、{authors[1]}和{authors[2]}, {year})",
+                        f"({authors[0]}, {authors[1]}, {authors[2]}, {year})",
+                        f"({authors[0]} et al., {year})"
+                    ]
+                    citation_variants.extend(base_formats)
                     
                 else:
-                    # 四位及以上作者
-                    standard_citation = f"({authors[0]} et al., {year})"
-                    valid_citation_map[standard_citation] = summary
-                    citation_to_key[standard_citation] = standard_citation
+                    # 四位及以上作者变体
+                    base_formats = [
+                        f"({authors[0]} et al., {year})",
+                        f"({authors[0]} 等, {year})",
+                        f"({authors[0]}等, {year})"
+                    ]
+                    citation_variants.extend(base_formats)
+                
+                # 为所有变体创建映射
+                for variant in citation_variants:
+                    # 原始格式映射
+                    citation_to_key[variant] = standard_citation
+                    # 标准化格式映射（处理空格和标点差异）
+                    normalized_variant = normalize_citation_for_mapping(variant)
+                    if normalized_variant != variant:
+                        citation_to_key[normalized_variant] = standard_citation
+                
+                # 额外处理：作者名之间可能有空格变体
+                if len(authors) >= 2:
+                    # 为双作者添加无空格变体
+                    no_space_variant = f"({authors[0]}&{authors[1]}, {year})"
+                    citation_to_key[no_space_variant] = standard_citation
 
         # 从Word文档中提取所有引用
         full_text: str = "\n".join([p.text for p in doc.paragraphs])
         sentences: List[str] = re.split(r'(?<=[.。?？!！])\s+', full_text)
 
+        # 辅助函数：标准化引用字符串
+        def normalize_citation(citation: str) -> str:
+            """标准化引用字符串，统一标点和空格"""
+            if not citation:
+                return citation
+            # 移除多余空格，将多个空格合并为一个
+            citation = re.sub(r'\s+', ' ', citation).strip()
+            # 统一标点：中文标点替换为英文标点
+            citation = citation.replace('；', ';').replace('，', ',').replace('、', ',')
+            # 移除常见的中文前缀（如"支持文献:"、"参见:"、"来源:"等）
+            # 处理括号内的前缀，例如"(支持文献: 作者, 年份)" -> "(作者, 年份)"
+            citation = re.sub(r'\(支持文献[:：]\s*', '(', citation)
+            citation = re.sub(r'\(参见[:：]\s*', '(', citation)
+            citation = re.sub(r'\(来源[:：]\s*', '(', citation)
+            citation = re.sub(r'\(引用自[:：]\s*', '(', citation)
+            # 统一“和”与“&”
+            citation = citation.replace(' 和 ', ' & ').replace('和', ' & ')
+            # 统一“等”与“et al.” - 更精细的处理
+            # 处理“等”后面跟逗号的情况，如“(张明等, 2021)” -> “(张明 et al., 2021)”
+            citation = re.sub(r'等\s*,', ' et al.,', citation)
+            # 处理“等”后面跟分号的情况（多个引用分隔）
+            citation = re.sub(r'等\s*;', ' et al.;', citation)
+            # 处理“等”后面跟右括号的情况（理论上不应该出现，但容错处理）
+            citation = re.sub(r'等\s*\)', ' et al.)', citation)
+            # 处理“等”前面有空格的情况，如“(张明 等, 2021)”
+            citation = re.sub(r'\s等\s*,', ' et al.,', citation)
+            # 确保年份前有空格
+            citation = re.sub(r',(\d{4})', r', \1', citation)
+            # 移除作者名之间的多余空格（仅保留一个空格）
+            citation = re.sub(r'\(\s*', '(', citation)
+            citation = re.sub(r'\s*\)', ')', citation)
+            citation = re.sub(r'\s*,\s*', ', ', citation)
+            citation = re.sub(r'\s*&\s*', ' & ', citation)
+            # 清理可能产生的双逗号（如"et al.,,"）
+            citation = re.sub(r',\s*,', ', ', citation)
+            citation = re.sub(r'et al\.\s*,', 'et al.,', citation)
+            return citation
+        
+        # 辅助函数：从句子中提取所有引用（正确处理多个引用）
+        def extract_citations_from_sentence(sentence: str) -> List[str]:
+            """从句子中提取所有引用，正确处理多个引用和中文标点"""
+            citations = []
+            
+            # 首先，匹配所有可能包含多个引用的模式
+            # 模式：以括号开头，包含逗号和年份，可能由分号分隔多个引用
+            # 例如：(作者1, 年份; 作者2, 年份) 或 (作者1, 年份) 等
+            multi_citation_pattern = r'\([^)]+,\s*\d{4}(?:[;；]\s*[^)]+,\s*\d{4})*\)'
+            multi_matches = re.findall(multi_citation_pattern, sentence)
+            
+            for match in multi_matches:
+                # 移除外层括号
+                inner = match[1:-1].strip()
+                if not inner:
+                    continue
+                    
+                # 按中文或英文分号分割
+                parts = re.split(r'[；;]\s*', inner)
+                for part in parts:
+                    if not part.strip():
+                        continue
+                        
+                    # 确保部分有括号
+                    part_stripped = part.strip()
+                    if not part_stripped.startswith('('):
+                        part_stripped = '(' + part_stripped
+                    if not part_stripped.endswith(')'):
+                        part_stripped = part_stripped + ')'
+                    
+                    # 验证是否为有效的引用格式
+                    if re.match(r'^\([^)]+,\s*\d{4}\)$', part_stripped):
+                        citations.append(part_stripped)
+            
+            # 如果未找到多个引用模式，尝试直接匹配单个引用
+            if not citations:
+                single_matches = re.findall(r'\([^)]+,\s*\d{4}\)', sentence)
+                citations.extend(single_matches)
+            
+            # 去重并返回
+            return list(dict.fromkeys(citations))  # 保持顺序的去重
+
         all_found_citations: set[str] = set()
         citation_locations: Dict[str, List[str]] = {}  # {'(Author, YYYY)': [sentence1, sentence2, ...]}
 
         for sentence in sentences:
-            citations_in_sentence: List[str] = re.findall(r'\([^)]+,\s*\d{4}\)', sentence)
+            citations_in_sentence: List[str] = extract_citations_from_sentence(sentence)
             for citation in citations_in_sentence:
-                all_found_citations.add(citation)
+                # 标准化引用
+                normalized_citation = normalize_citation(citation)
+                
+                # 尝试查找映射：先尝试原始引用，再尝试标准化后的引用
                 mapped_key: str = citation_to_key.get(citation, citation)
+                if mapped_key == citation:  # 原始引用未找到映射
+                    mapped_key = citation_to_key.get(normalized_citation, citation)
+                
+                all_found_citations.add(citation)
                 if mapped_key not in citation_locations:
                     citation_locations[mapped_key] = []
                 citation_locations[mapped_key].append(sentence.strip())

@@ -72,12 +72,29 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
         response = None
         for attempt in range(max_retries):
             try:
-                response = requests.post(
-                    api_url,
-                    headers=headers,
-                    json=payload,
-                    timeout=timeout_seconds
-                )
+                # 特殊处理AIHubMix API
+                final_payload = payload.copy()
+                is_aihubmix = 'aihubmix.com' in api_base.lower()
+                
+                if is_aihubmix:
+                    # AIHubMix支持Gemini模型，不需要映射
+                    if logger:
+                        logger.info(f"调用AIHubMix API，模型: {final_payload['model']}")
+                    # AIHubMix使用标准的json参数，与OpenAI兼容
+                    response = requests.post(
+                        api_url,
+                        headers=headers,
+                        json=final_payload,
+                        timeout=timeout_seconds
+                    )
+                else:
+                    # 标准OpenAI兼容API使用json参数
+                    response = requests.post(
+                        api_url,
+                        headers=headers,
+                        json=final_payload,
+                        timeout=timeout_seconds
+                    )
                 
                 response.raise_for_status()
                 response_data = response.json()
@@ -110,13 +127,29 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
             except requests.exceptions.HTTPError as e:
                 if attempt < max_retries - 1:
                     wait_time = 2 * (2 ** attempt)
+                    # 记录详细的错误信息
+                    error_details = f"HTTP错误 {response.status_code if response is not None else '?'}"
+                    if response is not None:
+                        try:
+                            error_response = response.json()
+                            error_details += f"，响应: {str(error_response)[:200]}"
+                        except:
+                            error_details += f"，响应文本: {response.text[:200] if response.text else '无响应内容'}"
                     if logger:
-                        logger.warning(f"HTTP错误 {response.status_code if response is not None else '?'}，{wait_time:.1f}秒后重试...")
+                        logger.warning(f"{error_details}，{wait_time:.1f}秒后重试...")
                     time.sleep(wait_time)
                     continue
                 else:
+                    # 最终失败时记录更详细的信息
+                    error_details = f"API调用最终失败: HTTP {response.status_code if response is not None else '?'}"
+                    if response is not None:
+                        try:
+                            error_response = response.json()
+                            error_details += f"，响应: {str(error_response)[:500]}"
+                        except:
+                            error_details += f"，响应文本: {response.text[:500] if response.text else '无响应内容'}"
                     if logger:
-                        logger.error(f"API调用失败: {str(e)}")
+                        logger.error(error_details)
                     return None
 
             except Exception as e:
@@ -860,6 +893,7 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                                       logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """
     调用AI API并返回结构化摘要，支持主引擎失败时自动切换到备用引擎
+    采用与validate_summary_quality相同的严格占位符检测标准
     
     Args:
         prompt_text: 完整的提示词文本
@@ -879,24 +913,84 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                                 engine_type='primary', logger=logger, config=config)
     
     if result is not None:
-        # 检查结果是否有效（不是全为"未提供"）
+        # 使用与validate_summary_quality相同的严格内容检查
+        # 定义无效内容的关键词黑名单（与context_manager.py保持一致）
+        PLACEHOLDER_KEYWORDS = [
+            "未提供相关信息", "未提及", "未提供", "无相关信息", "未知", 
+            "Not provided", "N/A", "null", "None", "...", "无摘要", "无数据",
+            "暂无信息", "信息不完整", "未明确说明", "无具体说明"
+        ]
+        
+        def is_valid_content(content: Any) -> bool:
+            """检查内容是否有效（不是占位符或空内容）"""
+            if content is None:
+                return False
+            
+            if isinstance(content, str):
+                text = str(content).strip()
+                # 检查是否为空或过短
+                if not text or text == '' or text == '...':
+                    return False
+                # 检查是否包含占位符关键词
+                if any(keyword in text for keyword in PLACEHOLDER_KEYWORDS):
+                    # 如果内容很短且包含占位符关键词，强烈怀疑是占位符
+                    if len(text) < 30:
+                        return False
+                    # 如果内容较长但包含占位符，需要更严格的检查
+                    placeholder_count = sum(1 for keyword in PLACEHOLDER_KEYWORDS if keyword in text)
+                    if placeholder_count > 0 and len(text) < 100:
+                        return False
+                # 检查摘要是否过短（小于50字）
+                if len(text) < 50:
+                    return False
+                return True
+            
+            elif isinstance(content, list):
+                # 检查列表是否为空
+                if not content:
+                    return False
+                # 检查列表中是否包含有效内容
+                for item in content:
+                    if isinstance(item, str) and is_valid_content(item):
+                        return True
+                return False
+            
+            else:
+                # 其他类型（如数字）认为有效
+                return True
+        
+        # 检查结果是否有效（使用严格标准）
         if 'common_core' in result:
-            # 检查是否有实际内容
-            has_content = any(
-                value and value != "未提供相关信息" and value != "..."
-                for key, value in result['common_core'].items()
-                if key != 'key_points'  # key_points可以是空列表
-            )
-            if has_content:
-                if logger:
-                    logger.debug("主引擎返回有效结果")
-                return result
+            common_core = result['common_core']
+            if isinstance(common_core, dict):
+                # 检查关键字段是否有实际内容
+                critical_fields = ['summary', 'methodology', 'findings', 'conclusions']
+                has_valid_content = any(
+                    is_valid_content(common_core.get(field))
+                    for field in critical_fields
+                )
+                
+                if has_valid_content:
+                    if logger:
+                        logger.debug("主引擎返回有效结果（通过严格内容检查）")
+                    return result
+                else:
+                    if logger:
+                        logger.warning("主引擎返回结果未通过严格内容检查，尝试备用引擎")
+                    # 记录失败的具体原因
+                    failed_fields = []
+                    for field in critical_fields:
+                        content = common_core.get(field)
+                        if not is_valid_content(content):
+                            failed_fields.append(f"{field}: {str(content)[:50]}")
+                    if logger:
+                        logger.info(f"内容检查失败字段: {', '.join(failed_fields)}")
             else:
                 if logger:
-                    logger.warning("主引擎返回结果无有效内容，尝试备用引擎")
+                    logger.warning(f"common_core字段类型错误: {type(common_core)}，尝试备用引擎")
         else:
             if logger:
-                logger.debug("主引擎返回有效结果")
+                logger.debug("主引擎返回结果（不含common_core，可能是旧格式）")
             return result
     
     # 主引擎失败或返回无效结果，尝试备用引擎
