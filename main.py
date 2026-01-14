@@ -1546,12 +1546,20 @@ class LiteratureReviewGenerator:
                     # 类型守卫：确保output_dir和project_name不是None
                     assert self.output_dir is not None and self.project_name is not None
                     checkpoint_file = os.path.join(self.output_dir, f'{self.project_name}_checkpoint.json')
-                    if os.path.exists(checkpoint_file):
+                    # 检查是否应保留检查点文件
+                    if not self.config:
+                        self.logger.warning("配置未加载，使用默认值保留检查点文件")
+                        keep_checkpoints = False
+                    else:
+                        keep_checkpoints = self.config.get('keep_checkpoints_after_completion', False)
+                    if os.path.exists(checkpoint_file) and not keep_checkpoints:
                         try:
                             os.remove(checkpoint_file)
                             self.logger.info("已清除断点文件，所有论文处理完成")
                         except Exception as e:
                             self.logger.warning(f"无法清除断点文件: {e}")
+                    elif keep_checkpoints:
+                        self.logger.info("配置要求保留检查点文件，已跳过清理")
                 
                 # 调用统一的报告生成方法
                 self.generate_all_reports()
@@ -2149,8 +2157,17 @@ class LiteratureReviewGenerator:
             
             # 清除断点文件（表示全部完成）
             if os.path.exists(review_checkpoint_file):
-                os.remove(review_checkpoint_file)
-                self.logger.info("已清除断点文件，所有章节生成完成")
+                # 检查是否应保留检查点文件
+                if not self.config:
+                    self.logger.warning("配置未加载，使用默认值清除断点文件")
+                    keep_checkpoints = False
+                else:
+                    keep_checkpoints = self.config.get('keep_checkpoints_after_completion', False)
+                if not keep_checkpoints:
+                    os.remove(review_checkpoint_file)
+                    self.logger.info("已清除断点文件，所有章节生成完成")
+                else:
+                    self.logger.info("配置要求保留检查点文件，已跳过清理")
             
             # 生成目录（在最终保存前）
             if last_completed_section < len(section_matches) or not os.path.exists(review_checkpoint_file):

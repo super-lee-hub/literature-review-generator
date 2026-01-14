@@ -409,78 +409,158 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
                 # 创建多种引用格式的映射，支持中文和英文格式变体
                 # 首先定义标准化函数（局部使用）
                 def normalize_citation_for_mapping(citation: str) -> str:
-                    """标准化引用字符串用于映射键"""
-                    # 移除多余空格，将多个空格合并为一个
+                    """标准化引用字符串用于映射键，与normalize_citation保持相同逻辑"""
+                    if not citation:
+                        return citation
+                    
+                    # 1. 移除多余空格，将多个空格合并为一个
                     citation = re.sub(r'\s+', ' ', citation).strip()
-                    # 统一标点：中文标点替换为英文标点
+                    
+                    # 2. 统一标点：中文标点替换为英文标点
                     citation = citation.replace('；', ';').replace('，', ',').replace('、', ',')
-                    # 移除常见的中文前缀（如"支持文献:"、"参见:"、"来源:"等）
-                    # 处理括号内的前缀，例如"(支持文献: 作者, 年份)" -> "(作者, 年份)"
+                    
+                    # 3. 移除常见的中文前缀
                     citation = re.sub(r'\(支持文献[:：]\s*', '(', citation)
                     citation = re.sub(r'\(参见[:：]\s*', '(', citation)
                     citation = re.sub(r'\(来源[:：]\s*', '(', citation)
                     citation = re.sub(r'\(引用自[:：]\s*', '(', citation)
-                    # 统一“和”与“&”
-                    citation = citation.replace(' 和 ', ' & ').replace('和', ' & ')
-                    # 统一“等”与“et al.” - 使用与normalize_citation一致的逻辑
+                    
+                    # 4. 统一"和"与"&" - 使用与normalize_citation相同的安全替换
+                    citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)\s+和\s+([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
+                    citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)和([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
+                    
+                    # 5. 统一"等"与"et al." - 与normalize_citation保持一致
                     citation = re.sub(r'等\s*,', ' et al.,', citation)
                     citation = re.sub(r'等\s*;', ' et al.;', citation)
                     citation = re.sub(r'等\s*\)', ' et al.)', citation)
                     citation = re.sub(r'\s等\s*,', ' et al.,', citation)
-                    # 确保年份前有空格
+                    citation = re.sub(r'等\s+', ' et al. ', citation)
+                    
+                    # 6. 确保年份前有空格，同时处理年份后的空格
                     citation = re.sub(r',(\d{4})', r', \1', citation)
-                    # 清理可能产生的双逗号
+                    citation = re.sub(r',\s+(\d{4})', r', \1', citation)  # 多个空格变体
+                    citation = re.sub(r',\s*(\d{4})\s*\)', r', \1)', citation)  # 年份后空格
+                    
+                    # 7. 规范化作者分隔符和空格
+                    citation = re.sub(r'\(\s*', '(', citation)
+                    citation = re.sub(r'\s*\)', ')', citation)
+                    citation = re.sub(r'\s*,\s*', ', ', citation)
+                    citation = re.sub(r'\s*&\s*', ' & ', citation)
+                    
+                    # 7.5 处理逗号+&格式（如"作者1, & 作者2"）
+                    citation = re.sub(r',\s*&', ' &', citation)
+                    
+                    # 8. 清理可能产生的双逗号和多余空格
                     citation = re.sub(r',\s*,', ', ', citation)
                     citation = re.sub(r'et al\.\s*,', 'et al.,', citation)
+                    citation = re.sub(r'\s+', ' ', citation)
+                    
+                    # 8.5 最终空格规范化
+                    citation = citation.replace('( ', '(').replace(' )', ')')
+                    citation = re.sub(r'\s+', ' ', citation)  # 最终空格合并
+                    
                     return citation
                 
                 # 生成所有可能的引用格式变体
-                citation_variants = []
+                citation_variants: List[str] = []
                 
                 if len(authors) == 1:
                     # 单作者变体（包括AI可能错误生成的'等'格式）
-                    base_formats = [
+                    base_formats: List[str] = [
+                        # 标准格式
                         f"({authors[0]}, {year})",
+                        f"({authors[0]},  {year})",  # 双空格
+                        f"({authors[0]},{year})",    # 无空格
+                        # 等格式变体
                         f"({authors[0]} 等, {year})",
                         f"({authors[0]}等, {year})",
+                        f"({authors[0]}等, {year})",
+                        f"({authors[0]} 等,{year})",
+                        f"({authors[0]}等,{year})",
+                        # et al.格式变体
                         f"({authors[0]} et al., {year})",
-                        f"({authors[0]}, {year})",  # 原始格式
+                        f"({authors[0]}et al., {year})",
+                        f"({authors[0]} et al.,{year})",
+                        f"({authors[0]}et al.,{year})",
+                        # 其他可能变体
+                        f"({authors[0]}, {year})",  # 原始格式重复
                         f"({authors[0]}, {year})",  # 无空格变体
-                        f"({authors[0]}, {year})",  # 全角逗号变体（标准化后会处理）
                     ]
                     citation_variants.extend(base_formats)
                     
                 elif len(authors) == 2:
                     # 双作者变体
-                    base_formats = [
+                    base_formats: List[str] = [
                         f"({authors[0]} & {authors[1]}, {year})",
+                        f"({authors[0]}&{authors[1]}, {year})",
+                        f"({authors[0]} &{authors[1]}, {year})",
+                        f"({authors[0]}& {authors[1]}, {year})",
                         f"({authors[0]}, {authors[1]}, {year})",
+                        f"({authors[0]}, {authors[1]}, {year})",  # 带空格变体
+                        f"({authors[0]},{authors[1]}, {year})",   # 无空格变体
                         f"({authors[0]} 和 {authors[1]}, {year})",
-                        f"({authors[0]}、{authors[1]}, {year})",
+                        f"({authors[0]}和 {authors[1]}, {year})",
                         f"({authors[0]}和{authors[1]}, {year})",
-                        f"({authors[0]} & {authors[1]}, {year})",
-                        f"({authors[0]} et al., {year})"
+                        f"({authors[0]} 和{authors[1]}, {year})",
+                        f"({authors[0]}、{authors[1]}, {year})",
+                        f"({authors[0]}、{authors[1]}, {year})",  # 中文顿号
+                        f"({authors[0]} 等, {year})",          # 中文等格式
+                        f"({authors[0]}等, {year})",           # 中文等格式（无空格）
+                        f"({authors[0]}等, {year})",           # 中文等格式（紧贴）
+                        f"({authors[0]} et al., {year})",
+                        f"({authors[0]}et al., {year})"
                     ]
                     citation_variants.extend(base_formats)
                     
                 elif len(authors) == 3:
                     # 三作者变体
-                    base_formats = [
+                    base_formats: List[str] = [
+                        # 英文格式变体
                         f"({authors[0]}, {authors[1]} & {authors[2]}, {year})",
+                        f"({authors[0]},{authors[1]} & {authors[2]}, {year})",
+                        f"({authors[0]}, {authors[1]}&{authors[2]}, {year})",
+                        f"({authors[0]},{authors[1]}&{authors[2]}, {year})",
+                        # 逗号分隔变体
                         f"({authors[0]}, {authors[1]}, {authors[2]}, {year})",
+                        f"({authors[0]},{authors[1]}, {authors[2]}, {year})",
+                        f"({authors[0]}, {authors[1]},{authors[2]}, {year})",
+                        f"({authors[0]},{authors[1]},{authors[2]}, {year})",
+                        # 逗号+&格式变体（针对类似'王希鹏, 王京龙, & 王仲孝'的格式）
+                        f"({authors[0]}, {authors[1]}, & {authors[2]}, {year})",
+                        f"({authors[0]},{authors[1]},& {authors[2]}, {year})",
+                        f"({authors[0]}, {authors[1]},& {authors[2]}, {year})",
+                        f"({authors[0]},{authors[1]}, &{authors[2]}, {year})",
+                        # 中文格式变体
                         f"({authors[0]}、{authors[1]}和{authors[2]}, {year})",
-                        f"({authors[0]}、{authors[1]}和{authors[2]}, {year})",
-                        f"({authors[0]}, {authors[1]}, {authors[2]}, {year})",
-                        f"({authors[0]} et al., {year})"
+                        f"({authors[0]}、{authors[1]}和 {authors[2]}, {year})",
+                        f"({authors[0]}、{authors[1]} 和{authors[2]}, {year})",
+                        f"({authors[0]}、{authors[1]} 和 {authors[2]}, {year})",
+                        # 等格式变体
+                        f"({authors[0]} et al., {year})",
+                        f"({authors[0]}et al., {year})",
+                        f"({authors[0]} 等, {year})",
+                        f"({authors[0]}等, {year})",
+                        f"({authors[0]}等, {year})"
                     ]
                     citation_variants.extend(base_formats)
                     
                 else:
                     # 四位及以上作者变体
-                    base_formats = [
+                    base_formats: List[str] = [
+                        # et al.格式变体
                         f"({authors[0]} et al., {year})",
+                        f"({authors[0]}et al., {year})",
+                        f"({authors[0]} et al.,{year})",
+                        f"({authors[0]}et al.,{year})",
+                        # 等格式变体
                         f"({authors[0]} 等, {year})",
-                        f"({authors[0]}等, {year})"
+                        f"({authors[0]}等, {year})",
+                        f"({authors[0]}等, {year})",
+                        f"({authors[0]} 等,{year})",
+                        f"({authors[0]}等,{year})",
+                        # 可能的多作者完整格式（虽然少见但AI可能生成）
+                        f"({authors[0]}, {authors[1]} et al., {year})",
+                        f"({authors[0]}, {authors[1]}, et al., {year})",
                     ]
                     citation_variants.extend(base_formats)
                 
@@ -505,46 +585,78 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
 
         # 辅助函数：标准化引用字符串
         def normalize_citation(citation: str) -> str:
-            """标准化引用字符串，统一标点和空格"""
+            """标准化引用字符串，统一标点和空格，处理中文格式变体"""
             if not citation:
                 return citation
-            # 移除多余空格，将多个空格合并为一个
+            
+            # 1. 移除多余空格，将多个空格合并为一个
             citation = re.sub(r'\s+', ' ', citation).strip()
-            # 统一标点：中文标点替换为英文标点
+            
+            # 2. 统一标点：中文标点替换为英文标点
             citation = citation.replace('；', ';').replace('，', ',').replace('、', ',')
-            # 移除常见的中文前缀（如"支持文献:"、"参见:"、"来源:"等）
-            # 处理括号内的前缀，例如"(支持文献: 作者, 年份)" -> "(作者, 年份)"
+            
+            # 3. 移除常见的中文前缀（如"支持文献:"、"参见:"、"来源:"等）
             citation = re.sub(r'\(支持文献[:：]\s*', '(', citation)
             citation = re.sub(r'\(参见[:：]\s*', '(', citation)
             citation = re.sub(r'\(来源[:：]\s*', '(', citation)
             citation = re.sub(r'\(引用自[:：]\s*', '(', citation)
-            # 统一“和”与“&”
-            citation = citation.replace(' 和 ', ' & ').replace('和', ' & ')
-            # 统一“等”与“et al.” - 更精细的处理
-            # 处理“等”后面跟逗号的情况，如“(张明等, 2021)” -> “(张明 et al., 2021)”
+            
+            # 4. 统一"和"与"&" - 更安全的替换，避免替换作者名中的"和"
+            # 只替换作为连接词的"和"（前面有作者名，后面有作者名或空格）
+            # 先处理带空格的" 和 "，再处理紧邻的"和"
+            citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)\s+和\s+([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
+            citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)和([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
+            
+            # 5. 统一"等"与"et al." - 更全面的处理
+            # 处理"等"后面跟逗号的情况，包括中文逗号（已统一为英文逗号）
             citation = re.sub(r'等\s*,', ' et al.,', citation)
-            # 处理“等”后面跟分号的情况（多个引用分隔）
+            # 处理"等"后面跟分号的情况
             citation = re.sub(r'等\s*;', ' et al.;', citation)
-            # 处理“等”后面跟右括号的情况（理论上不应该出现，但容错处理）
+            # 处理"等"后面跟右括号的情况
             citation = re.sub(r'等\s*\)', ' et al.)', citation)
-            # 处理“等”前面有空格的情况，如“(张明 等, 2021)”
+            # 处理"等"前面有空格的情况
             citation = re.sub(r'\s等\s*,', ' et al.,', citation)
-            # 确保年份前有空格
+            # 处理单独的"等"（后面没有标点，理论上不应该出现）
+            citation = re.sub(r'等\s+', ' et al. ', citation)
+            
+            # 6. 确保年份前有空格，同时处理年份后的空格
             citation = re.sub(r',(\d{4})', r', \1', citation)
-            # 移除作者名之间的多余空格（仅保留一个空格）
+            citation = re.sub(r',\s+(\d{4})', r', \1', citation)  # 多个空格变体
+            citation = re.sub(r',\s*(\d{4})\s*\)', r', \1)', citation)  # 年份后空格
+            
+            # 7. 规范化作者分隔符和空格
             citation = re.sub(r'\(\s*', '(', citation)
             citation = re.sub(r'\s*\)', ')', citation)
             citation = re.sub(r'\s*,\s*', ', ', citation)
             citation = re.sub(r'\s*&\s*', ' & ', citation)
-            # 清理可能产生的双逗号（如"et al.,,"）
+            
+            # 7.5 处理逗号+&格式（如"作者1, & 作者2"）
+            citation = re.sub(r',\s*&', ' &', citation)
+            
+            # 8. 清理可能产生的双逗号（如"et al.,,"）和多余空格
             citation = re.sub(r',\s*,', ', ', citation)
             citation = re.sub(r'et al\.\s*,', 'et al.,', citation)
+            citation = re.sub(r'\s+', ' ', citation)  # 再次合并多余空格
+            
+            # 8.5 最终空格规范化
+            citation = citation.replace('( ', '(').replace(' )', ')')
+            citation = re.sub(r'\s+', ' ', citation)  # 最终空格合并
+            
+            # 9. 特殊处理：将多个作者使用逗号分隔的格式转换为&格式（针对双作者）
+            # 匹配模式： (作者1, 作者2, 年份) -> (作者1 & 作者2, 年份)
+            # 但注意：三作者及以上应该使用et al.格式，这里只处理双作者情况
+            # 注意：这个转换可能影响其他格式，暂时注释掉，依赖citation_to_key的变体映射
+            # match = re.match(r'^\(([^,]+),\s*([^,]+),\s*(\d{4})\)$', citation)
+            # if match:
+            #     author1, author2, year = match.groups()
+            #     citation = f'({author1} & {author2}, {year})'
+            
             return citation
         
         # 辅助函数：从句子中提取所有引用（正确处理多个引用）
         def extract_citations_from_sentence(sentence: str) -> List[str]:
             """从句子中提取所有引用，正确处理多个引用和中文标点"""
-            citations = []
+            citations: List[str] = []
             
             # 首先，匹配所有可能包含多个引用的模式
             # 模式：以括号开头，包含逗号和年份，可能由分号分隔多个引用
