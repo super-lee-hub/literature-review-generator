@@ -33,7 +33,7 @@ def load_config():
         print(f"❌ 配置文件加载失败: {e}")
         return None
 
-def test_api_connection(name: str, api_config: Dict[str, str], test_message: str = "你好，请回复'连接正常'"):
+def check_api_connection(name: str, api_config: Dict[str, str], test_message: str = "你好，请回复'连接正常'"):
     """测试单个API连接"""
     print(f"\n🔍 测试 {name} API连接...")
     
@@ -117,19 +117,19 @@ def main():
     
     # 主引擎
     if 'Primary_Reader_API' in config:
-        test_results['Primary_Reader_API'] = test_api_connection("主引擎", config['Primary_Reader_API'])
+        test_results['Primary_Reader_API'] = check_api_connection("主引擎", config['Primary_Reader_API'])
     
     # 备用引擎
     if 'Backup_Reader_API' in config:
-        test_results['Backup_Reader_API'] = test_api_connection("备用引擎", config['Backup_Reader_API'])
+        test_results['Backup_Reader_API'] = check_api_connection("备用引擎", config['Backup_Reader_API'])
     
     # 写作引擎
     if 'Writer_API' in config:
-        test_results['Writer_API'] = test_api_connection("写作引擎", config['Writer_API'])
+        test_results['Writer_API'] = check_api_connection("写作引擎", config['Writer_API'])
     
     # 验证引擎
     if 'Validator_API' in config:
-        test_results['Validator_API'] = test_api_connection("验证引擎", config['Validator_API'])
+        test_results['Validator_API'] = check_api_connection("验证引擎", config['Validator_API'])
     
     # 总结结果
     print("\n" + "=" * 60)

@@ -1,18 +1,14 @@
 # file: models.py
 
 """
-核心数据模型定义文件
-使用 TypedDict 定义项目中的所有核心字典结构
-这是整个项目的「单一事实来源 (Single Source of Truth)」
+Core typed models for the project.
 """
 
-from typing import TypedDict, List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, TypedDict
 from typing_extensions import NotRequired
 
-# --- 核心数据结构 ---
 
 class PaperInfo(TypedDict, total=False):
-    """从 Zotero 或 PDF 文件解析出的原始论文元数据。所有键都是可选的，以适应不同来源。"""
     title: str
     authors: List[str]
     year: str
@@ -23,14 +19,18 @@ class PaperInfo(TypedDict, total=False):
     file_index: int
     item_type: str
     abstract: str
-    # ... and other potential keys from zotero_parser
     publication_title: str
     volume: str
     issue: str
     pages: str
 
-class CommonCoreSummary(TypedDict):
-    """AI 分析结果的核心部分"""
+
+class LegacyCommonCoreSummary(TypedDict, total=False):
+    title: str
+    authors: List[str]
+    year: str
+    journal: str
+    doi: str
     summary: str
     key_points: List[str]
     methodology: str
@@ -39,37 +39,131 @@ class CommonCoreSummary(TypedDict):
     relevance: str
     limitations: str
 
+
+class CoreVariables(TypedDict, total=False):
+    independent: List[str]
+    dependent: List[str]
+    mediators: List[str]
+    moderators: List[str]
+    controls: List[str]
+    other_core_constructs: List[str]
+
+
+class EmpiricalDetails(TypedDict, total=False):
+    research_questions_or_hypotheses: List[str]
+    data_source_and_size: Optional[str]
+    analysis_technique: Optional[str]
+    core_variables: CoreVariables
+    sample_characteristics_or_context: Optional[str]
+
+
+class ReviewDetails(TypedDict, total=False):
+    review_type: Optional[str]
+    search_databases: List[str]
+    time_span: Optional[str]
+    included_studies_count: Optional[str]
+    inclusion_exclusion_criteria: Optional[str]
+    synthesis_approach: Optional[str]
+    main_themes: List[str]
+
+
+class ConceptualDetails(TypedDict, total=False):
+    core_propositions: List[str]
+    conceptual_relationships: Optional[str]
+    theoretical_contributions: Optional[str]
+
+
+class LegacyTypeSpecificDetails(TypedDict, total=False):
+    paper_type: str
+    paper_subtype: str
+    route_confidence: str
+    classification_rationale: str
+    theoretical_framework: str
+    research_gap: str
+    research_questions_or_hypotheses: List[str]
+    data_source_and_size: str
+    analysis_technique: str
+    core_variables: CoreVariables
+    sample_characteristics_or_context: str
+    future_research_directions: List[str]
+    extraction_confidence: Any
+    empirical_details: EmpiricalDetails
+    review_details: Dict[str, Any]
+    conceptual_details: Dict[str, Any]
+
+
+class RoutingInfo(TypedDict):
+    paper_type: Optional[str]
+    paper_subtype_raw: Optional[str]
+    paper_subtype_normalized: Optional[str]
+    classification_status: str
+    route_confidence: str
+    classification_rationale: Optional[str]
+    secondary_candidates: List[str]
+
+
+class CoreAnalysis(TypedDict):
+    summary: Optional[str]
+    key_points: List[str]
+    methodology: Optional[str]
+    findings: Optional[str]
+    conclusions: Optional[str]
+    relevance: Optional[str]
+    limitations: Optional[str]
+    theoretical_framework: Optional[str]
+    research_gap: Optional[str]
+    future_research_directions: List[str]
+
+
+class SpecializedDetails(TypedDict):
+    empirical: Optional[EmpiricalDetails]
+    review: Optional[ReviewDetails]
+    conceptual: Optional[ConceptualDetails]
+
+
+class QualityAudit(TypedDict):
+    extraction_confidence: str
+    completeness_score: float
+    needs_manual_review: bool
+    missing_critical_fields: List[str]
+    conflict_flags: List[str]
+    inferred_fields: List[str]
+
+
 class ConceptAnalysis(TypedDict, total=False):
-    """概念增强分析的结果 (所有键都是可选的)"""
     contribution_to_concept: str
     position_in_development: str
     novelty_or_confirmation: str
 
+
 class AISummary(TypedDict):
-    """完整的 AI 分析结果，包含两段式结构"""
-    common_core: CommonCoreSummary
-    type_specific_details: Dict[str, Any]
+    schema_version: str
+    routing: RoutingInfo
+    core_analysis: CoreAnalysis
+    specialized_details: SpecializedDetails
+    quality_audit: QualityAudit
     concept_analysis: NotRequired[Optional[ConceptAnalysis]]
 
+
 class ProcessingResult(TypedDict):
-    """单篇论文处理完成后的最终结果对象 (成功或失败)"""
     paper_info: PaperInfo
-    status: str  # 'success' or 'failed'
+    status: str
     ai_summary: NotRequired[Optional[AISummary]]
     processing_time: NotRequired[Optional[str]]
+    text_length: NotRequired[Optional[int]]
+    preprocess: NotRequired[Dict[str, Any]]
     failure_reason: NotRequired[Optional[str]]
 
+
 class FailedPaper(TypedDict):
-    """失败论文的记录结构"""
     paper_info: PaperInfo
     failure_reason: str
 
-# --- 配置相关类型 ---
 
 class APIConfig(TypedDict):
     api_key: Optional[str]
     model: Optional[str]
     api_base: Optional[str]
 
-# --- 辅助类型 ---
+
 SummariesList = List[ProcessingResult]

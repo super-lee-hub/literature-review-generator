@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Testing and development
+pytest
+pytest-mock
+pyright
+
+# Optional GUI end-to-end tests
+playwright

@@ -14,6 +14,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import ProcessingResult
+from summary_schema import get_core_analysis
 
 
 def estimate_tokens(text: str) -> int:
@@ -55,8 +56,7 @@ def convert_json_to_markdown(summaries_data: Union[List[Dict[str, Any]], List[Pr
             paper_info = summary.get('paper_info', {})  # type: ignore
             
             # 获取AI摘要内容
-            ai_summary = summary.get('ai_summary', {})  # type: ignore
-            common_core = ai_summary.get('common_core', {}) if ai_summary else {}  # type: ignore
+            core_analysis = get_core_analysis(summary)  # type: ignore
             
             # 提取信息
             title = paper_info.get('title', '未知标题')  # type: ignore
@@ -76,22 +76,22 @@ def convert_json_to_markdown(summaries_data: Union[List[Dict[str, Any]], List[Pr
             markdown_content += f"**作者**: {authors_str} ({year})\\n\\n"
             
             # 摘要
-            summary_text = common_core.get('summary', '暂无摘要')  # type: ignore
+            summary_text = core_analysis.get('summary') or '暂无摘要'  # type: ignore
             if summary_text and summary_text != '...' and summary_text.strip():  # type: ignore
                 markdown_content += f"**摘要**: {summary_text}\\n\\n"
             
             # 主要发现
-            findings = common_core.get('findings', '暂无发现')  # type: ignore
+            findings = core_analysis.get('findings') or '暂无发现'  # type: ignore
             if findings and findings != '...' and findings.strip():  # type: ignore
                 markdown_content += f"**主要发现**: {findings}\\n\\n"
             
             # 方法论
-            methodology = common_core.get('methodology', '暂无方法')  # type: ignore
+            methodology = core_analysis.get('methodology') or '暂无方法'  # type: ignore
             if methodology and methodology != '...' and methodology.strip():  # type: ignore
                 markdown_content += f"**方法论**: {methodology}\\n\\n"
             
             # 核心观点
-            key_points = common_core.get('key_points', [])  # type: ignore
+            key_points = core_analysis.get('key_points', [])  # type: ignore
             if key_points and isinstance(key_points, list) and any(kp.strip() and kp != '...' for kp in key_points):  # type: ignore
                 markdown_content += "**核心观点**:\\n"
                 for j, point in enumerate(key_points, 1):  # type: ignore
@@ -175,9 +175,8 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
     
     try:
         # 获取AI摘要数据
-        ai_summary = summary_data.get('ai_summary', {})  # type: ignore
-        
-        common_core: Any = ai_summary.get('common_core', {}) if ai_summary else {}
+        paper_info = summary_data.get('paper_info', {}) if isinstance(summary_data, dict) else {}
+        core_analysis: Any = get_core_analysis(summary_data)
         
         # 定义无效内容的关键词黑名单（扩展版本）
         PLACEHOLDER_KEYWORDS = [
@@ -190,7 +189,7 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
         issues = []
         
         # 检查摘要
-        summary = common_core.get('summary', '')  # type: ignore
+        summary = core_analysis.get('summary', '')  # type: ignore
         summary_text = str(summary).strip()  # type: ignore
         if not summary_text or summary_text == '' or summary_text == '...':
             issues.append("摘要为空")  # type: ignore
@@ -208,7 +207,7 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
                     issues.append(f"摘要可能包含占位符内容")  # type: ignore
         
         # 检查核心观点
-        key_points = common_core.get('key_points', [])  # type: ignore
+        key_points = core_analysis.get('key_points', [])  # type: ignore
         if not key_points or not isinstance(key_points, list):  # type: ignore
             issues.append("核心观点字段格式错误")  # type: ignore
         else:
@@ -224,7 +223,7 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
                 issues.append(f"核心观点中存在占位符内容")  # type: ignore
         
         # 检查主要发现
-        findings = common_core.get('findings', '')  # type: ignore
+        findings = core_analysis.get('findings', '')  # type: ignore
         findings_text = str(findings).strip()  # type: ignore
         if not findings_text or findings_text == '' or findings_text == '...':
             issues.append("主要发现为空")  # type: ignore
@@ -235,36 +234,36 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
                 issues.append(f"主要发现包含无效占位符")  # type: ignore
         
         # 检查结论
-        conclusions = common_core.get('conclusions', '')  # type: ignore
+        conclusions = core_analysis.get('conclusions', '')  # type: ignore
         conclusions_text = str(conclusions).strip()  # type: ignore
         if conclusions_text and any(keyword in conclusions_text for keyword in PLACEHOLDER_KEYWORDS):  # type: ignore
             if len(conclusions_text) < 30:  # type: ignore
                 issues.append(f"结论包含无效占位符")  # type: ignore
         
         # 检查理论贡献
-        relevance = common_core.get('relevance', '')  # type: ignore
+        relevance = core_analysis.get('relevance', '')  # type: ignore
         relevance_text = str(relevance).strip()  # type: ignore
         if relevance_text and any(keyword in relevance_text for keyword in PLACEHOLDER_KEYWORDS):  # type: ignore
             if len(relevance_text) < 30:  # type: ignore
                 issues.append(f"理论贡献包含无效占位符")  # type: ignore
         
         # 检查研究局限
-        limitations = common_core.get('limitations', '')  # type: ignore
+        limitations = core_analysis.get('limitations', '')  # type: ignore
         limitations_text = str(limitations).strip()  # type: ignore
         if limitations_text and any(keyword in limitations_text for keyword in PLACEHOLDER_KEYWORDS):  # type: ignore
             if len(limitations_text) < 30:  # type: ignore
                 issues.append(f"研究局限包含无效占位符")  # type: ignore
         
         # 检查元数据质量
-        authors = common_core.get('authors', [])  # type: ignore
+        authors = paper_info.get('authors', []) if isinstance(paper_info, dict) else []  # type: ignore
         if not authors or (isinstance(authors, list) and len(authors) == 0):  # type: ignore
             issues.append("作者信息缺失")  # type: ignore
         
-        year = common_core.get('year', '')  # type: ignore
+        year = paper_info.get('year', '') if isinstance(paper_info, dict) else ''  # type: ignore
         if str(year) in ['未知年份', '未知', ''] or not str(year).strip():  # type: ignore
             issues.append("年份信息缺失")  # type: ignore
         
-        journal = common_core.get('journal', '')  # type: ignore
+        journal = paper_info.get('journal', '') if isinstance(paper_info, dict) else ''  # type: ignore
         if str(journal) in ['未知期刊', '未知', ''] or not str(journal).strip():  # type: ignore
             issues.append("期刊信息缺失")  # type: ignore
         

@@ -15,7 +15,7 @@ def load_config() -> configparser.ConfigParser:
     config.read('config.ini', encoding='utf-8')
     return config
 
-def test_writer_api():
+def check_writer_api():
     """测试Writer_API连接"""
     print("测试Writer_API连接...")
     
@@ -99,7 +99,7 @@ def test_writer_api():
         print(f"未知错误: {e}")
         return False
 
-def test_with_different_models() -> Optional[str]:
+def check_with_different_models() -> Optional[str]:
     """测试不同的模型名称"""
     print("\n测试不同的模型名称...")
     
@@ -200,11 +200,11 @@ def main():
     
     # 1. 测试当前配置
     print("\n1. 测试当前配置:")
-    success = test_writer_api()
+    success = check_writer_api()
     
     if not success:
         print("\n2. 尝试不同的模型名称:")
-        working_model = test_with_different_models()
+        working_model = check_with_different_models()
         
         if working_model:
             print(f"\n找到可用的模型: {working_model}")

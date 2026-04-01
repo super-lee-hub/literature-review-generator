@@ -19,8 +19,11 @@ import concurrent.futures
 import threading
 import json
 import logging
+import re
 from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union
 from datetime import datetime
+
+ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -37,8 +40,17 @@ from pdf_extractor import extract_text_from_pdf  # type: ignore
 from ai_interface import get_summary_from_ai, get_summary_from_ai_with_fallback, get_concept_analysis, _call_ai_api  # type: ignore
 from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
+from preprocess.service import PreprocessManager
+from services.environment_service import (
+    detect_runtime_environment,
+    recommended_conda_activate_command,
+    recommended_conda_create_command,
+)
+from services.text_io import load_json_file_with_fallbacks
 from utils import ensure_dir, sanitize_path_component
 from setup_wizard import run_setup_wizard
+from summary_schema import get_core_analysis, get_paper_metadata
+from free_mode.profile_manager import build_profile_context, load_profile
 import validator
 
 # 导入上下文管理模块
@@ -289,9 +301,13 @@ class LiteratureReviewGenerator:
         self.papers: List[PaperInfo] = []
         self.summaries: SummariesList = []
         self.failed_papers: List[FailedPaper] = []
+        self.preprocess_manager: Optional[PreprocessManager] = None
         self.processed_count: Counter = Counter(0)
         self.failed_count: Counter = Counter(0)
         self.save_lock: threading.Lock = threading.Lock()
+        self.free_mode_profile_path: Optional[str] = None
+        self.free_mode_profile: Optional[Dict[str, Any]] = None
+        self.free_mode_idea: Optional[str] = None
 
         # 身份基断点续传相关变量
         self._checkpoint_processed_papers: Set[str] = set()
@@ -371,6 +387,7 @@ class LiteratureReviewGenerator:
             if not self.config:
                 self.logger.error("配置文件加载失败或为空")
                 return False
+            self.preprocess_manager = PreprocessManager(config=self.config, logger=self.logger)
             self.logger.success("配置文件加载成功")
             return True
         except Exception as e:
@@ -623,6 +640,353 @@ class LiteratureReviewGenerator:
         """重置计数器"""
         self.processed_count.set(0)
         self.failed_count.set(0)
+
+    def _load_stage1_prompt_template(self) -> str:
+        """加载阶段一结构化分析提示词模板。"""
+        with open('prompts/optimized_prompt_analyze_router.txt', 'r', encoding='utf-8') as handle:
+            return handle.read()
+
+    def _prepare_stage1_input(self, pdf_path: str) -> Tuple[str, Dict[str, Any]]:
+        """优先使用预处理工件，必要时回退到旧版文本提取。"""
+
+        preprocess_metadata: Dict[str, Any] = {}
+
+        if self.preprocess_manager:
+            try:
+                preprocess_result = self.preprocess_manager.prepare_pdf(pdf_path)
+                if preprocess_result:
+                    stage1_text = (
+                        preprocess_result.markdown_text
+                        if self.preprocess_manager.use_markdown_as_stage1_input
+                        else preprocess_result.plain_text
+                    )
+                    if stage1_text and len(stage1_text.strip()) >= 500:
+                        input_kind = "normalized_markdown" if self.preprocess_manager.use_markdown_as_stage1_input else "plain_text"
+                        preprocess_metadata = {
+                            'analysis_input_kind': input_kind,
+                            'extractor_used': preprocess_result.extractor_used,
+                            'layout_fidelity': preprocess_result.layout_fidelity,
+                            'conversion_used': preprocess_result.conversion_used,
+                            'used_ocr': preprocess_result.used_ocr,
+                            'low_quality': preprocess_result.low_quality,
+                            'scanned_like': preprocess_result.scanned_like,
+                            'mineru_attempted': preprocess_result.mineru_attempted,
+                            'mineru_succeeded': preprocess_result.mineru_succeeded,
+                            'mineru_token_present': preprocess_result.mineru_token_present,
+                            'mineru_base_url': preprocess_result.mineru_base_url,
+                            'markdown_path': preprocess_result.markdown_path,
+                            'plain_text_path': preprocess_result.plain_text_path,
+                            'page_index_path': preprocess_result.page_index_path,
+                            'structured_json_path': preprocess_result.structured_json_path,
+                            'diagnostics_path': preprocess_result.diagnostics_path,
+                            'manifest_path': preprocess_result.manifest_path,
+                            'chunk_count': preprocess_result.chunk_count,
+                            'cache_dir': preprocess_result.cache_dir,
+                        }
+                        self.logger.info(
+                            f"阶段一输入使用预处理结果: {os.path.basename(pdf_path)} -> "
+                            f"{preprocess_result.extractor_used} / {input_kind}"
+                        )
+                        return stage1_text, preprocess_metadata
+
+                    self.logger.warning(
+                        f"预处理结果文本过短，回退旧版 PDF 文本提取: {os.path.basename(pdf_path)} "
+                        f"({len(stage1_text) if stage1_text else 0} 字符)"
+                    )
+            except Exception as exc:
+                self.logger.warning(f"预处理阶段失败，回退旧版 PDF 文本提取: {exc}")
+
+        self.logger.info(f"阶段一输入回退到旧版 PDF 文本提取: {os.path.basename(pdf_path)}")
+        legacy_text = str(extract_text_from_pdf(pdf_path) or "")  # type: ignore
+        preprocess_metadata = {
+            'analysis_input_kind': 'legacy_text',
+            'extractor_used': 'legacy_pdf_extractor',
+            'layout_fidelity': 'plain_text_only',
+            'conversion_used': 'native_pdf',
+            'used_ocr': False,
+            'low_quality': False,
+            'scanned_like': False,
+            'mineru_attempted': bool(self.preprocess_manager.mineru_api_token) if self.preprocess_manager else False,
+            'mineru_succeeded': False,
+            'mineru_token_present': bool(self.preprocess_manager.mineru_api_token) if self.preprocess_manager else False,
+            'mineru_base_url': self.preprocess_manager.mineru_base_url if self.preprocess_manager else '',
+        }
+        return legacy_text, preprocess_metadata
+
+    def _resolve_free_mode_context(self) -> str:
+        """Build prompt context from a saved free-mode profile or an ad-hoc idea."""
+
+        profile = self.free_mode_profile
+        profile_path = (self.free_mode_profile_path or "").strip()
+
+        if profile is None and profile_path:
+            try:
+                with open(profile_path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    self.free_mode_profile = loaded
+                    profile = loaded
+                    self.logger.info(f"已加载自由模式 profile: {profile_path}")
+            except Exception as exc:
+                self.logger.warning(f"加载自由模式 profile 失败，将回退到临时意图文本: {exc}")
+
+        if profile is None and self.output_dir and self.project_name:
+            try:
+                profile = load_profile(self.output_dir, self.project_name)
+                if profile:
+                    self.free_mode_profile = profile
+                    self.logger.info("已自动加载项目自由模式 profile。")
+            except Exception as exc:
+                self.logger.warning(f"自动加载项目自由模式 profile 失败: {exc}")
+
+        if profile:
+            return build_profile_context(profile)
+
+        free_mode_idea = str(self.free_mode_idea or "").strip()
+        if free_mode_idea:
+            return f"\n[FREE MODE IDEA]\n{free_mode_idea}\n"
+
+        return ""
+
+    def _inject_free_mode_context(self, prompt_template: str) -> str:
+        free_mode_context = self._resolve_free_mode_context()
+        prompt_with_placeholder = prompt_template.replace("{{FREE_MODE_CONTEXT}}", free_mode_context)
+        if free_mode_context and "{{FREE_MODE_CONTEXT}}" not in prompt_template:
+            return f"{free_mode_context}\n{prompt_with_placeholder}"
+        return prompt_with_placeholder
+
+    def _build_stage1_analysis_prompt(self, pdf_text: str) -> str:
+        prompt_template = self._load_stage1_prompt_template()
+        prompt_template = self._inject_free_mode_context(prompt_template)
+        return prompt_template.replace("{{PAPER_FULL_TEXT}}", pdf_text)
+
+    def _get_outline_file_path(self) -> str:
+        if not self.output_dir:
+            raise ValueError("输出目录未设置")
+        if self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_literature_review_outline.md")
+        return os.path.join(self.output_dir, "literature_review_outline.md")
+
+    def _get_review_checkpoint_file_path(self) -> str:
+        if not self.output_dir:
+            raise ValueError("输出目录未设置")
+        if self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_review_checkpoint.json")
+        return os.path.join(self.output_dir, "review_checkpoint.json")
+
+    def _get_review_word_file_path(self) -> str:
+        if not self.output_dir:
+            raise ValueError("输出目录未设置")
+        if self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_literature_review.docx")
+        return os.path.join(self.output_dir, "literature_review.docx")
+
+    def _get_failed_review_sections_file_path(self) -> str:
+        if not self.output_dir:
+            raise ValueError("输出目录未设置")
+        if self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_failed_review_sections.json")
+        return os.path.join(self.output_dir, "failed_review_sections.json")
+
+    @staticmethod
+    def _is_placeholder_metadata_value(value: Any) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return True
+        lowered = text.casefold()
+        return lowered in {"unknown", "n/a", "na", "none", "null"} or text in {"未知", "未知年份", "未知期刊"}
+
+    def _apply_ai_metadata_backfill(self, paper: PaperInfo, ai_summary: Any) -> List[str]:
+        metadata = get_paper_metadata(ai_summary or {})
+        updated_fields: List[str] = []
+
+        extracted_title = str(metadata.get("title") or "").strip()
+        extracted_authors = list(metadata.get("authors") or [])
+        extracted_year = str(metadata.get("year") or "").strip()
+        extracted_journal = str(metadata.get("journal") or "").strip()
+        extracted_doi = str(metadata.get("doi") or "").strip()
+
+        if extracted_title and extracted_title != str(paper.get("title") or "").strip():
+            paper["title"] = extracted_title
+            updated_fields.append("标题")
+
+        if extracted_authors and not paper.get("authors"):
+            paper["authors"] = extracted_authors
+            updated_fields.append("作者")
+
+        if extracted_year and (
+            self._is_placeholder_metadata_value(paper.get("year"))
+            or not str(paper.get("year") or "").strip()
+        ):
+            paper["year"] = extracted_year
+            updated_fields.append("年份")
+
+        if extracted_journal and (
+            self._is_placeholder_metadata_value(paper.get("journal"))
+            or not str(paper.get("journal") or "").strip()
+        ):
+            paper["journal"] = extracted_journal
+            updated_fields.append("期刊")
+
+        if extracted_doi and not str(paper.get("doi") or "").strip():
+            paper["doi"] = extracted_doi
+            updated_fields.append("DOI")
+
+        return updated_fields
+
+    def _save_failed_review_sections(self, failed_sections: List[Dict[str, Any]]) -> None:
+        failed_sections_file = self._get_failed_review_sections_file_path()
+        if failed_sections:
+            payload = {
+                "failed_sections": failed_sections,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(failed_sections_file, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            return
+
+        if os.path.exists(failed_sections_file):
+            os.remove(failed_sections_file)
+
+    def _load_failed_review_sections(self) -> List[Dict[str, Any]]:
+        failed_sections_file = self._get_failed_review_sections_file_path()
+        if not os.path.exists(failed_sections_file):
+            return []
+        try:
+            with open(failed_sections_file, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            failed_sections = payload.get("failed_sections", []) if isinstance(payload, dict) else []
+            if isinstance(failed_sections, list):
+                return [item for item in failed_sections if isinstance(item, dict)]
+        except Exception as exc:
+            self.logger.warning(f"读取失败章节记录失败: {exc}")
+        return []
+
+    def _clear_failed_review_section(self, section_number: int) -> None:
+        failed_sections = [
+            item
+            for item in self._load_failed_review_sections()
+            if int(item.get("section_number", 0) or 0) != section_number
+        ]
+        self._save_failed_review_sections(failed_sections)
+
+    def _remove_paragraph(self, paragraph: Any) -> None:
+        element = paragraph._element  # type: ignore[attr-defined]
+        parent = element.getparent()
+        if parent is not None:
+            parent.remove(element)
+
+    def _trim_review_document_from_section(self, word_file: str, section_number: int) -> bool:
+        if not os.path.exists(word_file):
+            return True
+        if not DOCX_AVAILABLE or Document is None:
+            self.logger.warning("python-docx 不可用，将退回整篇重生而不是裁剪已有文档。")
+            return False
+
+        try:
+            document = Document(word_file)  # type: ignore[operator]
+            current_section_number = 0
+            removing = False
+
+            for paragraph in list(document.paragraphs):
+                text = paragraph.text.strip()
+                heading_match = re.match(r"^第\s*(\d+)\s*章", text)
+                if heading_match:
+                    current_section_number = int(heading_match.group(1))
+                    if current_section_number >= section_number:
+                        removing = True
+                elif text == "参考文献" and current_section_number >= section_number:
+                    removing = True
+
+                if removing:
+                    self._remove_paragraph(paragraph)
+
+            document.save(word_file)
+            return True
+        except Exception as exc:
+            self.logger.warning(f"裁剪已有综述文档失败，将退回整篇重生: {exc}")
+            return False
+
+    def generate_specific_review_section(self, section_number: int) -> bool:
+        try:
+            if not self.config and not self.load_configuration():
+                return False
+            if not self.output_dir and not self.setup_output_directory():
+                return False
+            if not self.load_existing_summaries():
+                self.logger.error("无法加载摘要文件，请先运行阶段一")
+                return False
+            if not self.summaries:
+                self.logger.error("没有可用的摘要数据，请先运行阶段一")
+                return False
+
+            outline_file = self._get_outline_file_path()
+            if not os.path.exists(outline_file):
+                self.logger.error(f"大纲文件不存在: {outline_file}，请先运行 --generate-outline")
+                return False
+
+            with open(outline_file, "r", encoding="utf-8") as handle:
+                outline_content = handle.read()
+
+            section_title = self.extract_section_title_from_outline(outline_content, section_number)
+            if not section_title:
+                self.logger.error(f"未在大纲中找到第 {section_number} 章")
+                return False
+
+            return self.create_literature_review_section(section_number, section_title, outline_content)
+        except Exception as exc:
+            self.logger.error(f"补写指定章节失败: {exc}")
+            return False
+
+    def retry_failed_review_sections(self) -> bool:
+        try:
+            if not self.config and not self.load_configuration():
+                return False
+            if not self.output_dir and not self.setup_output_directory():
+                return False
+            if not self.load_existing_summaries():
+                self.logger.error("无法加载摘要文件，请先运行阶段一")
+                return False
+
+            failed_sections = self._load_failed_review_sections()
+            if not failed_sections:
+                self.logger.info("未找到失败章节记录，将直接重跑阶段二综述生成。")
+                return self.generate_full_review_from_outline()
+
+            section_numbers = sorted(
+                {
+                    int(item.get("section_number", 0) or 0)
+                    for item in failed_sections
+                    if int(item.get("section_number", 0) or 0) > 0
+                }
+            )
+            if not section_numbers:
+                self.logger.info("失败章节记录为空，将直接重跑阶段二综述生成。")
+                return self.generate_full_review_from_outline()
+
+            first_failed_section = section_numbers[0]
+            checkpoint_file = self._get_review_checkpoint_file_path()
+            word_file = self._get_review_word_file_path()
+            resume_from_section = 0
+
+            if os.path.exists(word_file) and self._trim_review_document_from_section(word_file, first_failed_section):
+                resume_from_section = first_failed_section - 1
+
+            checkpoint_payload = {
+                "last_completed_section": resume_from_section,
+                "last_section_title": "",
+                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            with open(checkpoint_file, "w", encoding="utf-8") as handle:
+                json.dump(checkpoint_payload, handle, ensure_ascii=False, indent=2)
+
+            self.logger.info(
+                f"将从第 {resume_from_section + 1} 章开始重新生成，以补齐之前失败的章节。"
+            )
+            return self.generate_full_review_from_outline()
+        except Exception as exc:
+            self.logger.error(f"重试失败章节时出错: {exc}")
+            return False
     
     def process_paper(self, paper: PaperInfo, paper_index: int, file_index: Optional[FileIndex], total_papers: int) -> Optional[ProcessingResult]:
         """处理单篇论文"""
@@ -697,33 +1061,25 @@ class LiteratureReviewGenerator:
                     'failure_reason': failure_reason
                 }
             
-            # 提取PDF文本
-
-            self.logger.info(f"正在提取PDF文本: {os.path.basename(pdf_path)}")
-
-            pdf_text = extract_text_from_pdf(pdf_path)  # type: ignore
-
-            
+            # 准备阶段一输入
+            self.logger.info(f"正在准备阶段一输入: {os.path.basename(pdf_path)}")
+            pdf_text, preprocess_metadata = self._prepare_stage1_input(pdf_path)
 
             if not pdf_text or len(pdf_text.strip()) < 500:  # type: ignore
-
-                failure_reason = f"PDF文本提取失败或内容过少({len(pdf_text) if pdf_text else 0}字符)"  # type: ignore
-
+                failure_reason = f"阶段一输入准备失败或内容过少({len(pdf_text) if pdf_text else 0}字符)"  # type: ignore
                 self.logger.error(failure_reason)
-
                 return {
-
                     'paper_info': paper,
-
                     'status': 'failed',
-
                     'failure_reason': failure_reason
-
                 }
 
-            
-
-            self.logger.success(f"PDF文本提取成功: {len(pdf_text)}字符")  # type: ignore
+            input_kind = preprocess_metadata.get('analysis_input_kind', 'text')
+            extractor_used = preprocess_metadata.get('extractor_used', 'unknown')
+            self.logger.success(
+                f"阶段一输入准备成功: {len(pdf_text)}字符 "
+                f"({input_kind} / {extractor_used})"
+            )
             
             # 调用AI API生成摘要
             self.logger.info("正在调用AI生成摘要...")
@@ -746,13 +1102,12 @@ class LiteratureReviewGenerator:
             
             # 构建完整的分析提示词
             try:
-                # 🆕 直接使用优化的分析提示词
-                with open('prompts/optimized_prompt_analyze.txt', 'r', encoding='utf-8') as f:
-                    prompt_template = f.read()
-                self.logger.info("使用优化后的分析提示词")
+                prompt_template = self._load_stage1_prompt_template()
+                self.logger.info("使用路由版阶段一分析提示词")
                 
                 # 替换占位符
-                analysis_prompt: str = prompt_template.replace('{{PAPER_FULL_TEXT}}', pdf_text)
+                prompt_template = self._inject_free_mode_context(prompt_template)
+                analysis_prompt = prompt_template.replace('{{PAPER_FULL_TEXT}}', pdf_text)
                 
             except Exception as e:
                 self.logger.warning(f"无法加载优化分析提示词模板，使用简化提示词: {e}")
@@ -893,7 +1248,12 @@ class LiteratureReviewGenerator:
             # =================== METADATA BACKFILL ===================
             # AI提取的元数据回填到paper_info中，解决Direct PDF Mode下的元数据显示问题
             try:
-                if ai_result and 'common_core' in ai_result:
+                updated_fields = self._apply_ai_metadata_backfill(paper, ai_result)
+                if updated_fields:
+                    self.logger.info(f"已从 AI 结果回填元数据字段: {', '.join(updated_fields)}")
+                else:
+                    self.logger.info("未检测到可回填的论文元数据，继续保留现有 paper_info。")
+                if False:
                     common_core = ai_result['common_core']
                     
                     # 提取AI分析出的元数据
@@ -968,7 +1328,8 @@ class LiteratureReviewGenerator:
                 'status': 'success',
                 'ai_summary': ai_result,  # type: ignore
                 'processing_time': datetime.now().isoformat(),
-                'text_length': len(pdf_text) if pdf_text else 0  # type: ignore
+                'text_length': len(pdf_text) if pdf_text else 0,  # type: ignore
+                'preprocess': preprocess_metadata,
             }
             
             return result
@@ -1628,6 +1989,7 @@ class LiteratureReviewGenerator:
             success = self.append_section_to_word_document(section_number, section_title, section_text, word_file)
             
             if success:
+                self._clear_failed_review_section(section_number)
                 self.logger.success(f"第{section_number}章已追加到文献综述: {word_file}")
                 return True
             else:
@@ -1661,6 +2023,7 @@ class LiteratureReviewGenerator:
             section_prompt: str = prompt_template.replace('{{SUMMARIES_JSON_ARRAY}}', optimized_context)
             section_prompt = section_prompt.replace('{{SECTION_TITLE}}', section_title)
             section_prompt = section_prompt.replace('{{REVIEW_OUTLINE}}', outline_content)
+            section_prompt = self._inject_free_mode_context(section_prompt)
 
             self.logger.info(f"生成综述提示词: {len(section_prompt)}字符")
 
@@ -2043,6 +2406,7 @@ class LiteratureReviewGenerator:
                     run.font.size = Pt(font_size_body)  # type: ignore
             
             # 用tqdm包装章节列表，显示进度条
+            failed_sections: List[Dict[str, Any]] = []
             progress_bar = tqdm(enumerate(section_matches, 1), total=len(section_matches), desc="[阶段二] 正在生成综述章节")
             
             # 逐章生成内容（从断点开始）
@@ -2066,6 +2430,14 @@ class LiteratureReviewGenerator:
                 section_content = self.generate_review_section_content(section_title, outline_content)
                 if not section_content:
                     self.logger.error(f"第{section_num}章内容生成失败")
+                    failed_sections.append(
+                        {
+                            "section_number": int(section_num),
+                            "section_title": section_title,
+                            "failure_reason": "section_content_generation_failed",
+                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
                     continue
                 
                 # 添加章节标题和内容到Word文档
@@ -2155,6 +2527,8 @@ class LiteratureReviewGenerator:
             # 最终保存
             doc.save(word_file)
             
+            self._save_failed_review_sections(failed_sections)
+
             # 清除断点文件（表示全部完成）
             if os.path.exists(review_checkpoint_file):
                 # 检查是否应保留检查点文件
@@ -2358,11 +2732,13 @@ class LiteratureReviewGenerator:
                     if continuation_attempts == 0:
                         # 首次调用：使用原始大纲提示词
                         final_prompt = outline_prompt_template.replace('{{SUMMARIES_JSON_ARRAY}}', summaries_string)
+                        final_prompt = self._inject_free_mode_context(final_prompt)
                         self.logger.info(f"首次大纲生成，提示词长度: {len(final_prompt)}字符")
                     else:
                         # 续写调用：使用续写提示词
                         final_prompt = continue_prompt_template.replace('{{SUMMARIES_JSON_ARRAY}}', summaries_string)
                         final_prompt = final_prompt.replace('{{PARTIAL_OUTLINE}}', partial_outline)  # type: ignore
+                        final_prompt = self._inject_free_mode_context(final_prompt)
                         self.logger.info(f"续写大纲生成(第{continuation_attempts}次)，提示词长度: {len(final_prompt)}字符")  # type: ignore
 
                     # 调用AI API
@@ -2520,25 +2896,25 @@ class LiteratureReviewGenerator:
             ai_summary: Union[AISummary, Dict[str, Any], None] = summary.get('ai_summary', {})
             
             # 适配新的两段式结构
-            if 'common_core' in ai_summary:  # type: ignore
+            if False:  # legacy branch retained for compatibility cleanup
                 # 新的两段式结构
-                common_core = ai_summary['common_core']  # type: ignore
+                core_analysis = get_core_analysis(ai_summary or {})  # type: ignore
             else:
                 # 兼容旧的单段式结构
-                common_core = ai_summary  # type: ignore
+                core_analysis = get_core_analysis(ai_summary or {})  # type: ignore
             
             paper_data: Dict[str, Any] = {  # type: ignore
                 'title': paper_info.get('title', '未知标题'),
                 'authors': paper_info.get('authors', []),
                 'year': paper_info.get('year', '未知年份'),
                 'journal': paper_info.get('journal', '未知期刊'),
-                'summary': common_core.get('summary', ''),  # type: ignore
-                'key_points': common_core.get('key_points', []),  # type: ignore
-                'methodology': common_core.get('methodology', ''),  # type: ignore
-                'findings': common_core.get('findings', ''),  # type: ignore
-                'conclusions': common_core.get('conclusions', ''),  # type: ignore
-                'relevance': common_core.get('relevance', ''),  # type: ignore
-                'limitations': common_core.get('limitations', '')  # type: ignore
+                'summary': core_analysis.get('summary', ''),  # type: ignore
+                'key_points': core_analysis.get('key_points', []),  # type: ignore
+                'methodology': core_analysis.get('methodology', ''),  # type: ignore
+                'findings': core_analysis.get('findings', ''),  # type: ignore
+                'conclusions': core_analysis.get('conclusions', ''),  # type: ignore
+                'relevance': core_analysis.get('relevance', ''),  # type: ignore
+                'limitations': core_analysis.get('limitations', '')  # type: ignore
             }
             
             review_data['papers'].append(paper_data)  # type: ignore
@@ -2578,6 +2954,7 @@ class LiteratureReviewGenerator:
 
             # 将完整的JSON字符串注入到模板中
             final_prompt = synthesize_prompt_template.replace('{{SUMMARIES_JSON_ARRAY}}', summaries_string)
+            final_prompt = self._inject_free_mode_context(final_prompt)
             self.logger.success(f"生成最终综述提示词: {len(final_prompt)}字符")
 
             # 提取写作引擎API配置
@@ -2752,21 +3129,21 @@ class LiteratureReviewGenerator:
                 try:
                     self.logger.info(f"正在分析种子论文: {os.path.basename(pdf_path)}")  # type: ignore
                     
-                    # 提取完整文本
-                    pdf_text = extract_text_from_pdf(pdf_path)  # type: ignore
+                    # 准备阶段一输入
+                    pdf_text, _preprocess_metadata = self._prepare_stage1_input(pdf_path)
                     if not pdf_text or len(pdf_text.strip()) < 500:  # type: ignore
-                        self.logger.warning(f"种子论文文本提取失败: {os.path.basename(pdf_path)}")  # type: ignore
+                        self.logger.warning(f"种子论文阶段一输入准备失败: {os.path.basename(pdf_path)}")  # type: ignore
                         return None
                     
                     # 创建论文信息
-                    paper_info: Dict[str, Any] = {
+                    paper_info: PaperInfo = {
                         'title': os.path.splitext(os.path.basename(pdf_path))[0],
                         'authors': [],
                         'year': '未知年份',
                         'journal': '未知期刊',
                         'doi': '',
                         'pdf_path': pdf_path
-                    }  # type: ignore
+                    }
                     
                     # 获取API配置
                     primary_config: Dict[str, str] = self.config.get('Primary_Reader_API', {}) if self.config else {}  # type: ignore
@@ -2786,11 +3163,11 @@ class LiteratureReviewGenerator:
                     
                     # 构建完整的分析提示词
                     try:
-                        with open('prompts/prompt_analyze.txt', 'r', encoding='utf-8') as f:
-                            prompt_template: str = f.read()  # type: ignore
+                        prompt_template = self._load_stage1_prompt_template()
                         
                         # 替换占位符
-                        analysis_prompt: str = prompt_template.replace('{{PAPER_FULL_TEXT}}', pdf_text)  # type: ignore
+                        prompt_template = self._inject_free_mode_context(prompt_template)
+                        analysis_prompt = prompt_template.replace('{{PAPER_FULL_TEXT}}', pdf_text)  # type: ignore
                         
                     except Exception as e:
                         self.logger.warning(f"无法加载分析提示词模板，使用简化提示词: {e}")
@@ -2800,6 +3177,7 @@ class LiteratureReviewGenerator:
                     # 调用AI分析
                     ai_result = get_summary_from_ai_with_fallback(analysis_prompt, reader_api_config, backup_api_config, logger=self.logger, config=self.config)
                     if ai_result:
+                        self._apply_ai_metadata_backfill(paper_info, ai_result)
                         self.logger.success(f"种子论文分析成功: {os.path.basename(pdf_path)}")
                         return {
                             'paper_info': paper_info,
@@ -2965,6 +3343,13 @@ def sanitize_path_component(path_component: str) -> str:
 def dispatch_command(args: argparse.Namespace):  # type: ignore
     """命令分派器 - 根据参数调用相应的处理函数"""
     try:
+        runtime = detect_runtime_environment()
+        print(f"[环境] 当前 Python 环境: {runtime.display_name}")
+        if runtime.needs_isolation_recommendation:
+            print("[环境] 建议使用独立 conda 环境，避免和现有环境中的包互相冲突。")
+            print(f"[环境]   {recommended_conda_create_command()}")
+            print(f"[环境]   {recommended_conda_activate_command()}")
+
         # 检查是否为安装模式
         if args.setup:
             run_setup_wizard()
@@ -3040,6 +3425,9 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             sys.exit(1)
         
         # 概念模式验证
+        generator.free_mode_profile_path = getattr(args, "free_mode_profile", None)
+        generator.free_mode_idea = getattr(args, "free_mode_idea", None)
+
         if args.concept and not args.prime_with_folder:
             generator.logger.info(f"检测到概念模式，概念名称: {args.concept}")
             # 设置概念模式标志
@@ -3066,8 +3454,12 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
         # 原有的单独执行模式
         elif args.generate_outline:
             handle_generate_outline_mode(generator, args)
+        elif getattr(args, "generate_section", None):
+            handle_generate_section_mode(generator, args)
         elif args.generate_review:
             handle_generate_review_mode(generator)
+        elif getattr(args, "retry_review_failed", False):
+            handle_retry_review_failed_mode(generator)
         elif args.validate_review:
             if generator.load_existing_summaries():
                  validator.run_review_validation(generator)  # type: ignore
@@ -3435,32 +3827,17 @@ def handle_merge_mode(args: argparse.Namespace):  # type: ignore
             generator.logger.error(f"合并文件不存在: {merge_file}")
             return
         
-        # 读取两个文件（添加robust编码处理）
         try:
-            with open(main_file, 'r', encoding='utf-8') as f:  # type: ignore
-                main_data = json.load(f)  # type: ignore
-        except UnicodeDecodeError:
-            try:
-                with open(main_file, 'r', encoding='gbk') as f:  # type: ignore
-                    content = f.read()
-                content = content.encode('gbk').decode('utf-8')
-                main_data = json.loads(content)  # type: ignore
-            except (UnicodeDecodeError, UnicodeError):
-                with open(main_file, 'r', encoding='utf-8', errors='ignore') as f:  # type: ignore
-                    main_data = json.load(f)  # type: ignore
+            main_data = load_json_file_with_fallbacks(main_file, logger=generator.logger)  # type: ignore
+        except Exception as exc:
+            generator.logger.error(f"读取主文件失败: {main_file} - {exc}")
+            return
         
         try:
-            with open(merge_file, 'r', encoding='utf-8') as f:  # type: ignore
-                merge_data = json.load(f)  # type: ignore
-        except UnicodeDecodeError:
-            try:
-                with open(merge_file, 'r', encoding='gbk') as f:  # type: ignore
-                    content = f.read()
-                content = content.encode('gbk').decode('utf-8')
-                merge_data = json.loads(content)  # type: ignore
-            except (UnicodeDecodeError, UnicodeError):
-                with open(merge_file, 'r', encoding='utf-8', errors='ignore') as f:  # type: ignore
-                    merge_data = json.load(f)  # type: ignore
+            merge_data = load_json_file_with_fallbacks(merge_file, logger=generator.logger)  # type: ignore
+        except Exception as exc:
+            generator.logger.error(f"读取合并文件失败: {merge_file} - {exc}")
+            return
         
         if not isinstance(main_data, list) or not isinstance(merge_data, list):  # type: ignore
             generator.logger.error("文件格式错误，必须是JSON数组")
@@ -3576,6 +3953,33 @@ def handle_generate_review_mode(generator: 'LiteratureReviewGenerator'):  # type
         generator.logger.error("\n文献综述生成失败！")
         sys.exit(1)
 
+def handle_generate_section_mode(generator: 'LiteratureReviewGenerator', args: argparse.Namespace):  # type: ignore
+    """Handle generation for a single outline section."""
+
+    section_number = int(getattr(args, "generate_section", 0) or 0)
+    if section_number <= 0:
+        generator.logger.error("generate-section 参数必须是大于 0 的整数")
+        sys.exit(1)
+
+    success = generator.generate_specific_review_section(section_number)
+    if success:
+        generator.logger.success(f"\n第 {section_number} 章已补写完成")
+    else:
+        generator.logger.error(f"\n第 {section_number} 章补写失败")
+        sys.exit(1)
+
+
+def handle_retry_review_failed_mode(generator: 'LiteratureReviewGenerator'):  # type: ignore
+    """Retry failed stage-two review sections from the saved failure record."""
+
+    success = generator.retry_failed_review_sections()
+    if success:
+        generator.logger.success("\n失败章节重试完成")
+    else:
+        generator.logger.error("\n失败章节重试失败")
+        sys.exit(1)
+
+
 def handle_stage_one_mode(generator: 'LiteratureReviewGenerator', args: argparse.Namespace):  # type: ignore
     """处理阶段一模式（默认模式）"""
     generator.logger.info("*** 阶段一模式已启动 ***")
@@ -3666,6 +4070,10 @@ def main() -> None:  # type: ignore
     parser.add_argument('--prime-with-folder', type=str, help='Path to a folder with seed papers for concept priming.')
     parser.add_argument('--concept', type=str, help='The name of the concept to be primed.')
     parser.add_argument('--retry-failed', action='store_true', help='Retry processing failed papers from a previous run.')
+    parser.add_argument('--generate-section', type=int, help='Generate only the specified outline section number.')
+    parser.add_argument('--retry-review-failed', action='store_true', help='Retry failed stage-two review sections from the latest run.')
+    parser.add_argument('--free-mode-profile', type=str, help='Path to a saved free-mode profile JSON.')
+    parser.add_argument('--free-mode-idea', type=str, help='Ad-hoc free-mode idea text when no profile file is provided.')
     parser.add_argument('--merge', type=str, help='Path to a summaries.json file to merge into the main project.')
 
     args = parser.parse_args()

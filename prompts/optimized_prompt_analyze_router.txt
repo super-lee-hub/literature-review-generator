@@ -1,0 +1,172 @@
+请对以下学术论文内容进行结构化分析，并且只输出一个合法 JSON 对象。{{FREE_MODE_CONTEXT}}
+
+【论文内容】
+{{PAPER_FULL_TEXT}}
+
+【总任务】
+你必须在一次回答中同时完成分类与抽取，但输出必须使用 canonical schema：
+1. 判断主类型 `routing.paper_type`
+2. 判断分类状态 `routing.classification_status`
+3. 提取共通分析字段到 `core_analysis`
+4. 只把类型专属信息写入 `specialized_details`
+
+【硬性约束】
+1. 只能基于论文原文和可直接支持的上下文提取信息，不要臆测。
+2. 不要输出 `common_core`、`type_specific_details`、`quality_audit`。
+3. 如能从论文原文中直接确认题名、作者、年份、期刊或 DOI，可额外输出到顶层 `paper_metadata`；无法确认时请保留 `null` / `[]`，不要猜测。
+4. 输出必须是纯 JSON，不要附加解释、Markdown、代码块。
+5. 空值规则：
+   - 缺失的标量文本字段用 `null`
+   - 缺失的列表字段用 `[]`
+   - 未激活的分支用 `null`
+6. 不要发明 subtype。`routing.paper_subtype_normalized` 只能填词表内值或 `null`。
+
+【主类型 ontology】
+`routing.paper_type` 只能是：
+- `"empirical"`
+- `"review"`
+- `"conceptual"`
+- `null`
+
+【分类状态】
+`routing.classification_status` 只能是：
+- `"resolved"`：能稳定判断主类型
+- `"uncertain"`：证据不足，无法稳定判断主类型
+- `"hybrid"`：有明确主类型，但存在一个或两个强二候选，且这些候选会影响论文整体定位
+
+【重要说明】
+- `uncertain` 不是 `paper_type`，而是 `classification_status`
+- 当 `classification_status = "uncertain"` 且无法稳定确定主类型时，`paper_type = null`
+- 当 `classification_status != "resolved"` 或 `secondary_candidates` 非空时，`classification_rationale` 不允许为 `null`
+- 只有在论文整体同时满足两个类型的重要识别特征时，才允许 `hybrid`
+- 仅有理论背景、文献回顾或概念讨论，不构成 `hybrid`
+
+【route_confidence】
+`routing.route_confidence` 只能填：
+- `"high"`
+- `"medium"`
+- `"low"`
+
+【paper_subtype_normalized 受控词表】
+如果 `paper_type = "empirical"`，只能填：
+- `quantitative`
+- `qualitative`
+- `mixed_method`
+- `experiment`
+- `survey`
+- `archival`
+- `case_study`
+- `panel`
+- `field_study`
+
+如果 `paper_type = "review"`，只能填：
+- `systematic_review`
+- `meta_analysis`
+- `bibliometric_review`
+- `scoping_review`
+- `narrative_review`
+- `integrative_review`
+
+如果 `paper_type = "conceptual"`，只能填：
+- `theory_building`
+- `framework_development`
+- `perspective`
+- `commentary`
+- `model_proposition`
+
+【secondary_candidates】
+- 只允许 `empirical / review / conceptual`
+- 不包含主类型
+- 去重
+- 最多 2 个
+
+【core_analysis 写作标准】
+- `summary`：250-400 字左右，概括研究问题、研究对象、方法、关键发现和结论
+- `key_points`：固定输出 3-7 条；每条尽量写成“发现/判断 + 条件/证据 + 启示”
+- `methodology`：写清研究设计、数据来源、样本、分析路径；综述或概念论文也要写清整合方式或理论建构路径
+- `findings`：这是高优先级字段，尽量保留关键发现、方向性结论、机制、主题归纳或显著差异
+- `conclusions`：概括作者最终判断、理论含义、实践含义或政策含义
+- `relevance`：优先覆盖理论贡献与实践意义
+- `limitations`：优先写作者明确提到的局限；可补充原文直接支持的样本、方法、情境、时间范围限制
+- `theoretical_framework`：只要原文明确使用理论框架、概念框架或理论视角，就尽量提取
+- `research_gap`：如果原文明确指出研究空白、研究不足或未解决问题，尽量完整提取；否则留 `null`
+- `future_research_directions`：若原文明确给出未来研究方向，提炼为若干清晰短句，否则留 `[]`
+
+【specialized_details 写作标准】
+- 只保留类型专属字段
+- 未激活的分支必须为 `null`
+- 如果 `paper_type = "empirical"`，只填 `specialized_details.empirical`
+- 如果 `paper_type = "review"`，只填 `specialized_details.review`
+- 如果 `paper_type = "conceptual"`，只填 `specialized_details.conceptual`
+- 如果 `paper_type = null`，三个分支都填 `null`
+
+【输出 schema】
+```json
+{
+  "routing": {
+    "paper_type": "empirical",
+    "paper_subtype_raw": "survey study",
+    "paper_subtype_normalized": "survey",
+    "classification_status": "resolved",
+    "route_confidence": "high",
+    "classification_rationale": null,
+    "secondary_candidates": []
+  },
+  "core_analysis": {
+    "summary": "",
+    "key_points": [],
+    "methodology": "",
+    "findings": "",
+    "conclusions": "",
+    "relevance": "",
+    "limitations": "",
+    "theoretical_framework": null,
+    "research_gap": null,
+    "future_research_directions": []
+  },
+  "paper_metadata": {
+    "title": null,
+    "authors": [],
+    "year": null,
+    "journal": null,
+    "doi": null
+  },
+  "specialized_details": {
+    "empirical": {
+      "research_questions_or_hypotheses": [],
+      "data_source_and_size": null,
+      "analysis_technique": null,
+      "core_variables": {
+        "independent": [],
+        "dependent": [],
+        "mediators": [],
+        "moderators": [],
+        "controls": [],
+        "other_core_constructs": []
+      },
+      "sample_characteristics_or_context": null
+    },
+    "review": null,
+    "conceptual": null
+  }
+}
+```
+
+【review 分支字段】
+- `review_type`
+- `search_databases`
+- `time_span`
+- `included_studies_count`
+- `inclusion_exclusion_criteria`
+- `synthesis_approach`
+- `main_themes`
+
+【conceptual 分支字段】
+- `core_propositions`
+- `conceptual_relationships`
+- `theoretical_contributions`
+
+【补充要求】
+- 若能提取定量结果，优先写出样本量、显著性、效应方向、系数、实验差异等
+- 若能提取定性结果，优先写出主题、机制、案例差异、受访者视角等
+- 不要因为分类而压缩分析密度；`research_gap`、关键发现、理论贡献、未来研究方向都尽量保留

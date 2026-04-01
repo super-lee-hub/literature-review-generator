@@ -13,6 +13,11 @@ import os
 import logging
 from typing import Optional, Dict, Any as _Any
 
+try:
+    import pdfplumber  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency.
+    pdfplumber = None  # type: ignore
+
 # 为PyMuPDF(fitz)类型创建类型别名
 try:
     import fitz  # PyMuPDF  # type: ignore
@@ -44,9 +49,12 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
     
     # 尝试使用pdfplumber提取文本
     try:
-        import pdfplumber  # type: ignore
-        
-        with pdfplumber.open(pdf_path) as pdf:
+        if pdfplumber is None:
+            raise ImportError("pdfplumber 未安装")
+
+        pdf_handle = pdfplumber.open(pdf_path)  # type: ignore[union-attr]
+        pdf = pdf_handle if hasattr(pdf_handle, 'pages') else pdf_handle.__enter__()
+        try:
             logging.info(f"PDF文件包含 {len(pdf.pages)} 页")
             
             for page_num, page in enumerate(pdf.pages, 1):
@@ -55,6 +63,12 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
                     text_content = f"{text_content}\n--- 第{page_num}页 ---\n{page_text.strip()}\n"  # type: ignore
                 else:
                     logging.warning(f"第{page_num}页无法提取文本（可能是扫描版）")
+        finally:
+            close_method = getattr(pdf_handle, 'close', None)
+            if callable(close_method):
+                close_method()
+            elif hasattr(pdf_handle, '__exit__'):
+                pdf_handle.__exit__(None, None, None)
         
         if text_content.strip():  # type: ignore
             logging.info(f"使用pdfplumber成功提取文本，共 {len(text_content)} 字符")
@@ -73,7 +87,7 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
         logging.info(f"PyMuPDF: PDF文件包含 {doc.page_count} 页")  # type: ignore
         
         for page_num in range(doc.page_count):  # type: ignore
-            page: _Any = doc[page_num]  # type: ignore - 使用_Any避免类型冲突
+            page: _Any = doc.load_page(page_num)  # type: ignore - 使用load_page便于测试替身模拟
             page_text: str = page.get_text()  # type: ignore
             if page_text:
                 text_content = f"{text_content}\n--- 第{page_num+1}页 ---\n{page_text.strip()}\n"  # type: ignore

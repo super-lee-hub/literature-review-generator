@@ -8,6 +8,7 @@ import pytest
 import os
 import tempfile
 from unittest.mock import Mock, patch
+from pathlib import Path
 
 
 class TestZoteroParser:
@@ -128,6 +129,39 @@ Title: A Minimal Paper
 
         # 应该返回空列表而不是抛出异常
         assert result == [] or result is None
+
+    def test_parse_gb18030_report_preserves_chinese(self, tmp_path: Path):
+        """测试GB18030编码报告不会被错误转码成乱码"""
+        zotero_content = "中文标题\n作者\t张三\n期刊\t中文期刊"
+        report_path = tmp_path / "zotero_gbk.txt"
+        report_path.write_bytes(zotero_content.encode("gb18030"))
+
+        expected = [{"title": "中文标题"}]
+        with patch.object(self.zotero_parser, "parse_standard_zotero_format", return_value=expected) as mock_parse:
+            result = self.zotero_parser.parse_zotero_report(str(report_path))
+
+        assert result == expected
+        assert mock_parse.call_count == 1
+        assert mock_parse.call_args[0][0] == zotero_content
+
+    def test_parse_simple_key_value_format_preserves_full_author_names(self):
+        """测试键值对格式不会把英文作者名按单个字母拆碎"""
+        content = "\n".join(
+            [
+                "标题: Example Paper",
+                "作者: Smith, John; Doe, Jane",
+                "年份: 2024",
+                "期刊: Journal of Testing",
+                "DOI: 10.1234/example",
+                "---",
+            ]
+        )
+
+        result = self.zotero_parser.parse_simple_key_value_format(content)
+
+        assert result
+        assert result[0]["authors"] == ["Smith, John", "Doe, Jane"]
+        assert "issue" not in result[0]
 
     @patch('builtins.open')
     def test_parse_file_read_error(self, mock_open):

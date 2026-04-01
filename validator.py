@@ -40,6 +40,7 @@ except ImportError:
 
 # 导入主程序中的AI接口调用函数
 from ai_interface import _call_ai_api  # type: ignore
+from summary_schema import get_core_analysis
 
 def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: Dict[str, Any],
                            use_cache: bool = True) -> Dict[str, Any]:
@@ -97,7 +98,7 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
 
     # 预检查：如果摘要包含占位符'...'，跳过验证（因为验证AI会错误地填充它）
     try:
-        common_core = ai_result.get('common_core', {})
+        common_core = get_core_analysis(ai_result)
         placeholder_fields: List[str] = []
         
         # 检查所有字段是否包含'...'

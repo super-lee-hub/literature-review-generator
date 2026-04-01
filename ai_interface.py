@@ -7,6 +7,25 @@ from typing import Union, Dict, Optional, Any, List, Tuple, Callable
 
 from models import APIConfig
 from config_loader import load_config
+from summary_schema import (
+    default_ai_summary,
+    get_ai_summary,
+    normalize_ai_summary,
+    project_legacy_ai_summary,
+)
+
+
+def _default_core_variables() -> Dict[str, List[str]]:
+    return project_legacy_ai_summary(default_ai_summary())["type_specific_details"]["core_variables"]
+
+
+def _default_type_specific_details() -> Dict[str, Any]:
+    return project_legacy_ai_summary(default_ai_summary())["type_specific_details"]
+
+
+def _normalize_type_specific_details(payload: Any) -> Dict[str, Any]:
+    canonical = normalize_ai_summary({"type_specific_details": payload})
+    return project_legacy_ai_summary(canonical)["type_specific_details"]
 
 
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
@@ -973,7 +992,7 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                 if has_valid_content:
                     if logger:
                         logger.debug("主引擎返回有效结果（通过严格内容检查）")
-                    return result
+                    return normalize_ai_summary(result)
                 else:
                     if logger:
                         logger.warning("主引擎返回结果未通过严格内容检查，尝试备用引擎")
@@ -1033,18 +1052,36 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
     """
     if ('dummy' in (primary_api_config.get('api_key') or '') or 
         'dummy' in (backup_api_config.get('api_key') or '')):
-        return {
-            'common_core': {
-                'summary': 'This is a dummy summary.',
-                'key_points': ['Dummy key point 1', 'Dummy key point 2'],
-                'methodology': 'Dummy methodology.',
-                'findings': 'Dummy findings.',
-                'conclusions': 'Dummy conclusions.',
-                'relevance': 'Dummy relevance.',
-                'limitations': 'Dummy limitations.'
-            },
-            'type_specific_details': {}
-        }
+        return normalize_ai_summary(
+            {
+                'routing': {
+                    'paper_type': None,
+                    'paper_subtype_raw': None,
+                    'paper_subtype_normalized': None,
+                    'classification_status': 'uncertain',
+                    'route_confidence': 'low',
+                    'classification_rationale': None,
+                    'secondary_candidates': [],
+                },
+                'core_analysis': {
+                    'summary': 'This is a dummy summary.',
+                    'key_points': ['Dummy key point 1', 'Dummy key point 2'],
+                    'methodology': 'Dummy methodology.',
+                    'findings': 'Dummy findings.',
+                    'conclusions': 'Dummy conclusions.',
+                    'relevance': 'Dummy relevance.',
+                    'limitations': 'Dummy limitations.',
+                    'theoretical_framework': None,
+                    'research_gap': None,
+                    'future_research_directions': [],
+                },
+                'specialized_details': {
+                    'empirical': None,
+                    'review': None,
+                    'conceptual': None,
+                },
+            }
+        )
 
     # 设置RateLimiter的logger
     if logger:
@@ -1180,6 +1217,15 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
 
     if not ai_response:
         return None
+    if isinstance(ai_response, dict):  # type: ignore
+        structured_summary = normalize_ai_summary(ai_response)
+        if logger:
+            status = rate_limiter.get_status(engine_type)
+            logger.debug(f"令牌桶状态: {status}")
+        return structured_summary
+    if logger:
+        logger.warning("AI返回非字典格式，尝试手动解析")
+    return _extract_summary_manually(ai_response)
 
     # 验证必需字段（两段式结构）
     if isinstance(ai_response, dict):  # type: ignore
@@ -1191,7 +1237,7 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
                 logger.debug("检测到旧格式摘要，自动转换为两段式结构")
             structured_summary = {
                 'common_core': structured_summary,
-                'type_specific_details': {}
+                'type_specific_details': _default_type_specific_details()
             }
 
         # 确保common_core是字典类型
@@ -1206,7 +1252,18 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         required_fields = ['summary', 'key_points', 'methodology', 'findings', 'conclusions', 'relevance', 'limitations']
         for field in required_fields:
             if field not in structured_summary['common_core']:
-                structured_summary['common_core'][field] = "未提供相关信息" if field != 'key_points' else []
+                structured_summary['common_core'][field] = '' if field != 'key_points' else []
+
+        metadata_defaults = {
+            'title': '',
+            'authors': [],
+            'year': '',
+            'journal': '',
+            'doi': '',
+        }
+        for field, default_value in metadata_defaults.items():
+            if field not in structured_summary['common_core']:
+                structured_summary['common_core'][field] = default_value
 
         # 确保key_points是列表
         if not isinstance(structured_summary['common_core']['key_points'], list):
@@ -1214,7 +1271,9 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
 
         # 确保type_specific_details存在
         if 'type_specific_details' not in structured_summary:
-            structured_summary['type_specific_details'] = {}
+            structured_summary['type_specific_details'] = _default_type_specific_details()
+        else:
+            structured_summary['type_specific_details'] = _normalize_type_specific_details(structured_summary['type_specific_details'])
 
         if logger:
             # 显示令牌桶状态
@@ -1253,7 +1312,7 @@ def _extract_summary_manually(ai_response: Union[Dict[str, Any], str]) -> Dict[s
             'relevance': '',
             'limitations': ''
         },
-        'type_specific_details': {}
+        'type_specific_details': _default_type_specific_details()
     }
 
     # 尝试使用正则表达式提取JSON格式的部分

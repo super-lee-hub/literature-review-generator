@@ -337,16 +337,11 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
     
 
 
-    # 验证路径配置
-
-
-    valid, error = validate_config_section(config_dict, 'Paths', ['zotero_report', 'library_path', 'output_path'])
-
-
-    if not valid:
-
-
-        return False, [error]
+    # 验证路径配置：output_path 必填，Zotero 路径允许在 PDF 文件夹模式下留空。
+    if 'Paths' not in config_dict:
+        return False, ["缺少配置段: [Paths]"]
+    if not str(config_dict['Paths'].get('output_path', '')).strip():
+        return False, ["配置项[Paths]output_path不能为空"]
 
 
     
@@ -477,6 +472,29 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
                     warnings.append(f"[Performance] {key} {error}")
 
+    if 'Outline_API' in config_dict and any(str(v).strip() for v in config_dict['Outline_API'].values()):
+        valid, error = validate_config_section(config_dict, 'Outline_API', ['api_key', 'model', 'api_base'])
+        if not valid:
+            return False, [error]
+        outline_api_base: str = config_dict['Outline_API']['api_base']
+        valid, error = validate_url(outline_api_base)
+        if not valid:
+            warnings.append(f"[Outline_API] {error}")
+
+    if 'Free_Mode_API' in config_dict and any(str(v).strip() for v in config_dict['Free_Mode_API'].values()):
+        valid, error = validate_config_section(config_dict, 'Free_Mode_API', ['api_key', 'model', 'api_base'])
+        if not valid:
+            return False, [error]
+        free_mode_api_base: str = config_dict['Free_Mode_API']['api_base']
+        valid, error = validate_url(free_mode_api_base)
+        if not valid:
+            warnings.append(f"[Free_Mode_API] {error}")
+
+    if 'Preprocess' in config_dict:
+        ocr_mode = str(config_dict['Preprocess'].get('ocr_mode', 'auto')).lower()
+        if ocr_mode not in {'auto', 'off', 'always'}:
+            warnings.append("[Preprocess] ocr_mode 应为 auto/off/always 之一")
+
 
     
 
@@ -527,9 +545,13 @@ def test_api_connection(api_key: str, api_base: str, model: str) -> Tuple[bool, 
 
 
     api_base = api_base.rstrip('/')
+    api_base = re.sub(r'/chat/completions/?$', '', api_base, flags=re.IGNORECASE)
+    api_base = re.sub(r'/v1/chat/completions/?$', '/v1', api_base, flags=re.IGNORECASE)
+    api_base = re.sub(r'/models/?$', '', api_base, flags=re.IGNORECASE)
+    if not api_base.endswith('/v1'):
+        api_base = f"{api_base}/v1"
 
-
-    models_endpoint = f"{api_base}/v1/models"
+    models_endpoint = f"{api_base}/models"
 
 
     

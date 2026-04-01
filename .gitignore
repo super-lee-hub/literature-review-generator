@@ -88,6 +88,8 @@ celerybeat-schedule
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -128,6 +130,8 @@ Thumbs.db
 
 # Project specific
 config.ini
+config.local.ini
+config.*.local.ini
 output/
 logs/
 *.log
@@ -136,10 +140,24 @@ logs/
 *_backup.*
 temp/
 tmp/
+.pyright/
+.ruff_cache/
+playwright-report/
+test-results/
 debug_*.py
 check_*.py
 find_*.py
 nul
+
+# Generated project artifacts
+*_summaries.json
+*_analyzed_papers.xlsx
+*_failed_papers_report.txt
+*_checkpoint.json
+*_review_checkpoint.json
+*_literature_review_outline.md
+*_literature_review.docx
+*_free_mode_profile.json
 
 # iFlow CLI generated files
 IFLOW.md

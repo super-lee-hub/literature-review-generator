@@ -10,6 +10,7 @@
 # LLM_PRIMARY_READER_API=your_primary_api_key_here
 # LLM_BACKUP_READER_API=your_backup_api_key_here
 # LLM_WRITER_API=your_writer_api_key_here
+# LLM_FREE_MODE_API=your_free_mode_api_key_here
 # LLM_VALIDATOR_API=your_validator_api_key_here
 #
 # 如果 .env 文件存在，其中的 API 密钥将覆盖配置文件中的值。
@@ -46,6 +47,19 @@ api_base = https://api.videocaptioner.cn/v1
 # 如需在配置文件中设置，请替换下面的占位符
 # 或者留空从 .env 文件读取
 api_key = YOUR_WRITER_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Outline_API]
+# [可选] 用于大纲生成的独立 API
+api_key = YOUR_OUTLINE_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Free_Mode_API]
+# [可选] 用于自由模式前置对话规划的独立 API
+# 如果留空，可回退到 Outline_API
+api_key = YOUR_FREE_MODE_API_KEY_HERE
 model = gemini-2.5-pro
 api_base = https://api.videocaptioner.cn/v1
 
@@ -103,6 +117,49 @@ base_retry_delay = 30
 #   推荐值：120-300秒
 max_retry_delay = 120
 
+[Stage2_Retry]
+# 阶段二（综述章节生成）自动重试配置
+# enabled = true 时，--generate-review 在首轮结束后会自动补跑失败章节
+enabled = true
+
+# 失败章节自动补跑的最大轮数
+max_retry_rounds = 2
+
+# 自动补跑的基础等待时间（秒）
+base_retry_delay = 30
+
+# 自动补跑的最大等待上限（秒）
+max_retry_delay = 120
+
+[Preprocess]
+# 启用 PDF 预处理
+enabled = true
+# 预处理缓存目录
+cache_dir = ./output/_preprocess_cache
+# hybrid / remote / local
+parser_mode = hybrid
+# 远程优先
+primary_parser = mineru_remote
+# 远程失败时回退本地
+fallback_parser = local
+# auto / fitz / pymupdf4llm
+extractor_profile = auto
+# auto / off / always
+ocr_mode = auto
+# Tesseract 语言包，如 eng 或 chi_sim+eng
+ocr_languages = eng
+# 是否强制重建缓存
+force_rebuild = false
+# 阶段一默认使用 normalized.md
+use_markdown_as_stage1_input = true
+# 固定保留结构化工件
+retain_structured_output = true
+retain_page_index = true
+retain_diagnostics = true
+# 本地 RAG（可选）
+enable_local_rag = false
+rag_backend = chroma
+
 [Styling]
 # [可选] 文档样式配置
 # 字体名称（建议使用常见字体如Times New Roman, Arial, Calibri）
@@ -145,6 +202,14 @@ concept_temperature = 0.3
 # 写作引擎参数（用于生成文献综述）
 writer_max_tokens = 8000
 writer_temperature = 0.5
+
+# 大纲引擎参数（用于大纲规划）
+outline_max_tokens = 6000
+outline_temperature = 0.4
+
+# 自由模式对话引擎参数（用于前置对话规划）
+free_mode_max_tokens = 6000
+free_mode_temperature = 0.4
 
 # 验证引擎参数（用于交叉验证）
 validator_max_tokens = 4096
