@@ -1,7 +1,10 @@
 import argparse
 import json
 from types import SimpleNamespace
+from typing import cast
 
+from config_loader import ConfigDict
+from context_manager import validate_summary_quality
 import main
 from models import PaperInfo
 
@@ -62,6 +65,61 @@ class _DummyGenerator:
 
     def setup_output_directory(self):
         return True
+
+
+def _quality_ready_ai_summary(
+    *,
+    paper_metadata: dict | None = None,
+    limitations: str = "This study is limited by a single-country sample and short observation window.",
+):
+    return {
+        "routing": {
+            "paper_type": "empirical",
+            "classification_status": "resolved",
+            "route_confidence": "high",
+            "secondary_candidates": [],
+        },
+        "core_analysis": {
+            "summary": "This paper studies how AI recommendations shape consumer decisions across multiple scenarios with enough detail to satisfy quality checks.",
+            "key_points": [
+                "AI recommendations increase perceived efficiency when consumers have clear goals and sufficient product information."
+            ],
+            "methodology": "The study combines experiments and archival evidence to compare recommendation sources across contexts.",
+            "findings": "The authors find that recommendation source effects depend on context, product framing, and user goals across several analyses.",
+            "conclusions": "The paper concludes that firms should align recommendation source design with user expectations and decision contexts.",
+            "relevance": "The study links recommender design to marketing and tourism decision support.",
+            "limitations": limitations,
+            "theoretical_framework": None,
+            "research_gap": None,
+            "future_research_directions": [],
+        },
+        "paper_metadata": paper_metadata
+        or {
+            "title": None,
+            "authors": [],
+            "year": None,
+            "journal": None,
+            "doi": None,
+        },
+        "specialized_details": {
+            "empirical": {
+                "research_questions_or_hypotheses": [],
+                "data_source_and_size": None,
+                "analysis_technique": None,
+                "core_variables": {
+                    "independent": [],
+                    "dependent": [],
+                    "mediators": [],
+                    "moderators": [],
+                    "controls": [],
+                    "other_core_constructs": [],
+                },
+                "sample_characteristics_or_context": None,
+            },
+            "review": None,
+            "conceptual": None,
+        },
+    }
 
 
 def test_build_stage1_prompt_injects_free_mode_profile(tmp_path) -> None:
@@ -127,6 +185,119 @@ def test_apply_ai_metadata_backfill_updates_direct_mode_placeholders(tmp_path) -
     assert paper["year"] == "2024"
     assert paper["journal"] == "Journal of Tests"
     assert paper["doi"] == "10.1000/test"
+
+
+def test_validate_summary_quality_uses_ai_metadata_when_paper_info_has_placeholders() -> None:
+    result = validate_summary_quality(
+        {
+            "paper_info": {
+                "title": "raw_filename",
+                "authors": [],
+                "year": "未知年份",
+                "journal": "未知期刊",
+                "doi": "",
+            },
+            "status": "success",
+            "ai_summary": _quality_ready_ai_summary(
+                paper_metadata={
+                    "title": "Recovered Title",
+                    "authors": ["Alice Smith"],
+                    "year": "2024",
+                    "journal": "Journal of Tests",
+                    "doi": "10.1000/test",
+                }
+            ),
+        }
+    )
+
+    assert result[0] is True
+
+
+def test_validate_summary_quality_relaxes_missing_metadata_for_direct_mode() -> None:
+    result = validate_summary_quality(
+        {
+            "paper_info": {
+                "title": "raw_filename",
+                "authors": [],
+                "year": "未知年份",
+                "journal": "未知期刊",
+                "doi": "",
+            },
+            "status": "success",
+            "source_mode": "direct",
+            "ai_summary": _quality_ready_ai_summary(),
+        }
+    )
+
+    assert result[0] is True
+
+
+def test_process_paper_backfills_metadata_before_quality_check(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "", "model": "m2", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda _path: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(
+        main,
+        "get_summary_from_ai_with_fallback",
+        lambda *args, **kwargs: _quality_ready_ai_summary(
+            paper_metadata={
+                "title": "Recovered Title",
+                "authors": ["Alice Smith"],
+                "year": "2024",
+                "journal": "Journal of Tests",
+                "doi": "10.1000/test",
+            }
+        ),
+    )
+
+    validation_snapshots = []
+
+    def _fake_validate(summary_data):
+        validation_snapshots.append(
+            {
+                "title": summary_data["paper_info"]["title"],
+                "authors": list(summary_data["paper_info"]["authors"]),
+                "year": summary_data["paper_info"]["year"],
+                "journal": summary_data["paper_info"]["journal"],
+                "source_mode": summary_data["source_mode"],
+            }
+        )
+        return True, "ok"
+
+    monkeypatch.setattr(main, "validate_summary_quality", _fake_validate)
+
+    paper: PaperInfo = {
+        "title": "raw_filename",
+        "authors": [],
+        "year": "未知年份",
+        "journal": "未知期刊",
+        "doi": "",
+        "pdf_path": str(pdf_path),
+    }
+
+    result = generator.process_paper(paper, 0, None, 1)
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert validation_snapshots == [
+        {
+            "title": "Recovered Title",
+            "authors": ["Alice Smith"],
+            "year": "2024",
+            "journal": "Journal of Tests",
+            "source_mode": "direct",
+        }
+    ]
 
 
 def test_dispatch_command_routes_generate_section(monkeypatch) -> None:

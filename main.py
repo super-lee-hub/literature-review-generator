@@ -1132,10 +1132,20 @@ class LiteratureReviewGenerator:
             # 使用新的上下文管理模块进行质量检查，如果质量不达标则标记为失败
             
             # 构建模拟的ProcessingResult对象用于质量检查
+            try:
+                updated_fields = self._apply_ai_metadata_backfill(paper, ai_result)
+                if updated_fields:
+                    self.logger.info(f"已从 AI 结果回填元数据字段: {', '.join(updated_fields)}")
+                else:
+                    self.logger.info("未检测到可回填的论文元数据，继续保留现有 paper_info。")
+            except Exception as e:
+                self.logger.warning(f"元数据回填失败: {e}")
+
             temp_result: Dict[str, Any] = {
                 'paper_info': paper,
                 'status': 'success',
-                'ai_summary': ai_result
+                'ai_summary': ai_result,
+                'source_mode': self.mode,
             }
             
             # 使用context_manager的质量检查功能
@@ -1159,10 +1169,18 @@ class LiteratureReviewGenerator:
                         self.logger.success("备用引擎AI摘要生成成功")
                         
                         # 检查备用引擎结果的质量
+                        try:
+                            updated_fields = self._apply_ai_metadata_backfill(paper, backup_result)
+                            if updated_fields:
+                                self.logger.info(f"已从备用 AI 结果回填元数据字段: {', '.join(updated_fields)}")
+                        except Exception as e:
+                            self.logger.warning(f"备用 AI 元数据回填失败: {e}")
+
                         temp_result_backup: Dict[str, Any] = {
                             'paper_info': paper,
                             'status': 'success',
-                            'ai_summary': backup_result
+                            'ai_summary': backup_result,
+                            'source_mode': self.mode,
                         }
                         
                         is_quality_ok_backup, quality_reason_backup = validate_summary_quality(temp_result_backup)
@@ -1330,6 +1348,7 @@ class LiteratureReviewGenerator:
                 'processing_time': datetime.now().isoformat(),
                 'text_length': len(pdf_text) if pdf_text else 0,  # type: ignore
                 'preprocess': preprocess_metadata,
+                'source_mode': self.mode,
             }
             
             return result

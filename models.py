@@ -148,6 +148,7 @@ class AISummary(TypedDict):
 class ProcessingResult(TypedDict):
     paper_info: PaperInfo
     status: str
+    source_mode: NotRequired[str]
     ai_summary: NotRequired[Optional[AISummary]]
     processing_time: NotRequired[Optional[str]]
     text_length: NotRequired[Optional[int]]

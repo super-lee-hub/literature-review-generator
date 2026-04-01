@@ -14,7 +14,46 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models import ProcessingResult
-from summary_schema import get_core_analysis
+from summary_schema import get_core_analysis, get_paper_metadata
+
+
+def _is_placeholder_metadata_value(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.casefold()
+    return lowered in {"unknown", "n/a", "na", "none", "null"} or text in {"未知", "未知年份", "未知期刊"}
+
+
+def _normalize_authors(value: Any) -> List[str]:
+    if isinstance(value, list):
+        authors = value
+    elif value is None:
+        authors = []
+    else:
+        authors = [value]
+
+    normalized: List[str] = []
+    for author in authors:
+        text = str(author or "").strip()
+        if not text or _is_placeholder_metadata_value(text):
+            continue
+        normalized.append(text)
+    return normalized
+
+
+def _resolve_metadata_value(primary: Any, fallback: Any) -> Any:
+    if isinstance(primary, list):
+        normalized_primary = _normalize_authors(primary)
+        if normalized_primary:
+            return normalized_primary
+        return _normalize_authors(fallback)
+
+    if not _is_placeholder_metadata_value(primary):
+        return str(primary).strip()
+    if not _is_placeholder_metadata_value(fallback):
+        return str(fallback).strip()
+    return ""
 
 
 def estimate_tokens(text: str) -> int:
@@ -176,7 +215,14 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
     try:
         # 获取AI摘要数据
         paper_info = summary_data.get('paper_info', {}) if isinstance(summary_data, dict) else {}
+        paper_metadata = get_paper_metadata(summary_data)
         core_analysis: Any = get_core_analysis(summary_data)
+        source_mode = ""
+        if isinstance(summary_data, dict):
+            source_mode = str(summary_data.get('source_mode') or "").strip().lower()
+        if not source_mode and isinstance(paper_info, dict):
+            source_mode = str(paper_info.get('source_mode') or "").strip().lower()
+        relax_metadata_requirements = source_mode == "direct"
         
         # 定义无效内容的关键词黑名单（扩展版本）
         PLACEHOLDER_KEYWORDS = [
@@ -255,16 +301,25 @@ def validate_summary_quality(summary_data: Union[Dict[str, Any], ProcessingResul
                 issues.append(f"研究局限包含无效占位符")  # type: ignore
         
         # 检查元数据质量
-        authors = paper_info.get('authors', []) if isinstance(paper_info, dict) else []  # type: ignore
-        if not authors or (isinstance(authors, list) and len(authors) == 0):  # type: ignore
+        authors = _resolve_metadata_value(
+            paper_info.get('authors', []) if isinstance(paper_info, dict) else [],
+            paper_metadata.get('authors', []),
+        )
+        if not authors and not relax_metadata_requirements:  # type: ignore
             issues.append("作者信息缺失")  # type: ignore
         
-        year = paper_info.get('year', '') if isinstance(paper_info, dict) else ''  # type: ignore
-        if str(year) in ['未知年份', '未知', ''] or not str(year).strip():  # type: ignore
+        year = _resolve_metadata_value(
+            paper_info.get('year', '') if isinstance(paper_info, dict) else '',
+            paper_metadata.get('year', ''),
+        )
+        if _is_placeholder_metadata_value(year) and not relax_metadata_requirements:  # type: ignore
             issues.append("年份信息缺失")  # type: ignore
         
-        journal = paper_info.get('journal', '') if isinstance(paper_info, dict) else ''  # type: ignore
-        if str(journal) in ['未知期刊', '未知', ''] or not str(journal).strip():  # type: ignore
+        journal = _resolve_metadata_value(
+            paper_info.get('journal', '') if isinstance(paper_info, dict) else '',
+            paper_metadata.get('journal', ''),
+        )
+        if _is_placeholder_metadata_value(journal) and not relax_metadata_requirements:  # type: ignore
             issues.append("期刊信息缺失")  # type: ignore
         
         if issues:  # type: ignore
