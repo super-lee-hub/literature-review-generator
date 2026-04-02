@@ -497,8 +497,9 @@ def test_dispatch_command_routes_generate_section(monkeypatch) -> None:
     )
 
     class _Runner:
-        def run(self, request):
+        def run(self, request, cancel_token=None):
             called["section"] = request.generate_section
+            called["cancel_token"] = cancel_token
             return SimpleNamespace(success=True, exit_code=0)
 
     monkeypatch.setattr("services.job_runner.JobRunner", _Runner)
@@ -518,8 +519,9 @@ def test_dispatch_command_routes_retry_review_failed(monkeypatch) -> None:
     )
 
     class _Runner:
-        def run(self, request):
+        def run(self, request, cancel_token=None):
             called["retry"] = bool(request.retry_review_failed)
+            called["cancel_token"] = cancel_token
             return SimpleNamespace(success=True, exit_code=0)
 
     monkeypatch.setattr("services.job_runner.JobRunner", _Runner)
@@ -540,9 +542,10 @@ def test_dispatch_command_injects_progress_tracker(monkeypatch) -> None:
     )
 
     class _Runner:
-        def run(self, request):
+        def run(self, request, cancel_token=None):
             captured["handled"] = True
             captured["tracker"] = request.progress_tracker
+            captured["cancel_token"] = cancel_token
             return SimpleNamespace(success=True, exit_code=0)
 
     monkeypatch.setattr("services.job_runner.JobRunner", _Runner)

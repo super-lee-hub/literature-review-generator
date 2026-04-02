@@ -1,6 +1,7 @@
 import json
 
 import main
+from config_loader import ConfigDict
 from services.artifact_registry import ArtifactRegistry
 from services.config_compat import CompatConfigView
 from services.job_workspace import JobWorkspace
@@ -44,7 +45,7 @@ def _resume_report(workspace: JobWorkspace) -> ResumeStateReport:
 def test_save_summaries_writes_progress_snapshot_and_registry_record(tmp_path) -> None:
     workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    config = {"Paths": {"output_path": str(tmp_path / "output")}, "Validation": {"stage1_enabled": "false", "stage2_enabled": "false"}}
+    config = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Validation": {"stage1_enabled": "false", "stage2_enabled": "false"}})
     compat_view = CompatConfigView.from_config(config)
 
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))

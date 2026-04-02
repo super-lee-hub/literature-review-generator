@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any, Dict, Iterable, List, Mapping, cast
+
+from models import PaperInfo
 
 
 def _safe_text(value: Any) -> str:
@@ -89,8 +91,8 @@ def normalize_source_papers(source_mode: str, papers: Iterable[Mapping[str, Any]
 def project_descriptors_to_legacy_papers(
     papers: Iterable[Mapping[str, Any]],
     descriptors: Iterable[SourcePaperDescriptor],
-) -> List[Dict[str, Any]]:
-    projected: List[Dict[str, Any]] = []
+) -> List[PaperInfo]:
+    projected: List[PaperInfo] = []
     for paper, descriptor in zip(papers, descriptors):
         enriched = dict(paper)
         enriched["source_mode"] = descriptor.source_mode
@@ -102,6 +104,5 @@ def project_descriptors_to_legacy_papers(
         enriched["metadata_confidence"] = descriptor.metadata_confidence
         enriched["metadata_source_priority_snapshot"] = list(descriptor.metadata_source_priority_snapshot)
         enriched["source_descriptor"] = descriptor.to_dict()
-        projected.append(enriched)
+        projected.append(cast(PaperInfo, enriched))
     return projected
-

@@ -4102,7 +4102,7 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
         from services.workflow_facade import build_job_request
 
         request = build_job_request(args)
-        result = JobRunner().run(request)
+        result = JobRunner().run(request, cancel_token=getattr(args, "_cancel_token", None))
         if not result.success:
             sys.exit(result.exit_code or 1)
             
