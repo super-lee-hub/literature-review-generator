@@ -491,8 +491,18 @@ def test_dispatch_command_routes_generate_section(monkeypatch) -> None:
     called = {}
 
     monkeypatch.setattr(main, "detect_runtime_environment", lambda: SimpleNamespace(display_name="test", needs_isolation_recommendation=False))
-    monkeypatch.setattr(main, "LiteratureReviewGenerator", _DummyGenerator)
-    monkeypatch.setattr(main, "handle_generate_section_mode", lambda generator, args: called.setdefault("section", args.generate_section))
+    monkeypatch.setattr(
+        "services.workflow_facade.build_job_request",
+        lambda args: SimpleNamespace(action="generate_section", generate_section=args.generate_section, progress_tracker=getattr(args, "_progress_tracker", None)),
+    )
+
+    class _Runner:
+        def run(self, request, cancel_token=None):
+            called["section"] = request.generate_section
+            called["cancel_token"] = cancel_token
+            return SimpleNamespace(success=True, exit_code=0)
+
+    monkeypatch.setattr("services.job_runner.JobRunner", _Runner)
 
     main.dispatch_command(_make_args(generate_section=3))
 
@@ -503,8 +513,18 @@ def test_dispatch_command_routes_retry_review_failed(monkeypatch) -> None:
     called = {"retry": False}
 
     monkeypatch.setattr(main, "detect_runtime_environment", lambda: SimpleNamespace(display_name="test", needs_isolation_recommendation=False))
-    monkeypatch.setattr(main, "LiteratureReviewGenerator", _DummyGenerator)
-    monkeypatch.setattr(main, "handle_retry_review_failed_mode", lambda generator: called.__setitem__("retry", True))
+    monkeypatch.setattr(
+        "services.workflow_facade.build_job_request",
+        lambda args: SimpleNamespace(action="retry_review_failed", retry_review_failed=args.retry_review_failed, progress_tracker=getattr(args, "_progress_tracker", None)),
+    )
+
+    class _Runner:
+        def run(self, request, cancel_token=None):
+            called["retry"] = bool(request.retry_review_failed)
+            called["cancel_token"] = cancel_token
+            return SimpleNamespace(success=True, exit_code=0)
+
+    monkeypatch.setattr("services.job_runner.JobRunner", _Runner)
 
     main.dispatch_command(_make_args(retry_review_failed=True))
 
@@ -515,19 +535,44 @@ def test_dispatch_command_injects_progress_tracker(monkeypatch) -> None:
     captured = {}
     tracker = object()
 
-    class _TrackingGenerator(_DummyGenerator):
-        def __init__(self, config, project_name, pdf_folder):
-            super().__init__(config, project_name, pdf_folder)
-            captured["generator"] = self
-
     monkeypatch.setattr(main, "detect_runtime_environment", lambda: SimpleNamespace(display_name="test", needs_isolation_recommendation=False))
-    monkeypatch.setattr(main, "LiteratureReviewGenerator", _TrackingGenerator)
-    monkeypatch.setattr(main, "handle_stage_one_mode", lambda generator, args: captured.setdefault("handled", True))
+    monkeypatch.setattr(
+        "services.workflow_facade.build_job_request",
+        lambda args: SimpleNamespace(action="analyze", progress_tracker=getattr(args, "_progress_tracker", None)),
+    )
+
+    class _Runner:
+        def run(self, request, cancel_token=None):
+            captured["handled"] = True
+            captured["tracker"] = request.progress_tracker
+            captured["cancel_token"] = cancel_token
+            return SimpleNamespace(success=True, exit_code=0)
+
+    monkeypatch.setattr("services.job_runner.JobRunner", _Runner)
 
     main.dispatch_command(_make_args(_progress_tracker=tracker))
 
     assert captured["handled"] is True
-    assert captured["generator"].progress_tracker is tracker
+    assert captured["tracker"] is tracker
+
+
+def test_generator_validation_helpers_read_via_compat_layer(tmp_path) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.config = ConfigDict(
+        {
+            "Validation": {
+                "stage1_enabled": "true",
+                "stage2_enabled": "false",
+            },
+            "Performance": {
+                "enable_stage1_validation": "false",
+                "enable_stage2_validation": "true",
+            },
+        }
+    )
+
+    assert generator._stage1_validation_enabled() is True
+    assert generator._stage2_validation_enabled() is False
 
 
 def test_process_all_papers_emits_stage1_progress_and_retry_updates(tmp_path, monkeypatch) -> None:

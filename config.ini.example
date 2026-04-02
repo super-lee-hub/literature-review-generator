@@ -96,6 +96,12 @@ enable_stage2_validation = false
 # - 大批量文献分析（>50篇）：建议都设为 false（速度优先）
 # - 少量高质量文献（<20篇）：建议启用第一阶段验证（准确性优先）
 
+[Validation]
+# Week 1 起，Validation 段作为验证与 checkpoint 保留策略的真值层。
+stage1_enabled = false
+stage2_enabled = false
+keep_checkpoints_after_completion = false
+
 [Retry_Settings]
 # 自动重试设置 - 当文献处理失败时的重试机制
 # 文献处理失败后的自动重试轮数

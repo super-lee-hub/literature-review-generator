@@ -30,3 +30,25 @@ Detailed guides:
 
 - 中文说明: [README.zh-CN.md](./README.zh-CN.md)
 - English: [README.en.md](./README.en.md)
+
+## Workspace Layout
+
+Week 1 introduces a job workspace layout. Real artifacts now live under:
+
+```text
+output/<project_name>__<job_id>/
+  artifacts/
+  checkpoints/
+  logs/
+  reports/
+  artifact_registry.json
+```
+
+`output/<project_name>/` is now reserved for compatibility pointers such as `_latest_job.json`. The project root output directory should not receive direct writes for summaries, checkpoints, outlines, reviews, or reports.
+
+## Resume Semantics
+
+- `stage1_progress_snapshot.json` is written alongside successful `*_summaries.json` saves.
+- `summaries-only` states are treated as `weak_resumable`.
+- Fingerprint mismatches are treated as `non_resumable`.
+- CLI and GUI both enter the same Week 1 execution boundary through `workflow_facade` and the shared config compatibility layer.

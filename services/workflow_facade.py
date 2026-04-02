@@ -6,6 +6,8 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from services.job_runner import JobRunRequest, build_job_request_from_args
+
 
 @dataclass
 class WorkflowResult:
@@ -35,6 +37,7 @@ def build_args(
     free_mode_idea: Optional[str] = None,
     gui: bool = False,
     progress_tracker: Optional[Any] = None,
+    cancel_token: Optional[Any] = None,
 ) -> argparse.Namespace:
     """Create a Namespace compatible with main.dispatch_command."""
 
@@ -59,14 +62,17 @@ def build_args(
     setattr(namespace, "free_mode_profile", free_mode_profile)
     setattr(namespace, "free_mode_idea", free_mode_idea)
     setattr(namespace, "_progress_tracker", progress_tracker)
+    setattr(namespace, "_cancel_token", cancel_token)
     return namespace
 
 
-def run_dispatch(args: argparse.Namespace) -> WorkflowResult:
+def run_dispatch(args: argparse.Namespace, cancel_token: Optional[Any] = None) -> WorkflowResult:
     """Run the existing CLI dispatcher without killing the GUI process."""
 
     from main import dispatch_command  # Local import avoids circular startup issues.
 
+    if cancel_token is not None and getattr(args, "_cancel_token", None) is None:
+        setattr(args, "_cancel_token", cancel_token)
     progress_tracker = getattr(args, "_progress_tracker", None)
     try:
         dispatch_command(args)
@@ -83,3 +89,9 @@ def run_dispatch(args: argparse.Namespace) -> WorkflowResult:
     if progress_tracker is not None:
         progress_tracker.finish(success=True)
     return WorkflowResult(success=True)
+
+
+def build_job_request(args: argparse.Namespace) -> JobRunRequest:
+    """Translate legacy CLI/GUI args into the shared Week-1 job request."""
+
+    return build_job_request_from_args(args)

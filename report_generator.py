@@ -234,6 +234,15 @@ def _build_dataframe(rows: List[Dict[str, Any]], columns: Sequence[str]) -> pd.D
     return pd.DataFrame(rows, columns=cast(Any, list(columns)))
 
 
+def _workspace_report_path(generator_instance: Any, suffix: str, fallback_name: str) -> str:  # type: ignore
+    helper = getattr(generator_instance, "_get_report_file_path", None)
+    if callable(helper):
+        return str(helper(suffix))
+    if getattr(generator_instance, "project_name", None):
+        return os.path.join(generator_instance.output_dir, f"{generator_instance.project_name}{suffix}")  # type: ignore
+    return os.path.join(generator_instance.output_dir, fallback_name)  # type: ignore
+
+
 def generate_excel_report(generator_instance: Any) -> bool:  # type: ignore
     try:
         generator_instance.logger.info("正在生成多工作表 Excel 分析报告...")  # type: ignore
@@ -346,11 +355,7 @@ def generate_excel_report(generator_instance: Any) -> bool:  # type: ignore
                     }
                 )
 
-        excel_file = (
-            os.path.join(generator_instance.output_dir, f"{generator_instance.project_name}_analyzed_papers.xlsx")  # type: ignore
-            if generator_instance.project_name  # type: ignore
-            else os.path.join(generator_instance.output_dir, "analyzed_papers.xlsx")  # type: ignore
-        )
+        excel_file = _workspace_report_path(generator_instance, "_analyzed_papers.xlsx", "analyzed_papers.xlsx")
 
         sheet_map = {
             "总表": _build_dataframe(total_rows, TOTAL_COLUMNS),
@@ -382,11 +387,7 @@ def generate_failure_report(generator_instance: Any) -> bool:  # type: ignore
         if not failed_papers:
             return True
 
-        failure_report_file = (
-            os.path.join(generator_instance.output_dir, f"{generator_instance.project_name}_failed_papers_report.txt")  # type: ignore
-            if generator_instance.project_name  # type: ignore
-            else os.path.join(generator_instance.output_dir, "failed_papers_report.txt")  # type: ignore
-        )
+        failure_report_file = _workspace_report_path(generator_instance, "_failed_papers_report.txt", "failed_papers_report.txt")
 
         with open(failure_report_file, "w", encoding="utf-8") as handle:
             handle.write("文献综述自动生成器 - 失败报告\n")
@@ -418,11 +419,7 @@ def generate_retry_zotero_report(generator_instance: Any) -> bool:  # type: igno
         if not failed_papers:
             return True
 
-        retry_report_file = (
-            os.path.join(generator_instance.output_dir, f"{generator_instance.project_name}_zotero_report_for_retry.txt")  # type: ignore
-            if generator_instance.project_name  # type: ignore
-            else os.path.join(generator_instance.output_dir, "zotero_report_for_retry.txt")  # type: ignore
-        )
+        retry_report_file = _workspace_report_path(generator_instance, "_zotero_report_for_retry.txt", "zotero_report_for_retry.txt")
 
         with open(retry_report_file, "w", encoding="utf-8") as handle:
             handle.write("Zotero 报告\n")
