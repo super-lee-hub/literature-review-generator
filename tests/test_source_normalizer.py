@@ -20,8 +20,8 @@ def test_source_normalizer_aligns_direct_pdf_inputs(tmp_path) -> None:
     assert descriptors[0].source_mode == "direct"
     assert descriptors[0].source_pdf == str(pdf_path)
     assert descriptors[0].source_pdf_fingerprint
-    assert projected[0]["source_mode"] == "direct"
-    assert projected[0]["source_descriptor"]["source_pdf"] == str(pdf_path)
+    assert projected[0].get("source_mode") == "direct"
+    assert projected[0].get("source_descriptor", {}).get("source_pdf") == str(pdf_path)
 
 
 def test_source_normalizer_aligns_zotero_inputs() -> None:

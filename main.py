@@ -18,6 +18,7 @@ import traceback
 import concurrent.futures
 import threading
 import json
+import hashlib
 import logging
 import re
 from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping
@@ -49,6 +50,7 @@ from services.environment_service import (
     recommended_conda_create_command,
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
+from services.paper_artifact import build_paper_artifact_v1
 from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
 from services.queue_service import CancelToken, JobCancelledError
 from services.model_selection import get_outline_api_config
@@ -300,6 +302,9 @@ class LiteratureReviewGenerator:
     OUTLINE_ARTIFACT_TYPE = "literature_review_outline"
     OUTLINE_ARTIFACT_ROLE = "outline"
     OUTLINE_ARTIFACT_VERSION = "v1"
+    PAPER_ARTIFACT_TYPE = "paper_artifact"
+    PAPER_ARTIFACT_ROLE = "paper"
+    PAPER_ARTIFACT_VERSION = "v1"
     
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None):
         self.config_file: str = config_file
@@ -474,6 +479,74 @@ class LiteratureReviewGenerator:
             ],
         )
         return True
+
+    @staticmethod
+    def _paper_artifact_hash(paper_key: str) -> str:
+        return hashlib.sha256(paper_key.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _paper_artifact_key(paper: Mapping[str, Any]) -> str:
+        explicit_key = str(paper.get("canonical_paper_key") or paper.get("source_paper_id") or "").strip()
+        if explicit_key:
+            return explicit_key
+        legacy_paper: Dict[str, Any] = dict(paper)
+        return LiteratureReviewGenerator.get_paper_key(legacy_paper)
+
+    def _paper_artifact_id(self, paper: Mapping[str, Any]) -> str:
+        paper_key = self._paper_artifact_key(paper)
+        return f"paper_artifact:{self._paper_artifact_hash(paper_key)}"
+
+    def _paper_artifact_path(self, paper: Mapping[str, Any]) -> str:
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        artifact_hash = self._paper_artifact_hash(self._paper_artifact_key(paper))
+        return self.job_workspace.artifact_path(f"paper_artifacts/{artifact_hash}.json")
+
+    def _persist_paper_artifact(self, result: Mapping[str, Any]) -> bool:
+        if result.get("status") != "success":
+            return True
+        if not self.job_workspace or not self.artifact_registry:
+            return True
+
+        paper = result.get("paper_info")
+        if not isinstance(paper, Mapping):
+            return True
+
+        try:
+            paper_key = self._paper_artifact_key(paper)
+            paper_artifact = build_paper_artifact_v1(
+                job_id=self.job_workspace.job_id,
+                paper=paper,
+                result=result,
+                paper_key=paper_key,
+            )
+            artifact_path = self._paper_artifact_path(paper)
+            atomic_write_json(artifact_path, paper_artifact.to_dict())
+
+            depends_on: List[ArtifactDependencyRef] = []
+            source_pdf = str(paper_artifact.source.get("source_pdf") or "")
+            if source_pdf:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type="source_pdf",
+                        path=source_pdf,
+                        content_hash=str(paper_artifact.source.get("source_pdf_fingerprint") or ""),
+                    )
+                )
+
+            self.artifact_registry.register_file(
+                artifact_role=self.PAPER_ARTIFACT_ROLE,
+                artifact_type=self.PAPER_ARTIFACT_TYPE,
+                artifact_version=self.PAPER_ARTIFACT_VERSION,
+                path=artifact_path,
+                producer="main.LiteratureReviewGenerator.process_paper",
+                depends_on=depends_on,
+                artifact_id=self._paper_artifact_id(paper),
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to persist paper_artifact_v1: {exc}")
+            return False
 
     def _init_logger(self):
         """初始化日志记录器"""
@@ -2013,6 +2086,13 @@ class LiteratureReviewGenerator:
                 'preprocess': preprocess_metadata,
                 'source_mode': self.mode,
             }
+
+            if not self._persist_paper_artifact(result):
+                return {
+                    'paper_info': paper,
+                    'status': 'failed',
+                    'failure_reason': 'paper_artifact_v1 persistence failed',
+                }
             
             return result
             
