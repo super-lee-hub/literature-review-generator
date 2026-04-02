@@ -556,6 +556,25 @@ def test_dispatch_command_injects_progress_tracker(monkeypatch) -> None:
     assert captured["tracker"] is tracker
 
 
+def test_generator_validation_helpers_read_via_compat_layer(tmp_path) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.config = ConfigDict(
+        {
+            "Validation": {
+                "stage1_enabled": "true",
+                "stage2_enabled": "false",
+            },
+            "Performance": {
+                "enable_stage1_validation": "false",
+                "enable_stage2_validation": "true",
+            },
+        }
+    )
+
+    assert generator._stage1_validation_enabled() is True
+    assert generator._stage2_validation_enabled() is False
+
+
 def test_process_all_papers_emits_stage1_progress_and_retry_updates(tmp_path, monkeypatch) -> None:
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
     generator.logger = cast(main.CustomLogger, _DummyLogger())

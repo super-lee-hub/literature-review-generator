@@ -399,14 +399,18 @@ class LiteratureReviewGenerator:
         return False
 
     def _stage1_validation_enabled(self) -> bool:
+        if not self.compat_config and self.config is not None:
+            self.compat_config = CompatConfigView.from_config(self.config)
         if self.compat_config:
             return self.compat_config.stage1_validation_enabled()
-        return bool(self.config and hasattr(self.config, "getboolean") and self.config.getboolean('Performance', 'enable_stage1_validation', fallback=False))
+        return False
 
     def _stage2_validation_enabled(self) -> bool:
+        if not self.compat_config and self.config is not None:
+            self.compat_config = CompatConfigView.from_config(self.config)
         if self.compat_config:
             return self.compat_config.stage2_validation_enabled()
-        return bool(self.config and hasattr(self.config, "getboolean") and self.config.getboolean('Performance', 'enable_stage2_validation', fallback=False))
+        return False
 
     def _check_cancelled(self) -> None:
         if self.cancel_token is not None:
