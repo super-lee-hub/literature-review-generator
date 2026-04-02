@@ -12,6 +12,17 @@ from requests.exceptions import RequestException, Timeout, ConnectionError  # ty
 from ai_interface import _normalize_type_specific_details
 
 
+def _runtime_config(retries: str = "3", timeout: str = "600"):
+    return {
+        "Performance": {
+            "api_retry_attempts": retries,
+        },
+        "API_Parameters": {
+            "timeout_seconds": timeout,
+        },
+    }
+
+
 class TestRateLimiter:
     """RateLimiter类测试"""
 
@@ -100,11 +111,12 @@ class TestAIIinterface:
         mock_post.return_value = mock_response
 
         # 调用函数
-        result = self.ai_interface._call_ai_api(
-            "test prompt",
-            {"api_key": "test_key", "model": "test_model"},
-            "primary"
-        )
+        with patch('ai_interface.load_config', return_value=_runtime_config()):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "primary"
+            )
 
         # 验证结果
         assert result is not None
@@ -121,11 +133,12 @@ class TestAIIinterface:
         mock_post.return_value = mock_response
 
         # 应该返回None（API调用失败）
-        result = self.ai_interface._call_ai_api(
-            "test prompt",
-            {"api_key": "test_key", "model": "test_model"},
-            "system prompt"
-        )
+        with patch('ai_interface.load_config', return_value=_runtime_config()), patch('ai_interface.time.sleep', return_value=None):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
 
         assert result is None
 
@@ -136,11 +149,12 @@ class TestAIIinterface:
         mock_post.side_effect = ConnectionError("Network error")
 
         # 应该返回None（网络错误被捕获）
-        result = self.ai_interface._call_ai_api(
-            "test prompt",
-            {"api_key": "test_key", "model": "test_model"},
-            "system prompt"
-        )
+        with patch('ai_interface.load_config', return_value=_runtime_config()), patch('ai_interface.time.sleep', return_value=None):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
 
         assert result is None
 
@@ -151,11 +165,12 @@ class TestAIIinterface:
         mock_post.side_effect = Timeout("Request timeout")
 
         # 应该返回None（超时被捕获）
-        result = self.ai_interface._call_ai_api(
-            "test prompt",
-            {"api_key": "test_key", "model": "test_model"},
-            "system prompt"
-        )
+        with patch('ai_interface.load_config', return_value=_runtime_config()), patch('ai_interface.time.sleep', return_value=None):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
 
         assert result is None
 
@@ -169,14 +184,45 @@ class TestAIIinterface:
         mock_post.return_value = mock_response
 
         # 应该能够处理并返回None或抛出错误
-        result = self.ai_interface._call_ai_api(
-            "test prompt",
-            {"api_key": "test_key", "model": "test_model"},
-            "primary"
-        )
+        with patch('ai_interface.load_config', return_value=_runtime_config()):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "primary"
+            )
 
         # 验证错误处理
         assert result is None or "error" in str(result).lower()
+
+    @patch('ai_interface.requests.post')
+    def test_call_ai_api_uses_configured_retry_attempts(self, mock_post):
+        """Uses configured retry attempts."""
+        mock_post.side_effect = ConnectionError("Network error")
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="4")), patch('ai_interface.time.sleep', return_value=None):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
+
+        assert result is None
+        assert mock_post.call_count == 4
+
+    @patch('ai_interface.requests.post')
+    def test_call_ai_api_invalid_retry_config_falls_back_to_default(self, mock_post):
+        """Falls back to default retries for invalid config."""
+        mock_post.side_effect = ConnectionError("Network error")
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="invalid")), patch('ai_interface.time.sleep', return_value=None):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
+
+        assert result is None
+        assert mock_post.call_count == 3
 
 
 if __name__ == "__main__":

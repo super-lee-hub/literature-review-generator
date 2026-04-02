@@ -1,8 +1,8 @@
-# LLM Reviewer Generator
+# LLM 文献综述生成器
 
-[中文](./README.zh-CN.md) | [English](./README.en.md)
+[中文说明](./README.zh-CN.md) | [English](./README.en.md)
 
-这是一个本地运行的 AI 文献综述工具，支持两种入口：
+这是一个本地运行的 AI 文献分析与综述生成工作台，支持两种入口：
 
 - `PDF 文件夹模式`：直接分析一个文件夹里的 PDF
 - `Zotero 模式`：读取 Zotero 报告和文库路径

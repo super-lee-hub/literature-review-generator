@@ -758,6 +758,330 @@ class LiteratureReviewGenerator:
         }
         return legacy_text, preprocess_metadata
 
+    @staticmethod
+    def _normalize_metadata_scan_text(value: Any) -> str:
+        text = str(value or "")
+        text = text.replace("\u00a0", " ")
+        text = text.replace("–", "-").replace("—", "-").replace("−", "-")
+        text = re.sub(r"[*#_`]+", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    @classmethod
+    def _metadata_match_key(cls, value: Any) -> str:
+        text = cls._normalize_metadata_scan_text(value).casefold()
+        return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+
+    @staticmethod
+    def _extract_doi_from_text(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+
+        url_match = re.search(r"https?://(?:dx\.)?doi\.org/(10\.\d{4,9}/\S+)", text, flags=re.IGNORECASE)
+        if url_match:
+            text = url_match.group(1)
+        else:
+            doi_match = re.search(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", text, flags=re.IGNORECASE)
+            if doi_match:
+                text = doi_match.group(1)
+
+        return text.rstrip(".,;:)]}>\"'")
+
+    @staticmethod
+    def _is_metadata_noise_line(line: str) -> bool:
+        lowered = line.casefold()
+        if not lowered:
+            return True
+
+        noise_tokens = (
+            "issn:",
+            "journal homepage",
+            "to cite this article",
+            "to link to this article",
+            "published online",
+            "submit your article",
+            "article views",
+            "view related articles",
+            "view crossmark data",
+            "full terms & conditions",
+            "abstract",
+            "article history",
+            "keywords",
+            "subjects",
+            "received ",
+            "accepted ",
+            "revised ",
+        )
+        if any(token in lowered for token in noise_tokens):
+            return True
+
+        if " | " in line and "article" in lowered:
+            return True
+
+        if re.search(r"\b(?:vol|issue|no\.)\b", lowered) and re.search(r"\b(?:19|20)\d{2}\b", line):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_affiliation_line(line: str) -> bool:
+        lowered = line.casefold()
+        affiliation_tokens = (
+            "university",
+            "universitas",
+            "faculty",
+            "department",
+            "school",
+            "college",
+            "hospital",
+            "institute",
+            "centre",
+            "center",
+            "laboratory",
+            "contact ",
+            "@",
+            "http://",
+            "https://",
+        )
+        return any(token in lowered for token in affiliation_tokens)
+
+    @classmethod
+    def _looks_like_inverted_author_parts(cls, parts: List[str]) -> bool:
+        if len(parts) < 2 or len(parts) % 2 != 0:
+            return False
+
+        for surname_part, given_part in zip(parts[::2], parts[1::2]):
+            surname_tokens = surname_part.split()
+            given_tokens = given_part.split()
+            if len(surname_tokens) != 1 or not 1 <= len(given_tokens) <= 3:
+                return False
+
+            combined_tokens = surname_tokens + given_tokens
+            if any(any(ch.isdigit() for ch in token) for token in combined_tokens):
+                return False
+            if not all(any(ch.isalpha() for ch in token) for token in combined_tokens):
+                return False
+
+        return True
+
+    @classmethod
+    def _split_author_candidates(cls, value: Any) -> List[str]:
+        text = cls._normalize_metadata_scan_text(value)
+        if not text or cls._is_metadata_noise_line(text) or cls._is_affiliation_line(text):
+            return []
+
+        text = re.sub(r"\[[^\]]+\]", " ", text)
+        text = re.sub(r"\b(?:orcid|id)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"[©®†‡]", " ", text)
+        text = re.sub(r"\S+@\S+", " ", text)
+        text = text.replace(" & ", "; ")
+        text = re.sub(r"\band\b", ";", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip(" ,;:-")
+
+        authors: List[str] = []
+        for raw_segment in re.split(r"\s*;\s*", text):
+            segment = cls._normalize_metadata_scan_text(raw_segment).strip(" ,;:-")
+            if not segment:
+                continue
+
+            parts: List[str] = []
+            for raw_part in re.split(r"\s*,\s*", segment):
+                part = cls._normalize_metadata_scan_text(raw_part)
+                if not part:
+                    continue
+                part = re.sub(r"\s+[a-z](?:,[a-z])*$", "", part)
+                part = part.strip(" ,;:-")
+                if not part or any(ch.isdigit() for ch in part):
+                    continue
+                if cls._is_affiliation_line(part) or cls._is_metadata_noise_line(part):
+                    continue
+                parts.append(part)
+
+            if not parts:
+                continue
+
+            if cls._looks_like_inverted_author_parts(parts):
+                authors.extend(
+                    f"{given_part} {surname_part}"
+                    for surname_part, given_part in zip(parts[::2], parts[1::2])
+                )
+                continue
+
+            authors.extend(parts)
+
+        unique_authors: List[str] = []
+        for author in authors:
+            if author not in unique_authors:
+                unique_authors.append(author)
+        return unique_authors
+
+    @classmethod
+    def _extract_citation_metadata(cls, lines: List[str], title_hint: str) -> Dict[str, Any]:
+        citation_line = next((line for line in lines[:80] if "to cite this article" in line.casefold()), "")
+        if not citation_line:
+            return {}
+
+        match = re.search(
+            r"to cite this article:\s*(?P<authors>.+?)\s*\((?P<year>(?:19|20)\d{2})\)\s*(?P<rest>.+)$",
+            citation_line,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return {"doi": cls._extract_doi_from_text(citation_line)}
+
+        rest = cls._normalize_metadata_scan_text(match.group("rest"))
+        doi = cls._extract_doi_from_text(rest or citation_line)
+        if doi:
+            rest = re.sub(rf",?\s*(?:DOI|doi)\s*:?\s*{re.escape(doi)}.*$", "", rest, flags=re.IGNORECASE)
+
+        segments = [cls._normalize_metadata_scan_text(segment) for segment in rest.split(",")]
+        segments = [segment for segment in segments if segment]
+
+        metadata: Dict[str, Any] = {
+            "authors": cls._split_author_candidates(match.group("authors")),
+            "year": match.group("year"),
+            "doi": doi,
+        }
+
+        title_key = cls._metadata_match_key(title_hint)
+        if title_key and segments:
+            cumulative = ""
+            for index, segment in enumerate(segments):
+                cumulative = f"{cumulative}, {segment}" if cumulative else segment
+                if title_key and title_key in cls._metadata_match_key(cumulative):
+                    metadata["title"] = cumulative
+                    for candidate in segments[index + 1:]:
+                        if cls._is_metadata_noise_line(candidate):
+                            continue
+                        if re.search(r"\b(?:19|20)\d{2}\b", candidate):
+                            continue
+                        if re.match(r"^\d", candidate):
+                            continue
+                        metadata["journal"] = candidate
+                        break
+                    break
+
+        return metadata
+
+    @classmethod
+    def _extract_stage1_metadata(cls, stage1_text: str, paper: Mapping[str, Any]) -> Dict[str, Any]:
+        if not stage1_text:
+            return {}
+
+        scan_text = stage1_text[:20000]
+        lines = [
+            cls._normalize_metadata_scan_text(line)
+            for line in scan_text.splitlines()
+        ]
+        lines = [line for line in lines if line]
+        if not lines:
+            return {}
+
+        metadata = cls._extract_citation_metadata(lines, str(paper.get("title") or ""))
+        metadata.setdefault("doi", cls._extract_doi_from_text(scan_text))
+
+        title_hint_key = cls._metadata_match_key(paper.get("title"))
+        title_index: Optional[int] = None
+        if title_hint_key:
+            for index, line in enumerate(lines[:80]):
+                if cls._is_metadata_noise_line(line):
+                    continue
+                line_key = cls._metadata_match_key(line)
+                if not line_key:
+                    continue
+                if line_key == title_hint_key or title_hint_key in line_key or line_key in title_hint_key:
+                    title_index = index
+                    break
+
+        if title_index is not None:
+            title_line = lines[title_index]
+            if title_line:
+                metadata.setdefault("title", title_line)
+
+            if not metadata.get("journal"):
+                for index in range(title_index - 1, max(-1, title_index - 6), -1):
+                    candidate = lines[index]
+                    if cls._is_metadata_noise_line(candidate) or cls._is_affiliation_line(candidate):
+                        continue
+                    if re.search(r"\b(?:19|20)\d{2}\b", candidate):
+                        continue
+                    if re.search(r"\b(?:vol|issue|no\.)\b", candidate.casefold()):
+                        continue
+                    metadata["journal"] = candidate
+                    break
+
+            if not metadata.get("authors"):
+                author_lines: List[str] = []
+                for index in range(title_index + 1, min(len(lines), title_index + 4)):
+                    candidate = lines[index]
+                    if cls._is_metadata_noise_line(candidate) or cls._is_affiliation_line(candidate):
+                        break
+                    if re.search(r"\b(?:19|20)\d{2}\b", candidate):
+                        break
+                    author_lines.append(candidate)
+                authors = cls._split_author_candidates(" ".join(author_lines))
+                if authors:
+                    metadata["authors"] = authors
+
+            if not metadata.get("year"):
+                for index in range(title_index - 1, max(-1, title_index - 6), -1):
+                    candidate = lines[index]
+                    year_match = re.search(r"\b(?:19|20)\d{2}\b", candidate)
+                    if year_match:
+                        metadata["year"] = year_match.group(0)
+                        break
+
+        return {
+            "title": cls._normalize_metadata_scan_text(metadata.get("title")),
+            "authors": list(metadata.get("authors") or []),
+            "year": cls._normalize_metadata_scan_text(metadata.get("year")),
+            "journal": cls._normalize_metadata_scan_text(metadata.get("journal")),
+            "doi": cls._extract_doi_from_text(metadata.get("doi")),
+        }
+
+    def _apply_stage1_text_metadata_backfill(self, paper: PaperInfo, stage1_text: str) -> List[str]:
+        needs_backfill = (
+            not paper.get("authors")
+            or self._is_placeholder_metadata_value(paper.get("year"))
+            or self._is_placeholder_metadata_value(paper.get("journal"))
+            or not str(paper.get("doi") or "").strip()
+        )
+        if not needs_backfill:
+            return []
+
+        metadata = self._extract_stage1_metadata(stage1_text, paper)
+        updated_fields: List[str] = []
+
+        extracted_authors = list(metadata.get("authors") or [])
+        extracted_year = str(metadata.get("year") or "").strip()
+        extracted_journal = str(metadata.get("journal") or "").strip()
+        extracted_doi = str(metadata.get("doi") or "").strip()
+
+        if extracted_authors and not paper.get("authors"):
+            paper["authors"] = extracted_authors
+            updated_fields.append("作者")
+
+        if extracted_year and (
+            self._is_placeholder_metadata_value(paper.get("year"))
+            or not str(paper.get("year") or "").strip()
+        ):
+            paper["year"] = extracted_year
+            updated_fields.append("年份")
+
+        if extracted_journal and (
+            self._is_placeholder_metadata_value(paper.get("journal"))
+            or not str(paper.get("journal") or "").strip()
+        ):
+            paper["journal"] = extracted_journal
+            updated_fields.append("期刊")
+
+        if extracted_doi and not str(paper.get("doi") or "").strip():
+            paper["doi"] = extracted_doi
+            updated_fields.append("DOI")
+
+        return updated_fields
+
     def _resolve_free_mode_context(self) -> str:
         """Build prompt context from a saved free-mode profile or an ad-hoc idea."""
 
@@ -834,12 +1158,34 @@ class LiteratureReviewGenerator:
         return os.path.join(self.output_dir, "failed_review_sections.json")
 
     @staticmethod
-    def _is_placeholder_metadata_value(value: Any) -> bool:
+    def _metadata_match_variants(value: Any) -> Set[str]:
         text = str(value or "").strip()
+        variants: Set[str] = set()
         if not text:
+            return variants
+
+        variants.add(text)
+        for encoding in ("gb18030", "gbk"):
+            try:
+                repaired = text.encode(encoding).decode("utf-8").strip()
+            except Exception:
+                continue
+            if repaired:
+                variants.add(repaired)
+        return variants
+
+    @staticmethod
+    def _is_placeholder_metadata_value(value: Any) -> bool:
+        variants = LiteratureReviewGenerator._metadata_match_variants(value)
+        if not variants:
             return True
-        lowered = text.casefold()
-        return lowered in {"unknown", "n/a", "na", "none", "null"} or text in {"未知", "未知年份", "未知期刊"}
+
+        placeholder_texts = {"未知", "未知年份", "未知期刊"}
+        placeholder_keywords = {"unknown", "n/a", "na", "none", "null"}
+        return any(
+            candidate.casefold() in placeholder_keywords or candidate in placeholder_texts
+            for candidate in variants
+        )
 
     def _apply_ai_metadata_backfill(self, paper: PaperInfo, ai_summary: Any) -> List[str]:
         metadata = get_paper_metadata(ai_summary or {})
@@ -1128,6 +1474,13 @@ class LiteratureReviewGenerator:
                 f"阶段一输入准备成功: {len(pdf_text)}字符 "
                 f"({input_kind} / {extractor_used})"
             )
+
+            try:
+                updated_fields = self._apply_stage1_text_metadata_backfill(paper, pdf_text)
+                if updated_fields:
+                    self.logger.info(f"已从阶段一输入回填元数据字段: {', '.join(updated_fields)}")
+            except Exception as e:
+                self.logger.warning(f"阶段一输入元数据回填失败: {e}")
             
             # 调用AI API生成摘要
             self.logger.info("正在调用AI生成摘要...")

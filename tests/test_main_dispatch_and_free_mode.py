@@ -92,6 +92,14 @@ class _DummyTqdm:
         return iter(self.iterable) if self.iterable is not None else iter(())
 
 
+def _legacy_mojibake_unknown_year() -> str:
+    return "".join(chr(codepoint) for codepoint in (0x93C8, 0xE046, 0x7161, 0x9A9E, 0x7FE0, 0x5524))
+
+
+def _legacy_mojibake_unknown_journal() -> str:
+    return "".join(chr(codepoint) for codepoint in (0x93C8, 0xE046, 0x7161, 0x93C8, 0x71B7, 0x5794))
+
+
 def _quality_ready_ai_summary(
     *,
     paper_metadata: dict | None = None,
@@ -257,6 +265,13 @@ def test_validate_summary_quality_relaxes_missing_metadata_for_direct_mode() -> 
     assert result[0] is True
 
 
+def test_placeholder_metadata_detection_handles_legacy_mojibake() -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=".")
+
+    assert generator._is_placeholder_metadata_value(_legacy_mojibake_unknown_year()) is True
+    assert generator._is_placeholder_metadata_value(_legacy_mojibake_unknown_journal()) is True
+
+
 def test_process_paper_backfills_metadata_before_quality_check(tmp_path, monkeypatch) -> None:
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
     generator.logger = cast(main.CustomLogger, _DummyLogger())
@@ -323,6 +338,100 @@ def test_process_paper_backfills_metadata_before_quality_check(tmp_path, monkeyp
             "source_mode": "direct",
         }
     ]
+
+
+def test_process_paper_backfills_metadata_from_stage1_text_when_ai_metadata_is_empty(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "", "model": "m2", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+
+    stage1_text = """
+    Cogent Business & Management
+    ISSN: 2331-1975 (Online) Journal homepage: www.tandfonline.com/journals/oabm20
+    Conversational AI in hospitality and tourism: a bibliometric-systematic review
+    Muhammad Fikry Aransyah, Bambang Hermanto, Anang Muftiadi & Hera Oktadiana
+    To cite this article: Muhammad Fikry Aransyah, Bambang Hermanto, Anang Muftiadi & Hera Oktadiana (2026) Conversational AI in hospitality and tourism: a bibliometric-systematic review, Cogent Business & Management, 13:1, 2613599, DOI: 10.1080/23311975.2026.2613599
+    ABSTRACT
+    """ + ("x" * 1200)
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda _path: (stage1_text, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
+    monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (True, "ok"))
+
+    paper: PaperInfo = {
+        "title": "Conversational AI in hospitality and tourism  a bibliometric systematic review",
+        "authors": [],
+        "year": _legacy_mojibake_unknown_year(),
+        "journal": _legacy_mojibake_unknown_journal(),
+        "doi": "",
+        "pdf_path": str(pdf_path),
+    }
+
+    result = generator.process_paper(paper, 0, None, 1)
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert paper["authors"] == [
+        "Muhammad Fikry Aransyah",
+        "Bambang Hermanto",
+        "Anang Muftiadi",
+        "Hera Oktadiana",
+    ]
+    assert paper["year"] == "2026"
+    assert paper["journal"] == "Cogent Business & Management"
+    assert paper["doi"] == "10.1080/23311975.2026.2613599"
+
+
+def test_process_paper_backfills_inverted_citation_authors_from_stage1_text(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "", "model": "m2", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+
+    stage1_text = """
+    Journal of AI Studies
+    Interesting Paper Title
+    Smith, John & Doe, Jane
+    To cite this article: Smith, John & Doe, Jane (2024) Interesting Paper Title, Journal of AI Studies, 1:1, 1-10, DOI: 10.1234/example
+    ABSTRACT
+    """ + ("x" * 1200)
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda _path: (stage1_text, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
+    monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (True, "ok"))
+
+    paper: PaperInfo = {
+        "title": "Interesting Paper Title",
+        "authors": [],
+        "year": _legacy_mojibake_unknown_year(),
+        "journal": _legacy_mojibake_unknown_journal(),
+        "doi": "",
+        "pdf_path": str(pdf_path),
+    }
+
+    result = generator.process_paper(paper, 0, None, 1)
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert paper["authors"] == ["John Smith", "Jane Doe"]
+    assert paper["year"] == "2024"
+    assert paper["journal"] == "Journal of AI Studies"
+    assert paper["doi"] == "10.1234/example"
 
 
 def test_generate_review_outline_prefers_outline_api_config(tmp_path, monkeypatch) -> None:

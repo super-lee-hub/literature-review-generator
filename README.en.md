@@ -1,8 +1,8 @@
-# LLM Reviewer Generator
+# LLM Literature Review Generator
 
-[中文](./README.zh-CN.md) | [English](./README.en.md)
+[中文说明](./README.zh-CN.md) | [English](./README.en.md)
 
-This is a local AI literature-review tool with two main input modes:
+This project is a local AI literature analysis and literature review generation workbench with two main input modes:
 
 - `PDF folder mode`: analyze a folder of PDFs directly
 - `Zotero mode`: use a Zotero report plus library path
