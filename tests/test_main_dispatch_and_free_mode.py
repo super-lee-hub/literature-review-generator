@@ -510,7 +510,7 @@ def test_dispatch_command_routes_generate_section(monkeypatch) -> None:
 
 
 def test_dispatch_command_routes_retry_review_failed(monkeypatch) -> None:
-    called = {"retry": False}
+    called: dict[str, object] = {"retry": False, "cancel_token": None}
 
     monkeypatch.setattr(main, "detect_runtime_environment", lambda: SimpleNamespace(display_name="test", needs_isolation_recommendation=False))
     monkeypatch.setattr(
