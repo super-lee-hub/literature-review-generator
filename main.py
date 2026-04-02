@@ -296,6 +296,10 @@ class LiteratureReviewGenerator:
     """文献综述生成器主类"""
     
     logger: CustomLogger
+    OUTLINE_ARTIFACT_ID = "literature_review_outline"
+    OUTLINE_ARTIFACT_TYPE = "literature_review_outline"
+    OUTLINE_ARTIFACT_ROLE = "outline"
+    OUTLINE_ARTIFACT_VERSION = "v1"
     
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None):
         self.config_file: str = config_file
@@ -1304,6 +1308,87 @@ class LiteratureReviewGenerator:
             return os.path.join(self.output_dir, f"{self.project_name}_literature_review_outline.md")
         return os.path.join(self.output_dir, "literature_review_outline.md")
 
+    def _get_legacy_outline_file_path(self) -> str:
+        if self.project_name:
+            if self.job_workspace is not None:
+                return os.path.join(
+                    self.job_workspace.project_pointer_dir(),
+                    f"{self.project_name}_literature_review_outline.md",
+                )
+
+            if self.config:
+                output_base_path = self.config.get("Paths", {}).get("output_path", "./output")  # type: ignore[union-attr]
+                return os.path.join(
+                    os.path.abspath(output_base_path),
+                    self.project_name,
+                    f"{self.project_name}_literature_review_outline.md",
+                )
+
+        if not self.output_dir:
+            raise ValueError("output directory is not configured")
+        return os.path.join(self.output_dir, "literature_review_outline.md")
+
+    def _write_outline_artifact(self, outline_text: str, *, producer: str) -> str:
+        outline_file = self._get_outline_file_path()
+        with open(outline_file, "w", encoding="utf-8") as handle:
+            handle.write(outline_text)
+
+        depends_on: List[ArtifactDependencyRef] = []
+        if self.summary_file:
+            depends_on.append(
+                ArtifactDependencyRef(
+                    artifact_type="summary_file",
+                    path=self.summary_file,
+                )
+            )
+
+        if self.artifact_registry:
+            self.artifact_registry.register_file(
+                artifact_role=self.OUTLINE_ARTIFACT_ROLE,
+                artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                artifact_version=self.OUTLINE_ARTIFACT_VERSION,
+                path=outline_file,
+                producer=producer,
+                depends_on=depends_on,
+                artifact_id=self.OUTLINE_ARTIFACT_ID,
+            )
+
+        return outline_file
+
+    def _resolve_outline_file_path(self) -> Optional[str]:
+        if self.artifact_registry:
+            record = self.artifact_registry.get(self.OUTLINE_ARTIFACT_ID)
+            if record and record.status == "ready" and os.path.exists(record.path):
+                self.logger.info(f"Using registered outline artifact: {record.path}")
+                return record.path
+            if record and not os.path.exists(record.path):
+                self.logger.warning(f"Registered outline artifact is missing on disk: {record.path}")
+
+        workspace_outline_file = self._get_outline_file_path()
+        if os.path.exists(workspace_outline_file):
+            self.logger.info(f"Using workspace outline file without registry lookup fallback: {workspace_outline_file}")
+            return workspace_outline_file
+
+        legacy_outline_file = self._get_legacy_outline_file_path()
+        if legacy_outline_file != workspace_outline_file and os.path.exists(legacy_outline_file):
+            self.logger.warning(f"Using legacy outline compatibility fallback: {legacy_outline_file}")
+            return legacy_outline_file
+
+        return None
+
+    def _load_outline_artifact(self) -> Optional[Tuple[str, str]]:
+        outline_file = self._resolve_outline_file_path()
+        if not outline_file:
+            self.logger.error("No outline artifact was found in the current workspace/registry or legacy fallback path")
+            return None
+
+        try:
+            with open(outline_file, "r", encoding="utf-8") as handle:
+                return outline_file, handle.read()
+        except Exception as exc:
+            self.logger.error(f"Failed to read outline artifact: {exc}")
+            return None
+
     def _get_review_checkpoint_file_path(self) -> str:
         if not self.output_dir:
             raise ValueError("输出目录未设置")
@@ -1485,13 +1570,13 @@ class LiteratureReviewGenerator:
                 self.logger.error("没有可用的摘要数据，请先运行阶段一")
                 return False
 
-            outline_file = self._get_outline_file_path()
-            if not os.path.exists(outline_file):
+            outline_artifact = self._load_outline_artifact()
+            outline_file = self._get_legacy_outline_file_path()
+            if outline_artifact is None:
                 self.logger.error(f"大纲文件不存在: {outline_file}，请先运行 --generate-outline")
                 return False
 
-            with open(outline_file, "r", encoding="utf-8") as handle:
-                outline_content = handle.read()
+            _outline_file, outline_content = outline_artifact
 
             section_title = self.extract_section_title_from_outline(outline_content, section_number)
             if not section_title:
@@ -2994,16 +3079,16 @@ class LiteratureReviewGenerator:
                 self.logger.error("输出目录未设置")
                 return False
 
-            outline_file = self._get_outline_file_path()
+            outline_artifact = self._load_outline_artifact()
             review_checkpoint_file = self._get_review_checkpoint_file_path()
             word_file = self._get_review_word_file_path()
+            outline_file = self._get_legacy_outline_file_path()
             
-            if not os.path.exists(outline_file):
+            if outline_artifact is None:
                 self.logger.error(f"大纲文件不存在: {outline_file}，请先运行 --generate-outline 生成大纲")
                 return False
             
-            with open(outline_file, 'r', encoding='utf-8') as f:
-                outline_content = f.read()
+            outline_file, outline_content = outline_artifact
             
             # 解析大纲中的所有章节
             import re
@@ -3307,9 +3392,10 @@ class LiteratureReviewGenerator:
             writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
             if 'dummy' in (writer_config.get('api_key') or ''):  # type: ignore
                 outline_content = "# Dummy Outline\n\n## Introduction\n\n## Body Paragraph\n\n## Conclusion"
-                outline_file = self._get_outline_file_path()
-                with open(outline_file, 'w', encoding='utf-8') as f:  # type: ignore
-                    f.write(outline_content)
+                outline_file = self._write_outline_artifact(
+                    outline_content,
+                    producer="main.LiteratureReviewGenerator.generate_literature_review_outline",
+                )
                 self.logger.success(f"Dummy outline saved to {outline_file}")
                 return True
             
@@ -3336,11 +3422,12 @@ class LiteratureReviewGenerator:
                 outline_text = outline_content
             
             # 生成大纲文件路径（添加项目名称前缀）
-            outline_file = self._get_outline_file_path()
+            outline_file = self._write_outline_artifact(
+                outline_text,
+                producer="main.LiteratureReviewGenerator.create_literature_review_outline",
+            )
             
             # 保存大纲文件
-            with open(outline_file, 'w', encoding='utf-8') as f:  # type: ignore
-                f.write(outline_text)
             
             self.logger.success(f"文献综述大纲已生成: {outline_file}")
             # 根据模式提供不同的命令提示
