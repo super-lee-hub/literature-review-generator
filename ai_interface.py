@@ -14,6 +14,9 @@ from summary_schema import (
     project_legacy_ai_summary,
 )
 
+_DEFAULT_TIMEOUT_SECONDS = 600
+_DEFAULT_API_RETRY_ATTEMPTS = 3
+
 
 def _default_core_variables() -> Dict[str, List[str]]:
     return project_legacy_ai_summary(default_ai_summary())["type_specific_details"]["core_variables"]
@@ -26,6 +29,36 @@ def _default_type_specific_details() -> Dict[str, Any]:
 def _normalize_type_specific_details(payload: Any) -> Dict[str, Any]:
     canonical = normalize_ai_summary({"type_specific_details": payload})
     return project_legacy_ai_summary(canonical)["type_specific_details"]
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _load_api_runtime_settings() -> Tuple[int, int]:
+    timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
+    retry_attempts = _DEFAULT_API_RETRY_ATTEMPTS
+
+    try:
+        config = load_config()
+    except Exception:
+        return timeout_seconds, retry_attempts
+
+    api_parameters = config.get("API_Parameters", {}) or {}
+    performance = config.get("Performance", {}) or {}
+    timeout_seconds = _coerce_positive_int(
+        api_parameters.get("timeout_seconds", timeout_seconds),
+        timeout_seconds,
+    )
+    retry_attempts = _coerce_positive_int(
+        performance.get("api_retry_attempts", retry_attempts),
+        retry_attempts,
+    )
+    return timeout_seconds, retry_attempts
 
 
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
@@ -56,8 +89,7 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
             return None
         
         # 从配置文件加载超时设置
-        config = load_config()
-        timeout_seconds = int(config.get('API_Parameters', {}).get('timeout_seconds', 600))
+        timeout_seconds, max_retries = _load_api_runtime_settings()
         
         api_url = f"{api_base.rstrip('/')}/chat/completions"
         
@@ -87,7 +119,6 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
             payload["response_format"] = {"type": "json_object"}
         
         # 重试逻辑
-        max_retries = 3
         response = None
         for attempt in range(max_retries):
             try:
@@ -1118,12 +1149,10 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
     if not model_name or not model_name.strip():
         raise ValueError(f"{engine_name}的模型名称不能为空")
 
-    # 读取重试配置
     try:
         config = load_config('config.ini')
-        int(config.get('Performance', {}).get('api_retry_attempts', 5))
     except Exception:
-        pass  # 使用默认值5次重试
+        config = None
 
     # 如果未提供api_base，则使用默认值
     if api_base is None:

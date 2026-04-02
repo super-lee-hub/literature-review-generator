@@ -1,8 +1,8 @@
-# LLM Reviewer Generator
+# LLM Literature Review Generator
 
 [中文说明](./README.zh-CN.md) | [English Guide](./README.en.md)
 
-This project batch-analyzes PDFs or Zotero exports and generates literature review outlines and full drafts.
+This project is a local AI literature analysis and literature review generation workbench that batch-analyzes PDFs or Zotero exports and generates literature review outlines and full drafts.
 
 ## Quick Start
 
@@ -28,5 +28,5 @@ Replace `<section_number>` with the outline section number you actually want to 
 
 Detailed guides:
 
-- 中文: [README.zh-CN.md](./README.zh-CN.md)
+- 中文说明: [README.zh-CN.md](./README.zh-CN.md)
 - English: [README.en.md](./README.en.md)
