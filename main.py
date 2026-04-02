@@ -1333,12 +1333,6 @@ class LiteratureReviewGenerator:
         with open(outline_file, "w", encoding="utf-8") as handle:
             handle.write(outline_text)
 
-        legacy_outline_file = self._get_legacy_outline_file_path()
-        if legacy_outline_file != outline_file:
-            os.makedirs(os.path.dirname(legacy_outline_file), exist_ok=True)
-            with open(legacy_outline_file, "w", encoding="utf-8") as handle:
-                handle.write(outline_text)
-
         depends_on: List[ArtifactDependencyRef] = []
         if self.summary_file:
             depends_on.append(

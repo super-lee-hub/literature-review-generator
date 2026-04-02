@@ -93,7 +93,7 @@ def test_create_literature_review_outline_registers_outline_artifact(tmp_path: P
     ]
 
     assert outline_path.read_text(encoding="utf-8") == outline_text
-    assert legacy_outline_path.read_text(encoding="utf-8") == outline_text
+    assert legacy_outline_path.exists() is False
     assert len(outline_records) == 1
     assert outline_records[0]["artifact_id"] == "literature_review_outline"
     assert outline_records[0]["artifact_role"] == "outline"
@@ -111,6 +111,7 @@ def test_generate_section_prefers_registered_outline_over_legacy_fallback(tmp_pa
         producer="tests",
     )
     legacy_outline_path = Path(generator._get_legacy_outline_file_path())
+    legacy_outline_path.parent.mkdir(parents=True, exist_ok=True)
     legacy_outline_path.write_text(
         "# Demo Outline\n\n## 1. Legacy Section\n\nLegacy details",
         encoding="utf-8",
@@ -138,9 +139,11 @@ def test_generate_section_falls_back_to_legacy_outline_when_workspace_registry_m
     monkeypatch,
 ) -> None:
     producer_generator, _workspace, _registry = _make_bound_generator(tmp_path, job_id="job-producer")
-    producer_generator._write_outline_artifact(
+    legacy_outline_path = Path(producer_generator._get_legacy_outline_file_path())
+    legacy_outline_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_outline_path.write_text(
         "# Demo Outline\n\n## 1. Compatibility Section\n\nCompatibility details",
-        producer="tests",
+        encoding="utf-8",
     )
 
     downstream_generator, downstream_workspace, _downstream_registry = _make_bound_generator(
@@ -166,6 +169,7 @@ def test_generate_section_falls_back_to_legacy_outline_when_workspace_registry_m
     assert captured["section_number"] == 1
     assert captured["section_title"].endswith("Compatibility Section")
     assert "Compatibility details" in captured["outline_content"]
+    assert Path(downstream_workspace.artifact_path("demo_literature_review_outline.md")).exists() is False
 
 
 def test_generate_review_fails_when_no_outline_is_available(tmp_path: Path, monkeypatch) -> None:
