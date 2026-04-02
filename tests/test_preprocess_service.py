@@ -3,7 +3,7 @@ from pathlib import Path
 
 import fitz  # type: ignore
 
-from preprocess.service import PreprocessManager
+from preprocess.service import PageDiagnostics, PreprocessManager
 
 
 def _make_text_pdf(path: Path) -> None:
@@ -196,3 +196,115 @@ def test_preprocess_manager_prefers_remote_mineru_when_available(tmp_path: Path,
     diagnostics = json.loads(Path(result.diagnostics_path).read_text(encoding="utf-8"))
     assert diagnostics["mineru_attempted"] is True
     assert diagnostics["mineru_succeeded"] is True
+
+
+def test_preprocess_manager_skips_docling_when_local_pipeline_is_healthy(monkeypatch) -> None:
+    manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "enabled": "true",
+                "ocr_mode": "off",
+            },
+        },
+        logger=None,
+    )
+
+    healthy_diagnostics = [
+        PageDiagnostics(
+            page_number=1,
+            text_length=600,
+            image_count=0,
+            scanned_candidate=False,
+            used_ocr=False,
+            low_quality=False,
+        )
+    ]
+    local_result = {
+        "markdown_text": "# Healthy\n\ncontent",
+        "plain_text": "Healthy content",
+        "page_index": [{"page_number": 1, "text": "Healthy content"}],
+        "page_diagnostics": healthy_diagnostics,
+        "page_blocks": [],
+        "structured_payload": {},
+        "extractor_used": "fitz",
+        "layout_fidelity": "page_text",
+        "conversion_used": "native_pdf",
+        "used_ocr": False,
+    }
+
+    monkeypatch.setattr(manager, "_extract_with_existing_local_pipeline", lambda _pdf_path: local_result)
+    monkeypatch.setattr(
+        manager,
+        "_extract_with_docling",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("docling should not run")),
+    )
+
+    result = manager._extract_with_local_fallbacks(
+        pdf_path="sample.pdf",
+        baseline_plain_text="Healthy content",
+        baseline_page_diagnostics=healthy_diagnostics,
+        baseline_page_blocks=[],
+        baseline_page_index=[{"page_number": 1, "text": "Healthy content"}],
+    )
+
+    assert result == local_result
+
+
+def test_preprocess_manager_uses_docling_when_local_pipeline_is_low_quality(monkeypatch) -> None:
+    manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "enabled": "true",
+                "ocr_mode": "off",
+            },
+        },
+        logger=None,
+    )
+
+    low_quality_diagnostics = [
+        PageDiagnostics(
+            page_number=1,
+            text_length=30,
+            image_count=1,
+            scanned_candidate=True,
+            used_ocr=True,
+            low_quality=True,
+        )
+    ]
+    local_result = {
+        "markdown_text": "",
+        "plain_text": "short",
+        "page_index": [{"page_number": 1, "text": "short"}],
+        "page_diagnostics": low_quality_diagnostics,
+        "page_blocks": [],
+        "structured_payload": {},
+        "extractor_used": "fitz",
+        "layout_fidelity": "page_text",
+        "conversion_used": "native_pdf",
+        "used_ocr": True,
+    }
+    docling_result = {
+        "markdown_text": "# Docling\n\ncontent",
+        "plain_text": "Docling content",
+        "page_index": [{"page_number": 1, "text": "Docling content"}],
+        "page_diagnostics": low_quality_diagnostics,
+        "page_blocks": [],
+        "structured_payload": {"source": "docling"},
+        "extractor_used": "docling",
+        "layout_fidelity": "layout_aware",
+        "conversion_used": "native_pdf",
+        "used_ocr": False,
+    }
+
+    monkeypatch.setattr(manager, "_extract_with_existing_local_pipeline", lambda _pdf_path: local_result)
+    monkeypatch.setattr(manager, "_extract_with_docling", lambda *_args, **_kwargs: docling_result)
+
+    result = manager._extract_with_local_fallbacks(
+        pdf_path="sample.pdf",
+        baseline_plain_text="short",
+        baseline_page_diagnostics=low_quality_diagnostics,
+        baseline_page_blocks=[],
+        baseline_page_index=[{"page_number": 1, "text": "short"}],
+    )
+
+    assert result == docling_result

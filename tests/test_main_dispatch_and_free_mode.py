@@ -6,7 +6,7 @@ from typing import cast
 from config_loader import ConfigDict
 from context_manager import validate_summary_quality
 import main
-from models import PaperInfo
+from models import APIConfig, PaperInfo, ProcessingResult, SummariesList
 
 
 def _make_args(**overrides):
@@ -59,12 +59,37 @@ class _DummyGenerator:
         self.concept_profile = None
         self.free_mode_profile_path = None
         self.free_mode_idea = None
+        self.progress_tracker = None
 
     def load_configuration(self):
         return True
 
     def setup_output_directory(self):
         return True
+
+
+class _RecordingTracker:
+    def __init__(self) -> None:
+        self.events: list[dict] = []
+
+    def emit(self, **kwargs):
+        self.events.append(dict(kwargs))
+
+
+class _DummyTqdm:
+    def __init__(self, iterable=None, total=None, desc=None):
+        self.iterable = iterable
+        self.total = total
+        self.desc = desc
+
+    def update(self, _value=1):
+        return None
+
+    def set_postfix_str(self, _value: str):
+        return None
+
+    def __iter__(self):
+        return iter(self.iterable) if self.iterable is not None else iter(())
 
 
 def _quality_ready_ai_summary(
@@ -300,6 +325,59 @@ def test_process_paper_backfills_metadata_before_quality_check(tmp_path, monkeyp
     ]
 
 
+def test_generate_review_outline_prefers_outline_api_config(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict(
+        {
+            "Writer_API": {
+                "api_key": "writer-key",
+                "model": "writer-model",
+                "api_base": "https://writer.example.com/v1",
+            },
+            "Outline_API": {
+                "api_key": "outline-key",
+                "model": "outline-model",
+                "api_base": "https://outline.example.com/v1",
+            },
+        }
+    )
+    generator.summaries = cast(
+        SummariesList,
+        [
+            cast(
+                ProcessingResult,
+                {
+                    "paper_info": {"title": "Paper A", "authors": ["Alice"]},
+                    "status": "success",
+                    "ai_summary": cast(main.AISummary, _quality_ready_ai_summary()),
+                },
+            )
+        ],
+    )
+
+    monkeypatch.setattr(main, "estimate_tokens", lambda _text: 42)
+    monkeypatch.setattr(main, "optimize_context_for_outline", lambda *_args, **_kwargs: "[]")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+
+    captured_api_config: APIConfig | None = None
+
+    def _fake_call_ai_api(*, api_config, **_kwargs):
+        nonlocal captured_api_config
+        captured_api_config = cast(APIConfig, api_config)
+        return "# Demo Outline\n\n## 1. Section\n" + ("content\n" * 30)
+
+    monkeypatch.setattr(main, "_call_ai_api", _fake_call_ai_api)
+
+    outline = generator.generate_review_outline({})
+
+    assert outline is not None
+    assert captured_api_config is not None
+    assert captured_api_config["model"] == "outline-model"
+    assert captured_api_config["api_key"] == "outline-key"
+    assert captured_api_config["api_base"] == "https://outline.example.com/v1"
+
+
 def test_dispatch_command_routes_generate_section(monkeypatch) -> None:
     called = {}
 
@@ -322,3 +400,93 @@ def test_dispatch_command_routes_retry_review_failed(monkeypatch) -> None:
     main.dispatch_command(_make_args(retry_review_failed=True))
 
     assert called["retry"] is True
+
+
+def test_dispatch_command_injects_progress_tracker(monkeypatch) -> None:
+    captured = {}
+    tracker = object()
+
+    class _TrackingGenerator(_DummyGenerator):
+        def __init__(self, config, project_name, pdf_folder):
+            super().__init__(config, project_name, pdf_folder)
+            captured["generator"] = self
+
+    monkeypatch.setattr(main, "detect_runtime_environment", lambda: SimpleNamespace(display_name="test", needs_isolation_recommendation=False))
+    monkeypatch.setattr(main, "LiteratureReviewGenerator", _TrackingGenerator)
+    monkeypatch.setattr(main, "handle_stage_one_mode", lambda generator, args: captured.setdefault("handled", True))
+
+    main.dispatch_command(_make_args(_progress_tracker=tracker))
+
+    assert captured["handled"] is True
+    assert captured["generator"].progress_tracker is tracker
+
+
+def test_process_all_papers_emits_stage1_progress_and_retry_updates(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict(
+        {
+            "Performance": {"max_workers": "2"},
+            "Retry_Settings": {"max_retry_rounds": "1", "base_retry_delay": "0", "max_retry_delay": "0"},
+        }
+    )
+    generator.papers = [
+        {"title": "Paper A", "pdf_path": str(tmp_path / "paper-a.pdf")},
+        {"title": "Paper B", "pdf_path": str(tmp_path / "paper-b.pdf")},
+    ]
+    generator.summary_file = str(tmp_path / "demo_summaries.json")
+
+    tracker = _RecordingTracker()
+    generator.progress_tracker = tracker
+
+    monkeypatch.setattr(main, "tqdm", _DummyTqdm)
+    monkeypatch.setattr(generator, "save_summaries", lambda: True)
+    monkeypatch.setattr(generator, "save_checkpoint", lambda: True)
+
+    attempts: dict[str, int] = {}
+
+    def _fake_process_paper(paper, paper_index, file_index, total_papers):
+        title = paper["title"]
+        attempts[title] = attempts.get(title, 0) + 1
+        generator._emit_progress(stage="analyze", item_label=title, message=f"正在调用AI生成摘要: {title}")
+        if title == "Paper B" and attempts[title] == 1:
+            return {
+                "paper_info": paper,
+                "status": "failed",
+                "failure_reason": "API timeout while generating summary",
+            }
+        return {
+            "paper_info": paper,
+            "status": "success",
+        }
+
+    monkeypatch.setattr(generator, "process_paper", _fake_process_paper)
+
+    assert generator.process_all_papers() is True
+    assert attempts == {"Paper A": 1, "Paper B": 2}
+
+    events = tracker.events
+    assert events[0]["stage"] == "analyze"
+    assert events[0]["total"] == 2
+    assert events[0]["current"] == 0
+    assert events[0]["success_count"] == 0
+    assert events[0]["failure_count"] == 0
+    assert events[0]["remaining_count"] == 2
+    assert events[0]["indeterminate"] is False
+    assert "开始并发处理" in events[0]["message"]
+
+    assert any(event.get("item_label") == "Paper A" and "正在调用AI生成摘要" in event.get("message", "") for event in events)
+    assert any("处理失败" in event.get("message", "") and event.get("failure_count") == 1 for event in events)
+    assert any(
+        event.get("retry_round") == 1
+        and event.get("retry_total_rounds") == 1
+        and "开始第 1 轮自动重试" in event.get("message", "")
+        for event in events
+    )
+    assert any(
+        "重试成功" in event.get("message", "")
+        and event.get("success_count") == 2
+        and event.get("failure_count") == 0
+        and event.get("remaining_count") == 0
+        for event in events
+    )

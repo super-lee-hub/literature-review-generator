@@ -7,9 +7,9 @@ import configparser
 import os
 from datetime import datetime
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from free_mode.profile_manager import get_profile_path, normalize_profile
 from free_mode.service import generate_free_mode_profile, plan_free_mode_chat_turn
@@ -683,6 +683,7 @@ class WorkspaceController:
         self.test_mode = os.environ.get("AUTO_GENERATE_GUI_TEST_MODE", "").lower() in {"1", "true", "yes"}
         self.runtime_environment = detect_runtime_environment()
         self.client: Any | None = None
+        self._registered_disconnect_clients: set[int] = set()
         self.sections = _read_existing_config(config_path)
         self.env_values = read_env_file(self.env_path)
         self.language = self.sections.get("GUI", {}).get("language", "zh-CN")
@@ -758,11 +759,78 @@ class WorkspaceController:
         return action_label(self.language, action)
 
     def register_status_label(self, label: Any) -> None:
+        self._prune_stale_bindings()
         self.bindings.status_labels.append(label)
-        label.set_text(self.status_message)
+        self._safe_apply(label, lambda element: element.set_text(self.status_message))
+
+    @staticmethod
+    def _is_deleted_client_error(exc: BaseException) -> bool:
+        return isinstance(exc, RuntimeError) and "client this element belongs to has been deleted" in str(exc).lower()
+
+    @classmethod
+    def _is_stale_element(cls, element: Any) -> bool:
+        if element is None:
+            return True
+        try:
+            if bool(getattr(element, "is_deleted", False)):
+                return True
+        except Exception:
+            return True
+        try:
+            getattr(element, "client")
+        except AttributeError:
+            return False
+        except RuntimeError as exc:
+            if cls._is_deleted_client_error(exc):
+                return True
+            raise
+        except Exception:
+            return True
+        return False
+
+    @classmethod
+    def _safe_apply(cls, element: Any, updater: Callable[[Any], None]) -> bool:
+        if cls._is_stale_element(element):
+            return False
+        try:
+            updater(element)
+            return True
+        except RuntimeError as exc:
+            if cls._is_deleted_client_error(exc):
+                return False
+            raise
+
+    @classmethod
+    def _safe_update_bound_list(cls, elements: list[Any], updater: Callable[[Any], None]) -> None:
+        live_elements: list[Any] = []
+        for element in elements:
+            if cls._safe_apply(element, updater):
+                live_elements.append(element)
+        elements[:] = live_elements
+
+    def _prune_stale_bindings(self) -> None:
+        for binding_field in fields(self.bindings):
+            bound_value = getattr(self.bindings, binding_field.name)
+            if isinstance(bound_value, list):
+                self._safe_update_bound_list(bound_value, lambda _element: None)
+            elif isinstance(bound_value, dict):
+                stale_keys = [key for key, element in list(bound_value.items()) if self._is_stale_element(element)]
+                for key in stale_keys:
+                    bound_value.pop(key, None)
 
     def register_client(self, client: Any) -> None:
         self.client = client
+        self._prune_stale_bindings()
+        if client is None:
+            return
+        client_key = id(client)
+        if client_key in self._registered_disconnect_clients:
+            return
+        self._registered_disconnect_clients.add(client_key)
+        try:
+            client.on_disconnect(lambda *_args: self._prune_stale_bindings())
+        except Exception:
+            self._registered_disconnect_clients.discard(client_key)
 
     def notify(
         self,
@@ -772,21 +840,32 @@ class WorkspaceController:
         multi_line: bool = False,
         close_button: bool | str = True,
     ) -> None:
-        if self.client is None:
+        client = self.client
+        if client is None:
             return
-        with self.client:
-            ui.notify(message, color=color, multi_line=multi_line, close_button=close_button)
+        try:
+            with client:
+                ui.notify(message, color=color, multi_line=multi_line, close_button=close_button)
+        except RuntimeError as exc:
+            if self._is_deleted_client_error(exc):
+                if self.client is client:
+                    self.client = None
+                self._prune_stale_bindings()
+                return
+            raise
 
     def register_log_widgets(self, path_label: Any, log_view: Any) -> None:
+        self._prune_stale_bindings()
         self.bindings.log_path_labels.append(path_label)
         self.bindings.log_views.append(log_view)
-        path_label.set_text(self.latest_log_path or self.t("暂无日志文件。"))
-        log_view.set_value(self.latest_log_excerpt)
+        self._safe_apply(path_label, lambda element: element.set_text(self.latest_log_path or self.t("暂无日志文件。")))
+        self._safe_apply(log_view, lambda element: element.set_value(self.latest_log_excerpt))
 
     def register_action_button(self, button: Any) -> None:
+        self._prune_stale_bindings()
         self.bindings.action_buttons.append(button)
         if self.workflow_running:
-            button.disable()
+            self._safe_apply(button, lambda element: element.disable())
 
     def register_free_mode_widgets(
         self,
@@ -799,6 +878,7 @@ class WorkspaceController:
         apply_button: Any,
         reset_button: Any,
     ) -> None:
+        self._prune_stale_bindings()
         self.bindings.free_mode_transcript_views.append(transcript_view)
         self.bindings.free_mode_profile_views.append(profile_view)
         self.bindings.free_mode_status_labels.append(status_label)
@@ -821,6 +901,7 @@ class WorkspaceController:
         overall_bar: Any,
         stage_bar: Any,
     ) -> None:
+        self._prune_stale_bindings()
         self.bindings.progress_task_labels.append(task_label)
         self.bindings.progress_stage_labels.append(stage_label)
         self.bindings.progress_message_labels.append(message_label)
@@ -833,16 +914,20 @@ class WorkspaceController:
         self.update_progress_widgets()
 
     def register_api_feedback(self, section_name: str, box: Any, label: Any, icon: Any) -> None:
+        self._prune_stale_bindings()
         self.bindings.api_feedback_boxes[section_name] = box
         self.bindings.api_feedback_labels[section_name] = label
         self.bindings.api_feedback_icons[section_name] = icon
 
     def hide_api_feedback(self, section_name: str) -> None:
+        self._prune_stale_bindings()
         box = self.bindings.api_feedback_boxes.get(section_name)
         if box is not None:
-            box.classes(add="hidden", remove="flex")
+            if not self._safe_apply(box, lambda element: element.classes(add="hidden", remove="flex")):
+                self.bindings.api_feedback_boxes.pop(section_name, None)
 
     def show_api_feedback(self, section_name: str, message: str, *, tone: str = "info") -> None:
+        self._prune_stale_bindings()
         box = self.bindings.api_feedback_boxes.get(section_name)
         label = self.bindings.api_feedback_labels.get(section_name)
         icon = self.bindings.api_feedback_icons.get(section_name)
@@ -850,28 +935,26 @@ class WorkspaceController:
             return
 
         for klass in ("ag-inline-alert-positive", "ag-inline-alert-negative", "ag-inline-alert-warning", "ag-inline-alert-info"):
-            box.classes(remove=klass)
-        box.classes(remove="hidden", add=f"flex ag-inline-alert-{tone}")
-        label.set_text(message)
-        icon.name = {
+            self._safe_apply(box, lambda element, klass=klass: element.classes(remove=klass))
+        self._safe_apply(box, lambda element: element.classes(remove="hidden", add=f"flex ag-inline-alert-{tone}"))
+        self._safe_apply(label, lambda element: element.set_text(message))
+        self._safe_apply(icon, lambda element: setattr(element, "name", {
             "positive": "task_alt",
             "negative": "error",
             "warning": "warning",
             "info": "info",
-        }.get(tone, "info")
+        }.get(tone, "info")))
 
     def set_status(self, message: str) -> None:
         self.status_message = message
-        for label in self.bindings.status_labels:
-            label.set_text(message)
+        self._safe_update_bound_list(self.bindings.status_labels, lambda element: element.set_text(message))
 
     def set_workflow_running(self, running: bool) -> None:
         self.workflow_running = running
-        for button in self.bindings.action_buttons:
-            if running:
-                button.disable()
-            else:
-                button.enable()
+        self._safe_update_bound_list(
+            self.bindings.action_buttons,
+            lambda element: element.disable() if running else element.enable(),
+        )
         self.update_free_mode_widgets()
 
     @staticmethod
@@ -944,24 +1027,22 @@ class WorkspaceController:
         disable_controls = self.workflow_running or self.free_mode_busy
         can_apply = (not disable_controls) and bool(self.free_mode_messages)
 
-        for view in self.bindings.free_mode_transcript_views:
-            view.set_value(transcript_text)
-        for view in self.bindings.free_mode_profile_views:
-            view.set_value(profile_text)
-        for label in self.bindings.free_mode_status_labels:
-            label.set_text(status_text)
-        for label in self.bindings.free_mode_hint_labels:
-            label.set_text(hint_text)
-        for button in self.bindings.free_mode_send_buttons + self.bindings.free_mode_reset_buttons:
-            if disable_controls:
-                button.disable()
-            else:
-                button.enable()
-        for button in self.bindings.free_mode_apply_buttons:
-            if can_apply:
-                button.enable()
-            else:
-                button.disable()
+        self._safe_update_bound_list(self.bindings.free_mode_transcript_views, lambda element: element.set_value(transcript_text))
+        self._safe_update_bound_list(self.bindings.free_mode_profile_views, lambda element: element.set_value(profile_text))
+        self._safe_update_bound_list(self.bindings.free_mode_status_labels, lambda element: element.set_text(status_text))
+        self._safe_update_bound_list(self.bindings.free_mode_hint_labels, lambda element: element.set_text(hint_text))
+        self._safe_update_bound_list(
+            self.bindings.free_mode_send_buttons,
+            lambda element: element.disable() if disable_controls else element.enable(),
+        )
+        self._safe_update_bound_list(
+            self.bindings.free_mode_reset_buttons,
+            lambda element: element.disable() if disable_controls else element.enable(),
+        )
+        self._safe_update_bound_list(
+            self.bindings.free_mode_apply_buttons,
+            lambda element: element.enable() if can_apply else element.disable(),
+        )
 
     def _collect_config_payload(self) -> tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
         updated_sections = ensure_config_sections(self.sections)
@@ -1168,28 +1249,24 @@ class WorkspaceController:
             progress_value = min(max(current / total, 0.0), 1.0)
         show_indeterminate = status == "running" and (indeterminate or total <= 0)
 
-        for label in self.bindings.progress_task_labels:
-            label.set_text(task_text)
-        for label in self.bindings.progress_stage_labels:
-            label.set_text(stage_text)
-        for label in self.bindings.progress_message_labels:
-            label.set_text(message_text)
-        for label in self.bindings.progress_item_labels:
-            label.set_text(item_text)
-        for label in self.bindings.progress_counts_labels:
-            label.set_text(counts_text)
-        for label in self.bindings.progress_retry_labels:
-            label.set_text(retry_text)
-        for label in self.bindings.progress_elapsed_labels:
-            label.set_text(elapsed_text)
+        self._safe_update_bound_list(self.bindings.progress_task_labels, lambda element: element.set_text(task_text))
+        self._safe_update_bound_list(self.bindings.progress_stage_labels, lambda element: element.set_text(stage_text))
+        self._safe_update_bound_list(self.bindings.progress_message_labels, lambda element: element.set_text(message_text))
+        self._safe_update_bound_list(self.bindings.progress_item_labels, lambda element: element.set_text(item_text))
+        self._safe_update_bound_list(self.bindings.progress_counts_labels, lambda element: element.set_text(counts_text))
+        self._safe_update_bound_list(self.bindings.progress_retry_labels, lambda element: element.set_text(retry_text))
+        self._safe_update_bound_list(self.bindings.progress_elapsed_labels, lambda element: element.set_text(elapsed_text))
 
-        for bar in self.bindings.progress_overall_bars + self.bindings.progress_stage_bars:
+        def _update_bar(element: Any) -> None:
             if show_indeterminate:
-                bar.props(add="indeterminate")
-                bar.set_value(0)
+                element.props(add="indeterminate")
+                element.set_value(0)
             else:
-                bar.props(remove="indeterminate")
-                bar.set_value(progress_value)
+                element.props(remove="indeterminate")
+                element.set_value(progress_value)
+
+        self._safe_update_bound_list(self.bindings.progress_overall_bars, _update_bar)
+        self._safe_update_bound_list(self.bindings.progress_stage_bars, _update_bar)
 
     def refresh_progress(self) -> None:
         if self.progress_tracker is not None:
@@ -1202,10 +1279,11 @@ class WorkspaceController:
 
     def refresh_logs(self) -> None:
         self.latest_log_path, self.latest_log_excerpt = _latest_log_excerpt(self.language)
-        for label in self.bindings.log_path_labels:
-            label.set_text(self.latest_log_path or self.t("暂无日志文件。"))
-        for log_view in self.bindings.log_views:
-            log_view.set_value(self.latest_log_excerpt)
+        self._safe_update_bound_list(
+            self.bindings.log_path_labels,
+            lambda element: element.set_text(self.latest_log_path or self.t("暂无日志文件。")),
+        )
+        self._safe_update_bound_list(self.bindings.log_views, lambda element: element.set_value(self.latest_log_excerpt))
 
     def persist_config(self, *, notify_user: bool = True) -> None:
         updated_sections, api_keys = self._collect_config_payload()

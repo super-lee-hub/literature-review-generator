@@ -20,7 +20,7 @@ import threading
 import json
 import logging
 import re
-from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union
+from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping
 from datetime import datetime
 
 ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
@@ -46,6 +46,7 @@ from services.environment_service import (
     recommended_conda_activate_command,
     recommended_conda_create_command,
 )
+from services.model_selection import get_outline_api_config
 from services.text_io import load_json_file_with_fallbacks
 from utils import ensure_dir, sanitize_path_component
 from setup_wizard import run_setup_wizard
@@ -305,6 +306,7 @@ class LiteratureReviewGenerator:
         self.processed_count: Counter = Counter(0)
         self.failed_count: Counter = Counter(0)
         self.save_lock: threading.Lock = threading.Lock()
+        self.progress_tracker: Optional[Any] = None
         self.free_mode_profile_path: Optional[str] = None
         self.free_mode_profile: Optional[Dict[str, Any]] = None
         self.free_mode_idea: Optional[str] = None
@@ -640,6 +642,49 @@ class LiteratureReviewGenerator:
         """重置计数器"""
         self.processed_count.set(0)
         self.failed_count.set(0)
+
+    @staticmethod
+    def _paper_progress_label(paper: Mapping[str, Any] | PaperInfo | None) -> str:
+        title = str((paper or {}).get('title') or '').strip()
+        return title or '未知标题'
+
+    @staticmethod
+    def _short_progress_message(message: str, max_length: int = 180) -> str:
+        normalized = " ".join(str(message or "").split())
+        if len(normalized) <= max_length:
+            return normalized
+        return normalized[: max_length - 1] + "…"
+
+    def _emit_progress(self, **kwargs: Any) -> None:
+        tracker = self.progress_tracker
+        if tracker is not None:
+            tracker.emit(**kwargs)
+
+    def _emit_stage1_progress(
+        self,
+        *,
+        total: int,
+        current: int,
+        success_count: int,
+        failure_count: int,
+        message: str,
+        item_label: str = "",
+        retry_round: int = 0,
+        retry_total_rounds: int = 0,
+    ) -> None:
+        self._emit_progress(
+            stage="analyze",
+            total=total,
+            current=current,
+            success_count=success_count,
+            failure_count=failure_count,
+            remaining_count=max(total - current, 0),
+            indeterminate=False,
+            message=message,
+            item_label=item_label,
+            retry_round=retry_round,
+            retry_total_rounds=retry_total_rounds,
+        )
 
     def _load_stage1_prompt_template(self) -> str:
         """加载阶段一结构化分析提示词模板。"""
@@ -1013,6 +1058,8 @@ class LiteratureReviewGenerator:
             self.logger.info(f"[{paper_index+1}/{total_papers}] 正在处理: {paper.get('title', '未知标题')}")
             
             # 获取PDF文件路径
+            paper_label = self._paper_progress_label(paper)
+            self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在处理: {paper_label}")
             pdf_path = paper.get('pdf_path')
             if not pdf_path and self.mode == "zotero":
                 # Zotero模式下查找PDF文件
@@ -1063,6 +1110,7 @@ class LiteratureReviewGenerator:
             
             # 准备阶段一输入
             self.logger.info(f"正在准备阶段一输入: {os.path.basename(pdf_path)}")
+            self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在准备阶段一输入: {os.path.basename(pdf_path)}")
             pdf_text, preprocess_metadata = self._prepare_stage1_input(pdf_path)
 
             if not pdf_text or len(pdf_text.strip()) < 500:  # type: ignore
@@ -1085,6 +1133,7 @@ class LiteratureReviewGenerator:
             self.logger.info("正在调用AI生成摘要...")
             
             # 提取分析引擎API配置
+            self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在调用AI生成摘要: {paper_label}")
             primary_reader_config: Dict[str, str] = self.config.get('Primary_Reader_API', {}) if self.config else {}
             reader_api_config: APIConfig = {
                 'api_key': primary_reader_config.get('api_key', ''),
@@ -1547,10 +1596,27 @@ class LiteratureReviewGenerator:
             
             if not papers_to_process:
                 self.logger.success("所有论文都已处理完成")
+                self._emit_stage1_progress(
+                    total=0,
+                    current=0,
+                    success_count=0,
+                    failure_count=0,
+                    message="所有论文都已处理完成",
+                )
                 return True
             
             # 重置计数器
             self.reset_counters()
+            run_success_count = 0
+            run_failure_count = 0
+            tracked_total = len(papers_to_process)
+            self._emit_stage1_progress(
+                total=tracked_total,
+                current=0,
+                success_count=0,
+                failure_count=0,
+                message=f"开始并发处理 {tracked_total} 篇论文",
+            )
             
             # 创建进度条
             progress_bar = tqdm(total=len(papers_to_process), desc="[阶段一] 正在分析文献")
@@ -1580,9 +1646,19 @@ class LiteratureReviewGenerator:
                             # 线程安全地增加计数器
                             with self.save_lock:
                                 self.processed_count.increment()
+                            run_success_count += 1
                             
                             # 更新进度条
                             progress_bar.update(1)
+                            completed_label = self._paper_progress_label(result.get('paper_info', paper))
+                            self._emit_stage1_progress(
+                                total=tracked_total,
+                                current=run_success_count + run_failure_count,
+                                success_count=run_success_count,
+                                failure_count=run_failure_count,
+                                item_label=completed_label,
+                                message=f"已完成 {run_success_count + run_failure_count}/{tracked_total}: {completed_label}",
+                            )
                             # 更新进度条的后缀信息
                             progress_bar.set_postfix_str(f"成功: {self.processed_count.value}, 失败: {self.failed_count.value}")
                         else:
@@ -1602,6 +1678,16 @@ class LiteratureReviewGenerator:
                             # 线程安全地增加计数器
                             with self.save_lock:
                                 self.failed_count.increment()
+                            run_failure_count += 1
+                            failed_label = self._paper_progress_label(failed_paper)
+                            self._emit_stage1_progress(
+                                total=tracked_total,
+                                current=run_success_count + run_failure_count,
+                                success_count=run_success_count,
+                                failure_count=run_failure_count,
+                                item_label=failed_label,
+                                message=f"处理失败 {run_success_count + run_failure_count}/{tracked_total}: {failed_label} | {self._short_progress_message(failure_reason)}",
+                            )
                             
                             # 更新进度条
                             progress_bar.update(1)
@@ -1634,6 +1720,16 @@ class LiteratureReviewGenerator:
                         # 线程安全地增加计数器
                         with self.save_lock:
                             self.failed_count.increment()
+                        run_failure_count += 1
+                        failed_label = self._paper_progress_label(paper)
+                        self._emit_stage1_progress(
+                            total=tracked_total,
+                            current=run_success_count + run_failure_count,
+                            success_count=run_success_count,
+                            failure_count=run_failure_count,
+                            item_label=failed_label,
+                            message=f"处理异常 {run_success_count + run_failure_count}/{tracked_total}: {failed_label} | {self._short_progress_message(failure_reason)}",
+                        )
                         
                         self.logger.error(f"任务执行异常: {e}")
                         self.logger.error(f"失败: {self.processed_count.value}成功, {self.failed_count.value}失败 - {failure_reason}")
@@ -1647,6 +1743,14 @@ class LiteratureReviewGenerator:
             # 最终保存所有数据
             self.save_summaries()
             self.save_checkpoint()
+            self._emit_stage1_progress(
+                total=tracked_total,
+                current=run_success_count + run_failure_count,
+                success_count=run_success_count,
+                failure_count=run_failure_count,
+                item_label=self._paper_progress_label(papers_to_process[-1][1]) if papers_to_process else "",
+                message=f"阶段一完成：成功 {run_success_count}，失败 {run_failure_count}",
+            )
             
             self.logger.success("\n并发处理完成！")
             self.logger.info(f"总文献数: {total_papers}")
@@ -1665,6 +1769,15 @@ class LiteratureReviewGenerator:
                 max_retry_rounds: int = int(retry_config.get('max_retry_rounds', 2))
                 base_retry_delay: int = int(retry_config.get('base_retry_delay', 30))
                 max_retry_delay: int = int(retry_config.get('max_retry_delay', 120))
+                self._emit_stage1_progress(
+                    total=tracked_total,
+                    current=run_success_count + run_failure_count,
+                    success_count=run_success_count,
+                    failure_count=run_failure_count,
+                    message=f"进入自动重试，共 {max_retry_rounds} 轮",
+                    retry_round=0,
+                    retry_total_rounds=max_retry_rounds,
+                )
                 
                 self.logger.info(f"🔄 重试配置: 最大重试轮数={max_retry_rounds}, 基础间隔={base_retry_delay}秒, 最大间隔={max_retry_delay}秒")
                 
@@ -1692,6 +1805,15 @@ class LiteratureReviewGenerator:
                 
                 # 执行自动重试（使用配置中的参数）
                 for retry_round in range(1, max_retry_rounds + 1):
+                    self._emit_stage1_progress(
+                        total=tracked_total,
+                        current=run_success_count + run_failure_count,
+                        success_count=run_success_count,
+                        failure_count=run_failure_count,
+                        message=f"开始第 {retry_round} 轮自动重试，待重试 {len(retriable_failures)} 篇",
+                        retry_round=retry_round,
+                        retry_total_rounds=max_retry_rounds,
+                    )
                     if not retriable_failures:
                         self.logger.info("没有可重试的失败论文，结束重试循环")
                         break
@@ -1701,6 +1823,15 @@ class LiteratureReviewGenerator:
                         # 使用配置的重试间隔，支持上限控制
                         calculated_delay = retry_round * base_retry_delay
                         retry_delay = min(calculated_delay, max_retry_delay)
+                        self._emit_stage1_progress(
+                            total=tracked_total,
+                            current=run_success_count + run_failure_count,
+                            success_count=run_success_count,
+                            failure_count=run_failure_count,
+                            message=f"第 {retry_round - 1} 轮重试后等待 {retry_delay} 秒",
+                            retry_round=retry_round,
+                            retry_total_rounds=max_retry_rounds,
+                        )
                         self.logger.info(f"第 {retry_round-1} 轮重试失败，等待 {retry_delay} 秒让API限制恢复...")
                         self.logger.info(f"⏰ 间隔计算: {retry_round} × {base_retry_delay} = {calculated_delay}秒，已限制上限为 {max_retry_delay}秒")
                         self.logger.info("⏳ 等待中... 这有助于避免API频率限制，提高重试成功率")
@@ -1775,8 +1906,22 @@ class LiteratureReviewGenerator:
                                     
                                     with self.save_lock:
                                         self.processed_count.increment()
+                                        self.failed_count.decrement()
+                                    run_success_count += 1
+                                    run_failure_count = max(run_failure_count - 1, 0)
                                     
                                     retry_progress_bar.update(1)
+                                    completed_label = self._paper_progress_label(result.get('paper_info', paper))
+                                    self._emit_stage1_progress(
+                                        total=tracked_total,
+                                        current=run_success_count + run_failure_count,
+                                        success_count=run_success_count,
+                                        failure_count=run_failure_count,
+                                        item_label=completed_label,
+                                        message=f"重试成功 {run_success_count}/{tracked_total}: {completed_label}",
+                                        retry_round=retry_round,
+                                        retry_total_rounds=max_retry_rounds,
+                                    )
                                     retry_progress_bar.set_postfix_str(f"成功: {self.processed_count.value}, 失败: {self.failed_count.value}")
                                 else:
                                     # 重试仍然失败
@@ -1785,6 +1930,17 @@ class LiteratureReviewGenerator:
                                         'paper_info': paper,
                                         'failure_reason': failure_reason
                                     })
+                                    failed_label = self._paper_progress_label(paper)
+                                    self._emit_stage1_progress(
+                                        total=tracked_total,
+                                        current=run_success_count + run_failure_count,
+                                        success_count=run_success_count,
+                                        failure_count=run_failure_count,
+                                        item_label=failed_label,
+                                        message=f"重试未通过 {run_success_count + run_failure_count}/{tracked_total}: {failed_label} | {self._short_progress_message(failure_reason)}",
+                                        retry_round=retry_round,
+                                        retry_total_rounds=max_retry_rounds,
+                                    )
                                     
                                     retry_progress_bar.update(1)
                                     retry_progress_bar.set_postfix_str(f"成功: {self.processed_count.value}, 失败: {self.failed_count.value}")
@@ -1807,6 +1963,17 @@ class LiteratureReviewGenerator:
                                     'paper_info': paper,
                                     'failure_reason': failure_reason
                                 })
+                                failed_label = self._paper_progress_label(paper)
+                                self._emit_stage1_progress(
+                                    total=tracked_total,
+                                    current=run_success_count + run_failure_count,
+                                    success_count=run_success_count,
+                                    failure_count=run_failure_count,
+                                    item_label=failed_label,
+                                    message=f"重试异常 {run_success_count + run_failure_count}/{tracked_total}: {failed_label} | {self._short_progress_message(failure_reason)}",
+                                    retry_round=retry_round,
+                                    retry_total_rounds=max_retry_rounds,
+                                )
                                 
                                 self.logger.error(f"重试任务执行异常: {e}")
                                 # 重试异常时立即保存，确保数据不丢失
@@ -1830,6 +1997,17 @@ class LiteratureReviewGenerator:
                 
                 # 更新失败计数
                 self.failed_count.set(len(self.failed_papers))
+                run_failure_count = len(self.failed_papers)
+                run_success_count = max(tracked_total - run_failure_count, 0)
+                self._emit_stage1_progress(
+                    total=tracked_total,
+                    current=run_success_count + run_failure_count,
+                    success_count=run_success_count,
+                    failure_count=run_failure_count,
+                    message=f"自动重试完成：成功 {run_success_count}，失败 {run_failure_count}",
+                    retry_round=max_retry_rounds if max_retry_rounds > 0 else 0,
+                    retry_total_rounds=max_retry_rounds,
+                )
                 
                 self.logger.info(f"🔄 自动重试循环完成！")
                 self.logger.info(f"📊 使用配置: {max_retry_rounds}轮重试，基础间隔{base_retry_delay}秒，上限{max_retry_delay}秒")
@@ -2730,15 +2908,10 @@ class LiteratureReviewGenerator:
             # 使用优化后的上下文
             summaries_string = optimized_context
 
-            # 提取写作引擎API配置
-            writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
-            writer_api_config: APIConfig = {
-                'api_key': writer_config.get('api_key') or '',  # type: ignore
-                'model': writer_config.get('model') or '',  # type: ignore
-                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
-            }
+            # 阶段二优先使用 Outline_API，未配置时回退到 Writer_API
+            outline_api_config: APIConfig = get_outline_api_config(self.config)
 
-            self.logger.info("正在调用写作引擎生成文献综述大纲（智能续写循环模式）...")
+            self.logger.info("正在调用大纲引擎生成文献综述大纲（智能续写循环模式）...")
 
             # ===== 智能续写循环核心逻辑 =====
             partial_outline = ""  # 存储已生成的大纲内容
@@ -2779,7 +2952,7 @@ class LiteratureReviewGenerator:
 
                     ai_response_text = _call_ai_api(
                         prompt=final_prompt,
-                        api_config=writer_api_config,
+                        api_config=outline_api_config,
                         system_prompt=system_prompt,
                         max_tokens=8192,
                         temperature=0.7,
@@ -3433,6 +3606,7 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
                 logging.warning(f"⚠️  项目名称过长（{len(args.project_name)}字符），建议使用更简洁的名称")
             
         generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+        generator.progress_tracker = getattr(args, "_progress_tracker", None)
         
         # 先加载配置和设置输出目录
         if not generator.load_configuration():

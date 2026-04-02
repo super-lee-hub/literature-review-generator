@@ -339,6 +339,23 @@ def test_workflow_page_groups_actions_and_idle_progress_is_static(page, gui_serv
     expect(progress_card.locator(".q-linear-progress--indeterminate")).to_have_count(0)
 
 
+def test_switching_between_workflow_and_logs_keeps_ui_responsive(page, gui_server):
+    _open_page(page, f'{gui_server["base_url"]}/workflow')
+    project_input = _editable_field_input(page, "项目名")
+    project_input.fill("Timer Resilience")
+    page.wait_for_timeout(1200)
+
+    _open_page(page, f'{gui_server["base_url"]}/logs')
+    expect(page.locator("textarea")).to_be_visible()
+    page.wait_for_timeout(1200)
+
+    _open_page(page, f'{gui_server["base_url"]}/workflow')
+    expect(page.get_by_role("button", name="仅分析文献")).to_be_visible()
+    project_input = _editable_field_input(page, "项目名")
+    project_input.fill("Still Responsive")
+    expect(project_input).to_have_value("Still Responsive")
+
+
 def test_workflow_actions_and_links(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/workflow')
 

@@ -82,4 +82,9 @@ class ProgressTracker:
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            return copy.deepcopy(self._snapshot)
+            snapshot = copy.deepcopy(self._snapshot)
+        if snapshot.get("status") == "running":
+            started_at = float(snapshot.get("started_at") or 0.0)
+            if started_at > 0:
+                snapshot["elapsed_seconds"] = max(0.0, time.time() - started_at)
+        return snapshot

@@ -424,6 +424,19 @@ class PreprocessManager:
         baseline_page_blocks: List[Dict[str, Any]],
         baseline_page_index: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        local_result = self._extract_with_existing_local_pipeline(pdf_path)
+        if local_result and not self._should_try_docling_fallback(
+            plain_text=str(local_result.get("plain_text", "") or ""),
+            page_diagnostics=local_result.get("page_diagnostics", []),
+        ):
+            return local_result
+
+        if local_result:
+            self._log(
+                "Trying Docling fallback because the local extraction looked incomplete or low-quality.",
+                level="info",
+            )
+
         docling_result = self._extract_with_docling(
             pdf_path=pdf_path,
             baseline_page_diagnostics=baseline_page_diagnostics,
@@ -433,7 +446,6 @@ class PreprocessManager:
         if docling_result:
             return docling_result
 
-        local_result = self._extract_with_existing_local_pipeline(pdf_path)
         if local_result:
             return local_result
 
@@ -943,6 +955,36 @@ class PreprocessManager:
             "conversion_used": "native_pdf",
             "used_ocr": any(item.used_ocr for item in baseline_page_diagnostics),
         }
+
+    def _should_try_docling_fallback(
+        self,
+        plain_text: str,
+        page_diagnostics: Iterable[Any],
+    ) -> bool:
+        if not str(plain_text or "").strip():
+            return True
+
+        diagnostics = list(page_diagnostics or [])
+        if not diagnostics:
+            return False
+
+        def _flag(item: Any, field: str) -> bool:
+            if isinstance(item, dict):
+                return bool(item.get(field, False))
+            return bool(getattr(item, field, False))
+
+        total_pages = len(diagnostics)
+        low_quality_pages = sum(1 for item in diagnostics if _flag(item, "low_quality"))
+        scanned_candidate_pages = sum(1 for item in diagnostics if _flag(item, "scanned_candidate"))
+        used_ocr_pages = sum(1 for item in diagnostics if _flag(item, "used_ocr"))
+
+        if low_quality_pages / total_pages >= 0.5:
+            return True
+        if scanned_candidate_pages / total_pages >= 0.25:
+            return True
+        if used_ocr_pages > 0:
+            return True
+        return False
 
     def _normalize_upload_targets(self, value: Any) -> List[str]:
         targets: List[str] = []
