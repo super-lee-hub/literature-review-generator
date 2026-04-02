@@ -6,6 +6,8 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from services.job_runner import JobRunRequest, build_job_request_from_args
+
 
 @dataclass
 class WorkflowResult:
@@ -83,3 +85,9 @@ def run_dispatch(args: argparse.Namespace) -> WorkflowResult:
     if progress_tracker is not None:
         progress_tracker.finish(success=True)
     return WorkflowResult(success=True)
+
+
+def build_job_request(args: argparse.Namespace) -> JobRunRequest:
+    """Translate legacy CLI/GUI args into the shared Week-1 job request."""
+
+    return build_job_request_from_args(args)

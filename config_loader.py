@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from config_validator import validate_all_config
 from dotenv import load_dotenv  # type: ignore
+from services.config_compat import apply_validation_compat_sections, read_validation_settings
 
 
 logger = logging.getLogger(__name__)
@@ -61,9 +62,10 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
     for section_name in config.sections():
         config_dict[section_name] = dict(config[section_name])
 
-    performance_section = config_dict.get("Performance", {})
-    stage1_enabled = str(performance_section.get("enable_stage1_validation", "false")).lower() == "true"
-    stage2_enabled = str(performance_section.get("enable_stage2_validation", "false")).lower() == "true"
+    config_dict = apply_validation_compat_sections(config_dict)
+    validation_settings = read_validation_settings(config_dict)
+    stage1_enabled = validation_settings.stage1_enabled
+    stage2_enabled = validation_settings.stage2_enabled
     if stage1_enabled or stage2_enabled:
         if "Validator_API" not in config.sections():
             raise configparser.Error(

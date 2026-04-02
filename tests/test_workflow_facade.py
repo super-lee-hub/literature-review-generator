@@ -1,4 +1,4 @@
-from services.workflow_facade import build_args
+from services.workflow_facade import build_args, build_job_request
 
 
 def test_build_args_supports_free_mode_and_gui_flags() -> None:
@@ -34,3 +34,29 @@ def test_build_args_supports_section_and_review_retry_flags() -> None:
     assert args.generate_section == 2
     assert args.retry_review_failed is True
     assert getattr(args, '_progress_tracker') is tracker
+
+
+def test_build_job_request_maps_legacy_args_to_shared_request() -> None:
+    tracker = object()
+    args = build_args(
+        config='config.ini',
+        project_name='demo',
+        pdf_folder='D:/papers',
+        generate_review=True,
+        free_mode_profile='profile.json',
+        free_mode_idea='Focus on mechanism differences.',
+        progress_tracker=tracker,
+        gui=True,
+    )
+
+    request = build_job_request(args)
+
+    assert request.config == 'config.ini'
+    assert request.project_name == 'demo'
+    assert request.pdf_folder == 'D:/papers'
+    assert request.action == 'generate_review'
+    assert request.generate_review is True
+    assert request.free_mode_profile == 'profile.json'
+    assert request.free_mode_idea == 'Focus on mechanism differences.'
+    assert request.progress_tracker is tracker
+    assert request.gui is True

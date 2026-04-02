@@ -15,9 +15,15 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert 'Free_Mode_API' in config
     assert 'Preprocess' in config
     assert 'Stage2_Retry' in config
+    assert 'Validation' in config
     assert config['Preprocess']['parser_mode'] == 'local'
     assert config['Preprocess']['primary_parser'] == 'local'
     assert config['Preprocess']['use_markdown_as_stage1_input'] == 'true'
+    assert config['Validation']['stage1_enabled'] == 'false'
+    assert config['Validation']['stage2_enabled'] == 'false'
+    assert config['Validation']['keep_checkpoints_after_completion'] == 'false'
+    assert config['Performance']['enable_stage1_validation'] == 'false'
+    assert config['Performance']['enable_stage2_validation'] == 'false'
 
 
 def test_write_env_file_allows_clearing_existing_keys(tmp_path) -> None:

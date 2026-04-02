@@ -23,6 +23,7 @@ from services.configuration_service import (
     save_config_and_env,
     test_api_endpoint,
 )
+from services.config_compat import apply_validation_compat_sections, read_validation_settings
 from services.environment_service import (
     RuntimeEnvironment,
     detect_runtime_environment,
@@ -703,6 +704,7 @@ class WorkspaceController:
         self.free_mode_ready_to_apply = False
         self.free_mode_busy = False
         self.status_message = f'{self.t("工作台已就绪。建议先进入“环境与路径”完成 setup，再回到“核心工作台”运行流程。")}  Build {BUILD_STAMP}'
+        validation_settings = read_validation_settings(self.sections)
         self.state: Dict[str, Any] = {
             "paths": {
                 "zotero_report": self.sections["Paths"].get("zotero_report", ""),
@@ -712,8 +714,8 @@ class WorkspaceController:
             "performance": {
                 "max_workers": self.sections["Performance"].get("max_workers", "3"),
                 "api_retry_attempts": self.sections["Performance"].get("api_retry_attempts", "5"),
-                "enable_stage1_validation": self.sections["Performance"].get("enable_stage1_validation", "false") == "true",
-                "enable_stage2_validation": self.sections["Performance"].get("enable_stage2_validation", "false") == "true",
+                "enable_stage1_validation": validation_settings.stage1_enabled,
+                "enable_stage2_validation": validation_settings.stage2_enabled,
             },
             "stage2_retry": {
                 "enabled": self.sections.get("Stage2_Retry", {}).get("enabled", "true") == "true",
@@ -1057,10 +1059,16 @@ class WorkspaceController:
             {
                 "max_workers": str(self.state["performance"]["max_workers"]),
                 "api_retry_attempts": str(self.state["performance"]["api_retry_attempts"]),
-                "enable_stage1_validation": "true" if self.state["performance"]["enable_stage1_validation"] else "false",
-                "enable_stage2_validation": "true" if self.state["performance"]["enable_stage2_validation"] else "false",
             }
         )
+        updated_sections.setdefault("Validation", {})
+        updated_sections["Validation"].update(
+            {
+                "stage1_enabled": "true" if self.state["performance"]["enable_stage1_validation"] else "false",
+                "stage2_enabled": "true" if self.state["performance"]["enable_stage2_validation"] else "false",
+            }
+        )
+        updated_sections = apply_validation_compat_sections(updated_sections)
         updated_sections["Stage2_Retry"].update(
             {
                 "enabled": "true" if self.state["stage2_retry"]["enabled"] else "false",

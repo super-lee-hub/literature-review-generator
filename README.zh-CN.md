@@ -108,6 +108,28 @@ python main.py --project-name "你的项目名" --generate-outline
 python main.py --project-name "你的项目名" --generate-review
 ```
 
+## 3.1 Week 1 输出目录与恢复语义
+
+Week 1 起，真实产物统一写入 job workspace：
+
+```text
+output/<project_name>__<job_id>/
+  artifacts/
+  checkpoints/
+  logs/
+  reports/
+  artifact_registry.json
+```
+
+`output/<project_name>/` 只保留兼容 pointer，例如 `_latest_job.json`。除 pointer 外，代码路径不应再把摘要、checkpoint、大纲、综述正文或报告直接写回 `output/<project_name>/`。
+
+恢复语义也同步调整为：
+
+- 每次成功写入 `*_summaries.json` 时，会同步写入 `stage1_progress_snapshot.json`
+- 只有 summaries、没有 progress snapshot 的旧状态会被视为 `weak_resumable`
+- fingerprint 不一致的状态会被视为 `non_resumable`
+- GUI 和 CLI 现在都通过同一套 facade + compat 底层语义进入工作流
+
 ## 4. GUI 和 CLI 对应关系
 
 GUI 工作台里现在有这些动作：

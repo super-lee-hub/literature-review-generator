@@ -23,6 +23,15 @@ class PaperInfo(TypedDict, total=False):
     volume: str
     issue: str
     pages: str
+    source_mode: str
+    source_paper_id: str
+    canonical_paper_key: str
+    paper_key_aliases: List[str]
+    source_pdf: str
+    source_pdf_fingerprint: str
+    metadata_confidence: str
+    metadata_source_priority_snapshot: List[str]
+    source_descriptor: Dict[str, Any]
 
 
 class LegacyCommonCoreSummary(TypedDict, total=False):

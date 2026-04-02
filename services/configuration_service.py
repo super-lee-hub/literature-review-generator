@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Dict, Mapping, MutableMapping
 
 from config_validator import test_api_connection
+from services.config_compat import apply_validation_compat_sections
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,11 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "backup_rpm_limit": "9000",
             "enable_stage1_validation": "false",
             "enable_stage2_validation": "false",
+        },
+        "Validation": {
+            "stage1_enabled": "false",
+            "stage2_enabled": "false",
+            "keep_checkpoints_after_completion": "false",
         },
         "Preprocess": {
             "enabled": "true",
@@ -191,7 +197,7 @@ def ensure_config_sections(
 
     merged = default_config_sections()
     if not existing:
-        return merged
+        return apply_validation_compat_sections(merged)
 
     for section, values in existing.items():
         merged.setdefault(section, {})
@@ -207,7 +213,7 @@ def ensure_config_sections(
     if not merged["Free_Mode_API"].get("api_base"):
         merged["Free_Mode_API"]["api_base"] = merged["Outline_API"].get("api_base", "")
 
-    return merged
+    return apply_validation_compat_sections(merged)
 
 
 def read_env_file(env_path: str = ".env") -> Dict[str, str]:

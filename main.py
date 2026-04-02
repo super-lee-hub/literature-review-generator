@@ -41,12 +41,18 @@ from ai_interface import get_summary_from_ai, get_summary_from_ai_with_fallback,
 from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from preprocess.service import PreprocessManager
+from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
+from services.config_compat import CompatConfigView
 from services.environment_service import (
     detect_runtime_environment,
     recommended_conda_activate_command,
     recommended_conda_create_command,
 )
+from services.job_workspace import JobWorkspace, atomic_write_json
+from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
+from services.queue_service import CancelToken, JobCancelledError
 from services.model_selection import get_outline_api_config
+from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
 from services.text_io import load_json_file_with_fallbacks
 from utils import ensure_dir, sanitize_path_component
 from setup_wizard import run_setup_wizard
@@ -193,7 +199,7 @@ class CheckpointManager:
             if not generator.output_dir or not generator.project_name:
                 return False
 
-            checkpoint_file = os.path.join(generator.output_dir, f'{generator.project_name}_checkpoint.json')
+            checkpoint_file = generator._get_stage1_checkpoint_file_path()
 
             # 创建已处理论文的身份集合
             processed_papers: Set[str] = set()
@@ -225,8 +231,7 @@ class CheckpointManager:
                 }
             }
 
-            with open(checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
+            atomic_write_json(checkpoint_file, checkpoint_data)
 
             self.logger.info(f"[断点保存] 已保存处理进度: {len(processed_papers)}成功, {len(failed_papers)}失败")
             return True
@@ -241,7 +246,7 @@ class CheckpointManager:
             if not generator.output_dir or not generator.project_name:
                 return False
 
-            checkpoint_file = os.path.join(generator.output_dir, f'{generator.project_name}_checkpoint.json')
+            checkpoint_file = generator._get_stage1_checkpoint_file_path()
 
             if not os.path.exists(checkpoint_file):
                 self.logger.info("[断点加载] 未找到断点文件，将开始全新处理")
@@ -297,9 +302,11 @@ class LiteratureReviewGenerator:
         self.project_name: Optional[str] = project_name
         self.pdf_folder: Optional[str] = pdf_folder
         self.config: Optional['ConfigDict'] = None
+        self.compat_config: Optional[CompatConfigView] = None
         self.output_dir: Optional[str] = None
         self.summary_file: Optional[str] = None
         self.papers: List[PaperInfo] = []
+        self.source_descriptors: List[Dict[str, Any]] = []
         self.summaries: SummariesList = []
         self.failed_papers: List[FailedPaper] = []
         self.preprocess_manager: Optional[PreprocessManager] = None
@@ -310,6 +317,11 @@ class LiteratureReviewGenerator:
         self.free_mode_profile_path: Optional[str] = None
         self.free_mode_profile: Optional[Dict[str, Any]] = None
         self.free_mode_idea: Optional[str] = None
+        self.cancel_token: Optional[CancelToken] = None
+        self.job_workspace: Optional[JobWorkspace] = None
+        self.artifact_registry: Optional[ArtifactRegistry] = None
+        self.job_fingerprint_bundle: Dict[str, Any] = {}
+        self.resume_state_report: Optional[ResumeStateReport] = None
 
         # 身份基断点续传相关变量
         self._checkpoint_processed_papers: Set[str] = set()
@@ -332,7 +344,129 @@ class LiteratureReviewGenerator:
         # 初始化服务组件
         self.reporting_service: ReportingService = ReportingService(self.logger)
         self.checkpoint_manager: CheckpointManager = CheckpointManager(self.logger)
-    
+
+    def bind_job_workspace(
+        self,
+        *,
+        workspace: JobWorkspace,
+        artifact_registry: ArtifactRegistry,
+        compat_config: CompatConfigView,
+        fingerprint_bundle: Dict[str, Any],
+        resume_state_report: ResumeStateReport,
+    ) -> None:
+        self.job_workspace = workspace
+        self.artifact_registry = artifact_registry
+        self.compat_config = compat_config
+        self.job_fingerprint_bundle = dict(fingerprint_bundle)
+        self.resume_state_report = resume_state_report
+        self.project_name = workspace.project_name
+        self.output_dir = workspace.root_dir
+        self.summary_file = workspace.artifact_path(f"{workspace.project_name}_summaries.json")
+
+    def _get_stage1_checkpoint_file_path(self) -> str:
+        if self.job_workspace and self.project_name:
+            return self.job_workspace.checkpoint_path(f"{self.project_name}_checkpoint.json")
+        if self.output_dir and self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_checkpoint.json")
+        return "checkpoint.json"
+
+    def _get_summary_file_path(self) -> str:
+        if self.summary_file:
+            return self.summary_file
+        if self.job_workspace and self.project_name:
+            return self.job_workspace.artifact_path(f"{self.project_name}_summaries.json")
+        if self.output_dir and self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_summaries.json")
+        return "summaries.json"
+
+    def _get_report_file_path(self, suffix: str) -> str:
+        if self.job_workspace and self.project_name:
+            return self.job_workspace.report_path(f"{self.project_name}{suffix}")
+        if self.output_dir and self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}{suffix}")
+        return suffix.lstrip("_")
+
+    def _get_concept_profile_file_path(self) -> str:
+        if self.job_workspace and self.project_name:
+            return self.job_workspace.artifact_path(f"{self.project_name}_concept_profile.json")
+        if self.output_dir and self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_concept_profile.json")
+        return "concept_profile.json"
+
+    def _keep_checkpoints_after_completion(self) -> bool:
+        if self.compat_config:
+            return self.compat_config.keep_checkpoints_after_completion()
+        return False
+
+    def _stage1_validation_enabled(self) -> bool:
+        if self.compat_config:
+            return self.compat_config.stage1_validation_enabled()
+        return bool(self.config and hasattr(self.config, "getboolean") and self.config.getboolean('Performance', 'enable_stage1_validation', fallback=False))
+
+    def _stage2_validation_enabled(self) -> bool:
+        if self.compat_config:
+            return self.compat_config.stage2_validation_enabled()
+        return bool(self.config and hasattr(self.config, "getboolean") and self.config.getboolean('Performance', 'enable_stage2_validation', fallback=False))
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_token is not None:
+            self.cancel_token.check_cancelled()
+
+    def _register_workspace_artifact(
+        self,
+        *,
+        artifact_role: str,
+        artifact_type: str,
+        artifact_version: str,
+        path: str,
+        producer: str = "main.LiteratureReviewGenerator",
+        depends_on: Optional[List[ArtifactDependencyRef]] = None,
+    ) -> None:
+        if not self.artifact_registry:
+            return
+        self.artifact_registry.register_file(
+            artifact_role=artifact_role,
+            artifact_type=artifact_type,
+            artifact_version=artifact_version,
+            path=path,
+            producer=producer,
+            depends_on=depends_on or [],
+        )
+
+    def _write_stage1_progress_snapshot(self) -> bool:
+        if not self.job_workspace or not self.project_name or not self.summary_file:
+            return False
+
+        snapshot_path = self.job_workspace.artifact_path("stage1_progress_snapshot.json")
+        snapshot = Stage1ProgressSnapshot(
+            artifact_type="stage1_progress_snapshot",
+            artifact_version="v1",
+            created_from_job_id=self.job_workspace.job_id,
+            created_at=datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            project_name=self.project_name,
+            job_id=self.job_workspace.job_id,
+            summary_file=self.summary_file,
+            summary_count=len(self.summaries),
+            processed_papers=sorted(self._checkpoint_processed_papers),
+            failed_papers=sorted(self._checkpoint_failed_papers),
+            fingerprint_bundle=dict(self.job_fingerprint_bundle),
+            checkpoint_file=self._get_stage1_checkpoint_file_path(),
+        )
+        write_stage1_progress_snapshot(snapshot_path, snapshot)
+        self._register_workspace_artifact(
+            artifact_role="progress",
+            artifact_type="stage1_progress_snapshot",
+            artifact_version="v1",
+            path=snapshot_path,
+            depends_on=[
+                ArtifactDependencyRef(
+                    artifact_type="summary_file",
+                    path=self.summary_file,
+                )
+            ],
+        )
+        return True
+
     def _init_logger(self):
         """初始化日志记录器"""
         import logging
@@ -389,6 +523,7 @@ class LiteratureReviewGenerator:
             if not self.config:
                 self.logger.error("配置文件加载失败或为空")
                 return False
+            self.compat_config = CompatConfigView.from_config(self.config)
             self.preprocess_manager = PreprocessManager(config=self.config, logger=self.logger)
             self.logger.success("配置文件加载成功")
             return True
@@ -419,7 +554,31 @@ class LiteratureReviewGenerator:
             # 确定输出路径
             paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
             output_base_path: str = paths_config.get('output_path', './output')
-            self.output_dir = os.path.join(output_base_path, self.project_name)
+            if self.job_workspace is None:
+                pointer_path = os.path.join(os.path.abspath(output_base_path), self.project_name, "_latest_job.json")
+                if os.path.exists(pointer_path):
+                    try:
+                        with open(pointer_path, 'r', encoding='utf-8') as handle:
+                            pointer_payload = json.load(handle)
+                        workspace_path = str(pointer_payload.get("workspace_path", "") or "")
+                        job_id = str(pointer_payload.get("job_id", "") or "")
+                        if workspace_path and os.path.exists(workspace_path):
+                            self.job_workspace = JobWorkspace.from_workspace_path(
+                                workspace_path=workspace_path,
+                                project_name=self.project_name,
+                                job_id=job_id or None,
+                            )
+                    except Exception as exc:
+                        self.logger.warning(f"读取 latest job pointer 失败，将创建新 workspace: {exc}")
+                if self.job_workspace is None:
+                    self.job_workspace = JobWorkspace.create(
+                        base_output_dir=output_base_path,
+                        project_name=self.project_name,
+                    )
+
+            self.job_workspace.ensure_exists()
+            self.output_dir = self.job_workspace.root_dir
+            self.summary_file = self._get_summary_file_path()
             
             # 确保输出目录存在
             if ensure_dir(self.output_dir):
@@ -427,9 +586,6 @@ class LiteratureReviewGenerator:
             else:
                 self.logger.error(f"无法创建输出目录: {self.output_dir}")
                 return False
-            
-            # 确定摘要文件路径
-            self.summary_file = os.path.join(self.output_dir, f'{self.project_name}_summaries.json')
             
             return True
         except Exception as e:
@@ -514,6 +670,9 @@ class LiteratureReviewGenerator:
                 
                 self.papers.append(paper_info)
             
+            descriptors = normalize_source_papers("direct", self.papers)
+            self.source_descriptors = [descriptor.to_dict() for descriptor in descriptors]
+            self.papers = project_descriptors_to_legacy_papers(self.papers, descriptors)
             self.logger.success(f"PDF文件夹扫描完成，共 {len(self.papers)} 篇论文")
             return True
             
@@ -548,6 +707,9 @@ class LiteratureReviewGenerator:
                 self.logger.error("Zotero报告解析失败或报告为空")
                 return False
             
+            descriptors = normalize_source_papers("zotero", self.papers)
+            self.source_descriptors = [descriptor.to_dict() for descriptor in descriptors]
+            self.papers = project_descriptors_to_legacy_papers(self.papers, descriptors)
             self.logger.success(f"Zotero报告解析完成，共 {len(self.papers)} 篇论文")
             return True
             
@@ -1132,6 +1294,8 @@ class LiteratureReviewGenerator:
     def _get_outline_file_path(self) -> str:
         if not self.output_dir:
             raise ValueError("输出目录未设置")
+        if self.job_workspace is not None and self.project_name:
+            return self.job_workspace.artifact_path(f"{self.project_name}_literature_review_outline.md")
         if self.project_name:
             return os.path.join(self.output_dir, f"{self.project_name}_literature_review_outline.md")
         return os.path.join(self.output_dir, "literature_review_outline.md")
@@ -1139,6 +1303,8 @@ class LiteratureReviewGenerator:
     def _get_review_checkpoint_file_path(self) -> str:
         if not self.output_dir:
             raise ValueError("输出目录未设置")
+        if self.job_workspace is not None and self.project_name:
+            return self.job_workspace.checkpoint_path(f"{self.project_name}_review_checkpoint.json")
         if self.project_name:
             return os.path.join(self.output_dir, f"{self.project_name}_review_checkpoint.json")
         return os.path.join(self.output_dir, "review_checkpoint.json")
@@ -1146,6 +1312,8 @@ class LiteratureReviewGenerator:
     def _get_review_word_file_path(self) -> str:
         if not self.output_dir:
             raise ValueError("输出目录未设置")
+        if self.job_workspace is not None and self.project_name:
+            return self.job_workspace.report_path(f"{self.project_name}_literature_review.docx")
         if self.project_name:
             return os.path.join(self.output_dir, f"{self.project_name}_literature_review.docx")
         return os.path.join(self.output_dir, "literature_review.docx")
@@ -1153,6 +1321,8 @@ class LiteratureReviewGenerator:
     def _get_failed_review_sections_file_path(self) -> str:
         if not self.output_dir:
             raise ValueError("输出目录未设置")
+        if self.job_workspace is not None and self.project_name:
+            return self.job_workspace.report_path(f"{self.project_name}_failed_review_sections.json")
         if self.project_name:
             return os.path.join(self.output_dir, f"{self.project_name}_failed_review_sections.json")
         return os.path.join(self.output_dir, "failed_review_sections.json")
@@ -1331,6 +1501,7 @@ class LiteratureReviewGenerator:
 
     def retry_failed_review_sections(self) -> bool:
         try:
+            self._check_cancelled()
             if not self.config and not self.load_configuration():
                 return False
             if not self.output_dir and not self.setup_output_directory():
@@ -1368,8 +1539,7 @@ class LiteratureReviewGenerator:
                 "last_section_title": "",
                 "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
-            with open(checkpoint_file, "w", encoding="utf-8") as handle:
-                json.dump(checkpoint_payload, handle, ensure_ascii=False, indent=2)
+            atomic_write_json(checkpoint_file, checkpoint_payload)
 
             self.logger.info(
                 f"将从第 {resume_from_section + 1} 章开始重新生成，以补齐之前失败的章节。"
@@ -1382,6 +1552,7 @@ class LiteratureReviewGenerator:
     def process_paper(self, paper: PaperInfo, paper_index: int, file_index: Optional[FileIndex], total_papers: int) -> Optional[ProcessingResult]:
         """处理单篇论文"""
         try:
+            self._check_cancelled()
             paper_key = LiteratureReviewGenerator.get_paper_key(paper)  # type: ignore
             
             # 检查是否已在断点中处理过
@@ -1474,6 +1645,7 @@ class LiteratureReviewGenerator:
                 f"阶段一输入准备成功: {len(pdf_text)}字符 "
                 f"({input_kind} / {extractor_used})"
             )
+            self._check_cancelled()
 
             try:
                 updated_fields = self._apply_stage1_text_metadata_backfill(paper, pdf_text)
@@ -1623,7 +1795,7 @@ class LiteratureReviewGenerator:
             # ================================================================
             
             # =================== STAGE 1 VALIDATION (MODULAR) ===================
-            if self.config and hasattr(self.config, 'getboolean') and self.config.getboolean('Performance', 'enable_stage1_validation', fallback=False):
+            if self._stage1_validation_enabled():
                 ai_result = validator.validate_paper_analysis(self, pdf_text, ai_result)  # type: ignore
             # ===================================================================
             
@@ -1791,28 +1963,19 @@ class LiteratureReviewGenerator:
             # 使用线程锁确保线程安全（如果存在）
             if hasattr(self, 'save_lock'):
                 with self.save_lock:
-                    # 原子性写入文件
-                    temp_file = f"{self.summary_file}.tmp"
-                    
-                    with open(temp_file, 'w', encoding='utf-8') as f:
-                        # 写入数据
-                        json.dump(self.summaries, f, ensure_ascii=False, indent=2)
-                        f.flush()
-                    
-                    # 原子性重命名到目标文件
-                    os.replace(temp_file, self.summary_file)
+                    atomic_write_json(self.summary_file, self.summaries)
             else:
                 # 无锁版本（向后兼容）
-                # 原子性写入文件
-                temp_file = f"{self.summary_file}.tmp"
-                
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    # 写入数据
-                    json.dump(self.summaries, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                
-                # 原子性重命名到目标文件
-                os.replace(temp_file, self.summary_file)
+                atomic_write_json(self.summary_file, self.summaries)
+
+            self._register_workspace_artifact(
+                artifact_role="summary",
+                artifact_type="summary_file",
+                artifact_version="v1",
+                path=self.summary_file,
+                producer="main.LiteratureReviewGenerator.save_summaries",
+            )
+            self._write_stage1_progress_snapshot()
             
             self.logger.debug(f"[保存] 摘要文件已更新: {len(self.summaries)}条记录")
             return True
@@ -1843,7 +2006,7 @@ class LiteratureReviewGenerator:
             if not self.output_dir or not self.project_name:
                 return False
             
-            excel_file = os.path.join(self.output_dir, f'{self.project_name}_analyzed_papers.xlsx')
+            excel_file = self._get_report_file_path('_analyzed_papers.xlsx')
             
             # 生成Excel报告
             success = generate_excel_report(self)
@@ -1865,7 +2028,7 @@ class LiteratureReviewGenerator:
             if not self.output_dir or not self.project_name:
                 return False
             
-            failure_report_file = os.path.join(self.output_dir, f'{self.project_name}_failed_papers_report.txt')
+            failure_report_file = self._get_report_file_path('_failed_papers_report.txt')
             
             # 生成失败报告
             success = generate_failure_report(self)
@@ -1893,7 +2056,7 @@ class LiteratureReviewGenerator:
             # 类型守卫：确保output_dir和project_name不是None
             assert self.output_dir is not None and self.project_name is not None
             
-            retry_report_file = os.path.join(self.output_dir, f'{self.project_name}_zotero_report_for_retry.txt')
+            retry_report_file = self._get_report_file_path('_zotero_report_for_retry.txt')
             
             # 生成重跑报告
             success = generate_retry_zotero_report(self)
@@ -1912,6 +2075,7 @@ class LiteratureReviewGenerator:
     def process_all_papers(self) -> bool:
         """处理所有论文（并发处理版本）"""
         try:
+            self._check_cancelled()
             if not self.papers:
                 self.logger.error("没有论文需要处理")
                 return False
@@ -1939,6 +2103,7 @@ class LiteratureReviewGenerator:
             skipped_count = 0
             
             for i, paper in enumerate(self.papers):
+                self._check_cancelled()
                 paper_key = LiteratureReviewGenerator.get_paper_key(paper)  # type: ignore
                 if paper_key in self._checkpoint_processed_papers or paper_key in self._checkpoint_failed_papers:
                     skipped_count += 1
@@ -1984,6 +2149,7 @@ class LiteratureReviewGenerator:
                 
                 # 处理完成的任务
                 for future in concurrent.futures.as_completed(future_to_paper):
+                    self._check_cancelled()
                     _, paper = future_to_paper[future]
                     paper_key = LiteratureReviewGenerator.get_paper_key(paper)  # type: ignore
                     
@@ -2158,6 +2324,7 @@ class LiteratureReviewGenerator:
                 
                 # 执行自动重试（使用配置中的参数）
                 for retry_round in range(1, max_retry_rounds + 1):
+                    self._check_cancelled()
                     self._emit_stage1_progress(
                         total=tracked_total,
                         current=run_success_count + run_failure_count,
@@ -2456,13 +2623,9 @@ class LiteratureReviewGenerator:
                 if self.output_dir and self.project_name:
                     # 类型守卫：确保output_dir和project_name不是None
                     assert self.output_dir is not None and self.project_name is not None
-                    checkpoint_file = os.path.join(self.output_dir, f'{self.project_name}_checkpoint.json')
+                    checkpoint_file = self._get_stage1_checkpoint_file_path()
                     # 检查是否应保留检查点文件
-                    if not self.config:
-                        self.logger.warning("配置未加载，使用默认值保留检查点文件")
-                        keep_checkpoints = False
-                    else:
-                        keep_checkpoints = self.config.get('keep_checkpoints_after_completion', False)
+                    keep_checkpoints = self._keep_checkpoints_after_completion()
                     if os.path.exists(checkpoint_file) and not keep_checkpoints:
                         try:
                             os.remove(checkpoint_file)
@@ -2529,11 +2692,8 @@ class LiteratureReviewGenerator:
             if not self.output_dir:
                 self.logger.error("输出目录未设置")
                 return False
-                
-            if self.project_name:
-                word_file = os.path.join(self.output_dir, f'{self.project_name}_literature_review.docx')
-            else:
-                word_file = os.path.join(self.output_dir, 'literature_review.docx')
+
+            word_file = self._get_review_word_file_path()
             
             # 将章节内容追加到Word文档
             success = self.append_section_to_word_document(section_number, section_title, section_text, word_file)
@@ -2799,6 +2959,7 @@ class LiteratureReviewGenerator:
         """从大纲生成完整文献综述"""
         self.logger.info("=" * 60 + "\n文献综述自动生成器 - 阶段二：综述生成\n" + "=" * 60)
         try:
+            self._check_cancelled()
             if not self.load_configuration(): 
                 return False
             if not self.setup_output_directory(): 
@@ -2815,11 +2976,8 @@ class LiteratureReviewGenerator:
                 if not self.output_dir:
                     self.logger.error("输出目录未设置")
                     return False
-                    
-                if self.project_name:
-                    word_file = os.path.join(self.output_dir, f'{self.project_name}_literature_review.docx')
-                else:
-                    word_file = os.path.join(self.output_dir, 'literature_review.docx')
+
+                word_file = self._get_review_word_file_path()
                 doc = Document()  # type: ignore
                 doc.add_heading('Dummy Literature Review', 0)
                 doc.add_paragraph('This is a dummy literature review.')
@@ -2831,15 +2989,10 @@ class LiteratureReviewGenerator:
             if not self.output_dir:
                 self.logger.error("输出目录未设置")
                 return False
-                
-            if self.project_name:
-                outline_file = os.path.join(self.output_dir, f'{self.project_name}_literature_review_outline.md')  # type: ignore
-                review_checkpoint_file = os.path.join(self.output_dir, f'{self.project_name}_review_checkpoint.json')
-                word_file = os.path.join(self.output_dir, f'{self.project_name}_literature_review.docx')
-            else:
-                outline_file = os.path.join(self.output_dir, 'literature_review_outline.md')
-                review_checkpoint_file = os.path.join(self.output_dir, 'review_checkpoint.json')
-                word_file = os.path.join(self.output_dir, 'literature_review.docx')
+
+            outline_file = self._get_outline_file_path()
+            review_checkpoint_file = self._get_review_checkpoint_file_path()
+            word_file = self._get_review_word_file_path()
             
             if not os.path.exists(outline_file):
                 self.logger.error(f"大纲文件不存在: {outline_file}，请先运行 --generate-outline 生成大纲")
@@ -2961,6 +3114,7 @@ class LiteratureReviewGenerator:
             
             # 逐章生成内容（从断点开始）
             for i, (section_num, section_title) in progress_bar:
+                self._check_cancelled()
                 # 跳过已完成的章节
                 if i <= last_completed_section:
                     self.logger.info(f"[跳过] 第{section_num}章已完成，继续下一章...")
@@ -3029,8 +3183,7 @@ class LiteratureReviewGenerator:
                     'last_section_title': section_title,
                     'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
-                with open(review_checkpoint_file, 'w', encoding='utf-8') as f:
-                    json.dump(checkpoint_data, f, ensure_ascii=False, indent=2)
+                atomic_write_json(review_checkpoint_file, checkpoint_data)
                 
                 self.logger.success(f"第{section_num}章已处理并更新断点")
             
@@ -3082,11 +3235,7 @@ class LiteratureReviewGenerator:
             # 清除断点文件（表示全部完成）
             if os.path.exists(review_checkpoint_file):
                 # 检查是否应保留检查点文件
-                if not self.config:
-                    self.logger.warning("配置未加载，使用默认值清除断点文件")
-                    keep_checkpoints = False
-                else:
-                    keep_checkpoints = self.config.get('keep_checkpoints_after_completion', False)
+                keep_checkpoints = self._keep_checkpoints_after_completion()
                 if not keep_checkpoints:
                     os.remove(review_checkpoint_file)
                     self.logger.info("已清除断点文件，所有章节生成完成")
@@ -3106,7 +3255,7 @@ class LiteratureReviewGenerator:
             
             # 第二阶段验证（根据配置决定是否自动运行）
             try:
-                if self.config and self.config.getboolean('Performance', 'enable_stage2_validation', fallback=False):
+                if self._stage2_validation_enabled():
                     self.logger.info("根据配置文件自动启动第二阶段验证...")
                     from validator import run_review_validation
                     validation_success = run_review_validation(self)
@@ -3154,10 +3303,7 @@ class LiteratureReviewGenerator:
             writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
             if 'dummy' in (writer_config.get('api_key') or ''):  # type: ignore
                 outline_content = "# Dummy Outline\n\n## Introduction\n\n## Body Paragraph\n\n## Conclusion"
-                if self.project_name:
-                    outline_file = os.path.join(self.output_dir, f'{self.project_name}_literature_review_outline.md')  # type: ignore
-                else:
-                    outline_file = os.path.join(self.output_dir, 'literature_review_outline.md')  # type: ignore
+                outline_file = self._get_outline_file_path()
                 with open(outline_file, 'w', encoding='utf-8') as f:  # type: ignore
                     f.write(outline_content)
                 self.logger.success(f"Dummy outline saved to {outline_file}")
@@ -3186,10 +3332,7 @@ class LiteratureReviewGenerator:
                 outline_text = outline_content
             
             # 生成大纲文件路径（添加项目名称前缀）
-            if self.project_name:
-                outline_file = os.path.join(self.output_dir, f'{self.project_name}_literature_review_outline.md')  # type: ignore
-            else:
-                outline_file = os.path.join(self.output_dir, 'literature_review_outline.md')  # type: ignore
+            outline_file = self._get_outline_file_path()
             
             # 保存大纲文件
             with open(outline_file, 'w', encoding='utf-8') as f:  # type: ignore
@@ -3402,11 +3545,8 @@ class LiteratureReviewGenerator:
             if not self.output_dir:
                 self.logger.error("输出目录未设置")
                 return False
-                
-            if self.project_name:
-                word_file = os.path.join(self.output_dir, f'{self.project_name}_literature_review.docx')
-            else:
-                word_file = os.path.join(self.output_dir, 'literature_review.docx')
+
+            word_file = self._get_review_word_file_path()
             
             # 创建Word文档
             success = self.create_word_document(review_text, word_file)
@@ -3754,7 +3894,7 @@ class LiteratureReviewGenerator:
                 return False
             
             # 保存概念配置
-            concept_profile_file: str = os.path.join(self.output_dir, f"{self.project_name}_concept_profile.json")  # type: ignore
+            concept_profile_file: str = self._get_concept_profile_file_path()
             with open(concept_profile_file, 'w', encoding='utf-8') as f:  # type: ignore
                 json.dump(concept_profile, f, ensure_ascii=False, indent=2)
             
@@ -3958,63 +4098,13 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             if len(args.project_name) > 50:
                 logging.warning(f"⚠️  项目名称过长（{len(args.project_name)}字符），建议使用更简洁的名称")
             
-        generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
-        generator.progress_tracker = getattr(args, "_progress_tracker", None)
-        
-        # 先加载配置和设置输出目录
-        if not generator.load_configuration():
-            generator.logger.error("配置加载失败")
-            sys.exit(1)
-        
-        if not generator.setup_output_directory():
-            generator.logger.error("输出目录设置失败")
-            sys.exit(1)
-        
-        # 概念模式验证
-        generator.free_mode_profile_path = getattr(args, "free_mode_profile", None)
-        generator.free_mode_idea = getattr(args, "free_mode_idea", None)
+        from services.job_runner import JobRunner
+        from services.workflow_facade import build_job_request
 
-        if args.concept and not args.prime_with_folder:
-            generator.logger.info(f"检测到概念模式，概念名称: {args.concept}")
-            # 设置概念模式标志
-            generator.concept_mode = True
-            
-            # 尝试加载概念配置文件
-            concept_profile_file: str = os.path.join(generator.output_dir or '', f'{generator.project_name or "concept"}_concept_profile.json')  # type: ignore
-            if os.path.exists(concept_profile_file):  # type: ignore
-                try:
-                    with open(concept_profile_file, 'r', encoding='utf-8') as f:  # type: ignore
-                        generator.concept_profile = json.load(f)
-                    generator.logger.success(f"概念配置文件已加载: {concept_profile_file}")
-                except Exception as e:
-                    generator.logger.error(f"加载概念配置文件失败: {e}")
-                    generator.concept_profile = None
-            else:
-                generator.logger.warning(f"未找到概念配置文件: {concept_profile_file}")
-                generator.logger.warning("概念增强分析将无法执行，请先运行概念学习阶段")
-                generator.concept_profile = None
-        
-        # 一键执行模式
-        if args.run_all:
-            handle_run_all_mode(generator)
-        # 原有的单独执行模式
-        elif args.generate_outline:
-            handle_generate_outline_mode(generator, args)
-        elif getattr(args, "generate_section", None):
-            handle_generate_section_mode(generator, args)
-        elif args.generate_review:
-            handle_generate_review_mode(generator)
-        elif getattr(args, "retry_review_failed", False):
-            handle_retry_review_failed_mode(generator)
-        elif args.validate_review:
-            if generator.load_existing_summaries():
-                 validator.run_review_validation(generator)  # type: ignore
-            else:
-                generator.logger.error("无法加载摘要文件，请先运行阶段一")
-                sys.exit(1)
-        else:
-            # 默认执行阶段一
-            handle_stage_one_mode(generator, args)
+        request = build_job_request(args)
+        result = JobRunner().run(request)
+        if not result.success:
+            sys.exit(result.exit_code or 1)
             
     except KeyboardInterrupt:
         logging.info("用户中断程序")
@@ -4227,7 +4317,7 @@ def handle_retry_failed(args: argparse.Namespace):  # type: ignore
     papers_to_retry = []
     retry_report_file = ''  # 初始化变量
     if generator.mode == "zotero":
-        retry_report_file: str = os.path.join(generator.output_dir or '', f'{generator.project_name or "project"}_zotero_report_for_retry.txt')  # type: ignore
+        retry_report_file = generator._get_report_file_path('_zotero_report_for_retry.txt')
         if not os.path.exists(retry_report_file):  # type: ignore:
             generator.logger.error(f"Zotero模式重试失败：未找到重跑报告文件 '{retry_report_file}'")
             sys.exit(1)
@@ -4242,7 +4332,7 @@ def handle_retry_failed(args: argparse.Namespace):  # type: ignore
         # 如果没有在summaries.json中找到失败的论文，尝试从失败报告文件中读取
         if not papers_to_retry:
             generator.logger.info("在summaries.json中未找到失败的论文，正在检查失败报告...")
-            failure_report_file = os.path.join(generator.output_dir or '', f'{generator.project_name or "project"}_failed_papers_report.txt')
+            failure_report_file = generator._get_report_file_path('_failed_papers_report.txt')
             
             if os.path.exists(failure_report_file):
                 generator.logger.info(f"找到失败报告文件: {failure_report_file}")
