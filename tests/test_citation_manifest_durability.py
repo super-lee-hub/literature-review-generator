@@ -121,35 +121,37 @@ def test_successful_stage2_generation_creates_registered_citation_manifest(tmp_p
         }
     ]
 
-    # Create citation manifest directly using the builder function
-    from services.citation_manifest import build_citation_manifest_v1
-    citation_manifest = build_citation_manifest_v1(
-        job_id=workspace.job_id,
-        project_name=generator.project_name or "review",
-        manifest_id=generator.CITATION_MANIFEST_ARTIFACT_ID,
+    # Test the _persist_citation_manifest method directly to verify persistence and registration
+    assert generator._persist_citation_manifest(
         review_draft_path=review_draft_path,
         review_word_path=word_file_path,
         citations=minimal_citations,
-    )
+    ) is True, "Citation manifest persistence should succeed"
 
-    # Check the citation manifest content
-    assert citation_manifest.artifact_type == "citation_manifest"
-    assert citation_manifest.artifact_version == "v1"
-    assert citation_manifest.created_from_job_id == workspace.job_id
-    assert citation_manifest.manifest_identity["manifest_id"] == "citation_manifest:v1"
-    assert citation_manifest.review_reference["review_word_path"] == word_file_path
-    assert len(citation_manifest.citations) == 1
-    assert citation_manifest.citations[0]["text"] == "Author, A. (2024). Demo reference."
-    assert citation_manifest.citations[0]["section_title"] == "参考文献"
+    # Verify citation manifest was written to job workspace
+    citation_path = Path(workspace.artifact_path("citation_manifests/demo_citation_manifest_v1.json"))
+    assert citation_path.exists() is True, "Citation manifest should be written to job workspace"
 
-    # Test that the manifest can be converted to dict
-    manifest_dict = citation_manifest.to_dict()
-    assert "artifact_type" in manifest_dict
-    assert "artifact_version" in manifest_dict
-    assert "created_from_job_id" in manifest_dict
-    assert "manifest_identity" in manifest_dict
-    assert "review_reference" in manifest_dict
-    assert "citations" in manifest_dict
+    # Verify citation manifest was registered in ArtifactRegistry
+    registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
+    citation_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "citation_manifest"]
+    assert len(citation_records) == 1, "Citation manifest should be registered in ArtifactRegistry"
+
+    # Verify citation manifest content structure
+    artifact_payload = json.loads(citation_path.read_text(encoding="utf-8"))
+    assert artifact_payload["artifact_type"] == "citation_manifest"
+    assert artifact_payload["artifact_version"] == "v1"
+    assert artifact_payload["created_from_job_id"] == workspace.job_id
+    assert artifact_payload["manifest_identity"]["manifest_id"] == "citation_manifest:v1"
+    assert artifact_payload["review_reference"]["review_word_path"] == str(word_file_path)
+    assert len(artifact_payload["citations"]) == 1
+    assert artifact_payload["citations"][0]["text"] == "Author, A. (2024). Demo reference."
+    assert artifact_payload["citations"][0]["section_title"] == "参考文献"
+    assert any(dep["artifact_type"] == "review_draft" for dep in citation_records[0]["depends_on"]), "Citation manifest should depend on review_draft"
+
+    # Verify citation manifest is written to job workspace, not project-root truth path
+    assert str(citation_path).startswith(str(workspace.paths.artifacts_dir)), "Citation manifest should be in job workspace artifacts directory"
+    assert not str(citation_path).startswith(str(workspace.paths.root_dir) + "/output"), "Citation manifest should not be in project root output directory"
 
 
 

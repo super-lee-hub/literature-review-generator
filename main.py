@@ -698,9 +698,6 @@ class LiteratureReviewGenerator:
                 citations=citations,
             )
             artifact_path = self._citation_manifest_path()
-            # Ensure the directory exists
-            import os
-            os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
             atomic_write_json(artifact_path, citation_manifest.to_dict())
 
             depends_on: List[ArtifactDependencyRef] = []
@@ -714,7 +711,7 @@ class LiteratureReviewGenerator:
 
             self.artifact_registry.register_file(
                 artifact_role=self.CITATION_MANIFEST_ARTIFACT_ROLE,
-                artifact_type=self.CITATION_MANIFACT_ARTIFACT_TYPE,
+                artifact_type=self.CITATION_MANIFEST_ARTIFACT_TYPE,
                 artifact_version=self.CITATION_MANIFEST_ARTIFACT_VERSION,
                 path=artifact_path,
                 producer="main.LiteratureReviewGenerator.generate_full_review_from_outline",
