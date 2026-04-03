@@ -803,3 +803,34 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
         generator_instance.logger.error(f"验证综述时发生未知异常: {e}")
         traceback.print_exc()
         return False
+
+
+def run_week3_review_validation(
+    review_draft: Dict[str, Any],
+    citation_manifest: Dict[str, Any],
+    paper_artifacts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Week 3 compatibility entry point for review validation using Week 2 artifacts."""
+    from validation.review_validator import ReviewValidator
+
+    validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
+    report = validator.validate()
+
+    return {
+        "week3_validation": True,
+        "report": report,
+    }
+
+
+def run_week3_summary_recheck(
+    paper_artifacts: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Week 3 compatibility entry point for summary recheck using paper artifacts."""
+    from validation.summary_recheck import run_summary_rechecks
+
+    reports = run_summary_rechecks(paper_artifacts)
+
+    return {
+        "week3_recheck": True,
+        "reports": reports,
+    }
