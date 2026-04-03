@@ -53,6 +53,7 @@ from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
 from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
 from services.queue_service import CancelToken, JobCancelledError
+from services.review_draft import build_review_draft_v1
 from services.model_selection import get_outline_api_config
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
 from services.text_io import load_json_file_with_fallbacks
@@ -305,6 +306,10 @@ class LiteratureReviewGenerator:
     PAPER_ARTIFACT_TYPE = "paper_artifact"
     PAPER_ARTIFACT_ROLE = "paper"
     PAPER_ARTIFACT_VERSION = "v1"
+    REVIEW_DRAFT_ARTIFACT_ID = "review_draft:full_review"
+    REVIEW_DRAFT_ARTIFACT_TYPE = "review_draft"
+    REVIEW_DRAFT_ARTIFACT_ROLE = "review_draft"
+    REVIEW_DRAFT_ARTIFACT_VERSION = "v1"
     
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None):
         self.config_file: str = config_file
@@ -546,6 +551,119 @@ class LiteratureReviewGenerator:
             return True
         except Exception as exc:
             self.logger.error(f"Failed to persist paper_artifact_v1: {exc}")
+            return False
+
+    def _review_draft_path(self) -> str:
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        project_name = self.project_name or "review"
+        return self.job_workspace.artifact_path(f"review_drafts/{project_name}_review_draft_v1.json")
+
+    def _extract_review_sections_from_word_document(
+        self,
+        word_file: str,
+        *,
+        section_titles_by_number: Mapping[int, str],
+    ) -> Dict[int, Dict[str, Any]]:
+        if not os.path.exists(word_file) or not DOCX_AVAILABLE or Document is None:
+            return {}
+
+        try:
+            document = Document(word_file)  # type: ignore[operator]
+            section_map: Dict[int, Dict[str, Any]] = {}
+            current_section_number: Optional[int] = None
+            current_paragraphs: List[str] = []
+
+            def _flush_current_section() -> None:
+                nonlocal current_section_number, current_paragraphs
+                if current_section_number is None:
+                    return
+                section_map[current_section_number] = {
+                    "section_number": current_section_number,
+                    "section_title": section_titles_by_number.get(current_section_number, ""),
+                    "content": "\n\n".join(current_paragraphs).strip(),
+                }
+                current_section_number = None
+                current_paragraphs = []
+
+            for paragraph in document.paragraphs:
+                text = paragraph.text.strip()
+                style_name = str(getattr(getattr(paragraph, "style", None), "name", "") or "")
+
+                if style_name.startswith("Heading 1"):
+                    _flush_current_section()
+                    heading_match = re.search(r"(\d+)", text)
+                    if heading_match:
+                        candidate = int(heading_match.group(1))
+                        if candidate in section_titles_by_number:
+                            current_section_number = candidate
+                    continue
+
+                if current_section_number is not None and text:
+                    current_paragraphs.append(text)
+
+            _flush_current_section()
+            return section_map
+        except Exception as exc:
+            self.logger.warning(f"Failed to extract existing review sections from Word document: {exc}")
+            return {}
+
+    def _persist_review_draft(
+        self,
+        *,
+        outline_file: str,
+        review_sections: List[Dict[str, Any]],
+        references: List[str],
+        word_file: str,
+        generation_mode: str = "full_review",
+    ) -> bool:
+        if not self.job_workspace or not self.artifact_registry:
+            return True
+
+        try:
+            review_draft = build_review_draft_v1(
+                job_id=self.job_workspace.job_id,
+                project_name=self.project_name or "review",
+                draft_id=self.REVIEW_DRAFT_ARTIFACT_ID,
+                outline_artifact_id=self.OUTLINE_ARTIFACT_ID,
+                outline_source_path=outline_file,
+                summary_file=self.summary_file or "",
+                review_word_path=word_file,
+                sections=review_sections,
+                references=references,
+                generation_mode=generation_mode,
+            )
+            artifact_path = self._review_draft_path()
+            atomic_write_json(artifact_path, review_draft.to_dict())
+
+            depends_on: List[ArtifactDependencyRef] = []
+            if outline_file:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                        path=outline_file,
+                    )
+                )
+            if self.summary_file:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type="summary_file",
+                        path=self.summary_file,
+                    )
+                )
+
+            self.artifact_registry.register_file(
+                artifact_role=self.REVIEW_DRAFT_ARTIFACT_ROLE,
+                artifact_type=self.REVIEW_DRAFT_ARTIFACT_TYPE,
+                artifact_version=self.REVIEW_DRAFT_ARTIFACT_VERSION,
+                path=artifact_path,
+                producer="main.LiteratureReviewGenerator.generate_full_review_from_outline",
+                depends_on=depends_on,
+                artifact_id=self.REVIEW_DRAFT_ARTIFACT_ID,
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to persist review_draft_v1: {exc}")
             return False
 
     def _init_logger(self):
@@ -3151,6 +3269,20 @@ class LiteratureReviewGenerator:
                 doc.add_heading('Dummy Literature Review', 0)
                 doc.add_paragraph('This is a dummy literature review.')
                 doc.save(word_file)
+                if not self._persist_review_draft(
+                    outline_file="",
+                    review_sections=[
+                        {
+                            "section_number": 1,
+                            "section_title": "Dummy Literature Review",
+                            "content": "This is a dummy literature review.",
+                        }
+                    ],
+                    references=[],
+                    word_file=word_file,
+                    generation_mode="dummy_full_review",
+                ):
+                    return False
                 self.logger.success(f"Dummy review saved to {word_file}")
                 return True
             
@@ -3189,6 +3321,10 @@ class LiteratureReviewGenerator:
                     self.logger.error("请检查大纲文件，确保章节编号连续（如1, 2, 3...）")
                     return False
             self.logger.success("大纲章节编号验证通过：编号连续")
+            section_titles_by_number = {
+                int(section_num): section_title
+                for section_num, section_title in section_matches
+            }
             
             # 检查断点续传文件
             last_completed_section = 0
@@ -3276,6 +3412,15 @@ class LiteratureReviewGenerator:
                     run.font.name = font_name  # type: ignore
 
                     run.font.size = Pt(font_size_body)  # type: ignore
+
+            review_sections_by_number: Dict[int, Dict[str, Any]] = {}
+            if last_completed_section > 0 and os.path.exists(word_file):
+                review_sections_by_number.update(
+                    self._extract_review_sections_from_word_document(
+                        word_file,
+                        section_titles_by_number=section_titles_by_number,
+                    )
+                )
             
             # 用tqdm包装章节列表，显示进度条
             failed_sections: List[Dict[str, Any]] = []
@@ -3312,6 +3457,12 @@ class LiteratureReviewGenerator:
                         }
                     )
                     continue
+
+                review_sections_by_number[int(section_num)] = {
+                    "section_number": int(section_num),
+                    "section_title": section_title,
+                    "content": section_content,
+                }
                 
                 # 添加章节标题和内容到Word文档
                 doc.add_paragraph()  # 空行分隔
@@ -3419,6 +3570,22 @@ class LiteratureReviewGenerator:
                 
                 # 最终保存
                 doc.save(word_file)
+
+            if failed_sections:
+                self.logger.warning("Skipping review_draft_v1 registration because one or more review sections failed")
+            else:
+                review_sections = [
+                    review_sections_by_number[int(section_num)]
+                    for section_num, _section_title in section_matches
+                    if int(section_num) in review_sections_by_number
+                ]
+                if not self._persist_review_draft(
+                    outline_file=outline_file,
+                    review_sections=review_sections,
+                    references=references,
+                    word_file=word_file,
+                ):
+                    return False
             
             self.logger.success(f"完整文献综述已生成: {word_file}")
             
