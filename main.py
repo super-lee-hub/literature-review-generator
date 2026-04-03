@@ -54,6 +54,7 @@ from services.paper_artifact import build_paper_artifact_v1
 from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
 from services.queue_service import CancelToken, JobCancelledError
 from services.review_draft import build_review_draft_v1
+from services.citation_manifest import build_citation_manifest_v1
 from services.model_selection import get_outline_api_config
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
 from services.text_io import load_json_file_with_fallbacks
@@ -311,6 +312,11 @@ class LiteratureReviewGenerator:
     REVIEW_DRAFT_ARTIFACT_ROLE = "review_draft"
     REVIEW_DRAFT_ARTIFACT_VERSION = "v1"
     
+    CITATION_MANIFEST_ARTIFACT_ID = "citation_manifest:v1"
+    CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
+    CITATION_MANIFEST_ARTIFACT_ROLE = "citation_manifest"
+    CITATION_MANIFEST_ARTIFACT_VERSION = "v1"
+    
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None):
         self.config_file: str = config_file
         self.project_name: Optional[str] = project_name
@@ -559,6 +565,12 @@ class LiteratureReviewGenerator:
         project_name = self.project_name or "review"
         return self.job_workspace.artifact_path(f"review_drafts/{project_name}_review_draft_v1.json")
 
+    def _citation_manifest_path(self) -> str:
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        project_name = self.project_name or "review"
+        return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_manifest_v1.json")
+
     def _extract_review_sections_from_word_document(
         self,
         word_file: str,
@@ -664,6 +676,54 @@ class LiteratureReviewGenerator:
             return True
         except Exception as exc:
             self.logger.error(f"Failed to persist review_draft_v1: {exc}")
+            return False
+
+    def _persist_citation_manifest(
+        self,
+        *,
+        review_draft_path: str,
+        review_word_path: str,
+        citations: list[dict[str, Any]],
+    ) -> bool:
+        if not self.job_workspace or not self.artifact_registry:
+            return True
+
+        try:
+            citation_manifest = build_citation_manifest_v1(
+                job_id=self.job_workspace.job_id,
+                project_name=self.project_name or "review",
+                manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
+                review_draft_path=review_draft_path,
+                review_word_path=review_word_path,
+                citations=citations,
+            )
+            artifact_path = self._citation_manifest_path()
+            # Ensure the directory exists
+            import os
+            os.makedirs(os.path.dirname(artifact_path), exist_ok=True)
+            atomic_write_json(artifact_path, citation_manifest.to_dict())
+
+            depends_on: List[ArtifactDependencyRef] = []
+            if review_draft_path:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type=self.REVIEW_DRAFT_ARTIFACT_TYPE,
+                        path=review_draft_path,
+                    )
+                )
+
+            self.artifact_registry.register_file(
+                artifact_role=self.CITATION_MANIFEST_ARTIFACT_ROLE,
+                artifact_type=self.CITATION_MANIFACT_ARTIFACT_TYPE,
+                artifact_version=self.CITATION_MANIFEST_ARTIFACT_VERSION,
+                path=artifact_path,
+                producer="main.LiteratureReviewGenerator.generate_full_review_from_outline",
+                depends_on=depends_on,
+                artifact_id=self.CITATION_MANIFEST_ARTIFACT_ID,
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to persist citation_manifest_v1: {exc}")
             return False
 
     def _init_logger(self):
@@ -3584,6 +3644,26 @@ class LiteratureReviewGenerator:
                     review_sections=review_sections,
                     references=references,
                     word_file=word_file,
+                ):
+                    return False
+                
+                # Generate minimal citation data (this is a thin slice, so we'll create basic citations)
+                minimal_citations = []
+                for i, ref in enumerate(references):
+                    minimal_citations.append({
+                        "citation_id": f"cite_{i+1}",
+                        "paper_id": f"paper_{i+1}",
+                        "text": ref,
+                        "context": "Reference list",
+                        "section_number": len(section_matches) + 1,  # References section
+                        "section_title": "参考文献",
+                    })
+                
+                review_draft_path = self._review_draft_path()
+                if not self._persist_citation_manifest(
+                    review_draft_path=review_draft_path,
+                    review_word_path=word_file,
+                    citations=minimal_citations,
                 ):
                     return False
             
