@@ -768,13 +768,20 @@ class LiteratureReviewGenerator:
             return True
 
         try:
+            # Add review_draft_version to citations
+            enriched_citations = []
+            for citation in citations:
+                enriched_citation = citation.copy()
+                enriched_citation.setdefault("review_draft_version", "v2")
+                enriched_citations.append(enriched_citation)
+            
             citation_manifest = build_citation_manifest_v1(
                 job_id=self.job_workspace.job_id,
                 project_name=self.project_name or "review",
                 manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
                 review_draft_path=review_draft_path,
                 review_word_path=review_word_path,
-                citations=citations,
+                citations=enriched_citations,
             )
             artifact_path = self._citation_manifest_path()
             atomic_write_json(artifact_path, citation_manifest.to_dict())
@@ -783,7 +790,7 @@ class LiteratureReviewGenerator:
             if review_draft_path:
                 depends_on.append(
                     ArtifactDependencyRef(
-                        artifact_type=self.REVIEW_DRAFT_ARTIFACT_TYPE,
+                        artifact_type=self.REVIEW_DRAFT_V2_ARTIFACT_TYPE,
                         path=review_draft_path,
                     )
                 )
@@ -3849,7 +3856,7 @@ class LiteratureReviewGenerator:
                     return False
 
                 # Create minimal citation manifest
-                review_draft_path = self._review_draft_path()
+                review_draft_path = self._review_draft_v2_path()
                 # Generate minimal citation data (this is a thin slice, so we'll create basic citations)
                 minimal_citations = []
                 for i, ref in enumerate(references):
@@ -3860,6 +3867,8 @@ class LiteratureReviewGenerator:
                         "context": "Reference list",
                         "section_number": len(section_matches) + 1,  # References section
                         "section_title": "参考文献",
+                        "block_id": f"ref_block_{i+1}",
+                        "block_order": i + 1,
                     })
                 
                 if not self._persist_citation_manifest(

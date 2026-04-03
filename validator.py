@@ -362,7 +362,7 @@ def _validate_claims_for_single_paper(source_summary: dict, sentences: List[str]
 
 def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
     """
-    [第二阶段验证] 对生成的文献综述Word文档进行高效、批量的验证。
+    [第二阶段验证] 对生成的文献综述进行高效、批量的验证（使用工件而非docx）。
     """
     generator_instance.logger.info("=" * 60 + "\n文献综述验证阶段 (高效版)\n" + "=" * 60)  # type: ignore
     try:
@@ -370,6 +370,103 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
             generator_instance.logger.warn("第二阶段验证未在配置中启用。跳过此步骤。")  # type: ignore
             return True
 
+        # 尝试使用Week 3验证流程（基于工件）
+        try:
+            # 加载review_draft_v2
+            review_draft_path = generator_instance._review_draft_v2_path()
+            if not os.path.exists(review_draft_path):
+                generator_instance.logger.error(f"找不到review_draft_v2文件: {review_draft_path}。请先生成综述。")
+                return False
+            
+            with open(review_draft_path, 'r', encoding='utf-8') as f:
+                review_draft = json.load(f)
+            
+            # 加载citation_manifest
+            citation_manifest_path = generator_instance._citation_manifest_path()
+            if not os.path.exists(citation_manifest_path):
+                generator_instance.logger.error(f"找不到citation_manifest文件: {citation_manifest_path}。请先生成综述。")
+                return False
+            
+            with open(citation_manifest_path, 'r', encoding='utf-8') as f:
+                citation_manifest = json.load(f)
+            
+            # 构建paper_artifacts
+            paper_artifacts = []
+            for summary in generator_instance.summaries:
+                paper_info = summary.get('paper_info', {})
+                ai_summary = summary.get('ai_summary', {})
+                
+                paper_artifact = {
+                    "paper_identity": {
+                        "canonical_paper_key": generator_instance.get_paper_key(paper_info),
+                        "source_paper_id": paper_info.get('pdf_path', '')
+                    },
+                    "analysis": {
+                        "ai_summary": ai_summary
+                    },
+                    "source": {
+                        "source_pdf": paper_info.get('pdf_path', '')
+                    }
+                }
+                paper_artifacts.append(paper_artifact)
+            
+            # 运行Week 3验证
+            from validation.review_validator import ReviewValidator
+            validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
+            report = validator.validate()
+            
+            # 运行summary_recheck
+            from validation.summary_recheck import run_summary_rechecks
+            recheck_reports = run_summary_rechecks(paper_artifacts)
+            
+            # 生成验证报告
+            report_lines = ["llm_reviewer_generator文献综述验证报告", f"生成时间: {datetime.now().isoformat()}\n", "="*30]
+            report_lines.append(f"【验证摘要】")
+            report_lines.append(f"总引用数: {report.total_citations}")
+            report_lines.append(f"支持: {report.supported_count}")
+            report_lines.append(f"部分支持: {report.partial_support_count}")
+            report_lines.append(f"不支持: {report.unsupported_count}")
+            report_lines.append(f"错误来源: {report.wrong_source_count}")
+            report_lines.append(f"需要审核: {report.needs_review_count}")
+            
+            # 添加summary_recheck结果
+            if recheck_reports:
+                report_lines.append("\n【摘要检查结果】")
+                report_lines.append(f"检查论文数: {len(recheck_reports)}")
+                total_candidates = sum(len(report.correction_candidates) for report in recheck_reports)
+                report_lines.append(f"修正建议数: {total_candidates}")
+                
+                for i, recheck_report in enumerate(recheck_reports, 1):
+                    if recheck_report.correction_candidates:
+                        report_lines.append(f"\n{i}. 论文: {recheck_report.paper_key}")
+                        for j, candidate in enumerate(recheck_report.correction_candidates, 1):
+                            report_lines.append(f"   {j}. 字段: {candidate.field_path}")
+                            report_lines.append(f"      原因: {candidate.reason}")
+            
+            if report.citation_results:
+                report_lines.append("\n【详细结果】")
+                for i, result in enumerate(report.citation_results, 1):
+                    report_lines.append(f"\n{i}. 引用ID: {result.citation_id}")
+                    report_lines.append(f"   论文ID: {result.paper_id}")
+                    report_lines.append(f"   结论: {result.conclusion.value}")
+                    report_lines.append(f"   根本原因: {[rc.value for rc in result.root_causes]}")
+                    report_lines.append(f"   证据候选数: {len(result.evidence_candidates)}")
+            
+            # 保存报告
+            report_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_validation_report.txt')
+            with open(report_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(report_lines))
+            
+            generator_instance.logger.info(f"验证报告已保存到: {report_file}")
+            generator_instance.logger.success("Week 3验证流程完成！")
+            return True
+            
+        except Exception as e:
+            generator_instance.logger.warning(f"Week 3验证流程失败，回退到传统验证: {e}")
+            # 继续执行传统验证流程（docx-based）
+            pass
+
+        # 传统验证流程（回退）
         if not DOCX_AVAILABLE:
             generator_instance.logger.error("python-docx模块未安装，无法进行第二阶段验证。请运行: pip install python-docx")  # type: ignore
             return False
@@ -643,15 +740,6 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
             citation = citation.replace('( ', '(').replace(' )', ')')
             citation = re.sub(r'\s+', ' ', citation)  # 最终空格合并
             
-            # 9. 特殊处理：将多个作者使用逗号分隔的格式转换为&格式（针对双作者）
-            # 匹配模式： (作者1, 作者2, 年份) -> (作者1 & 作者2, 年份)
-            # 但注意：三作者及以上应该使用et al.格式，这里只处理双作者情况
-            # 注意：这个转换可能影响其他格式，暂时注释掉，依赖citation_to_key的变体映射
-            # match = re.match(r'^\(([^,]+),\s*([^,]+),\s*(\d{4})\)$', citation)
-            # if match:
-            #     author1, author2, year = match.groups()
-            #     citation = f'({author1} & {author2}, {year})'
-            
             return citation
         
         # 辅助函数：从句子中提取所有引用（正确处理多个引用）
@@ -795,7 +883,7 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
         
         generator_instance.logger.info(f"验证报告已保存到: {report_file}")
         return True
-
+        
     except (configparser.NoSectionError, configparser.NoOptionError):
         generator_instance.logger.error("无法找到[Validator_API]或[Performance]中的验证配置，跳过验证。")
         return False

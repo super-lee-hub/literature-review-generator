@@ -129,19 +129,22 @@ def build_review_draft_v1(
 
 def _parse_section_into_blocks(section_number: int, section_title: str, content: str) -> List[ReviewBlock]:
     """Parse section content into blocks (paragraphs as minimal blocks)."""
+    import hashlib
     blocks: List[ReviewBlock] = []
     paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
 
     for order, para in enumerate(paragraphs, start=1):
         block_id = f"s{section_number}_b{order}"
         anchor_text = para[:80] if len(para) <= 80 else para[:80] + "..."
+        # 生成 anchor_hash 使用 SHA256 的前 8 个字符
+        anchor_hash = hashlib.sha256(para.encode('utf-8')).hexdigest()[:8]
         blocks.append(ReviewBlock(
             block_id=block_id,
             block_kind="paragraph",
             block_order=order,
             text=para,
             anchor_text=anchor_text,
-            anchor_hash="",
+            anchor_hash=anchor_hash,
         ))
 
     return blocks

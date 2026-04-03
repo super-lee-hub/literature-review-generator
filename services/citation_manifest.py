@@ -37,6 +37,9 @@ def build_citation_manifest_v1(
             "context": str(citation.get("context") or "").strip(),
             "section_number": int(citation.get("section_number") or 0),
             "section_title": str(citation.get("section_title") or "").strip(),
+            "block_id": str(citation.get("block_id") or ""),
+            "block_order": int(citation.get("block_order") or 0),
+            "review_draft_version": str(citation.get("review_draft_version") or "v2"),
         }
         for citation in citations
     ]
