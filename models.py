@@ -162,6 +162,7 @@ class ProcessingResult(TypedDict):
     processing_time: NotRequired[Optional[str]]
     text_length: NotRequired[Optional[int]]
     preprocess: NotRequired[Dict[str, Any]]
+    stage1_input: NotRequired[Dict[str, Any]]
     failure_reason: NotRequired[Optional[str]]
 
 
