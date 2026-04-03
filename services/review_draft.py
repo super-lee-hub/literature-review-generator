@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from services.job_workspace import utc_now_iso
 
@@ -129,7 +130,6 @@ def build_review_draft_v1(
 
 def _parse_section_into_blocks(section_number: int, section_title: str, content: str) -> List[ReviewBlock]:
     """Parse section content into blocks (paragraphs as minimal blocks)."""
-    import hashlib
     blocks: List[ReviewBlock] = []
     paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
 

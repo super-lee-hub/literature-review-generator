@@ -477,5 +477,109 @@ def test_evidence_candidate_has_required_fields():
     assert candidate.evidence_scope
 
 
+def test_citation_manifest_uses_real_paper_ids():
+    """Test that citation manifest uses real paper IDs that match actual paper artifacts."""
+    from services.citation_manifest import build_citation_manifest_v1
+    from services.paper_artifact import build_paper_artifact_v1
+    
+    # Create a real paper artifact with canonical paper key
+    paper_artifact = build_paper_artifact_v1(
+        job_id="test-job",
+        paper={
+            "title": "Test Paper",
+            "authors": ["Author1", "Author2"],
+            "year": "2024",
+        },
+        result={
+            "status": "success",
+            "ai_summary": {"summary": "Test summary"},
+        },
+        paper_key="test_paper_key_2024",
+    )
+    
+    real_paper_id = paper_artifact.paper_identity["canonical_paper_key"]
+    
+    # Create citation manifest with real paper ID
+    citations = [
+        {
+            "citation_id": "cite_1",
+            "paper_id": real_paper_id,
+            "text": "Test citation",
+            "context": "Test context",
+            "section_number": 1,
+            "section_title": "Introduction",
+            "block_id": "s1_b1",
+            "block_order": 1,
+            "review_draft_version": "v2",
+        }
+    ]
+    
+    citation_manifest = build_citation_manifest_v1(
+        job_id="test-job",
+        project_name="test-project",
+        manifest_id="test-manifest",
+        review_draft_path="/test/review_draft_v2.json",
+        review_word_path="/test/review.docx",
+        citations=citations,
+    )
+    
+    # Verify citation uses real paper ID
+    assert citation_manifest.citations[0]["paper_id"] == real_paper_id
+    assert citation_manifest.citations[0]["paper_id"] != "paper_1"  # Not a placeholder
+
+
+def test_evidence_resolver_receives_preprocess_and_visual_inputs():
+    """Test that evidence resolver receives preprocess/visual inputs in Week 3 path."""
+    from validation.evidence_resolver import EvidenceResolver, build_evidence_resolver_context
+    
+    # Create paper artifact with preprocess and visual refs
+    paper_artifact = {
+        "paper_identity": {
+            "canonical_paper_key": "test_paper_key_2024",
+        },
+        "analysis": {
+            "preprocess": {
+                "chunks": [
+                    {
+                        "chunk_id": "chunk1",
+                        "text": "Test chunk with cited information",
+                        "page_range": [1, 1],
+                    }
+                ],
+                "normalized_text": "Normalized text with cited information",
+            },
+        },
+        "stage1_inputs": {
+            "selected_visual_refs": [
+                {
+                    "path": "test_image.png",
+                    "caption": "Visual caption with cited information",
+                    "page_range": [2, 2],
+                }
+            ],
+        },
+    }
+    
+    # Build resolver context
+    context = build_evidence_resolver_context(paper_artifact)
+    resolver = EvidenceResolver(context)
+    
+    # Resolve evidence
+    cited_span = "cited information"
+    selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
+    candidates = resolver.resolve_evidence(cited_span, selected_visual_refs=selected_visual_refs)
+    
+    # Verify candidates were found from both preprocess and visual sources
+    assert len(candidates) > 0
+    
+    # Check that at least one candidate came from preprocess chunks
+    chunk_candidates = [c for c in candidates if c.resolver_tier == "preprocess_chunks"]
+    assert len(chunk_candidates) > 0
+    
+    # Check that at least one candidate came from visual refs
+    visual_candidates = [c for c in candidates if c.resolver_tier == "visual_refs"]
+    assert len(visual_candidates) > 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

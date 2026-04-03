@@ -3857,12 +3857,20 @@ class LiteratureReviewGenerator:
 
                 # Create minimal citation manifest
                 review_draft_path = self._review_draft_v2_path()
-                # Generate minimal citation data (this is a thin slice, so we'll create basic citations)
+                # Generate minimal citation data with real paper IDs
                 minimal_citations = []
                 for i, ref in enumerate(references):
+                    # Get real paper ID from summaries if available
+                    paper_id = f"paper_{i+1}"  # Fallback to placeholder
+                    if i < len(self.summaries):
+                        paper_info = self.summaries[i].get('paper_info', {})
+                        canonical_key = self.get_paper_key(paper_info)
+                        if canonical_key:
+                            paper_id = canonical_key
+                    
                     minimal_citations.append({
                         "citation_id": f"cite_{i+1}",
-                        "paper_id": f"paper_{i+1}",
+                        "paper_id": paper_id,
                         "text": ref,
                         "context": "Reference list",
                         "section_number": len(section_matches) + 1,  # References section

@@ -165,6 +165,13 @@ def build_evidence_resolver_context(
     preprocess_artifacts_path: Optional[str] = None,
 ) -> EvidenceResolverContext:
     preprocess_artifacts: Dict[str, Any] = {}
+    
+    # 首先从paper_artifact的analysis.preprocess字段获取预处理信息
+    analysis_preprocess = paper_artifact.get("analysis", {}).get("preprocess", {})
+    if analysis_preprocess:
+        preprocess_artifacts = analysis_preprocess
+    
+    # 然后从preprocess_artifacts_path加载，覆盖已有信息
     if preprocess_artifacts_path and os.path.exists(preprocess_artifacts_path):
         try:
             with open(preprocess_artifacts_path, "r", encoding="utf-8") as f:
