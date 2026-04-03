@@ -1,0 +1,19 @@
+# Core runtime
+pandas
+openpyxl
+python-docx
+pdfplumber
+PyMuPDF
+pymupdf4llm
+requests
+tqdm
+python-dotenv
+typing_extensions
+
+# GUI
+nicegui
+
+# Local RAG / advanced PDF rescue
+chromadb
+sentence-transformers
+docling

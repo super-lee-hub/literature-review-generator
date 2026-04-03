@@ -1,0 +1,7 @@
+请继续完成这份未写完的文献综述大纲。
+
+【全部论文分析数据】
+{{SUMMARIES_JSON_ARRAY}}
+
+【已完成的大纲草稿】
+{{PARTIAL_OUTLINE}}

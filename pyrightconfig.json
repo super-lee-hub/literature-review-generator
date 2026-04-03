@@ -1,0 +1,20 @@
+{
+  "exclude": [
+    "**/node_modules",
+    "**/.*",
+    "**/.git",
+    "**/.idea",
+    "**/.mypy_cache",
+    "**/.pytest_cache",
+    "**/__pycache__",
+    "**/venv",
+    "**/logs",
+    "**/output",
+    "**/tmp"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "."
+    }
+  ]
+}

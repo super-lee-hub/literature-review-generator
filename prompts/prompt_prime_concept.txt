@@ -1,0 +1,54 @@
+你是一位学术研究专家，专门研究概念的历史发展和理论演化。请基于以下种子论文，深入分析并创建一个关于"{{CONCEPT_NAME}}"这一概念的全面学习笔记。
+
+## 任务目标
+1. 深入理解"{{CONCEPT_NAME}}"的核心内涵和理论框架
+2. 追溯该概念的历史发展脉络和关键里程碑
+3. 识别该概念的核心理论贡献者和代表性文献
+4. 分析该概念在不同研究领域的应用和演变
+5. 建立一个可用于指导后续文献分析的概念知识框架
+
+## 种子论文分析
+{{SEED_PAPERS}}
+
+## 输出要求
+请生成一个JSON格式的概念学习笔记，包含以下结构：
+
+```json
+{
+  "concept_name": "{{CONCEPT_NAME}}",
+  "core_definition": "概念的核心定义和内涵",
+  "historical_development": {
+    "origins": "概念的起源和早期发展",
+    "key_milestones": [
+      {
+        "period": "时间段",
+        "development": "重要发展或突破",
+        "key_contributors": "贡献者"
+      }
+    ],
+    "evolution": "概念如何随时间演变"
+  },
+  "theoretical_framework": {
+    "foundational_theories": "基础理论",
+    "key_dimensions": "概念的核心维度",
+    "measurement_approaches": "测量和评估方法"
+  },
+  "research_applications": {
+    "primary_fields": "主要应用领域",
+    "cross_disciplinary_impact": "跨学科影响",
+    "practical_applications": "实际应用场景"
+  },
+  "future_directions": {
+    "emerging_trends": "新兴趋势",
+    "research_gaps": "研究空白",
+    "potential_developments": "潜在发展方向"
+  },
+  "analysis_guidance": {
+    "key_questions": "分析相关论文时应关注的关键问题",
+    "evaluation_criteria": "评估论文贡献的标准",
+    "connection_points": "与该概念连接的关键点"
+  }
+}
+```
+
+请确保分析深入、全面，为后续的文献调查提供坚实的理论基础和分析框架。

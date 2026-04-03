@@ -1,0 +1,85 @@
+请对照论文原文与给定的 canonical summary JSON，只做“事实核查式”验证。
+
+【论文原文】
+{{PAPER_FULL_TEXT}}
+
+【待验证的 canonical summary】
+{{GENERATED_SUMMARY}}
+
+【任务】
+检查 summary 中是否存在以下问题：
+1. 客观事实错误
+2. 原文没有支持的过度概括
+3. 类型判断明显错误
+4. 方法、样本、结论、理论框架、研究空白等关键字段与原文不符
+
+【重要约束】
+1. 只修正能被原文直接支持的内容。
+2. 不要为了“补全结构”而编造缺失字段。
+3. 如果某个字段原文没有明确给出，不要强行修正出一个值。
+4. 如果内容只是表述风格不同但事实一致，不要判为错误。
+
+【字段路径规则】
+如果需要给出修正，请只使用 canonical 路径，例如：
+- `routing.paper_type`
+- `routing.paper_subtype_raw`
+- `routing.paper_subtype_normalized`
+- `routing.classification_status`
+- `routing.route_confidence`
+- `routing.classification_rationale`
+- `core_analysis.summary`
+- `core_analysis.key_points`
+- `core_analysis.methodology`
+- `core_analysis.findings`
+- `core_analysis.conclusions`
+- `core_analysis.relevance`
+- `core_analysis.limitations`
+- `core_analysis.theoretical_framework`
+- `core_analysis.research_gap`
+- `core_analysis.future_research_directions`
+- `specialized_details.empirical.research_questions_or_hypotheses`
+- `specialized_details.empirical.data_source_and_size`
+- `specialized_details.empirical.analysis_technique`
+- `specialized_details.empirical.core_variables`
+- `specialized_details.empirical.sample_characteristics_or_context`
+- `specialized_details.review.review_type`
+- `specialized_details.review.search_databases`
+- `specialized_details.review.time_span`
+- `specialized_details.review.included_studies_count`
+- `specialized_details.review.inclusion_exclusion_criteria`
+- `specialized_details.review.synthesis_approach`
+- `specialized_details.review.main_themes`
+- `specialized_details.conceptual.core_propositions`
+- `specialized_details.conceptual.conceptual_relationships`
+- `specialized_details.conceptual.theoretical_contributions`
+
+【输出格式】
+只输出一个 JSON 对象：
+
+```json
+{
+  "is_consistent": true,
+  "feedback": "",
+  "corrections": [
+    {
+      "field": "core_analysis.findings",
+      "issue": "overstated claim",
+      "corrected_value": "",
+      "justification": ""
+    }
+  ]
+}
+```
+
+【判定规则】
+- 如果没有明确错误，返回：
+  - `"is_consistent": true`
+  - `"corrections": []`
+- 如果存在明确错误，返回：
+  - `"is_consistent": false`
+  - 在 `corrections` 中列出需要修正的字段
+
+【补充要求】
+- `corrected_value` 必须是可直接落回 JSON 的值
+- `justification` 要简短说明原文证据
+- 不要返回与 canonical schema 无关的路径

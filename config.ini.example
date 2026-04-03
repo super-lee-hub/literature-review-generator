@@ -1,0 +1,226 @@
+# =============================================================================
+# llm_reviewer_generator 配置文件模板
+# =============================================================================
+#
+# 安全说明：
+# 强烈建议使用 .env 文件来存储 API 密钥，而不是直接写在配置文件中。
+# .env 文件不会被提交到版本控制系统，更安全。
+#
+# .env 文件格式示例：
+# LLM_PRIMARY_READER_API=your_primary_api_key_here
+# LLM_BACKUP_READER_API=your_backup_api_key_here
+# LLM_WRITER_API=your_writer_api_key_here
+# LLM_FREE_MODE_API=your_free_mode_api_key_here
+# LLM_VALIDATOR_API=your_validator_api_key_here
+#
+# 如果 .env 文件存在，其中的 API 密钥将覆盖配置文件中的值。
+# =============================================================================
+
+[Paths]
+# [必填] 您的完整Zotero报告路径
+zotero_report = D:\zotero_report\Zotero 报告.txt
+
+# [必填] 您的Zotero文献库存放路径
+library_path = D:\zotero_library\Zotero\storage
+
+# [建议] 最终产出的文件夹，程序会自动创建
+output_path = ./output
+
+[Primary_Reader_API]
+# [建议] 主阅读引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_PRIMARY_READER_API_KEY_HERE
+model = Pro/moonshotai/Kimi-K2-Instruct-0905
+api_base = https://api.siliconflow.cn/v1
+
+[Backup_Reader_API]
+# [建议] 备用阅读引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_BACKUP_READER_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Writer_API]
+# [建议] 写作引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_WRITER_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Outline_API]
+# [可选] 用于大纲生成的独立 API
+api_key = YOUR_OUTLINE_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Free_Mode_API]
+# [可选] 用于自由模式前置对话规划的独立 API
+# 如果留空，可回退到 Outline_API
+api_key = YOUR_FREE_MODE_API_KEY_HERE
+model = gemini-2.5-pro
+api_base = https://api.videocaptioner.cn/v1
+
+[Performance]
+# 并发处理的最大工作线程数
+# 推荐值为2-3，以平衡速度和API的TPM限制
+# 建议不要超过3，以避免触发API频率限制
+max_workers = 3
+# API调用失败时的重试次数（增强到5次）
+api_retry_attempts = 5
+# 主阅读引擎速率限制配置（可选，设置为API限制的90%，留出安全边际）
+# 如果您的API服务商未提供此信息，请设置为0或留空，系统将自动切换到忍者模式
+# TPM: Tokens Per Minute，每分钟令牌数限制
+primary_tpm_limit = 900000
+# RPM: Requests Per Minute，每分钟请求数限制
+primary_rpm_limit = 9000
+# 备用阅读引擎速率限制配置（可选，通常比主引擎更高，处理超长论文）
+# 如果您的API服务商未提供此信息，请设置为0或留空，系统将自动切换到忍者模式
+backup_tpm_limit = 2000000
+# RPM: Requests Per Minute，每分钟请求数限制
+backup_rpm_limit = 9000
+# 启用/禁用验证模块 (true/false) - 重要：影响处理速度和准确性
+# 第一阶段验证：在单篇文献分析后进行交叉验证，增加准确度但会显著减慢处理速度
+#   true: 启用验证，增加准确度但速度变慢（每篇论文额外1-2分钟）
+#   false: 跳过验证，速度更快（推荐用于大批量处理）
+enable_stage1_validation = false
+
+# 第二阶段验证：对生成的整体文献综述进行引用准确性和一致性验证
+#   true: 启用综述级验证，检查引用准确性和逻辑一致性
+#   false: 跳过综述级验证（推荐）
+enable_stage2_validation = false
+
+# 📝 速度 vs 准确性权衡建议：
+# - 大批量文献分析（>50篇）：建议都设为 false（速度优先）
+# - 少量高质量文献（<20篇）：建议启用第一阶段验证（准确性优先）
+
+[Validation]
+# Week 1 起，Validation 段作为验证与 checkpoint 保留策略的真值层。
+stage1_enabled = false
+stage2_enabled = false
+keep_checkpoints_after_completion = false
+
+[Retry_Settings]
+# 自动重试设置 - 当文献处理失败时的重试机制
+# 文献处理失败后的自动重试轮数
+#   1-3: 较少重试，节省时间但可能遗漏一些本来可以成功的论文
+#   4-5: 较多的重试，提高成功率但会显著增加总处理时间
+#   推荐值：2-3轮，平衡成功率和时间成本
+max_retry_rounds = 2
+
+# 重试间隔基础时间（秒）- 每次重试间隔的起始值
+# 间隔时间计算公式：retry_round * base_retry_delay
+#   30: 标准间隔，第一轮重试30秒后，第二轮60秒，第三轮90秒，以此类推
+#   60: 较长间隔，给予API更多恢复时间
+#   推荐值：30-60秒，根据API限制调整
+base_retry_delay = 30
+
+# 最大重试间隔上限（秒）- 避免等待时间过长
+#   120: 2分钟上限，第一轮30s，第二轮60s，第三轮120s，第四轮及以后都是120s
+#   300: 5分钟上限，适合API限制较严格的场景
+#   推荐值：120-300秒
+max_retry_delay = 120
+
+[Stage2_Retry]
+# 阶段二（综述章节生成）自动重试配置
+# enabled = true 时，--generate-review 在首轮结束后会自动补跑失败章节
+enabled = true
+
+# 失败章节自动补跑的最大轮数
+max_retry_rounds = 2
+
+# 自动补跑的基础等待时间（秒）
+base_retry_delay = 30
+
+# 自动补跑的最大等待上限（秒）
+max_retry_delay = 120
+
+[Preprocess]
+# 启用 PDF 预处理
+enabled = true
+# 预处理缓存目录
+cache_dir = ./output/_preprocess_cache
+# hybrid / remote / local
+parser_mode = hybrid
+# 远程优先
+primary_parser = mineru_remote
+# 远程失败时回退本地
+fallback_parser = local
+# auto / fitz / pymupdf4llm
+extractor_profile = auto
+# auto / off / always
+ocr_mode = auto
+# Tesseract 语言包，如 eng 或 chi_sim+eng
+ocr_languages = eng
+# 是否强制重建缓存
+force_rebuild = false
+# 阶段一默认使用 normalized.md
+use_markdown_as_stage1_input = true
+# 固定保留结构化工件
+retain_structured_output = true
+retain_page_index = true
+retain_diagnostics = true
+# 本地 RAG（可选）
+enable_local_rag = false
+rag_backend = chroma
+
+[Styling]
+# [可选] 文档样式配置
+# 字体名称（建议使用常见字体如Times New Roman, Arial, Calibri）
+font_name = Times New Roman
+# 正文字体大小（磅）
+font_size_body = 12
+# 一级标题字体大小（磅）
+font_size_heading1 = 16
+# 二级标题字体大小（磅）
+font_size_heading2 = 14
+
+[Validator_API]
+# [可选] 验证者AI引擎 - 建议使用与Reader/Writer不同的强大模型以保证交叉验证的独立性
+# 仅在启用验证功能时需要
+# [建议] 验证引擎 API 密钥 - 推荐通过 .env 文件设置
+# 如需在配置文件中设置，请替换下面的占位符
+# 或者留空从 .env 文件读取
+api_key = YOUR_VALIDATOR_API_KEY_HERE
+model = gpt-4-turbo-preview
+api_base = https://api.openai.com/v1
+
+[API_Parameters]
+# API调用参数配置 - 可根据您的模型和需求调整这些参数
+
+# 主阅读引擎参数（用于分析单篇文献）
+primary_max_tokens = 3000
+primary_temperature = 0.3
+
+# API调用超时设置（秒，默认600秒=10分钟）
+timeout_seconds = 600
+
+# 备用阅读引擎参数（用于处理长文档）
+backup_max_tokens = 8192
+backup_temperature = 0.3
+
+# 概念分析引擎参数
+concept_max_tokens = 4000
+concept_temperature = 0.3
+
+# 写作引擎参数（用于生成文献综述）
+writer_max_tokens = 8000
+writer_temperature = 0.5
+
+# 大纲引擎参数（用于大纲规划）
+outline_max_tokens = 6000
+outline_temperature = 0.4
+
+# 自由模式对话引擎参数（用于前置对话规划）
+free_mode_max_tokens = 6000
+free_mode_temperature = 0.4
+
+# 验证引擎参数（用于交叉验证）
+validator_max_tokens = 4096
+validator_temperature = 0.3
+
+# 观点验证引擎参数（用于批量验证引用）
+claims_max_tokens = 8192
+claims_temperature = 0.3
