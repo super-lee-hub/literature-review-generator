@@ -54,7 +54,7 @@ from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
 from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
 from services.queue_service import CancelToken, JobCancelledError
-from services.review_draft import build_review_draft_v1
+from services.review_draft import build_review_draft_v1, build_review_draft_v2
 from services.citation_manifest import build_citation_manifest_v1
 from services.stage1_input_builder import Stage1InputBuilder
 from services.model_selection import get_outline_api_config
@@ -313,6 +313,10 @@ class LiteratureReviewGenerator:
     REVIEW_DRAFT_ARTIFACT_TYPE = "review_draft"
     REVIEW_DRAFT_ARTIFACT_ROLE = "review_draft"
     REVIEW_DRAFT_ARTIFACT_VERSION = "v1"
+    REVIEW_DRAFT_V2_ARTIFACT_ID = "review_draft_v2:full_review"
+    REVIEW_DRAFT_V2_ARTIFACT_TYPE = "review_draft"
+    REVIEW_DRAFT_V2_ARTIFACT_ROLE = "review_draft_v2"
+    REVIEW_DRAFT_V2_ARTIFACT_VERSION = "v2"
     CITATION_MANIFEST_ARTIFACT_ID = "citation_manifest:v1"
     CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
     CITATION_MANIFEST_ARTIFACT_ROLE = "citation_manifest"
@@ -576,6 +580,12 @@ class LiteratureReviewGenerator:
         project_name = self.project_name or "review"
         return self.job_workspace.artifact_path(f"review_drafts/{project_name}_review_draft_v1.json")
 
+    def _review_draft_v2_path(self) -> str:
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        project_name = self.project_name or "review"
+        return self.job_workspace.artifact_path(f"review_drafts/{project_name}_review_draft_v2.json")
+
     def _citation_manifest_path(self) -> str:
         if not self.job_workspace:
             raise ValueError("job workspace is not configured")
@@ -687,6 +697,64 @@ class LiteratureReviewGenerator:
             return True
         except Exception as exc:
             self.logger.error(f"Failed to persist review_draft_v1: {exc}")
+            return False
+
+    def _persist_review_draft_v2(
+        self,
+        *,
+        outline_file: str,
+        review_sections: List[Dict[str, Any]],
+        references: List[str],
+        word_file: str,
+        generation_mode: str = "full_review",
+    ) -> bool:
+        if not self.job_workspace or not self.artifact_registry:
+            return True
+
+        try:
+            review_draft = build_review_draft_v2(
+                job_id=self.job_workspace.job_id,
+                project_name=self.project_name or "review",
+                draft_id=self.REVIEW_DRAFT_V2_ARTIFACT_ID,
+                outline_artifact_id=self.OUTLINE_ARTIFACT_ID,
+                outline_source_path=outline_file,
+                summary_file=self.summary_file or "",
+                review_word_path=word_file,
+                sections=review_sections,
+                references=references,
+                generation_mode=generation_mode,
+            )
+            artifact_path = self._review_draft_v2_path()
+            atomic_write_json(artifact_path, review_draft.to_dict())
+
+            depends_on: List[ArtifactDependencyRef] = []
+            if outline_file:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                        path=outline_file,
+                    )
+                )
+            if self.summary_file:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type="summary_file",
+                        path=self.summary_file,
+                    )
+                )
+
+            self.artifact_registry.register_file(
+                artifact_role=self.REVIEW_DRAFT_V2_ARTIFACT_ROLE,
+                artifact_type=self.REVIEW_DRAFT_V2_ARTIFACT_TYPE,
+                artifact_version=self.REVIEW_DRAFT_V2_ARTIFACT_VERSION,
+                path=artifact_path,
+                producer="main.LiteratureReviewGenerator.generate_full_review_from_outline",
+                depends_on=depends_on,
+                artifact_id=self.REVIEW_DRAFT_V2_ARTIFACT_ID,
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to persist review_draft_v2: {exc}")
             return False
 
     def _persist_citation_manifest(
@@ -3770,7 +3838,16 @@ class LiteratureReviewGenerator:
                     word_file=word_file,
                 ):
                     return False
-                
+
+                # Persist review_draft_v2 (block-structured durability)
+                if not self._persist_review_draft_v2(
+                    outline_file=outline_file,
+                    review_sections=review_sections,
+                    references=references,
+                    word_file=word_file,
+                ):
+                    return False
+
                 # Create minimal citation manifest
                 review_draft_path = self._review_draft_path()
                 # Generate minimal citation data (this is a thin slice, so we'll create basic citations)

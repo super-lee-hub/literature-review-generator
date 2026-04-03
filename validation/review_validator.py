@@ -151,4 +151,4 @@ class ReviewValidator:
         elif visual_candidates and has_visual_refs:
             return ValidationConclusion.NEEDS_REVIEW, [RootCause.VISUAL_UNDERSTANDING_GAP]
         else:
-            return ValidationConclusion.UNSUPPORTED, [RootCause.REVIEW_DRIFT]
+            return ValidationConclusion.UNSUPPORTED, [RootCause.INSUFFICIENT_CONTEXT]

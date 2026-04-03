@@ -50,18 +50,48 @@ class EvidenceResolver:
         candidates.sort(key=lambda x: (-x.confidence, x.window_rank))
         return candidates
 
+    def _calculate_confidence(self, cited_span: str, context_text: str) -> float:
+        """Calculate confidence based on text matching quality."""
+        if not cited_span or not context_text:
+            return 0.0
+        
+        # Base confidence for exact match
+        base_confidence = 0.8
+        
+        # Adjust based on cited span length relative to context
+        span_length = len(cited_span)
+        context_length = len(context_text)
+        
+        # Longer spans relative to context give higher confidence
+        length_ratio = min(span_length / max(context_length, 1), 1.0)
+        length_bonus = length_ratio * 0.15
+        
+        # Adjust based on how early the match appears in context
+        match_pos = context_text.lower().find(cited_span.lower())
+        if match_pos == 0:
+            position_bonus = 0.05
+        elif match_pos < len(context_text) * 0.2:
+            position_bonus = 0.03
+        else:
+            position_bonus = 0.0
+        
+        # Calculate final confidence (capped at 0.95 to leave room for higher tiers)
+        confidence = base_confidence + length_bonus + position_bonus
+        return min(confidence, 0.95)
+
     def _resolve_from_preprocess_chunks(self, cited_span: str) -> List[EvidenceCandidate]:
         candidates: List[EvidenceCandidate] = []
         chunks = self.context.preprocess_artifacts.get("chunks", [])
         for idx, chunk in enumerate(chunks):
             chunk_text = chunk.get("text", "")
             if cited_span.lower() in chunk_text.lower():
+                confidence = self._calculate_confidence(cited_span, chunk_text)
                 candidates.append(
                     EvidenceCandidate(
                         match_reason="chunk_text_match",
                         resolver_tier="preprocess_chunks",
                         window_rank=idx,
-                        confidence=0.9,
+                        confidence=confidence,
                         artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
                         page_span=chunk.get("page_range"),
                         chunk_ids=[chunk.get("chunk_id", str(idx))],
@@ -80,12 +110,15 @@ class EvidenceResolver:
         if normalized_text and cited_span.lower() in normalized_text.lower():
             excerpt_start = max(0, normalized_text.lower().find(cited_span.lower()) - 200)
             excerpt_end = min(len(normalized_text), excerpt_start + len(cited_span) + 400)
+            confidence = self._calculate_confidence(cited_span, normalized_text)
+            # Normalized text gets slightly lower base confidence
+            confidence = max(0.6, confidence * 0.9)
             candidates.append(
                 EvidenceCandidate(
                     match_reason="normalized_text_match",
                     resolver_tier="normalized_text",
                     window_rank=0,
-                    confidence=0.7,
+                    confidence=confidence,
                     artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
                     page_span=None,
                     chunk_ids=None,
@@ -105,12 +138,15 @@ class EvidenceResolver:
         for idx, visual in enumerate(visual_refs):
             caption = visual.get("caption", "")
             if cited_span.lower() in caption.lower():
+                confidence = self._calculate_confidence(cited_span, caption)
+                # Visual caption gets slightly lower base confidence
+                confidence = max(0.7, confidence * 0.85)
                 candidates.append(
                     EvidenceCandidate(
                         match_reason="visual_caption_match",
                         resolver_tier="visual_refs",
                         window_rank=idx,
-                        confidence=0.8,
+                        confidence=confidence,
                         artifact_path=visual.get("path", ""),
                         page_span=visual.get("page_range"),
                         chunk_ids=None,

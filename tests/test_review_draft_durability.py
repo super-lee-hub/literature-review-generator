@@ -109,7 +109,7 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
 
     word_path = Path(workspace.report_path("demo_literature_review.docx"))
     registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
-    review_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "review_draft"]
+    review_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "review_draft" and item["artifact_version"] == "v1"]
 
     assert word_path.exists() is True
     assert len(review_records) == 1
@@ -206,7 +206,7 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     assert generator.generate_full_review_from_outline() is True
 
     registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
-    review_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "review_draft"]
+    review_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "review_draft" and item["artifact_version"] == "v1"]
     artifact_path = Path(review_records[0]["path"])
     artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
 
@@ -258,3 +258,138 @@ def test_retry_failed_review_sections_still_reenters_full_review_generation(
 
     assert generator.retry_failed_review_sections() is True
     assert captured["last_completed_section"] == 1
+
+
+def test_successful_stage2_generation_creates_registered_review_draft_v2(tmp_path: Path, monkeypatch) -> None:
+    """Test that review_draft_v2 is created and registered alongside v1."""
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-v2-success")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+
+    outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(
+        generator,
+        "generate_review_section_content",
+        lambda section_title, _outline: f"{section_title} generated content.\n\nSecond paragraph for {section_title}.",
+    )
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
+
+    assert generator.generate_full_review_from_outline() is True
+
+    registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
+    review_v2_records = [item for item in registry_payload["artifacts"] if item.get("artifact_version") == "v2"]
+    v2_artifact_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v2.json"))
+
+    assert len(review_v2_records) == 1
+    assert v2_artifact_path.exists() is True
+
+    artifact_payload = json.loads(v2_artifact_path.read_text(encoding="utf-8"))
+    assert artifact_payload["artifact_type"] == "review_draft"
+    assert artifact_payload["artifact_version"] == "v2"
+    assert artifact_payload["created_from_job_id"] == workspace.job_id
+    assert artifact_payload["draft_identity"]["draft_id"] == "review_draft_v2:full_review"
+    assert len(artifact_payload["content"]["sections"]) == 2
+
+    # Check block structure
+    first_section = artifact_payload["content"]["sections"][0]
+    assert "blocks" in first_section
+    assert len(first_section["blocks"]) >= 1
+    assert first_section["blocks"][0]["block_id"] == "s1_b1"
+    assert first_section["blocks"][0]["block_kind"] == "paragraph"
+    assert first_section["blocks"][0]["block_order"] == 1
+    assert "text" in first_section["blocks"][0]
+    assert "anchor_text" in first_section["blocks"][0]
+
+
+def test_stage2_with_failed_sections_does_not_register_review_draft_v2(tmp_path: Path, monkeypatch) -> None:
+    """Test that review_draft_v2 is NOT created when sections fail."""
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-v2-failed")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+
+    outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
+
+    def _section_content(section_title: str, _outline: str):
+        if section_title == "Second Section":
+            return None
+        return f"{section_title} generated content."
+
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
+
+    assert generator.generate_full_review_from_outline() is True
+
+    v2_draft_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v2.json"))
+    registry_path = Path(workspace.paths.registry_path)
+
+    assert v2_draft_path.exists() is False
+    if registry_path.exists():
+        registry_payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        assert not any(item.get("artifact_version") == "v2" for item in registry_payload["artifacts"])
+
+
+def test_review_draft_v2_written_to_job_workspace_not_project_root(tmp_path: Path, monkeypatch) -> None:
+    """Test that review_draft_v2 is written to job workspace, not output/<project>/."""
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-v2-location")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+
+    outline_text = "# Demo Outline\n\n## 1. Single Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(
+        generator,
+        "generate_review_section_content",
+        lambda section_title, _outline: f"{section_title} content.",
+    )
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
+
+    assert generator.generate_full_review_from_outline() is True
+
+    # Verify v2 is in job workspace artifacts directory
+    v2_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v2.json"))
+    assert v2_path.exists() is True
+    assert str(v2_path).startswith(str(workspace.paths.root_dir))
+
+    # Verify it's NOT in the legacy output location
+    legacy_path = Path(tmp_path / "output" / "demo" / "demo_review_draft_v2.json")
+    assert not legacy_path.exists()
+
+
+def test_review_draft_v1_and_v2_coexist_in_registry(tmp_path: Path, monkeypatch) -> None:
+    """Test that both v1 and v2 can coexist in the artifact registry."""
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-both-versions")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+
+    outline_text = "# Demo Outline\n\n## 1. First Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(
+        generator,
+        "generate_review_section_content",
+        lambda section_title, _outline: f"{section_title} content.",
+    )
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
+
+    assert generator.generate_full_review_from_outline() is True
+
+    registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
+    review_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "review_draft"]
+
+    v1_records = [r for r in review_records if r["artifact_version"] == "v1"]
+    v2_records = [r for r in review_records if r["artifact_version"] == "v2"]
+
+    assert len(v1_records) == 1
+    assert len(v2_records) == 1
+    assert v1_records[0]["artifact_id"] == "review_draft:full_review"
+    assert v2_records[0]["artifact_id"] == "review_draft_v2:full_review"
+    assert v1_records[0]["artifact_role"] == "review_draft"
+    assert v2_records[0]["artifact_role"] == "review_draft_v2"

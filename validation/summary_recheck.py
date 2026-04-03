@@ -71,6 +71,74 @@ class SummaryRechecker:
         current_value = self._get_nested_value(self.ai_summary, field_path)
         if current_value is None:
             return None
+        
+        # Get original paper content if available
+        original_content = self._get_nested_value(self.paper_artifact, "preprocess_artifacts.normalized_text") or ""
+        
+        # Check for empty or too short values
+        if isinstance(current_value, str):
+            # Trim whitespace
+            trimmed_value = current_value.strip()
+            
+            # Check if value is empty or too short
+            if not trimmed_value:
+                return SummaryCorrectionCandidate(
+                    field_path=field_path,
+                    current_value=current_value,
+                    suggested_value="",
+                    confidence=0.9,
+                    evidence_source="validation_logic",
+                    reason="Field is empty or contains only whitespace"
+                )
+            
+            # Check if value is too short for certain fields
+            if field_path in ["core_analysis.abstract", "core_analysis.methods", "core_analysis.findings"]:
+                if len(trimmed_value) < 50:
+                    return SummaryCorrectionCandidate(
+                        field_path=field_path,
+                        current_value=current_value,
+                        suggested_value=trimmed_value,
+                        confidence=0.7,
+                        evidence_source="validation_logic",
+                        reason="Field value is unusually short"
+                    )
+        
+        # Check for potential issues in paper info fields
+        if field_path == "paper_info.year":
+            if isinstance(current_value, str):
+                if not current_value.isdigit() or len(current_value) != 4:
+                    return SummaryCorrectionCandidate(
+                        field_path=field_path,
+                        current_value=current_value,
+                        suggested_value=current_value,
+                        confidence=0.8,
+                        evidence_source="validation_logic",
+                        reason="Year format appears to be invalid"
+                    )
+        
+        # Check for authors field
+        if field_path == "paper_info.authors":
+            if isinstance(current_value, list):
+                if len(current_value) == 0:
+                    return SummaryCorrectionCandidate(
+                        field_path=field_path,
+                        current_value=current_value,
+                        suggested_value=[],
+                        confidence=0.9,
+                        evidence_source="validation_logic",
+                        reason="Authors list is empty"
+                    )
+            elif isinstance(current_value, str):
+                if not current_value.strip():
+                    return SummaryCorrectionCandidate(
+                        field_path=field_path,
+                        current_value=current_value,
+                        suggested_value="",
+                        confidence=0.9,
+                        evidence_source="validation_logic",
+                        reason="Authors field is empty"
+                    )
+        
         return None
 
     def _get_nested_value(self, data: Dict[str, Any], path: str) -> Any:
