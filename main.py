@@ -42,6 +42,7 @@ from ai_interface import get_summary_from_ai, get_summary_from_ai_with_fallback,
 from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from preprocess.service import PreprocessManager
+from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
 from services.config_compat import CompatConfigView
 from services.environment_service import (
@@ -55,6 +56,7 @@ from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, w
 from services.queue_service import CancelToken, JobCancelledError
 from services.review_draft import build_review_draft_v1
 from services.citation_manifest import build_citation_manifest_v1
+from services.stage1_input_builder import Stage1InputBuilder
 from services.model_selection import get_outline_api_config
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
 from services.text_io import load_json_file_with_fallbacks
@@ -311,7 +313,6 @@ class LiteratureReviewGenerator:
     REVIEW_DRAFT_ARTIFACT_TYPE = "review_draft"
     REVIEW_DRAFT_ARTIFACT_ROLE = "review_draft"
     REVIEW_DRAFT_ARTIFACT_VERSION = "v1"
-    
     CITATION_MANIFEST_ARTIFACT_ID = "citation_manifest:v1"
     CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
     CITATION_MANIFEST_ARTIFACT_ROLE = "citation_manifest"
@@ -364,6 +365,8 @@ class LiteratureReviewGenerator:
         # 初始化服务组件
         self.reporting_service: ReportingService = ReportingService(self.logger)
         self.checkpoint_manager: CheckpointManager = CheckpointManager(self.logger)
+        self.stage1_visual_builder = Stage1VisualArtifactBuilder(logger=self.logger)
+        self.stage1_input_builder = Stage1InputBuilder(logger=self.logger)
 
     def bind_job_workspace(
         self,
@@ -544,6 +547,14 @@ class LiteratureReviewGenerator:
                         content_hash=str(paper_artifact.source.get("source_pdf_fingerprint") or ""),
                     )
                 )
+            visual_manifest_path = str(paper_artifact.stage1_inputs.get("visual_artifact_manifest_path") or "")
+            if visual_manifest_path:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type="visual_manifest",
+                        path=visual_manifest_path,
+                    )
+                )
 
             self.artifact_registry.register_file(
                 artifact_role=self.PAPER_ARTIFACT_ROLE,
@@ -680,7 +691,7 @@ class LiteratureReviewGenerator:
 
     def _persist_citation_manifest(
         self,
-        *,
+        *, 
         review_draft_path: str,
         review_word_path: str,
         citations: list[dict[str, Any]],
@@ -1547,6 +1558,79 @@ class LiteratureReviewGenerator:
         prompt_template = self._inject_free_mode_context(prompt_template)
         return prompt_template.replace("{{PAPER_FULL_TEXT}}", pdf_text)
 
+    def _build_stage1_visual_bundle(
+        self,
+        *,
+        paper: Mapping[str, Any],
+        pdf_path: str,
+        preprocess_metadata: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if not self.job_workspace or not self.artifact_registry:
+            return None
+
+        paper_key = self._paper_artifact_key(paper)
+        artifact_hash = self._paper_artifact_hash(paper_key)
+        output_dir = self.job_workspace.artifact_path(f"stage1_visuals/{artifact_hash}")
+        self.stage1_visual_builder.logger = self.logger
+
+        try:
+            bundle = self.stage1_visual_builder.build_bundle(
+                job_id=self.job_workspace.job_id,
+                paper_key=paper_key,
+                paper_info=paper,
+                source_pdf=pdf_path,
+                output_dir=output_dir,
+                artifact_registry=self.artifact_registry,
+                preprocess_metadata=preprocess_metadata,
+            )
+            return bundle.to_dict() if bundle else None
+        except Exception as exc:
+            self.logger.warning(f"Failed to build stage-1 visual bundle, continuing with text-first fallback: {exc}")
+            return None
+
+    def _build_stage1_model_input(
+        self,
+        *,
+        pdf_text: str,
+        reader_api_config: Mapping[str, Any],
+        visual_bundle: Optional[Mapping[str, Any]] = None,
+        paper: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self.stage1_input_builder.logger = self.logger
+        prompt_template = self._load_stage1_prompt_template()
+        prompt_template = self._inject_free_mode_context(prompt_template)
+        
+        # Use registry-first visual artifact resolution if available
+        resolved_visual_bundle = dict(visual_bundle or {})
+        if paper and self.artifact_registry and self.job_workspace:
+            from services.visual_artifact_resolver import VisualArtifactResolver
+            resolver = VisualArtifactResolver(self.artifact_registry, self.logger)
+            
+            # Try to resolve paper artifact
+            paper_key = self._paper_artifact_key(paper)
+            artifact_hash = self._paper_artifact_hash(paper_key)
+            paper_artifact_path = self.job_workspace.artifact_path(f"paper_artifacts/{artifact_hash}.json")
+            
+            # Resolve selected visual refs from paper artifact or registry
+            selected_visual_refs = resolver.resolve_selected_visual_refs(paper_artifact_path)
+            if selected_visual_refs:
+                resolved_visual_bundle["selected_visual_refs"] = selected_visual_refs
+                resolved_visual_bundle.setdefault("visual_manifest_path", "")
+                resolved_visual_bundle.setdefault("bundle_path", "")
+                resolved_visual_bundle.setdefault("selection_policy_snapshot", {})
+
+                manifest_path = resolver.resolve_visual_manifest_path(paper_artifact_path)
+                if manifest_path:
+                    resolved_visual_bundle["visual_manifest_path"] = manifest_path
+        
+        built_input = self.stage1_input_builder.build(
+            prompt_template=prompt_template,
+            paper_text=pdf_text,
+            reader_api_config=reader_api_config,
+            visual_bundle=resolved_visual_bundle,
+        )
+        return built_input.to_metadata_dict()
+
     def _get_outline_file_path(self) -> str:
         if not self.output_dir:
             raise ValueError("输出目录未设置")
@@ -2011,22 +2095,57 @@ class LiteratureReviewGenerator:
                 'api_base': backup_reader_config.get('api_base', 'https://api.openai.com/v1')
             }
             
-            # 构建完整的分析提示词
+            visual_bundle = self._build_stage1_visual_bundle(
+                paper=paper,
+                pdf_path=pdf_path,
+                preprocess_metadata=preprocess_metadata,
+            )
+
+            # 构建显式的阶段一输入：文本始终是主输入，视觉证据只作为受控补充
             try:
-                prompt_template = self._load_stage1_prompt_template()
-                self.logger.info("使用路由版阶段一分析提示词")
-                
-                # 替换占位符
-                prompt_template = self._inject_free_mode_context(prompt_template)
-                analysis_prompt = prompt_template.replace('{{PAPER_FULL_TEXT}}', pdf_text)
-                
+                stage1_input = self._build_stage1_model_input(
+                    pdf_text=pdf_text,
+                    reader_api_config=reader_api_config,
+                    visual_bundle=visual_bundle,
+                    paper=paper,
+                )
+                analysis_prompt = str(stage1_input.get("prompt_text") or pdf_text)
             except Exception as e:
-                self.logger.warning(f"无法加载优化分析提示词模板，使用简化提示词: {e}")
-                # 简化提示词
-                analysis_prompt = f"请分析以下论文内容，生成结构化摘要：\n\n{pdf_text}"
-            
+                self.logger.warning(f"无法构建显式阶段一输入，回退到文本提示词: {e}")
+                stage1_input = {
+                    "input_mode": "text_only",
+                    "prompt_text": f"请分析以下论文内容，生成结构化摘要：\n\n{pdf_text}",
+                    "user_message_content": None,
+                    "selected_visual_refs": [],
+                    "visual_manifest_path": "",
+                    "visual_bundle_path": "",
+                    "visual_selection_policy_snapshot": {},
+                    "multimodal_capability": {},
+                    "fallback_reason": "stage1_input_builder_error",
+                }
+                analysis_prompt = str(stage1_input.get("prompt_text") or pdf_text)
+
+            stage1_user_content = stage1_input.get("user_message_content")
+            stage1_input_snapshot = {
+                key: value
+                for key, value in stage1_input.items()
+                if key not in {"prompt_text", "user_message_content"}
+            }
+            preprocess_metadata["visual_artifact_manifest_path"] = str(stage1_input.get("visual_manifest_path") or "")
+            preprocess_metadata["visual_bundle_path"] = str(stage1_input.get("visual_bundle_path") or "")
+            preprocess_metadata["selected_visual_count"] = len(stage1_input.get("selected_visual_refs") or [])
+            preprocess_metadata["stage1_input_mode"] = str(stage1_input.get("input_mode") or "text_only")
+            preprocess_metadata["stage1_input_fallback_reason"] = str(stage1_input.get("fallback_reason") or "")
+
             # 调用AI接口生成摘要（自动处理引擎切换）
-            ai_result = get_summary_from_ai_with_fallback(analysis_prompt, reader_api_config, backup_api_config, logger=self.logger, config=self.config)
+            ai_result = get_summary_from_ai_with_fallback(
+                analysis_prompt,
+                reader_api_config,
+                backup_api_config,
+                logger=self.logger,
+                config=self.config,
+                user_content=stage1_user_content,
+            )
             
             if not ai_result:
                 failure_reason = "AI摘要生成失败"
@@ -2073,8 +2192,15 @@ class LiteratureReviewGenerator:
                     self.logger.info("主引擎内容质量检查失败，尝试备用引擎...")
                     
                     # 使用备用引擎直接调用（绕过主引擎）
-                    backup_result = get_summary_from_ai(analysis_prompt, reader_api_config, backup_api_config,
-                                                       engine_type='backup', logger=self.logger, config=self.config)
+                    backup_result = get_summary_from_ai(
+                        analysis_prompt,
+                        reader_api_config,
+                        backup_api_config,
+                        engine_type='backup',
+                        logger=self.logger,
+                        config=self.config,
+                        user_content=stage1_user_content,
+                    )
                     
                     if backup_result:
                         self.logger.success("备用引擎AI摘要生成成功")
@@ -2259,6 +2385,7 @@ class LiteratureReviewGenerator:
                 'processing_time': datetime.now().isoformat(),
                 'text_length': len(pdf_text) if pdf_text else 0,  # type: ignore
                 'preprocess': preprocess_metadata,
+                'stage1_input': stage1_input_snapshot,
                 'source_mode': self.mode,
             }
 
@@ -3644,6 +3771,8 @@ class LiteratureReviewGenerator:
                 ):
                     return False
                 
+                # Create minimal citation manifest
+                review_draft_path = self._review_draft_path()
                 # Generate minimal citation data (this is a thin slice, so we'll create basic citations)
                 minimal_citations = []
                 for i, ref in enumerate(references):
@@ -3656,7 +3785,6 @@ class LiteratureReviewGenerator:
                         "section_title": "参考文献",
                     })
                 
-                review_draft_path = self._review_draft_path()
                 if not self._persist_citation_manifest(
                     review_draft_path=review_draft_path,
                     review_word_path=word_file,

@@ -60,7 +60,8 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
 
     config_dict: Dict[str, Dict[str, str]] = {}
     for section_name in config.sections():
-        config_dict[section_name] = dict(config[section_name])
+        section = config[section_name]
+        config_dict[section_name] = {str(key): str(value) for key, value in section.items()}
 
     config_dict = apply_validation_compat_sections(config_dict)
     validation_settings = read_validation_settings(config_dict)

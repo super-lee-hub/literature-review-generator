@@ -27,7 +27,6 @@ class _DummyLogger:
         pass
 
 
-
 def _resume_report(workspace: JobWorkspace) -> ResumeStateReport:
     return ResumeStateReport(
         artifact_type="resume_state_report",
@@ -43,7 +42,6 @@ def _resume_report(workspace: JobWorkspace) -> ResumeStateReport:
         checkpoint_file=workspace.checkpoint_path(f"{workspace.project_name}_checkpoint.json"),
         fingerprint_bundle={"request": "demo"},
     )
-
 
 
 def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: str | None = None):
@@ -81,78 +79,50 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
     return generator, workspace, registry
 
 
-
 def _stub_stage2_bootstrap(monkeypatch, generator) -> None:
     monkeypatch.setattr(generator, "load_configuration", lambda: True)
     monkeypatch.setattr(generator, "setup_output_directory", lambda: True)
     monkeypatch.setattr(generator, "load_existing_summaries", lambda: True)
     monkeypatch.setattr(generator, "_stage2_validation_enabled", lambda: False)
     monkeypatch.setattr(generator, "generate_word_table_of_contents", lambda _doc: True)
-    monkeypatch.setattr(generator, "create_word_document", lambda *args, **kwargs: True)
-    monkeypatch.setattr(generator, "append_section_to_word_document", lambda *args, **kwargs: True)
-
 
 
 def test_successful_stage2_generation_creates_registered_citation_manifest(tmp_path: Path, monkeypatch) -> None:
     generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-citation-success")
     _stub_stage2_bootstrap(monkeypatch, generator)
 
-    # Create a review draft path for testing
-    review_draft_path = workspace.artifact_path("review_drafts/demo_review_draft_v1.json")
-    Path(review_draft_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(review_draft_path, 'w', encoding='utf-8') as f:
-        json.dump({"artifact_type": "review_draft"}, f)
+    outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
 
-    # Create a word file path for testing
-    word_file_path = workspace.report_path("demo_literature_review.docx")
-    Path(word_file_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(word_file_path, 'w', encoding='utf-8') as f:
-        f.write("")
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(
+        generator, "generate_review_section_content",
+        lambda section_title, _outline: f"{section_title} generated content.",
+    )
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
-    # Create minimal citations
-    minimal_citations = [
-        {
-            "citation_id": "cite_1",
-            "paper_id": "paper_1",
-            "text": "Author, A. (2024). Demo reference.",
-            "context": "Reference list",
-            "section_number": 3,
-            "section_title": "参考文献",
-        }
-    ]
+    assert generator.generate_full_review_from_outline() is True
 
-    # Test the _persist_citation_manifest method directly to verify persistence and registration
-    assert generator._persist_citation_manifest(
-        review_draft_path=review_draft_path,
-        review_word_path=word_file_path,
-        citations=minimal_citations,
-    ) is True, "Citation manifest persistence should succeed"
-
-    # Verify citation manifest was written to job workspace
-    citation_path = Path(workspace.artifact_path("citation_manifests/demo_citation_manifest_v1.json"))
-    assert citation_path.exists() is True, "Citation manifest should be written to job workspace"
-
-    # Verify citation manifest was registered in ArtifactRegistry
+    word_path = Path(workspace.report_path("demo_literature_review.docx"))
     registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
     citation_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "citation_manifest"]
-    assert len(citation_records) == 1, "Citation manifest should be registered in ArtifactRegistry"
 
-    # Verify citation manifest content structure
-    artifact_payload = json.loads(citation_path.read_text(encoding="utf-8"))
+    assert word_path.exists() is True
+    assert len(citation_records) == 1
+
+    artifact_path = Path(citation_records[0]["path"])
+    artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+
     assert artifact_payload["artifact_type"] == "citation_manifest"
     assert artifact_payload["artifact_version"] == "v1"
     assert artifact_payload["created_from_job_id"] == workspace.job_id
     assert artifact_payload["manifest_identity"]["manifest_id"] == "citation_manifest:v1"
-    assert artifact_payload["review_reference"]["review_word_path"] == str(word_file_path)
+    assert artifact_payload["review_reference"]["review_word_path"] == str(word_path)
     assert len(artifact_payload["citations"]) == 1
     assert artifact_payload["citations"][0]["text"] == "Author, A. (2024). Demo reference."
     assert artifact_payload["citations"][0]["section_title"] == "参考文献"
-    assert any(dep["artifact_type"] == "review_draft" for dep in citation_records[0]["depends_on"]), "Citation manifest should depend on review_draft"
-
-    # Verify citation manifest is written to job workspace, not project-root truth path
-    assert str(citation_path).startswith(str(workspace.paths.artifacts_dir)), "Citation manifest should be in job workspace artifacts directory"
-    assert not str(citation_path).startswith(str(workspace.paths.root_dir) + "/output"), "Citation manifest should not be in project root output directory"
-
+    assert any(dep["artifact_type"] == "review_draft" for dep in citation_records[0]["depends_on"])
 
 
 def test_stage2_with_failed_sections_does_not_register_citation_manifest(tmp_path: Path, monkeypatch) -> None:

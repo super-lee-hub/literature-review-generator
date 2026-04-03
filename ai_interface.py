@@ -1,8 +1,10 @@
-import requests  # type: ignore
+import base64
 import json
+import mimetypes
 import time
 import threading
 import re
+import requests  # type: ignore
 from typing import Union, Dict, Optional, Any, List, Tuple, Callable
 
 from models import APIConfig
@@ -61,8 +63,66 @@ def _load_api_runtime_settings() -> Tuple[int, int]:
     return timeout_seconds, retry_attempts
 
 
+def _encode_local_image_as_data_url(path: str) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            image_bytes = handle.read()
+    except OSError:
+        return None
+
+    if not image_bytes:
+        return None
+
+    mime_type = mimetypes.guess_type(path)[0] or "image/png"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any = None) -> Any:
+    if not isinstance(user_content, list):
+        return prompt
+
+    normalized: List[Dict[str, Any]] = []
+    for item in user_content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type == "text":
+            text = str(item.get("text") or "")
+            if text:
+                normalized.append({"type": "text", "text": text})
+            continue
+        if item_type == "local_image_path":
+            path = str(item.get("path") or "").strip()
+            data_url = _encode_local_image_as_data_url(path)
+            if not data_url:
+                if logger:
+                    logger.warning(f"Skipping missing or unreadable local image input: {path}")
+                continue
+            normalized.append({"type": "image_url", "image_url": {"url": data_url}})
+            continue
+        if item_type == "image_url":
+            image_url = item.get("image_url")
+            if isinstance(image_url, dict) and image_url.get("url"):
+                normalized.append({"type": "image_url", "image_url": {"url": str(image_url.get("url"))}})
+            elif isinstance(image_url, str) and image_url.strip():
+                normalized.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+            continue
+
+    if not normalized:
+        return prompt
+
+    has_text = any(item.get("type") == "text" for item in normalized)
+    if not has_text and prompt:
+        normalized.insert(0, {"type": "text", "text": prompt})
+    return normalized
+
+
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
-                 temperature: float = 0.3, response_format: str = "json", logger: Any = None) -> Optional[Dict[str, Any]]:
+                 temperature: float = 0.3, response_format: str = "json", logger: Any = None,
+                 user_content: Any = None) -> Optional[Dict[str, Any]]:
     """
     统一的AI API调用函数，完全独立处理JSON解析，包含自动纠错功能
 
@@ -98,6 +158,8 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
             "Authorization": f"Bearer {api_key}"
         }
         
+        normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
+
         payload: Dict[str, Any] = {
             "model": model_name,
             "messages": [
@@ -107,7 +169,7 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
                 },
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": normalized_user_content
                 }
             ],
             "temperature": temperature,
@@ -940,7 +1002,8 @@ except Exception as e:
 
 
 def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,
-                                      logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                                      logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None,
+                                      user_content: Any = None) -> Optional[Dict[str, Any]]:
     """
     调用AI API并返回结构化摘要，支持主引擎失败时自动切换到备用引擎
     采用与validate_summary_quality相同的严格占位符检测标准
@@ -959,8 +1022,15 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
     if logger:
         logger.debug("尝试使用主引擎生成摘要...")
     
-    result = get_summary_from_ai(prompt_text, primary_api_config, backup_api_config, 
-                                engine_type='primary', logger=logger, config=config)
+    result = get_summary_from_ai(
+        prompt_text,
+        primary_api_config,
+        backup_api_config,
+        engine_type='primary',
+        logger=logger,
+        config=config,
+        user_content=user_content,
+    )
     
     if result is not None:
         # 使用与validate_summary_quality相同的严格内容检查
@@ -1047,8 +1117,15 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
     if logger:
         logger.info("主引擎失败，切换到备用引擎...")
     
-    result = get_summary_from_ai(prompt_text, primary_api_config, backup_api_config,
-                                engine_type='backup', logger=logger, config=config)
+    result = get_summary_from_ai(
+        prompt_text,
+        primary_api_config,
+        backup_api_config,
+        engine_type='backup',
+        logger=logger,
+        config=config,
+        user_content=user_content,
+    )
     
     if result is not None:
         if logger:
@@ -1061,7 +1138,8 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
 
 
 def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,
-                       engine_type: str = 'primary', logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                       engine_type: str = 'primary', logger: Optional[Any] = None,
+                       config: Optional[Dict[str, Any]] = None, user_content: Any = None) -> Optional[Dict[str, Any]]:
     """
     调用AI API并返回结构化摘要（带重试机制和429错误处理）
 
@@ -1224,7 +1302,14 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         if engine_type == 'primary':
             if logger:
                 logger.info("主引擎令牌不足，切换到备用引擎")
-            return get_summary_from_ai(prompt_text, primary_api_config, backup_api_config, 'backup', logger=logger)
+            return get_summary_from_ai(
+                prompt_text,
+                primary_api_config,
+                backup_api_config,
+                'backup',
+                logger=logger,
+                user_content=user_content,
+            )
         else:
             if logger:
                 logger.error("备用引擎令牌不足，无法处理此论文")
@@ -1242,7 +1327,16 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
     # ======================================================================
 
     # 使用统一的API调用函数
-    ai_response = _call_ai_api(prompt_text, api_config, system_prompt, max_tokens=max_tokens, temperature=temperature, response_format="json", logger=logger)
+    ai_response = _call_ai_api(
+        prompt_text,
+        api_config,
+        system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        response_format="json",
+        logger=logger,
+        user_content=user_content,
+    )
 
     if not ai_response:
         return None

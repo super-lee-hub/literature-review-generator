@@ -1,0 +1,663 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+import fitz  # type: ignore
+
+from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry, file_sha256
+from services.job_workspace import atomic_write_json, utc_now_iso
+
+
+_VISUAL_KEYWORDS = (
+    "figure",
+    "fig.",
+    "fig ",
+    "table",
+    "framework",
+    "model",
+    "process",
+    "mechanism",
+    "architecture",
+    "workflow",
+    "diagram",
+    "schema",
+    "illustrates",
+    "shown in",
+    "图",
+    "表",
+    "框架",
+    "机制",
+    "模型",
+    "流程",
+    "架构",
+)
+
+_DEFAULT_SELECTION_POLICY: Dict[str, Any] = {
+    "policy_name": "stage1_visual_bundle_budgeted_v1",
+    "text_is_primary": True,
+    "supported_artifact_types": ["page_snapshot", "figure_crop"],
+    "deferred_artifact_types": ["table_crop"],
+    "budgets": {
+        "page_snapshot_max": 4,
+        "figure_crop_max": 6,
+        "total_visuals_max": 10,
+        "figure_crop_max_per_page": 2,
+    },
+    "selection_signals": [
+        "image_rich_pages",
+        "figure_and_framework_keywords",
+        "nearby_caption_and_context_cues",
+        "deterministic_score_sorting",
+        "per_page_diversity_limits",
+        "decorative_small_block_filtering",
+    ],
+}
+
+
+def _truncate(value: Any, limit: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 0)].rstrip() + "..."
+
+
+def _normalize_bbox(value: Any) -> List[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return []
+    bbox: List[float] = []
+    for item in value:
+        try:
+            bbox.append(round(float(item), 2))
+        except (TypeError, ValueError):
+            return []
+    x0, y0, x1, y1 = bbox
+    if x1 <= x0 or y1 <= y0:
+        return []
+    return bbox
+
+
+def _block_text(block: Mapping[str, Any]) -> str:
+    collected: List[str] = []
+    for line in block.get("lines", []) if isinstance(block.get("lines"), list) else []:
+        if not isinstance(line, Mapping):
+            continue
+        for span in line.get("spans", []) if isinstance(line.get("spans"), list) else []:
+            if not isinstance(span, Mapping):
+                continue
+            text = str(span.get("text") or "").strip()
+            if text:
+                collected.append(text)
+    return " ".join(collected).strip()
+
+
+def _count_keyword_hits(text: str) -> int:
+    lowered = text.casefold()
+    hits = 0
+    for keyword in _VISUAL_KEYWORDS:
+        hits += lowered.count(keyword.casefold())
+    return hits
+
+
+def _load_json(path: str) -> Any:
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _paper_hash(paper_key: str) -> str:
+    return hashlib.sha256(paper_key.encode("utf-8")).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class VisualArtifactRecord:
+    visual_id: str
+    artifact_id: str
+    paper_key: str
+    source_pdf: str
+    page_no: int
+    bbox: List[float]
+    artifact_type: str
+    source_type: str
+    image_path: str
+    caption_excerpt: str
+    nearby_text_excerpt: str
+    selection_reason: str
+    selection_score: float
+    dedupe_group_id: str
+
+    def to_ref(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class Stage1VisualBundle:
+    artifact_type: str
+    artifact_version: str
+    created_from_job_id: str
+    created_at: str
+    paper_key: str
+    source_pdf: str
+    bundle_path: str
+    visual_manifest_path: str
+    selected_visual_refs: List[Dict[str, Any]]
+    selection_policy_snapshot: Dict[str, Any]
+    bundle_metadata: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class Stage1VisualArtifactBuilder:
+    """Create a small, durable, traceable visual bundle for stage-one analysis."""
+
+    def __init__(self, *, logger: Any = None):
+        self.logger = logger
+
+    def build_bundle(
+        self,
+        *,
+        job_id: str,
+        paper_key: str,
+        paper_info: Mapping[str, Any],
+        source_pdf: str,
+        output_dir: str,
+        artifact_registry: ArtifactRegistry,
+        preprocess_metadata: Mapping[str, Any] | None = None,
+    ) -> Optional[Stage1VisualBundle]:
+        if not source_pdf or not os.path.exists(source_pdf):
+            return None
+
+        policy = json.loads(json.dumps(_DEFAULT_SELECTION_POLICY))
+        preprocess_metadata = dict(preprocess_metadata or {})
+        artifact_hash = _paper_hash(paper_key)
+        bundle_dir = os.path.abspath(output_dir)
+        os.makedirs(bundle_dir, exist_ok=True)
+        bundle_path = os.path.join(bundle_dir, "visual_bundle.json")
+        manifest_path = os.path.join(bundle_dir, "visual_manifest.json")
+
+        page_index = self._load_page_index(preprocess_metadata)
+        page_blocks = self._load_page_blocks(preprocess_metadata)
+        if not page_index or not page_blocks:
+            fallback_page_index, fallback_page_blocks = self._extract_pdf_page_data(source_pdf)
+            if not page_index:
+                page_index = fallback_page_index
+            if not page_blocks:
+                page_blocks = fallback_page_blocks
+
+        pdf_hash = file_sha256(source_pdf)
+        depends_on = self._build_base_dependencies(source_pdf, pdf_hash, preprocess_metadata)
+        page_candidates = self._select_page_candidates(page_index, policy)
+        figure_candidates = self._select_figure_candidates(page_blocks, page_index, policy)
+
+        selected_visuals = self._materialize_visuals(
+            source_pdf=source_pdf,
+            page_candidates=page_candidates,
+            figure_candidates=figure_candidates,
+            policy=policy,
+            bundle_dir=bundle_dir,
+            paper_key=paper_key,
+            artifact_hash=artifact_hash,
+        )
+
+        created_at = utc_now_iso()
+        budget_decisions = {
+            "candidate_counts": {
+                "page_snapshot": len(page_candidates),
+                "figure_crop": len(figure_candidates),
+                "table_crop": 0,
+            },
+            "selected_counts": {
+                "page_snapshot": sum(1 for item in selected_visuals if item.artifact_type == "page_snapshot"),
+                "figure_crop": sum(1 for item in selected_visuals if item.artifact_type == "figure_crop"),
+                "table_crop": 0,
+                "total": len(selected_visuals),
+            },
+            "deferred_artifact_types": ["table_crop"],
+        }
+
+        manifest_payload = {
+            "artifact_type": "visual_manifest",
+            "artifact_version": "v1",
+            "created_from_job_id": job_id,
+            "created_at": created_at,
+            "paper_key": paper_key,
+            "paper_title": str(paper_info.get("title") or ""),
+            "source_pdf": source_pdf,
+            "bundle_dir": bundle_dir,
+            "selection_policy": policy,
+            "budget_decisions": budget_decisions,
+            "visuals": [item.to_ref() for item in selected_visuals],
+        }
+        atomic_write_json(manifest_path, manifest_payload)
+
+        for visual in selected_visuals:
+            artifact_registry.register_file(
+                artifact_role=visual.artifact_type,
+                artifact_type=visual.artifact_type,
+                artifact_version="v1",
+                path=visual.image_path,
+                producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+                depends_on=depends_on,
+                artifact_id=visual.artifact_id,
+            )
+
+        manifest_dependencies = list(depends_on)
+        for visual in selected_visuals:
+            manifest_dependencies.append(
+                ArtifactDependencyRef(
+                    artifact_type=visual.artifact_type,
+                    path=visual.image_path,
+                )
+            )
+        artifact_registry.register_file(
+            artifact_role="visual_manifest",
+            artifact_type="visual_manifest",
+            artifact_version="v1",
+            path=manifest_path,
+            producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+            depends_on=manifest_dependencies,
+            artifact_id=f"visual_manifest:{artifact_hash}",
+        )
+
+        bundle = Stage1VisualBundle(
+            artifact_type="stage1_visual_bundle",
+            artifact_version="v1",
+            created_from_job_id=job_id,
+            created_at=created_at,
+            paper_key=paper_key,
+            source_pdf=source_pdf,
+            bundle_path=bundle_path,
+            visual_manifest_path=manifest_path,
+            selected_visual_refs=[item.to_ref() for item in selected_visuals],
+            selection_policy_snapshot=policy,
+            bundle_metadata=budget_decisions,
+        )
+        atomic_write_json(bundle_path, bundle.to_dict())
+        bundle_dependencies = [
+            ArtifactDependencyRef(
+                artifact_type="visual_manifest",
+                path=manifest_path,
+            )
+        ]
+        for visual in selected_visuals:
+            bundle_dependencies.append(
+                ArtifactDependencyRef(
+                    artifact_type=visual.artifact_type,
+                    path=visual.image_path,
+                )
+            )
+        artifact_registry.register_file(
+            artifact_role="visual_bundle",
+            artifact_type="stage1_visual_bundle",
+            artifact_version="v1",
+            path=bundle_path,
+            producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+            depends_on=bundle_dependencies,
+            artifact_id=f"stage1_visual_bundle:{artifact_hash}",
+        )
+        return bundle
+
+    def _build_base_dependencies(
+        self,
+        source_pdf: str,
+        pdf_hash: str,
+        preprocess_metadata: Mapping[str, Any],
+    ) -> List[ArtifactDependencyRef]:
+        depends_on = [
+            ArtifactDependencyRef(
+                artifact_type="source_pdf",
+                path=source_pdf,
+                content_hash=pdf_hash,
+            )
+        ]
+        for artifact_type, key in (
+            ("preprocess_manifest", "manifest_path"),
+            ("preprocess_page_index", "page_index_path"),
+            ("preprocess_structured_json", "structured_json_path"),
+        ):
+            path = str(preprocess_metadata.get(key) or "").strip()
+            if path and os.path.exists(path):
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type=artifact_type,
+                        path=path,
+                        content_hash=file_sha256(path),
+                    )
+                )
+        return depends_on
+
+    def _load_page_index(self, preprocess_metadata: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        page_index_path = str(preprocess_metadata.get("page_index_path") or "").strip()
+        payload = _load_json(page_index_path)
+        return payload if isinstance(payload, list) else []
+
+    def _load_page_blocks(self, preprocess_metadata: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        structured_json_path = str(preprocess_metadata.get("structured_json_path") or "").strip()
+        payload = _load_json(structured_json_path)
+        if isinstance(payload, Mapping):
+            pages = payload.get("pages")
+            if isinstance(pages, list):
+                return [dict(item) for item in pages if isinstance(item, Mapping)]
+        return []
+
+    def _extract_pdf_page_data(self, source_pdf: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        page_index: List[Dict[str, Any]] = []
+        page_blocks: List[Dict[str, Any]] = []
+        doc = fitz.open(source_pdf)
+        try:
+            for page_number in range(doc.page_count):
+                page = doc.load_page(page_number)
+                text = str(page.get_text("text") or "")
+                blocks = page.get_text("dict")
+                page_index.append(
+                    {
+                        "page_number": page_number + 1,
+                        "text": text,
+                        "text_length": len(text.strip()),
+                        "image_count": len(page.get_images(full=True)),
+                        "block_count": len(blocks.get("blocks", [])) if isinstance(blocks, Mapping) else 0,
+                        "scanned_candidate": False,
+                        "used_ocr": False,
+                        "low_quality": len(text.strip()) < 80,
+                    }
+                )
+                page_blocks.append(
+                    {
+                        "page_number": page_number + 1,
+                        "text": text,
+                        "image_count": len(page.get_images(full=True)),
+                        "blocks": blocks,
+                    }
+                )
+        finally:
+            doc.close()
+        return page_index, page_blocks
+
+    def _select_page_candidates(
+        self,
+        page_index: Iterable[Mapping[str, Any]],
+        policy: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for item in page_index:
+            page_no = int(item.get("page_number", 0) or 0)
+            if page_no <= 0:
+                continue
+            text = str(item.get("text") or "")
+            image_count = int(item.get("image_count", 0) or 0)
+            cue_hits = _count_keyword_hits(text)
+            if image_count <= 0 and cue_hits <= 0:
+                continue
+
+            score = float(min(image_count, 4) * 2 + cue_hits * 1.5)
+            if bool(item.get("low_quality", False)):
+                score -= 0.5
+            reason_parts = []
+            if image_count > 0:
+                reason_parts.append(f"image_rich_page:{image_count}")
+            if cue_hits > 0:
+                reason_parts.append(f"keyword_hits:{cue_hits}")
+
+            candidates.append(
+                {
+                    "page_no": page_no,
+                    "bbox": [],
+                    "score": round(score, 2),
+                    "selection_reason": ", ".join(reason_parts) or "image_rich_page",
+                    "caption_excerpt": "",
+                    "nearby_text_excerpt": _truncate(text),
+                    "dedupe_group_id": f"page:{page_no}",
+                }
+            )
+
+        candidates.sort(key=lambda item: (-float(item["score"]), int(item["page_no"])))
+        limit = int(policy.get("budgets", {}).get("page_snapshot_max", 4) or 4)
+        return candidates[:limit]
+
+    def _select_figure_candidates(
+        self,
+        page_blocks: Iterable[Mapping[str, Any]],
+        page_index: Iterable[Mapping[str, Any]],
+        policy: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+        page_text_by_no = {
+            int(item.get("page_number", 0) or 0): str(item.get("text") or "")
+            for item in page_index
+            if int(item.get("page_number", 0) or 0) > 0
+        }
+        candidates: List[Dict[str, Any]] = []
+        max_per_page = int(policy.get("budgets", {}).get("figure_crop_max_per_page", 2) or 2)
+
+        for page_entry in page_blocks:
+            page_no = int(page_entry.get("page_number", 0) or 0)
+            if page_no <= 0:
+                continue
+            block_payload = page_entry.get("blocks")
+            if not isinstance(block_payload, Mapping):
+                continue
+            blocks = block_payload.get("blocks")
+            if not isinstance(blocks, list):
+                continue
+
+            page_width = float(block_payload.get("width", 0.0) or 0.0)
+            page_height = float(block_payload.get("height", 0.0) or 0.0)
+            page_area = page_width * page_height if page_width > 0 and page_height > 0 else 1.0
+
+            text_blocks = []
+            image_candidates = []
+            for block in blocks:
+                if not isinstance(block, Mapping):
+                    continue
+                block_type = block.get("type")
+                bbox = _normalize_bbox(block.get("bbox"))
+                if not bbox:
+                    continue
+                if block_type == 0:
+                    text = _block_text(block)
+                    if text:
+                        text_blocks.append({"bbox": bbox, "text": text})
+                    continue
+                if block_type != 1:
+                    continue
+
+                x0, y0, x1, y1 = bbox
+                width = x1 - x0
+                height = y1 - y0
+                area_ratio = (width * height) / page_area if page_area else 0.0
+                if width < 70 or height < 70 or area_ratio < 0.015:
+                    continue
+                if (y0 < page_height * 0.08 or y1 > page_height * 0.92) and height < page_height * 0.12:
+                    continue
+
+                caption_excerpt, nearby_text_excerpt = self._extract_nearby_text(
+                    image_bbox=bbox,
+                    text_blocks=text_blocks,
+                    page_text=page_text_by_no.get(page_no, ""),
+                )
+                cue_hits = _count_keyword_hits(f"{caption_excerpt}\n{nearby_text_excerpt}\n{page_text_by_no.get(page_no, '')}")
+                score = round(min(area_ratio * 30, 5.0) + cue_hits * 1.5, 2)
+                if score <= 0:
+                    score = round(area_ratio * 20, 2)
+                selection_reason_parts = [f"large_image_block:{round(area_ratio, 3)}"]
+                if cue_hits > 0:
+                    selection_reason_parts.append(f"caption_or_context_cues:{cue_hits}")
+
+                dedupe_seed = caption_excerpt or nearby_text_excerpt or f"{page_no}:{bbox}"
+                dedupe_group_id = self._dedupe_group_id(page_no, dedupe_seed, bbox)
+                image_candidates.append(
+                    {
+                        "page_no": page_no,
+                        "bbox": bbox,
+                        "score": score,
+                        "selection_reason": ", ".join(selection_reason_parts),
+                        "caption_excerpt": _truncate(caption_excerpt),
+                        "nearby_text_excerpt": _truncate(nearby_text_excerpt),
+                        "dedupe_group_id": dedupe_group_id,
+                    }
+                )
+
+            image_candidates.sort(
+                key=lambda item: (
+                    -float(item["score"]),
+                    int(item["page_no"]),
+                    float(item["bbox"][1]) if item.get("bbox") else 0.0,
+                )
+            )
+            candidates.extend(image_candidates[:max_per_page])
+
+        candidates.sort(
+            key=lambda item: (
+                -float(item["score"]),
+                int(item["page_no"]),
+                float(item["bbox"][1]) if item.get("bbox") else 0.0,
+            )
+        )
+
+        deduped: List[Dict[str, Any]] = []
+        seen_groups = set()
+        total_limit = int(policy.get("budgets", {}).get("figure_crop_max", 6) or 6)
+        for item in candidates:
+            group_id = str(item.get("dedupe_group_id") or "")
+            if group_id in seen_groups:
+                continue
+            seen_groups.add(group_id)
+            deduped.append(item)
+            if len(deduped) >= total_limit:
+                break
+        return deduped
+
+    def _extract_nearby_text(
+        self,
+        *,
+        image_bbox: List[float],
+        text_blocks: List[Dict[str, Any]],
+        page_text: str,
+    ) -> Tuple[str, str]:
+        x0, y0, x1, y1 = image_bbox
+        nearby: List[Tuple[float, str]] = []
+        captions: List[Tuple[float, str]] = []
+        for text_block in text_blocks:
+            bbox = text_block.get("bbox") or []
+            if not bbox:
+                continue
+            tx0, ty0, tx1, ty1 = bbox
+            vertical_distance = min(abs(ty1 - y0), abs(ty0 - y1), abs(ty0 - y0), abs(ty1 - y1))
+            horizontal_overlap = min(x1, tx1) - max(x0, tx0)
+            if horizontal_overlap < -40:
+                continue
+            text = str(text_block.get("text") or "").strip()
+            if not text:
+                continue
+            nearby.append((vertical_distance, text))
+            if ty0 >= y1 - 20 and ty0 <= y1 + 140:
+                captions.append((vertical_distance, text))
+
+        nearby.sort(key=lambda item: (item[0], item[1]))
+        captions.sort(key=lambda item: (item[0], item[1]))
+
+        caption_excerpt = ""
+        for _distance, text in captions:
+            if _count_keyword_hits(text) > 0:
+                caption_excerpt = text
+                break
+        if not caption_excerpt and captions:
+            caption_excerpt = captions[0][1]
+
+        nearby_text_excerpt = " ".join(text for _distance, text in nearby[:3]).strip()
+        if not nearby_text_excerpt:
+            nearby_text_excerpt = _truncate(page_text)
+        return caption_excerpt, nearby_text_excerpt
+
+    def _dedupe_group_id(self, page_no: int, seed_text: str, bbox: List[float]) -> str:
+        normalized_seed = re.sub(r"\W+", " ", seed_text.casefold()).strip()
+        if normalized_seed:
+            digest_source = f"{page_no}:{normalized_seed}"
+        else:
+            digest_source = f"{page_no}:{bbox}"
+        return hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:12]
+
+    def _materialize_visuals(
+        self,
+        *,
+        source_pdf: str,
+        page_candidates: List[Dict[str, Any]],
+        figure_candidates: List[Dict[str, Any]],
+        policy: Mapping[str, Any],
+        bundle_dir: str,
+        paper_key: str,
+        artifact_hash: str,
+    ) -> List[VisualArtifactRecord]:
+        total_limit = int(policy.get("budgets", {}).get("total_visuals_max", 10) or 10)
+        page_limit = int(policy.get("budgets", {}).get("page_snapshot_max", 4) or 4)
+        figure_limit = int(policy.get("budgets", {}).get("figure_crop_max", 6) or 6)
+
+        selected_pages = page_candidates[: min(page_limit, total_limit)]
+        remaining_budget = max(total_limit - len(selected_pages), 0)
+        selected_figures = figure_candidates[: min(figure_limit, remaining_budget)]
+
+        doc = fitz.open(source_pdf)
+        try:
+            visuals: List[VisualArtifactRecord] = []
+
+            for page_candidate in selected_pages:
+                page_no = int(page_candidate["page_no"])
+                page = doc.load_page(page_no - 1)
+                bbox = [0.0, 0.0, round(float(page.rect.width), 2), round(float(page.rect.height), 2)]
+                image_path = os.path.join(bundle_dir, f"page_snapshot_p{page_no:03d}.png")
+                page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False).save(image_path)
+                artifact_id = f"page_snapshot:{artifact_hash}:p{page_no:03d}"
+                visuals.append(
+                    VisualArtifactRecord(
+                        visual_id=f"page-{page_no:03d}",
+                        artifact_id=artifact_id,
+                        paper_key=paper_key,
+                        source_pdf=source_pdf,
+                        page_no=page_no,
+                        bbox=bbox,
+                        artifact_type="page_snapshot",
+                        source_type="page",
+                        image_path=os.path.abspath(image_path),
+                        caption_excerpt=str(page_candidate.get("caption_excerpt") or ""),
+                        nearby_text_excerpt=str(page_candidate.get("nearby_text_excerpt") or ""),
+                        selection_reason=str(page_candidate.get("selection_reason") or "image_rich_page"),
+                        selection_score=round(float(page_candidate.get("score", 0.0) or 0.0), 2),
+                        dedupe_group_id=str(page_candidate.get("dedupe_group_id") or f"page:{page_no}"),
+                    )
+                )
+
+            for index, figure_candidate in enumerate(selected_figures, start=1):
+                page_no = int(figure_candidate["page_no"])
+                bbox = _normalize_bbox(figure_candidate.get("bbox"))
+                if not bbox:
+                    continue
+                page = doc.load_page(page_no - 1)
+                image_path = os.path.join(bundle_dir, f"figure_crop_p{page_no:03d}_{index:02d}.png")
+                page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8), clip=fitz.Rect(bbox), alpha=False).save(image_path)
+                artifact_id = f"figure_crop:{artifact_hash}:p{page_no:03d}:c{index:02d}"
+                visuals.append(
+                    VisualArtifactRecord(
+                        visual_id=f"figure-{page_no:03d}-{index:02d}",
+                        artifact_id=artifact_id,
+                        paper_key=paper_key,
+                        source_pdf=source_pdf,
+                        page_no=page_no,
+                        bbox=bbox,
+                        artifact_type="figure_crop",
+                        source_type="image_block",
+                        image_path=os.path.abspath(image_path),
+                        caption_excerpt=str(figure_candidate.get("caption_excerpt") or ""),
+                        nearby_text_excerpt=str(figure_candidate.get("nearby_text_excerpt") or ""),
+                        selection_reason=str(figure_candidate.get("selection_reason") or "large_image_block"),
+                        selection_score=round(float(figure_candidate.get("score", 0.0) or 0.0), 2),
+                        dedupe_group_id=str(figure_candidate.get("dedupe_group_id") or ""),
+                    )
+                )
+            return visuals
+        finally:
+            doc.close()
