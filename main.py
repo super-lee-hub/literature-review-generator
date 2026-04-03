@@ -3857,16 +3857,46 @@ class LiteratureReviewGenerator:
 
                 # Create minimal citation manifest
                 review_draft_path = self._review_draft_v2_path()
-                # Generate minimal citation data with real paper IDs
+                # Generate minimal citation data with real paper IDs using deterministic mapping
                 minimal_citations = []
+                
+                # Build a mapping from canonical paper key to paper info for deterministic matching
+                paper_key_to_info = {}
+                for summary in self.summaries:
+                    paper_info = summary.get('paper_info', {})
+                    canonical_key = self.get_paper_key(paper_info)
+                    if canonical_key:
+                        paper_key_to_info[canonical_key] = paper_info
+                
+                # Also build a reverse mapping from paper info to canonical key for fallback
+                info_to_key = {}
+                for canonical_key, paper_info in paper_key_to_info.items():
+                    # Use a combination of title and authors as a key for matching
+                    title = paper_info.get('title', '').lower()
+                    authors = ''.join(paper_info.get('authors', [])).lower()
+                    info_key = f"{title}_{authors}"
+                    if info_key:
+                        info_to_key[info_key] = canonical_key
+                
                 for i, ref in enumerate(references):
-                    # Get real paper ID from summaries if available
+                    # Get real paper ID using deterministic matching
                     paper_id = f"paper_{i+1}"  # Fallback to placeholder
-                    if i < len(self.summaries):
-                        paper_info = self.summaries[i].get('paper_info', {})
+                    
+                    # Try to find a matching paper by checking all summaries
+                    # This is more robust than index-based matching
+                    for summary in self.summaries:
+                        paper_info = summary.get('paper_info', {})
                         canonical_key = self.get_paper_key(paper_info)
-                        if canonical_key:
+                        
+                        # Check if this paper's info matches the reference
+                        title = paper_info.get('title', '').lower()
+                        authors = ''.join(paper_info.get('authors', [])).lower()
+                        
+                        # Simple heuristic: check if title or authors are in the reference
+                        ref_lower = ref.lower()
+                        if (title and title in ref_lower) or (authors and authors in ref_lower):
                             paper_id = canonical_key
+                            break
                     
                     minimal_citations.append({
                         "citation_id": f"cite_{i+1}",
