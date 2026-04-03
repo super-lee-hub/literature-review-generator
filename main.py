@@ -1601,7 +1601,7 @@ class LiteratureReviewGenerator:
         prompt_template = self._inject_free_mode_context(prompt_template)
         
         # Use registry-first visual artifact resolution if available
-        resolved_visual_bundle = visual_bundle
+        resolved_visual_bundle = dict(visual_bundle or {})
         if paper and self.artifact_registry and self.job_workspace:
             from services.visual_artifact_resolver import VisualArtifactResolver
             resolver = VisualArtifactResolver(self.artifact_registry, self.logger)
@@ -1614,18 +1614,14 @@ class LiteratureReviewGenerator:
             # Resolve selected visual refs from paper artifact or registry
             selected_visual_refs = resolver.resolve_selected_visual_refs(paper_artifact_path)
             if selected_visual_refs:
-                # Build resolved visual bundle
-                resolved_visual_bundle = {
-                    "selected_visual_refs": selected_visual_refs,
-                    "visual_manifest_path": "",
-                    "bundle_path": "",
-                    "selection_policy_snapshot": {},
-                }
-                
-                # Try to resolve visual manifest path
-                manifest = resolver.resolve_visual_manifest(paper_artifact_path)
-                if manifest:
-                    resolved_visual_bundle["visual_manifest_path"] = manifest.get("bundle_dir", "")
+                resolved_visual_bundle["selected_visual_refs"] = selected_visual_refs
+                resolved_visual_bundle.setdefault("visual_manifest_path", "")
+                resolved_visual_bundle.setdefault("bundle_path", "")
+                resolved_visual_bundle.setdefault("selection_policy_snapshot", {})
+
+                manifest_path = resolver.resolve_visual_manifest_path(paper_artifact_path)
+                if manifest_path:
+                    resolved_visual_bundle["visual_manifest_path"] = manifest_path
         
         built_input = self.stage1_input_builder.build(
             prompt_template=prompt_template,

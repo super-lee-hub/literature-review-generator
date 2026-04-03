@@ -2,15 +2,80 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional
 
-from services.artifact_registry import ArtifactRegistry, ArtifactRecord
+from services.artifact_registry import ArtifactRegistry
 
 
 class VisualArtifactResolver:
     def __init__(self, artifact_registry: ArtifactRegistry, logger: Any = None):
         self.artifact_registry = artifact_registry
         self.logger = logger
+
+    def _load_json_file(self, path: str) -> Optional[Dict[str, Any]]:
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            if self.logger:
+                self.logger.warning(f"Error loading JSON file {path}: {e}")
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _load_paper_artifact(self, paper_artifact_path: str) -> Optional[Dict[str, Any]]:
+        return self._load_json_file(paper_artifact_path)
+
+    def _paper_key_candidates(self, paper_artifact: Dict[str, Any]) -> List[str]:
+        candidates: List[str] = []
+        paper_identity = paper_artifact.get("paper_identity")
+        if isinstance(paper_identity, dict):
+            for key in ("canonical_paper_key", "source_paper_id"):
+                value = str(paper_identity.get(key) or "").strip()
+                if value and value not in candidates:
+                    candidates.append(value)
+            aliases = paper_identity.get("paper_key_aliases")
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    value = str(alias or "").strip()
+                    if value and value not in candidates:
+                        candidates.append(value)
+
+        stage1_inputs = paper_artifact.get("stage1_inputs")
+        if isinstance(stage1_inputs, dict):
+            for item in stage1_inputs.get("selected_visual_refs", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                value = str(item.get("paper_key") or "").strip()
+                if value and value not in candidates:
+                    candidates.append(value)
+        return candidates
+
+    def resolve_visual_manifest_path(self, paper_artifact_path: str) -> str:
+        paper_artifact = self._load_paper_artifact(paper_artifact_path)
+        if not paper_artifact:
+            return ""
+
+        stage1_inputs = paper_artifact.get("stage1_inputs")
+        manifest_path = ""
+        if isinstance(stage1_inputs, dict):
+            manifest_path = str(stage1_inputs.get("visual_artifact_manifest_path") or "").strip()
+        if manifest_path and os.path.isfile(manifest_path):
+            return os.path.abspath(manifest_path)
+
+        paper_keys = set(self._paper_key_candidates(paper_artifact))
+        for record in self.artifact_registry.list_records():
+            if record.artifact_type != "visual_manifest" or record.status != "ready":
+                continue
+            manifest = self._load_json_file(record.path)
+            if not manifest:
+                continue
+            manifest_paper_key = str(manifest.get("paper_key") or "").strip()
+            if paper_keys and manifest_paper_key not in paper_keys:
+                continue
+            return os.path.abspath(record.path)
+        return ""
 
     def resolve_visual_manifest(self, paper_artifact_path: str) -> Optional[Dict[str, Any]]:
         """Resolve visual manifest from paper artifact and registry.
@@ -21,32 +86,8 @@ class VisualArtifactResolver:
         Returns:
             Visual manifest dict if found, None otherwise
         """
-        try:
-            if not os.path.exists(paper_artifact_path):
-                return None
-            
-            with open(paper_artifact_path, 'r', encoding='utf-8') as f:
-                paper_artifact = json.load(f)
-            
-            # Try to get manifest path from paper artifact
-            manifest_path = paper_artifact.get('stage1_inputs', {}).get('visual_artifact_manifest_path')
-            if manifest_path and os.path.exists(manifest_path):
-                with open(manifest_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            
-            # Fall back to registry lookup
-            registry_records = self.artifact_registry.list_records()
-            for record in registry_records:
-                if record.artifact_type == 'visual_manifest' and record.status == 'ready':
-                    if os.path.exists(record.path):
-                        with open(record.path, 'r', encoding='utf-8') as f:
-                            return json.load(f)
-            
-        except (FileNotFoundError, json.JSONDecodeError, PermissionError) as e:
-            if self.logger:
-                self.logger.warning(f"Error resolving visual manifest: {e}")
-        
-        return None
+        manifest_path = self.resolve_visual_manifest_path(paper_artifact_path)
+        return self._load_json_file(manifest_path)
 
     def resolve_selected_visual_refs(self, paper_artifact_path: str) -> List[Dict[str, Any]]:
         """Resolve selected visual refs from paper artifact and registry.
@@ -57,28 +98,24 @@ class VisualArtifactResolver:
         Returns:
             List of selected visual refs
         """
-        try:
-            if not os.path.exists(paper_artifact_path):
-                return []
-            
-            with open(paper_artifact_path, 'r', encoding='utf-8') as f:
-                paper_artifact = json.load(f)
-            
-            # Try to get selected visual refs from paper artifact
-            selected_refs = paper_artifact.get('stage1_inputs', {}).get('selected_visual_refs', [])
+        paper_artifact = self._load_paper_artifact(paper_artifact_path)
+        if not paper_artifact:
+            return []
+
+        stage1_inputs = paper_artifact.get("stage1_inputs")
+        if isinstance(stage1_inputs, dict):
+            selected_refs = [
+                dict(item)
+                for item in (stage1_inputs.get("selected_visual_refs") or [])
+                if isinstance(item, dict)
+            ]
             if selected_refs:
                 return selected_refs
-            
-            # Fall back to visual manifest
-            manifest = self.resolve_visual_manifest(paper_artifact_path)
-            if manifest:
-                return manifest.get('visuals', [])
-            
-        except (FileNotFoundError, json.JSONDecodeError, PermissionError) as e:
-            if self.logger:
-                self.logger.warning(f"Error resolving selected visual refs: {e}")
-        
-        return []
+
+        manifest = self.resolve_visual_manifest(paper_artifact_path)
+        if not manifest:
+            return []
+        return [dict(item) for item in (manifest.get("visuals") or []) if isinstance(item, dict)]
 
     def resolve_visual_artifact_by_id(self, visual_id: str) -> Optional[Dict[str, Any]]:
         """Resolve visual artifact by its ID.
@@ -89,24 +126,17 @@ class VisualArtifactResolver:
         Returns:
             Visual artifact dict if found, None otherwise
         """
-        try:
-            # Look through all visual manifests
-            registry_records = self.artifact_registry.list_records()
-            for record in registry_records:
-                if record.artifact_type == 'visual_manifest' and record.status == 'ready':
-                    if os.path.exists(record.path):
-                        with open(record.path, 'r', encoding='utf-8') as f:
-                            manifest = json.load(f)
-                        
-                        # Look for visual artifact with matching ID
-                        for visual in manifest.get('visuals', []):
-                            if visual.get('id') == visual_id or visual.get('visual_id') == visual_id:
-                                return visual
-            
-        except (FileNotFoundError, json.JSONDecodeError, PermissionError) as e:
-            if self.logger:
-                self.logger.warning(f"Error resolving visual artifact by ID: {e}")
-        
+        for record in self.artifact_registry.list_records():
+            if record.artifact_type != "visual_manifest" or record.status != "ready":
+                continue
+            manifest = self._load_json_file(record.path)
+            if not manifest:
+                continue
+            for visual in manifest.get("visuals", []):
+                if not isinstance(visual, dict):
+                    continue
+                if visual.get("id") == visual_id or visual.get("visual_id") == visual_id:
+                    return visual
         return None
 
     def get_visual_artifacts_for_paper(self, paper_key: str) -> List[Dict[str, Any]]:
@@ -118,25 +148,18 @@ class VisualArtifactResolver:
         Returns:
             List of visual artifacts for the paper
         """
-        try:
-            visual_artifacts = []
-            
-            # Look through all visual manifests
-            registry_records = self.artifact_registry.list_records()
-            for record in registry_records:
-                if record.artifact_type == 'visual_manifest' and record.status == 'ready':
-                    if os.path.exists(record.path):
-                        with open(record.path, 'r', encoding='utf-8') as f:
-                            manifest = json.load(f)
-                        
-                        # Check if this manifest is for the specified paper
-                        if manifest.get('paper_key') == paper_key:
-                            visual_artifacts.extend(manifest.get('visuals', []))
-            
-            return visual_artifacts
-            
-        except (FileNotFoundError, json.JSONDecodeError, PermissionError) as e:
-            if self.logger:
-                self.logger.warning(f"Error getting visual artifacts for paper: {e}")
-        
-        return []
+        visual_artifacts: List[Dict[str, Any]] = []
+        for record in self.artifact_registry.list_records():
+            if record.artifact_type != "visual_manifest" or record.status != "ready":
+                continue
+            manifest = self._load_json_file(record.path)
+            if not manifest:
+                continue
+            if str(manifest.get("paper_key") or "") != paper_key:
+                continue
+            visual_artifacts.extend(
+                dict(item)
+                for item in (manifest.get("visuals") or [])
+                if isinstance(item, dict)
+            )
+        return visual_artifacts

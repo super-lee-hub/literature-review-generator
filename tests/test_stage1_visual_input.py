@@ -375,3 +375,112 @@ def test_process_paper_links_visual_bundle_into_paper_artifact_with_text_only_fa
     assert paper_artifact["stage1_inputs"]["visual_artifact_manifest_path"]
     assert paper_artifact["stage1_inputs"]["selected_visual_refs"]
     assert paper_artifact["stage1_inputs"]["visual_selection_policy_snapshot"]["budgets"]["total_visuals_max"] == 10
+
+
+def test_build_stage1_model_input_restores_manifest_file_path_from_registry(tmp_path: Path, monkeypatch) -> None:
+    generator, workspace, registry = _make_bound_generator(
+        tmp_path,
+        api_base="https://example.com/v1",
+        model="custom-reader",
+        job_id="job-stage1-visual-restore",
+    )
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "Analyze:\n{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+
+    image_path = tmp_path / "restored-sample.png"
+    image_path.write_bytes(PNG_BYTES)
+
+    paper: PaperInfo = {
+        "title": "Visual Paper",
+        "authors": ["Alice Example"],
+        "year": "2024",
+        "journal": "Journal of Tests",
+        "doi": "10.1000/demo",
+        "pdf_path": str(tmp_path / "paper.pdf"),
+        "canonical_paper_key": "test-paper",
+        "paper_key_aliases": ["test-paper"],
+    }
+
+    manifest_path = Path(workspace.artifact_path("stage1_visuals/test/visual_manifest.json"))
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "visual_manifest",
+                "artifact_version": "v1",
+                "created_from_job_id": workspace.job_id,
+                "created_at": "2024-01-01T00:00:00Z",
+                "paper_key": "test-paper",
+                "paper_title": "Visual Paper",
+                "source_pdf": "paper.pdf",
+                "bundle_dir": str(manifest_path.parent),
+                "selection_policy": {"budgets": {"total_visuals_max": 10}},
+                "budget_decisions": {},
+                "visuals": [
+                    {
+                        "visual_id": "figure-001",
+                        "artifact_id": "figure_crop:test",
+                        "paper_key": "test-paper",
+                        "source_pdf": "paper.pdf",
+                        "page_no": 2,
+                        "bbox": [90.0, 170.0, 430.0, 430.0],
+                        "artifact_type": "figure_crop",
+                        "source_type": "image_block",
+                        "image_path": str(image_path),
+                        "caption_excerpt": "Figure 1. Proposed framework model.",
+                        "nearby_text_excerpt": "As shown in Figure 1, the proposed framework model explains the process.",
+                        "selection_reason": "large_image_block:0.18, caption_or_context_cues:4",
+                        "selection_score": 7.5,
+                        "dedupe_group_id": "abc123",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry.register_file(
+        artifact_role="visual_manifest",
+        artifact_type="visual_manifest",
+        artifact_version="v1",
+        path=str(manifest_path),
+        producer="test",
+    )
+
+    paper_key = generator._paper_artifact_key(paper)
+    artifact_hash = generator._paper_artifact_hash(paper_key)
+    paper_artifact_path = Path(workspace.artifact_path(f"paper_artifacts/{artifact_hash}.json"))
+    paper_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    paper_artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "paper_artifact",
+                "artifact_version": "v1",
+                "created_from_job_id": workspace.job_id,
+                "created_at": "2024-01-01T00:00:00Z",
+                "paper_identity": {
+                    "source_paper_id": "test-paper",
+                    "canonical_paper_key": "test-paper",
+                    "paper_key_aliases": ["test-paper"],
+                },
+                "source": {},
+                "paper_info": dict(paper),
+                "analysis": {},
+                "stage1_inputs": {
+                    "visual_artifact_manifest_path": str(manifest_path.parent),
+                    "selected_visual_refs": [],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    built = generator._build_stage1_model_input(
+        pdf_text="Main text body.",
+        reader_api_config={"api_key": "key", "model": "custom-reader", "api_base": "https://example.com/v1"},
+        visual_bundle=None,
+        paper=paper,
+    )
+
+    assert built["visual_manifest_path"] == str(manifest_path)
+    assert built["visual_manifest_path"] != str(manifest_path.parent)
+    assert built["selected_visual_refs"][0]["paper_key"] == "test-paper"
