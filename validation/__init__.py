@@ -18,8 +18,31 @@ from validation.summary_recheck import (
     WHITELISTED_FIELDS,
     run_summary_rechecks,
 )
+from validation.repair_models import (
+    AppliedPatchRecord,
+    ApplyGuardResult,
+    DependencyHashBundle,
+    PatchGranularity,
+    PatchProposal,
+    PatchTargetSignature,
+    RepairApplyResult,
+    RepairPlan,
+    RepairPolicy,
+    RepairReport,
+    RepairRootCause,
+)
+from validation.repair_planner import (
+    RepairPlanner,
+    run_repair_planning,
+)
+from validation.repair_apply import (
+    RepairApplier,
+    check_apply_guards,
+    run_repair_apply,
+)
 
 __all__ = [
+    # Week 3 validation
     "EvidenceCandidate",
     "EvidenceResolver",
     "EvidenceResolverContext",
@@ -34,4 +57,21 @@ __all__ = [
     "SummaryRechecker",
     "WHITELISTED_FIELDS",
     "run_summary_rechecks",
+    # Week 4 repair pipeline
+    "AppliedPatchRecord",
+    "ApplyGuardResult",
+    "DependencyHashBundle",
+    "PatchGranularity",
+    "PatchProposal",
+    "PatchTargetSignature",
+    "RepairApplyResult",
+    "RepairPlan",
+    "RepairPolicy",
+    "RepairReport",
+    "RepairRootCause",
+    "RepairPlanner",
+    "run_repair_planning",
+    "RepairApplier",
+    "check_apply_guards",
+    "run_repair_apply",
 ]
