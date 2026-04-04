@@ -210,7 +210,12 @@ def run_repair_pipeline(
 
 
 def load_repair_plan(plan_id: str, workspace: JobWorkspace) -> Optional[RepairPlan]:
-    """Load a persisted repair plan from workspace."""
+    """Load a persisted repair plan from workspace.
+    
+    Reconstructs a RepairPlan from its JSON serialization, including all
+    nested PatchProposal objects with their DependencyHashBundle and
+    PatchTargetSignature.
+    """
     plan_path = workspace.artifact_path(f"repair_plan_{plan_id}.json")
     
     if not os.path.exists(plan_path):
@@ -219,6 +224,55 @@ def load_repair_plan(plan_id: str, workspace: JobWorkspace) -> Optional[RepairPl
     with open(plan_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     
-    from validation.repair_models import RepairPlan, RepairPolicy, PatchProposal
+    from validation.repair_models import (
+        RepairPlan, RepairPolicy, PatchProposal, PatchTargetSignature,
+        DependencyHashBundle, RepairRootCause, PatchGranularity
+    )
+    
+    # Reconstruct proposals
+    proposals = []
+    for prop_data in data.get("proposals", []):
+        # Reconstruct target signature
+        target_data = prop_data.get("target", {})
+        target = PatchTargetSignature(
+            block_id=target_data.get("block_id", ""),
+            anchor_text=target_data.get("anchor_text", ""),
+            anchor_hash=target_data.get("anchor_hash", ""),
+            span_start=target_data.get("span_start"),
+            span_end=target_data.get("span_end"),
+        )
+        
+        # Reconstruct dependency bundle
+        bundle_data = prop_data.get("dependency_bundle", {})
+        dependency_bundle = DependencyHashBundle(
+            summary_hash=bundle_data.get("summary_hash", ""),
+            paper_artifact_hash=bundle_data.get("paper_artifact_hash", ""),
+            visual_manifest_hash=bundle_data.get("visual_manifest_hash", ""),
+            selected_visual_refs_hash=bundle_data.get("selected_visual_refs_hash", ""),
+        )
+        
+        # Reconstruct proposal
+        proposal = PatchProposal(
+            proposal_id=prop_data.get("proposal_id", ""),
+            citation_id=prop_data.get("citation_id", ""),
+            root_cause=RepairRootCause(prop_data.get("root_cause", "citation_mapping_error")),
+            granularity=PatchGranularity(prop_data.get("granularity", "span")),
+            target=target,
+            original_text=prop_data.get("original_text", ""),
+            proposed_text=prop_data.get("proposed_text", ""),
+            confidence=prop_data.get("confidence", 0.5),
+            fix_strategy=prop_data.get("fix_strategy", ""),
+            dependency_bundle=dependency_bundle,
+            metadata=prop_data.get("metadata", {}),
+        )
+        proposals.append(proposal)
     
     # Reconstruct RepairPlan
+    return RepairPlan(
+        plan_id=data.get("plan_id", plan_id),
+        created_at=data.get("created_at", ""),
+        created_from_job_id=data.get("created_from_job_id", ""),
+        validation_report_id=data.get("validation_report_id", ""),
+        proposals=proposals,
+        policy=RepairPolicy(data.get("policy", "report_first")),
+    )

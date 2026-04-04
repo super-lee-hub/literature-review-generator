@@ -128,3 +128,61 @@ class ArtifactRegistry:
         self.save()
         return record
 
+    def register(
+        self,
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        artifact_version: str,
+        path: str,
+        producer: str,
+        job_id: str,
+        status: str = "ready",
+        depends_on: List[Dict[str, str]] | None = None,
+    ) -> ArtifactRecord:
+        """Register an artifact with dependency tracking.
+        
+        This is the primary registration method used by repair_integration and other
+        Week 4/5 modules. Converts dict-style dependencies to ArtifactDependencyRef.
+        """
+        abs_path = os.path.abspath(path)
+        content_hash = file_sha256(abs_path) if os.path.exists(abs_path) else ""
+        
+        # Convert dict dependencies to ArtifactDependencyRef objects
+        dependency_refs: List[ArtifactDependencyRef] = []
+        if depends_on:
+            for dep in depends_on:
+                if isinstance(dep, dict):
+                    # Get the dependency record to extract its type and hash
+                    dep_record = self._artifacts.get(dep.get("artifact_id", ""))
+                    if dep_record:
+                        dependency_refs.append(ArtifactDependencyRef(
+                            artifact_type=dep_record.artifact_type,
+                            path=dep_record.path,
+                            content_hash=dep_record.content_hash,
+                        ))
+                    else:
+                        # Dependency not yet registered, use placeholder
+                        dependency_refs.append(ArtifactDependencyRef(
+                            artifact_type=dep.get("role", "unknown"),
+                            path="",
+                            content_hash="",
+                        ))
+        
+        record = ArtifactRecord(
+            artifact_id=artifact_id,
+            artifact_role=artifact_type,
+            artifact_type=artifact_type,
+            artifact_version=artifact_version,
+            path=abs_path,
+            producer=producer,
+            job_id=job_id,
+            status=status,
+            content_hash=content_hash,
+            depends_on=dependency_refs,
+            created_at=utc_now_iso(),
+        )
+        self._artifacts[record.artifact_id] = record
+        self.save()
+        return record
+
