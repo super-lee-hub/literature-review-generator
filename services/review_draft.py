@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -17,6 +18,19 @@ class ReviewDraftV1:
     generation_context: Dict[str, Any]
     content: Dict[str, Any]
     projections: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StructuredCitation:
+    local_ref_id: str
+    paper_id: Optional[str] = None
+    paper_key: Optional[str] = None
+    raw_text: str = ""
+    mode: str = "parenthetical"
+    locator: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -129,6 +143,53 @@ def build_review_draft_v1(
     )
 
 
+def _extract_citations_from_text(text: str, block_id: str) -> List[Dict[str, Any]]:
+    """Extract structured citations from text content using APA-style pattern matching."""
+    citations: List[Dict[str, Any]] = []
+    
+    # APA-style citation patterns: (Author, Year) or (Author et al., Year) or Author (Year)
+    parenthetical_pattern = r'\([^)]+,\s*\d{4}(?:\s*[;,]\s*[^)]+)*\)'
+    narrative_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*\(\s*\d{4}\s*\)'
+    
+    # Find all parenthetical citations
+    parenthetical_matches = re.finditer(parenthetical_pattern, text)
+    for idx, match in enumerate(parenthetical_matches, start=1):
+        local_ref_id = f"{block_id}_cite_p{idx}"
+        raw_text = match.group(0)
+        
+        # Try to extract author/year info for paper_id fallback
+        year_match = re.search(r'\b(\d{4})\b', raw_text)
+        year = year_match.group(1) if year_match else "n.d."
+        
+        citation = StructuredCitation(
+            local_ref_id=local_ref_id,
+            paper_key=None,
+            paper_id=None,
+            raw_text=raw_text,
+            mode="parenthetical",
+            locator=None
+        )
+        citations.append(citation.to_dict())
+    
+    # Find all narrative citations
+    narrative_matches = re.finditer(narrative_pattern, text)
+    for idx, match in enumerate(narrative_matches, start=len(citations) + 1):
+        local_ref_id = f"{block_id}_cite_n{idx}"
+        raw_text = match.group(0)
+        
+        citation = StructuredCitation(
+            local_ref_id=local_ref_id,
+            paper_key=None,
+            paper_id=None,
+            raw_text=raw_text,
+            mode="narrative",
+            locator=None
+        )
+        citations.append(citation.to_dict())
+    
+    return citations
+
+
 def _parse_section_into_blocks(section_number: int, section_title: str, content: str) -> List[ReviewBlock]:
     """Parse section content into blocks (paragraphs as minimal blocks)."""
     blocks: List[ReviewBlock] = []
@@ -139,6 +200,10 @@ def _parse_section_into_blocks(section_number: int, section_title: str, content:
         anchor_text = para[:80] if len(para) <= 80 else para[:80] + "..."
         # 生成 anchor_hash 使用 SHA256 的前 8 个字符
         anchor_hash = hashlib.sha256(para.encode('utf-8')).hexdigest()[:8]
+        
+        # Extract structured citations from paragraph text
+        citations = _extract_citations_from_text(para, block_id)
+        
         blocks.append(ReviewBlock(
             block_id=block_id,
             block_kind="paragraph",
@@ -146,7 +211,7 @@ def _parse_section_into_blocks(section_number: int, section_title: str, content:
             text=para,
             anchor_text=anchor_text,
             anchor_hash=anchor_hash,
-            citations=[],
+            citations=citations,
         ))
 
     return blocks

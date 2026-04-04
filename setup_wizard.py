@@ -368,17 +368,21 @@ def _collect_validation_section(
     existing_env: Mapping[str, str],
 ) -> None:
     performance = sections["Performance"]
+    validation = sections["Validation"]
     print("\n[验证设置]")
     stage1_validation = _prompt_yes_no(
         "启用阶段一验证",
-        _parse_bool(performance["enable_stage1_validation"]),
+        _parse_bool(validation.get("stage1_enabled", performance["enable_stage1_validation"])),
     )
     stage2_validation = _prompt_yes_no(
         "启用阶段二验证",
-        _parse_bool(performance["enable_stage2_validation"]),
+        _parse_bool(validation.get("stage2_enabled", performance["enable_stage2_validation"])),
     )
+    # 同时更新两个段，保持一致性
     performance["enable_stage1_validation"] = "true" if stage1_validation else "false"
     performance["enable_stage2_validation"] = "true" if stage2_validation else "false"
+    validation["stage1_enabled"] = "true" if stage1_validation else "false"
+    validation["stage2_enabled"] = "true" if stage2_validation else "false"
 
     if stage1_validation or stage2_validation:
         _collect_api_section(

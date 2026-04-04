@@ -437,10 +437,17 @@ def build_citation_manifest_v2_from_review_draft(
                     occurrence_counter += 1
                     occurrence_id = f"occ_{occurrence_counter}"
                     
-                    # Get paper info from structured citation
-                    paper_id = citation.get('paper_id', 'unknown')
+                    # Get paper info from structured citation (supports both old and new schema)
+                    paper_id = citation.get('paper_id', None)
                     paper_key = citation.get('paper_key', paper_id)
-                    citation_token = citation.get('text', f"({paper_key}, {citation.get('year', 'n.d.')})")
+                    # 兼容新旧字段名：raw_text (new schema) vs text (old schema)
+                    citation_token = citation.get('raw_text', citation.get('text', f"({paper_key}, n.d.)"))
+                    
+                    # If paper_id not set, try to match from citation_token
+                    if not paper_id or paper_id == 'unknown':
+                        matched_id, matched_key = _match_citation_to_paper(citation_token, paper_key_to_info)
+                        paper_id = matched_id
+                        paper_key = matched_key
                     
                     # Create occurrence using helper function
                     occurrence = _create_citation_occurrence(
@@ -485,7 +492,7 @@ def build_citation_manifest_v2_from_review_draft(
     
     # Build clusters from occurrence map
     for paper_id, occ_ids in paper_occurrence_map.items():
-        if paper_id == "unknown":
+        if not paper_id or paper_id == "unknown":
             continue
             
         # Find first occurrence section
@@ -504,37 +511,82 @@ def build_citation_manifest_v2_from_review_draft(
         )
         clusters.append(cluster)
     
-    # Build bibliography from references and cited papers
+    # Build bibliography primarily from cited papers (truth from occurrences/clusters)
     cited_paper_ids = set(paper_occurrence_map.keys())
     
-    for idx, ref in enumerate(references):
-        entry_id = f"bib_{idx}"
+    # Filter out invalid paper IDs
+    valid_cited_paper_ids = [pid for pid in cited_paper_ids if pid and pid != "unknown"]
+    
+    # First, add all cited papers that have known paper info
+    bib_idx = 0
+    for paper_id in valid_cited_paper_ids:
+        entry_id = f"bib_{bib_idx}"
+        cluster_id = f"cluster_{paper_id}"
         
-        # Try to find if this reference corresponds to a cited paper
+        # Try to find citation text from paper_info or references
+        citation_text = f"Citation for {paper_id}"
+        found_ref = False
+        
+        # Try to match in references for better citation text
+        for ref in references:
+            ref_lower = ref.lower()
+            for title_key, paper_data in paper_key_to_info.items():
+                if paper_data['paper_id'] == paper_id:
+                    if title_key in ref_lower or any(
+                        author.lower() in ref_lower for author in paper_data.get('authors', [])
+                    ):
+                        citation_text = ref
+                        found_ref = True
+                        break
+            if found_ref:
+                break
+        
+        entry = BibliographyEntry(
+            entry_id=entry_id,
+            paper_id=paper_id,
+            paper_key=paper_id,
+            citation_text=citation_text,
+            is_cited=True,
+            cluster_id=cluster_id,
+        )
+        bibliography.append(entry)
+        bib_idx += 1
+    
+    # Second, add remaining references, marking whether they're cited or not
+    for idx, ref in enumerate(references):
         ref_lower = ref.lower()
         matched_paper_id = "unknown"
-        cluster_id = None
+        already_added = False
+        is_cited = False
         
+        # Check if this reference corresponds to a known paper
         for title_key, paper_data in paper_key_to_info.items():
             if title_key in ref_lower or any(
                 author.lower() in ref_lower for author in paper_data.get('authors', [])
             ):
                 matched_paper_id = paper_data['paper_id']
-                if matched_paper_id in cited_paper_ids:
-                    cluster_id = f"cluster_{matched_paper_id}"
+                if matched_paper_id in valid_cited_paper_ids:
+                    is_cited = True
+                    # Check if already added from valid_cited_paper_ids
+                    for existing in bibliography:
+                        if existing.paper_id == matched_paper_id:
+                            already_added = True
+                            break
                 break
         
-        is_cited = matched_paper_id in cited_paper_ids
-        
-        entry = BibliographyEntry(
-            entry_id=entry_id,
-            paper_id=matched_paper_id,
-            paper_key=matched_paper_id,
-            citation_text=ref,
-            is_cited=is_cited,
-            cluster_id=cluster_id,
-        )
-        bibliography.append(entry)
+        if not already_added:
+            entry_id = f"bib_{bib_idx}"
+            cluster_id = f"cluster_{matched_paper_id}" if is_cited else None
+            entry = BibliographyEntry(
+                entry_id=entry_id,
+                paper_id=matched_paper_id,
+                paper_key=matched_paper_id,
+                citation_text=ref,
+                is_cited=is_cited,
+                cluster_id=cluster_id,
+            )
+            bibliography.append(entry)
+            bib_idx += 1
     
     return CitationManifestV2(
         artifact_type="citation_manifest",

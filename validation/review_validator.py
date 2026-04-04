@@ -103,55 +103,14 @@ class ReviewValidator:
         citations = self.citation_manifest.get("citations", [])
         return citations
 
-    def _validate_occurrence(self, occurrence: Dict[str, Any]) -> CitationValidationResult:
-        """Validate a single citation occurrence (v2-style)."""
-        occurrence_id = occurrence.get("occurrence_id") or occurrence.get("citation_id", "")
-        paper_id = occurrence.get("paper_id", "")
-        cited_text = occurrence.get("citation_token") or occurrence.get("text", "")
-        context = occurrence.get("context_before") or occurrence.get("context", "")
-
-        paper_artifact = self.paper_artifacts.get(paper_id)
-
-        if not paper_artifact:
-            return CitationValidationResult(
-                citation_id=occurrence_id,
-                paper_id=paper_id,
-                conclusion=ValidationConclusion.WRONG_SOURCE,
-                root_causes=[RootCause.CITATION_MAPPING_ERROR],
-                evidence_candidates=[],
-                details={"reason": "paper_not_found_in_artifacts"},
-            )
-
-        resolver_context = build_evidence_resolver_context(paper_artifact)
-        resolver = EvidenceResolver(resolver_context)
-        selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
-        evidence_candidates = resolver.resolve_evidence(
-            cited_span=cited_text,
-            selected_visual_refs=selected_visual_refs,
-        )
-
-        conclusion, root_causes = self._classify_citation(
-            cited_text=cited_text,
-            context=context,
-            evidence_candidates=evidence_candidates,
-            has_visual_refs=bool(selected_visual_refs),
-        )
-
-        return CitationValidationResult(
-            citation_id=occurrence_id,
-            paper_id=paper_id,
-            conclusion=conclusion,
-            root_causes=root_causes,
-            evidence_candidates=evidence_candidates,
-            details={},
-        )
-
-    def _validate_citation(self, citation: Dict[str, Any]) -> CitationValidationResult:
-        citation_id = citation.get("citation_id", "")
-        paper_id = citation.get("paper_id", "")
-        cited_text = citation.get("text", "")
-        context = citation.get("context", "")
-
+    def _validate_citation_generic(
+        self,
+        citation_id: str,
+        paper_id: str,
+        cited_text: str,
+        context: str,
+    ) -> CitationValidationResult:
+        """Generic citation validation logic shared by occurrence and citation."""
         paper_artifact = self.paper_artifacts.get(paper_id)
 
         if not paper_artifact:
@@ -186,6 +145,34 @@ class ReviewValidator:
             root_causes=root_causes,
             evidence_candidates=evidence_candidates,
             details={},
+        )
+
+    def _validate_occurrence(self, occurrence: Dict[str, Any]) -> CitationValidationResult:
+        """Validate a single citation occurrence (v2-style)."""
+        occurrence_id = occurrence.get("occurrence_id") or occurrence.get("citation_id", "")
+        paper_id = occurrence.get("paper_id", "")
+        cited_text = occurrence.get("citation_token") or occurrence.get("text", "")
+        context = occurrence.get("context_before") or occurrence.get("context", "")
+
+        return self._validate_citation_generic(
+            citation_id=occurrence_id,
+            paper_id=paper_id,
+            cited_text=cited_text,
+            context=context,
+        )
+
+    def _validate_citation(self, citation: Dict[str, Any]) -> CitationValidationResult:
+        """Validate a single citation (v1-style)."""
+        citation_id = citation.get("citation_id", "")
+        paper_id = citation.get("paper_id", "")
+        cited_text = citation.get("text", "")
+        context = citation.get("context", "")
+
+        return self._validate_citation_generic(
+            citation_id=citation_id,
+            paper_id=paper_id,
+            cited_text=cited_text,
+            context=context,
         )
 
     def _classify_citation(

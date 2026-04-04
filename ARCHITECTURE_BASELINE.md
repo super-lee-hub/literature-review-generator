@@ -121,10 +121,22 @@ Pointer updates are required to be atomic:
 
 Any non-atomic pointer update is considered a migration bug.
 
+## Source-of-Truth Matrix
+
+| Domain | Current Source | Target Source | Compat Projection | Stop-Write Time |
+|--------|----------------|---------------|-------------------|-----------------|
+| Summaries | `*_summaries.json` | `paper_artifact.json` | `*_summaries.json` | Week 1 |
+| Outline | `*_outline.md` | `outline.json` | `*_outline.md` | Week 5 |
+| Review Draft | Checkpoint + Word | `review_draft_v2.json` | `*_review_checkpoint.json` | Week 3 |
+| Citations | Word / regex | `citation_manifest_v2.json` | `citation_manifest_v1.json` | Week 3 |
+| Validation Reports | Legacy validator | `validation/review_validator.py` outputs | TBD | Week 4 |
+| Configuration | `Performance` section | `Validation` section | Bi-directional sync | Week 0 |
+
 ## Write-Stop Timeline
 
 - Week 0:
   - Freeze this baseline document.
+  - Bi-directional config sync between `Validation` and `Performance` sections.
 - Week 1:
   - Stop writing real artifacts into `output/<project_name>/`.
   - Keep only `_latest_job.json` in the project-root compatibility directory.

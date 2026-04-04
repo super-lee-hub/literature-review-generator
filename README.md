@@ -79,14 +79,16 @@ output/<project_name>__<job_id>/
 - Fingerprint mismatches are treated as `non_resumable`.
 - CLI and GUI both enter the same Week 1 execution boundary through `workflow_facade` and the shared config compatibility layer.
 
-## Persistent Queue (MVP)
+## Persistent Queue (Infrastructure Only)
 
-The project now includes a persistent queue system (see `services/queue_service.py`):
+The project includes a persistent queue infrastructure layer (see `services/queue_service.py`), but it is **not yet integrated into the main GUI or CLI workflow**:
 
 - `QueueJobSpec`: Job specification with parameters and dependencies
 - `QueueJobRuntime`: Runtime state tracking with retry count
 - `PersistentQueueService`: JSON-based persistent queue storage
 - Supports: add_job, update_job_state, retry_failed_jobs, etc.
+
+**Note**: The queue system is currently storage-layer only. Full productization (GUI/CLI integration, queue runner, etc.) is planned for a future release.
 
 ## Citation Truth-Source (Week 6 Runtime Upgrade)
 
