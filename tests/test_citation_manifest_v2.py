@@ -34,6 +34,7 @@ def test_citation_occurrence_roundtrip() -> None:
         occurrence_id="occ_1",
         citation_token="(Author, 2024)",
         paper_id="paper_123",
+        paper_key="paper_123",
         section_number=1,
         section_title="Introduction",
         block_id="s1_b1",
@@ -56,6 +57,7 @@ def test_citation_manifest_v2_basic() -> None:
         occurrence_id="occ_1",
         citation_token="(A, 2024)",
         paper_id="paper_a",
+        paper_key="paper_a",
         section_number=1,
         section_title="Intro",
         block_id="b1",
@@ -120,15 +122,15 @@ def test_get_cited_bibliography() -> None:
 
 def test_get_occurrences_for_paper() -> None:
     occ1 = CitationOccurrence(
-        occurrence_id="o1", citation_token="t1", paper_id="p1",
+        occurrence_id="o1", citation_token="t1", paper_id="p1", paper_key="p1",
         section_number=1, section_title="", block_id="", block_order=1,
     )
     occ2 = CitationOccurrence(
-        occurrence_id="o2", citation_token="t2", paper_id="p2",
+        occurrence_id="o2", citation_token="t2", paper_id="p2", paper_key="p2",
         section_number=2, section_title="", block_id="", block_order=1,
     )
     occ3 = CitationOccurrence(
-        occurrence_id="o3", citation_token="t3", paper_id="p1",
+        occurrence_id="o3", citation_token="t3", paper_id="p1", paper_key="p1",
         section_number=3, section_title="", block_id="", block_order=1,
     )
     
@@ -217,7 +219,7 @@ def test_migrate_v1_to_v2() -> None:
 def test_citation_manifest_v2_to_dict_and_from_dict() -> None:
     span = CitationSpan(span_id="s1", start_offset=0, end_offset=10, text="test")
     occurrence = CitationOccurrence(
-        occurrence_id="occ_1", citation_token="(A, 2024)", paper_id="p1",
+        occurrence_id="occ_1", citation_token="(A, 2024)", paper_id="p1", paper_key="p1",
         section_number=1, section_title="Intro", block_id="b1", block_order=1, spans=[span],
     )
     

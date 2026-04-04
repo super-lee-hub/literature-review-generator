@@ -27,6 +27,7 @@ class CitationOccurrence:
     occurrence_id: str
     citation_token: str
     paper_id: str
+    paper_key: str
     section_number: int
     section_title: str
     block_id: str
@@ -40,6 +41,7 @@ class CitationOccurrence:
             "occurrence_id": self.occurrence_id,
             "citation_token": self.citation_token,
             "paper_id": self.paper_id,
+            "paper_key": self.paper_key,
             "section_number": self.section_number,
             "section_title": self.section_title,
             "block_id": self.block_id,
@@ -55,6 +57,7 @@ class CitationOccurrence:
             occurrence_id=data["occurrence_id"],
             citation_token=data["citation_token"],
             paper_id=data["paper_id"],
+            paper_key=data.get("paper_key", data["paper_id"]),
             section_number=data["section_number"],
             section_title=data["section_title"],
             block_id=data["block_id"],
@@ -258,6 +261,7 @@ def migrate_v1_to_v2(v1_manifest: CitationManifestV1) -> CitationManifestV2:
             occurrence_id=occurrence_id,
             citation_token=str(citation.get("text", "")),
             paper_id=paper_id,
+            paper_key=paper_id,
             section_number=int(citation.get("section_number", 0)),
             section_title=str(citation.get("section_title", "")),
             block_id=str(citation.get("block_id", f"block_{idx}")),
