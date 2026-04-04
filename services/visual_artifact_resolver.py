@@ -30,12 +30,12 @@ def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
     normalized["source_pdf"] = visual.get("source_pdf") or ""
     
     # 页面信息
-    normalized["page_no"] = int(visual.get("page_no") or visual.get("page_number") or 0)
+    normalized["page_no"] = int(visual.get("page_no") or visual.get("page_number") or -1)
     page_range = visual.get("page_range")
     if page_range:
         normalized["page_range"] = page_range
     else:
-        normalized["page_range"] = [normalized["page_no"]] if normalized["page_no"] > 0 else []
+        normalized["page_range"] = [normalized["page_no"]] if normalized["page_no"] >= 0 else []
     
     # 位置信息
     normalized["bbox"] = visual.get("bbox") or []
