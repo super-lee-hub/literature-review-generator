@@ -782,20 +782,37 @@ class LiteratureReviewGenerator:
         This creates occurrence/cluster/bibliography truth from the review draft blocks,
         not just from the final reference list.
         """
-        from services.citation_manifest import migrate_v1_to_v2
+        from services.citation_manifest import build_citation_manifest_v2_from_review_draft
         
-        # First build v1 as intermediate (for migration path)
-        v1_manifest = build_citation_manifest_v1(
+        # Load review_draft_v2 to get block structure
+        try:
+            with open(review_draft_path, 'r', encoding='utf-8') as f:
+                review_draft_v2 = json.load(f)
+        except Exception as e:
+            self.logger.error(f"Failed to load review_draft_v2: {e}")
+            # Fallback to v1 migration path if review_draft_v2 is not available
+            from services.citation_manifest import migrate_v1_to_v2
+            v1_manifest = build_citation_manifest_v1(
+                job_id=self.job_workspace.job_id if self.job_workspace else "unknown",
+                project_name=self.project_name or "review",
+                manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
+                review_draft_path=review_draft_path,
+                review_word_path=review_word_path,
+                citations=citations,
+            )
+            v2_manifest = migrate_v1_to_v2(v1_manifest)
+            return v2_manifest
+        
+        # Use direct v2 builder from review_draft_v2 block structure
+        v2_manifest = build_citation_manifest_v2_from_review_draft(
             job_id=self.job_workspace.job_id if self.job_workspace else "unknown",
             project_name=self.project_name or "review",
             manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
             review_draft_path=review_draft_path,
             review_word_path=review_word_path,
-            citations=citations,
+            review_draft_v2=review_draft_v2,
+            paper_summaries=[dict(summary) for summary in self.summaries],
         )
-        
-        # Migrate to v2 with occurrence/cluster/bibliography structure
-        v2_manifest = migrate_v1_to_v2(v1_manifest)
         
         return v2_manifest
 
