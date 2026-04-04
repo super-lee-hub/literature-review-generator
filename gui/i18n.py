@@ -32,6 +32,7 @@ ACTION_LABELS: Dict[str, Dict[str, str]] = {
 
 
 TRANSLATIONS: Dict[str, Dict[str, str]] = {
+    "zh-CN": {},
     "en": {
         "开始": "Start",
         "总览": "Overview",

@@ -33,6 +33,9 @@ class JobRunRequest:
     free_mode_idea: Optional[str] = None
     progress_tracker: Optional[Any] = None
     gui: bool = False
+    source_mode: str = "direct"
+    zotero_report: Optional[str] = None
+    library_path: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,9 @@ def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
         free_mode_idea=getattr(args, "free_mode_idea", None),
         progress_tracker=getattr(args, "_progress_tracker", None),
         gui=getattr(args, "gui", False),
+        source_mode=getattr(args, "source_mode", "direct"),
+        zotero_report=getattr(args, "zotero_report", None),
+        library_path=getattr(args, "library_path", None),
     )
 
 

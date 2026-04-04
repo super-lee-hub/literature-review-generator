@@ -325,7 +325,7 @@ def migrate_v1_to_v2(v1_manifest: CitationManifestV1) -> CitationManifestV2:
 def _create_citation_occurrence(
     occurrence_id: str,
     citation_token: str,
-    paper_id: str,
+    paper_id: Optional[str],
     paper_key: str,
     section_number: int,
     section_title: str,
@@ -334,10 +334,12 @@ def _create_citation_occurrence(
     block_text: str,
 ) -> CitationOccurrence:
     """Create a CitationOccurrence with standardized fields."""
+    # 确保paper_id有默认值
+    safe_paper_id = paper_id if paper_id and paper_id != "unknown" else "unknown"
     return CitationOccurrence(
         occurrence_id=occurrence_id,
         citation_token=citation_token,
-        paper_id=paper_id,
+        paper_id=safe_paper_id,
         paper_key=paper_key,
         section_number=section_number,
         section_title=section_title,
@@ -351,13 +353,15 @@ def _create_citation_occurrence(
 
 def _update_occurrence_map(
     paper_occurrence_map: Dict[str, List[str]],
-    paper_id: str,
+    paper_id: Optional[str],
     occurrence_id: str,
 ) -> None:
     """Update the paper occurrence map with a new occurrence."""
-    if paper_id not in paper_occurrence_map:
-        paper_occurrence_map[paper_id] = []
-    paper_occurrence_map[paper_id].append(occurrence_id)
+    # 确保paper_id有默认值
+    safe_paper_id = paper_id if paper_id and paper_id != "unknown" else "unknown"
+    if safe_paper_id not in paper_occurrence_map:
+        paper_occurrence_map[safe_paper_id] = []
+    paper_occurrence_map[safe_paper_id].append(occurrence_id)
 
 
 def _match_citation_to_paper(
@@ -403,15 +407,16 @@ def build_citation_manifest_v2_from_review_draft(
     paper_key_to_info: Dict[str, Dict[str, Any]] = {}
     for summary in paper_summaries:
         paper_info = summary.get('paper_info', {})
-        # Use title as canonical key if available
-        title = paper_info.get('title', '')
-        if title:
-            paper_key_to_info[title.lower()] = {
-                'paper_id': title.lower(),
-                'paper_key': title.lower(),
-                'authors': paper_info.get('authors', []),
-                'year': paper_info.get('year', ''),
-            }
+        # 使用get_paper_key函数生成一致的paper_key
+        from main import get_paper_key
+        paper_key = get_paper_key(paper_info)
+        paper_key_to_info[paper_key] = {
+            'paper_id': paper_key,
+            'paper_key': paper_key,
+            'authors': paper_info.get('authors', []),
+            'year': paper_info.get('year', ''),
+            'title': paper_info.get('title', ''),
+        }
     
     # Extract occurrences from review_draft_v2 sections/blocks
     sections = review_draft_v2.get('content', {}).get('sections', [])
@@ -431,7 +436,7 @@ def build_citation_manifest_v2_from_review_draft(
             block_text = block.get('text', '')
             block_citations = block.get('citations', [])
             
-            # Priority 1: Use structured citations from blocks
+            # Priority 1: Use structured citations from blocks (primary path)
             if block_citations:
                 for citation in block_citations:
                     occurrence_counter += 1
@@ -442,6 +447,19 @@ def build_citation_manifest_v2_from_review_draft(
                     paper_key = citation.get('paper_key', paper_id)
                     # 兼容新旧字段名：raw_text (new schema) vs text (old schema)
                     citation_token = citation.get('raw_text', citation.get('text', f"({paper_key}, n.d.)"))
+                    mode = citation.get('mode', 'parenthetical')
+                    locator = citation.get('locator', None)
+                    
+                    # 从[[cite:]]语法中提取paper_key
+                    cite_pattern = r'\[\[cite:([^|\]]+)(?:\|([^\]]+))*\]\]'
+                    cite_match = re.match(cite_pattern, citation_token)
+                    if cite_match:
+                        extracted_paper_key = cite_match.group(1).strip()
+                        if extracted_paper_key:
+                            paper_key = extracted_paper_key
+                            # 尝试找到对应的paper_id
+                            if paper_key in paper_key_to_info:
+                                paper_id = paper_key_to_info[paper_key]['paper_id']
                     
                     # If paper_id not set, try to match from citation_token
                     if not paper_id or paper_id == 'unknown':
@@ -464,7 +482,51 @@ def build_citation_manifest_v2_from_review_draft(
                     occurrences.append(occurrence)
                     _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
             else:
-                # Priority 2: Fallback to regex extraction from free-form text
+                # Priority 2: Fallback to regex extraction from free-form text (legacy fallback)
+                # 优先匹配[[cite:]]语法
+                cite_pattern = r'\[\[cite:([^|\]]+)(?:\|([^\]]+))*\]\]'
+                found_cite_tokens = re.findall(cite_pattern, block_text)
+                
+                for match in found_cite_tokens:
+                    occurrence_counter += 1
+                    occurrence_id = f"occ_{occurrence_counter}"
+                    
+                    paper_key = match[0].strip()
+                    # 解析参数
+                    params = {}
+                    if match[1]:
+                        for param in match[1].split('|'):
+                            if '=' in param:
+                                key, value = param.split('=', 1)
+                                params[key.strip()] = value.strip()
+                    
+                    # 尝试找到对应的paper_id
+                    paper_id = None
+                    if paper_key in paper_key_to_info:
+                        paper_id = paper_key_to_info[paper_key]['paper_id']
+                    
+                    # 创建citation token
+                    citation_token = f"[[cite:{paper_key}"
+                    if params:
+                        citation_token += '|' + '|'.join([f"{k}={v}" for k, v in params.items()])
+                    citation_token += "]]"
+                    
+                    # Create occurrence using helper function
+                    occurrence = _create_citation_occurrence(
+                        occurrence_id=occurrence_id,
+                        citation_token=citation_token,
+                        paper_id=paper_id,
+                        paper_key=paper_key,
+                        section_number=section_number,
+                        section_title=section_title,
+                        block_id=block_id,
+                        block_order=block_order,
+                        block_text=block_text,
+                    )
+                    occurrences.append(occurrence)
+                    _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
+                
+                # 然后尝试匹配传统的APA格式
                 citation_pattern = r'\([^)]+,\s*\d{4}[^)]*\)'
                 found_citations = re.findall(citation_pattern, block_text)
                 
@@ -517,7 +579,7 @@ def build_citation_manifest_v2_from_review_draft(
     # Filter out invalid paper IDs
     valid_cited_paper_ids = [pid for pid in cited_paper_ids if pid and pid != "unknown"]
     
-    # First, add all cited papers that have known paper info
+    # Only add cited papers to bibliography (primary path: cited-only)
     bib_idx = 0
     for paper_id in valid_cited_paper_ids:
         entry_id = f"bib_{bib_idx}"
@@ -530,9 +592,9 @@ def build_citation_manifest_v2_from_review_draft(
         # Try to match in references for better citation text
         for ref in references:
             ref_lower = ref.lower()
-            for title_key, paper_data in paper_key_to_info.items():
+            for paper_key, paper_data in paper_key_to_info.items():
                 if paper_data['paper_id'] == paper_id:
-                    if title_key in ref_lower or any(
+                    if paper_data['title'].lower() in ref_lower or any(
                         author.lower() in ref_lower for author in paper_data.get('authors', [])
                     ):
                         citation_text = ref
@@ -552,41 +614,9 @@ def build_citation_manifest_v2_from_review_draft(
         bibliography.append(entry)
         bib_idx += 1
     
-    # Second, add remaining references, marking whether they're cited or not
-    for idx, ref in enumerate(references):
-        ref_lower = ref.lower()
-        matched_paper_id = "unknown"
-        already_added = False
-        is_cited = False
-        
-        # Check if this reference corresponds to a known paper
-        for title_key, paper_data in paper_key_to_info.items():
-            if title_key in ref_lower or any(
-                author.lower() in ref_lower for author in paper_data.get('authors', [])
-            ):
-                matched_paper_id = paper_data['paper_id']
-                if matched_paper_id in valid_cited_paper_ids:
-                    is_cited = True
-                    # Check if already added from valid_cited_paper_ids
-                    for existing in bibliography:
-                        if existing.paper_id == matched_paper_id:
-                            already_added = True
-                            break
-                break
-        
-        if not already_added:
-            entry_id = f"bib_{bib_idx}"
-            cluster_id = f"cluster_{matched_paper_id}" if is_cited else None
-            entry = BibliographyEntry(
-                entry_id=entry_id,
-                paper_id=matched_paper_id,
-                paper_key=matched_paper_id,
-                citation_text=ref,
-                is_cited=is_cited,
-                cluster_id=cluster_id,
-            )
-            bibliography.append(entry)
-            bib_idx += 1
+    # Fallback: add remaining references only if explicitly needed for compatibility
+    # This ensures we don't include uncited references in the primary bibliography
+    # Comment out the following section if you want strictly cited-only bibliography
     
     return CitationManifestV2(
         artifact_type="citation_manifest",

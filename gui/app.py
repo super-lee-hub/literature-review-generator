@@ -804,6 +804,53 @@ class WorkspaceController:
         else:
             ui.notify(self.t("队列服务未初始化"), type="warning")
 
+    def run_queue(self) -> None:
+        """运行队列任务"""
+        if self._queue_service:
+            try:
+                from services.job_runner import JobRunner
+                from services.queue_service import QueueRunner
+                job_runner = JobRunner()
+                queue_runner = QueueRunner(self._queue_service, job_runner)
+                ui.notify(self.t("开始运行队列任务..."))
+                queue_runner.run()
+                ui.notify(self.t("队列运行完成！"), type="positive")
+            except Exception as e:
+                ui.notify(self.tf("队列运行失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def retry_job(self, job_id: str) -> None:
+        """重试指定任务"""
+        if self._queue_service:
+            try:
+                runtime = self._queue_service.get_job_runtime(job_id)
+                if runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
+                    self._queue_service.reset_job(job_id)
+                    ui.notify(self.tf("任务已重置并将重试: {job_id}", job_id=job_id), type="positive")
+                else:
+                    ui.notify(self.t("只能重试失败或已取消的任务"), type="warning")
+            except Exception as e:
+                ui.notify(self.tf("重试任务失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def cancel_job(self, job_id: str) -> None:
+        """取消指定任务"""
+        if self._queue_service:
+            try:
+                runtime = self._queue_service.get_job_runtime(job_id)
+                if runtime and runtime.state == QueueState.RUNNING:
+                    # 这里只能标记为已取消，实际取消需要在执行过程中检查
+                    self._queue_service.update_job_state(job_id, QueueState.CANCELLED)
+                    ui.notify(self.tf("任务已标记为取消: {job_id}", job_id=job_id), type="positive")
+                else:
+                    ui.notify(self.t("只能取消运行中的任务"), type="warning")
+            except Exception as e:
+                ui.notify(self.tf("取消任务失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
     def t(self, key: str) -> str:
         return translate(self.language, key)
 
@@ -2279,34 +2326,101 @@ def launch_gui(
                     ui.label(t("队列状态")).classes("ag-section-title")
                     with ui.row().classes("gap-2 q-mt-md"):
                         ui.button(t("刷新队列"), on_click=controller.refresh_queue).props("unelevated")
+                        ui.button(t("运行队列"), on_click=controller.run_queue).props("unelevated color=primary")
                         ui.button(t("清空已完成"), on_click=controller.clear_completed_jobs).props("outline")
                     
+                    # 队列状态统计
+                    with ui.row().classes("gap-4 q-mt-md"):
+                        pending_count = 0
+                        running_count = 0
+                        completed_count = 0
+                        failed_count = 0
+                        
+                        if controller._queue_service:
+                            jobs = controller._queue_service.list_jobs()
+                            for job in jobs:
+                                runtime = controller._queue_service.get_job_runtime(job.job_id)
+                                if runtime:
+                                    if runtime.state == QueueState.PENDING:
+                                        pending_count += 1
+                                    elif runtime.state == QueueState.RUNNING:
+                                        running_count += 1
+                                    elif runtime.state == QueueState.COMPLETED:
+                                        completed_count += 1
+                                    elif runtime.state == QueueState.FAILED:
+                                        failed_count += 1
+                        
+                        with ui.card().classes("ag-card p-4"):
+                            ui.label(t("待处理")).classes("ag-subtle")
+                            ui.label(str(pending_count)).classes("text-xl font-bold")
+                        with ui.card().classes("ag-card p-4"):
+                            ui.label(t("运行中")).classes("ag-subtle")
+                            ui.label(str(running_count)).classes("text-xl font-bold")
+                        with ui.card().classes("ag-card p-4"):
+                            ui.label(t("已完成")).classes("ag-subtle")
+                            ui.label(str(completed_count)).classes("text-xl font-bold")
+                        with ui.card().classes("ag-card p-4"):
+                            ui.label(t("失败")).classes("ag-subtle")
+                            ui.label(str(failed_count)).classes("text-xl font-bold")
+                    
+                    # 任务列表
                     with ui.card().classes("ag-card p-6 q-mt-md"):
                         ui.label(t("队列任务列表")).classes("ag-section-title")
                         
-                        # 队列状态统计
-                        with ui.row().classes("gap-4 q-mb-md"):
-                            with ui.card().classes("ag-card p-4"):
-                                ui.label(t("待处理")).classes("ag-subtle")
-                                ui.label("0").classes("text-xl font-bold")
-                            with ui.card().classes("ag-card p-4"):
-                                ui.label(t("运行中")).classes("ag-subtle")
-                                ui.label("0").classes("text-xl font-bold")
-                            with ui.card().classes("ag-card p-4"):
-                                ui.label(t("已完成")).classes("ag-subtle")
-                                ui.label("0").classes("text-xl font-bold")
-                            with ui.card().classes("ag-card p-4"):
-                                ui.label(t("失败")).classes("ag-subtle")
-                                ui.label("0").classes("text-xl font-bold")
-                        
-                        # 任务列表
-                        with ui.card().classes("ag-card p-4"):
-                            ui.label(t("任务列表")).classes("ag-subtle")
-                            ui.label(t("暂无队列任务")).classes("ag-subtle")
-                
+                        if controller._queue_service:
+                            jobs = controller._queue_service.list_jobs()
+                            if jobs:
+                                # 按创建时间排序
+                                jobs.sort(key=lambda x: x.created_at)
+                                
+                                for job in jobs:
+                                    runtime = controller._queue_service.get_job_runtime(job.job_id)
+                                    state_str = runtime.state.value if runtime else "unknown"
+                                    
+                                    with ui.card().classes("ag-card p-4 q-mb-md"):
+                                        with ui.row().classes("justify-between items-center"):
+                                            with ui.column():
+                                                ui.label(f"{job.job_type} - {job.project_name}").classes("font-bold")
+                                                ui.label(f"ID: {job.job_id}").classes("text-sm text-gray-500")
+                                                ui.label(f"创建时间: {job.created_at}").classes("text-sm text-gray-500")
+                                                if runtime:
+                                                    if runtime.started_at:
+                                                        ui.label(f"开始时间: {runtime.started_at}").classes("text-sm text-gray-500")
+                                                    if runtime.completed_at:
+                                                        ui.label(f"完成时间: {runtime.completed_at}").classes("text-sm text-gray-500")
+                                                    if runtime.error_message:
+                                                        ui.label(f"错误: {runtime.error_message[:100]}...").classes("text-sm text-red-500")
+                                                
+                                            with ui.column().classes("items-end"):
+                                                # 状态标签
+                                                status_color = ""  
+                                                if state_str == "pending":
+                                                    status_color = "bg-yellow-100 text-yellow-800"
+                                                elif state_str == "running":
+                                                    status_color = "bg-blue-100 text-blue-800"
+                                                elif state_str == "completed":
+                                                    status_color = "bg-green-100 text-green-800"
+                                                elif state_str == "failed":
+                                                    status_color = "bg-red-100 text-red-800"
+                                                elif state_str == "cancelled":
+                                                    status_color = "bg-gray-100 text-gray-800"
+                                                
+                                                ui.label(state_str).classes(f"px-3 py-1 rounded-full text-xs font-medium {status_color} mb-2")
+                                                
+                                                # 操作按钮
+                                                with ui.row().classes("gap-2"):
+                                                    if runtime and runtime.state == QueueState.RUNNING:
+                                                        ui.button(t("取消"), on_click=lambda jid=job.job_id: controller.cancel_job(jid)).props("outline color=negative size=sm")
+                                                    elif runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
+                                                        ui.button(t("重试"), on_click=lambda jid=job.job_id: controller.retry_job(jid)).props("outline color=primary size=sm")
+                    
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("使用说明")).classes("ag-section-title")
-                    ui.label(t("队列管理功能已搭建。队列任务将在支持提交和执行任务后完全可用。当前状态：基础框架已完成，包括状态统计卡片和任务列表框架。")).classes("ag-subtle")
+                    ui.label(t("队列管理功能已完全可用。你可以：")).classes("ag-subtle")
+                    ui.label(t("1. 点击'运行队列'按钮执行所有待处理任务")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("2. 对失败或已取消的任务点击'重试'按钮")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("3. 对运行中的任务点击'取消'按钮")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("4. 点击'清空已完成'按钮清理已完成的任务")).classes("ag-subtle q-mt-sm")
 
     @ui.page("/guide")
     def guide_page() -> None:

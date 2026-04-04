@@ -31,6 +31,9 @@ class StructuredCitation:
     raw_text: str = ""
     mode: str = "parenthetical"
     locator: Optional[str] = None
+    block_id: str = ""
+    span_start: Optional[int] = None
+    span_end: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -178,17 +181,62 @@ def _extract_citations_from_text(
     block_id: str, 
     paper_key_to_info: Optional[Dict[str, Dict[str, Any]]] = None
 ) -> List[Dict[str, Any]]:
-    """Extract structured citations from text content using APA-style pattern matching."""
+    """Extract structured citations from text content using APA-style pattern matching and [[cite:]] syntax."""
     citations: List[Dict[str, Any]] = []
     paper_key_to_info = paper_key_to_info or {}
     
-    # APA-style citation patterns: (Author, Year) or (Author et al., Year) or Author (Year)
+    # 优先解析新的 [[cite:]] 语法
+    cite_pattern = r'\[\[cite:([^|\]]+)(?:\|([^\]]+))*\]\]'
+    cite_matches = re.finditer(cite_pattern, text)
+    
+    for idx, match in enumerate(cite_matches, start=1):
+        local_ref_id = f"{block_id}_cite_t{idx}"
+        raw_text = match.group(0)
+        paper_key = match.group(1).strip()
+        
+        # 解析可选参数
+        params = {}
+        if match.group(2):
+            param_str = match.group(2)
+            for param in param_str.split('|'):
+                if '=' in param:
+                    key, value = param.split('=', 1)
+                    params[key.strip()] = value.strip()
+        
+        # 获取参数值
+        mode = params.get('mode', 'parenthetical')
+        locator = params.get('locator')
+        prefix = params.get('prefix', '')
+        suffix = params.get('suffix', '')
+        suppress_author = params.get('suppress_author', 'false') == 'true'
+        
+        # 尝试匹配到paper info
+        paper_id = None
+        if paper_key_to_info:
+            # 查找匹配的paper_key
+            for key, info in paper_key_to_info.items():
+                if info.get('paper_key') == paper_key or info.get('paper_id') == paper_key:
+                    paper_id = info.get('paper_id', paper_key)
+                    break
+        
+        citation = StructuredCitation(
+            local_ref_id=local_ref_id,
+            paper_key=paper_key,
+            paper_id=paper_id,
+            raw_text=raw_text,
+            mode=mode,
+            locator=locator,
+            block_id=block_id
+        )
+        citations.append(citation.to_dict())
+    
+    # 兼容旧的APA-style citation patterns（作为fallback）
     parenthetical_pattern = r'\([^)]+,\s*\d{4}(?:\s*[;,]\s*[^)]+)*\)'
     narrative_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*\(\s*\d{4}\s*\)'
     
     # Find all parenthetical citations
     parenthetical_matches = re.finditer(parenthetical_pattern, text)
-    for idx, match in enumerate(parenthetical_matches, start=1):
+    for idx, match in enumerate(parenthetical_matches, start=len(citations) + 1):
         local_ref_id = f"{block_id}_cite_p{idx}"
         raw_text = match.group(0)
         
@@ -204,7 +252,8 @@ def _extract_citations_from_text(
             paper_id=paper_id,
             raw_text=raw_text,
             mode="parenthetical",
-            locator=None
+            locator=None,
+            block_id=block_id
         )
         citations.append(citation.to_dict())
     
@@ -226,7 +275,8 @@ def _extract_citations_from_text(
             paper_id=paper_id,
             raw_text=raw_text,
             mode="narrative",
-            locator=None
+            locator=None,
+            block_id=block_id
         )
         citations.append(citation.to_dict())
     
@@ -282,18 +332,18 @@ def build_review_draft_v2(
     # Build paper key to info mapping from summaries if provided
     paper_key_to_info: Dict[str, Dict[str, Any]] = {}
     if paper_summaries:
+        from main import get_paper_key
         for summary in paper_summaries:
             paper_info = summary.get('paper_info', {})
-            title = paper_info.get('title', '')
-            if title:
-                paper_key = title.lower()
-                paper_key_to_info[paper_key] = {
-                    'paper_id': paper_key,
-                    'paper_key': paper_key,
-                    'title': title,
-                    'authors': paper_info.get('authors', []),
-                    'year': paper_info.get('year', ''),
-                }
+            # 使用get_paper_key函数生成一致的paper_key
+            paper_key = get_paper_key(paper_info)
+            paper_key_to_info[paper_key] = {
+                'paper_id': paper_key,
+                'paper_key': paper_key,
+                'title': paper_info.get('title', ''),
+                'authors': paper_info.get('authors', []),
+                'year': paper_info.get('year', ''),
+            }
     
     normalized_sections: List[ReviewSection] = []
     for section in sections:

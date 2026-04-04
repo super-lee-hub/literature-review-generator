@@ -35,7 +35,7 @@ def test_review_draft_v2_persists_structured_citation_refs():
         {
             'section_number': 1,
             'section_title': 'Introduction',
-            'content': 'This is a test section with citations.'
+            'content': 'This is a test section with citations (Doe, 2020).'
         }
     ]
     
@@ -68,6 +68,19 @@ def test_review_draft_v2_persists_structured_citation_refs():
     block = section['blocks'][0]
     assert 'citations' in block
     assert isinstance(block['citations'], list)
+    
+    # Verify citation object fields
+    if block['citations']:
+        citation = block['citations'][0]
+        assert 'local_ref_id' in citation
+        assert 'paper_id' in citation
+        assert 'paper_key' in citation
+        assert 'raw_text' in citation
+        assert 'mode' in citation
+        assert 'locator' in citation
+        assert 'block_id' in citation
+        assert 'span_start' in citation
+        assert 'span_end' in citation
 
 
 def test_citation_manifest_prefers_structured_refs(sample_paper_summaries):
@@ -202,3 +215,50 @@ def test_citation_manifest_handles_mixed_citations(sample_paper_summaries):
     assert len(manifest.occurrences) == 1
     occurrence = manifest.occurrences[0]
     assert occurrence.citation_token == '(Doe & Smith, 2020)'
+
+
+def test_bibliography_only_includes_cited_entries(sample_paper_summaries):
+    """Test that bibliography only includes cited entries"""
+    # Create review draft structure with only one cited paper
+    review_draft_v2 = {
+        'content': {
+            'sections': [
+                {
+                    'section_number': 1,
+                    'section_title': 'Introduction',
+                    'blocks': [
+                        {
+                            'block_id': 's1_b1',
+                            'block_order': 1,
+                            'text': 'This references only one paper.',
+                            'citations': [
+                                {
+                                    'paper_id': 'test paper 1',
+                                    'paper_key': 'test paper 1',
+                                    'text': '(Doe & Smith, 2020)',
+                                    'year': '2020'
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ],
+            'references': ['Test Paper 1', 'Test Paper 2']  # Two references, but only one cited
+        }
+    }
+    
+    # Build citation manifest
+    manifest = build_citation_manifest_v2_from_review_draft(
+        job_id='test_job',
+        project_name='test_project',
+        manifest_id='test_manifest',
+        review_draft_path='test_draft.json',
+        review_word_path='test_review.docx',
+        review_draft_v2=review_draft_v2,
+        paper_summaries=sample_paper_summaries
+    )
+    
+    # Verify bibliography only includes cited paper
+    assert len(manifest.bibliography) == 1
+    assert manifest.bibliography[0].paper_id == 'test paper 1'
+    assert manifest.bibliography[0].is_cited == True

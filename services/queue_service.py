@@ -270,3 +270,119 @@ class PersistentQueueService:
 
 def create_queue_job_id() -> str:
     return f"job_{uuid.uuid4().hex[:12]}"
+
+
+class QueueRunner:
+    def __init__(self, queue_service: PersistentQueueService, job_runner: Any) -> None:
+        self.queue_service = queue_service
+        self.job_runner = job_runner
+        self._running = False
+        self._lock = threading.Lock()
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._running
+
+    def _process_job(self, job_spec: QueueJobSpec) -> None:
+        try:
+            self.queue_service.update_job_state(job_spec.job_id, QueueState.RUNNING)
+            
+            # 从job_spec参数构建JobRunRequest
+            params = job_spec.parameters
+            config = params.get("config", "config.ini")
+            project_name = params.get("project_name")
+            pdf_folder = params.get("pdf_folder")
+            action = params.get("action", "analyze")
+            
+            # 构建JobRunRequest
+            from services.job_runner import JobRunRequest
+            request = JobRunRequest(
+                config=config,
+                project_name=project_name,
+                pdf_folder=pdf_folder,
+                action=action,
+                run_all=params.get("run_all", False),
+                analyze_only=params.get("analyze_only", False),
+                generate_outline=params.get("generate_outline", False),
+                generate_review=params.get("generate_review", False),
+                generate_section=params.get("generate_section"),
+                validate_review=params.get("validate_review", False),
+                retry_review_failed=params.get("retry_review_failed", False),
+                concept=params.get("concept"),
+                free_mode_profile=params.get("free_mode_profile"),
+                free_mode_idea=params.get("free_mode_idea"),
+                gui=params.get("gui", False),
+                source_mode=params.get("source_mode", "direct"),
+                zotero_report=params.get("zotero_report"),
+                library_path=params.get("library_path"),
+            )
+            
+            # 执行任务
+            result = self.job_runner.run(request)
+            
+            if result.success:
+                self.queue_service.update_job_state(job_spec.job_id, QueueState.COMPLETED)
+                self.queue_service.set_job_result(job_spec.job_id, {
+                    "exit_code": result.exit_code,
+                    "message": result.message,
+                    "workspace_path": result.workspace_path,
+                    "job_id": result.job_id,
+                    "resume_state": result.resume_state,
+                })
+            else:
+                self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
+                self.queue_service.set_job_error(job_spec.job_id, result.message)
+        except Exception as e:
+            self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
+            self.queue_service.set_job_error(job_spec.job_id, str(e))
+
+    def run(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+        
+        try:
+            while True:
+                with self._lock:
+                    if not self._running:
+                        break
+                
+                # 获取待处理的任务
+                pending_jobs = self.queue_service.list_jobs_by_state(QueueState.PENDING)
+                if not pending_jobs:
+                    break
+                
+                # 按创建时间排序，先处理早创建的任务
+                pending_jobs.sort(key=lambda x: x.created_at)
+                
+                for job in pending_jobs:
+                    with self._lock:
+                        if not self._running:
+                            break
+                    
+                    # 检查任务状态，确保没有被其他进程处理
+                    runtime = self.queue_service.get_job_runtime(job.job_id)
+                    if runtime and runtime.state == QueueState.PENDING:
+                        self._process_job(job)
+        finally:
+            with self._lock:
+                self._running = False
+
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+
+    def run_single_job(self, job_id: str) -> bool:
+        job = self.queue_service.get_job(job_id)
+        if not job:
+            return False
+        
+        runtime = self.queue_service.get_job_runtime(job_id)
+        if not runtime or runtime.state not in (QueueState.PENDING, QueueState.FAILED):
+            return False
+        
+        # 重置任务状态
+        self.queue_service.reset_job(job_id)
+        self._process_job(job)
+        return True

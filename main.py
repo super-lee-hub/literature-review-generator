@@ -74,6 +74,71 @@ from summary_schema import get_core_analysis, get_paper_metadata
 from free_mode.profile_manager import build_profile_context, load_profile
 import validator
 
+
+def get_paper_key(paper: 'Dict[str, Any] | PaperInfo') -> str:
+    """为论文生成唯一身份标识（模块级别函数）
+    
+    优先使用DOI作为唯一标识
+    如果没有DOI，使用标题+作者组合
+    
+    Args:
+        paper: 论文信息字典或PaperInfo对象
+    
+    Returns:
+        唯一身份标识字符串
+    """
+    from typing import Dict, Any, List
+    
+    # 优先使用DOI作为唯一标识
+    doi = paper.get('doi', '').strip()
+    if doi and doi.lower() != 'unknown' and doi.lower() != 'n/a':
+        # DOI标准化处理：提取纯粹的ID部分
+        import re
+        # 匹配DOI ID模式：以10.开头，后跟数字和斜杠
+        doi_pattern = r'(10\.\d+/.+)'
+        match = re.search(doi_pattern, doi)
+        
+        if match:
+            # 返回标准化的DOI ID部分
+            return match.group(1)
+        else:
+            # 如果无法提取标准格式，返回原始DOI（但进行基本清理）
+            # 移除常见的DOI前缀
+            doi_clean = re.sub(r'^https?://(doi\.org|dx\.doi\.org)/', '', doi, flags=re.IGNORECASE)
+            return doi_clean
+    
+    # 如果没有DOI，使用标题+作者组合
+    title = paper.get('title', '').strip()
+    authors = paper.get('authors', [])
+    
+    # 清理和标准化标题
+    if title:
+        import re
+        title_clean = re.sub(r'[^\w\s]', '', title.lower())
+        title_clean = re.sub(r'\s+', ' ', title_clean).strip()
+    else:
+        title_clean = 'unknown_title'
+    
+    # 处理作者列表
+    if authors and isinstance(authors, list):
+        author_surnames: List[str] = []
+        for author in authors[:3]:
+            if isinstance(author, str):
+                name_parts: List[str] = author.strip().split()
+                if name_parts:
+                    surname: str = name_parts[-1].lower()
+                    author_surnames.append(surname)
+        
+        if len(authors) > 3:
+            author_surnames.append('et_al')
+        
+        authors_str = '_'.join(author_surnames) if author_surnames else 'unknown_author'
+    else:
+        authors_str = 'unknown_author'
+    
+    # 组合标题和作者作为唯一标识
+    return f"{title_clean}_{authors_str}"
+
 # 导入上下文管理模块
 from context_manager import validate_summary_quality, optimize_context_for_synthesis, optimize_context_for_outline, estimate_tokens
 
@@ -1211,57 +1276,8 @@ class LiteratureReviewGenerator:
     
     @staticmethod
     def get_paper_key(paper: 'Dict[str, Any] | PaperInfo') -> str:
-        """为论文生成唯一身份标识"""
-        # 优先使用DOI作为唯一标识
-        doi = paper.get('doi', '').strip()
-        if doi and doi.lower() != 'unknown' and doi.lower() != 'n/a':
-            # DOI标准化处理：提取纯粹的ID部分
-            import re
-            # 匹配DOI ID模式：以10.开头，后跟数字和斜杠
-            doi_pattern = r'(10\.\d+/.+)'
-            match = re.search(doi_pattern, doi)
-            
-            if match:
-                # 返回标准化的DOI ID部分
-                return match.group(1)
-            else:
-                # 如果无法提取标准格式，返回原始DOI（但进行基本清理）
-                # 移除常见的DOI前缀
-                doi_clean = re.sub(r'^https?://(doi\.org|dx\.doi\.org)/', '', doi, flags=re.IGNORECASE)
-                return doi_clean
-        
-        # 如果没有DOI，使用标题+作者组合
-        title = paper.get('title', '').strip()
-        authors = paper.get('authors', [])
-        
-        # 清理和标准化标题
-        if title:
-            import re
-            title_clean = re.sub(r'[^\w\s]', '', title.lower())
-            title_clean = re.sub(r'\s+', ' ', title_clean).strip()
-        else:
-            title_clean = 'unknown_title'
-        
-        # 处理作者列表
-        if authors and isinstance(authors, list):
-            author_surnames: List[str] = []
-            for author in authors[:3]:  # 只取前3个作者 # type: ignore
-                if isinstance(author, str):
-                    name_parts: List[str] = author.strip().split()
-                    if name_parts:
-                        surname: str = name_parts[-1].lower()
-                        author_surnames.append(surname)
-            
-            if len(authors) > 3:  # type: ignore
-
-                author_surnames.append('et_al')
-            
-            authors_str = '_'.join(author_surnames) if author_surnames else 'unknown_author'
-        else:
-            authors_str = 'unknown_author'
-        
-        # 组合标题和作者作为唯一标识
-        return f"{title_clean}_{authors_str}"
+        """为论文生成唯一身份标识（调用模块级别函数）"""
+        return get_paper_key(paper)
     
     def load_existing_summaries(self) -> bool:
         """加载现有摘要文件（用于断点续传）"""
@@ -5188,6 +5204,16 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             handle_queue_clear_mode(args)
             return
         
+        # 队列添加命令
+        if hasattr(args, 'queue_add') and args.queue_add:
+            handle_queue_add_mode(args)
+            return
+        
+        # 队列运行命令
+        if hasattr(args, 'queue_run') and args.queue_run:
+            handle_queue_run_mode(args)
+            return
+        
         # 正常执行模式 - 验证参数
         if not args.project_name and not args.pdf_folder:
             logging.error("必须指定--project-name或--pdf-folder参数中的一个")
@@ -5750,6 +5776,121 @@ def handle_queue_clear_mode(args: argparse.Namespace):  # type: ignore
         generator.logger.error(f"队列清空操作失败: {e}")
         traceback.print_exc()
 
+
+def handle_queue_add_mode(args: argparse.Namespace):  # type: ignore
+    """处理队列添加命令"""
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator.logger.info("*** 队列添加模式已启动 ***")
+    generator.logger.info("=" * 60)
+    
+    try:
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+        
+        generator._init_queue_service()
+        if generator.queue_service is None:
+            generator.logger.error("队列服务未初始化")
+            return
+        
+        # 构建任务参数
+        params = {
+            "config": args.config,
+            "project_name": args.project_name,
+            "pdf_folder": args.pdf_folder,
+            "action": "analyze",
+            "run_all": getattr(args, "run_all", False),
+            "analyze_only": getattr(args, "analyze_only", False),
+            "generate_outline": getattr(args, "generate_outline", False),
+            "generate_review": getattr(args, "generate_review", False),
+            "generate_section": getattr(args, "generate_section", None),
+            "validate_review": getattr(args, "validate_review", False),
+            "retry_review_failed": getattr(args, "retry_review_failed", False),
+            "concept": getattr(args, "concept", None),
+            "free_mode_profile": getattr(args, "free_mode_profile", None),
+            "free_mode_idea": getattr(args, "free_mode_idea", None),
+            "source_mode": "zotero" if args.zotero_report else "direct",
+            "zotero_report": args.zotero_report,
+            "library_path": args.library_path,
+        }
+        
+        # 确定任务类型
+        job_type = "analyze"
+        if getattr(args, "run_all", False):
+            job_type = "run_all"
+        elif getattr(args, "generate_outline", False):
+            job_type = "generate_outline"
+        elif getattr(args, "generate_section", None):
+            job_type = "generate_section"
+        elif getattr(args, "generate_review", False):
+            job_type = "generate_review"
+        elif getattr(args, "retry_review_failed", False):
+            job_type = "retry_review_failed"
+        elif getattr(args, "validate_review", False):
+            job_type = "validate_review"
+        
+        # 创建任务规格
+        from services.queue_service import QueueJobSpec, create_queue_job_id
+        job_spec = QueueJobSpec(
+            job_id=create_queue_job_id(),
+            job_type=job_type,
+            project_name=args.project_name or "literature_review",
+            parameters=params
+        )
+        
+        # 添加任务到队列
+        job_id = generator.queue_service.add_job(job_spec)
+        generator.logger.success(f"任务已添加到队列: {job_id}")
+        generator.logger.info(f"任务类型: {job_type}")
+        if args.project_name:
+            generator.logger.info(f"项目名称: {args.project_name}")
+        if args.pdf_folder:
+            generator.logger.info(f"PDF文件夹: {args.pdf_folder}")
+        if args.zotero_report:
+            generator.logger.info(f"Zotero报告: {args.zotero_report}")
+            
+    except Exception as e:
+        generator.logger.error(f"队列添加操作失败: {e}")
+        traceback.print_exc()
+
+
+def handle_queue_run_mode(args: argparse.Namespace):  # type: ignore
+    """处理队列运行命令"""
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator.logger.info("*** 队列运行模式已启动 ***")
+    generator.logger.info("=" * 60)
+    
+    try:
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+        
+        generator._init_queue_service()
+        if generator.queue_service is None:
+            generator.logger.error("队列服务未初始化")
+            return
+        
+        # 创建JobRunner和QueueRunner
+        from services.job_runner import JobRunner
+        from services.queue_service import QueueRunner
+        job_runner = JobRunner()
+        queue_runner = QueueRunner(generator.queue_service, job_runner)
+        
+        # 运行队列
+        generator.logger.info("开始运行队列任务...")
+        queue_runner.run()
+        generator.logger.success("队列运行完成！")
+            
+    except Exception as e:
+        generator.logger.error(f"队列运行操作失败: {e}")
+        traceback.print_exc()
+
 def handle_run_all_mode(generator: 'LiteratureReviewGenerator'):  # type: ignore
     """处理一键执行模式"""
     generator.logger.info("*** '一键执行'模式已启动 ***")
@@ -5993,6 +6134,22 @@ def main() -> None:  # type: ignore
     # 队列选项
     queue_group = parser.add_argument_group('队列选项')
     queue_group.add_argument(
+        '--queue-add',
+        action='store_true',
+        help='添加任务到队列'
+    )
+    queue_group.add_argument(
+        '--queue-run',
+        action='store_true',
+        help='运行队列任务'
+    )
+    queue_group.add_argument(
+        '--queue-file',
+        type=str,
+        default='output/_queue/queue.json',
+        help='队列文件路径（默认：output/_queue/queue.json）'
+    )
+    queue_group.add_argument(
         '--queue-list',
         action='store_true',
         help='列出所有队列任务'
@@ -6013,6 +6170,19 @@ def main() -> None:  # type: ignore
         '--queue-clear',
         action='store_true',
         help='清空已完成的任务'
+    )
+    
+    # Zotero选项
+    zotero_group = parser.add_argument_group('Zotero选项')
+    zotero_group.add_argument(
+        '--zotero-report',
+        type=str,
+        help='Zotero报告文件路径'
+    )
+    zotero_group.add_argument(
+        '--library-path',
+        type=str,
+        help='Zotero库路径'
     )
 
     args = parser.parse_args()

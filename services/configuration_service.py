@@ -163,6 +163,21 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "model": "",
             "api_base": PROVIDER_PRESETS["openai"].default_api_base,
         },
+        "Queue": {
+            "enabled": "true",
+            "queue_file_path": "./output/_queue/queue.json",
+            "max_concurrent_jobs": "1",
+            "retry_attempts": "3",
+        },
+        "Validation": {
+            "stage1_enabled": "false",
+            "stage2_enabled": "false",
+            "keep_checkpoints_after_completion": "false",
+            "evidence_resolver_enabled": "true",
+            "visual_refs_enabled": "true",
+            "review_drift_threshold": "0.3",
+            "summary_drift_threshold": "0.2",
+        },
     }
 
 
