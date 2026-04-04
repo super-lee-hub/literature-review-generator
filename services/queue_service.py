@@ -278,14 +278,29 @@ class QueueRunner:
         self.job_runner = job_runner
         self._running = False
         self._lock = threading.Lock()
+        self._cancel_tokens: Dict[str, CancelToken] = {}
 
     def is_running(self) -> bool:
         with self._lock:
             return self._running
 
     def _process_job(self, job_spec: QueueJobSpec) -> None:
+        cancel_token = CancelToken()
+        with self._lock:
+            self._cancel_tokens[job_spec.job_id] = cancel_token
+        
         try:
+            # 检查任务是否已经被取消
+            runtime = self.queue_service.get_job_runtime(job_spec.job_id)
+            if runtime and runtime.state == QueueState.CANCELLED:
+                return
+            
             self.queue_service.update_job_state(job_spec.job_id, QueueState.RUNNING)
+            
+            # 再次检查任务状态，确保没有被取消
+            runtime = self.queue_service.get_job_runtime(job_spec.job_id)
+            if runtime and runtime.state == QueueState.CANCELLED:
+                return
             
             # 从job_spec参数构建JobRunRequest
             params = job_spec.parameters
@@ -317,8 +332,13 @@ class QueueRunner:
                 library_path=params.get("library_path"),
             )
             
-            # 执行任务
-            result = self.job_runner.run(request)
+            # 执行任务，传入cancel_token
+            result = self.job_runner.run(request, cancel_token=cancel_token)
+            
+            # 最后检查一次任务状态
+            runtime = self.queue_service.get_job_runtime(job_spec.job_id)
+            if runtime and runtime.state == QueueState.CANCELLED:
+                return
             
             if result.success:
                 self.queue_service.update_job_state(job_spec.job_id, QueueState.COMPLETED)
@@ -330,11 +350,25 @@ class QueueRunner:
                     "resume_state": result.resume_state,
                 })
             else:
-                self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                self.queue_service.set_job_error(job_spec.job_id, result.message)
+                # 检查是否因为取消而失败
+                if result.exit_code == 130:
+                    self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+                else:
+                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
+                    self.queue_service.set_job_error(job_spec.job_id, result.message)
+        except JobCancelledError:
+            self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
         except Exception as e:
+            # 检查是否是因为取消而导致的异常
+            runtime = self.queue_service.get_job_runtime(job_spec.job_id)
+            if runtime and runtime.state == QueueState.CANCELLED:
+                return
             self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
             self.queue_service.set_job_error(job_spec.job_id, str(e))
+        finally:
+            with self._lock:
+                if job_spec.job_id in self._cancel_tokens:
+                    del self._cancel_tokens[job_spec.job_id]
 
     def run(self) -> None:
         with self._lock:
@@ -372,6 +406,29 @@ class QueueRunner:
     def stop(self) -> None:
         with self._lock:
             self._running = False
+
+    def cancel_job(self, job_id: str) -> bool:
+        """取消指定的任务
+        
+        Args:
+            job_id: 要取消的任务ID
+            
+        Returns:
+            是否成功取消
+        """
+        # 先标记任务状态为CANCELLED
+        runtime = self.queue_service.get_job_runtime(job_id)
+        if not runtime or runtime.state != QueueState.RUNNING:
+            return False
+        
+        self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
+        
+        # 如果任务正在运行，请求取消令牌
+        with self._lock:
+            if job_id in self._cancel_tokens:
+                self._cancel_tokens[job_id].request_cancel()
+        
+        return True
 
     def run_single_job(self, job_id: str) -> bool:
         job = self.queue_service.get_job(job_id)

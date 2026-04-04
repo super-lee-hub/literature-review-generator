@@ -765,6 +765,7 @@ class WorkspaceController:
         
         # 初始化队列服务
         self._queue_service: Optional[Any] = None
+        self._queue_runner: Optional[Any] = None
         self._init_queue_service()
 
     def _init_queue_service(self) -> None:
@@ -811,12 +812,14 @@ class WorkspaceController:
                 from services.job_runner import JobRunner
                 from services.queue_service import QueueRunner
                 job_runner = JobRunner()
-                queue_runner = QueueRunner(self._queue_service, job_runner)
+                self._queue_runner = QueueRunner(self._queue_service, job_runner)
                 ui.notify(self.t("开始运行队列任务..."))
-                queue_runner.run()
+                self._queue_runner.run()
                 ui.notify(self.t("队列运行完成！"), type="positive")
             except Exception as e:
                 ui.notify(self.tf("队列运行失败: {e}", e=str(e)), type="negative")
+            finally:
+                self._queue_runner = None
         else:
             ui.notify(self.t("队列服务未初始化"), type="warning")
 
@@ -839,13 +842,20 @@ class WorkspaceController:
         """取消指定任务"""
         if self._queue_service:
             try:
-                runtime = self._queue_service.get_job_runtime(job_id)
-                if runtime and runtime.state == QueueState.RUNNING:
-                    # 这里只能标记为已取消，实际取消需要在执行过程中检查
-                    self._queue_service.update_job_state(job_id, QueueState.CANCELLED)
-                    ui.notify(self.tf("任务已标记为取消: {job_id}", job_id=job_id), type="positive")
+                # 如果queue_runner存在，使用它的cancel_job方法
+                if self._queue_runner:
+                    if self._queue_runner.cancel_job(job_id):
+                        ui.notify(self.tf("任务已取消: {job_id}", job_id=job_id), type="positive")
+                    else:
+                        ui.notify(self.t("只能取消运行中的任务"), type="warning")
                 else:
-                    ui.notify(self.t("只能取消运行中的任务"), type="warning")
+                    # 如果queue_runner不存在，只标记状态
+                    runtime = self._queue_service.get_job_runtime(job_id)
+                    if runtime and runtime.state == QueueState.RUNNING:
+                        self._queue_service.update_job_state(job_id, QueueState.CANCELLED)
+                        ui.notify(self.tf("任务已标记为取消: {job_id}", job_id=job_id), type="positive")
+                    else:
+                        ui.notify(self.t("只能取消运行中的任务"), type="warning")
             except Exception as e:
                 ui.notify(self.tf("取消任务失败: {e}", e=str(e)), type="negative")
         else:

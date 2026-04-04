@@ -364,6 +364,42 @@ def _update_occurrence_map(
     paper_occurrence_map[safe_paper_id].append(occurrence_id)
 
 
+def _parse_cite_token(
+    citation_token: str,
+    paper_key_to_info: Dict[str, Dict[str, Any]],
+) -> tuple[Optional[str], str, Dict[str, str]]:
+    """解析[[cite:]]语法token
+    
+    Args:
+        citation_token: citation token字符串
+        paper_key_to_info: paper key到信息的映射
+        
+    Returns:
+        Tuple of (paper_id, paper_key, params)
+    """
+    cite_pattern = r'\[\[cite:([^|\]]+)(?:\|([^\]]+))*\]\]'
+    cite_match = re.match(cite_pattern, citation_token)
+    
+    paper_key = "unknown"
+    params: Dict[str, str] = {}
+    paper_id = None
+    
+    if cite_match:
+        paper_key = cite_match.group(1).strip()
+        # 解析参数
+        if cite_match.group(2):
+            for param in cite_match.group(2).split('|'):
+                if '=' in param:
+                    key, value = param.split('=', 1)
+                    params[key.strip()] = value.strip()
+        
+        # 尝试找到对应的paper_id
+        if paper_key in paper_key_to_info:
+            paper_id = paper_key_to_info[paper_key]['paper_id']
+    
+    return paper_id, paper_key, params
+
+
 def _match_citation_to_paper(
     citation_token: str,
     paper_key_to_info: Dict[str, Dict[str, Any]],
@@ -451,15 +487,11 @@ def build_citation_manifest_v2_from_review_draft(
                     locator = citation.get('locator', None)
                     
                     # 从[[cite:]]语法中提取paper_key
-                    cite_pattern = r'\[\[cite:([^|\]]+)(?:\|([^\]]+))*\]\]'
-                    cite_match = re.match(cite_pattern, citation_token)
-                    if cite_match:
-                        extracted_paper_key = cite_match.group(1).strip()
-                        if extracted_paper_key:
-                            paper_key = extracted_paper_key
-                            # 尝试找到对应的paper_id
-                            if paper_key in paper_key_to_info:
-                                paper_id = paper_key_to_info[paper_key]['paper_id']
+                    parsed_paper_id, parsed_paper_key, params = _parse_cite_token(citation_token, paper_key_to_info)
+                    if parsed_paper_key != "unknown":
+                        paper_key = parsed_paper_key
+                        if parsed_paper_id:
+                            paper_id = parsed_paper_id
                     
                     # If paper_id not set, try to match from citation_token
                     if not paper_id or paper_id == 'unknown':
@@ -483,33 +515,15 @@ def build_citation_manifest_v2_from_review_draft(
                     _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
             else:
                 # Priority 2: Fallback to regex extraction from free-form text (legacy fallback)
-                # 优先匹配[[cite:]]语法
-                cite_pattern = r'\[\[cite:([^|\]]+)(?:\|([^\]]+))*\]\]'
-                found_cite_tokens = re.findall(cite_pattern, block_text)
-                
-                for match in found_cite_tokens:
+                # 优先匹配[[cite:]]语法 - 使用re.finditer获取完整token
+                cite_full_pattern = r'\[\[cite:[^|\]]+(?:\|[^\]]+)*\]\]'
+                for full_match in re.finditer(cite_full_pattern, block_text):
                     occurrence_counter += 1
                     occurrence_id = f"occ_{occurrence_counter}"
+                    citation_token = full_match.group(0)
                     
-                    paper_key = match[0].strip()
-                    # 解析参数
-                    params = {}
-                    if match[1]:
-                        for param in match[1].split('|'):
-                            if '=' in param:
-                                key, value = param.split('=', 1)
-                                params[key.strip()] = value.strip()
-                    
-                    # 尝试找到对应的paper_id
-                    paper_id = None
-                    if paper_key in paper_key_to_info:
-                        paper_id = paper_key_to_info[paper_key]['paper_id']
-                    
-                    # 创建citation token
-                    citation_token = f"[[cite:{paper_key}"
-                    if params:
-                        citation_token += '|' + '|'.join([f"{k}={v}" for k, v in params.items()])
-                    citation_token += "]]"
+                    # 使用统一的解析函数
+                    paper_id, paper_key, params = _parse_cite_token(citation_token, paper_key_to_info)
                     
                     # Create occurrence using helper function
                     occurrence = _create_citation_occurrence(
