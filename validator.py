@@ -360,7 +360,7 @@ def _validate_claims_for_single_paper(source_summary: dict, sentences: List[str]
         # 注意：这里没有generator_instance的引用，所以暂时不记录日志
         return None
 
-def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
+def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
     """
     [第二阶段验证] 对生成的文献综述进行高效、批量的验证（使用工件而非docx）。
     """
@@ -368,7 +368,7 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
     try:
         if not generator_instance.config.getboolean('Performance', 'enable_stage2_validation', fallback=False):  # type: ignore
             generator_instance.logger.warn("第二阶段验证未在配置中启用。跳过此步骤。")  # type: ignore
-            return True
+            return {"success": True, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
 
         # 尝试使用Week 3验证流程（基于工件）
         try:
@@ -376,7 +376,7 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
             review_draft_path = generator_instance._review_draft_v2_path()
             if not os.path.exists(review_draft_path):
                 generator_instance.logger.error(f"找不到review_draft_v2文件: {review_draft_path}。请先生成综述。")
-                return False
+                return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
             
             with open(review_draft_path, 'r', encoding='utf-8') as f:
                 review_draft = json.load(f)
@@ -385,7 +385,7 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
             citation_manifest_path = generator_instance._citation_manifest_path()
             if not os.path.exists(citation_manifest_path):
                 generator_instance.logger.error(f"找不到citation_manifest文件: {citation_manifest_path}。请先生成综述。")
-                return False
+                return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
             
             with open(citation_manifest_path, 'r', encoding='utf-8') as f:
                 citation_manifest = json.load(f)
@@ -459,7 +459,7 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
             
             generator_instance.logger.info(f"验证报告已保存到: {report_file}")
             generator_instance.logger.success("Week 3验证流程完成！")
-            return True
+            return {"success": True, "report": report, "review_draft": review_draft, "citation_manifest": citation_manifest, "paper_artifacts": paper_artifacts}
             
         except Exception as e:
             generator_instance.logger.warning(f"Week 3验证流程失败，回退到传统验证: {e}")
@@ -469,12 +469,12 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
         # 传统验证流程（回退）
         if not DOCX_AVAILABLE:
             generator_instance.logger.error("python-docx模块未安装，无法进行第二阶段验证。请运行: pip install python-docx")  # type: ignore
-            return False
+            return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
 
         word_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_literature_review.docx')  # type: ignore
         if not os.path.exists(word_file):
             generator_instance.logger.error(f"找不到文献综述文件: {word_file}。请先生成综述。")  # type: ignore
-            return False
+            return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
             
         validator_api_config: Dict[str, str] = {
             'api_key': (generator_instance.config.get('Validator_API') or {}).get('api_key', ''),  # type: ignore
@@ -882,15 +882,15 @@ def run_review_validation(generator_instance: Any) -> bool:  # type: ignore
             f.write('\n'.join(report_lines))
         
         generator_instance.logger.info(f"验证报告已保存到: {report_file}")
-        return True
+        return {"success": True, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
         
     except (configparser.NoSectionError, configparser.NoOptionError):
         generator_instance.logger.error("无法找到[Validator_API]或[Performance]中的验证配置，跳过验证。")
-        return False
+        return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
     except Exception as e:
         generator_instance.logger.error(f"验证综述时发生未知异常: {e}")
         traceback.print_exc()
-        return False
+        return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
 
 
 def run_week3_review_validation(

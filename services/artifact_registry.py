@@ -145,6 +145,9 @@ class ArtifactRegistry:
         
         This is the primary registration method used by repair_integration and other
         Week 4/5 modules. Converts dict-style dependencies to ArtifactDependencyRef.
+        
+        Args:
+            artifact_role: Optional artifact role (uses artifact_type if not provided)
         """
         abs_path = os.path.abspath(path)
         content_hash = file_sha256(abs_path) if os.path.exists(abs_path) else ""

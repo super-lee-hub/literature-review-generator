@@ -3913,9 +3913,37 @@ class LiteratureReviewGenerator:
                 if self._stage2_validation_enabled():
                     self.logger.info("根据配置文件自动启动第二阶段验证...")
                     from validator import run_review_validation
-                    validation_success = run_review_validation(self)
-                    if validation_success:
+                    validation_result = run_review_validation(self)
+                    if validation_result.get("success"):
                         self.logger.success("第二阶段验证完成！验证报告已生成。")
+                        
+                        # Week4: Run repair pipeline (report-first policy)
+                        validation_report = validation_result.get("report")
+                        review_draft = validation_result.get("review_draft")
+                        citation_manifest = validation_result.get("citation_manifest")
+                        paper_artifacts = validation_result.get("paper_artifacts")
+                        
+                        if all([
+                            validation_report is not None,
+                            review_draft is not None,
+                            citation_manifest is not None,
+                            paper_artifacts is not None,
+                            self.job_workspace is not None,
+                            self.artifact_registry is not None,
+                        ]):
+                            self.logger.info("Starting Week4 repair pipeline (report-first policy)...")
+                            from services.repair_integration import run_repair_pipeline
+                            repair_result = run_repair_pipeline(
+                                validation_report=validation_report,
+                                review_draft=review_draft,
+                                citation_manifest=citation_manifest,
+                                paper_artifacts=paper_artifacts,
+                                job_id=self.job_workspace.job_id,
+                                workspace=self.job_workspace,
+                                registry=self.artifact_registry,
+                                auto_apply=False,  # Default: report-first policy
+                            )
+                            self.logger.success(f"Week4 repair pipeline completed: {repair_result}")
                     else:
                         self.logger.warning("第二阶段验证失败，请检查验证报告文件。")
                 else:
@@ -3993,6 +4021,82 @@ class LiteratureReviewGenerator:
                 producer="main.LiteratureReviewGenerator.create_literature_review_outline",
             )
             
+            # Week5: Generate and persist JSON-first OutlineDocument
+            if self.job_workspace and self.artifact_registry:
+                self.logger.info("Generating Week5 JSON-first OutlineDocument...")
+                from outline.generator import run_outline_generation
+                from outline.arbitration import run_outline_critique, run_outline_arbitration, run_outline_adopt
+                from services.artifact_registry import ArtifactDependencyRef
+                
+                writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
+                generator_model = writer_config.get('model', 'gpt-4')
+                
+                # Generate OutlineDocument from markdown
+                outline_result = run_outline_generation(
+                    markdown_text=outline_text,
+                    sections_data=None,
+                    job_id=self.job_workspace.job_id,
+                    generator_model=generator_model,
+                    summaries=self.summaries,
+                )
+                outline_dict = outline_result.get('outline')
+                
+                # Persist OutlineDocument
+                if outline_dict:
+                    outline_doc_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_document.json")
+                    from services.job_workspace import atomic_write_json
+                    atomic_write_json(outline_doc_path, outline_dict)
+                    
+                    # Register in artifact registry
+                    self.artifact_registry.register_file(
+                        artifact_role="outline",
+                        artifact_type="outline_document",
+                        artifact_version="v1",
+                        path=outline_doc_path,
+                        producer="main.LiteratureReviewGenerator.create_literature_review_outline",
+                        artifact_id="outline_document:v1",
+                        depends_on=[
+                            ArtifactDependencyRef(
+                                artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                                path=outline_file,
+                            )
+                        ],
+                    )
+                    
+                    self.logger.success(f"Week5 OutlineDocument saved to: {outline_doc_path}")
+                
+                # Run peer critique
+                self.logger.info("Running Week5 peer critique...")
+                from outline.models import OutlineDocument
+                outline_doc = OutlineDocument.from_dict(outline_dict)
+                critique_result = run_outline_critique(
+                    outline=outline_doc,
+                    critic_model=generator_model,
+                    summaries=self.summaries,
+                    job_id=self.job_workspace.job_id,
+                )
+                
+                # Save critique result
+                critique_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_critique.json")
+                atomic_write_json(critique_path, critique_result)
+                
+                self.artifact_registry.register_file(
+                    artifact_role="outline_critique",
+                    artifact_type="outline_critique",
+                    artifact_version="v1",
+                    path=critique_path,
+                    producer="main.LiteratureReviewGenerator.create_literature_review_outline",
+                    artifact_id="outline_critique:v1",
+                    depends_on=[
+                        ArtifactDependencyRef(
+                            artifact_type="outline_document",
+                            path=outline_doc_path,
+                        )
+                    ],
+                )
+                
+                self.logger.success(f"Week5 outline critique saved to: {critique_path}")
+            
             # 保存大纲文件
             
             self.logger.success(f"文献综述大纲已生成: {outline_file}")
@@ -4007,6 +4111,8 @@ class LiteratureReviewGenerator:
                 
         except Exception as e:
             self.logger.error(f"创建文献综述大纲失败: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def generate_review_outline(self, review_data: Dict[str, Any]) -> Optional[str]:
