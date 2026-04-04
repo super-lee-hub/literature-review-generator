@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from services.job_workspace import utc_now_iso
 

@@ -642,12 +642,13 @@ def test_citation_paper_mapping_is_deterministic():
 
 
 def test_validator_loads_real_paper_artifacts():
-    """Test that validator loads real persisted paper artifact files."""
+    """Test that validator loads real persisted paper artifact files from disk."""
     import tempfile
     import os
+    import json
     from validator import run_week3_review_validation
     
-    # Create a mock paper artifact file
+    # Create a mock paper artifact file on disk
     with tempfile.TemporaryDirectory() as temp_dir:
         # Create paper_artifacts directory
         paper_artifacts_dir = os.path.join(temp_dir, 'paper_artifacts')
@@ -683,8 +684,23 @@ def test_validator_loads_real_paper_artifacts():
             },
         }
         
-        # Note: In a real test, we would save this to a file and test the loading logic
-        # For now, we'll test the validation logic with the artifact
+        # Save paper artifact to file
+        artifact_file_path = os.path.join(paper_artifacts_dir, 'test_paper_artifact.json')
+        with open(artifact_file_path, 'w', encoding='utf-8') as f:
+            json.dump(paper_artifact, f)
+        
+        # Verify file exists
+        assert os.path.exists(artifact_file_path), "Paper artifact file should exist on disk"
+        
+        # Load the artifact from file to verify it's valid
+        with open(artifact_file_path, 'r', encoding='utf-8') as f:
+            loaded_artifact = json.load(f)
+        
+        # Verify loaded artifact has expected structure
+        assert "paper_identity" in loaded_artifact
+        assert "analysis" in loaded_artifact
+        assert "preprocess" in loaded_artifact["analysis"]
+        assert "stage1_inputs" in loaded_artifact
         
         # Create test review draft and citation manifest
         review_draft = {
@@ -728,8 +744,8 @@ def test_validator_loads_real_paper_artifacts():
             ],
         }
         
-        # Run validation
-        result = run_week3_review_validation(review_draft, citation_manifest, [paper_artifact])
+        # Run validation with the loaded artifact
+        result = run_week3_review_validation(review_draft, citation_manifest, [loaded_artifact])
         assert result["week3_validation"] is True
 
 

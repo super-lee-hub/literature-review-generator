@@ -3868,16 +3868,6 @@ class LiteratureReviewGenerator:
                     if canonical_key:
                         paper_key_to_info[canonical_key] = paper_info
                 
-                # Also build a reverse mapping from paper info to canonical key for fallback
-                info_to_key = {}
-                for canonical_key, paper_info in paper_key_to_info.items():
-                    # Use a combination of title and authors as a key for matching
-                    title = paper_info.get('title', '').lower()
-                    authors = ''.join(paper_info.get('authors', [])).lower()
-                    info_key = f"{title}_{authors}"
-                    if info_key:
-                        info_to_key[info_key] = canonical_key
-                
                 for i, ref in enumerate(references):
                     # Get real paper ID using deterministic matching
                     paper_id = f"paper_{i+1}"  # Fallback to placeholder
