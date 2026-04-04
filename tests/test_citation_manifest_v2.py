@@ -140,9 +140,35 @@ def test_get_occurrences_for_paper() -> None:
         occurrences=[occ1, occ2, occ3],
     )
     
-    p1_occs = manifest.get_occurrences_for_paper("p1")
-    assert len(p1_occs) == 2
-    assert {o.occurrence_id for o in p1_occs} == {"o1", "o3"}
+    p1_occs_by_id = manifest.get_occurrences_for_paper("p1")
+    assert len(p1_occs_by_id) == 2
+    assert {o.occurrence_id for o in p1_occs_by_id} == {"o1", "o3"}
+    
+    p1_occs_by_key = manifest.get_occurrences_for_paper("p1")
+    assert len(p1_occs_by_key) == 2
+    assert {o.occurrence_id for o in p1_occs_by_key} == {"o1", "o3"}
+
+
+def test_get_occurrences_for_paper_with_different_id_and_key() -> None:
+    occ = CitationOccurrence(
+        occurrence_id="o1", citation_token="t1",
+        paper_id="internal_id_123", paper_key="user_friendly_key",
+        section_number=1, section_title="", block_id="", block_order=1,
+    )
+    
+    manifest = build_citation_manifest_v2(
+        job_id="j1", project_name="p", manifest_id="m",
+        review_draft_path="", review_word_path="",
+        occurrences=[occ],
+    )
+    
+    by_id = manifest.get_occurrences_for_paper("internal_id_123")
+    assert len(by_id) == 1
+    assert by_id[0].occurrence_id == "o1"
+    
+    by_key = manifest.get_occurrences_for_paper("user_friendly_key")
+    assert len(by_key) == 1
+    assert by_key[0].occurrence_id == "o1"
 
 
 def test_get_cluster_for_paper() -> None:
@@ -157,12 +183,41 @@ def test_get_cluster_for_paper() -> None:
         clusters=[cluster],
     )
     
-    found = manifest.get_cluster_for_paper("p1")
-    assert found is not None
-    assert found.cluster_id == "c1"
+    found_by_id = manifest.get_cluster_for_paper("p1")
+    assert found_by_id is not None
+    assert found_by_id.cluster_id == "c1"
+    
+    found_by_key = manifest.get_cluster_for_paper("p1")
+    assert found_by_key is not None
+    assert found_by_key.cluster_id == "c1"
     
     not_found = manifest.get_cluster_for_paper("nonexistent")
     assert not_found is None
+
+
+def test_get_cluster_for_paper_with_different_id_and_key() -> None:
+    cluster = CitationCluster(
+        cluster_id="c1",
+        paper_id="internal_id_456",
+        paper_key="another_friendly_key",
+        occurrence_ids=["o1"],
+        first_occurrence_section=1,
+        total_occurrences=1,
+    )
+    
+    manifest = build_citation_manifest_v2(
+        job_id="j1", project_name="p", manifest_id="m",
+        review_draft_path="", review_word_path="",
+        clusters=[cluster],
+    )
+    
+    by_id = manifest.get_cluster_for_paper("internal_id_456")
+    assert by_id is not None
+    assert by_id.cluster_id == "c1"
+    
+    by_key = manifest.get_cluster_for_paper("another_friendly_key")
+    assert by_key is not None
+    assert by_key.cluster_id == "c1"
 
 
 def test_migrate_v1_to_v2() -> None:

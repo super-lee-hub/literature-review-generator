@@ -161,12 +161,15 @@ class CitationManifestV2:
     def get_cited_bibliography(self) -> List[BibliographyEntry]:
         return [entry for entry in self.bibliography if entry.is_cited]
 
-    def get_occurrences_for_paper(self, paper_id: str) -> List[CitationOccurrence]:
-        return [occ for occ in self.occurrences if occ.paper_id == paper_id]
+    def get_occurrences_for_paper(self, paper_identifier: str) -> List[CitationOccurrence]:
+        return [
+            occ for occ in self.occurrences
+            if occ.paper_id == paper_identifier or occ.paper_key == paper_identifier
+        ]
 
-    def get_cluster_for_paper(self, paper_id: str) -> Optional[CitationCluster]:
+    def get_cluster_for_paper(self, paper_identifier: str) -> Optional[CitationCluster]:
         for cluster in self.clusters:
-            if cluster.paper_id == paper_id:
+            if cluster.paper_id == paper_identifier or cluster.paper_key == paper_identifier:
                 return cluster
         return None
 
