@@ -1,182 +1,192 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-单元测试 - Word文档生成器
-"""
+"""测试 docx_writer 模块"""
 
-import pytest
 import os
 import tempfile
-from unittest.mock import Mock, patch, MagicMock
-from docx import Document  # type: ignore
+from typing import Dict, List, Any
+
+import pytest
+
+from docx_writer import generate_apa_references_from_manifest, generate_apa_references
 
 
-class TestDocxWriter:
-    """Word文档生成器测试"""
+class MockGenerator:
+    """模拟 LiteratureReviewGenerator 类"""
+    def __init__(self, summaries=None):
+        self.summaries = summaries or []
+        self.config = {}
+        
+        # 模拟 logger
+        class MockLogger:
+            def info(self, msg):
+                pass
+            def warning(self, msg):
+                pass
+            def error(self, msg):
+                pass
+        
+        self.logger = MockLogger()
 
-    def setup_method(self):
-        """初始化"""
-        self.docx_writer = __import__('docx_writer', fromlist=['create_word_document'])
 
-    @patch('docx_writer.Document')
-    def test_create_word_document_basic(self, mock_document_class):
-        """测试创建基本Word文档"""
-        from unittest.mock import MagicMock
-        # 模拟Document类
-        mock_doc = MagicMock()
-        mock_paragraph = MagicMock()
-        mock_doc.add_heading.return_value = mock_paragraph
-        mock_doc.add_paragraph.return_value = mock_paragraph
-        mock_document_class.return_value = mock_doc
-
-        # 测试数据
-        outline = {
-            "title": "Test Literature Review",
-            "sections": [
-                {"heading": "Introduction", "content": "Test introduction"},
-                {"heading": "Methodology", "content": "Test methodology"}
-            ]
-        }
-
-        summaries = [
-            {"title": "Paper 1", "summary": "Summary of paper 1"}
+def test_manifest_first_bibliography():
+    """测试 bibliography 按 manifest-first 解析"""
+    # 模拟 v2 manifest 数据
+    citation_manifest = {
+        'bibliography': [
+            {
+                'entry_id': 'bib_0',
+                'paper_id': 'test_paper_1',
+                'paper_key': 'test_paper_1',
+                'citation_text': 'Author A, B. (2023). Test Paper 1. Journal of Testing.',
+                'is_cited': True
+            }
         ]
+    }
+    
+    # 模拟生成器实例
+    generator = MockGenerator()
+    
+    # 调用函数
+    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    
+    # 验证结果
+    assert len(references) == 1
+    assert 'Author A, B. (2023). Test Paper 1. Journal of Testing.' in references
 
-        # 创建临时输出目录
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, "test_output")
 
-            # 调用函数
-            result = self.docx_writer.create_word_document(
-                outline, summaries, output_path, {}
-            )
-
-            # 验证结果
-            assert result is not None
-            assert os.path.exists(result)
-
-            # 验证Document被正确调用
-            assert mock_document_class.called
-
-    @patch('docx_writer.Document')
-    def test_create_document_with_styling(self, mock_document_class):
-        """测试带样式的文档创建"""
-        from unittest.mock import MagicMock
-        mock_doc = MagicMock()
-        mock_paragraph = MagicMock()
-        mock_run = MagicMock()
-        mock_paragraph.add_run.return_value = mock_run
-        mock_doc.add_heading.return_value = mock_paragraph
-        mock_doc.add_paragraph.return_value = mock_paragraph
-        mock_document_class.return_value = mock_doc
-
-        outline = {
-            "title": "Styled Document",
-            "sections": []
-        }
-
-        summaries = []
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, "styled_output")
-
-            # 配置样式
-            config = {
-                "font_name": "Times New Roman",
-                "font_size_body": 12,
-                "font_size_heading1": 16,
-                "font_size_heading2": 14
+def test_v2_bibliography_cited_only():
+    """测试 v2 bibliography cited-only 输出"""
+    # 模拟 v2 manifest 数据（包含未被引用的条目）
+    citation_manifest = {
+        'bibliography': [
+            {
+                'entry_id': 'bib_0',
+                'paper_id': 'test_paper_1',
+                'paper_key': 'test_paper_1',
+                'citation_text': 'Author A, B. (2023). Test Paper 1. Journal of Testing.',
+                'is_cited': True
+            },
+            {
+                'entry_id': 'bib_1',
+                'paper_id': 'test_paper_2',
+                'paper_key': 'test_paper_2',
+                'citation_text': 'Author C. (2024). Test Paper 2. Journal of Testing.',
+                'is_cited': False  # 未被引用
             }
+        ]
+    }
+    
+    # 模拟生成器实例
+    generator = MockGenerator()
+    
+    # 调用函数
+    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    
+    # 验证结果（只包含被引用的条目）
+    assert len(references) == 1
+    assert 'Author A, B. (2023). Test Paper 1. Journal of Testing.' in references
+    assert 'Author C. (2024). Test Paper 2. Journal of Testing.' not in references
 
-            result = self.docx_writer.create_word_document(
-                outline, summaries, output_path, config
-            )
 
-            assert result is not None
-
-    def test_word_document_structure(self):
-        """测试Word文档结构"""
-        from unittest.mock import MagicMock
-        # 使用真实的Document类来验证结构（但不保存文件）
-        with patch('docx_writer.Document') as mock_document_class:
-            mock_doc = MagicMock(spec=Document)
-            mock_paragraph = MagicMock()
-            mock_doc.add_heading = MagicMock(return_value=mock_paragraph)
-            mock_doc.add_paragraph = MagicMock(return_value=mock_paragraph)
-            mock_document_class.return_value = mock_doc
-
-            outline = {
-                "title": "Test",
-                "sections": [
-                    {"heading": "Section 1", "content": "Content 1"},
-                    {"heading": "Section 2", "content": "Content 2"}
-                ]
+def test_manifest_not_available_fallback():
+    """测试 manifest 不可用时 legacy fallback 仍可工作"""
+    # 模拟 summaries 数据
+    summaries = [
+        {
+            'status': 'success',
+            'paper_info': {
+                'title': 'Test Paper 1',
+                'authors': ['Author A', 'Author B'],
+                'year': '2023',
+                'journal': 'Journal of Testing'
             }
-
-            summaries = [
-                {"title": "Paper 1", "key_findings": ["Finding 1"], "summary": "Summary 1"}
-            ]
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                output_path = os.path.join(tmpdir, "test")
-
-                result = self.docx_writer.create_word_document(
-                    outline, summaries, output_path, {}
-                )
-
-                # 验证文档结构
-                assert mock_doc.add_heading.called
-                assert mock_doc.add_paragraph.called
-
-    @patch('docx_writer.Document')
-    def test_handle_empty_outline(self, mock_document_class):
-        """测试处理空大纲"""
-        from unittest.mock import MagicMock
-        mock_doc = MagicMock()
-        mock_document_class.return_value = mock_doc
-
-        outline = {
-            "title": "Empty Document",
-            "sections": []
         }
-
-        summaries = []
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, "empty_output")
-
-            result = self.docx_writer.create_word_document(
-                outline, summaries, output_path, {}
-            )
-
-            assert result is not None
-
-    @patch('docx_writer.Document')
-    @patch('docx_writer.os.makedirs')
-    def test_create_output_directory(self, mock_makedirs, mock_document_class):
-        """测试创建输出目录"""
-        from unittest.mock import MagicMock
-        mock_doc = MagicMock()
-        mock_document_class.return_value = mock_doc
-
-        outline = {"title": "Test", "sections": []}
-        summaries = []
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = os.path.join(tmpdir, "new_directory", "output")
-
-            # 确保目录不存在
-            assert not os.path.exists(output_path)
-
-            result = self.docx_writer.create_word_document(
-                outline, summaries, output_path, {}
-            )
-
-            # 验证目录被创建
-            mock_makedirs.assert_called_once()
-
-            assert result is not None
+    ]
+    
+    # 模拟生成器实例
+    generator = MockGenerator(summaries=summaries)
+    
+    # 调用函数（citation_manifest 为 None）
+    references = generate_apa_references_from_manifest(None, generator)
+    
+    # 验证结果
+    assert len(references) == 1
+    assert 'Author A, Author B' in references[0]
+    assert '2023' in references[0]
+    assert 'Test Paper 1' in references[0]
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+def test_v1_manifest_fallback():
+    """测试只有 v1 manifest 时回退到旧方法"""
+    # 模拟 v1 manifest 数据
+    citation_manifest = {
+        'citations': [
+            {
+                'citation_id': 'cit1',
+                'paper_id': 'test_paper_1',
+                'text': '(Author A, 2023)',
+                'context': 'Test context',
+                'section_number': 1,
+                'section_title': 'Introduction',
+                'block_id': 's1_b1',
+                'block_order': 1
+            }
+        ]
+    }
+    
+    # 模拟 summaries 数据
+    summaries = [
+        {
+            'status': 'success',
+            'paper_info': {
+                'title': 'Test Paper 1',
+                'authors': ['Author A', 'Author B'],
+                'year': '2023',
+                'journal': 'Journal of Testing'
+            }
+        }
+    ]
+    
+    # 模拟生成器实例
+    generator = MockGenerator(summaries=summaries)
+    
+    # 调用函数
+    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    
+    # 验证结果（应该回退到使用 summaries 生成）
+    assert len(references) == 1
+    assert 'Author A, Author B' in references[0]
+    assert '2023' in references[0]
+    assert 'Test Paper 1' in references[0]
+
+
+def test_empty_bibliography_fallback():
+    """测试 v2 manifest 存在但 bibliography 为空时回退到旧方法"""
+    # 模拟 v2 manifest 数据（空 bibliography）
+    citation_manifest = {
+        'bibliography': []
+    }
+    
+    # 模拟 summaries 数据
+    summaries = [
+        {
+            'status': 'success',
+            'paper_info': {
+                'title': 'Test Paper 1',
+                'authors': ['Author A', 'Author B'],
+                'year': '2023',
+                'journal': 'Journal of Testing'
+            }
+        }
+    ]
+    
+    # 模拟生成器实例
+    generator = MockGenerator(summaries=summaries)
+    
+    # 调用函数
+    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    
+    # 验证结果（应该回退到使用 summaries 生成）
+    assert len(references) == 1
+    assert 'Author A, Author B' in references[0]
+    assert '2023' in references[0]
+    assert 'Test Paper 1' in references[0]

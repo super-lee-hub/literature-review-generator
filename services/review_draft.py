@@ -26,6 +26,7 @@ class ReviewDraftV1:
 @dataclass(frozen=True)
 class StructuredCitation:
     local_ref_id: str
+    citation_token: str
     paper_id: Optional[str] = None
     paper_key: Optional[str] = None
     raw_text: str = ""
@@ -34,6 +35,7 @@ class StructuredCitation:
     block_id: str = ""
     span_start: Optional[int] = None
     span_end: Optional[int] = None
+    source_type: str = "legacy_regex"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -221,21 +223,24 @@ def _extract_citations_from_text(
         
         citation = StructuredCitation(
             local_ref_id=local_ref_id,
+            citation_token=raw_text,
             paper_key=paper_key,
             paper_id=paper_id,
             raw_text=raw_text,
             mode=mode,
             locator=locator,
-            block_id=block_id
+            block_id=block_id,
+            source_type="legacy_regex"
         )
         citations.append(citation.to_dict())
     
     # 兼容旧的APA-style citation patterns（作为fallback）
-    parenthetical_pattern = r'\([^)]+,\s*\d{4}(?:\s*[;,]\s*[^)]+)*\)'
+    # 简化的括号引用模式，确保能匹配 (Author A, 2023) 这种格式
+    parenthetical_pattern = r'\([^)]+,\s*\d{4}[^)]*\)'
     narrative_pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*\(\s*\d{4}\s*\)'
     
     # Find all parenthetical citations
-    parenthetical_matches = re.finditer(parenthetical_pattern, text)
+    parenthetical_matches = list(re.finditer(parenthetical_pattern, text))
     for idx, match in enumerate(parenthetical_matches, start=len(citations) + 1):
         local_ref_id = f"{block_id}_cite_p{idx}"
         raw_text = match.group(0)
@@ -248,17 +253,19 @@ def _extract_citations_from_text(
         
         citation = StructuredCitation(
             local_ref_id=local_ref_id,
+            citation_token=raw_text,
             paper_key=paper_key,
             paper_id=paper_id,
             raw_text=raw_text,
             mode="parenthetical",
             locator=None,
-            block_id=block_id
+            block_id=block_id,
+            source_type="legacy_regex"
         )
         citations.append(citation.to_dict())
     
     # Find all narrative citations
-    narrative_matches = re.finditer(narrative_pattern, text)
+    narrative_matches = list(re.finditer(narrative_pattern, text))
     for idx, match in enumerate(narrative_matches, start=len(citations) + 1):
         local_ref_id = f"{block_id}_cite_n{idx}"
         raw_text = match.group(0)
@@ -271,12 +278,14 @@ def _extract_citations_from_text(
         
         citation = StructuredCitation(
             local_ref_id=local_ref_id,
+            citation_token=raw_text,
             paper_key=paper_key,
             paper_id=paper_id,
             raw_text=raw_text,
             mode="narrative",
             locator=None,
-            block_id=block_id
+            block_id=block_id,
+            source_type="legacy_regex"
         )
         citations.append(citation.to_dict())
     
@@ -315,6 +324,38 @@ def _parse_section_into_blocks(
     return blocks
 
 
+def _normalize_block_citations(citations: List[Mapping[str, Any]], block_id: str) -> List[Dict[str, Any]]:
+    """Normalize block citations to canonical structure."""
+    normalized: List[Dict[str, Any]] = []
+    for idx, citation in enumerate(citations, start=1):
+        # Extract fields with fallbacks
+        local_ref_id = citation.get('local_ref_id', f"{block_id}_cite_{idx}")
+        citation_token = citation.get('citation_token', citation.get('raw_text', citation.get('text', '')))
+        paper_id = citation.get('paper_id')
+        paper_key = citation.get('paper_key', paper_id)
+        raw_text = citation.get('raw_text', citation_token)
+        mode = citation.get('mode', 'parenthetical')
+        locator = citation.get('locator')
+        span_start = citation.get('span_start')
+        span_end = citation.get('span_end')
+        source_type = citation.get('source_type', 'structured_block')
+        
+        # Create normalized citation
+        normalized.append({
+            'local_ref_id': local_ref_id,
+            'citation_token': citation_token,
+            'paper_id': paper_id,
+            'paper_key': paper_key,
+            'raw_text': raw_text,
+            'mode': mode,
+            'locator': locator,
+            'block_id': block_id,
+            'span_start': span_start,
+            'span_end': span_end,
+            'source_type': source_type,
+        })
+    return normalized
+
 def build_review_draft_v2(
     *,
     job_id: str,
@@ -350,7 +391,42 @@ def build_review_draft_v2(
         section_number = int(section.get("section_number") or 0)
         section_title = str(section.get("section_title") or "").strip()
         content = str(section.get("content") or "").strip()
-        blocks = _parse_section_into_blocks(section_number, section_title, content, paper_key_to_info)
+        
+        # Check if section already has blocks with citations (new input mode)
+        existing_blocks = section.get("blocks", [])
+        if existing_blocks:
+            # Use existing blocks and normalize citations
+            blocks: List[ReviewBlock] = []
+            for block_idx, block_data in enumerate(existing_blocks, start=1):
+                block_id = block_data.get('block_id', f"s{section_number}_b{block_idx}")
+                block_kind = block_data.get('block_kind', 'paragraph')
+                block_order = block_data.get('block_order', block_idx)
+                text = str(block_data.get('text', '')).strip()
+                anchor_text = block_data.get('anchor_text', text[:80] if len(text) <= 80 else text[:80] + "...")
+                anchor_hash = block_data.get('anchor_hash', hashlib.sha256(text.encode('utf-8')).hexdigest()[:8])
+                
+                # Normalize citations if they exist
+                citations = block_data.get('citations', [])
+                if citations:
+                    # 如果有结构化 citations，直接标准化
+                    normalized_citations = _normalize_block_citations(citations, block_id)
+                else:
+                    # 如果没有结构化 citations，尝试从文本中提取
+                    normalized_citations = _extract_citations_from_text(text, block_id, paper_key_to_info)
+                
+                blocks.append(ReviewBlock(
+                    block_id=block_id,
+                    block_kind=block_kind,
+                    block_order=block_order,
+                    text=text,
+                    anchor_text=anchor_text,
+                    anchor_hash=anchor_hash,
+                    citations=normalized_citations,
+                ))
+        else:
+            # Old input mode: parse from content
+            blocks = _parse_section_into_blocks(section_number, section_title, content, paper_key_to_info)
+        
         normalized_sections.append(ReviewSection(
             section_number=section_number,
             section_title=section_title,

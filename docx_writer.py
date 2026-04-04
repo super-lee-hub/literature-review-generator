@@ -283,7 +283,7 @@ def generate_apa_references_from_manifest(
     """
     try:
         if citation_manifest is not None:
-            # 尝试从 v2 manifest 中获取 bibliography
+            # 尝试从 v2 manifest 中获取 bibliography（优先路径）
             if 'bibliography' in citation_manifest:
                 references: List[str] = []
                 for entry in citation_manifest['bibliography']:
@@ -299,20 +299,20 @@ def generate_apa_references_from_manifest(
                 if references:
                     # 按第一作者姓氏排序
                     references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
+                    generator_instance.logger.info("使用 v2 manifest 中的 bibliography 生成参考文献")
                     return references
+                else:
+                    # v2 manifest 存在但 bibliography 为空，记录日志并回退
+                    generator_instance.logger.warning("v2 manifest 存在但 bibliography 为空，回退到旧方法")
             
             # 尝试从 v1 manifest 中获取 citations
             elif 'citations' in citation_manifest:
-                references: List[str] = []
-                for citation in citation_manifest['citations']:
-                    if isinstance(citation, dict) and 'text' in citation:
-                        references.append(citation['text'])
-                
-                if references:
-                    # 去重并排序
-                    references = list(dict.fromkeys(references))
-                    references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
-                    return references
+                generator_instance.logger.warning("只有 v1 manifest，回退到旧方法")
+                # 回退到旧方法
+                return generate_apa_references(generator_instance)
+        else:
+            # manifest 不存在，记录日志并回退
+            generator_instance.logger.warning("citation manifest 不存在，回退到旧方法")
     
     except Exception as e:
         generator_instance.logger.warning(f"从 citation manifest 生成参考文献失败，回退到旧方法: {e}")

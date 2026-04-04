@@ -2420,9 +2420,9 @@ def launch_gui(
                                                 # 操作按钮
                                                 with ui.row().classes("gap-2"):
                                                     if runtime and runtime.state == QueueState.RUNNING:
-                                                        ui.button(t("取消"), on_click=lambda jid=job.job_id: controller.cancel_job(jid)).props("outline color=negative size=sm")
+                                                        ui.button(t("取消"), on_click=lambda event=None, jid=job.job_id: controller.cancel_job(jid)).props("outline color=negative size=sm")
                                                     elif runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
-                                                        ui.button(t("重试"), on_click=lambda jid=job.job_id: controller.retry_job(jid)).props("outline color=primary size=sm")
+                                                        ui.button(t("重试"), on_click=lambda event=None, jid=job.job_id: controller.retry_job(jid)).props("outline color=primary size=sm")
                     
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("使用说明")).classes("ag-section-title")
