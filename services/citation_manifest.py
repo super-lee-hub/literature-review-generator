@@ -415,13 +415,18 @@ def _create_citation_occurrence(
     # Create spans if span information is available
     spans: List[CitationSpan] = []
     if span_start is not None and span_end is not None:
-        span_text = block_text[span_start:span_end] if 0 <= span_start < span_end <= len(block_text) else ""
-        spans.append(CitationSpan(
-            span_id=f"span_{occurrence_id}",
-            start_offset=span_start,
-            end_offset=span_end,
-            text=span_text
-        ))
+        # 验证span参数有效性
+        if isinstance(span_start, int) and isinstance(span_end, int):
+            # 确保span_start和span_end在有效范围内
+            if 0 <= span_start < span_end <= len(block_text):
+                span_text = block_text[span_start:span_end]
+                spans.append(CitationSpan(
+                    span_id=f"span_{occurrence_id}",
+                    start_offset=span_start,
+                    end_offset=span_end,
+                    text=span_text
+                ))
+            # 否则不创建span，避免IndexError
     
     return CitationOccurrence(
         occurrence_id=occurrence_id,
