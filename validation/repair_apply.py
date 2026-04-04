@@ -1,9 +1,9 @@
 """Repair apply module for Week 4.
 
 Enforces guards before applying patches:
-- Version guard
+- Version guard (artifact_type + artifact_version)
 - Anchor/hash guard
-- Dependency guard
+- Dependency guard (including visual_manifest_hash)
 
 Patch granularity is block/span only (no whole-section rewrite).
 """
@@ -53,6 +53,7 @@ def _check_dependency_bundle(
     proposal: PatchProposal,
     paper_artifacts: Sequence[Dict[str, Any]],
     review_draft: Dict[str, Any],
+    visual_manifest: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Check if dependencies are still valid.
     
@@ -81,6 +82,12 @@ def _check_dependency_bundle(
     if current_artifact_hash != bundle.paper_artifact_hash:
         return False
     
+    # Check visual manifest hash
+    if bundle.visual_manifest_hash:
+        current_visual_manifest_hash = _compute_hash(visual_manifest or {})
+        if current_visual_manifest_hash != bundle.visual_manifest_hash:
+            return False
+    
     # Check visual refs hash
     selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
     current_visual_refs_hash = _compute_hash(selected_visual_refs)
@@ -94,21 +101,30 @@ def check_apply_guards(
     proposal: PatchProposal,
     review_draft: Dict[str, Any],
     paper_artifacts: Sequence[Dict[str, Any]],
+    visual_manifest: Optional[Dict[str, Any]] = None,
+    expected_artifact_version: str = "v1",
 ) -> ApplyGuardResult:
     """Check all guards before applying a patch.
     
     Guards:
-    1. Version guard - review_draft version matches expected
+    1. Version guard - review_draft artifact_type and version match expected
     2. Anchor/hash guard - target block still has expected anchor_hash
-    3. Dependency guard - all dependencies present and not stale
+    3. Dependency guard - all dependencies present and not stale (including visual_manifest_hash)
     """
     block_reasons: List[str] = []
     
-    # Version guard - check review_draft has expected structure
+    # Version guard - check review_draft has expected structure and version
     version_guard_passed = True
     if review_draft.get("artifact_type") != "review_draft":
         version_guard_passed = False
         block_reasons.append("Invalid review_draft artifact_type")
+    
+    if review_draft.get("artifact_version") != expected_artifact_version:
+        version_guard_passed = False
+        block_reasons.append(
+            f"Version mismatch: expected {expected_artifact_version}, "
+            f"got {review_draft.get('artifact_version')}"
+        )
     
     # Anchor/hash guard
     anchor_hash_guard_passed = True
@@ -126,7 +142,9 @@ def check_apply_guards(
             )
     
     # Dependency guard
-    dependency_guard_passed = _check_dependency_bundle(proposal, paper_artifacts, review_draft)
+    dependency_guard_passed = _check_dependency_bundle(
+        proposal, paper_artifacts, review_draft, visual_manifest
+    )
     if not dependency_guard_passed:
         block_reasons.append("Dependency bundle check failed - dependencies missing or stale")
     
@@ -142,19 +160,30 @@ def check_apply_guards(
 
 
 def _apply_span_patch(block_text: str, proposal: PatchProposal) -> str:
-    """Apply a span-level patch to block text.
+    """Apply a true span-level patch to block text.
     
-    For citation_mapping_error: replace the problematic citation.
-    For other issues: this is a placeholder - real implementation would
-    use more sophisticated text matching.
+    For citation_mapping_error: replace the problematic citation span.
+    For other issues: apply the specific text replacement.
     """
     if proposal.root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
-        # For mapping errors, replace with marker
-        # In real implementation, this would find and replace the specific citation
-        return block_text.replace(proposal.original_text, proposal.proposed_text)
+        # For mapping errors, mark the citation as needing review
+        # In real implementation, this would find and replace the specific citation span
+        citation_id = proposal.citation_id
+        return block_text.replace(
+            proposal.original_text,
+            f"[CITATION_MAPPING_ERROR: {citation_id} - needs manual review]"
+        )
     
-    # For other span patches, return proposed text
-    return proposal.proposed_text
+    # For true span patches with span_start/span_end
+    if proposal.target.span_start is not None and proposal.target.span_end is not None:
+        return (
+            block_text[:proposal.target.span_start] +
+            proposal.proposed_text +
+            block_text[proposal.target.span_end:]
+        )
+    
+    # Fallback: replace original with proposed
+    return block_text.replace(proposal.original_text, proposal.proposed_text)
 
 
 def _apply_block_patch(block_text: str, proposal: PatchProposal) -> str:
@@ -170,13 +199,14 @@ def apply_patch(
     review_draft: Dict[str, Any],
     paper_artifacts: Sequence[Dict[str, Any]],
     job_id: str,
+    visual_manifest: Optional[Dict[str, Any]] = None,
 ) -> Optional[AppliedPatchRecord]:
     """Apply a single patch to review_draft.
     
     Returns AppliedPatchRecord on success, None on failure.
     """
     # Check guards first
-    guard_result = check_apply_guards(proposal, review_draft, paper_artifacts)
+    guard_result = check_apply_guards(proposal, review_draft, paper_artifacts, visual_manifest)
     if not guard_result.can_apply:
         return None
     
@@ -222,7 +252,7 @@ class RepairApplier:
     """Applies repair plans with guard enforcement.
     
     Enforces:
-    - Version guard
+    - Version guard (artifact_type + artifact_version)
     - Anchor/hash guard
     - Dependency guard
     - Block/span-only patch granularity (no whole-section rewrite)
@@ -235,12 +265,14 @@ class RepairApplier:
         citation_manifest: Dict[str, Any],
         paper_artifacts: Sequence[Dict[str, Any]],
         job_id: str,
+        visual_manifest: Optional[Dict[str, Any]] = None,
     ):
         self.repair_plan = repair_plan
         self.review_draft = review_draft
         self.citation_manifest = citation_manifest
         self.paper_artifacts = paper_artifacts
         self.job_id = job_id
+        self.visual_manifest = visual_manifest
         self.applied_records: List[AppliedPatchRecord] = []
         self.rejected_proposals: List[Dict[str, Any]] = []
     
@@ -253,9 +285,13 @@ class RepairApplier:
         applied_ids: List[str] = []
         
         for proposal in self.repair_plan.proposals:
+            # Add plan_id to metadata
+            if "plan_id" not in proposal.metadata:
+                proposal.metadata["plan_id"] = self.repair_plan.plan_id
+            
             # Check guards
             guard_result = check_apply_guards(
-                proposal, self.review_draft, self.paper_artifacts
+                proposal, self.review_draft, self.paper_artifacts, self.visual_manifest
             )
             
             if not guard_result.can_apply:
@@ -269,13 +305,10 @@ class RepairApplier:
             
             # Apply patch
             record = apply_patch(
-                proposal, self.review_draft, self.paper_artifacts, self.job_id
+                proposal, self.review_draft, self.paper_artifacts, self.job_id, self.visual_manifest
             )
             
             if record:
-                # Add plan_id to record metadata
-                record_dict = record.to_dict()
-                record_dict["plan_id"] = self.repair_plan.plan_id
                 self.applied_records.append(record)
                 applied_ids.append(proposal.proposal_id)
             else:
@@ -309,6 +342,7 @@ def run_repair_apply(
     citation_manifest: Dict[str, Any],
     paper_artifacts: Sequence[Dict[str, Any]],
     job_id: str,
+    visual_manifest: Optional[Dict[str, Any]] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Week 4 entry point for repair application.
@@ -322,13 +356,14 @@ def run_repair_apply(
         citation_manifest=citation_manifest,
         paper_artifacts=paper_artifacts,
         job_id=job_id,
+        visual_manifest=visual_manifest,
     )
     
     if dry_run:
         # Just check guards for all proposals
         results = []
         for proposal in repair_plan.proposals:
-            guard_result = check_apply_guards(proposal, review_draft, paper_artifacts)
+            guard_result = check_apply_guards(proposal, review_draft, paper_artifacts, visual_manifest)
             results.append({
                 "proposal_id": proposal.proposal_id,
                 "can_apply": guard_result.can_apply,
