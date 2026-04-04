@@ -88,12 +88,34 @@ The project now includes a persistent queue system (see `services/queue_service.
 - `PersistentQueueService`: JSON-based persistent queue storage
 - Supports: add_job, update_job_state, retry_failed_jobs, etc.
 
-## Citation Truth-Source
+## Citation Truth-Source (Week 6 Runtime Upgrade)
 
-The citation system has been upgraded to V2 (see `services/citation_manifest.py`):
+The citation system has been upgraded to V2 as the **primary runtime truth source**:
 
-- `CitationOccurrence`: Block/span-level citation occurrences
-- `CitationCluster`: Paper-level citation clusters
-- `BibliographyEntry`: Bibliography entries with `is_cited` flag
-- `get_cited_bibliography()`: Generates bibliography only from actually cited papers
-- Backward compatible: V1 manifests can be migrated to V2
+### Architecture
+- **`CitationManifestV2`** is now the primary durable artifact (registered in artifact registry)
+- **`CitationManifestV1`** is kept as explicit compatibility projection only
+- **Occurrence/Cluster/Bibliography** structure replaces flat citations list
+
+### Key Components
+- `CitationOccurrence`: Block/span-level citation occurrences with context
+- `CitationCluster`: Paper-level citation clusters aggregating occurrences
+- `BibliographyEntry`: Bibliography entries with `is_cited` flag and cluster linkage
+- `build_citation_manifest_v2_from_review_draft()`: Builds v2 from review_draft_v2 blocks
+
+### Consumer Alignment
+- **Validator** (`validation/review_validator.py`): Consumes `occurrences` as primary input (v2), falls back to `citations` (v1)
+- **Repair Pipeline** (`services/repair_integration.py`): Receives v2 data through validation reports
+- **Main Flow** (`main.py`): Produces v2 as primary, v1 as projection for compatibility
+
+### File Locations
+```
+output/<project>__<job_id>/
+  citation_manifests/
+    <project>_citation_manifest_v2.json   # Primary truth source
+    <project>_citation_manifest_v1.json   # Compatibility projection
+```
+
+### Backward Compatibility
+- V1 manifests auto-migrate to V2 via `migrate_v1_to_v2()`
+- Validator maintains fallback to v1 `citations` field for legacy data

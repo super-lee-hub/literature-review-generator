@@ -64,3 +64,39 @@ Both modes must normalize into a shared source descriptor before paper processin
 - Zotero mode starts with structured metadata and library-backed identity.
 - Both converge into `SourcePaperDescriptor` before downstream processing.
 
+## Citation Manifest V2 (Week 6)
+
+### Runtime Truth Source Upgrade
+
+The citation manifest has been upgraded from v1 to v2 as the primary durable artifact:
+
+**What Changed:**
+- `citation_manifest_v2.json` is now the **primary** citation truth source
+- `citation_manifest_v1.json` is kept as an explicit **compatibility projection**
+- Registry now registers v2 as the canonical artifact version
+
+**V2 Structure:**
+```json
+{
+  "artifact_type": "citation_manifest",
+  "artifact_version": "v2",
+  "occurrences": [...],
+  "clusters": [...],
+  "bibliography": [...]
+}
+```
+
+**Migration Path:**
+- Existing v1 manifests are auto-migrated to v2 via `migrate_v1_to_v2()`
+- Validator now consumes `occurrences` as primary input (with fallback to `citations`)
+- Repair pipeline receives v2 data through validation reports
+
+**File Locations:**
+- Primary: `output/<project>__<job_id>/citation_manifests/<project>_citation_manifest_v2.json`
+- Compatibility: `output/<project>__<job_id>/citation_manifests/<project>_citation_manifest_v1.json`
+
+**Consumer Updates:**
+- `validation/review_validator.py` - now reads `occurrences` first, falls back to `citations`
+- `services/repair_integration.py` - receives v2 data via validation reports
+- `main.py` - produces v2 as primary, v1 as projection
+

@@ -280,7 +280,7 @@ def test_successful_stage2_generation_creates_registered_review_draft_v2(tmp_pat
     assert generator.generate_full_review_from_outline() is True
 
     registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
-    review_v2_records = [item for item in registry_payload["artifacts"] if item.get("artifact_version") == "v2"]
+    review_v2_records = [item for item in registry_payload["artifacts"] if item.get("artifact_type") == "review_draft" and item.get("artifact_version") == "v2"]
     v2_artifact_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v2.json"))
 
     assert len(review_v2_records) == 1

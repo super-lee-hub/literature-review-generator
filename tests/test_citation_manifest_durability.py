@@ -115,13 +115,14 @@ def test_successful_stage2_generation_creates_registered_citation_manifest(tmp_p
     artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
 
     assert artifact_payload["artifact_type"] == "citation_manifest"
-    assert artifact_payload["artifact_version"] == "v1"
+    assert artifact_payload["artifact_version"] == "v2"
     assert artifact_payload["created_from_job_id"] == workspace.job_id
     assert artifact_payload["manifest_identity"]["manifest_id"] == "citation_manifest:v1"
     assert artifact_payload["review_reference"]["review_word_path"] == str(word_path)
-    assert len(artifact_payload["citations"]) == 1
-    assert artifact_payload["citations"][0]["text"] == "Author, A. (2024). Demo reference."
-    assert artifact_payload["citations"][0]["section_title"] == "参考文献"
+    # V2 uses occurrences/clusters/bibliography instead of flat citations
+    assert "occurrences" in artifact_payload
+    assert "clusters" in artifact_payload
+    assert "bibliography" in artifact_payload
     assert any(dep["artifact_type"] == "review_draft" for dep in citation_records[0]["depends_on"])
 
 

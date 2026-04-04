@@ -67,11 +67,12 @@ class ReviewValidator:
     def validate(self) -> ReviewValidationReport:
         from datetime import datetime
 
-        citations = self.citation_manifest.get("citations", [])
+        # Primary path: consume v2 occurrences/clusters/bibliography
+        occurrences = self._get_occurrences_from_manifest()
         citation_results: List[CitationValidationResult] = []
 
-        for citation in citations:
-            citation_results.append(self._validate_citation(citation))
+        for occurrence in occurrences:
+            citation_results.append(self._validate_occurrence(occurrence))
 
         supported_count = sum(1 for r in citation_results if r.conclusion == ValidationConclusion.SUPPORTED)
         partial_count = sum(1 for r in citation_results if r.conclusion == ValidationConclusion.PARTIAL_SUPPORT)
@@ -82,13 +83,67 @@ class ReviewValidator:
         return ReviewValidationReport(
             report_id=f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             created_at=datetime.now().isoformat(),
-            total_citations=len(citations),
+            total_citations=len(occurrences),
             supported_count=supported_count,
             partial_support_count=partial_count,
             unsupported_count=unsupported_count,
             wrong_source_count=wrong_source_count,
             needs_review_count=needs_review_count,
             citation_results=citation_results,
+        )
+
+    def _get_occurrences_from_manifest(self) -> List[Dict[str, Any]]:
+        """Extract occurrences from citation manifest, preferring v2 structure."""
+        # Primary: v2 occurrences
+        occurrences = self.citation_manifest.get("occurrences", [])
+        if occurrences:
+            return occurrences
+        
+        # Fallback: v1 citations (legacy compatibility)
+        citations = self.citation_manifest.get("citations", [])
+        return citations
+
+    def _validate_occurrence(self, occurrence: Dict[str, Any]) -> CitationValidationResult:
+        """Validate a single citation occurrence (v2-style)."""
+        occurrence_id = occurrence.get("occurrence_id") or occurrence.get("citation_id", "")
+        paper_id = occurrence.get("paper_id", "")
+        cited_text = occurrence.get("citation_token") or occurrence.get("text", "")
+        context = occurrence.get("context_before") or occurrence.get("context", "")
+
+        paper_artifact = self.paper_artifacts.get(paper_id)
+
+        if not paper_artifact:
+            return CitationValidationResult(
+                citation_id=occurrence_id,
+                paper_id=paper_id,
+                conclusion=ValidationConclusion.WRONG_SOURCE,
+                root_causes=[RootCause.CITATION_MAPPING_ERROR],
+                evidence_candidates=[],
+                details={"reason": "paper_not_found_in_artifacts"},
+            )
+
+        resolver_context = build_evidence_resolver_context(paper_artifact)
+        resolver = EvidenceResolver(resolver_context)
+        selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
+        evidence_candidates = resolver.resolve_evidence(
+            cited_span=cited_text,
+            selected_visual_refs=selected_visual_refs,
+        )
+
+        conclusion, root_causes = self._classify_citation(
+            cited_text=cited_text,
+            context=context,
+            evidence_candidates=evidence_candidates,
+            has_visual_refs=bool(selected_visual_refs),
+        )
+
+        return CitationValidationResult(
+            citation_id=occurrence_id,
+            paper_id=paper_id,
+            conclusion=conclusion,
+            root_causes=root_causes,
+            evidence_candidates=evidence_candidates,
+            details={},
         )
 
     def _validate_citation(self, citation: Dict[str, Any]) -> CitationValidationResult:

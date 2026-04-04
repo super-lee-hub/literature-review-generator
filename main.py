@@ -21,7 +21,7 @@ import json
 import hashlib
 import logging
 import re
-from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping
+from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, cast
 from datetime import datetime
 
 ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
@@ -55,7 +55,14 @@ from services.paper_artifact import build_paper_artifact_v1
 from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
 from services.queue_service import CancelToken, JobCancelledError
 from services.review_draft import build_review_draft_v1, build_review_draft_v2
-from services.citation_manifest import build_citation_manifest_v1
+from services.citation_manifest import (
+    build_citation_manifest_v1,
+    build_citation_manifest_v2,
+    CitationOccurrence,
+    CitationCluster,
+    BibliographyEntry,
+    CitationSpan,
+)
 from services.stage1_input_builder import Stage1InputBuilder
 from services.model_selection import get_outline_api_config
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
@@ -590,6 +597,13 @@ class LiteratureReviewGenerator:
         if not self.job_workspace:
             raise ValueError("job workspace is not configured")
         project_name = self.project_name or "review"
+        return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_manifest_v2.json")
+
+    def _citation_manifest_v1_path(self) -> str:
+        """Legacy v1 path for compatibility projection only."""
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        project_name = self.project_name or "review"
         return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_manifest_v1.json")
 
     def _extract_review_sections_from_word_document(
@@ -757,6 +771,34 @@ class LiteratureReviewGenerator:
             self.logger.error(f"Failed to persist review_draft_v2: {exc}")
             return False
 
+    def _build_citation_manifest_v2_from_review_draft(
+        self,
+        review_draft_path: str,
+        review_word_path: str,
+        citations: list[dict[str, Any]],
+    ) -> Any:
+        """Build CitationManifestV2 from review_draft_v2 block structure and citation data.
+        
+        This creates occurrence/cluster/bibliography truth from the review draft blocks,
+        not just from the final reference list.
+        """
+        from services.citation_manifest import migrate_v1_to_v2
+        
+        # First build v1 as intermediate (for migration path)
+        v1_manifest = build_citation_manifest_v1(
+            job_id=self.job_workspace.job_id if self.job_workspace else "unknown",
+            project_name=self.project_name or "review",
+            manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
+            review_draft_path=review_draft_path,
+            review_word_path=review_word_path,
+            citations=citations,
+        )
+        
+        # Migrate to v2 with occurrence/cluster/bibliography structure
+        v2_manifest = migrate_v1_to_v2(v1_manifest)
+        
+        return v2_manifest
+
     def _persist_citation_manifest(
         self,
         *, 
@@ -768,23 +810,16 @@ class LiteratureReviewGenerator:
             return True
 
         try:
-            # Add review_draft_version to citations
-            enriched_citations = []
-            for citation in citations:
-                enriched_citation = citation.copy()
-                enriched_citation.setdefault("review_draft_version", "v2")
-                enriched_citations.append(enriched_citation)
-            
-            citation_manifest = build_citation_manifest_v1(
-                job_id=self.job_workspace.job_id,
-                project_name=self.project_name or "review",
-                manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
+            # Build v2 as primary truth source with occurrence/cluster/bibliography
+            citation_manifest_v2 = self._build_citation_manifest_v2_from_review_draft(
                 review_draft_path=review_draft_path,
                 review_word_path=review_word_path,
-                citations=enriched_citations,
+                citations=citations,
             )
-            artifact_path = self._citation_manifest_path()
-            atomic_write_json(artifact_path, citation_manifest.to_dict())
+            
+            # Persist v2 as primary artifact
+            artifact_path_v2 = self._citation_manifest_path()
+            atomic_write_json(artifact_path_v2, citation_manifest_v2.to_dict())
 
             depends_on: List[ArtifactDependencyRef] = []
             if review_draft_path:
@@ -795,18 +830,49 @@ class LiteratureReviewGenerator:
                     )
                 )
 
+            # Register v2 as primary artifact
             self.artifact_registry.register_file(
                 artifact_role=self.CITATION_MANIFEST_ARTIFACT_ROLE,
                 artifact_type=self.CITATION_MANIFEST_ARTIFACT_TYPE,
-                artifact_version=self.CITATION_MANIFEST_ARTIFACT_VERSION,
-                path=artifact_path,
+                artifact_version="v2",  # Now v2 is the primary version
+                path=artifact_path_v2,
                 producer="main.LiteratureReviewGenerator.generate_full_review_from_outline",
                 depends_on=depends_on,
                 artifact_id=self.CITATION_MANIFEST_ARTIFACT_ID,
             )
+            
+            # Also persist v1 as explicit compatibility projection
+            artifact_path_v1 = self._citation_manifest_v1_path()
+            v1_compatible = {
+                "artifact_type": "citation_manifest",
+                "artifact_version": "v1",
+                "created_from_job_id": citation_manifest_v2.created_from_job_id,
+                "created_at": citation_manifest_v2.created_at,
+                "manifest_identity": {
+                    **citation_manifest_v2.manifest_identity,
+                    "projection_from": "v2",
+                },
+                "review_reference": citation_manifest_v2.review_reference,
+                "citations": [
+                    {
+                        "citation_id": occ.occurrence_id,
+                        "paper_id": occ.paper_id,
+                        "text": occ.citation_token,
+                        "context": occ.context_before,
+                        "section_number": occ.section_number,
+                        "section_title": occ.section_title,
+                        "block_id": occ.block_id,
+                        "block_order": occ.block_order,
+                        "review_draft_version": "v2",
+                    }
+                    for occ in citation_manifest_v2.occurrences
+                ],
+            }
+            atomic_write_json(artifact_path_v1, v1_compatible)
+            
             return True
         except Exception as exc:
-            self.logger.error(f"Failed to persist citation_manifest_v1: {exc}")
+            self.logger.error(f"Failed to persist citation_manifest: {exc}")
             return False
 
     def _init_logger(self):
@@ -1825,7 +1891,7 @@ class LiteratureReviewGenerator:
             from outline.legacy_adapter import OutlineLegacyAdapter
 
             adapter = OutlineLegacyAdapter.from_workspace(
-                workspace_path=self.job_workspace.paths.artifacts_path,
+                workspace_path=self.job_workspace.paths.artifacts_dir,
                 project_name=self.project_name,
                 legacy_markdown="",
             )
@@ -3964,28 +4030,46 @@ class LiteratureReviewGenerator:
                         citation_manifest = validation_result.get("citation_manifest")
                         paper_artifacts = validation_result.get("paper_artifacts")
                         
-                        if all([
-                            validation_report is not None,
-                            review_draft is not None,
-                            citation_manifest is not None,
-                            paper_artifacts is not None,
-                            self.job_workspace is not None,
-                            self.artifact_registry is not None,
-                        ]):
+                        job_workspace = self.job_workspace
+                        artifact_registry = self.artifact_registry
+                        has_repair_inputs = (
+                            job_workspace is not None
+                            and artifact_registry is not None
+                            and isinstance(review_draft, dict)
+                            and isinstance(citation_manifest, dict)
+                            and isinstance(paper_artifacts, list)
+                            and all(isinstance(item, dict) for item in paper_artifacts)
+                        )
+
+                        if has_repair_inputs:
                             try:
+                                assert job_workspace is not None
+                                assert artifact_registry is not None
+                                assert isinstance(review_draft, dict)
+                                assert isinstance(citation_manifest, dict)
+                                assert isinstance(paper_artifacts, list)
+
                                 self.logger.info("Starting Week4 repair pipeline (report-first policy)...")
                                 from services.repair_integration import run_repair_pipeline
-                                repair_result = run_repair_pipeline(
-                                    validation_report=validation_report,
-                                    review_draft=review_draft,
-                                    citation_manifest=citation_manifest,
-                                    paper_artifacts=paper_artifacts,
-                                    job_id=self.job_workspace.job_id,
-                                    workspace=self.job_workspace,
-                                    registry=self.artifact_registry,
-                                    auto_apply=False,  # Default: report-first policy
-                                )
-                                self.logger.success(f"Week4 repair pipeline completed: {repair_result}")
+                                from validation.review_validator import ReviewValidationReport
+
+                                if not isinstance(validation_report, ReviewValidationReport):
+                                    self.logger.warning("Week4 repair pipeline skipped: invalid validation report type.")
+                                else:
+                                    typed_review_draft = cast(Dict[str, Any], review_draft)
+                                    typed_citation_manifest = cast(Dict[str, Any], citation_manifest)
+                                    typed_paper_artifacts = cast(List[Dict[str, Any]], paper_artifacts)
+                                    repair_result = run_repair_pipeline(
+                                        validation_report=validation_report,
+                                        review_draft=typed_review_draft,
+                                        citation_manifest=typed_citation_manifest,
+                                        paper_artifacts=typed_paper_artifacts,
+                                        job_id=job_workspace.job_id,
+                                        workspace=job_workspace,
+                                        registry=artifact_registry,
+                                        auto_apply=False,  # Default: report-first policy
+                                    )
+                                    self.logger.success(f"Week4 repair pipeline completed: {repair_result}")
                             except Exception as repair_error:
                                 self.logger.error(f"Week4 repair pipeline failed: {repair_error}")
                                 self.logger.warning("修复管道失败，但验证流程将继续。请检查修复相关文件。")
@@ -4075,6 +4159,7 @@ class LiteratureReviewGenerator:
                 
                 writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
                 generator_model = writer_config.get('model', 'gpt-4')
+                outline_summaries: List[Dict[str, Any]] = [dict(summary) for summary in self.summaries]
                 
                 # Generate OutlineDocument from markdown
                 outline_result = run_outline_generation(
@@ -4082,9 +4167,12 @@ class LiteratureReviewGenerator:
                     sections_data=None,
                     job_id=self.job_workspace.job_id,
                     generator_model=generator_model,
-                    summaries=self.summaries,
+                    summaries=outline_summaries,
                 )
-                outline_dict = outline_result.get('outline')
+                outline_dict_raw = outline_result.get('outline')
+                if not isinstance(outline_dict_raw, dict):
+                    raise ValueError("Week5 outline generation did not return a valid outline payload.")
+                outline_dict: Dict[str, Any] = outline_dict_raw
                 
                 # Persist OutlineDocument
                 outline_doc_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_document.json")
@@ -4117,7 +4205,7 @@ class LiteratureReviewGenerator:
                 critique_result = run_outline_critique(
                     outline=outline_doc,
                     critic_model=generator_model,
-                    summaries=self.summaries,
+                    summaries=outline_summaries,
                     job_id=self.job_workspace.job_id,
                 )
                 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -314,6 +315,177 @@ def migrate_v1_to_v2(v1_manifest: CitationManifestV1) -> CitationManifestV2:
             "migrated_from": "v1",
         },
         review_reference=v1_manifest.review_reference,
+        occurrences=occurrences,
+        clusters=clusters,
+        bibliography=bibliography,
+        review_draft_version="v2",
+    )
+
+
+def build_citation_manifest_v2_from_review_draft(
+    *,
+    job_id: str,
+    project_name: str,
+    manifest_id: str,
+    review_draft_path: str,
+    review_word_path: str,
+    review_draft_v2: Dict[str, Any],
+    paper_summaries: List[Dict[str, Any]],
+) -> CitationManifestV2:
+    """Build CitationManifestV2 directly from review_draft_v2 block structure.
+    
+    This creates occurrence/cluster/bibliography truth from the review draft blocks,
+    not just from the final reference list. It extracts citation information from
+    the block structure and correlates it with paper summaries.
+    """
+    occurrences: List[CitationOccurrence] = []
+    clusters: List[CitationCluster] = []
+    bibliography: List[BibliographyEntry] = []
+    
+    # Build paper key to info mapping from summaries
+    paper_key_to_info: Dict[str, Dict[str, Any]] = {}
+    for summary in paper_summaries:
+        paper_info = summary.get('paper_info', {})
+        # Use title as canonical key if available
+        title = paper_info.get('title', '')
+        if title:
+            paper_key_to_info[title.lower()] = {
+                'paper_id': title.lower(),
+                'paper_key': title.lower(),
+                'authors': paper_info.get('authors', []),
+                'year': paper_info.get('year', ''),
+            }
+    
+    # Extract occurrences from review_draft_v2 sections/blocks
+    sections = review_draft_v2.get('content', {}).get('sections', [])
+    references = review_draft_v2.get('content', {}).get('references', [])
+    
+    occurrence_counter = 0
+    paper_occurrence_map: Dict[str, List[str]] = {}
+    
+    for section in sections:
+        section_number = section.get('section_number', 0)
+        section_title = section.get('section_title', '')
+        blocks = section.get('blocks', [])
+        
+        for block in blocks:
+            block_id = block.get('block_id', f's{section_number}_b0')
+            block_order = block.get('block_order', 0)
+            block_text = block.get('text', '')
+            
+            # Simple citation extraction: look for patterns like (Author, YYYY)
+            # This is a basic implementation - can be enhanced with more sophisticated parsing
+            citation_pattern = r'\([^)]+,\s*\d{4}[^)]*\)'
+            found_citations = re.findall(citation_pattern, block_text)
+            
+            for citation_token in found_citations:
+                occurrence_counter += 1
+                occurrence_id = f"occ_{occurrence_counter}"
+                
+                # Try to match citation to paper
+                paper_id = "unknown"
+                paper_key = "unknown"
+                
+                # Simple heuristic: check if any paper title or author appears in citation
+                citation_lower = citation_token.lower()
+                for title_key, paper_data in paper_key_to_info.items():
+                    # Check if author names from paper appear in citation
+                    authors = paper_data.get('authors', [])
+                    for author in authors:
+                        if author.lower() in citation_lower:
+                            paper_id = paper_data['paper_id']
+                            paper_key = paper_data['paper_key']
+                            break
+                    if paper_id != "unknown":
+                        break
+                
+                # Create occurrence
+                occurrence = CitationOccurrence(
+                    occurrence_id=occurrence_id,
+                    citation_token=citation_token,
+                    paper_id=paper_id,
+                    paper_key=paper_key,
+                    section_number=section_number,
+                    section_title=section_title,
+                    block_id=block_id,
+                    block_order=block_order,
+                    spans=[],
+                    context_before=block_text[:200] if len(block_text) > 200 else block_text,
+                    context_after="",
+                )
+                occurrences.append(occurrence)
+                
+                if paper_id not in paper_occurrence_map:
+                    paper_occurrence_map[paper_id] = []
+                paper_occurrence_map[paper_id].append(occurrence_id)
+    
+    # Build clusters from occurrence map
+    for paper_id, occ_ids in paper_occurrence_map.items():
+        if paper_id == "unknown":
+            continue
+            
+        # Find first occurrence section
+        first_section = min(
+            (occ.section_number for occ in occurrences if occ.paper_id == paper_id),
+            default=0
+        )
+        
+        cluster = CitationCluster(
+            cluster_id=f"cluster_{paper_id}",
+            paper_id=paper_id,
+            paper_key=paper_id,
+            occurrence_ids=occ_ids,
+            first_occurrence_section=first_section,
+            total_occurrences=len(occ_ids),
+        )
+        clusters.append(cluster)
+    
+    # Build bibliography from references and cited papers
+    cited_paper_ids = set(paper_occurrence_map.keys())
+    
+    for idx, ref in enumerate(references):
+        entry_id = f"bib_{idx}"
+        
+        # Try to find if this reference corresponds to a cited paper
+        ref_lower = ref.lower()
+        matched_paper_id = "unknown"
+        cluster_id = None
+        
+        for title_key, paper_data in paper_key_to_info.items():
+            if title_key in ref_lower or any(
+                author.lower() in ref_lower for author in paper_data.get('authors', [])
+            ):
+                matched_paper_id = paper_data['paper_id']
+                if matched_paper_id in cited_paper_ids:
+                    cluster_id = f"cluster_{matched_paper_id}"
+                break
+        
+        is_cited = matched_paper_id in cited_paper_ids
+        
+        entry = BibliographyEntry(
+            entry_id=entry_id,
+            paper_id=matched_paper_id,
+            paper_key=matched_paper_id,
+            citation_text=ref,
+            is_cited=is_cited,
+            cluster_id=cluster_id,
+        )
+        bibliography.append(entry)
+    
+    return CitationManifestV2(
+        artifact_type="citation_manifest",
+        artifact_version="v2",
+        created_from_job_id=job_id,
+        created_at=utc_now_iso(),
+        manifest_identity={
+            "manifest_id": manifest_id,
+            "project_name": project_name,
+            "scope": "review_citations_truth_source",
+        },
+        review_reference={
+            "review_draft_path": review_draft_path,
+            "review_word_path": review_word_path,
+        },
         occurrences=occurrences,
         clusters=clusters,
         bibliography=bibliography,
