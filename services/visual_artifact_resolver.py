@@ -7,6 +7,58 @@ from typing import Any, Dict, List, Optional
 from services.artifact_registry import ArtifactRegistry
 
 
+def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
+    """归一化视觉证据 artifact，统一字段命名
+    
+    解决以下不一致问题：
+    - caption_excerpt vs caption
+    - image_path vs path
+    - page_no vs page_range
+    
+    Args:
+        visual: 视觉证据 artifact
+        
+    Returns:
+        归一化后的视觉证据 artifact
+    """
+    normalized = {}
+    
+    # 基本字段
+    normalized["visual_id"] = visual.get("visual_id") or visual.get("id") or ""
+    normalized["artifact_id"] = visual.get("artifact_id") or ""
+    normalized["paper_key"] = visual.get("paper_key") or ""
+    normalized["source_pdf"] = visual.get("source_pdf") or ""
+    
+    # 页面信息
+    normalized["page_no"] = int(visual.get("page_no") or visual.get("page_number") or 0)
+    page_range = visual.get("page_range")
+    if page_range:
+        normalized["page_range"] = page_range
+    else:
+        normalized["page_range"] = [normalized["page_no"]] if normalized["page_no"] > 0 else []
+    
+    # 位置信息
+    normalized["bbox"] = visual.get("bbox") or []
+    
+    # 类型信息
+    normalized["artifact_type"] = visual.get("artifact_type") or ""
+    normalized["source_type"] = visual.get("source_type") or ""
+    
+    # 路径信息
+    normalized["image_path"] = visual.get("image_path") or visual.get("path") or ""
+    
+    # 文本信息
+    normalized["caption_excerpt"] = visual.get("caption_excerpt") or visual.get("caption") or ""
+    normalized["nearby_text_excerpt"] = visual.get("nearby_text_excerpt") or visual.get("nearby_text") or ""
+    
+    # 选择信息
+    normalized["selection_reason"] = visual.get("selection_reason") or ""
+    normalized["selection_score"] = float(visual.get("selection_score") or 0.0)
+    normalized["dedupe_group_id"] = visual.get("dedupe_group_id") or ""
+    
+    return normalized
+
+
 class VisualArtifactResolver:
     def __init__(self, artifact_registry: ArtifactRegistry, logger: Any = None):
         self.artifact_registry = artifact_registry
@@ -96,7 +148,7 @@ class VisualArtifactResolver:
             paper_artifact_path: Path to paper artifact JSON file
             
         Returns:
-            List of selected visual refs
+            List of normalized selected visual refs
         """
         paper_artifact = self._load_paper_artifact(paper_artifact_path)
         if not paper_artifact:
@@ -105,7 +157,7 @@ class VisualArtifactResolver:
         stage1_inputs = paper_artifact.get("stage1_inputs")
         if isinstance(stage1_inputs, dict):
             selected_refs = [
-                dict(item)
+                normalize_visual_artifact(dict(item))
                 for item in (stage1_inputs.get("selected_visual_refs") or [])
                 if isinstance(item, dict)
             ]
@@ -115,7 +167,7 @@ class VisualArtifactResolver:
         manifest = self.resolve_visual_manifest(paper_artifact_path)
         if not manifest:
             return []
-        return [dict(item) for item in (manifest.get("visuals") or []) if isinstance(item, dict)]
+        return [normalize_visual_artifact(dict(item)) for item in (manifest.get("visuals") or []) if isinstance(item, dict)]
 
     def resolve_visual_artifact_by_id(self, visual_id: str) -> Optional[Dict[str, Any]]:
         """Resolve visual artifact by its ID.
@@ -124,7 +176,7 @@ class VisualArtifactResolver:
             visual_id: Visual artifact ID
             
         Returns:
-            Visual artifact dict if found, None otherwise
+            Normalized visual artifact dict if found, None otherwise
         """
         for record in self.artifact_registry.list_records():
             if record.artifact_type != "visual_manifest" or record.status != "ready":
@@ -136,7 +188,7 @@ class VisualArtifactResolver:
                 if not isinstance(visual, dict):
                     continue
                 if visual.get("id") == visual_id or visual.get("visual_id") == visual_id:
-                    return visual
+                    return normalize_visual_artifact(visual)
         return None
 
     def get_visual_artifacts_for_paper(self, paper_key: str) -> List[Dict[str, Any]]:
@@ -146,7 +198,7 @@ class VisualArtifactResolver:
             paper_key: Paper key
             
         Returns:
-            List of visual artifacts for the paper
+            List of normalized visual artifacts for the paper
         """
         visual_artifacts: List[Dict[str, Any]] = []
         for record in self.artifact_registry.list_records():
@@ -158,7 +210,7 @@ class VisualArtifactResolver:
             if str(manifest.get("paper_key") or "") != paper_key:
                 continue
             visual_artifacts.extend(
-                dict(item)
+                normalize_visual_artifact(dict(item))
                 for item in (manifest.get("visuals") or [])
                 if isinstance(item, dict)
             )

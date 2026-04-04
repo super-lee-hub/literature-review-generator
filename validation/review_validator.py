@@ -31,6 +31,12 @@ class CitationValidationResult:
     root_causes: List[RootCause]
     evidence_candidates: List[EvidenceCandidate]
     details: Dict[str, Any]
+    # 新增结构化字段
+    claim_text: str
+    claim_context: str
+    evidence_excerpt_list: List[str]
+    reasoning_summary: str
+    repair_hint: str
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,17 @@ class ReviewValidator:
 
         if not paper_artifact:
             details["reason"] = "paper_not_found_in_artifacts"
+            # 构建结构化输出
+            claim_text = cited_text
+            claim_context = context
+            evidence_excerpt_list = []
+            
+            # 生成 reasoning summary
+            reasoning_summary = "引用来源错误: 未找到对应论文 artifact"
+            
+            # 生成 repair hint
+            repair_hint = "请检查引用的论文ID是否正确; 确认是否引用了正确的文献; 请检查引用映射是否正确"
+            
             return CitationValidationResult(
                 citation_id=citation_id,
                 paper_id=paper_id,
@@ -143,6 +160,11 @@ class ReviewValidator:
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
                 details=details,
+                claim_text=claim_text,
+                claim_context=claim_context,
+                evidence_excerpt_list=evidence_excerpt_list,
+                reasoning_summary=reasoning_summary,
+                repair_hint=repair_hint,
             )
 
         # Get preprocess evidence for this paper if available
@@ -185,6 +207,26 @@ class ReviewValidator:
         details["has_preprocess_evidence"] = bool(paper_preprocess_evidence)
         details["has_paper_metadata"] = bool(paper_specific_metadata)
 
+        # 构建结构化输出
+        claim_text = cited_text
+        claim_context = context
+        evidence_excerpt_list = [candidate.text_excerpt for candidate in evidence_candidates if candidate.text_excerpt]
+        
+        # 生成 reasoning summary
+        reasoning_summary = self._generate_reasoning_summary(
+            conclusion=conclusion,
+            root_causes=root_causes,
+            evidence_candidates=evidence_candidates
+        )
+        
+        # 生成 repair hint
+        repair_hint = self._generate_repair_hint(
+            conclusion=conclusion,
+            root_causes=root_causes,
+            claim_text=claim_text,
+            claim_context=claim_context
+        )
+        
         return CitationValidationResult(
             citation_id=citation_id,
             paper_id=paper_id,
@@ -192,6 +234,11 @@ class ReviewValidator:
             root_causes=root_causes,
             evidence_candidates=evidence_candidates,
             details=details,
+            claim_text=claim_text,
+            claim_context=claim_context,
+            evidence_excerpt_list=evidence_excerpt_list,
+            reasoning_summary=reasoning_summary,
+            repair_hint=repair_hint,
         )
 
     def _validate_occurrence(self, occurrence: Dict[str, Any]) -> CitationValidationResult:
@@ -253,3 +300,74 @@ class ReviewValidator:
             return ValidationConclusion.NEEDS_REVIEW, [RootCause.VISUAL_UNDERSTANDING_GAP]
         else:
             return ValidationConclusion.UNSUPPORTED, [RootCause.INSUFFICIENT_CONTEXT]
+    
+    def _generate_reasoning_summary(
+        self,
+        conclusion: ValidationConclusion,
+        root_causes: List[RootCause],
+        evidence_candidates: List[EvidenceCandidate]
+    ) -> str:
+        """生成推理摘要"""
+        reasoning_parts = []
+        
+        # 结论部分
+        if conclusion == ValidationConclusion.SUPPORTED:
+            reasoning_parts.append("该引用得到了充分的证据支持")
+        elif conclusion == ValidationConclusion.PARTIAL_SUPPORT:
+            reasoning_parts.append("该引用得到了部分证据支持")
+        elif conclusion == ValidationConclusion.UNSUPPORTED:
+            reasoning_parts.append("该引用未得到证据支持")
+        elif conclusion == ValidationConclusion.WRONG_SOURCE:
+            reasoning_parts.append("引用来源错误")
+        elif conclusion == ValidationConclusion.NEEDS_REVIEW:
+            reasoning_parts.append("需要人工审核")
+        
+        # 根本原因部分
+        if root_causes:
+            causes = [rc.value for rc in root_causes]
+            reasoning_parts.append(f"根本原因: {', '.join(causes)}")
+        
+        # 证据部分
+        if evidence_candidates:
+            high_confidence_count = len([c for c in evidence_candidates if c.confidence >= 0.8])
+            medium_confidence_count = len([c for c in evidence_candidates if 0.5 <= c.confidence < 0.8])
+            reasoning_parts.append(f"高置信度证据: {high_confidence_count}, 中等置信度证据: {medium_confidence_count}")
+        
+        return ". ".join(reasoning_parts)
+    
+    def _generate_repair_hint(
+        self,
+        conclusion: ValidationConclusion,
+        root_causes: List[RootCause],
+        claim_text: str,
+        claim_context: str
+    ) -> str:
+        """生成修复提示"""
+        hints = []
+        
+        if conclusion == ValidationConclusion.WRONG_SOURCE:
+            hints.append("请检查引用的论文ID是否正确")
+            hints.append("确认是否引用了正确的文献")
+        elif conclusion == ValidationConclusion.UNSUPPORTED:
+            hints.append("请修改引用的内容，使其与原文献一致")
+            hints.append("考虑引用其他支持该观点的文献")
+        elif conclusion == ValidationConclusion.PARTIAL_SUPPORT:
+            hints.append("请补充更多上下文信息，增强引用的说服力")
+            hints.append("考虑添加更多支持该观点的证据")
+        elif conclusion == ValidationConclusion.NEEDS_REVIEW:
+            hints.append("请人工审核该引用，特别是视觉证据部分")
+        
+        # 针对具体根因的提示
+        for root_cause in root_causes:
+            if root_cause == RootCause.CITATION_MAPPING_ERROR:
+                hints.append("请检查引用映射是否正确")
+            elif root_cause == RootCause.REVIEW_DRIFT:
+                hints.append("请确保综述内容与原文献保持一致")
+            elif root_cause == RootCause.SUMMARY_DRIFT:
+                hints.append("请检查摘要内容是否准确反映了原文献")
+            elif root_cause == RootCause.INSUFFICIENT_CONTEXT:
+                hints.append("请提供更多上下文信息")
+            elif root_cause == RootCause.VISUAL_UNDERSTANDING_GAP:
+                hints.append("请检查视觉证据是否正确理解")
+        
+        return "; ".join(hints)

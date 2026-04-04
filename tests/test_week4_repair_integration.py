@@ -362,6 +362,11 @@ class TestRepairPipelineIntegration:
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
                 details={"block_id": "s1_b1"},
+                claim_text="Test claim",
+                claim_context="Test context",
+                evidence_excerpt_list=[],
+                reasoning_summary="Test reasoning",
+                repair_hint="Test repair hint",
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",
@@ -436,6 +441,11 @@ class TestRepairPipelineIntegration:
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
                 details={"block_id": "s1_b1"},
+                claim_text="Test claim",
+                claim_context="Test context",
+                evidence_excerpt_list=[],
+                reasoning_summary="Test reasoning",
+                repair_hint="Test repair hint",
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",

@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, MutableMapping, Optional, cast
+from typing import Any, Dict, List, MutableMapping, Optional, cast
 
 from services.artifact_registry import ArtifactRegistry
 from services.config_compat import CompatConfigView
@@ -47,6 +47,11 @@ class JobRunResult:
     workspace_path: str
     job_id: str
     resume_state: str
+    # 新增产物追踪字段
+    produced_artifacts: List[str]
+    log_path: str
+    report_paths: List[str]
+    failure_summary: Optional[str]
 
 
 def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
@@ -138,6 +143,19 @@ class JobRunner:
             "library_path": os.path.abspath(request.library_path) if request.library_path else os.path.abspath(paths_config.get("library_path", "")) if paths_config.get("library_path") else "",
             "project_name": self._resolve_project_name(request),
         }
+
+    def _collect_artifact_tracking_info(self, registry: ArtifactRegistry, workspace: JobWorkspace, failure_summary: Optional[str]) -> tuple[List[str], str, List[str]]:
+        """收集产物追踪信息"""
+        produced_artifacts = [record.path for record in registry.list_records() if record.status == "ready"]
+        log_path = workspace.artifact_path("job.log")
+        report_paths = []
+        try:
+            report_dir = workspace.paths.reports_dir
+            if os.path.exists(report_dir):
+                report_paths = [os.path.join(report_dir, f) for f in os.listdir(report_dir) if f.endswith(".txt") or f.endswith(".json")]
+        except Exception:
+            pass
+        return produced_artifacts, log_path, report_paths
 
     def _request_snapshot(self, request: JobRunRequest) -> dict[str, Any]:
         return {
@@ -277,6 +295,10 @@ class JobRunner:
                 workspace_path="",
                 job_id="",
                 resume_state="non_resumable",
+                produced_artifacts=[],
+                log_path="",
+                report_paths=[],
+                failure_summary=None,
             )
 
         # 使用 request 中的 queue_file 参数
@@ -294,6 +316,10 @@ class JobRunner:
                 workspace_path="",
                 job_id="",
                 resume_state="non_resumable",
+                produced_artifacts=[],
+                log_path="",
+                report_paths=[],
+                failure_summary="configuration load failed",
             )
 
         if generator.config is None:
@@ -304,6 +330,10 @@ class JobRunner:
                 workspace_path="",
                 job_id="",
                 resume_state="non_resumable",
+                produced_artifacts=[],
+                log_path="",
+                report_paths=[],
+                failure_summary="configuration is unavailable after load",
             )
 
         generator_config = cast(MutableMapping[str, Dict[str, str]], generator.config)
@@ -394,6 +424,10 @@ class JobRunner:
                 fingerprint_bundle=fingerprint_bundle_dict,
                 status="completed" if success else "failed",
             )
+            
+            failure_summary = message if not success else None
+            produced_artifacts, log_path, report_paths = self._collect_artifact_tracking_info(registry, workspace, failure_summary)
+            
             return JobRunResult(
                 success=success,
                 exit_code=exit_code,
@@ -401,7 +435,12 @@ class JobRunner:
                 workspace_path=workspace.root_dir,
                 job_id=workspace.job_id,
                 resume_state=resume_state,
+                produced_artifacts=produced_artifacts,
+                log_path=log_path,
+                report_paths=report_paths,
+                failure_summary=failure_summary,
             )
+
         except JobCancelledError as exc:
             resume_state = self._finalize_run_state(
                 workspace=workspace,
@@ -413,6 +452,9 @@ class JobRunner:
                 fingerprint_bundle=fingerprint_bundle_dict,
                 status="cancelled",
             )
+            failure_summary = str(exc)
+            produced_artifacts, log_path, report_paths = self._collect_artifact_tracking_info(registry, workspace, failure_summary)
+            
             return JobRunResult(
                 success=False,
                 exit_code=130,
@@ -420,6 +462,10 @@ class JobRunner:
                 workspace_path=workspace.root_dir,
                 job_id=workspace.job_id,
                 resume_state=resume_state,
+                produced_artifacts=produced_artifacts,
+                log_path=log_path,
+                report_paths=report_paths,
+                failure_summary=failure_summary,
             )
         except Exception as exc:
             resume_state = self._finalize_run_state(
@@ -432,6 +478,9 @@ class JobRunner:
                 fingerprint_bundle=fingerprint_bundle_dict,
                 status="failed",
             )
+            failure_summary = str(exc)
+            produced_artifacts, log_path, report_paths = self._collect_artifact_tracking_info(registry, workspace, failure_summary)
+            
             return JobRunResult(
                 success=False,
                 exit_code=1,
@@ -439,4 +488,8 @@ class JobRunner:
                 workspace_path=workspace.root_dir,
                 job_id=workspace.job_id,
                 resume_state=resume_state,
+                produced_artifacts=produced_artifacts,
+                log_path=log_path,
+                report_paths=report_paths,
+                failure_summary=failure_summary,
             )

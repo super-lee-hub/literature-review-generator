@@ -1003,7 +1003,7 @@ def test_summary_recheck_source_grounded_path(tmp_path):
         "analysis": {
             "ai_summary": {
                 "core_analysis": {
-                    "abstract": "This summary talks about unicorns which are not in the source text",
+                    "summary": "This summary talks about unicorns which are not in the source text",
                 }
             },
             "preprocess": {
@@ -1016,10 +1016,10 @@ def test_summary_recheck_source_grounded_path(tmp_path):
     report = rechecker.recheck()
     
     # Check that we got a candidate for the source-grounded check
-    assert "core_analysis.abstract" in report.fields_with_candidates
+    assert "core_analysis.summary" in report.fields_with_candidates
     # Find the candidate
     abstract_candidate = next(
-        (c for c in report.correction_candidates if c.field_path == "core_analysis.abstract"),
+        (c for c in report.correction_candidates if c.field_path == "core_analysis.summary"),
         None
     )
     assert abstract_candidate is not None

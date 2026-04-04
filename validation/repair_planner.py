@@ -161,9 +161,23 @@ def _create_patch_proposal(
     if root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
         # For mapping errors, propose removing the problematic citation
         proposed_text = f"[CITATION_MAPPING_ERROR: {citation_result.citation_id} - needs manual review]"
+    elif root_cause == RepairRootCause.REVIEW_DRIFT:
+        # For review drift, mark for targeted fix
+        proposed_text = block_text  # Keep original, mark for targeted fix
     else:
         # For other errors, mark for recheck
         proposed_text = block_text  # Keep original, mark for recheck
+    
+    # 构建增强的 metadata，包含 repair hint
+    metadata = {
+        "paper_id": citation_result.paper_id,
+        "validation_conclusion": citation_result.conclusion.value,
+        "evidence_candidates_count": len(citation_result.evidence_candidates),
+        "claim_text": citation_result.claim_text,
+        "claim_context": citation_result.claim_context,
+        "reasoning_summary": citation_result.reasoning_summary,
+        "repair_hint": citation_result.repair_hint,
+    }
     
     return PatchProposal(
         proposal_id=str(uuid.uuid4()),
@@ -176,11 +190,7 @@ def _create_patch_proposal(
         confidence=0.7 if root_cause == RepairRootCause.CITATION_MAPPING_ERROR else 0.5,
         fix_strategy=fix_strategy,
         dependency_bundle=dependency_bundle,
-        metadata={
-            "paper_id": citation_result.paper_id,
-            "validation_conclusion": citation_result.conclusion.value,
-            "evidence_candidates_count": len(citation_result.evidence_candidates),
-        },
+        metadata=metadata,
     )
 
 

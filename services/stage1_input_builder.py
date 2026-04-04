@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 from services.multimodal_capability import MultimodalCapability, detect_multimodal_capability
+from services.visual_artifact_resolver import normalize_visual_artifact
 
 
 def _truncate(value: Any, limit: int = 280) -> str:
@@ -49,7 +50,7 @@ class Stage1InputBuilder:
     ) -> Stage1BuiltInput:
         visual_bundle_dict = dict(visual_bundle or {})
         selected_visual_refs = [
-            dict(item)
+            normalize_visual_artifact(dict(item))
             for item in (visual_bundle_dict.get("selected_visual_refs") or [])
             if isinstance(item, Mapping)
         ]

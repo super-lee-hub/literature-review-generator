@@ -390,25 +390,75 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             with open(citation_manifest_path, 'r', encoding='utf-8') as f:
                 citation_manifest = json.load(f)
             
-            # 构建paper_artifacts
+            # 优先从 workspace / artifact registry 加载持久化 artifact
             paper_artifacts = []
-            for summary in generator_instance.summaries:
-                paper_info = summary.get('paper_info', {})
-                ai_summary = summary.get('ai_summary', {})
+            try:
+                # 尝试从 artifact registry 加载
+                from services.artifact_registry import ArtifactRegistry
+                from services.job_workspace import JobWorkspace
                 
-                paper_artifact = {
-                    "paper_identity": {
-                        "canonical_paper_key": generator_instance.get_paper_key(paper_info),
-                        "source_paper_id": paper_info.get('pdf_path', '')
-                    },
-                    "analysis": {
-                        "ai_summary": ai_summary
-                    },
-                    "source": {
-                        "source_pdf": paper_info.get('pdf_path', '')
+                # 构建 workspace 和 registry
+                if hasattr(generator_instance, 'job_workspace') and generator_instance.job_workspace:
+                    workspace = generator_instance.job_workspace
+                    job_id = workspace.job_id
+                    registry = generator_instance.artifact_registry or ArtifactRegistry(workspace.paths.registry_path, job_id)
+                else:
+                    # 回退到使用 project_name 和生成的 job_id
+                    project_name = generator_instance.project_name or "unknown_project"
+                    job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+                    workspace = JobWorkspace(generator_instance.output_dir, project_name, job_id)
+                    registry = ArtifactRegistry(workspace.paths.registry_path, job_id)
+                
+                # 加载 paper artifacts
+                for record in registry.list_records():
+                    if record.artifact_type == "paper_artifact" and record.status == "ready":
+                        try:
+                            with open(record.path, 'r', encoding='utf-8') as f:
+                                paper_artifact = json.load(f)
+                            paper_artifacts.append(paper_artifact)
+                        except Exception as e:
+                            generator_instance.logger.warning(f"加载 paper artifact 失败: {e}")
+                
+                # 如果没有从 registry 加载到，回退到从 summaries 构建
+                if not paper_artifacts:
+                    generator_instance.logger.info("从 artifact registry 加载失败，回退到从 summaries 构建 paper_artifacts")
+                    for summary in generator_instance.summaries:
+                        paper_info = summary.get('paper_info', {})
+                        ai_summary = summary.get('ai_summary', {})
+                        
+                        paper_artifact = {
+                            "paper_identity": {
+                                "canonical_paper_key": generator_instance.get_paper_key(paper_info),
+                                "source_paper_id": paper_info.get('pdf_path', '')
+                            },
+                            "analysis": {
+                                "ai_summary": ai_summary
+                            },
+                            "source": {
+                                "source_pdf": paper_info.get('pdf_path', '')
+                            }
+                        }
+                        paper_artifacts.append(paper_artifact)
+            except Exception as e:
+                generator_instance.logger.warning(f"从 artifact registry 加载失败: {e}，回退到从 summaries 构建")
+                # 回退到从 summaries 构建
+                for summary in generator_instance.summaries:
+                    paper_info = summary.get('paper_info', {})
+                    ai_summary = summary.get('ai_summary', {})
+                    
+                    paper_artifact = {
+                        "paper_identity": {
+                            "canonical_paper_key": generator_instance.get_paper_key(paper_info),
+                            "source_paper_id": paper_info.get('pdf_path', '')
+                        },
+                        "analysis": {
+                            "ai_summary": ai_summary
+                        },
+                        "source": {
+                            "source_pdf": paper_info.get('pdf_path', '')
+                        }
                     }
-                }
-                paper_artifacts.append(paper_artifact)
+                    paper_artifacts.append(paper_artifact)
             
             # 构建 preprocess_evidence 和 paper_metadata
             preprocess_evidence = {}
@@ -465,8 +515,20 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
                     report_lines.append(f"   根本原因: {[rc.value for rc in result.root_causes]}")
                     report_lines.append(f"   证据候选数: {len(result.evidence_candidates)}")
             
-            # 保存报告
-            report_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_validation_report.txt')
+            # 保存报告到 workspace 目录
+            try:
+                from services.job_workspace import JobWorkspace
+                # 使用 project_name 和生成的 job_id
+                project_name = generator_instance.project_name or "unknown_project"
+                job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+                workspace = JobWorkspace(generator_instance.output_dir, project_name, job_id)
+                report_file: str = os.path.join(workspace.paths.reports_dir, f'{project_name}_validation_report.txt')
+                # 确保目录存在
+                os.makedirs(os.path.dirname(report_file), exist_ok=True)
+            except Exception as e:
+                generator_instance.logger.warning(f"创建 workspace 目录失败: {e}，回退到旧路径")
+                report_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_validation_report.txt')
+            
             with open(report_file, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(report_lines))
             

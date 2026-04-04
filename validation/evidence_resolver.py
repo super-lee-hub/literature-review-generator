@@ -5,6 +5,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from services.visual_artifact_resolver import normalize_visual_artifact
+
 
 @dataclass(frozen=True)
 class EvidenceCandidate:
@@ -264,7 +266,9 @@ class EvidenceResolver:
     ) -> List[EvidenceCandidate]:
         candidates: List[EvidenceCandidate] = []
         for idx, visual in enumerate(visual_refs):
-            caption = visual.get("caption", "")
+            # 归一化视觉证据
+            normalized_visual = normalize_visual_artifact(visual)
+            caption = normalized_visual.get("caption_excerpt", "")
             if cited_span.lower() in caption.lower():
                 confidence = self._calculate_confidence(cited_span, caption)
                 # Visual caption gets slightly lower base confidence
@@ -275,12 +279,12 @@ class EvidenceResolver:
                         resolver_tier="visual_refs",
                         window_rank=idx,
                         confidence=confidence,
-                        artifact_path=visual.get("path", ""),
-                        page_span=visual.get("page_range"),
+                        artifact_path=normalized_visual.get("image_path", ""),
+                        page_span=normalized_visual.get("page_range"),
                         chunk_ids=None,
                         text_excerpt="",
                         negative_evidence_reason=None,
-                        visual_refs=[visual],
+                        visual_refs=[normalized_visual],
                         caption_excerpt=caption,
                         evidence_scope="visual",
                     )

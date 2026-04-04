@@ -7,19 +7,19 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 # Field owner registry for canonical-only patching
 FIELD_OWNER_REGISTRY: Dict[str, str] = {
     # Core analysis fields (canonical path)
-    "core_analysis.abstract": "canonical",
-    "core_analysis.methods": "canonical",
+    "core_analysis.summary": "canonical",
+    "core_analysis.methodology": "canonical",
     "core_analysis.findings": "canonical",
     "core_analysis.conclusions": "canonical",
     "core_analysis.relevance": "canonical",
     "core_analysis.limitations": "canonical",
     "core_analysis.theoretical_framework": "canonical",
     "core_analysis.research_gap": "canonical",
-    # Paper info fields (canonical path)
-    "paper_info.title": "canonical",
-    "paper_info.authors": "canonical",
-    "paper_info.year": "canonical",
-    "paper_info.journal": "canonical",
+    # Paper metadata fields (canonical path)
+    "paper_metadata.title": "canonical",
+    "paper_metadata.authors": "canonical",
+    "paper_metadata.year": "canonical",
+    "paper_metadata.journal": "canonical",
 }
 
 # Canonical fields only (derived from FIELD_OWNER_REGISTRY)
@@ -54,7 +54,11 @@ class SummaryRecheckReport:
 class SummaryRechecker:
     def __init__(self, paper_artifact: Dict[str, Any]):
         self.paper_artifact = paper_artifact
+        # Get AI summary from canonical path
         self.ai_summary = paper_artifact.get("analysis", {}).get("ai_summary", {})
+        # Also check for ai_summary at top level for compatibility
+        if not self.ai_summary:
+            self.ai_summary = paper_artifact.get("ai_summary", {})
         # Get preprocess artifacts for source-grounded checks
         self.preprocess_artifacts = paper_artifact.get("analysis", {}).get("preprocess", {})
         # Also check for preprocess artifacts at top level for compatibility
@@ -96,8 +100,8 @@ class SummaryRechecker:
         # Only apply source-grounded checks for canonical fields
         # For this slice, we focus on core analysis fields
         source_check_canonical = [
-            "core_analysis.abstract",
-            "core_analysis.methods",
+            "core_analysis.summary",
+            "core_analysis.methodology",
             "core_analysis.findings",
             "core_analysis.conclusions"
         ]
@@ -158,7 +162,7 @@ class SummaryRechecker:
                 )
             
             # Check if value is too short for certain fields
-            if field_path in ["core_analysis.abstract", "core_analysis.methods", "core_analysis.findings"]:
+            if field_path in ["core_analysis.summary", "core_analysis.methodology", "core_analysis.findings"]:
                 if len(trimmed_value) < 50:
                     return SummaryCorrectionCandidate(
                         field_path=field_path,
@@ -169,8 +173,8 @@ class SummaryRechecker:
                         reason="Field value is unusually short"
                     )
         
-        # Check for potential issues in paper info fields
-        if field_path == "paper_info.year":
+        # Check for potential issues in paper metadata fields
+        if field_path == "paper_metadata.year":
             if isinstance(current_value, str):
                 if not current_value.isdigit() or len(current_value) != 4:
                     return SummaryCorrectionCandidate(
@@ -183,7 +187,7 @@ class SummaryRechecker:
                     )
         
         # Check for authors field
-        if field_path == "paper_info.authors":
+        if field_path == "paper_metadata.authors":
             if isinstance(current_value, list):
                 if len(current_value) == 0:
                     return SummaryCorrectionCandidate(

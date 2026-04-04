@@ -305,6 +305,11 @@ class TestRepairPlanner:
             root_causes=[RootCause.CITATION_MAPPING_ERROR],
             evidence_candidates=[],
             details={},
+            claim_text="Test claim",
+            claim_context="Test context",
+            evidence_excerpt_list=[],
+            reasoning_summary="Test reasoning",
+            repair_hint="Test repair hint",
         )
         report = ReviewValidationReport(
             report_id="val-001",
