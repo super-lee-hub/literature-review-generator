@@ -92,9 +92,19 @@ class ReviewValidator:
             citation_results=citation_results,
         )
 
+    def _get_block_from_review_draft(self, block_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a block from review_draft_v2 using block_id."""
+        sections = self.review_draft.get("content", {}).get("sections", [])
+        for section in sections:
+            blocks = section.get("blocks", [])
+            for block in blocks:
+                if block.get("block_id") == block_id:
+                    return block
+        return None
+
     def _get_occurrences_from_manifest(self) -> List[Dict[str, Any]]:
         """Extract occurrences from citation manifest, preferring v2 structure."""
-        # Primary: v2 occurrences
+        # Primary: v2 occurrences (primary runtime truth source)
         occurrences = self.citation_manifest.get("occurrences", [])
         if occurrences:
             return occurrences
@@ -109,25 +119,38 @@ class ReviewValidator:
         paper_id: str,
         cited_text: str,
         context: str,
+        block_text: Optional[str] = None,
+        locator: Optional[str] = None,
     ) -> CitationValidationResult:
-        """Generic citation validation logic shared by occurrence and citation."""
+        """Generic citation validation logic shared by occurrence and citation.
+        
+        Primary path prefers block_text from review_draft_v2 over just context.
+        """
         paper_artifact = self.paper_artifacts.get(paper_id)
+        details: Dict[str, Any] = {"used_block_text": bool(block_text)}
 
         if not paper_artifact:
+            details["reason"] = "paper_not_found_in_artifacts"
             return CitationValidationResult(
                 citation_id=citation_id,
                 paper_id=paper_id,
                 conclusion=ValidationConclusion.WRONG_SOURCE,
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
-                details={"reason": "paper_not_found_in_artifacts"},
+                details=details,
             )
 
         resolver_context = build_evidence_resolver_context(paper_artifact)
         resolver = EvidenceResolver(resolver_context)
         selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
+        
+        # Prioritize block text from review_draft_v2 for evidence resolution
+        # Use block_text if available, otherwise fall back to cited_text
+        search_span = block_text if block_text else cited_text
+        
         evidence_candidates = resolver.resolve_evidence(
-            cited_span=cited_text,
+            cited_span=search_span,
+            locator=locator,
             selected_visual_refs=selected_visual_refs,
         )
 
@@ -144,25 +167,37 @@ class ReviewValidator:
             conclusion=conclusion,
             root_causes=root_causes,
             evidence_candidates=evidence_candidates,
-            details={},
+            details=details,
         )
 
     def _validate_occurrence(self, occurrence: Dict[str, Any]) -> CitationValidationResult:
-        """Validate a single citation occurrence (v2-style)."""
+        """Validate a single citation occurrence (v2-style, primary path).
+        
+        This uses block_id to retrieve the full block text from review_draft_v2
+        as the primary context for evidence resolution.
+        """
         occurrence_id = occurrence.get("occurrence_id") or occurrence.get("citation_id", "")
         paper_id = occurrence.get("paper_id", "")
         cited_text = occurrence.get("citation_token") or occurrence.get("text", "")
         context = occurrence.get("context_before") or occurrence.get("context", "")
-
+        block_id = occurrence.get("block_id", "")
+        
+        # Get block text from review_draft_v2 for richer context
+        block = self._get_block_from_review_draft(block_id)
+        block_text = block.get("text") if block else None
+        locator = None  # Could be extended in future if needed
+        
         return self._validate_citation_generic(
             citation_id=occurrence_id,
             paper_id=paper_id,
             cited_text=cited_text,
             context=context,
+            block_text=block_text,
+            locator=locator,
         )
 
     def _validate_citation(self, citation: Dict[str, Any]) -> CitationValidationResult:
-        """Validate a single citation (v1-style)."""
+        """Validate a single citation (v1-style, legacy fallback)."""
         citation_id = citation.get("citation_id", "")
         paper_id = citation.get("paper_id", "")
         cited_text = citation.get("text", "")

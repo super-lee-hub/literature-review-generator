@@ -143,9 +143,44 @@ def build_review_draft_v1(
     )
 
 
-def _extract_citations_from_text(text: str, block_id: str) -> List[Dict[str, Any]]:
+def _match_citation_to_paper(
+    citation_token: str,
+    paper_key_to_info: Dict[str, Dict[str, Any]],
+) -> tuple[Optional[str], Optional[str]]:
+    """Match a citation token to a paper using heuristics.
+    
+    Returns:
+        Tuple of (paper_id, paper_key)
+    """
+    citation_lower = citation_token.lower()
+    for paper_key, paper_data in paper_key_to_info.items():
+        # Check if author names from paper appear in citation
+        authors = paper_data.get('authors', [])
+        year = paper_data.get('year', '')
+        title = paper_data.get('title', '')
+        
+        # Check for author + year match
+        author_matches = any(author.lower() in citation_lower for author in authors)
+        year_match = str(year) in citation_lower if year else False
+        
+        if author_matches and year_match:
+            return paper_data.get('paper_id', paper_key), paper_key
+        
+        # Fallback: check for title keywords
+        if title and title.lower() in citation_lower:
+            return paper_data.get('paper_id', paper_key), paper_key
+    
+    return None, None
+
+
+def _extract_citations_from_text(
+    text: str, 
+    block_id: str, 
+    paper_key_to_info: Optional[Dict[str, Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
     """Extract structured citations from text content using APA-style pattern matching."""
     citations: List[Dict[str, Any]] = []
+    paper_key_to_info = paper_key_to_info or {}
     
     # APA-style citation patterns: (Author, Year) or (Author et al., Year) or Author (Year)
     parenthetical_pattern = r'\([^)]+,\s*\d{4}(?:\s*[;,]\s*[^)]+)*\)'
@@ -157,14 +192,16 @@ def _extract_citations_from_text(text: str, block_id: str) -> List[Dict[str, Any
         local_ref_id = f"{block_id}_cite_p{idx}"
         raw_text = match.group(0)
         
-        # Try to extract author/year info for paper_id fallback
-        year_match = re.search(r'\b(\d{4})\b', raw_text)
-        year = year_match.group(1) if year_match else "n.d."
+        # Try to match to paper info if available
+        paper_id = None
+        paper_key = None
+        if paper_key_to_info:
+            paper_id, paper_key = _match_citation_to_paper(raw_text, paper_key_to_info)
         
         citation = StructuredCitation(
             local_ref_id=local_ref_id,
-            paper_key=None,
-            paper_id=None,
+            paper_key=paper_key,
+            paper_id=paper_id,
             raw_text=raw_text,
             mode="parenthetical",
             locator=None
@@ -177,10 +214,16 @@ def _extract_citations_from_text(text: str, block_id: str) -> List[Dict[str, Any
         local_ref_id = f"{block_id}_cite_n{idx}"
         raw_text = match.group(0)
         
+        # Try to match to paper info if available
+        paper_id = None
+        paper_key = None
+        if paper_key_to_info:
+            paper_id, paper_key = _match_citation_to_paper(raw_text, paper_key_to_info)
+        
         citation = StructuredCitation(
             local_ref_id=local_ref_id,
-            paper_key=None,
-            paper_id=None,
+            paper_key=paper_key,
+            paper_id=paper_id,
             raw_text=raw_text,
             mode="narrative",
             locator=None
@@ -190,7 +233,12 @@ def _extract_citations_from_text(text: str, block_id: str) -> List[Dict[str, Any
     return citations
 
 
-def _parse_section_into_blocks(section_number: int, section_title: str, content: str) -> List[ReviewBlock]:
+def _parse_section_into_blocks(
+    section_number: int, 
+    section_title: str, 
+    content: str,
+    paper_key_to_info: Optional[Dict[str, Dict[str, Any]]] = None
+) -> List[ReviewBlock]:
     """Parse section content into blocks (paragraphs as minimal blocks)."""
     blocks: List[ReviewBlock] = []
     paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
@@ -202,7 +250,7 @@ def _parse_section_into_blocks(section_number: int, section_title: str, content:
         anchor_hash = hashlib.sha256(para.encode('utf-8')).hexdigest()[:8]
         
         # Extract structured citations from paragraph text
-        citations = _extract_citations_from_text(para, block_id)
+        citations = _extract_citations_from_text(para, block_id, paper_key_to_info)
         
         blocks.append(ReviewBlock(
             block_id=block_id,
@@ -229,13 +277,30 @@ def build_review_draft_v2(
     sections: Sequence[Mapping[str, Any]],
     references: Sequence[str],
     generation_mode: str,
+    paper_summaries: Optional[List[Dict[str, Any]]] = None,
 ) -> ReviewDraftV2:
+    # Build paper key to info mapping from summaries if provided
+    paper_key_to_info: Dict[str, Dict[str, Any]] = {}
+    if paper_summaries:
+        for summary in paper_summaries:
+            paper_info = summary.get('paper_info', {})
+            title = paper_info.get('title', '')
+            if title:
+                paper_key = title.lower()
+                paper_key_to_info[paper_key] = {
+                    'paper_id': paper_key,
+                    'paper_key': paper_key,
+                    'title': title,
+                    'authors': paper_info.get('authors', []),
+                    'year': paper_info.get('year', ''),
+                }
+    
     normalized_sections: List[ReviewSection] = []
     for section in sections:
         section_number = int(section.get("section_number") or 0)
         section_title = str(section.get("section_title") or "").strip()
         content = str(section.get("content") or "").strip()
-        blocks = _parse_section_into_blocks(section_number, section_title, content)
+        blocks = _parse_section_into_blocks(section_number, section_title, content, paper_key_to_info)
         normalized_sections.append(ReviewSection(
             section_number=section_number,
             section_title=section_title,

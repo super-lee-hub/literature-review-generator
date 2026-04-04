@@ -281,6 +281,34 @@ ACTION_LABELS["en"].update(
 
 TRANSLATIONS["en"].update(
     {
+        "任务": "Tasks",
+        "队列管理": "Queue Management",
+        "管理后台任务队列": "Manage background task queue",
+        "队列状态": "Queue Status",
+        "待处理": "Pending",
+        "运行中": "Running",
+        "已完成": "Completed",
+        "失败": "Failed",
+        "已取消": "Cancelled",
+        "任务类型": "Job Type",
+        "项目名": "Project Name",
+        "创建时间": "Created At",
+        "开始时间": "Started At",
+        "完成时间": "Completed At",
+        "错误信息": "Error Message",
+        "结果摘要": "Result Summary",
+        "重试次数": "Retry Count",
+        "刷新队列": "Refresh Queue",
+        "取消任务": "Cancel Job",
+        "重试任务": "Retry Job",
+        "清空已完成": "Clear Completed",
+        "暂无队列任务": "No queued jobs yet.",
+        "队列服务未初始化": "Queue service not initialized.",
+    }
+)
+
+TRANSLATIONS["en"].update(
+    {
         "章节操作": "Section Actions",
         "章节号": "Section Number",
         "补写指定章节": "Generate Selected Section",

@@ -44,6 +44,11 @@ class SummaryRechecker:
     def __init__(self, paper_artifact: Dict[str, Any]):
         self.paper_artifact = paper_artifact
         self.ai_summary = paper_artifact.get("analysis", {}).get("ai_summary", {})
+        # Get preprocess artifacts for source-grounded checks
+        self.preprocess_artifacts = paper_artifact.get("analysis", {}).get("preprocess", {})
+        # Also check for preprocess artifacts at top level for compatibility
+        if not self.preprocess_artifacts:
+            self.preprocess_artifacts = paper_artifact.get("preprocess_artifacts", {})
 
     def recheck(self) -> SummaryRecheckReport:
         from datetime import datetime
@@ -54,7 +59,10 @@ class SummaryRechecker:
 
         for field_path in WHITELISTED_FIELDS:
             fields_checked.append(field_path)
-            candidate = self._check_field(field_path)
+            # First try source-grounded check, then fall back to existing checks
+            candidate = self._check_field_source_grounded(field_path)
+            if not candidate:
+                candidate = self._check_field(field_path)
             if candidate:
                 correction_candidates.append(candidate)
 
@@ -67,13 +75,59 @@ class SummaryRechecker:
             fields_with_candidates=[c.field_path for c in correction_candidates],
         )
 
-    def _check_field(self, field_path: str) -> Optional[SummaryCorrectionCandidate]:
+    def _check_field_source_grounded(self, field_path: str) -> Optional[SummaryCorrectionCandidate]:
+        """Source-grounded check using preprocess artifacts (whitelist-only)."""
         current_value = self._get_nested_value(self.ai_summary, field_path)
         if current_value is None:
             return None
         
-        # Get original paper content if available
-        original_content = self._get_nested_value(self.paper_artifact, "preprocess_artifacts.normalized_text") or ""
+        # Only apply source-grounded checks for specific whitelisted fields
+        # For this slice, we focus on core analysis fields
+        source_check_whitelist = [
+            "core_analysis.abstract",
+            "core_analysis.methods",
+            "core_analysis.findings",
+            "core_analysis.conclusions"
+        ]
+        
+        if field_path not in source_check_whitelist:
+            return None
+        
+        # Get preprocessed text for source
+        normalized_text = self.preprocess_artifacts.get("normalized_text", "")
+        if not normalized_text:
+            return None
+        
+        # Simple source-grounded check:
+        # If current summary field is a string and normalized text is available,
+        # check if any key content appears in source text to suggest confidence
+        if isinstance(current_value, str):
+            # For source-grounded check we only report if we have strong evidence
+            # This is a conservative check that preserves whitelist discipline
+            trimmed_current = current_value.strip()
+            if not trimmed_current:
+                return None
+            
+            # Extract first 50 chars as key content to check against source
+            key_content = trimmed_current[:50].lower()
+            if key_content not in normalized_text.lower():
+                # Key content not found in normalized text, suggest verifying
+                # Keep suggested value as original (we don't mutate, just flag)
+                return SummaryCorrectionCandidate(
+                    field_path=field_path,
+                    current_value=current_value,
+                    suggested_value=current_value,
+                    confidence=0.6,
+                    evidence_source="preprocess_artifacts.normalized_text",
+                    reason="Key content not found in normalized paper text"
+                )
+        
+        return None
+
+    def _check_field(self, field_path: str) -> Optional[SummaryCorrectionCandidate]:
+        current_value = self._get_nested_value(self.ai_summary, field_path)
+        if current_value is None:
+            return None
         
         # Check for empty or too short values
         if isinstance(current_value, str):

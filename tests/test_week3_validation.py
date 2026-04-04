@@ -870,5 +870,161 @@ def test_missing_artifacts_fail_clearly():
     assert report.wrong_source_count == 1
 
 
+def test_evidence_resolver_explicit_tier_order(tmp_path):
+    """Test that evidence resolver follows the explicit tier order: locator/page, chunks, normalized, plain, visual."""
+    from validation.evidence_resolver import EvidenceResolver, EvidenceResolverContext
+    
+    # Create test context with all tiers available
+    context = EvidenceResolverContext(
+        paper_key="test_key",
+        paper_identity={"canonical_paper_key": "test_key"},
+        preprocess_artifacts={
+            "page_index": [
+                {"page_number": 1, "text": "Page index content with cited text here"},
+            ],
+            "chunks": [
+                {"chunk_id": "c1", "text": "Chunk content with cited text here", "page_range": [1]}
+            ],
+            "normalized_text": "Normalized text with cited text here",
+            "plain_text": "Plain text with cited text here",
+        },
+        paper_artifact={"source": {"source_pdf": "/test.pdf"}},
+    )
+    
+    resolver = EvidenceResolver(context)
+    candidates = resolver.resolve_evidence(cited_span="cited text")
+    
+    # Verify we have candidates from multiple tiers
+    tier_names = [c.resolver_tier for c in candidates if c.confidence > 0]
+    assert "locator_page_index" in tier_names
+    assert "preprocess_chunks" in tier_names
+    assert "normalized_text" in tier_names
+    assert "plain_text_fallback" in tier_names
+
+
+def test_negative_evidence_candidate_generation(tmp_path):
+    """Test that negative evidence candidate is generated with clear reason."""
+    from validation.evidence_resolver import EvidenceResolver, EvidenceResolverContext
+    
+    context = EvidenceResolverContext(
+        paper_key="test_key",
+        paper_identity={"canonical_paper_key": "test_key"},
+        preprocess_artifacts={
+            "chunks": [{"chunk_id": "c1", "text": "No matching text here"}],
+            "normalized_text": "Still no matching text here",
+        },
+        paper_artifact={"source": {"source_pdf": "/test.pdf"}},
+    )
+    
+    resolver = EvidenceResolver(context)
+    candidates = resolver.resolve_evidence(cited_span="this text will never be found")
+    
+    # Should have at least one candidate (negative evidence)
+    assert len(candidates) >= 1
+    negative_candidates = [c for c in candidates if c.resolver_tier == "negative"]
+    assert len(negative_candidates) == 1
+    assert negative_candidates[0].negative_evidence_reason == "cited_text_not_found_in_any_tier"
+    assert negative_candidates[0].confidence == 0.0
+
+
+def test_validator_uses_review_draft_v2_block_context(tmp_path):
+    """Test that validator uses review_draft_v2 block text as primary context."""
+    from validation.review_validator import ReviewValidator
+    
+    # Create review_draft_v2 with blocks
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Introduction",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "text": "This is the full block text with important findings from Smith (2024).",
+                            "block_kind": "paragraph",
+                            "block_order": 1,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    
+    # Create citation_manifest_v2
+    citation_manifest = {
+        "occurrences": [
+            {
+                "occurrence_id": "occ_1",
+                "citation_token": "(Smith, 2024)",
+                "paper_id": "paper_1",
+                "paper_key": "paper_1",
+                "section_number": 1,
+                "section_title": "Introduction",
+                "block_id": "s1_b1",
+                "block_order": 1,
+                "context_before": "This is context",
+            }
+        ],
+    }
+    
+    # Create paper artifact with preprocess artifacts matching block text
+    paper_artifacts = [
+        {
+            "paper_identity": {
+                "canonical_paper_key": "paper_1",
+                "source_paper_id": "paper_1",
+            },
+            "analysis": {
+                "preprocess": {
+                    "normalized_text": "This paper has important findings",
+                },
+            },
+            "stage1_inputs": {"selected_visual_refs": []},
+        }
+    ]
+    
+    validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
+    report = validator.validate()
+    
+    # Check that validation ran and used block text
+    assert report.total_citations == 1
+    result = report.citation_results[0]
+    assert result.details.get("used_block_text") is True
+
+
+def test_summary_recheck_source_grounded_path(tmp_path):
+    """Test that summary_recheck uses source-grounded path for whitelisted fields."""
+    from validation.summary_recheck import SummaryRechecker
+    
+    # Create paper artifact with mismatched summary
+    paper_artifact = {
+        "paper_identity": {"canonical_paper_key": "test_paper"},
+        "analysis": {
+            "ai_summary": {
+                "core_analysis": {
+                    "abstract": "This summary talks about unicorns which are not in the source text",
+                }
+            },
+            "preprocess": {
+                "normalized_text": "This is the actual normalized paper text that doesn't mention unicorns",
+            },
+        },
+    }
+    
+    rechecker = SummaryRechecker(paper_artifact)
+    report = rechecker.recheck()
+    
+    # Check that we got a candidate for the source-grounded check
+    assert "core_analysis.abstract" in report.fields_with_candidates
+    # Find the candidate
+    abstract_candidate = next(
+        (c for c in report.correction_candidates if c.field_path == "core_analysis.abstract"),
+        None
+    )
+    assert abstract_candidate is not None
+    assert abstract_candidate.evidence_source == "preprocess_artifacts.normalized_text"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

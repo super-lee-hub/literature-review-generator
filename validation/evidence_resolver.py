@@ -42,13 +42,57 @@ class EvidenceResolver:
     ) -> List[EvidenceCandidate]:
         candidates: List[EvidenceCandidate] = []
 
+        # Explicit tier order as required
+        # Tier 1: Locator + Page Index
+        candidates.extend(self._resolve_from_locator_page_index(cited_span, locator))
+        # Tier 2: Preprocess chunks
         candidates.extend(self._resolve_from_preprocess_chunks(cited_span))
+        # Tier 3: Normalized text
         candidates.extend(self._resolve_from_normalized_text(cited_span))
+        # Tier 4: Plain text fallback
+        candidates.extend(self._resolve_from_plain_text(cited_span))
+        # Tier 5: Visual refs
         if selected_visual_refs:
             candidates.extend(self._resolve_from_visual_refs(selected_visual_refs, cited_span))
 
+        # Now add negative evidence if no candidates were found
+        if not candidates:
+            candidates.append(self._create_negative_evidence_candidate(cited_span))
+
+        # Sort by confidence (descending) and window_rank (ascending)
         candidates.sort(key=lambda x: (-x.confidence, x.window_rank))
         return candidates
+
+    def _create_negative_evidence_candidate(self, cited_span: str) -> EvidenceCandidate:
+        """Create a negative evidence candidate with clear reason."""
+        # Determine the reason based on what artifacts were available
+        available_artifacts = []
+        if self.context.preprocess_artifacts.get("chunks"):
+            available_artifacts.append("preprocess_chunks")
+        if self.context.preprocess_artifacts.get("normalized_text"):
+            available_artifacts.append("normalized_text")
+        if self.context.preprocess_artifacts.get("plain_text"):
+            available_artifacts.append("plain_text")
+        
+        if not available_artifacts:
+            reason = "no_preprocess_artifacts_available"
+        else:
+            reason = f"cited_text_not_found_in_any_tier"
+        
+        return EvidenceCandidate(
+            match_reason="negative_evidence",
+            resolver_tier="negative",
+            window_rank=0,
+            confidence=0.0,
+            artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
+            page_span=None,
+            chunk_ids=None,
+            text_excerpt="",
+            negative_evidence_reason=reason,
+            visual_refs=None,
+            caption_excerpt=None,
+            evidence_scope="negative",
+        )
 
     def _calculate_confidence(self, cited_span: str, context_text: str) -> float:
         """Calculate confidence based on text matching quality."""
@@ -78,6 +122,60 @@ class EvidenceResolver:
         # Calculate final confidence (capped at 0.95 to leave room for higher tiers)
         confidence = base_confidence + length_bonus + position_bonus
         return min(confidence, 0.95)
+
+    def _resolve_from_locator_page_index(self, cited_span: str, locator: Optional[str]) -> List[EvidenceCandidate]:
+        """Resolve evidence from locator/page index if available."""
+        candidates: List[EvidenceCandidate] = []
+        page_index = self.context.preprocess_artifacts.get("page_index", [])
+        
+        if locator:
+            # If we have a locator, try to find relevant pages
+            for idx, page_entry in enumerate(page_index):
+                page_text = page_entry.get("text", "")
+                if cited_span.lower() in page_text.lower():
+                    confidence = self._calculate_confidence(cited_span, page_text)
+                    confidence = min(confidence + 0.05, 0.98)  # Page index with locator gets a small boost
+                    candidates.append(
+                        EvidenceCandidate(
+                            match_reason="page_index_locator_match",
+                            resolver_tier="locator_page_index",
+                            window_rank=idx,
+                            confidence=confidence,
+                            artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
+                            page_span=page_entry.get("page_range", [page_entry.get("page_number", 0)]),
+                            chunk_ids=None,
+                            text_excerpt=page_text[:500],
+                            negative_evidence_reason=None,
+                            visual_refs=None,
+                            caption_excerpt=None,
+                            evidence_scope="page",
+                        )
+                    )
+        
+        # Also check page index without locator for matches
+        if not locator:
+            for idx, page_entry in enumerate(page_index):
+                page_text = page_entry.get("text", "")
+                if cited_span.lower() in page_text.lower():
+                    confidence = self._calculate_confidence(cited_span, page_text)
+                    candidates.append(
+                        EvidenceCandidate(
+                            match_reason="page_index_match",
+                            resolver_tier="locator_page_index",
+                            window_rank=idx,
+                            confidence=confidence,
+                            artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
+                            page_span=page_entry.get("page_range", [page_entry.get("page_number", 0)]),
+                            chunk_ids=None,
+                            text_excerpt=page_text[:500],
+                            negative_evidence_reason=None,
+                            visual_refs=None,
+                            caption_excerpt=None,
+                            evidence_scope="page",
+                        )
+                    )
+        
+        return candidates
 
     def _resolve_from_preprocess_chunks(self, cited_span: str) -> List[EvidenceCandidate]:
         candidates: List[EvidenceCandidate] = []
@@ -127,6 +225,34 @@ class EvidenceResolver:
                     visual_refs=None,
                     caption_excerpt=None,
                     evidence_scope="full_text",
+                )
+            )
+        return candidates
+
+    def _resolve_from_plain_text(self, cited_span: str) -> List[EvidenceCandidate]:
+        """Resolve evidence from plain text fallback."""
+        candidates: List[EvidenceCandidate] = []
+        plain_text = self.context.preprocess_artifacts.get("plain_text", "")
+        if plain_text and cited_span.lower() in plain_text.lower():
+            excerpt_start = max(0, plain_text.lower().find(cited_span.lower()) - 200)
+            excerpt_end = min(len(plain_text), excerpt_start + len(cited_span) + 400)
+            confidence = self._calculate_confidence(cited_span, plain_text)
+            # Plain text fallback gets lower confidence
+            confidence = max(0.5, confidence * 0.85)
+            candidates.append(
+                EvidenceCandidate(
+                    match_reason="plain_text_fallback_match",
+                    resolver_tier="plain_text_fallback",
+                    window_rank=0,
+                    confidence=confidence,
+                    artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
+                    page_span=None,
+                    chunk_ids=None,
+                    text_excerpt=plain_text[excerpt_start:excerpt_end],
+                    negative_evidence_reason=None,
+                    visual_refs=None,
+                    caption_excerpt=None,
+                    evidence_scope="plain_text",
                 )
             )
         return candidates

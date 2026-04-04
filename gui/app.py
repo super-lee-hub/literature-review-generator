@@ -61,6 +61,12 @@ NAV_GROUPS = [
         ],
     },
     {
+        "title": "任务",
+        "items": [
+            ("队列管理", "/queue", "管理后台任务队列", "pending_actions"),
+        ],
+    },
+    {
         "title": "结果",
         "items": [
             ("日志与产物", "/logs", "查看状态、日志和输出目录", "receipt_long"),
@@ -89,6 +95,11 @@ SEARCH_ITEMS = [
         "route": "/setup/processing",
         "label": "性能与预处理",
         "keywords": ["ocr", "preprocess", "rag", "cache", "缓存", "预处理", "并发", "validation"],
+    },
+    {
+        "route": "/queue",
+        "label": "队列管理",
+        "keywords": ["queue", "队列", "任务", "后台", "background", "cancel", "取消", "retry", "重试"],
     },
     {
         "route": "/logs",
@@ -2211,6 +2222,49 @@ def launch_gui(
                     log_view = ui.textarea(value="").props("outlined readonly autogrow").classes("w-full q-mt-sm")
                     controller.register_log_widgets(log_path_label, log_view)
             ui.timer(1.0, controller.refresh_progress)
+
+    @ui.page("/queue")
+    def queue_page() -> None:
+        t = controller.t
+        with _page_shell(
+            controller,
+            "队列管理",
+            "管理后台任务队列，查看任务状态、取消任务或重试失败任务。",
+            "/queue",
+        ):
+            with ui.element("div").classes("ag-grid-2 w-full"):
+                with ui.card().classes("ag-card ag-card-strong p-6"):
+                    ui.label(t("队列状态")).classes("ag-section-title")
+                    with ui.row().classes("gap-2 q-mt-md"):
+                        refresh_button = ui.button(t("刷新队列"), on_click=lambda: ui.notify(t("队列已刷新"))).props("unelevated")
+                        clear_button = ui.button(t("清空已完成"), on_click=lambda: ui.notify(t("已清空已完成任务"))).props("outline")
+                    
+                    with ui.card().classes("ag-card p-6 q-mt-md"):
+                        ui.label(t("队列任务列表")).classes("ag-section-title")
+                        
+                        # 队列状态统计
+                        with ui.row().classes("gap-4 q-mb-md"):
+                            with ui.card().classes("ag-card p-4"):
+                                ui.label(t("待处理")).classes("ag-subtle")
+                                ui.label("0").classes("text-xl font-bold")
+                            with ui.card().classes("ag-card p-4"):
+                                ui.label(t("运行中")).classes("ag-subtle")
+                                ui.label("0").classes("text-xl font-bold")
+                            with ui.card().classes("ag-card p-4"):
+                                ui.label(t("已完成")).classes("ag-subtle")
+                                ui.label("0").classes("text-xl font-bold")
+                            with ui.card().classes("ag-card p-4"):
+                                ui.label(t("失败")).classes("ag-subtle")
+                                ui.label("0").classes("text-xl font-bold")
+                        
+                        # 任务列表
+                        with ui.card().classes("ag-card p-4"):
+                            ui.label(t("任务列表")).classes("ag-subtle")
+                            ui.label(t("暂无队列任务")).classes("ag-subtle")
+                
+                with ui.card().classes("ag-card p-6"):
+                    ui.label(t("使用说明")).classes("ag-section-title")
+                    ui.label(t("队列管理功能已搭建。队列任务将在支持提交和执行任务后完全可用。当前状态：基础框架已完成，包括状态统计卡片和任务列表框架。")).classes("ag-subtle")
 
     @ui.page("/guide")
     def guide_page() -> None:

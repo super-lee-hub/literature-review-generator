@@ -21,6 +21,7 @@ import json
 import hashlib
 import logging
 import re
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, cast
 from datetime import datetime
 
@@ -39,7 +40,7 @@ from zotero_parser import parse_zotero_report
 from file_finder import create_file_index, FileIndex, find_pdf
 from pdf_extractor import extract_text_from_pdf  # type: ignore
 from ai_interface import get_summary_from_ai, get_summary_from_ai_with_fallback, get_concept_analysis, _call_ai_api  # type: ignore
-from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references
+from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references, generate_apa_references_from_manifest
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from preprocess.service import PreprocessManager
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
@@ -53,7 +54,7 @@ from services.environment_service import (
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
 from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
-from services.queue_service import CancelToken, JobCancelledError
+from services.queue_service import CancelToken, JobCancelledError, PersistentQueueService, QueueJobSpec, QueueState, create_queue_job_id
 from services.review_draft import build_review_draft_v1, build_review_draft_v2
 from services.citation_manifest import (
     build_citation_manifest_v1,
@@ -354,6 +355,7 @@ class LiteratureReviewGenerator:
         self.artifact_registry: Optional[ArtifactRegistry] = None
         self.job_fingerprint_bundle: Dict[str, Any] = {}
         self.resume_state_report: Optional[ResumeStateReport] = None
+        self.queue_service: Optional[PersistentQueueService] = None
 
         # 身份基断点续传相关变量
         self._checkpoint_processed_papers: Set[str] = set()
@@ -396,6 +398,65 @@ class LiteratureReviewGenerator:
         self.project_name = workspace.project_name
         self.output_dir = workspace.root_dir
         self.summary_file = workspace.artifact_path(f"{workspace.project_name}_summaries.json")
+        
+        # 初始化队列服务
+        queue_file_path = Path(workspace.root_dir) / "_queue" / "queue.json"
+        self.queue_service = PersistentQueueService(queue_file_path)
+
+    def _init_queue_service(self) -> None:
+        """初始化队列服务（向后兼容：在没有 job_workspace 时使用）"""
+        if self.queue_service is None and self.output_dir:
+            queue_file_path = Path(self.output_dir) / "_queue" / "queue.json"
+            self.queue_service = PersistentQueueService(queue_file_path)
+
+    def submit_job_to_queue(self, job_type: str, parameters: Dict[str, Any]) -> str:
+        """提交任务到队列"""
+        self._init_queue_service()
+        if self.queue_service is None or not self.project_name:
+            raise RuntimeError("Queue service not initialized or project name not set")
+        
+        job_id = create_queue_job_id()
+        job_spec = QueueJobSpec(
+            job_id=job_id,
+            job_type=job_type,
+            project_name=self.project_name,
+            parameters=parameters
+        )
+        return self.queue_service.add_job(job_spec)
+
+    def list_queue_jobs(self) -> List[QueueJobSpec]:
+        """列出所有队列任务"""
+        self._init_queue_service()
+        if self.queue_service is None:
+            return []
+        return self.queue_service.list_jobs()
+
+    def cancel_queue_job(self, job_id: str) -> bool:
+        """取消队列任务"""
+        self._init_queue_service()
+        if self.queue_service is None:
+            return False
+        return self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
+
+    def retry_queue_job(self, job_id: str) -> bool:
+        """重试失败的队列任务"""
+        self._init_queue_service()
+        if self.queue_service is None:
+            return False
+        return self.queue_service.reset_job(job_id) and self.queue_service.increment_retry_count(job_id) > 0
+
+    def clear_completed_queue_jobs(self) -> int:
+        """清空已完成的队列任务"""
+        self._init_queue_service()
+        if self.queue_service is None:
+            return 0
+        count = 0
+        for job in self.queue_service.list_jobs():
+            runtime = self.queue_service.get_job_runtime(job.job_id)
+            if runtime and runtime.state in (QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCELLED):
+                self.queue_service.remove_job(job.job_id)
+                count += 1
+        return count
 
     def _get_stage1_checkpoint_file_path(self) -> str:
         if self.job_workspace and self.project_name:
@@ -721,11 +782,16 @@ class LiteratureReviewGenerator:
         references: List[str],
         word_file: str,
         generation_mode: str = "full_review",
+        paper_summaries: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         if not self.job_workspace or not self.artifact_registry:
             return True
 
         try:
+            # Use self.summaries if paper_summaries is not explicitly provided
+            if paper_summaries is None:
+                paper_summaries = [dict(summary) for summary in self.summaries]
+            
             review_draft = build_review_draft_v2(
                 job_id=self.job_workspace.job_id,
                 project_name=self.project_name or "review",
@@ -737,6 +803,7 @@ class LiteratureReviewGenerator:
                 sections=review_sections,
                 references=references,
                 generation_mode=generation_mode,
+                paper_summaries=paper_summaries,
             )
             artifact_path = self._review_draft_v2_path()
             atomic_write_json(artifact_path, review_draft.to_dict())
@@ -4108,9 +4175,25 @@ class LiteratureReviewGenerator:
         """为Word文档生成自动目录"""
         return generate_word_table_of_contents(doc)
 
+    def _load_citation_manifest(self) -> Optional[Dict[str, Any]]:
+        """尝试加载 citation manifest（优先 v2，回退到 v1）"""
+        try:
+            v2_path = self._citation_manifest_path()
+            if os.path.exists(v2_path):
+                with open(v2_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            v1_path = self._citation_manifest_v1_path()
+            if os.path.exists(v1_path):
+                with open(v1_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"加载 citation manifest 失败: {e}")
+        return None
+
     def generate_apa_references(self) -> List[str]:
-        """生成APA格式的参考文献列表"""
-        return generate_apa_references(self)
+        """生成APA格式的参考文献列表（优先使用 citation manifest）"""
+        citation_manifest = self._load_citation_manifest()
+        return generate_apa_references_from_manifest(citation_manifest, self)
 
     
 
@@ -5085,6 +5168,26 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             handle_merge_mode(args)
             return
         
+        # 队列列表命令
+        if hasattr(args, 'queue_list') and args.queue_list:
+            handle_queue_list_mode(args)
+            return
+        
+        # 队列取消命令
+        if hasattr(args, 'queue_cancel') and args.queue_cancel:
+            handle_queue_cancel_mode(args, args.queue_cancel)
+            return
+        
+        # 队列重试命令
+        if hasattr(args, 'queue_retry') and args.queue_retry:
+            handle_queue_retry_mode(args, args.queue_retry)
+            return
+        
+        # 队列清空命令
+        if hasattr(args, 'queue_clear') and args.queue_clear:
+            handle_queue_clear_mode(args)
+            return
+        
         # 正常执行模式 - 验证参数
         if not args.project_name and not args.pdf_folder:
             logging.error("必须指定--project-name或--pdf-folder参数中的一个")
@@ -5531,6 +5634,122 @@ def handle_merge_mode(args: argparse.Namespace):  # type: ignore
         generator.logger.error(f"合并过程中出错: {e}")
         traceback.print_exc()
 
+def handle_queue_list_mode(args: argparse.Namespace):  # type: ignore
+    """处理队列列表命令"""
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator.logger.info("*** 队列列表模式已启动 ***")
+    generator.logger.info("=" * 60)
+    
+    try:
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+        
+        generator._init_queue_service()
+        if generator.queue_service is None:
+            generator.logger.error("队列服务未初始化")
+            return
+        
+        jobs = generator.queue_service.list_jobs()
+        if not jobs:
+            generator.logger.info("暂无队列任务")
+            return
+        
+        generator.logger.info(f"共 {len(jobs)} 个队列任务:")
+        for job in jobs:
+            runtime = generator.queue_service.get_job_runtime(job.job_id)
+            state_str = runtime.state.value if runtime else "unknown"
+            generator.logger.info(f"  - [{state_str}] {job.job_type} - {job.project_name} ({job.job_id})")
+            
+    except Exception as e:
+        generator.logger.error(f"队列列表查询失败: {e}")
+        traceback.print_exc()
+
+def handle_queue_cancel_mode(args: argparse.Namespace, job_id: str):  # type: ignore
+    """处理队列取消命令"""
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator.logger.info("*** 队列取消模式已启动 ***")
+    generator.logger.info("=" * 60)
+    
+    try:
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+        
+        generator._init_queue_service()
+        if generator.queue_service is None:
+            generator.logger.error("队列服务未初始化")
+            return
+        
+        if generator.cancel_queue_job(job_id):
+            generator.logger.success(f"任务已取消: {job_id}")
+        else:
+            generator.logger.error(f"取消任务失败: {job_id}")
+            
+    except Exception as e:
+        generator.logger.error(f"队列取消操作失败: {e}")
+        traceback.print_exc()
+
+def handle_queue_retry_mode(args: argparse.Namespace, job_id: str):  # type: ignore
+    """处理队列重试命令"""
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator.logger.info("*** 队列重试模式已启动 ***")
+    generator.logger.info("=" * 60)
+    
+    try:
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+        
+        generator._init_queue_service()
+        if generator.queue_service is None:
+            generator.logger.error("队列服务未初始化")
+            return
+        
+        if generator.retry_queue_job(job_id):
+            generator.logger.success(f"任务已重置并将重试: {job_id}")
+        else:
+            generator.logger.error(f"重试任务失败: {job_id}")
+            
+    except Exception as e:
+        generator.logger.error(f"队列重试操作失败: {e}")
+        traceback.print_exc()
+
+def handle_queue_clear_mode(args: argparse.Namespace):  # type: ignore
+    """处理队列清空命令"""
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator.logger.info("*** 队列清空模式已启动 ***")
+    generator.logger.info("=" * 60)
+    
+    try:
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+        
+        generator._init_queue_service()
+        if generator.queue_service is None:
+            generator.logger.error("队列服务未初始化")
+            return
+        
+        count = generator.clear_completed_queue_jobs()
+        generator.logger.success(f"已清空 {count} 个已完成的任务")
+            
+    except Exception as e:
+        generator.logger.error(f"队列清空操作失败: {e}")
+        traceback.print_exc()
+
 def handle_run_all_mode(generator: 'LiteratureReviewGenerator'):  # type: ignore
     """处理一键执行模式"""
     generator.logger.info("*** '一键执行'模式已启动 ***")
@@ -5659,64 +5878,142 @@ def main() -> None:  # type: ignore
     """主函数，处理命令行参数和执行相应操作"""
     
     parser = argparse.ArgumentParser(
-        description="llm_reviewer_generator - 文献综述自动生成器",
-        formatter_class=argparse.RawTextHelpFormatter
+        description="auto-generate - AI 文献分析与综述写作工作台\n"
+                   "支持本地 GUI 和 CLI 两种模式，提供文献分析、综述生成、队列管理等功能。",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="示例:\n"
+               "  # 运行交互式设置\n"
+               "  python main.py --setup\n"
+               "\n"
+               "  # 使用 PDF 文件夹分析文献\n"
+               "  python main.py --pdf-folder \"D:\\papers\" --analyze-only\n"
+               "\n"
+               "  # 一键运行所有阶段\n"
+               "  python main.py --project-name \"my_review\" --run-all\n"
+               "\n"
+               "  # 查看队列任务\n"
+               "  python main.py --project-name \"my_review\" --queue-list\n"
     )
     
-    parser.add_argument(
+    # 基础选项
+    base_group = parser.add_argument_group('基础选项')
+    base_group.add_argument(
         '--config',
         type=str,
         default='config.ini',
-        help='Path to the configuration file.'
+        help='配置文件路径（默认：config.ini）'
     )
-    parser.add_argument(
-        '--project-name', 
+    base_group.add_argument(
+        '--project-name', '-p',
         type=str, 
-        help='为您的项目指定一个唯一的名称，用于创建独立的输出文件夹。'
+        help='项目名称（用于创建独立的输出文件夹）'
     )
-    parser.add_argument(
-        '--pdf-folder', 
+    base_group.add_argument(
+        '--pdf-folder', '-f',
         type=str, 
-        help='直接指定包含PDF文件的文件夹路径，llm_reviewer_generator将扫描并处理这些文件。'
+        help='PDF 文件夹路径（直接扫描该文件夹处理文献）'
     )
-    parser.add_argument(
-        '--run-all', 
+    
+    # 工作流选项
+    workflow_group = parser.add_argument_group('工作流选项')
+    workflow_group.add_argument(
+        '--setup',
         action='store_true', 
-        help='一键运行所有阶段：从文献分析到最终生成Word版文献综述。'
+        help='运行交互式设置向导'
     )
-    parser.add_argument(
-        '--analyze-only', 
+    workflow_group.add_argument(
+        '--run-all', '-a',
         action='store_true', 
-        help='仅运行阶段一：分析文献并生成摘要。'
+        help='一键运行：分析 → 大纲 → 综述'
     )
-    parser.add_argument(
-        '--generate-outline', 
+    workflow_group.add_argument(
+        '--analyze-only', '-A',
         action='store_true', 
-        help='仅运行阶段二：根据现有摘要生成文献综述大纲。'
+        help='仅运行阶段一：文献分析'
     )
-    parser.add_argument(
-        '--generate-review', 
+    workflow_group.add_argument(
+        '--generate-outline', '-o',
         action='store_true', 
-        help='仅运行阶段三：根据现有大纲和摘要生成完整的Word版文献综述。'
+        help='仅运行阶段二：生成大纲'
     )
-    parser.add_argument(
-        '--validate-review',
+    workflow_group.add_argument(
+        '--generate-review', '-r',
+        action='store_true', 
+        help='仅运行阶段三：生成综述'
+    )
+    workflow_group.add_argument(
+        '--validate-review', '-v',
         action='store_true',
-        help='（在综述生成后运行）对生成的Word综述进行引用和观点验证。'
+        help='验证生成的综述'
     )
-    parser.add_argument(
-        '--setup', 
-        action='store_true', 
-        help='运行交互式设置向导，创建或更新config.ini文件。'
+    
+    # 高级选项
+    advanced_group = parser.add_argument_group('高级选项')
+    advanced_group.add_argument(
+        '--prime-with-folder',
+        type=str,
+        help='概念预热：指定种子论文文件夹'
     )
-    parser.add_argument('--prime-with-folder', type=str, help='Path to a folder with seed papers for concept priming.')
-    parser.add_argument('--concept', type=str, help='The name of the concept to be primed.')
-    parser.add_argument('--retry-failed', action='store_true', help='Retry processing failed papers from a previous run.')
-    parser.add_argument('--generate-section', type=int, help='Generate only the specified outline section number.')
-    parser.add_argument('--retry-review-failed', action='store_true', help='Retry failed stage-two review sections from the latest run.')
-    parser.add_argument('--free-mode-profile', type=str, help='Path to a saved free-mode profile JSON.')
-    parser.add_argument('--free-mode-idea', type=str, help='Ad-hoc free-mode idea text when no profile file is provided.')
-    parser.add_argument('--merge', type=str, help='Path to a summaries.json file to merge into the main project.')
+    advanced_group.add_argument(
+        '--concept',
+        type=str,
+        help='概念预热：指定概念名称'
+    )
+    advanced_group.add_argument(
+        '--retry-failed',
+        action='store_true',
+        help='重试失败的论文'
+    )
+    advanced_group.add_argument(
+        '--generate-section',
+        type=int,
+        help='仅生成指定章节号'
+    )
+    advanced_group.add_argument(
+        '--retry-review-failed',
+        action='store_true',
+        help='重试失败的综述章节'
+    )
+    advanced_group.add_argument(
+        '--free-mode-profile',
+        type=str,
+        help='自由模式：加载 profile JSON 文件'
+    )
+    advanced_group.add_argument(
+        '--free-mode-idea',
+        type=str,
+        help='自由模式：直接输入想法文本'
+    )
+    advanced_group.add_argument(
+        '--merge',
+        type=str,
+        help='合并：指定要合并的 summaries.json 文件'
+    )
+    
+    # 队列选项
+    queue_group = parser.add_argument_group('队列选项')
+    queue_group.add_argument(
+        '--queue-list',
+        action='store_true',
+        help='列出所有队列任务'
+    )
+    queue_group.add_argument(
+        '--queue-cancel',
+        type=str,
+        metavar='JOB_ID',
+        help='取消指定任务（需要 job_id）'
+    )
+    queue_group.add_argument(
+        '--queue-retry',
+        type=str,
+        metavar='JOB_ID',
+        help='重试失败任务（需要 job_id）'
+    )
+    queue_group.add_argument(
+        '--queue-clear',
+        action='store_true',
+        help='清空已完成的任务'
+    )
 
     args = parser.parse_args()
     dispatch_command(args)

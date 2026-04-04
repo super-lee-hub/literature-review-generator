@@ -267,9 +267,63 @@ def generate_word_table_of_contents(doc: Any) -> bool:  # type: ignore
         return False
 
 
+def generate_apa_references_from_manifest(
+    citation_manifest: Optional[Dict[str, Any]],
+    generator_instance: Any
+) -> List[str]:
+    """
+    从 citation manifest 生成APA格式的参考文献列表
+    
+    Args:
+        citation_manifest: citation manifest 数据（v1 或 v2 格式）
+        generator_instance: 文献综述生成器实例，用于访问摘要数据
+        
+    Returns:
+        List[str]: APA格式的参考文献列表
+    """
+    try:
+        if citation_manifest is not None:
+            # 尝试从 v2 manifest 中获取 bibliography
+            if 'bibliography' in citation_manifest:
+                references: List[str] = []
+                for entry in citation_manifest['bibliography']:
+                    # v2 manifest 格式
+                    if isinstance(entry, dict) and 'citation_text' in entry:
+                        # 只包含被引用的文献
+                        if entry.get('is_cited', True):
+                            references.append(entry['citation_text'])
+                    elif isinstance(entry, str):
+                        # 向后兼容：直接使用字符串
+                        references.append(entry)
+                
+                if references:
+                    # 按第一作者姓氏排序
+                    references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
+                    return references
+            
+            # 尝试从 v1 manifest 中获取 citations
+            elif 'citations' in citation_manifest:
+                references: List[str] = []
+                for citation in citation_manifest['citations']:
+                    if isinstance(citation, dict) and 'text' in citation:
+                        references.append(citation['text'])
+                
+                if references:
+                    # 去重并排序
+                    references = list(dict.fromkeys(references))
+                    references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
+                    return references
+    
+    except Exception as e:
+        generator_instance.logger.warning(f"从 citation manifest 生成参考文献失败，回退到旧方法: {e}")
+    
+    # 回退到旧方法
+    return generate_apa_references(generator_instance)
+
+
 def generate_apa_references(generator_instance: Any) -> List[str]:
     """
-    生成APA格式的参考文献列表
+    生成APA格式的参考文献列表（旧方法，保持向后兼容）
     
     Args:
         generator_instance: 文献综述生成器实例，用于访问摘要数据
