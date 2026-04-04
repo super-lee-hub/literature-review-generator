@@ -1784,6 +1784,22 @@ class LiteratureReviewGenerator:
         return None
 
     def _load_outline_artifact(self) -> Optional[Tuple[str, str]]:
+        """Load outline artifact, preferring reviewed outline if available and adopted.
+
+        Priority:
+        1. ReviewedOutlineDocument (if exists and adopted) - converted to markdown
+        2. Registered outline artifact from registry
+        3. Workspace outline file
+        4. Legacy outline file (fallback)
+        """
+        # Week5: Check for reviewed outline first
+        reviewed_outline_content = self._load_reviewed_outline_as_markdown()
+        if reviewed_outline_content:
+            self.logger.info("Using Week5 reviewed outline (adopted) as downstream truth")
+            # Return a virtual path indicating this came from reviewed outline
+            reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.md") if self.job_workspace else "reviewed_outline.md"
+            return reviewed_outline_path, reviewed_outline_content
+
         outline_file = self._resolve_outline_file_path()
         if not outline_file:
             self.logger.error("No outline artifact was found in the current workspace/registry or legacy fallback path")
@@ -1795,6 +1811,31 @@ class LiteratureReviewGenerator:
         except Exception as exc:
             self.logger.error(f"Failed to read outline artifact: {exc}")
             return None
+
+    def _load_reviewed_outline_as_markdown(self) -> Optional[str]:
+        """Load reviewed outline and convert to markdown if it exists and is adopted.
+
+        Returns:
+            Markdown string if reviewed outline exists and is adopted, None otherwise
+        """
+        if not self.job_workspace or not self.project_name:
+            return None
+
+        try:
+            from outline.legacy_adapter import OutlineLegacyAdapter
+
+            adapter = OutlineLegacyAdapter.from_workspace(
+                workspace_path=self.job_workspace.paths.artifacts_path,
+                project_name=self.project_name,
+                legacy_markdown="",
+            )
+
+            if adapter.has_adopted_outline():
+                return adapter.get_markdown()
+        except Exception as exc:
+            self.logger.debug(f"Could not load reviewed outline: {exc}")
+
+        return None
 
     def _get_review_checkpoint_file_path(self) -> str:
         if not self.output_dir:
@@ -4046,9 +4087,9 @@ class LiteratureReviewGenerator:
                 outline_dict = outline_result.get('outline')
                 
                 # Persist OutlineDocument
+                outline_doc_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_document.json")
+                from services.job_workspace import atomic_write_json
                 if outline_dict:
-                    outline_doc_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_document.json")
-                    from services.job_workspace import atomic_write_json
                     atomic_write_json(outline_doc_path, outline_dict)
                     
                     # Register in artifact registry
@@ -4100,6 +4141,84 @@ class LiteratureReviewGenerator:
                 )
                 
                 self.logger.success(f"Week5 outline critique saved to: {critique_path}")
+                
+                # Week5: Run arbitration and explicit adopt
+                self.logger.info("Running Week5 arbitration and adopt...")
+                from outline.arbitration import run_outline_arbitration, run_outline_adopt
+                from outline.models import ArbitrationDecision, CritiqueArbitration
+                
+                # Create arbitrations for all critiques (auto-accept for thin integration)
+                critiques_list = critique_result.get("critiques", [])
+                arbitrations = [
+                    CritiqueArbitration(
+                        critique_id=c["critique_id"],
+                        decision=ArbitrationDecision.ACCEPT,
+                        reason="Auto-accepted by workflow",
+                        arbitrated_at=datetime.now().isoformat(),
+                        arbitrated_by="workflow",
+                    )
+                    for c in critiques_list
+                ]
+                
+                # Run arbitration
+                arbitration_result = run_outline_arbitration(
+                    outline=outline_doc,
+                    arbitrations=arbitrations,
+                    job_id=self.job_workspace.job_id,
+                    arbitrated_by="workflow",
+                )
+                
+                # Save arbitration result
+                arbitration_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_arbitration.json")
+                atomic_write_json(arbitration_path, arbitration_result)
+                
+                self.artifact_registry.register_file(
+                    artifact_role="outline_arbitration",
+                    artifact_type="outline_arbitration_result",
+                    artifact_version="v1",
+                    path=arbitration_path,
+                    producer="main.LiteratureReviewGenerator.create_literature_review_outline",
+                    artifact_id="outline_arbitration:v1",
+                    depends_on=[
+                        ArtifactDependencyRef(
+                            artifact_type="outline_critique",
+                            path=critique_path,
+                        )
+                    ],
+                )
+                
+                self.logger.success(f"Week5 outline arbitration saved to: {arbitration_path}")
+                
+                # Run explicit adopt
+                from outline.models import OutlineArbitrationResult
+                arb_result_obj = OutlineArbitrationResult.from_dict(arbitration_result["arbitration_result"])
+                adopt_result = run_outline_adopt(
+                    outline=outline_doc,
+                    arbitration_result=arb_result_obj,
+                    job_id=self.job_workspace.job_id,
+                    adopted_by="workflow",
+                )
+                
+                # Save reviewed outline
+                reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.json")
+                atomic_write_json(reviewed_outline_path, adopt_result["reviewed_outline"])
+                
+                self.artifact_registry.register_file(
+                    artifact_role="reviewed_outline",
+                    artifact_type="reviewed_outline_document",
+                    artifact_version="v1",
+                    path=reviewed_outline_path,
+                    producer="main.LiteratureReviewGenerator.create_literature_review_outline",
+                    artifact_id="reviewed_outline:v1",
+                    depends_on=[
+                        ArtifactDependencyRef(
+                            artifact_type="outline_arbitration_result",
+                            path=arbitration_path,
+                        )
+                    ],
+                )
+                
+                self.logger.success(f"Week5 reviewed outline saved to: {reviewed_outline_path}")
             
             # 保存大纲文件
             

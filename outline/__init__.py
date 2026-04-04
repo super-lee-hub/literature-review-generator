@@ -32,6 +32,13 @@ from outline.arbitration import (
     run_outline_critique,
     run_peer_critique,
 )
+from outline.legacy_adapter import (
+    OutlineLegacyAdapter,
+    get_outline_markdown_for_downstream,
+    is_reviewed_outline_adopted,
+    outline_document_to_markdown,
+    reviewed_outline_to_markdown,
+)
 
 __all__ = [
     # Models
@@ -60,4 +67,10 @@ __all__ = [
     "run_outline_arbitration",
     "run_outline_critique",
     "run_peer_critique",
+    # Legacy Adapter
+    "OutlineLegacyAdapter",
+    "get_outline_markdown_for_downstream",
+    "is_reviewed_outline_adopted",
+    "outline_document_to_markdown",
+    "reviewed_outline_to_markdown",
 ]

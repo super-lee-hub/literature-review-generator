@@ -366,7 +366,7 @@ class OutlineArbitrator:
         if not self.arbitrations:
             return None
         
-        arbitration_result = self.run_arbitration(arbitrated_by)
+        arbitration_result = self.run_arbitration(adopted_by)
         return adopt_outline(
             outline=self.outline,
             arbitration_result=arbitration_result,
