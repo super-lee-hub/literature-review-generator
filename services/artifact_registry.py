@@ -139,6 +139,7 @@ class ArtifactRegistry:
         job_id: str,
         status: str = "ready",
         depends_on: List[Dict[str, str]] | None = None,
+        artifact_role: str | None = None,
     ) -> ArtifactRecord:
         """Register an artifact with dependency tracking.
         
@@ -171,7 +172,7 @@ class ArtifactRegistry:
         
         record = ArtifactRecord(
             artifact_id=artifact_id,
-            artifact_role=artifact_type,
+            artifact_role=artifact_role or artifact_type,
             artifact_type=artifact_type,
             artifact_version=artifact_version,
             path=abs_path,
