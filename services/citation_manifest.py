@@ -372,52 +372,83 @@ def build_citation_manifest_v2_from_review_draft(
             block_id = block.get('block_id', f's{section_number}_b0')
             block_order = block.get('block_order', 0)
             block_text = block.get('text', '')
+            block_citations = block.get('citations', [])
             
-            # Simple citation extraction: look for patterns like (Author, YYYY)
-            # This is a basic implementation - can be enhanced with more sophisticated parsing
-            citation_pattern = r'\([^)]+,\s*\d{4}[^)]*\)'
-            found_citations = re.findall(citation_pattern, block_text)
-            
-            for citation_token in found_citations:
-                occurrence_counter += 1
-                occurrence_id = f"occ_{occurrence_counter}"
+            # Priority 1: Use structured citations from blocks
+            if block_citations:
+                for citation in block_citations:
+                    occurrence_counter += 1
+                    occurrence_id = f"occ_{occurrence_counter}"
+                    
+                    # Get paper info from structured citation
+                    paper_id = citation.get('paper_id', 'unknown')
+                    paper_key = citation.get('paper_key', paper_id)
+                    citation_token = citation.get('text', f"({paper_key}, {citation.get('year', 'n.d.')})")
+                    
+                    # Create occurrence
+                    occurrence = CitationOccurrence(
+                        occurrence_id=occurrence_id,
+                        citation_token=citation_token,
+                        paper_id=paper_id,
+                        paper_key=paper_key,
+                        section_number=section_number,
+                        section_title=section_title,
+                        block_id=block_id,
+                        block_order=block_order,
+                        spans=[],
+                        context_before=block_text[:200] if len(block_text) > 200 else block_text,
+                        context_after="",
+                    )
+                    occurrences.append(occurrence)
+                    
+                    if paper_id not in paper_occurrence_map:
+                        paper_occurrence_map[paper_id] = []
+                    paper_occurrence_map[paper_id].append(occurrence_id)
+            else:
+                # Priority 2: Fallback to regex extraction from free-form text
+                citation_pattern = r'\([^)]+,\s*\d{4}[^)]*\)'
+                found_citations = re.findall(citation_pattern, block_text)
                 
-                # Try to match citation to paper
-                paper_id = "unknown"
-                paper_key = "unknown"
-                
-                # Simple heuristic: check if any paper title or author appears in citation
-                citation_lower = citation_token.lower()
-                for title_key, paper_data in paper_key_to_info.items():
-                    # Check if author names from paper appear in citation
-                    authors = paper_data.get('authors', [])
-                    for author in authors:
-                        if author.lower() in citation_lower:
-                            paper_id = paper_data['paper_id']
-                            paper_key = paper_data['paper_key']
+                for citation_token in found_citations:
+                    occurrence_counter += 1
+                    occurrence_id = f"occ_{occurrence_counter}"
+                    
+                    # Try to match citation to paper
+                    paper_id = "unknown"
+                    paper_key = "unknown"
+                    
+                    # Simple heuristic: check if any paper title or author appears in citation
+                    citation_lower = citation_token.lower()
+                    for title_key, paper_data in paper_key_to_info.items():
+                        # Check if author names from paper appear in citation
+                        authors = paper_data.get('authors', [])
+                        for author in authors:
+                            if author.lower() in citation_lower:
+                                paper_id = paper_data['paper_id']
+                                paper_key = paper_data['paper_key']
+                                break
+                        if paper_id != "unknown":
                             break
-                    if paper_id != "unknown":
-                        break
-                
-                # Create occurrence
-                occurrence = CitationOccurrence(
-                    occurrence_id=occurrence_id,
-                    citation_token=citation_token,
-                    paper_id=paper_id,
-                    paper_key=paper_key,
-                    section_number=section_number,
-                    section_title=section_title,
-                    block_id=block_id,
-                    block_order=block_order,
-                    spans=[],
-                    context_before=block_text[:200] if len(block_text) > 200 else block_text,
-                    context_after="",
-                )
-                occurrences.append(occurrence)
-                
-                if paper_id not in paper_occurrence_map:
-                    paper_occurrence_map[paper_id] = []
-                paper_occurrence_map[paper_id].append(occurrence_id)
+                    
+                    # Create occurrence
+                    occurrence = CitationOccurrence(
+                        occurrence_id=occurrence_id,
+                        citation_token=citation_token,
+                        paper_id=paper_id,
+                        paper_key=paper_key,
+                        section_number=section_number,
+                        section_title=section_title,
+                        block_id=block_id,
+                        block_order=block_order,
+                        spans=[],
+                        context_before=block_text[:200] if len(block_text) > 200 else block_text,
+                        context_after="",
+                    )
+                    occurrences.append(occurrence)
+                    
+                    if paper_id not in paper_occurrence_map:
+                        paper_occurrence_map[paper_id] = []
+                    paper_occurrence_map[paper_id].append(occurrence_id)
     
     # Build clusters from occurrence map
     for paper_id, occ_ids in paper_occurrence_map.items():

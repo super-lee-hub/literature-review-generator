@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from services.job_workspace import utc_now_iso
@@ -30,6 +30,7 @@ class ReviewBlock:
     text: str
     anchor_text: str = ""
     anchor_hash: str = ""
+    citations: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -145,6 +146,7 @@ def _parse_section_into_blocks(section_number: int, section_title: str, content:
             text=para,
             anchor_text=anchor_text,
             anchor_hash=anchor_hash,
+            citations=[],
         ))
 
     return blocks
