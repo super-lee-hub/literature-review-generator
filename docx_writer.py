@@ -302,11 +302,11 @@ def generate_apa_references_from_manifest(
                     generator_instance.logger.info("使用 v2 manifest 中的 bibliography 生成参考文献")
                     return references
                 else:
-                    # v2 manifest 存在但 bibliography 为空，记录日志并回退
-                    generator_instance.logger.warning("v2 manifest 存在但 bibliography 为空，回退到旧方法")
+                    # v2 manifest 存在但 bibliography 为空，继续检查 v1 citations
+                    generator_instance.logger.warning("v2 manifest 存在但 bibliography 为空，检查 v1 citations")
             
             # 尝试从 v1 manifest 中获取 citations
-            elif 'citations' in citation_manifest:
+            if 'citations' in citation_manifest:
                 generator_instance.logger.warning("只有 v1 manifest，回退到旧方法")
                 # 回退到旧方法
                 return generate_apa_references(generator_instance)

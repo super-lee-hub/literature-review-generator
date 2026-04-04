@@ -698,6 +698,7 @@ class TestEntryPoints:
         result = run_outline_critique(
             outline=doc,
             critic_model="critic-model",
+            coverage_critic_model="coverage-critic-model",
             summaries=summaries,
             job_id="job-001",
         )

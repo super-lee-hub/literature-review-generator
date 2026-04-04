@@ -410,9 +410,22 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
                 }
                 paper_artifacts.append(paper_artifact)
             
+            # 构建 preprocess_evidence 和 paper_metadata
+            preprocess_evidence = {}
+            paper_metadata = {}
+            
+            # 从 paper_artifacts 中提取相关信息
+            for artifact in paper_artifacts:
+                paper_key = artifact.get('paper_identity', {}).get('canonical_paper_key', '')
+                if paper_key:
+                    # 提取 preprocess evidence
+                    preprocess_evidence[paper_key] = artifact.get('stage1_inputs', {}).get('preprocess_evidence', {})
+                    # 提取 paper metadata
+                    paper_metadata[paper_key] = artifact.get('paper_identity', {})
+            
             # 运行Week 3验证
             from validation.review_validator import ReviewValidator
-            validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
+            validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
             report = validator.validate()
             
             # 运行summary_recheck

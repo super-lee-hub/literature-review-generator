@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 
@@ -28,6 +28,8 @@ class EvidenceResolverContext:
     paper_identity: Dict[str, Any]
     preprocess_artifacts: Dict[str, Any]
     paper_artifact: Dict[str, Any]
+    preprocess_evidence: Dict[str, Any] = field(default_factory=dict)
+    paper_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class EvidenceResolver:

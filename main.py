@@ -395,10 +395,13 @@ class LiteratureReviewGenerator:
     CITATION_MANIFEST_ARTIFACT_ROLE = "citation_manifest"
     CITATION_MANIFEST_ARTIFACT_VERSION = "v1"
     
-    def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None):
+    def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None, queue_file: str = 'output/_queue/queue.json', zotero_report: Optional[str] = None, library_path: Optional[str] = None):
         self.config_file: str = config_file
         self.project_name: Optional[str] = project_name
         self.pdf_folder: Optional[str] = pdf_folder
+        self.queue_file: str = queue_file
+        self.zotero_report: Optional[str] = zotero_report
+        self.library_path: Optional[str] = library_path
         self.config: Optional['ConfigDict'] = None
         self.compat_config: Optional[CompatConfigView] = None
         self.output_dir: Optional[str] = None
@@ -465,13 +468,23 @@ class LiteratureReviewGenerator:
         self.summary_file = workspace.artifact_path(f"{workspace.project_name}_summaries.json")
         
         # 初始化队列服务
-        queue_file_path = Path(workspace.root_dir) / "_queue" / "queue.json"
+        if self.queue_file and os.path.exists(self.queue_file):
+            # 如果提供了 queue_file 且文件存在，使用它
+            queue_file_path = Path(self.queue_file)
+        else:
+            # 否则使用默认路径
+            queue_file_path = Path(workspace.root_dir) / "_queue" / "queue.json"
         self.queue_service = PersistentQueueService(queue_file_path)
 
     def _init_queue_service(self) -> None:
         """初始化队列服务（向后兼容：在没有 job_workspace 时使用）"""
-        if self.queue_service is None and self.output_dir:
-            queue_file_path = Path(self.output_dir) / "_queue" / "queue.json"
+        if self.queue_service is None:
+            if self.output_dir:
+                # 如果提供了 output_dir，使用 job_workspace 路径结构
+                queue_file_path = Path(self.output_dir) / "_queue" / "queue.json"
+            else:
+                # 否则使用传入的 queue_file 参数
+                queue_file_path = Path(self.queue_file)
             self.queue_service = PersistentQueueService(queue_file_path)
 
     def submit_job_to_queue(self, job_type: str, parameters: Dict[str, Any]) -> str:
@@ -1247,6 +1260,8 @@ class LiteratureReviewGenerator:
             # 确定Zotero报告路径
             if override_path:
                 zotero_report_path = override_path
+            elif self.zotero_report:
+                zotero_report_path = self.zotero_report
             else:
                 paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
                 zotero_report_path: str = paths_config.get('zotero_report', '')
@@ -2286,7 +2301,7 @@ class LiteratureReviewGenerator:
                 file_title = paper.get('title', '')
                 _file_authors = paper.get('authors', [])
                 paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
-                library_path: str = paths_config.get('library_path', '')
+                library_path: str = self.library_path or paths_config.get('library_path', '')
                 
                 if not library_path:
                     failure_reason = "配置文件中缺少library_path路径"
@@ -3587,9 +3602,10 @@ class LiteratureReviewGenerator:
 1. 直接输出纯文本格式的章节正文内容
 2. 不要包含章节标题
 3. 内容需要专业、客观、全面
-4. 适当引用具体文献以支持论点
+4. 适当引用具体文献以支持论点，使用结构化的 citation refs 或 token，格式为 [cite:paper_key]，其中 paper_key 是论文的唯一标识符
 5. 语言风格需专业、学术
-6. 只撰写指定章节的内容，不要包含其他章节"""
+6. 只撰写指定章节的内容，不要包含其他章节
+7. 不要使用传统的 (作者, 年份) 格式，只使用 [cite:paper_key] 格式的引用标记"""
 
             # Determine final prompt
             if is_continuation:
@@ -3659,9 +3675,10 @@ class LiteratureReviewGenerator:
 
 要求：
 1. 深度综合不同学者的观点，对比异同
-2. 每个论点必须引用至少1-2篇文献，格式为(作者, 年份)
+2. 每个论点必须引用至少1-2篇文献，使用结构化的 citation refs 或 token，格式为 [cite:paper_key]，其中 paper_key 是论文的唯一标识符
 3. 逻辑连贯，段落间有过渡
-4. 避免流水账式写法，按主题组织内容"""
+4. 避免流水账式写法，按主题组织内容
+5. 不要使用传统的 (作者, 年份) 格式，只使用 [cite:paper_key] 格式的引用标记"""
 
             # 对于续写调用，添加续写标记
             if is_continuation and partial_content:
@@ -4273,8 +4290,9 @@ class LiteratureReviewGenerator:
                 from outline.arbitration import run_outline_critique, run_outline_arbitration, run_outline_adopt
                 from services.artifact_registry import ArtifactDependencyRef
                 
-                writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
-                generator_model = writer_config.get('model', 'gpt-4')
+                from services.model_selection import get_outline_api_config
+                outline_api_config = get_outline_api_config(self.config)
+                generator_model = outline_api_config.get('model') or 'gpt-4'
                 outline_summaries: List[Dict[str, Any]] = [dict(summary) for summary in self.summaries]
                 
                 # Generate OutlineDocument from markdown
@@ -4318,9 +4336,19 @@ class LiteratureReviewGenerator:
                 self.logger.info("Running Week5 peer critique...")
                 from outline.models import OutlineDocument
                 outline_doc = OutlineDocument.from_dict(outline_dict)
+                
+                # Get different API configs for different critique types
+                writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
+                primary_reader_config: Dict[str, Any] = (self.config or {}).get('Primary_Reader_API', {})  # type: ignore
+                
+                # Writer_API for structure critique, Primary_Reader_API for coverage critique
+                structure_critic_model = writer_config.get('model', 'gpt-4')
+                coverage_critic_model = primary_reader_config.get('model', 'gpt-4-turbo')
+                
                 critique_result = run_outline_critique(
                     outline=outline_doc,
-                    critic_model=generator_model,
+                    critic_model=structure_critic_model,
+                    coverage_critic_model=coverage_critic_model,
                     summaries=outline_summaries,
                     job_id=self.job_workspace.job_id,
                 )
@@ -4351,28 +4379,22 @@ class LiteratureReviewGenerator:
                 from outline.arbitration import run_outline_arbitration, run_outline_adopt
                 from outline.models import ArbitrationDecision, CritiqueArbitration
                 
-                # Create arbitrations for all critiques (auto-accept for thin integration)
+                # Remove auto-accept - require explicit adopt
                 critiques_list = critique_result.get("critiques", [])
-                arbitrations = [
-                    CritiqueArbitration(
-                        critique_id=c["critique_id"],
-                        decision=ArbitrationDecision.ACCEPT,
-                        reason="Auto-accepted by workflow",
-                        arbitrated_at=datetime.now().isoformat(),
-                        arbitrated_by="workflow",
-                    )
-                    for c in critiques_list
-                ]
+                # No auto-accept - arbitrations will be created through explicit user action
+                arbitrations = []
                 
                 # Run arbitration with error handling
                 arbitration_result = None
                 arbitration_path = None
                 try:
+                    # Outline_API for arbitration
                     arbitration_result = run_outline_arbitration(
                         outline=outline_doc,
                         arbitrations=arbitrations,
                         job_id=self.job_workspace.job_id,
                         arbitrated_by="workflow",
+                        arbitrator_model=generator_model,  # Use Outline_API model for arbitration
                     )
                     
                     # Save arbitration result
@@ -5152,7 +5174,7 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
                 logging.error("概念学习模式需要指定 --project-name 参数")
                 sys.exit(1)
             
-            generator = LiteratureReviewGenerator(args.config, args.project_name, None)
+            generator = LiteratureReviewGenerator(args.config, args.project_name, None, getattr(args, "queue_file", "output/_queue/queue.json"))
             generator.logger.info("*** 概念学习模式已启动 ***")
             generator.logger.info("=" * 60)
             
@@ -5439,7 +5461,7 @@ def handle_retry_failed(args: argparse.Namespace):  # type: ignore
             logging.error("📝 示例：--project-name \"案例分析\" 而非 --project-name \"C:\\Users\\123\\Desktop\\我的项目\"")
             sys.exit(1)
 
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
     generator.logger.info("*** 失败论文重试模式已启动 ***")
     
     if not generator.load_configuration() or not generator.setup_output_directory():
@@ -5570,7 +5592,7 @@ def handle_merge_mode(args: argparse.Namespace):  # type: ignore
             logging.error("📝 示例：--project-name \"案例分析\" 而非 --project-name \"C:\\Users\\123\\Desktop\\我的项目\"")
             sys.exit(1)
     
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
     generator.logger.info("*** 合并模式已启动 ***")
     generator.logger.info("=" * 60)
     
@@ -5662,7 +5684,7 @@ def handle_merge_mode(args: argparse.Namespace):  # type: ignore
 
 def handle_queue_list_mode(args: argparse.Namespace):  # type: ignore
     """处理队列列表命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
     generator.logger.info("*** 队列列表模式已启动 ***")
     generator.logger.info("=" * 60)
     
@@ -5696,7 +5718,7 @@ def handle_queue_list_mode(args: argparse.Namespace):  # type: ignore
 
 def handle_queue_cancel_mode(args: argparse.Namespace, job_id: str):  # type: ignore
     """处理队列取消命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
     generator.logger.info("*** 队列取消模式已启动 ***")
     generator.logger.info("=" * 60)
     
@@ -5724,7 +5746,7 @@ def handle_queue_cancel_mode(args: argparse.Namespace, job_id: str):  # type: ig
 
 def handle_queue_retry_mode(args: argparse.Namespace, job_id: str):  # type: ignore
     """处理队列重试命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
     generator.logger.info("*** 队列重试模式已启动 ***")
     generator.logger.info("=" * 60)
     
@@ -5752,7 +5774,7 @@ def handle_queue_retry_mode(args: argparse.Namespace, job_id: str):  # type: ign
 
 def handle_queue_clear_mode(args: argparse.Namespace):  # type: ignore
     """处理队列清空命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
     generator.logger.info("*** 队列清空模式已启动 ***")
     generator.logger.info("=" * 60)
     
@@ -5779,7 +5801,7 @@ def handle_queue_clear_mode(args: argparse.Namespace):  # type: ignore
 
 def handle_queue_add_mode(args: argparse.Namespace):  # type: ignore
     """处理队列添加命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"), getattr(args, "zotero_report", None), getattr(args, "library_path", None))
     generator.logger.info("*** 队列添加模式已启动 ***")
     generator.logger.info("=" * 60)
     
@@ -5859,7 +5881,7 @@ def handle_queue_add_mode(args: argparse.Namespace):  # type: ignore
 
 def handle_queue_run_mode(args: argparse.Namespace):  # type: ignore
     """处理队列运行命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder)
+    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"), getattr(args, "zotero_report", None), getattr(args, "library_path", None))
     generator.logger.info("*** 队列运行模式已启动 ***")
     generator.logger.info("=" * 60)
     
@@ -5875,6 +5897,19 @@ def handle_queue_run_mode(args: argparse.Namespace):  # type: ignore
         if generator.queue_service is None:
             generator.logger.error("队列服务未初始化")
             return
+        
+        # 处理批量 queue 文件
+        if hasattr(args, 'queue_files') and args.queue_files:
+            for queue_file in args.queue_files:
+                if os.path.exists(queue_file):
+                    generator.logger.info(f"加载队列文件: {queue_file}")
+                    try:
+                        generator.queue_service.load_queue(queue_file)
+                        generator.logger.success(f"队列文件加载成功: {queue_file}")
+                    except Exception as e:
+                        generator.logger.error(f"加载队列文件失败: {queue_file} - {e}")
+                else:
+                    generator.logger.error(f"队列文件不存在: {queue_file}")
         
         # 创建JobRunner和QueueRunner
         from services.job_runner import JobRunner
@@ -6148,6 +6183,12 @@ def main() -> None:  # type: ignore
         type=str,
         default='output/_queue/queue.json',
         help='队列文件路径（默认：output/_queue/queue.json）'
+    )
+    queue_group.add_argument(
+        '--queue-files',
+        type=str,
+        nargs='+',
+        help='批量队列文件路径（支持多个文件）'
     )
     queue_group.add_argument(
         '--queue-list',

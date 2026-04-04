@@ -4,20 +4,31 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 
-WHITELISTED_FIELDS: Set[str] = {
-    "core_analysis.abstract",
-    "core_analysis.methods",
-    "core_analysis.findings",
-    "core_analysis.conclusions",
-    "core_analysis.relevance",
-    "core_analysis.limitations",
-    "core_analysis.theoretical_framework",
-    "core_analysis.research_gap",
-    "paper_info.title",
-    "paper_info.authors",
-    "paper_info.year",
-    "paper_info.journal",
+# Field owner registry for canonical-only patching
+FIELD_OWNER_REGISTRY: Dict[str, str] = {
+    # Core analysis fields (canonical path)
+    "core_analysis.abstract": "canonical",
+    "core_analysis.methods": "canonical",
+    "core_analysis.findings": "canonical",
+    "core_analysis.conclusions": "canonical",
+    "core_analysis.relevance": "canonical",
+    "core_analysis.limitations": "canonical",
+    "core_analysis.theoretical_framework": "canonical",
+    "core_analysis.research_gap": "canonical",
+    # Paper info fields (canonical path)
+    "paper_info.title": "canonical",
+    "paper_info.authors": "canonical",
+    "paper_info.year": "canonical",
+    "paper_info.journal": "canonical",
 }
+
+# Canonical fields only (derived from FIELD_OWNER_REGISTRY)
+CANONICAL_FIELDS: Set[str] = {
+    field for field, owner in FIELD_OWNER_REGISTRY.items() if owner == "canonical"
+}
+
+# Backward compatibility
+WHITELISTED_FIELDS = CANONICAL_FIELDS
 
 
 @dataclass(frozen=True)
@@ -57,7 +68,8 @@ class SummaryRechecker:
         correction_candidates: List[SummaryCorrectionCandidate] = []
         fields_checked: List[str] = []
 
-        for field_path in WHITELISTED_FIELDS:
+        # Only check canonical fields (canonical-only patching)
+        for field_path in CANONICAL_FIELDS:
             fields_checked.append(field_path)
             # First try source-grounded check, then fall back to existing checks
             candidate = self._check_field_source_grounded(field_path)
@@ -76,21 +88,21 @@ class SummaryRechecker:
         )
 
     def _check_field_source_grounded(self, field_path: str) -> Optional[SummaryCorrectionCandidate]:
-        """Source-grounded check using preprocess artifacts (whitelist-only)."""
+        """Source-grounded check using preprocess artifacts (canonical-only)."""
         current_value = self._get_nested_value(self.ai_summary, field_path)
         if current_value is None:
             return None
         
-        # Only apply source-grounded checks for specific whitelisted fields
+        # Only apply source-grounded checks for canonical fields
         # For this slice, we focus on core analysis fields
-        source_check_whitelist = [
+        source_check_canonical = [
             "core_analysis.abstract",
             "core_analysis.methods",
             "core_analysis.findings",
             "core_analysis.conclusions"
         ]
         
-        if field_path not in source_check_whitelist:
+        if field_path not in source_check_canonical or field_path not in CANONICAL_FIELDS:
             return None
         
         # Get preprocessed text for source

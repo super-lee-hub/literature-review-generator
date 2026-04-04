@@ -36,6 +36,7 @@ class JobRunRequest:
     source_mode: str = "direct"
     zotero_report: Optional[str] = None
     library_path: Optional[str] = None
+    queue_file: str = "output/_queue/queue.json"
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,11 @@ def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
     elif getattr(args, "validate_review", False):
         action = "validate_review"
 
+    # 确定 source_mode
+    source_mode = "direct"
+    if getattr(args, "zotero_report", None):
+        source_mode = "zotero"
+
     return JobRunRequest(
         config=getattr(args, "config", "config.ini"),
         project_name=getattr(args, "project_name", None),
@@ -80,9 +86,10 @@ def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
         free_mode_idea=getattr(args, "free_mode_idea", None),
         progress_tracker=getattr(args, "_progress_tracker", None),
         gui=getattr(args, "gui", False),
-        source_mode=getattr(args, "source_mode", "direct"),
+        source_mode=source_mode,
         zotero_report=getattr(args, "zotero_report", None),
         library_path=getattr(args, "library_path", None),
+        queue_file=getattr(args, "queue_file", "output/_queue/queue.json"),
     )
 
 
@@ -125,10 +132,10 @@ class JobRunner:
     def _source_snapshot(self, generator: Any, request: JobRunRequest) -> dict[str, Any]:
         paths_config = generator.config.get("Paths", {}) if getattr(generator, "config", None) else {}
         return {
-            "source_mode": "direct" if request.pdf_folder else "zotero",
+            "source_mode": request.source_mode,
             "pdf_folder": os.path.abspath(request.pdf_folder) if request.pdf_folder else "",
-            "zotero_report": os.path.abspath(paths_config.get("zotero_report", "")) if paths_config.get("zotero_report") else "",
-            "library_path": os.path.abspath(paths_config.get("library_path", "")) if paths_config.get("library_path") else "",
+            "zotero_report": os.path.abspath(request.zotero_report) if request.zotero_report else os.path.abspath(paths_config.get("zotero_report", "")) if paths_config.get("zotero_report") else "",
+            "library_path": os.path.abspath(request.library_path) if request.library_path else os.path.abspath(paths_config.get("library_path", "")) if paths_config.get("library_path") else "",
             "project_name": self._resolve_project_name(request),
         }
 
@@ -272,7 +279,8 @@ class JobRunner:
                 resume_state="non_resumable",
             )
 
-        generator = legacy_main.LiteratureReviewGenerator(request.config, project_name, request.pdf_folder)
+        # 使用 request 中的 queue_file 参数
+        generator = legacy_main.LiteratureReviewGenerator(request.config, project_name, request.pdf_folder, request.queue_file, request.zotero_report, request.library_path)
         generator.cancel_token = active_cancel_token
         generator.progress_tracker = request.progress_tracker
         generator.free_mode_profile_path = request.free_mode_profile

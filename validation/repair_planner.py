@@ -133,6 +133,12 @@ def _create_patch_proposal(
     if root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
         fix_strategy = "manifest_fix_rerender"
         granularity = PatchGranularity.SPAN
+    elif root_cause == RepairRootCause.SUMMARY_DRIFT:
+        fix_strategy = "targeted_summary_recheck"
+        granularity = PatchGranularity.BLOCK
+    elif root_cause == RepairRootCause.REVIEW_DRIFT:
+        fix_strategy = "block_span_patch"
+        granularity = PatchGranularity.SPAN
     elif root_cause == RepairRootCause.VISUAL_UNDERSTANDING_GAP:
         fix_strategy = "summary_recheck_visual_bundle"
         granularity = PatchGranularity.SPAN

@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence
 from enum import Enum
 
-from validation.evidence_resolver import EvidenceCandidate, EvidenceResolver, build_evidence_resolver_context
+from validation.evidence_resolver import EvidenceCandidate, EvidenceResolver, EvidenceResolverContext, build_evidence_resolver_context
 
 
 class ValidationConclusion(Enum):
@@ -52,6 +52,8 @@ class ReviewValidator:
         review_draft: Dict[str, Any],
         citation_manifest: Dict[str, Any],
         paper_artifacts: Sequence[Dict[str, Any]],
+        preprocess_evidence: Optional[Dict[str, Any]] = None,
+        paper_metadata: Optional[Dict[str, Any]] = None,
     ):
         self.review_draft = review_draft
         self.citation_manifest = citation_manifest
@@ -63,6 +65,8 @@ class ReviewValidator:
             pa.get("paper_identity", {}).get("source_paper_id", ""): pa
             for pa in paper_artifacts
         })
+        self.preprocess_evidence = preprocess_evidence or {}
+        self.paper_metadata = paper_metadata or {}
 
     def validate(self) -> ReviewValidationReport:
         from datetime import datetime
@@ -125,6 +129,7 @@ class ReviewValidator:
         """Generic citation validation logic shared by occurrence and citation.
         
         Primary path prefers block_text from review_draft_v2 over just context.
+        Now also incorporates preprocess/visual evidence and paper metadata.
         """
         paper_artifact = self.paper_artifacts.get(paper_id)
         details: Dict[str, Any] = {"used_block_text": bool(block_text)}
@@ -140,7 +145,22 @@ class ReviewValidator:
                 details=details,
             )
 
-        resolver_context = build_evidence_resolver_context(paper_artifact)
+        # Get preprocess evidence for this paper if available
+        paper_preprocess_evidence = self.preprocess_evidence.get(paper_id, {})
+        
+        # Get paper metadata for this paper if available
+        paper_specific_metadata = self.paper_metadata.get(paper_id, {})
+
+        # Create resolver context with preprocess evidence and paper metadata
+        resolver_context = EvidenceResolverContext(
+            paper_key=paper_artifact.get("paper_identity", {}).get("canonical_paper_key", ""),
+            paper_identity=paper_artifact.get("paper_identity", {}),
+            preprocess_artifacts=paper_artifact.get("analysis", {}).get("preprocess", {}),
+            paper_artifact=paper_artifact,
+            preprocess_evidence=paper_preprocess_evidence,
+            paper_metadata=paper_specific_metadata
+        )
+        
         resolver = EvidenceResolver(resolver_context)
         selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
         
@@ -160,6 +180,10 @@ class ReviewValidator:
             evidence_candidates=evidence_candidates,
             has_visual_refs=bool(selected_visual_refs),
         )
+
+        # Add preprocess and metadata info to details
+        details["has_preprocess_evidence"] = bool(paper_preprocess_evidence)
+        details["has_paper_metadata"] = bool(paper_specific_metadata)
 
         return CitationValidationResult(
             citation_id=citation_id,

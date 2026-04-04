@@ -861,6 +861,83 @@ class WorkspaceController:
         else:
             ui.notify(self.t("队列服务未初始化"), type="warning")
 
+    def add_job_to_queue(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> None:
+        """添加任务到队列"""
+        if self._queue_service:
+            try:
+                from services.queue_service import QueueJobSpec, create_queue_job_id
+                # 构建参数字典
+                parameters = {
+                    "action": action,
+                    "project_name": project_name,
+                    "pdf_folder": pdf_folder if pdf_folder else None,
+                    "zotero_report": zotero_report if zotero_report else None,
+                    "library_path": self.state["paths"]["library_path"] if self.state["paths"]["library_path"] else None,
+                    "config": self.config_path,
+                    "gui": True
+                }
+                # 创建 QueueJobSpec
+                spec = QueueJobSpec(
+                    job_id=create_queue_job_id(),
+                    job_type=action,
+                    project_name=project_name,
+                    parameters=parameters
+                )
+                job_id = self._queue_service.add_job(spec)
+                ui.notify(self.tf("任务已添加到队列: {job_id}", job_id=job_id), type="positive")
+            except Exception as e:
+                ui.notify(self.tf("添加任务失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def remove_job(self, job_id: str) -> None:
+        """删除指定任务"""
+        if self._queue_service:
+            try:
+                runtime = self._queue_service.get_job_runtime(job_id)
+                if runtime and runtime.state == QueueState.RUNNING:
+                    ui.notify(self.t("不能删除运行中的任务"), type="warning")
+                    return
+                self._queue_service.remove_job(job_id)
+                ui.notify(self.tf("任务已删除: {job_id}", job_id=job_id), type="positive")
+            except Exception as e:
+                ui.notify(self.tf("删除任务失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def reorder_jobs(self, job_ids: list[str]) -> None:
+        """重排任务顺序"""
+        if self._queue_service:
+            try:
+                self._queue_service.reorder_jobs(job_ids)
+                ui.notify(self.t("任务顺序已更新"), type="positive")
+            except Exception as e:
+                ui.notify(self.tf("重排任务失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def save_queue(self, file_path: str) -> None:
+        """保存队列到文件"""
+        if self._queue_service:
+            try:
+                self._queue_service.save_queue(file_path)
+                ui.notify(self.tf("队列已保存到: {file_path}", file_path=file_path), type="positive")
+            except Exception as e:
+                ui.notify(self.tf("保存队列失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def load_queue(self, file_path: str) -> None:
+        """从文件加载队列"""
+        if self._queue_service:
+            try:
+                self._queue_service.load_queue(file_path)
+                ui.notify(self.tf("队列已从: {file_path} 加载", file_path=file_path), type="positive")
+            except Exception as e:
+                ui.notify(self.tf("加载队列失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
     def t(self, key: str) -> str:
         return translate(self.language, key)
 
@@ -2293,8 +2370,8 @@ def launch_gui(
                     ui.label(t("验证功能默认关闭，暂时作为实验功能保留。")).classes("ag-subtle")
                     with ui.expansion(t("高级 / 实验功能"), icon="science").classes("w-full q-mt-md"):
                         with ui.column().classes("gap-2 q-pa-sm"):
-                            ui.switch(t("启用阶段一验证"), value=controller.state["performance"]["enable_stage1_validation"]).bind_value(controller.state["performance"], "enable_stage1_validation")
-                            ui.switch(t("启用阶段二验证"), value=controller.state["performance"]["enable_stage2_validation"]).bind_value(controller.state["performance"], "enable_stage2_validation")
+                            ui.switch(t("启用摘要验证"), value=controller.state["performance"]["enable_stage1_validation"]).bind_value(controller.state["performance"], "enable_stage1_validation")
+                            ui.switch(t("启用综述验证"), value=controller.state["performance"]["enable_stage2_validation"]).bind_value(controller.state["performance"], "enable_stage2_validation")
 
     @ui.page("/logs")
     def logs_page() -> None:
@@ -2373,6 +2450,44 @@ def launch_gui(
                             ui.label(t("失败")).classes("ag-subtle")
                             ui.label(str(failed_count)).classes("text-xl font-bold")
                     
+                    # 添加任务到队列
+                    with ui.card().classes("ag-card p-6 q-mt-md"):
+                        ui.label(t("添加任务到队列")).classes("ag-section-title")
+                        with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
+                            project_name_input = ui.input(t("项目名"), placeholder=t("请输入项目名")).classes("w-full")
+                            action_select = ui.select(
+                                {"analyze": t("仅分析文献"), "outline": t("生成大纲"), "review": t("生成全文"), "run_all": t("一键运行")},
+                                label=t("任务类型"),
+                                value="analyze"
+                            ).classes("w-full")
+                            pdf_folder_input = ui.input(t("PDF 文件夹"), placeholder=t("请输入 PDF 文件夹路径")).classes("w-full")
+                            zotero_report_input = ui.input(t("Zotero 报告路径"), placeholder=t("请输入 Zotero 报告路径")).classes("w-full")
+                        with ui.row().classes("gap-2 q-mt-md"):
+                            ui.button(
+                                t("添加任务"),
+                                on_click=lambda:
+                                    controller.add_job_to_queue(
+                                        project_name_input.value,
+                                        pdf_folder_input.value,
+                                        zotero_report_input.value,
+                                        action_select.value or ""
+                                    )
+                            ).props("unelevated")
+                    
+                    # 保存/加载队列
+                    with ui.card().classes("ag-card p-6 q-mt-md"):
+                        ui.label(t("队列文件操作")).classes("ag-section-title")
+                        queue_file_input = ui.input(t("队列文件路径"), placeholder=t("请输入队列文件路径")).classes("w-full q-mt-md")
+                        with ui.row().classes("gap-2 q-mt-md"):
+                            ui.button(
+                                t("保存队列"),
+                                on_click=lambda: controller.save_queue(queue_file_input.value)
+                            ).props("outline")
+                            ui.button(
+                                t("加载队列"),
+                                on_click=lambda: controller.load_queue(queue_file_input.value)
+                            ).props("outline")
+                    
                     # 任务列表
                     with ui.card().classes("ag-card p-6 q-mt-md"):
                         ui.label(t("队列任务列表")).classes("ag-section-title")
@@ -2382,6 +2497,13 @@ def launch_gui(
                             if jobs:
                                 # 按创建时间排序
                                 jobs.sort(key=lambda x: x.created_at)
+                                
+                                # 重排功能
+                                job_ids = [job.job_id for job in jobs]
+                                
+                                with ui.row().classes("gap-2 q-mb-md"):
+                                    ui.button(t("上移选中任务"), on_click=lambda: controller.reorder_jobs(job_ids)).props("outline size=sm")
+                                    ui.button(t("下移选中任务"), on_click=lambda: controller.reorder_jobs(job_ids[::-1])).props("outline size=sm")
                                 
                                 for job in jobs:
                                     runtime = controller._queue_service.get_job_runtime(job.job_id)
@@ -2423,6 +2545,8 @@ def launch_gui(
                                                         ui.button(t("取消"), on_click=lambda event=None, jid=job.job_id: controller.cancel_job(jid)).props("outline color=negative size=sm")
                                                     elif runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
                                                         ui.button(t("重试"), on_click=lambda event=None, jid=job.job_id: controller.retry_job(jid)).props("outline color=primary size=sm")
+                                                    if runtime and runtime.state != QueueState.RUNNING:
+                                                        ui.button(t("删除"), on_click=lambda event=None, jid=job.job_id: controller.remove_job(jid)).props("outline color=negative size=sm")
                     
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("使用说明")).classes("ag-section-title")
@@ -2431,6 +2555,9 @@ def launch_gui(
                     ui.label(t("2. 对失败或已取消的任务点击'重试'按钮")).classes("ag-subtle q-mt-sm")
                     ui.label(t("3. 对运行中的任务点击'取消'按钮")).classes("ag-subtle q-mt-sm")
                     ui.label(t("4. 点击'清空已完成'按钮清理已完成的任务")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("5. 在'添加任务到队列'区域添加新任务")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("6. 对非运行中的任务点击'删除'按钮移除任务")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("7. 使用'保存队列'和'加载队列'功能管理队列文件")).classes("ag-subtle q-mt-sm")
 
     @ui.page("/guide")
     def guide_page() -> None:

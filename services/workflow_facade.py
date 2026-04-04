@@ -38,6 +38,9 @@ def build_args(
     gui: bool = False,
     progress_tracker: Optional[Any] = None,
     cancel_token: Optional[Any] = None,
+    zotero_report: Optional[str] = None,
+    library_path: Optional[str] = None,
+    queue_file: str = "output/_queue/queue.json",
 ) -> argparse.Namespace:
     """Create a Namespace compatible with main.dispatch_command."""
 
@@ -58,6 +61,9 @@ def build_args(
         retry_review_failed=retry_review_failed,
         merge=merge,
         gui=gui,
+        zotero_report=zotero_report,
+        library_path=library_path,
+        queue_file=queue_file,
     )
     setattr(namespace, "free_mode_profile", free_mode_profile)
     setattr(namespace, "free_mode_idea", free_mode_idea)

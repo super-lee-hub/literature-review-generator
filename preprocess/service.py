@@ -853,11 +853,12 @@ class PreprocessManager:
                 used_ocr = False
                 effective_text = raw_text
 
-                if allow_ocr and self._should_try_ocr(scanned_candidate):
-                    ocr_text = self._ocr_page(page)
-                    if ocr_text:
-                        effective_text = ocr_text
-                        used_ocr = True
+                # 避免 OCR 操作以减少崩溃风险
+                # if allow_ocr and self._should_try_ocr(scanned_candidate):
+                #     ocr_text = self._ocr_page(page)
+                #     if ocr_text:
+                #         effective_text = ocr_text
+                #         used_ocr = True
 
                 plain_parts.append(f"\n--- Page {page_number + 1} ---\n{effective_text.strip()}\n")
                 page_blocks.append(
@@ -884,22 +885,37 @@ class PreprocessManager:
         return "".join(plain_parts).strip(), page_diagnostics, page_blocks
 
     def _extract_with_pymupdf4llm(self, pdf_path: str) -> str:
-        import pymupdf4llm  # type: ignore
+        try:
+            # 懒加载 pymupdf4llm，仅在需要时导入
+            import pymupdf4llm  # type: ignore
 
-        markdown_output = pymupdf4llm.to_markdown(pdf_path)
-        if isinstance(markdown_output, str):
-            return markdown_output
-        if isinstance(markdown_output, list):
-            texts: List[str] = []
-            for item in markdown_output:
-                if isinstance(item, str):
-                    texts.append(item)
-                elif isinstance(item, dict):
-                    texts.append(str(item.get("text") or item.get("markdown") or ""))
-            return "\n\n".join([item for item in texts if item.strip()])
-        if isinstance(markdown_output, dict):
-            return str(markdown_output.get("text") or markdown_output.get("markdown") or "")
-        return ""
+            # 捕获可能的崩溃级错误
+            try:
+                markdown_output = pymupdf4llm.to_markdown(pdf_path)
+                if isinstance(markdown_output, str):
+                    return markdown_output
+                if isinstance(markdown_output, list):
+                    texts: List[str] = []
+                    for item in markdown_output:
+                        if isinstance(item, str):
+                            texts.append(item)
+                        elif isinstance(item, dict):
+                            texts.append(str(item.get("text") or item.get("markdown") or ""))
+                    return "\n\n".join([item for item in texts if item.strip()])
+                if isinstance(markdown_output, dict):
+                    return str(markdown_output.get("text") or markdown_output.get("markdown") or "")
+                return ""
+            except Exception as exc:
+                self._log(f"PyMuPDF4LLM to_markdown failed: {exc}", level="warning")
+                return ""
+        except ImportError:
+            self._log("PyMuPDF4LLM not available", level="info")
+            return ""
+        except Exception as exc:
+            self._log(f"PyMuPDF4LLM extraction failed: {exc}", level="warning")
+            return ""
+
+
 
     def _extract_with_legacy_pdf_extractor(
         self,

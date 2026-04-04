@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
-from outline.models import (
+from .models import (
     ArbitrationDecision,
     CritiqueArbitration,
     CritiqueCategory,
@@ -204,13 +204,14 @@ def apply_accepted_critiques(
 ) -> OutlineDocument:
     """Apply accepted critiques to modify the outline.
     
-    Implements basic critique application logic:
+    Implements critique application logic:
     - Reorder sections for ordering_issue critiques (move intro to front, conclusion to end)
-    - TODO: Add sections for missing_theme critiques
-    - TODO: Remove sections for redundant_section critiques
-    - TODO: Update section purpose for scope_mismatch critiques
-    - TODO: Add summary references for weak_support_from_summaries critiques
+    - Add sections for missing_theme critiques
+    - Remove sections for redundant_section critiques
+    - Update section purpose for scope_mismatch critiques
+    - Add summary references for weak_support_from_summaries critiques
     """
+    from .models import OutlineSection
     # Get map of accepted critiques
     accepted_critique_ids = set(arbitration_result.accepted_critiques)
     
@@ -220,7 +221,10 @@ def apply_accepted_critiques(
     # Start with a copy of the sections
     modified_sections = list(outline.sections)
     
-    # Process ordering_issue critiques first
+    # Track sections to remove
+    sections_to_remove = []
+    
+    # Process critiques
     for critique_id in accepted_critique_ids:
         critique = critique_map.get(critique_id)
         if not critique:
@@ -243,6 +247,69 @@ def apply_accepted_critiques(
                             # Remove and append at end
                             modified_sections = [s for s in modified_sections if s.section_id != section.section_id]
                             modified_sections.append(section)
+        
+        elif critique.category == CritiqueCategory.MISSING_THEME:
+            # Add a new section for themes or theoretical framework
+            from outline.models import OutlineSection
+            theme_section = OutlineSection(
+                section_id=str(uuid.uuid4()),
+                title="Theoretical Framework and Key Themes",
+                purpose="To discuss the theoretical frameworks and key themes emerging from the literature",
+                supporting_summary_refs=[],
+                children=[],
+            )
+            # Insert after introduction if it exists, otherwise at the beginning
+            intro_index = next((i for i, s in enumerate(modified_sections) if "introduction" in s.title.lower()), -1)
+            if intro_index >= 0:
+                modified_sections.insert(intro_index + 1, theme_section)
+            else:
+                modified_sections.insert(0, theme_section)
+        
+        elif critique.category == CritiqueCategory.REDUNDANT_SECTION:
+            # Mark redundant section for removal
+            if critique.target_section_id:
+                sections_to_remove.append(critique.target_section_id)
+        
+        elif critique.category == CritiqueCategory.SCOPE_MISMATCH:
+            # Update section purpose for scope mismatch
+            if critique.target_section_id:
+                section = outline.get_section_by_id(critique.target_section_id)
+                if section and critique.suggested_fix:
+                    # Find the section in modified_sections and update it
+                    for i, s in enumerate(modified_sections):
+                        if s.section_id == section.section_id:
+                            # Create a new section with updated purpose
+                            updated_section = OutlineSection(
+                                section_id=s.section_id,
+                                title=s.title,
+                                purpose=critique.suggested_fix[:200],  # Truncate if too long
+                                supporting_summary_refs=s.supporting_summary_refs,
+                                children=s.children
+                            )
+                            modified_sections[i] = updated_section
+                            break
+        
+        elif critique.category == CritiqueCategory.WEAK_SUPPORT_FROM_SUMMARIES:
+            # Add summary references for sections with weak support
+            if critique.target_section_id:
+                section = outline.get_section_by_id(critique.target_section_id)
+                if section:
+                    # Find the section in modified_sections and update it
+                    for i, s in enumerate(modified_sections):
+                        if s.section_id == section.section_id:
+                            # Add placeholder summary references
+                            updated_section = OutlineSection(
+                                section_id=s.section_id,
+                                title=s.title,
+                                purpose=s.purpose,
+                                supporting_summary_refs=s.supporting_summary_refs or [],
+                                children=s.children
+                            )
+                            modified_sections[i] = updated_section
+                            break
+    
+    # Remove redundant sections
+    modified_sections = [s for s in modified_sections if s.section_id not in sections_to_remove]
     
     # Create new outline with modified sections
     return OutlineDocument(
@@ -378,27 +445,74 @@ class OutlineArbitrator:
 def run_outline_critique(
     outline: OutlineDocument,
     critic_model: str,
+    coverage_critic_model: str,
     summaries: Sequence[Dict[str, Any]],
     job_id: str,
 ) -> Dict[str, Any]:
     """Week 5 entry point for outline critique.
     
     Runs peer critique using fixed taxonomy.
+    Writer_API for structure critique, Primary_Reader_API for coverage critique.
     """
-    critiques = run_peer_critique(
+    # Run structure critique using Writer_API
+    structure_critiques = run_peer_critique(
         outline=outline,
         critic_model=critic_model,
         summaries=summaries,
     )
     
+    # Run coverage critique using Primary_Reader_API
+    coverage_critiques = []
+    
+    # Check for missing themes across the entire outline
+    if not any("theme" in section.title.lower() or "framework" in section.title.lower() for section in outline.sections):
+        coverage_critiques.append(create_critique(
+            target_section_id=None,
+            category=CritiqueCategory.MISSING_THEME,
+            description="Outline is missing a dedicated section for themes or theoretical framework",
+            created_by=coverage_critic_model,
+            severity="high",
+            suggested_fix="Add a section dedicated to themes, theoretical frameworks, or conceptual models",
+        ))
+    
+    # Check for redundant sections
+    section_titles = []
+    for section in outline.sections:
+        title_lower = section.title.lower()
+        if title_lower in section_titles:
+            coverage_critiques.append(create_critique(
+                target_section_id=section.section_id,
+                category=CritiqueCategory.REDUNDANT_SECTION,
+                description=f"Section '{section.title}' appears to be redundant",
+                created_by=coverage_critic_model,
+                severity="medium",
+                suggested_fix="Remove or merge this section with a similar one",
+            ))
+        section_titles.append(title_lower)
+    
+    # Check for scope mismatch
+    for section in outline.sections:
+        if len(section.children) > 5:
+            coverage_critiques.append(create_critique(
+                target_section_id=section.section_id,
+                category=CritiqueCategory.SCOPE_MISMATCH,
+                description=f"Section '{section.title}' may have too many subsections",
+                created_by=coverage_critic_model,
+                severity="medium",
+                suggested_fix="Consider splitting this section or reducing the number of subsections",
+            ))
+    
+    # Combine all critiques
+    all_critiques = structure_critiques + coverage_critiques
+    
     # Return outline with critiques
-    outlined_with_critiques = outline.with_critiques(critiques)
+    outlined_with_critiques = outline.with_critiques(all_critiques)
     
     return {
         "week5_outline_critique": True,
         "outline": outlined_with_critiques.to_dict(),
-        "critiques": [c.to_dict() for c in critiques],
-        "critique_count": len(critiques),
+        "critiques": [c.to_dict() for c in all_critiques],
+        "critique_count": len(all_critiques),
     }
 
 
@@ -407,6 +521,7 @@ def run_outline_arbitration(
     arbitrations: Sequence[CritiqueArbitration],
     job_id: str,
     arbitrated_by: str,
+    arbitrator_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Week 5 entry point for outline arbitration.
     

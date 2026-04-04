@@ -49,6 +49,13 @@ class QueueJobSpec:
     parameters: Dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     depends_on_job_ids: List[str] = field(default_factory=list)
+    source_snapshot: Dict[str, Any] = field(default_factory=dict)
+    input_fingerprint: str = ""
+    config_fingerprint: str = ""
+    current_stage: str = ""
+    workspace_path: str = ""
+    log_path: str = ""
+    produced_artifacts: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.created_at:
@@ -60,6 +67,14 @@ class QueueJobSpec:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QueueJobSpec":
+        # 处理可能不存在的字段
+        data.setdefault('source_snapshot', {})
+        data.setdefault('input_fingerprint', '')
+        data.setdefault('config_fingerprint', '')
+        data.setdefault('current_stage', '')
+        data.setdefault('workspace_path', '')
+        data.setdefault('log_path', '')
+        data.setdefault('produced_artifacts', [])
         return cls(**data)
 
 
@@ -72,6 +87,10 @@ class QueueJobRuntime:
     error_message: Optional[str] = None
     result_summary: Optional[Dict[str, Any]] = None
     retry_count: int = 0
+    current_stage: str = ""
+    workspace_path: str = ""
+    log_path: str = ""
+    produced_artifacts: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +101,10 @@ class QueueJobRuntime:
             "error_message": self.error_message,
             "result_summary": self.result_summary,
             "retry_count": self.retry_count,
+            "current_stage": self.current_stage,
+            "workspace_path": self.workspace_path,
+            "log_path": self.log_path,
+            "produced_artifacts": self.produced_artifacts,
         }
 
     @classmethod
@@ -94,6 +117,10 @@ class QueueJobRuntime:
             error_message=data.get("error_message"),
             result_summary=data.get("result_summary"),
             retry_count=data.get("retry_count", 0),
+            current_stage=data.get("current_stage", ""),
+            workspace_path=data.get("workspace_path", ""),
+            log_path=data.get("log_path", ""),
+            produced_artifacts=data.get("produced_artifacts", []),
         )
 
 
@@ -267,6 +294,52 @@ class PersistentQueueService:
             retried_job_ids.append(job.job_id)
         return retried_job_ids
 
+    def save_queue(self, file_path: str | Path) -> None:
+        """保存队列到文件"""
+        save_path = Path(file_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "jobs": {job_id: job.to_dict() for job_id, job in self._jobs.items()},
+            "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
+            "last_updated": self._utc_now(),
+        }
+        temp_path = save_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(save_path)
+
+    def load_queue(self, file_path: str | Path) -> None:
+        """从文件加载队列"""
+        load_path = Path(file_path)
+        if load_path.exists():
+            try:
+                data = json.loads(load_path.read_text(encoding="utf-8"))
+                with self._lock:
+                    # 加载任务
+                    for job_id, job_data in data.get("jobs", {}).items():
+                        self._jobs[job_id] = QueueJobSpec.from_dict(job_data)
+                    # 加载运行时信息
+                    for job_id, runtime_data in data.get("runtimes", {}).items():
+                        self._runtimes[job_id] = QueueJobRuntime.from_dict(runtime_data)
+                    # 保存到当前队列文件
+                    self._save()
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+    def reorder_jobs(self, job_ids: List[str]) -> None:
+        """重排任务顺序"""
+        # 按指定顺序重新排列任务
+        with self._lock:
+            ordered_jobs = {}
+            for job_id in job_ids:
+                if job_id in self._jobs:
+                    ordered_jobs[job_id] = self._jobs[job_id]
+            # 保留未在列表中的任务
+            for job_id, job in self._jobs.items():
+                if job_id not in ordered_jobs:
+                    ordered_jobs[job_id] = job
+            self._jobs = ordered_jobs
+            self._save()
+
 
 def create_queue_job_id() -> str:
     return f"job_{uuid.uuid4().hex[:12]}"
@@ -295,12 +368,16 @@ class QueueRunner:
             if runtime and runtime.state == QueueState.CANCELLED:
                 return
             
+            # 更新任务状态为运行中
             self.queue_service.update_job_state(job_spec.job_id, QueueState.RUNNING)
             
             # 再次检查任务状态，确保没有被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and runtime.state == QueueState.CANCELLED:
                 return
+            
+            # 更新当前阶段
+            self._update_job_stage(job_spec.job_id, "initializing")
             
             # 从job_spec参数构建JobRunRequest
             params = job_spec.parameters
@@ -332,6 +409,9 @@ class QueueRunner:
                 library_path=params.get("library_path"),
             )
             
+            # 更新当前阶段
+            self._update_job_stage(job_spec.job_id, "executing")
+            
             # 执行任务，传入cancel_token
             result = self.job_runner.run(request, cancel_token=cancel_token)
             
@@ -340,14 +420,27 @@ class QueueRunner:
             if runtime and runtime.state == QueueState.CANCELLED:
                 return
             
+            # 更新当前阶段
+            self._update_job_stage(job_spec.job_id, "completing")
+            
             if result.success:
+                # 更新任务状态为完成
                 self.queue_service.update_job_state(job_spec.job_id, QueueState.COMPLETED)
-                self.queue_service.set_job_result(job_spec.job_id, {
+                
+                # 更新任务结果和工件信息
+                result_summary = {
                     "exit_code": result.exit_code,
                     "message": result.message,
                     "workspace_path": result.workspace_path,
                     "job_id": result.job_id,
                     "resume_state": result.resume_state,
+                }
+                self.queue_service.set_job_result(job_spec.job_id, result_summary)
+                
+                # 更新运行时信息
+                self._update_job_runtime_info(job_spec.job_id, {
+                    "workspace_path": result.workspace_path,
+                    "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
                 })
             else:
                 # 检查是否因为取消而失败
@@ -369,6 +462,26 @@ class QueueRunner:
             with self._lock:
                 if job_spec.job_id in self._cancel_tokens:
                     del self._cancel_tokens[job_spec.job_id]
+    
+    def _update_job_stage(self, job_id: str, stage: str) -> None:
+        """更新任务的当前阶段"""
+        with self._lock:
+            if job_id in self.queue_service._runtimes:
+                self.queue_service._runtimes[job_id].current_stage = stage
+                self.queue_service._save()
+    
+    def _update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> None:
+        """更新任务的运行时信息"""
+        with self._lock:
+            if job_id in self.queue_service._runtimes:
+                runtime = self.queue_service._runtimes[job_id]
+                if 'workspace_path' in info:
+                    runtime.workspace_path = info['workspace_path']
+                if 'log_path' in info:
+                    runtime.log_path = info['log_path']
+                if 'produced_artifacts' in info:
+                    runtime.produced_artifacts = info['produced_artifacts']
+                self.queue_service._save()
 
     def run(self) -> None:
         with self._lock:

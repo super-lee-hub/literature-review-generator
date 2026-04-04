@@ -26,6 +26,7 @@ def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path) -> N
             "cache_dir": str(cache_dir),
             "ocr_mode": "off",
             "force_rebuild": "false",
+            "extractor_profile": "fitz",  # 测试默认使用 fitz 提取器，避免 pymupdf4llm 导入
         },
     }
     manager = PreprocessManager(config=config, logger=None)
@@ -65,6 +66,7 @@ def test_preprocess_manager_defaults_to_local_even_with_ambient_mineru_token(tmp
             "cache_dir": str(cache_dir),
             "ocr_mode": "off",
             "force_rebuild": "false",
+            "extractor_profile": "fitz",  # 测试默认使用 fitz 提取器，避免 pymupdf4llm 导入
         },
     }
     manager = PreprocessManager(config=config, logger=None)
@@ -87,6 +89,7 @@ def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path) -> None:
             "cache_dir": str(cache_dir),
             "ocr_mode": "off",
             "force_rebuild": "false",
+            "extractor_profile": "fitz",  # 测试默认使用 fitz 提取器，避免 pymupdf4llm 导入
         },
     }
     manager = PreprocessManager(config=config, logger=None)

@@ -79,16 +79,18 @@ output/<project_name>__<job_id>/
 - Fingerprint mismatches are treated as `non_resumable`.
 - CLI and GUI both enter the same Week 1 execution boundary through `workflow_facade` and the shared config compatibility layer.
 
-## Persistent Queue (Infrastructure Only)
+## Persistent Queue
 
-The project includes a persistent queue infrastructure layer (see `services/queue_service.py`), but it is **not yet integrated into the main GUI or CLI workflow**:
+The project includes a complete persistent queue system with both backend and full GUI integration:
 
 - `QueueJobSpec`: Job specification with parameters and dependencies
 - `QueueJobRuntime`: Runtime state tracking with retry count
 - `PersistentQueueService`: JSON-based persistent queue storage
-- Supports: add_job, update_job_state, retry_failed_jobs, etc.
+- Supports: add_job, update_job_state, retry_failed_jobs, save_queue, load_queue, reorder_jobs, etc.
+- GUI integration: Complete queue management page available at `/queue` with full operations
+- CLI integration: Full set of queue commands available, including batch queue file support
 
-**Note**: The queue system is currently storage-layer only. Full productization (GUI/CLI integration, queue runner, etc.) is planned for a future release.
+**Note**: The queue system is now fully integrated into both GUI and CLI workflows. For detailed status, see the [Feature Matrix](./FEATURE_MATRIX.md).
 
 ## Citation Truth-Source (Week 6 Runtime Upgrade)
 
@@ -121,3 +123,41 @@ output/<project>__<job_id>/
 ### Backward Compatibility
 - V1 manifests auto-migrate to V2 via `migrate_v1_to_v2()`
 - Validator maintains fallback to v1 `citations` field for legacy data
+
+## Feature Status
+
+For a comprehensive overview of all features and their current implementation status, please refer to the [Feature Matrix](./FEATURE_MATRIX.md). This matrix provides a detailed breakdown of each feature's status as `implemented`, `partial`, `legacy`, or `planned`.
+
+### Current Implementation Status
+
+- **P0: Stability and Truth Alignment** - ✅ Completed
+  - Fixed Windows pymupdf4llm/onnxruntime access violation
+  - Unified --zotero-report, --library-path, --queue-file execution chain
+  - Created feature reality matrix
+
+- **P1: Citation Object Main Chain** - ✅ Completed
+  - Modified stage 2 writing to use structured citation refs/tokens
+  - Extended review_draft_v2 block structure
+  - Made citation_manifest_v2 use structured citations as primary truth source
+  - Updated DOCX v2 path to use manifest bibliography
+
+- **P2: Validation and Repair** - ✅ Completed
+  - Updated ReviewValidator input structure
+  - Modified SummaryRechecker to be canonical-only
+  - Implemented repair root cause classification
+
+- **P3: Queue Productization** - ✅ Completed
+  - Extended QueueJobSpec/QueueJobRuntime with additional fields
+  - Added complete queue operations to GUI
+  - Updated CLI to support batch queue files
+
+- **P4: Outline Arbitration** - ✅ Completed
+  - Updated Outline artifact generator_model
+  - Implemented critique process
+  - Removed auto-accept/auto-adopt from workflow
+  - Completed arbitration application logic
+
+- **P5: Documentation and GUI Updates** - ✅ Completed
+  - Updated GUI validation entry and configuration text
+  - Cleaned up test temporary artifacts
+  - Generated new truth source documentation

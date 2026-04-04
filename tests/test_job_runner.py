@@ -21,10 +21,13 @@ class _DummyLogger:
 
 
 class _DummyGenerator:
-    def __init__(self, config_file, project_name, pdf_folder):
+    def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
         self.config_file = config_file
         self.project_name = project_name
         self.pdf_folder = pdf_folder
+        self.queue_file = queue_file
+        self.zotero_report = zotero_report
+        self.library_path = library_path
         self.config = {"Paths": {"output_path": ""}}
         self.logger = _DummyLogger()
         self.progress_tracker = None
@@ -57,8 +60,8 @@ def test_job_runner_creates_workspace_and_pointer(tmp_path, monkeypatch) -> None
     called = {}
 
     class _Generator(_DummyGenerator):
-        def __init__(self, config_file, project_name, pdf_folder):
-            super().__init__(config_file, project_name, pdf_folder)
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
+            super().__init__(config_file, project_name, pdf_folder, queue_file)
             self.config = {"Paths": {"output_path": str(output_dir)}}
 
     def _handle_stage_one(generator, args):
@@ -92,9 +95,9 @@ def test_job_runner_aborts_immediately_when_cancelled_before_start(monkeypatch) 
     constructed = {"count": 0}
 
     class _Generator(_DummyGenerator):
-        def __init__(self, config_file, project_name, pdf_folder):
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
             constructed["count"] += 1
-            super().__init__(config_file, project_name, pdf_folder)
+            super().__init__(config_file, project_name, pdf_folder, queue_file, zotero_report, library_path)
 
     token = CancelToken()
     token.request_cancel()
@@ -125,8 +128,8 @@ def test_job_runner_cancels_at_handler_loop_boundary(tmp_path, monkeypatch) -> N
     result_holder: dict[str, JobRunResult] = {}
 
     class _Generator(_DummyGenerator):
-        def __init__(self, config_file, project_name, pdf_folder):
-            super().__init__(config_file, project_name, pdf_folder)
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
+            super().__init__(config_file, project_name, pdf_folder, queue_file)
             self.config = {"Paths": {"output_path": str(output_dir)}}
 
     def _handle_stage_one(generator, _args):
@@ -178,8 +181,8 @@ def test_job_runner_marks_failed_handler_in_result_pointer_and_resume_report(tmp
     output_dir = tmp_path / "output"
 
     class _Generator(_DummyGenerator):
-        def __init__(self, config_file, project_name, pdf_folder):
-            super().__init__(config_file, project_name, pdf_folder)
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
+            super().__init__(config_file, project_name, pdf_folder, queue_file)
             self.config = {"Paths": {"output_path": str(output_dir)}}
 
     monkeypatch.setattr(main, "LiteratureReviewGenerator", _Generator)

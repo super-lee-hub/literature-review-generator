@@ -158,6 +158,29 @@ nul
 *_literature_review_outline.md
 *_literature_review.docx
 *_free_mode_profile.json
+*_queue.json
+*_review_draft.json
+*_citation_manifest.json
 
 # iFlow CLI generated files
 IFLOW.md
+
+# Test temporary artifacts
+test-*.json
+test-*.md
+test-*.xlsx
+test-*.docx
+
+# Chroma DB for RAG
+chroma_db/
+
+# MinerU related
+.mineru/
+
+# ONNX runtime temporary files
+*.onnx
+*.ort
+
+# pymupdf4llm temporary files
+*.fitz
+*.pymupdf

@@ -501,6 +501,11 @@ def build_citation_manifest_v2_from_review_draft(
                     paper_key = citation.get('paper_key', paper_id)
                     # Fixed priority order: citation_token > raw_text > text
                     citation_token = citation.get('citation_token', citation.get('raw_text', citation.get('text', '')))
+                    # Set default citation_token if all are empty
+                    if not citation_token and paper_id:
+                        citation_token = f"({paper_id}, n.d.)"
+                    elif not citation_token:
+                        citation_token = "(Unknown, n.d.)"
                     mode = citation.get('mode', 'parenthetical')
                     locator = citation.get('locator', None)
                     span_start = citation.get('span_start')
@@ -515,7 +520,7 @@ def build_citation_manifest_v2_from_review_draft(
                                 paper_id = parsed_paper_id
                     
                     # If paper_id not set, try to match from citation_token
-                    if not paper_id or paper_id == 'unknown' and citation_token:
+                    if not paper_id or (paper_id == 'unknown' and citation_token):
                         matched_id, matched_key = _match_citation_to_paper(citation_token, paper_key_to_info)
                         paper_id = matched_id
                         paper_key = matched_key

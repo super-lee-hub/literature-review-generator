@@ -281,8 +281,10 @@ class RepairApplier:
         
         Skips patches that fail guard checks.
         Returns result with applied and rejected counts.
+        Automatically triggers targeted recheck after repair application.
         """
         applied_ids: List[str] = []
+        recheck_triggered: List[str] = []
         
         for proposal in self.repair_plan.proposals:
             # Add plan_id to metadata
@@ -311,12 +313,26 @@ class RepairApplier:
             if record:
                 self.applied_records.append(record)
                 applied_ids.append(proposal.proposal_id)
+                
+                # Auto-trigger targeted recheck based on root cause
+                if proposal.root_cause == RepairRootCause.SUMMARY_DRIFT:
+                    # Trigger targeted summary recheck
+                    recheck_triggered.append(f"summary_recheck:{proposal.metadata.get('paper_id')}")
+                elif proposal.root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
+                    # Trigger citation mapping recheck and manifest update
+                    recheck_triggered.append(f"citation_mapping_recheck:{proposal.citation_id}")
+                elif proposal.root_cause == RepairRootCause.REVIEW_DRIFT:
+                    # Trigger block/span recheck
+                    recheck_triggered.append(f"review_recheck:{proposal.target.block_id}")
             else:
                 self.rejected_proposals.append({
                     "proposal_id": proposal.proposal_id,
                     "citation_id": proposal.citation_id,
                     "reason": "apply_failed",
                 })
+        
+        # Note: AppliedPatchRecord doesn't have metadata field, so we'll just track rechecks in the result
+        # Rechecks are triggered based on root cause, and will be handled in the calling code
         
         return RepairApplyResult(
             success=len(self.applied_records) > 0,

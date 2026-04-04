@@ -50,6 +50,8 @@ class ReviewBlock:
     anchor_text: str = ""
     anchor_hash: str = ""
     citations: List[Dict[str, Any]] = field(default_factory=list)
+    block_source: str = "model_generated"
+    span_map: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -319,6 +321,8 @@ def _parse_section_into_blocks(
             anchor_text=anchor_text,
             anchor_hash=anchor_hash,
             citations=citations,
+            block_source="model_generated",
+            span_map={},
         ))
 
     return blocks
@@ -422,6 +426,8 @@ def build_review_draft_v2(
                     anchor_text=anchor_text,
                     anchor_hash=anchor_hash,
                     citations=normalized_citations,
+                    block_source=block_data.get('block_source', 'model_generated'),
+                    span_map=block_data.get('span_map', {}),
                 ))
         else:
             # Old input mode: parse from content
