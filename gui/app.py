@@ -32,6 +32,7 @@ from services.environment_service import (
 )
 from services.workflow_facade import build_args, run_dispatch
 from services.progress_service import ProgressTracker
+from services.queue_service import PersistentQueueService, QueueState
 from gui.i18n import LANGUAGE_OPTIONS, action_label, translate
 
 try:
@@ -761,6 +762,47 @@ class WorkspaceController:
                 "api_base": api_base,
                 "api_key": self.env_values.get(API_ENV_MAPPING[section_name], ""),
             }
+        
+        # 初始化队列服务
+        self._queue_service: Optional[Any] = None
+        self._init_queue_service()
+
+    def _init_queue_service(self) -> None:
+        """初始化队列服务"""
+        try:
+            output_path = Path(self.state["paths"]["output_path"])
+            queue_file_path = output_path / "_queue" / "queue.json"
+            self._queue_service = PersistentQueueService(queue_file_path)
+        except Exception as e:
+            self._queue_service = None
+
+    def refresh_queue(self) -> None:
+        """刷新队列状态"""
+        if self._queue_service:
+            ui.notify(self.t("队列已刷新"))
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def clear_completed_jobs(self) -> None:
+        """清空已完成的任务"""
+        if self._queue_service:
+            try:
+                jobs = self._queue_service.list_jobs()
+                count = 0
+                for job in jobs:
+                    runtime = self._queue_service.get_job_runtime(job.job_id)
+                    if runtime and runtime.state in (
+                        QueueState.COMPLETED,
+                        QueueState.FAILED,
+                        QueueState.CANCELLED,
+                    ):
+                        self._queue_service.remove_job(job.job_id)
+                        count += 1
+                ui.notify(self.tf("已清空已完成任务 {count}", count=count))
+            except Exception as e:
+                ui.notify(self.tf("清空失败: {e}", e=str(e)), type="negative")
+        else:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
 
     def t(self, key: str) -> str:
         return translate(self.language, key)
@@ -2236,8 +2278,8 @@ def launch_gui(
                 with ui.card().classes("ag-card ag-card-strong p-6"):
                     ui.label(t("队列状态")).classes("ag-section-title")
                     with ui.row().classes("gap-2 q-mt-md"):
-                        refresh_button = ui.button(t("刷新队列"), on_click=lambda: ui.notify(t("队列已刷新"))).props("unelevated")
-                        clear_button = ui.button(t("清空已完成"), on_click=lambda: ui.notify(t("已清空已完成任务"))).props("outline")
+                        ui.button(t("刷新队列"), on_click=controller.refresh_queue).props("unelevated")
+                        ui.button(t("清空已完成"), on_click=controller.clear_completed_jobs).props("outline")
                     
                     with ui.card().classes("ag-card p-6 q-mt-md"):
                         ui.label(t("队列任务列表")).classes("ag-section-title")

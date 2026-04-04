@@ -279,6 +279,13 @@ ACTION_LABELS["en"].update(
     }
 )
 
+TRANSLATIONS["zh-CN"].update(
+    {
+        "已清空已完成任务 {count}": "已清空 {count} 个已完成任务",
+        "清空失败: {e}": "清空失败: {e}",
+    }
+)
+
 TRANSLATIONS["en"].update(
     {
         "任务": "Tasks",
@@ -304,6 +311,8 @@ TRANSLATIONS["en"].update(
         "清空已完成": "Clear Completed",
         "暂无队列任务": "No queued jobs yet.",
         "队列服务未初始化": "Queue service not initialized.",
+        "已清空已完成任务 {count}": "Cleared {count} completed jobs",
+        "清空失败: {e}": "Clear failed: {e}",
     }
 )
 
