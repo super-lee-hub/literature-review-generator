@@ -4160,65 +4160,80 @@ class LiteratureReviewGenerator:
                     for c in critiques_list
                 ]
                 
-                # Run arbitration
-                arbitration_result = run_outline_arbitration(
-                    outline=outline_doc,
-                    arbitrations=arbitrations,
-                    job_id=self.job_workspace.job_id,
-                    arbitrated_by="workflow",
-                )
+                # Run arbitration with error handling
+                arbitration_result = None
+                arbitration_path = None
+                try:
+                    arbitration_result = run_outline_arbitration(
+                        outline=outline_doc,
+                        arbitrations=arbitrations,
+                        job_id=self.job_workspace.job_id,
+                        arbitrated_by="workflow",
+                    )
+                    
+                    # Save arbitration result
+                    arbitration_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_arbitration.json")
+                    atomic_write_json(arbitration_path, arbitration_result)
+                    
+                    self.artifact_registry.register_file(
+                        artifact_role="outline_arbitration",
+                        artifact_type="outline_arbitration_result",
+                        artifact_version="v1",
+                        path=arbitration_path,
+                        producer="main.LiteratureReviewGenerator.create_literature_review_outline",
+                        artifact_id="outline_arbitration:v1",
+                        depends_on=[
+                            ArtifactDependencyRef(
+                                artifact_type="outline_critique",
+                                path=critique_path,
+                            )
+                        ],
+                    )
+                    
+                    self.logger.success(f"Week5 outline arbitration saved to: {arbitration_path}")
+                except Exception as arb_exc:
+                    self.logger.error(f"Week5 outline arbitration failed: {arb_exc}")
+                    import traceback
+                    traceback.print_exc()
+                    self.logger.warning("Skipping Week5 arbitration and adopt steps due to error")
                 
-                # Save arbitration result
-                arbitration_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_arbitration.json")
-                atomic_write_json(arbitration_path, arbitration_result)
-                
-                self.artifact_registry.register_file(
-                    artifact_role="outline_arbitration",
-                    artifact_type="outline_arbitration_result",
-                    artifact_version="v1",
-                    path=arbitration_path,
-                    producer="main.LiteratureReviewGenerator.create_literature_review_outline",
-                    artifact_id="outline_arbitration:v1",
-                    depends_on=[
-                        ArtifactDependencyRef(
-                            artifact_type="outline_critique",
-                            path=critique_path,
+                # Run explicit adopt with error handling (only if arbitration succeeded)
+                if arbitration_result is not None and arbitration_path is not None:
+                    try:
+                        from outline.models import OutlineArbitrationResult
+                        arb_result_obj = OutlineArbitrationResult.from_dict(arbitration_result["arbitration_result"])
+                        adopt_result = run_outline_adopt(
+                            outline=outline_doc,
+                            arbitration_result=arb_result_obj,
+                            job_id=self.job_workspace.job_id,
+                            adopted_by="workflow",
                         )
-                    ],
-                )
-                
-                self.logger.success(f"Week5 outline arbitration saved to: {arbitration_path}")
-                
-                # Run explicit adopt
-                from outline.models import OutlineArbitrationResult
-                arb_result_obj = OutlineArbitrationResult.from_dict(arbitration_result["arbitration_result"])
-                adopt_result = run_outline_adopt(
-                    outline=outline_doc,
-                    arbitration_result=arb_result_obj,
-                    job_id=self.job_workspace.job_id,
-                    adopted_by="workflow",
-                )
-                
-                # Save reviewed outline
-                reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.json")
-                atomic_write_json(reviewed_outline_path, adopt_result["reviewed_outline"])
-                
-                self.artifact_registry.register_file(
-                    artifact_role="reviewed_outline",
-                    artifact_type="reviewed_outline_document",
-                    artifact_version="v1",
-                    path=reviewed_outline_path,
-                    producer="main.LiteratureReviewGenerator.create_literature_review_outline",
-                    artifact_id="reviewed_outline:v1",
-                    depends_on=[
-                        ArtifactDependencyRef(
-                            artifact_type="outline_arbitration_result",
-                            path=arbitration_path,
+                        
+                        # Save reviewed outline
+                        reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.json")
+                        atomic_write_json(reviewed_outline_path, adopt_result["reviewed_outline"])
+                        
+                        self.artifact_registry.register_file(
+                            artifact_role="reviewed_outline",
+                            artifact_type="reviewed_outline_document",
+                            artifact_version="v1",
+                            path=reviewed_outline_path,
+                            producer="main.LiteratureReviewGenerator.create_literature_review_outline",
+                            artifact_id="reviewed_outline:v1",
+                            depends_on=[
+                                ArtifactDependencyRef(
+                                    artifact_type="outline_arbitration_result",
+                                    path=arbitration_path,
+                                )
+                            ],
                         )
-                    ],
-                )
-                
-                self.logger.success(f"Week5 reviewed outline saved to: {reviewed_outline_path}")
+                        
+                        self.logger.success(f"Week5 reviewed outline saved to: {reviewed_outline_path}")
+                    except Exception as adopt_exc:
+                        self.logger.error(f"Week5 outline adopt failed: {adopt_exc}")
+                        import traceback
+                        traceback.print_exc()
+                        self.logger.warning("Skipping Week5 adopt step due to error")
             
             # 保存大纲文件
             

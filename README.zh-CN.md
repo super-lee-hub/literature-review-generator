@@ -130,6 +130,51 @@ output/<project_name>__<job_id>/
 - fingerprint 不一致的状态会被视为 `non_resumable`
 - GUI 和 CLI 现在都通过同一套 facade + compat 底层语义进入工作流
 
+## 4. 当前架构状态（Week 0-5 已完成）
+
+本项目已从简单的三阶段脚本演进为结构化工作台。Week 0-5 主骨架现已完成：
+
+### 核心基础设施（Week 1）
+- **Job Workspace**：带 artifact registry 的隔离执行环境
+- **Artifact Registry**：所有生成产物的持久化追踪
+- **Workflow Facade**：CLI 和 GUI 的统一入口
+
+### 核心契约（Week 2-3）
+- **Review Draft V2**：块/段结构的综述内容
+- **Citation Manifest V2**：带有 occurrence/cluster 语义的引用真值层
+- **Paper Artifact**：持久化的论文分析记录
+- **Validation Pipeline**：带证据解析器的基于证据的验证
+
+### 修复链路（Week 4）
+- **Repair Planner**：识别问题但不立即应用
+- **Repair Apply**：仅在明确批准时应用修复
+- **Integration**：完整流水线集成
+
+### 大纲批评与仲裁（Week 5）
+- **JSON-first Outline**：结构化大纲表示
+- **Critique**：自动化大纲质量批评
+- **Arbitration**：多个批评之间的冲突解决
+- **Adopt**：安全采用仲裁结果
+
+## 5. 持久化队列（MVP）
+
+项目现在包含持久化队列系统（参见 `services/queue_service.py`）：
+
+- `QueueJobSpec`：带参数和依赖关系的作业规范
+- `QueueJobRuntime`：带重试计数的运行时状态追踪
+- `PersistentQueueService`：基于 JSON 的持久化队列存储
+- 支持：add_job、update_job_state、retry_failed_jobs 等
+
+## 6. 引用真值层
+
+引用系统已升级到 V2（参见 `services/citation_manifest.py`）：
+
+- `CitationOccurrence`：块/段级别的引用出现
+- `CitationCluster`：论文级别的引用簇
+- `BibliographyEntry`：带 `is_cited` 标志的参考文献条目
+- `get_cited_bibliography()`：仅从实际被引论文生成参考文献
+- 向后兼容：V1 manifest 可迁移到 V2
+
 ## 4. GUI 和 CLI 对应关系
 
 GUI 工作台里现在有这些动作：
