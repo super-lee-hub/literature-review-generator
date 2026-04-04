@@ -322,6 +322,63 @@ def migrate_v1_to_v2(v1_manifest: CitationManifestV1) -> CitationManifestV2:
     )
 
 
+def _create_citation_occurrence(
+    occurrence_id: str,
+    citation_token: str,
+    paper_id: str,
+    paper_key: str,
+    section_number: int,
+    section_title: str,
+    block_id: str,
+    block_order: int,
+    block_text: str,
+) -> CitationOccurrence:
+    """Create a CitationOccurrence with standardized fields."""
+    return CitationOccurrence(
+        occurrence_id=occurrence_id,
+        citation_token=citation_token,
+        paper_id=paper_id,
+        paper_key=paper_key,
+        section_number=section_number,
+        section_title=section_title,
+        block_id=block_id,
+        block_order=block_order,
+        spans=[],
+        context_before=block_text[:200] if len(block_text) > 200 else block_text,
+        context_after="",
+    )
+
+
+def _update_occurrence_map(
+    paper_occurrence_map: Dict[str, List[str]],
+    paper_id: str,
+    occurrence_id: str,
+) -> None:
+    """Update the paper occurrence map with a new occurrence."""
+    if paper_id not in paper_occurrence_map:
+        paper_occurrence_map[paper_id] = []
+    paper_occurrence_map[paper_id].append(occurrence_id)
+
+
+def _match_citation_to_paper(
+    citation_token: str,
+    paper_key_to_info: Dict[str, Dict[str, Any]],
+) -> tuple[str, str]:
+    """Match a citation token to a paper using heuristics.
+    
+    Returns:
+        Tuple of (paper_id, paper_key)
+    """
+    citation_lower = citation_token.lower()
+    for title_key, paper_data in paper_key_to_info.items():
+        # Check if author names from paper appear in citation
+        authors = paper_data.get('authors', [])
+        for author in authors:
+            if author.lower() in citation_lower:
+                return paper_data['paper_id'], paper_data['paper_key']
+    return "unknown", "unknown"
+
+
 def build_citation_manifest_v2_from_review_draft(
     *,
     job_id: str,
@@ -385,8 +442,8 @@ def build_citation_manifest_v2_from_review_draft(
                     paper_key = citation.get('paper_key', paper_id)
                     citation_token = citation.get('text', f"({paper_key}, {citation.get('year', 'n.d.')})")
                     
-                    # Create occurrence
-                    occurrence = CitationOccurrence(
+                    # Create occurrence using helper function
+                    occurrence = _create_citation_occurrence(
                         occurrence_id=occurrence_id,
                         citation_token=citation_token,
                         paper_id=paper_id,
@@ -395,15 +452,10 @@ def build_citation_manifest_v2_from_review_draft(
                         section_title=section_title,
                         block_id=block_id,
                         block_order=block_order,
-                        spans=[],
-                        context_before=block_text[:200] if len(block_text) > 200 else block_text,
-                        context_after="",
+                        block_text=block_text,
                     )
                     occurrences.append(occurrence)
-                    
-                    if paper_id not in paper_occurrence_map:
-                        paper_occurrence_map[paper_id] = []
-                    paper_occurrence_map[paper_id].append(occurrence_id)
+                    _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
             else:
                 # Priority 2: Fallback to regex extraction from free-form text
                 citation_pattern = r'\([^)]+,\s*\d{4}[^)]*\)'
@@ -413,25 +465,11 @@ def build_citation_manifest_v2_from_review_draft(
                     occurrence_counter += 1
                     occurrence_id = f"occ_{occurrence_counter}"
                     
-                    # Try to match citation to paper
-                    paper_id = "unknown"
-                    paper_key = "unknown"
+                    # Match citation to paper using helper function
+                    paper_id, paper_key = _match_citation_to_paper(citation_token, paper_key_to_info)
                     
-                    # Simple heuristic: check if any paper title or author appears in citation
-                    citation_lower = citation_token.lower()
-                    for title_key, paper_data in paper_key_to_info.items():
-                        # Check if author names from paper appear in citation
-                        authors = paper_data.get('authors', [])
-                        for author in authors:
-                            if author.lower() in citation_lower:
-                                paper_id = paper_data['paper_id']
-                                paper_key = paper_data['paper_key']
-                                break
-                        if paper_id != "unknown":
-                            break
-                    
-                    # Create occurrence
-                    occurrence = CitationOccurrence(
+                    # Create occurrence using helper function
+                    occurrence = _create_citation_occurrence(
                         occurrence_id=occurrence_id,
                         citation_token=citation_token,
                         paper_id=paper_id,
@@ -440,15 +478,10 @@ def build_citation_manifest_v2_from_review_draft(
                         section_title=section_title,
                         block_id=block_id,
                         block_order=block_order,
-                        spans=[],
-                        context_before=block_text[:200] if len(block_text) > 200 else block_text,
-                        context_after="",
+                        block_text=block_text,
                     )
                     occurrences.append(occurrence)
-                    
-                    if paper_id not in paper_occurrence_map:
-                        paper_occurrence_map[paper_id] = []
-                    paper_occurrence_map[paper_id].append(occurrence_id)
+                    _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
     
     # Build clusters from occurrence map
     for paper_id, occ_ids in paper_occurrence_map.items():
