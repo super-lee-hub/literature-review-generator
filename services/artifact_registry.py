@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 from services.job_workspace import atomic_write_json, utc_now_iso
 

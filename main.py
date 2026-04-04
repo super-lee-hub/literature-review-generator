@@ -3913,7 +3913,7 @@ class LiteratureReviewGenerator:
                 if self._stage2_validation_enabled():
                     self.logger.info("根据配置文件自动启动第二阶段验证...")
                     from validator import run_review_validation
-                    validation_result = run_review_validation(self)
+                    validation_result: Dict[str, Any] = run_review_validation(self)  # type: ignore
                     if validation_result.get("success"):
                         self.logger.success("第二阶段验证完成！验证报告已生成。")
                         
@@ -3931,19 +3931,23 @@ class LiteratureReviewGenerator:
                             self.job_workspace is not None,
                             self.artifact_registry is not None,
                         ]):
-                            self.logger.info("Starting Week4 repair pipeline (report-first policy)...")
-                            from services.repair_integration import run_repair_pipeline
-                            repair_result = run_repair_pipeline(
-                                validation_report=validation_report,
-                                review_draft=review_draft,
-                                citation_manifest=citation_manifest,
-                                paper_artifacts=paper_artifacts,
-                                job_id=self.job_workspace.job_id,
-                                workspace=self.job_workspace,
-                                registry=self.artifact_registry,
-                                auto_apply=False,  # Default: report-first policy
-                            )
-                            self.logger.success(f"Week4 repair pipeline completed: {repair_result}")
+                            try:
+                                self.logger.info("Starting Week4 repair pipeline (report-first policy)...")
+                                from services.repair_integration import run_repair_pipeline
+                                repair_result = run_repair_pipeline(
+                                    validation_report=validation_report,
+                                    review_draft=review_draft,
+                                    citation_manifest=citation_manifest,
+                                    paper_artifacts=paper_artifacts,
+                                    job_id=self.job_workspace.job_id,
+                                    workspace=self.job_workspace,
+                                    registry=self.artifact_registry,
+                                    auto_apply=False,  # Default: report-first policy
+                                )
+                                self.logger.success(f"Week4 repair pipeline completed: {repair_result}")
+                            except Exception as repair_error:
+                                self.logger.error(f"Week4 repair pipeline failed: {repair_error}")
+                                self.logger.warning("修复管道失败，但验证流程将继续。请检查修复相关文件。")
                     else:
                         self.logger.warning("第二阶段验证失败，请检查验证报告文件。")
                 else:
