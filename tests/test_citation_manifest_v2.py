@@ -122,15 +122,18 @@ def test_get_cited_bibliography() -> None:
 
 def test_get_occurrences_for_paper() -> None:
     occ1 = CitationOccurrence(
-        occurrence_id="o1", citation_token="t1", paper_id="p1", paper_key="p1",
+        occurrence_id="o1", citation_token="t1",
+        paper_id="internal_p1", paper_key="paper_key_p1",
         section_number=1, section_title="", block_id="", block_order=1,
     )
     occ2 = CitationOccurrence(
-        occurrence_id="o2", citation_token="t2", paper_id="p2", paper_key="p2",
+        occurrence_id="o2", citation_token="t2",
+        paper_id="internal_p2", paper_key="paper_key_p2",
         section_number=2, section_title="", block_id="", block_order=1,
     )
     occ3 = CitationOccurrence(
-        occurrence_id="o3", citation_token="t3", paper_id="p1", paper_key="p1",
+        occurrence_id="o3", citation_token="t3",
+        paper_id="internal_p1", paper_key="paper_key_p1",
         section_number=3, section_title="", block_id="", block_order=1,
     )
     
@@ -140,11 +143,11 @@ def test_get_occurrences_for_paper() -> None:
         occurrences=[occ1, occ2, occ3],
     )
     
-    p1_occs_by_id = manifest.get_occurrences_for_paper("p1")
+    p1_occs_by_id = manifest.get_occurrences_for_paper("internal_p1")
     assert len(p1_occs_by_id) == 2
     assert {o.occurrence_id for o in p1_occs_by_id} == {"o1", "o3"}
     
-    p1_occs_by_key = manifest.get_occurrences_for_paper("p1")
+    p1_occs_by_key = manifest.get_occurrences_for_paper("paper_key_p1")
     assert len(p1_occs_by_key) == 2
     assert {o.occurrence_id for o in p1_occs_by_key} == {"o1", "o3"}
 
@@ -173,8 +176,12 @@ def test_get_occurrences_for_paper_with_different_id_and_key() -> None:
 
 def test_get_cluster_for_paper() -> None:
     cluster = CitationCluster(
-        cluster_id="c1", paper_id="p1", paper_key="p1",
-        occurrence_ids=["o1"], first_occurrence_section=1, total_occurrences=1,
+        cluster_id="c1",
+        paper_id="internal_p1",
+        paper_key="paper_key_p1",
+        occurrence_ids=["o1"],
+        first_occurrence_section=1,
+        total_occurrences=1,
     )
     
     manifest = build_citation_manifest_v2(
@@ -183,11 +190,11 @@ def test_get_cluster_for_paper() -> None:
         clusters=[cluster],
     )
     
-    found_by_id = manifest.get_cluster_for_paper("p1")
+    found_by_id = manifest.get_cluster_for_paper("internal_p1")
     assert found_by_id is not None
     assert found_by_id.cluster_id == "c1"
     
-    found_by_key = manifest.get_cluster_for_paper("p1")
+    found_by_key = manifest.get_cluster_for_paper("paper_key_p1")
     assert found_by_key is not None
     assert found_by_key.cluster_id == "c1"
     
