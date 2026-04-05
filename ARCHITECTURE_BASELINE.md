@@ -131,6 +131,9 @@ Any non-atomic pointer update is considered a migration bug.
 | Citations | Word / regex | `citation_manifest_v2.json` | `citation_manifest_v1.json` | Week 3 |
 | Validation Reports | Legacy validator | `validation/review_validator.py` outputs | TBD | Week 4 |
 | Configuration | `Performance` section | `Validation` section | Bi-directional sync | Week 0 |
+| Queue | N/A | `Queue` section | N/A | Week 5 |
+| Stage1 Visual | N/A | `Stage1_Visual` section | N/A | Week 5 |
+| Multimodal | N/A | `Multimodal` section | N/A | Week 5 |
 
 ## Write-Stop Timeline
 

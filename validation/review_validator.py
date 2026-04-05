@@ -4,7 +4,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence
 from enum import Enum
 
-from validation.evidence_resolver import EvidenceCandidate, EvidenceResolver, EvidenceResolverContext, build_evidence_resolver_context
+from .evidence_resolver import EvidenceCandidate, EvidenceResolver, EvidenceResolverContext, build_evidence_resolver_context
+from . import PreprocessEvidence, PreprocessEvidenceLoader, build_evidence_context_from_preprocess
 
 
 class ValidationConclusion(Enum):
@@ -73,6 +74,7 @@ class ReviewValidator:
         })
         self.preprocess_evidence = preprocess_evidence or {}
         self.paper_metadata = paper_metadata or {}
+        self.evidence_loader = PreprocessEvidenceLoader()
 
     def validate(self) -> ReviewValidationReport:
         from datetime import datetime
@@ -173,11 +175,31 @@ class ReviewValidator:
         # Get paper metadata for this paper if available
         paper_specific_metadata = self.paper_metadata.get(paper_id, {})
 
-        # Create resolver context with preprocess evidence and paper metadata
+        # Load evidence using PreprocessEvidenceLoader
+        evidence = self.evidence_loader.load_evidence(
+            plain_text_path=paper_preprocess_evidence.get("plain_text_path"),
+            page_index_path=paper_preprocess_evidence.get("page_index_path"),
+            chunks_path=paper_preprocess_evidence.get("chunks_path"),
+            structured_json_path=paper_preprocess_evidence.get("structured_json_path"),
+            manifest_path=paper_preprocess_evidence.get("manifest_path"),
+            visual_artifacts_path=paper_preprocess_evidence.get("visual_artifacts_path"),
+            diagnostics_path=paper_preprocess_evidence.get("diagnostics_path")
+        )
+
+        # Create resolver context with loaded evidence and paper metadata
         resolver_context = EvidenceResolverContext(
             paper_key=paper_artifact.get("paper_identity", {}).get("canonical_paper_key", ""),
             paper_identity=paper_artifact.get("paper_identity", {}),
-            preprocess_artifacts=paper_artifact.get("analysis", {}).get("preprocess", {}),
+            preprocess_artifacts={
+                "normalized_text": evidence.normalized_text,
+                "plain_text": evidence.plain_text,
+                "page_index": evidence.page_index,
+                "chunks": evidence.chunks,
+                "structured_json": evidence.structured_json,
+                "manifest": evidence.manifest,
+                "visual_artifacts": evidence.visual_artifacts,
+                "diagnostics": evidence.diagnostics
+            },
             paper_artifact=paper_artifact,
             preprocess_evidence=paper_preprocess_evidence,
             paper_metadata=paper_specific_metadata

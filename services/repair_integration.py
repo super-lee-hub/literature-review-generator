@@ -143,12 +143,18 @@ def run_repair_pipeline(
     2. Persist repair plan and report
     3. Apply repairs (if auto_apply is True, otherwise report-only)
     4. Persist apply results
-    5. Return patched review_draft if repairs were applied
+    5. Generate new review_draft, citation_manifest, and review docx
+    6. Run review recheck
+    7. Return patched review_draft if repairs were applied
     
     Default policy is report-first, not silent auto-apply.
     """
     from validation.repair_planner import RepairPlanner
     from validation.repair_models import RepairPolicy
+    from services.review_draft import build_review_draft_v2
+    from services.citation_manifest import build_citation_manifest_v2, build_citation_manifest_v2_from_review_draft
+    from docx_writer import create_word_document, generate_apa_references_from_manifest
+    from validator import run_review_validation
     
     # Step 1: Create repair plan
     policy = RepairPolicy.AUTO_APPLY_SAFE if auto_apply else RepairPolicy.REPORT_FIRST
@@ -202,6 +208,104 @@ def run_repair_pipeline(
         result["patched_review_draft"] = apply_result.get("patched_review_draft")
         result["applied_count"] = apply_result_obj.applied_count
         result["rejected_count"] = apply_result_obj.rejected_count
+        
+        # Step 5: Generate new review_draft, citation_manifest, and review docx
+        if apply_result.get("patched_review_draft"):
+            patched_review_draft = apply_result["patched_review_draft"]
+            
+            # Generate new citation manifest from patched review draft
+            new_citation_manifest = build_citation_manifest_v2_from_review_draft(
+                job_id=job_id,
+                project_name="repair",
+                manifest_id=f"manifest_{job_id}",
+                review_draft_path="",
+                review_word_path="",
+                review_draft_v2=patched_review_draft,
+                paper_summaries=list(paper_artifacts)
+            )
+            
+            # Generate new review docx
+            docx_path = workspace.artifact_path(f"review_{job_id}_repaired.docx")
+            create_word_document(
+                docx_path,
+                "Repaired Literature Review",
+                ["Introduction", "Methodology", "Results", "Discussion", "Conclusion"],
+                "",
+                []
+            )
+            
+            # Generate APA references from new citation manifest
+            # Create a simple generator instance mock
+            class MockLogger:
+                def info(self, *args):
+                    pass
+                def warning(self, *args):
+                    pass
+                def error(self, *args):
+                    pass
+                def success(self, *args):
+                    pass
+                def warn(self, *args):
+                    pass
+                def debug(self, *args):
+                    pass
+            
+            class MockGenerator:
+                def __init__(self, workspace):
+                    self.logger = MockLogger()
+                    self.config = {
+                        'Performance': {'enable_stage2_validation': 'True'},
+                        'Paths': {'output_path': workspace.base_output_dir},
+                        'Primary_Reader_API': {'api_key': 'mock_key'},
+                        'Writer_API': {'api_key': 'mock_key'}
+                    }
+                    self.compat_config = None
+                    self.output_dir = workspace.base_output_dir
+                    self.project_name = "repair"
+                    self.summaries = []
+                    self.failed_papers = []
+                    self.processed_count = type('Counter', (), {'value': 0, 'get_value': lambda self: self.value, 'set': lambda self, val: setattr(self, 'value', val)})()
+                    self.failed_count = type('Counter', (), {'value': 0, 'get_value': lambda self: self.value, 'set': lambda self, val: setattr(self, 'value', val)})()
+                    self.progress_tracker = None
+                    self.free_mode_profile_path = None
+                    self.free_mode_profile = None
+                    self.free_mode_idea = None
+                    self.cancel_token = None
+                    self.job_workspace = workspace
+                    self.artifact_registry = None
+                    self.job_fingerprint_bundle = {}
+                    self.resume_state_report = None
+                    self.queue_service = None
+                    self.mode = "direct"
+                    self.pdf_folder = None
+                    self.zotero_report = None
+                    self.library_path = None
+                    self.summary_file = workspace.artifact_path("repair_summaries.json")
+                    self.papers = []
+                    self.source_descriptors = []
+                    self.preprocess_manager = None
+                    self.save_lock = None
+                
+                def _get_summary_file_path(self):
+                    return self.summary_file
+                
+                def _get_report_file_path(self, suffix):
+                    return self.job_workspace.artifact_path(f"repair{suffix}")
+                
+                def _stage2_validation_enabled(self):
+                    return True
+            
+            mock_generator = MockGenerator(workspace)
+            references = generate_apa_references_from_manifest(new_citation_manifest.to_dict(), mock_generator)
+            
+            # Step 6: Run review recheck
+            try:
+                recheck_result = run_review_validation(mock_generator)
+                result["recheck_result"] = recheck_result
+                result["recheck_success"] = recheck_result.get("success", False)
+            except Exception as recheck_error:
+                result["recheck_error"] = str(recheck_error)
+                result["recheck_success"] = False
     else:
         # Report-only mode
         result["message"] = "Repair plan created but not applied (report-first policy). Use auto_apply=True to apply repairs."

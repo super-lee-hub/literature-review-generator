@@ -148,13 +148,22 @@ output/<project_name>__<job_id>/
 ### 修复链路（Week 4）
 - **Repair Planner**：识别问题但不立即应用
 - **Repair Apply**：仅在明确批准时应用修复
-- **Integration**：完整流水线集成
+- **Integration**：完整流水线集成，包括修复后自动生成新的review_draft、citation_manifest和review docx，并自动跑一次review recheck
 
 ### 大纲批评与仲裁（Week 5）
 - **JSON-first Outline**：结构化大纲表示
 - **Critique**：自动化大纲质量批评
 - **Arbitration**：多个批评之间的冲突解决
-- **Adopt**：安全采用仲裁结果
+- **Adopt**：安全采用仲裁结果，需要显式用户操作，不再自动adopt
+
+### 队列系统（Week 5）
+- **Persistent Queue Service**：基于JSON的持久化队列存储
+- **Complete Task Snapshot**：包含source_snapshot、input_fingerprint、config_fingerprint、workspace_path、log_path的完整任务快照
+- **Dependency Tracking**：支持串行依赖阻塞和上游失败时的状态传播
+
+### 预处理与证据加载（Week 5）
+- **Preprocess Evidence Loader**：统一加载plain_text_path/page_index_path/chunks_path/structured_json_path/manifest_path为validator可直接消费的evidence context
+- **Visual Bundle Support**：支持"文本没问题但图表/框架图理解不足"的recheck分流
 
 ## 5. 持久化队列（MVP）
 

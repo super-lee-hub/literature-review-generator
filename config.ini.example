@@ -1,5 +1,5 @@
 # =============================================================================
-# llm_reviewer_generator 配置文件模板
+# auto-generate 配置文件模板
 # =============================================================================
 #
 # 安全说明：
@@ -224,3 +224,22 @@ validator_temperature = 0.3
 # 观点验证引擎参数（用于批量验证引用）
 claims_max_tokens = 8192
 claims_temperature = 0.3
+
+[Queue]
+# 队列服务配置
+enabled = true
+queue_file_path = ./output/queue.json
+max_concurrent_jobs = 1
+
+[Stage1_Visual]
+# 阶段一视觉输入配置
+enabled = false
+max_visual_refs_per_paper = 5
+visual_artifact_dir = ./output/_visual_artifacts
+
+[Multimodal]
+# 多模态配置
+enabled = false
+multimodal_api_key = YOUR_MULTIMODAL_API_KEY_HERE
+multimodal_model = gpt-4-vision-preview
+multimodal_api_base = https://api.openai.com/v1

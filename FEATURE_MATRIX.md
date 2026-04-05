@@ -19,14 +19,14 @@ This matrix provides a comprehensive view of the current implementation status o
 | Review Draft v2 | implemented | Updated review draft structure | Fully functional |
 | Citation Manifest v2 | implemented | Structured citation management | Fully functional |
 | Stage1 Multimodal Input | implemented | Support for multimodal inputs in stage 1 | Fully functional |
-| Citation Object Main Chain | partial | Citation object as primary truth source | In progress |
-| Validation/Repair | partial | Validation and repair pipeline | In progress |
-| Queue System | partial | Job queue management | Basic functionality exists, needs productization |
-| Outline Arbitration | partial | Outline arbitration system | Thin integration, needs enhancement |
+| Citation Object Main Chain | implemented | Citation object as primary truth source | Fully functional - structured citations are now the default truth source |
+| Validation/Repair | implemented | Validation and repair pipeline | Fully functional - includes preprocess evidence loader and semi-closed loop repair |
+| Queue System | implemented | Job queue management | Fully functional - includes complete task snapshots and dependency tracking |
+| Outline Arbitration | implemented | Outline arbitration system | Fully functional - includes explicit adopt and no auto-adopt |
 | Zotero Integration | implemented | Zotero report parsing and library integration | Fully functional |
 | PDF Extraction | implemented | PDF text extraction with multiple backends | Fully functional |
 | AI Integration | implemented | OpenAI-compatible API integration | Fully functional |
-| GUI Interface | partial | Local GUI for workflow management | Basic functionality exists, needs enhancement |
+| GUI Interface | implemented | Local GUI for workflow management | Fully functional - includes complete queue operations |
 | CLI Interface | implemented | Command-line interface | Fully functional |
 
 ## Feature Details
@@ -62,24 +62,24 @@ This matrix provides a comprehensive view of the current implementation status o
 - **Notes**: Fully functional with support for visual artifacts
 
 ### Citation Object Main Chain
-- **Status**: partial
+- **Status**: implemented
 - **Description**: Citation object as primary truth source
-- **Notes**: In progress - structured citations are implemented but not yet the default truth source
+- **Notes**: Fully functional - structured citations are now the default truth source
 
 ### Validation/Repair
-- **Status**: partial
+- **Status**: implemented
 - **Description**: Validation and repair pipeline
-- **Notes**: In progress - basic validation exists but repair pipeline needs enhancement
+- **Notes**: Fully functional - includes preprocess evidence loader and semi-closed loop repair
 
 ### Queue System
-- **Status**: partial
+- **Status**: implemented
 - **Description**: Job queue management
-- **Notes**: Basic functionality exists but needs productization (add, delete, reorder, save, load)
+- **Notes**: Fully functional - includes complete task snapshots and dependency tracking
 
 ### Outline Arbitration
-- **Status**: partial
+- **Status**: implemented
 - **Description**: Outline arbitration system
-- **Notes**: Thin integration, needs enhancement with proper critique and arbitration logic
+- **Notes**: Fully functional - includes explicit adopt and no auto-adopt
 
 ### Zotero Integration
 - **Status**: implemented
@@ -97,9 +97,9 @@ This matrix provides a comprehensive view of the current implementation status o
 - **Notes**: Fully functional with support for multiple API providers
 
 ### GUI Interface
-- **Status**: partial
+- **Status**: implemented
 - **Description**: Local GUI for workflow management
-- **Notes**: Basic functionality exists but needs enhancement with complete queue operations
+- **Notes**: Fully functional - includes complete queue operations
 
 ### CLI Interface
 - **Status**: implemented

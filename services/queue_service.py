@@ -368,6 +368,22 @@ class QueueRunner:
             if runtime and runtime.state == QueueState.CANCELLED:
                 return
             
+            # 检查依赖任务状态
+            for dep_job_id in job_spec.depends_on_job_ids:
+                dep_runtime = self.queue_service.get_job_runtime(dep_job_id)
+                if not dep_runtime:
+                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
+                    self.queue_service.set_job_error(job_spec.job_id, f"Dependency job {dep_job_id} not found")
+                    return
+                if dep_runtime.state not in (QueueState.COMPLETED, QueueState.CANCELLED):
+                    # 依赖任务未完成，跳过执行
+                    return
+                if dep_runtime.state == QueueState.FAILED:
+                    # 依赖任务失败，标记当前任务为失败
+                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
+                    self.queue_service.set_job_error(job_spec.job_id, f"Dependency job {dep_job_id} failed")
+                    return
+            
             # 更新任务状态为运行中
             self.queue_service.update_job_state(job_spec.job_id, QueueState.RUNNING)
             
@@ -440,6 +456,7 @@ class QueueRunner:
                 # 更新运行时信息
                 self._update_job_runtime_info(job_spec.job_id, {
                     "workspace_path": result.workspace_path,
+                    "log_path": result.log_path if hasattr(result, 'log_path') else job_spec.log_path,
                     "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
                 })
             else:

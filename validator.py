@@ -483,7 +483,7 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             recheck_reports = run_summary_rechecks(paper_artifacts)
             
             # 生成验证报告
-            report_lines = ["llm_reviewer_generator文献综述验证报告", f"生成时间: {datetime.now().isoformat()}\n", "="*30]
+            report_lines = ["auto-generate文献综述验证报告", f"生成时间: {datetime.now().isoformat()}\n", "="*30]
             report_lines.append(f"【验证摘要】")
             report_lines.append(f"总引用数: {report.total_citations}")
             report_lines.append(f"支持: {report.supported_count}")
@@ -880,7 +880,7 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
 
         # --- 2. 幻觉引用检查 ---
         phantom_citations: List[str] = sorted(list(all_found_citations - set(citation_to_key.keys()) - set(valid_citation_map.keys())))
-        report_lines: List[str] = ["llm_reviewer_generator文献综述验证报告", f"生成时间: {datetime.now().isoformat()}\n", "="*30]
+        report_lines: List[str] = ["auto-generate文献综述验证报告", f"生成时间: {datetime.now().isoformat()}\n", "="*30]
         if phantom_citations:
             generator_instance.logger.error(f"发现 {len(phantom_citations)} 处可能的幻觉引用！")
             report_lines.append("【幻觉引用检查 - 失败】\n以下引用未在您的文献库中找到：\n" + "\n".join(phantom_citations))

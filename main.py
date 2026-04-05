@@ -4,8 +4,7 @@
 """
 文献综述自动生成器 - 工业级版本
 支持身份基断点续传、双重工作模式、智能续写、项目命名空间、智能文件查找、双引擎PDF提取、适应性速率控制、并发处理、错误管理、自动重试机制和交互式安装向导。
-
-作者: llm_reviewer_generator 文献综述自动生成器开发团队
+# 作者: auto-generate 文献综述自动生成器开发团队
 版本: 1.2
 更新日期: 2025-10-15
 """
@@ -1044,7 +1043,7 @@ class LiteratureReviewGenerator:
         from datetime import datetime
         
         # 创建日志记录器
-        self.logger = logging.getLogger(f"llm_reviewer_generator_{datetime.now().strftime('%Y%m%d_%H%M%S')}")  # type: ignore
+        self.logger = logging.getLogger(f"auto-generate_{datetime.now().strftime('%Y%m%d_%H%M%S')}")  # type: ignore
         self.logger.setLevel(logging.INFO)
         
         # 如果记录器已经有处理器，先清除
@@ -3907,7 +3906,17 @@ class LiteratureReviewGenerator:
             
             # 用tqdm包装章节列表，显示进度条
             failed_sections: List[Dict[str, Any]] = []
-            progress_bar = tqdm(enumerate(section_matches, 1), total=len(section_matches), desc="[阶段二] 正在生成综述章节")
+            total_sections = len(section_matches)
+            progress_bar = tqdm(enumerate(section_matches, 1), total=total_sections, desc="[阶段二] 正在生成综述章节")
+            
+            # 发送阶段二开始的进度
+            self._emit_progress(
+                stage="outline",
+                total=total_sections,
+                current=0,
+                message=f"开始生成综述章节，共 {total_sections} 章",
+                indeterminate=False
+            )
             
             # 逐章生成内容（从断点开始）
             for i, (section_num, section_title) in progress_bar:
@@ -3925,17 +3934,59 @@ class LiteratureReviewGenerator:
                 # 更新进度条的当前章节信息
                 progress_bar.set_postfix_str(f"当前章节: {section_num}. {section_title[:30]}...")
                 
+                # 发送章节开始的进度
+                self._emit_progress(
+                    stage="outline",
+                    total=total_sections,
+                    current=i,
+                    message=f"正在生成第{section_num}章: {section_title}",
+                    item_label=section_title,
+                    indeterminate=False
+                )
+                
                 self.logger.info(f"正在生成第{section_num}章: {section_title}")
                 
                 # 生成章节内容
                 section_content = self.generate_review_section_content(section_title, outline_content)
                 if not section_content:
                     self.logger.error(f"第{section_num}章内容生成失败")
+                    # 发送章节失败的进度
+                    self._emit_progress(
+                        stage="outline",
+                        total=total_sections,
+                        current=i,
+                        message=f"第{section_num}章内容生成失败: {section_title}",
+                        item_label=section_title,
+                        indeterminate=False
+                    )
                     failed_sections.append(
                         {
                             "section_number": int(section_num),
                             "section_title": section_title,
                             "failure_reason": "section_content_generation_failed",
+                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
+                    continue
+                
+                # 发送章节成功的进度
+                self._emit_progress(
+                    stage="outline",
+                    total=total_sections,
+                    current=i,
+                    message=f"第{section_num}章内容生成成功: {section_title}",
+                    item_label=section_title,
+                    indeterminate=False
+                )
+                
+                # 检查章节内容是否包含结构化citation token
+                if "[[cite:" not in section_content:
+                    self.logger.warning(f"第{section_num}章内容缺少结构化citation token，标记为生成异常")
+                    failed_sections.append(
+                        {
+                            "section_number": int(section_num),
+                            "section_title": section_title,
+                            "failure_reason": "missing_structured_citation_token",
                             "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         }
                     )
@@ -4034,6 +4085,24 @@ class LiteratureReviewGenerator:
             doc.save(word_file)
             
             self._save_failed_review_sections(failed_sections)
+            
+            # 发送阶段二完成的进度
+            if not failed_sections:
+                self._emit_progress(
+                    stage="outline",
+                    total=total_sections,
+                    current=total_sections,
+                    message="所有章节生成成功！",
+                    indeterminate=False
+                )
+            else:
+                self._emit_progress(
+                    stage="outline",
+                    total=total_sections,
+                    current=total_sections - len(failed_sections),
+                    message=f"章节生成完成，有 {len(failed_sections)} 个章节生成失败",
+                    indeterminate=False
+                )
 
             # 清除断点文件（表示全部完成）
             if os.path.exists(review_checkpoint_file):
@@ -4423,43 +4492,10 @@ class LiteratureReviewGenerator:
                     traceback.print_exc()
                     self.logger.warning("Skipping Week5 arbitration and adopt steps due to error")
                 
-                # Run explicit adopt with error handling (only if arbitration succeeded)
-                if arbitration_result is not None and arbitration_path is not None:
-                    try:
-                        from outline.models import OutlineArbitrationResult
-                        arb_result_obj = OutlineArbitrationResult.from_dict(arbitration_result["arbitration_result"])
-                        adopt_result = run_outline_adopt(
-                            outline=outline_doc,
-                            arbitration_result=arb_result_obj,
-                            job_id=self.job_workspace.job_id,
-                            adopted_by="workflow",
-                        )
-                        
-                        # Save reviewed outline
-                        reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.json")
-                        atomic_write_json(reviewed_outline_path, adopt_result["reviewed_outline"])
-                        
-                        self.artifact_registry.register_file(
-                            artifact_role="reviewed_outline",
-                            artifact_type="reviewed_outline_document",
-                            artifact_version="v1",
-                            path=reviewed_outline_path,
-                            producer="main.LiteratureReviewGenerator.create_literature_review_outline",
-                            artifact_id="reviewed_outline:v1",
-                            depends_on=[
-                                ArtifactDependencyRef(
-                                    artifact_type="outline_arbitration_result",
-                                    path=arbitration_path,
-                                )
-                            ],
-                        )
-                        
-                        self.logger.success(f"Week5 reviewed outline saved to: {reviewed_outline_path}")
-                    except Exception as adopt_exc:
-                        self.logger.error(f"Week5 outline adopt failed: {adopt_exc}")
-                        import traceback
-                        traceback.print_exc()
-                        self.logger.warning("Skipping Week5 adopt step due to error")
+                # 停止自动adopt，需要显式用户操作
+                self.logger.info("Week5: 停止自动adopt，需要显式用户操作")
+                # 移除自动adopt代码，改为提示用户进行显式adopt
+                self.logger.info("请通过GUI或CLI执行显式adopt操作来应用大纲修改")
             
             # 保存大纲文件
             
