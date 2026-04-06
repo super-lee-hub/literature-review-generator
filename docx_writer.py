@@ -15,6 +15,13 @@ from docx.oxml.ns import qn  # type: ignore
 from docx.oxml import OxmlElement  # type: ignore
 from docx.oxml.ns import qn  # type: ignore
 
+from services.citation_catalog import (
+    build_citation_catalog,
+    format_in_text_citation,
+    normalize_alias,
+)
+from services.citation_manifest import unresolved_occurrences
+
 
 def _log(logger: Any, level: str, message: str) -> None:
     log_method = getattr(logger, level, None)
@@ -24,6 +31,38 @@ def _log(logger: Any, level: str, message: str) -> None:
     fallback = getattr(logger, 'info' if level == 'success' else level, None)
     if callable(fallback):
         fallback(message)
+
+
+def _build_citation_entry_lookup(generator_instance: Any) -> Dict[str, Any]:
+    summaries = getattr(generator_instance, "summaries", []) or []
+    _entries, alias_map = build_citation_catalog(summaries)
+    return alias_map
+
+
+def render_structured_citations(text: str, generator_instance: Any) -> tuple[str, List[str]]:
+    alias_map = _build_citation_entry_lookup(generator_instance)
+    unresolved: List[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        raw_key = str(match.group(1) or "").strip()
+        params_text = str(match.group(2) or "")
+        params: Dict[str, str] = {}
+        for part in params_text.split("|"):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                params[key.strip()] = value.strip()
+        entry = alias_map.get(normalize_alias(raw_key))
+        if entry is None:
+            unresolved.append(raw_key or match.group(0))
+            return match.group(0)
+        return format_in_text_citation(
+            entry,
+            mode=params.get("mode", "parenthetical"),
+            locator=params.get("locator"),
+        )
+
+    rendered = re.sub(r"\[\[cite:([^|\]]+)(?:\|([^\]]*))?\]\]", _replace, str(text or ""))
+    return rendered, unresolved
 
 
 def set_advanced_document_styles(doc: Any, font_name: str, font_size_body: int, font_size_heading1: int, font_size_heading2: int) -> None:
@@ -193,7 +232,12 @@ def append_section_to_word_document(generator_instance: Any, section_number: int
         
         # 添加章节内容
         # 将文本按段落分割
-        paragraphs = section_text.split('\n\n')
+        rendered_section_text, unresolved_tokens = render_structured_citations(section_text, generator_instance)
+        if unresolved_tokens:
+            generator_instance.logger.warning(
+                f"Word 导出时发现未解析 citation token: {', '.join(sorted(set(unresolved_tokens))[:5])}"
+            )
+        paragraphs = rendered_section_text.split('\n\n')
         for para in paragraphs:
             para = para.strip()
             if para:

@@ -4,6 +4,12 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from services.citation_catalog import (
+    build_citation_catalog,
+    extract_citation_key,
+    format_reference_entry,
+    normalize_alias,
+)
 from services.job_workspace import utc_now_iso
 
 
@@ -161,14 +167,16 @@ class CitationManifestV2:
 
     def get_cited_bibliography(self) -> List[BibliographyEntry]:
         return [entry for entry in self.bibliography if entry.is_cited]
-
+    
     def get_occurrences_for_paper(self, paper_identifier: str) -> List[CitationOccurrence]:
+        """根据 paper_id 或 paper_key 获取所有相关的引用出现"""
         return [
-            occ for occ in self.occurrences
+            occ for occ in self.occurrences 
             if occ.paper_id == paper_identifier or occ.paper_key == paper_identifier
         ]
-
+    
     def get_cluster_for_paper(self, paper_identifier: str) -> Optional[CitationCluster]:
+        """根据 paper_id 或 paper_key 获取相关的引用集群"""
         for cluster in self.clusters:
             if cluster.paper_id == paper_identifier or cluster.paper_key == paper_identifier:
                 return cluster
@@ -176,7 +184,7 @@ class CitationManifestV2:
 
 
 def build_citation_manifest_v1(
-    *, 
+    *,
     job_id: str,
     project_name: str,
     manifest_id: str,
@@ -254,66 +262,57 @@ def migrate_v1_to_v2(v1_manifest: CitationManifestV1) -> CitationManifestV2:
     occurrences: List[CitationOccurrence] = []
     bibliography: List[BibliographyEntry] = []
     clusters: List[CitationCluster] = []
-
     paper_occurrence_map: Dict[str, List[str]] = {}
 
     for idx, citation in enumerate(v1_manifest.citations):
         paper_id = str(citation.get("paper_id", f"paper_{idx}"))
         occurrence_id = f"occ_{idx}_{paper_id}"
-        
-        occurrence = CitationOccurrence(
-            occurrence_id=occurrence_id,
-            citation_token=str(citation.get("text", "")),
-            paper_id=paper_id,
-            paper_key=paper_id,
-            section_number=int(citation.get("section_number", 0)),
-            section_title=str(citation.get("section_title", "")),
-            block_id=str(citation.get("block_id", f"block_{idx}")),
-            block_order=int(citation.get("block_order", idx + 1)),
-            spans=[],
-            context_before=str(citation.get("context", "")),
-            context_after="",
-        )
-        occurrences.append(occurrence)
-
-        if paper_id not in paper_occurrence_map:
-            paper_occurrence_map[paper_id] = []
-        paper_occurrence_map[paper_id].append(occurrence_id)
-
-        entry_exists = any(entry.paper_id == paper_id for entry in bibliography)
-        if not entry_exists:
-            bibliography.append(BibliographyEntry(
-                entry_id=f"bib_{paper_id}",
+        occurrences.append(
+            CitationOccurrence(
+                occurrence_id=occurrence_id,
+                citation_token=str(citation.get("text", "")),
                 paper_id=paper_id,
                 paper_key=paper_id,
-                citation_text=str(citation.get("text", "")),
-                is_cited=True,
-                cluster_id=None,
-            ))
+                section_number=int(citation.get("section_number", 0)),
+                section_title=str(citation.get("section_title", "")),
+                block_id=str(citation.get("block_id", f"block_{idx}")),
+                block_order=int(citation.get("block_order", idx + 1)),
+                spans=[],
+                context_before=str(citation.get("context", "")),
+                context_after="",
+            )
+        )
+        paper_occurrence_map.setdefault(paper_id, []).append(occurrence_id)
+        if not any(entry.paper_id == paper_id for entry in bibliography):
+            bibliography.append(
+                BibliographyEntry(
+                    entry_id=f"bib_{paper_id}",
+                    paper_id=paper_id,
+                    paper_key=paper_id,
+                    citation_text=str(citation.get("text", "")),
+                    is_cited=True,
+                )
+            )
 
     for paper_id, occ_ids in paper_occurrence_map.items():
-        first_section = min(
-            (occ.section_number for occ in occurrences if occ.paper_id == paper_id),
-            default=0
+        first_section = min((occ.section_number for occ in occurrences if occ.paper_id == paper_id), default=0)
+        clusters.append(
+            CitationCluster(
+                cluster_id=f"cluster_{paper_id}",
+                paper_id=paper_id,
+                paper_key=paper_id,
+                occurrence_ids=occ_ids,
+                first_occurrence_section=first_section,
+                total_occurrences=len(occ_ids),
+            )
         )
-        clusters.append(CitationCluster(
-            cluster_id=f"cluster_{paper_id}",
-            paper_id=paper_id,
-            paper_key=paper_id,
-            occurrence_ids=occ_ids,
-            first_occurrence_section=first_section,
-            total_occurrences=len(occ_ids),
-        ))
 
     return CitationManifestV2(
         artifact_type="citation_manifest",
         artifact_version="v2",
         created_from_job_id=v1_manifest.created_from_job_id,
         created_at=v1_manifest.created_at,
-        manifest_identity={
-            **v1_manifest.manifest_identity,
-            "migrated_from": "v1",
-        },
+        manifest_identity={**v1_manifest.manifest_identity, "migrated_from": "v1"},
         review_reference=v1_manifest.review_reference,
         occurrences=occurrences,
         clusters=clusters,
@@ -322,125 +321,84 @@ def migrate_v1_to_v2(v1_manifest: CitationManifestV1) -> CitationManifestV2:
     )
 
 
+def unresolved_occurrences(citation_manifest: Dict[str, Any] | CitationManifestV2) -> List[Dict[str, Any]]:
+    manifest_dict = citation_manifest.to_dict() if isinstance(citation_manifest, CitationManifestV2) else citation_manifest
+    unresolved: List[Dict[str, Any]] = []
+    for occurrence in manifest_dict.get("occurrences", []):
+        paper_id = str(occurrence.get("paper_id") or "").strip()
+        if not paper_id or paper_id == "unknown":
+            unresolved.append(occurrence)
+    return unresolved
 
 
-
-def _update_occurrence_map(
-    paper_occurrence_map: Dict[str, List[str]],
-    paper_id: Optional[str],
-    occurrence_id: str,
-) -> None:
-    """Update the paper occurrence map with a new occurrence."""
-    # 确保paper_id有默认值
-    safe_paper_id = paper_id if paper_id and paper_id != "unknown" else "unknown"
-    if safe_paper_id not in paper_occurrence_map:
-        paper_occurrence_map[safe_paper_id] = []
-    paper_occurrence_map[safe_paper_id].append(occurrence_id)
-
-
-def _parse_cite_token(
-    citation_token: str,
-    paper_key_to_info: Dict[str, Dict[str, Any]],
-) -> tuple[Optional[str], str, Dict[str, str]]:
-    """解析[[cite:]]语法token
-    
-    Args:
-        citation_token: citation token字符串
-        paper_key_to_info: paper key到信息的映射
-        
-    Returns:
-        Tuple of (paper_id, paper_key, params)
-    """
-    cite_pattern = r'\[\[cite:([^|\]]+)(?:\|([^\]]+))*\]\]'
-    cite_match = re.match(cite_pattern, citation_token)
-    
-    paper_key = "unknown"
-    params: Dict[str, str] = {}
-    paper_id = None
-    
-    if cite_match:
-        paper_key = cite_match.group(1).strip()
-        # 解析参数
-        if cite_match.group(2):
-            for param in cite_match.group(2).split('|'):
-                if '=' in param:
-                    key, value = param.split('=', 1)
-                    params[key.strip()] = value.strip()
-        
-        # 尝试找到对应的paper_id
-        if paper_key in paper_key_to_info:
-            paper_id = paper_key_to_info[paper_key]['paper_id']
-    
-    return paper_id, paper_key, params
-
-
-def _match_citation_to_paper(
-    citation_token: str,
-    paper_key_to_info: Dict[str, Dict[str, Any]],
-) -> tuple[str, str]:
-    """Match a citation token to a paper using heuristics.
-    
-    Returns:
-        Tuple of (paper_id, paper_key)
-    """
-    citation_lower = citation_token.lower()
-    for title_key, paper_data in paper_key_to_info.items():
-        # Check if author names from paper appear in citation
-        authors = paper_data.get('authors', [])
-        for author in authors:
-            if author.lower() in citation_lower:
-                return paper_data['paper_id'], paper_data['paper_key']
-    return "unknown", "unknown"
-
-
-def _create_citation_occurrence(
+def _build_occurrence(
+    *,
     occurrence_id: str,
     citation_token: str,
     paper_id: Optional[str],
-    paper_key: str,
+    paper_key: Optional[str],
     section_number: int,
     section_title: str,
     block_id: str,
     block_order: int,
     block_text: str,
-    mode: str = "parenthetical",
-    locator: Optional[str] = None,
     span_start: Optional[int] = None,
     span_end: Optional[int] = None,
 ) -> CitationOccurrence:
-    """Create a CitationOccurrence with standardized fields."""
-    # 确保paper_id有默认值
-    safe_paper_id = paper_id if paper_id and paper_id != "unknown" else "unknown"
-    
-    # Create spans if span information is available
+    safe_paper_id = str(paper_id or "unknown").strip() or "unknown"
+    safe_paper_key = str(paper_key or safe_paper_id).strip() or "unknown"
     spans: List[CitationSpan] = []
-    if span_start is not None and span_end is not None:
-        # 验证span参数有效性
-        if isinstance(span_start, int) and isinstance(span_end, int):
-            # 确保span_start和span_end在有效范围内
-            if 0 <= span_start < span_end <= len(block_text):
-                span_text = block_text[span_start:span_end]
-                spans.append(CitationSpan(
-                    span_id=f"span_{occurrence_id}",
-                    start_offset=span_start,
-                    end_offset=span_end,
-                    text=span_text
-                ))
-            # 否则不创建span，避免IndexError
-    
+    if isinstance(span_start, int) and isinstance(span_end, int) and 0 <= span_start < span_end <= len(block_text):
+        spans.append(
+            CitationSpan(
+                span_id=f"span_{occurrence_id}",
+                start_offset=span_start,
+                end_offset=span_end,
+                text=block_text[span_start:span_end],
+            )
+        )
+    context_before = block_text[max(0, (span_start or 0) - 160):(span_start or 0)].strip() if spans else block_text[:200].strip()
+    context_after = block_text[span_end:(span_end + 160)].strip() if spans and span_end is not None else ""
     return CitationOccurrence(
         occurrence_id=occurrence_id,
         citation_token=citation_token,
         paper_id=safe_paper_id,
-        paper_key=paper_key,
+        paper_key=safe_paper_key,
         section_number=section_number,
         section_title=section_title,
         block_id=block_id,
         block_order=block_order,
         spans=spans,
-        context_before=block_text[:200] if len(block_text) > 200 else block_text,
-        context_after="",
+        context_before=context_before,
+        context_after=context_after,
     )
+
+
+def _resolve_entry(
+    *,
+    citation_token: str,
+    explicit_paper_key: Optional[str],
+    explicit_paper_id: Optional[str],
+    alias_map: Dict[str, Any],
+    entries_by_paper_id: Dict[str, Any],
+) -> tuple[Optional[Any], str]:
+    raw_key = explicit_paper_key or extract_citation_key(citation_token)
+    candidate = alias_map.get(normalize_alias(raw_key))
+    if candidate is not None:
+        return candidate, raw_key
+    if explicit_paper_id and explicit_paper_id in entries_by_paper_id:
+        return entries_by_paper_id[explicit_paper_id], raw_key
+
+    citation_lower = citation_token.lower()
+    for entry in entries_by_paper_id.values():
+        if entry.title and entry.title.lower() in citation_lower:
+            return entry, raw_key
+        surnames = [author.split()[-1].lower() for author in entry.authors if str(author).strip()]
+        if surnames and any(surname in citation_lower for surname in surnames):
+            if entry.year and entry.year in citation_token:
+                return entry, raw_key
+    return None, raw_key
+
 
 def build_citation_manifest_v2_from_review_draft(
     *,
@@ -452,264 +410,109 @@ def build_citation_manifest_v2_from_review_draft(
     review_draft_v2: Dict[str, Any],
     paper_summaries: List[Dict[str, Any]],
 ) -> CitationManifestV2:
-    """Build CitationManifestV2 directly from review_draft_v2 block structure.
-    
-    This creates occurrence/cluster/bibliography truth from the review draft blocks,
-    not just from the final reference list. It extracts citation information from
-    the block structure and correlates it with paper summaries.
-    """
     occurrences: List[CitationOccurrence] = []
     clusters: List[CitationCluster] = []
     bibliography: List[BibliographyEntry] = []
-    
-    # Build paper key to info mapping from summaries
-    paper_key_to_info: Dict[str, Dict[str, Any]] = {}
-    for summary in paper_summaries:
-        paper_info = summary.get('paper_info', {})
-        # 使用get_paper_key函数生成一致的paper_key
-        from main import get_paper_key
-        paper_key = get_paper_key(paper_info)
-        paper_key_to_info[paper_key] = {
-            'paper_id': paper_key,
-            'paper_key': paper_key,
-            'authors': paper_info.get('authors', []),
-            'year': paper_info.get('year', ''),
-            'title': paper_info.get('title', ''),
-        }
-    
-    # Extract occurrences from review_draft_v2 sections/blocks
-    sections = review_draft_v2.get('content', {}).get('sections', [])
-    references = review_draft_v2.get('content', {}).get('references', [])
-    
-    occurrence_counter = 0
+
+    entries, alias_map = build_citation_catalog(paper_summaries)
+    entries_by_paper_id = {entry.paper_id: entry for entry in entries}
     paper_occurrence_map: Dict[str, List[str]] = {}
-    
+    sections = review_draft_v2.get("content", {}).get("sections", [])
+
+    occurrence_counter = 0
+    fallback_cite_pattern = re.compile(r"\[\[cite:[^|\]]+(?:\|[^\]]+)*\]\]")
+    fallback_apa_pattern = re.compile(r"\([^)]+,\s*\d{4}[^)]*\)")
+
     for section in sections:
-        section_number = section.get('section_number', 0)
-        section_title = section.get('section_title', '')
-        blocks = section.get('blocks', [])
-        
-        for block in blocks:
-            block_id = block.get('block_id', f's{section_number}_b0')
-            block_order = block.get('block_order', 0)
-            block_text = block.get('text', '')
-            block_citations = block.get('citations', [])
-            
-            # Priority 1: Use structured citations from blocks (primary path)
-            if block_citations:
-                for citation in block_citations:
-                    occurrence_counter += 1
-                    occurrence_id = f"occ_{occurrence_counter}"
-                    
-                    # Get paper info from structured citation with fixed priority order
-                    paper_id = citation.get('paper_id', None)
-                    paper_key = citation.get('paper_key', paper_id)
-                    # Fixed priority order: citation_token > raw_text > text
-                    citation_token = citation.get('citation_token', citation.get('raw_text', citation.get('text', '')))
-                    # Set default citation_token if all are empty
-                    if not citation_token and paper_id:
-                        citation_token = f"({paper_id}, n.d.)"
-                    elif not citation_token:
-                        citation_token = "(Unknown, n.d.)"
-                    mode = citation.get('mode', 'parenthetical')
-                    locator = citation.get('locator', None)
-                    span_start = citation.get('span_start')
-                    span_end = citation.get('span_end')
-                    
-                    # 从[[cite:]]语法中提取paper_key
-                    if citation_token:
-                        parsed_paper_id, parsed_paper_key, params = _parse_cite_token(citation_token, paper_key_to_info)
-                        if parsed_paper_key != "unknown":
-                            paper_key = parsed_paper_key
-                            if parsed_paper_id:
-                                paper_id = parsed_paper_id
-                    
-                    # If paper_id not set, try to match from citation_token
-                    if not paper_id or (paper_id == 'unknown' and citation_token):
-                        matched_id, matched_key = _match_citation_to_paper(citation_token, paper_key_to_info)
-                        paper_id = matched_id
-                        paper_key = matched_key
-                    
-                    # Create occurrence with additional fields
-                    occurrence = _create_citation_occurrence(
-                        occurrence_id=occurrence_id,
-                        citation_token=citation_token,
-                        paper_id=paper_id,
-                        paper_key=paper_key,
-                        section_number=section_number,
-                        section_title=section_title,
-                        block_id=block_id,
-                        block_order=block_order,
-                        block_text=block_text,
-                        mode=mode,
-                        locator=locator,
-                        span_start=span_start,
-                        span_end=span_end,
+        section_number = int(section.get("section_number") or 0)
+        section_title = str(section.get("section_title") or "")
+        for block in section.get("blocks", []):
+            block_id = str(block.get("block_id") or f"s{section_number}_b0")
+            block_order = int(block.get("block_order") or 0)
+            block_text = str(block.get("text") or "")
+            block_citations = block.get("citations", [])
+
+            extracted_citations = list(block_citations)
+            if not extracted_citations:
+                for match in fallback_cite_pattern.finditer(block_text):
+                    extracted_citations.append(
+                        {
+                            "citation_token": match.group(0),
+                            "paper_key": extract_citation_key(match.group(0)),
+                            "span_start": match.start(),
+                            "span_end": match.end(),
+                        }
                     )
-                    occurrences.append(occurrence)
-                    _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
-            else:
-                # Priority 2: Fallback to regex extraction from free-form text (legacy fallback)
-                # 优先匹配[[cite:]]语法 - 使用re.finditer获取完整token
-                cite_full_pattern = r'\[\[cite:[^|\]]+(?:\|[^\]]+)*\]\]'
-                for full_match in re.finditer(cite_full_pattern, block_text):
-                    occurrence_counter += 1
-                    occurrence_id = f"occ_{occurrence_counter}"
-                    citation_token = full_match.group(0)
-                    
-                    # 使用统一的解析函数
-                    paper_id, paper_key, params = _parse_cite_token(citation_token, paper_key_to_info)
-                    
-                    # Create occurrence using helper function
-                    occurrence = _create_citation_occurrence(
-                        occurrence_id=occurrence_id,
-                        citation_token=citation_token,
-                        paper_id=paper_id,
-                        paper_key=paper_key,
-                        section_number=section_number,
-                        section_title=section_title,
-                        block_id=block_id,
-                        block_order=block_order,
-                        block_text=block_text,
+                for match in fallback_apa_pattern.finditer(block_text):
+                    extracted_citations.append(
+                        {
+                            "citation_token": match.group(0),
+                            "span_start": match.start(),
+                            "span_end": match.end(),
+                        }
                     )
-                    occurrences.append(occurrence)
-                    _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
-                
-                # 然后尝试匹配传统的APA格式
-                citation_pattern = r'\([^)]+,\s*\d{4}[^)]*\)'
-                found_citations = re.findall(citation_pattern, block_text)
-                
-                for citation_token in found_citations:
-                    occurrence_counter += 1
-                    occurrence_id = f"occ_{occurrence_counter}"
-                    
-                    # Match citation to paper using helper function
-                    paper_id, paper_key = _match_citation_to_paper(citation_token, paper_key_to_info)
-                    
-                    # Create occurrence using helper function
-                    occurrence = _create_citation_occurrence(
-                        occurrence_id=occurrence_id,
-                        citation_token=citation_token,
-                        paper_id=paper_id,
-                        paper_key=paper_key,
-                        section_number=section_number,
-                        section_title=section_title,
-                        block_id=block_id,
-                        block_order=block_order,
-                        block_text=block_text,
-                    )
-                    occurrences.append(occurrence)
-                    _update_occurrence_map(paper_occurrence_map, paper_id, occurrence_id)
-    
-    # Build clusters from occurrence map
-    for paper_id, occ_ids in paper_occurrence_map.items():
-        if not paper_id or paper_id == "unknown":
+
+            for citation in extracted_citations:
+                occurrence_counter += 1
+                citation_token = str(
+                    citation.get("citation_token")
+                    or citation.get("raw_text")
+                    or citation.get("text")
+                    or ""
+                ).strip()
+                explicit_paper_key = str(citation.get("paper_key") or "").strip() or None
+                explicit_paper_id = str(citation.get("paper_id") or "").strip() or None
+                entry, raw_key = _resolve_entry(
+                    citation_token=citation_token,
+                    explicit_paper_key=explicit_paper_key,
+                    explicit_paper_id=explicit_paper_id,
+                    alias_map=alias_map,
+                    entries_by_paper_id=entries_by_paper_id,
+                )
+                occurrence = _build_occurrence(
+                    occurrence_id=f"occ_{occurrence_counter}",
+                    citation_token=citation_token or raw_key or "(Unknown, n.d.)",
+                    paper_id=entry.paper_id if entry else explicit_paper_id,
+                    paper_key=entry.paper_key if entry else (explicit_paper_key or raw_key or "unknown"),
+                    section_number=section_number,
+                    section_title=section_title,
+                    block_id=block_id,
+                    block_order=block_order,
+                    block_text=block_text,
+                    span_start=citation.get("span_start"),
+                    span_end=citation.get("span_end"),
+                )
+                occurrences.append(occurrence)
+                if occurrence.paper_id != "unknown":
+                    paper_occurrence_map.setdefault(occurrence.paper_id, []).append(occurrence.occurrence_id)
+
+    for paper_id, occurrence_ids in paper_occurrence_map.items():
+        first_section = min((occ.section_number for occ in occurrences if occ.paper_id == paper_id), default=0)
+        clusters.append(
+            CitationCluster(
+                cluster_id=f"cluster_{paper_id}",
+                paper_id=paper_id,
+                paper_key=paper_id,
+                occurrence_ids=occurrence_ids,
+                first_occurrence_section=first_section,
+                total_occurrences=len(occurrence_ids),
+            )
+        )
+
+    for entry in entries:
+        if entry.paper_id not in paper_occurrence_map:
             continue
-            
-        # Find first occurrence section
-        first_section = min(
-            (occ.section_number for occ in occurrences if occ.paper_id == paper_id),
-            default=0
+        bibliography.append(
+            BibliographyEntry(
+                entry_id=f"bib_{entry.index:03d}",
+                paper_id=entry.paper_id,
+                paper_key=entry.paper_key,
+                citation_text=format_reference_entry(entry),
+                is_cited=True,
+                cluster_id=f"cluster_{entry.paper_id}",
+            )
         )
-        
-        cluster = CitationCluster(
-            cluster_id=f"cluster_{paper_id}",
-            paper_id=paper_id,
-            paper_key=paper_id,
-            occurrence_ids=occ_ids,
-            first_occurrence_section=first_section,
-            total_occurrences=len(occ_ids),
-        )
-        clusters.append(cluster)
-    
-    # Build bibliography primarily from cited papers (truth from occurrences/clusters)
-    cited_paper_ids = set(paper_occurrence_map.keys())
-    
-    # Filter out invalid paper IDs
-    valid_cited_paper_ids = [pid for pid in cited_paper_ids if pid and pid != "unknown"]
-    
-    # Only add cited papers to bibliography (primary path: cited-only)
-    bib_idx = 0
-    for paper_id in valid_cited_paper_ids:
-        entry_id = f"bib_{bib_idx}"
-        cluster_id = f"cluster_{paper_id}"
-        
-        # Try to find citation text with fixed priority order
-        citation_text = ""
-        found_ref = False
-        
-        # 1. Priority: Match in review_draft_v2.content.references
-        for paper_key, paper_data in paper_key_to_info.items():
-            if paper_data['paper_id'] == paper_id:
-                for ref in references:
-                    ref_lower = ref.lower()
-                    if paper_data['title'].lower() in ref_lower or any(
-                        author.lower() in ref_lower for author in paper_data.get('authors', [])
-                    ):
-                        citation_text = ref
-                        found_ref = True
-                        break
-                if found_ref:
-                    break
-        
-        # 2. Fallback: Generate from paper_summaries metadata
-        if not found_ref:
-            # 尝试匹配 paper_id
-            for summary in paper_summaries:
-                paper_info = summary.get('paper_info', {})
-                from main import get_paper_key
-                summary_paper_key = get_paper_key(paper_info)
-                if summary_paper_key == paper_id:
-                    authors = paper_info.get('authors', [])
-                    year = paper_info.get('year', '')
-                    title = paper_info.get('title', '')
-                    
-                    if authors:
-                        author_list = ', '.join(authors)
-                    else:
-                        author_list = "Anonymous"
-                    
-                    parts = [author_list]
-                    parts.append(f"({year or 'n.d.'}).")
-                    parts.append(f"{title or '无标题'}.")
-                    
-                    citation_text = " ".join(parts)
-                    found_ref = True
-                    break
-            
-            # 如果仍然没有找到，尝试基于标题和作者匹配
-            if not found_ref:
-                for summary in paper_summaries:
-                    paper_info = summary.get('paper_info', {})
-                    title = paper_info.get('title', '').lower()
-                    authors = paper_info.get('authors', [])
-                    author_names = [author.lower() for author in authors]
-                    
-                    # 检查引用文本是否包含标题或作者
-                    for ref in references:
-                        ref_lower = ref.lower()
-                        if title in ref_lower or any(author in ref_lower for author in author_names):
-                            citation_text = ref
-                            found_ref = True
-                            break
-                    if found_ref:
-                        break
-        
-        # Ensure we have a valid citation text
-        if not citation_text:
-            citation_text = f"[{paper_id}]"
-        
-        entry = BibliographyEntry(
-            entry_id=entry_id,
-            paper_id=paper_id,
-            paper_key=paper_id,
-            citation_text=citation_text,
-            is_cited=True,
-            cluster_id=cluster_id,
-        )
-        bibliography.append(entry)
-        bib_idx += 1
-    
+
     return CitationManifestV2(
         artifact_type="citation_manifest",
         artifact_version="v2",

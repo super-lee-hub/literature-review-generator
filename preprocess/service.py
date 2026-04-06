@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shutil
+import threading
 import time
 import zipfile
 from dataclasses import asdict, dataclass
@@ -76,6 +77,8 @@ class PreprocessResult:
     mineru_attempted: bool
     mineru_succeeded: bool
     mineru_token_present: bool
+    mineru_remote_requested: bool
+    mineru_remote_enabled: bool
     mineru_base_url: str
 
 
@@ -111,6 +114,7 @@ class PreprocessManager:
         self.retain_structured_output = _as_bool(preprocess_section.get("retain_structured_output", "true"), default=True)
         self.retain_page_index = _as_bool(preprocess_section.get("retain_page_index", "true"), default=True)
         self.retain_diagnostics = _as_bool(preprocess_section.get("retain_diagnostics", "true"), default=True)
+        self.force_docling_strategy = False
 
         self.mineru_base_url = str(os.getenv("MINERU_BASE_URL", "https://mineru.net/api/v4")).strip().rstrip("/")
         self.mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
@@ -199,6 +203,8 @@ class PreprocessManager:
         mineru_attempted = bool(extraction.get("mineru_attempted"))
         mineru_succeeded = bool(extraction.get("mineru_succeeded"))
         mineru_token_present = bool(extraction.get("mineru_token_present"))
+        mineru_remote_requested = bool(extraction.get("mineru_remote_requested"))
+        mineru_remote_enabled = bool(extraction.get("mineru_remote_enabled"))
         structured_payload = extraction.get("structured_payload", {})
 
         diagnostics_payload = {
@@ -214,6 +220,8 @@ class PreprocessManager:
             "mineru_attempted": mineru_attempted,
             "mineru_succeeded": mineru_succeeded,
             "mineru_token_present": mineru_token_present,
+            "mineru_remote_requested": mineru_remote_requested,
+            "mineru_remote_enabled": mineru_remote_enabled,
             "mineru_base_url": self.mineru_base_url,
             "page_diagnostics": [asdict(item) for item in page_diagnostics],
             "artifact_paths": {
@@ -243,6 +251,8 @@ class PreprocessManager:
             "mineru_attempted": mineru_attempted,
             "mineru_succeeded": mineru_succeeded,
             "mineru_token_present": mineru_token_present,
+            "mineru_remote_requested": mineru_remote_requested,
+            "mineru_remote_enabled": mineru_remote_enabled,
             "mineru_base_url": self.mineru_base_url,
             "artifacts": diagnostics_payload["artifact_paths"],
         }
@@ -300,6 +310,8 @@ class PreprocessManager:
             mineru_attempted=mineru_attempted,
             mineru_succeeded=mineru_succeeded,
             mineru_token_present=mineru_token_present,
+            mineru_remote_requested=mineru_remote_requested,
+            mineru_remote_enabled=mineru_remote_enabled,
             mineru_base_url=self.mineru_base_url,
         )
 
@@ -335,12 +347,16 @@ class PreprocessManager:
                 baseline_page_diagnostics=baseline_page_diagnostics,
             )
             if not remote_enabled:
+                baseline_text_length = len((baseline_plain_text or "").strip())
+                total_pages = len(baseline_page_diagnostics)
+                low_quality_pages = sum(1 for item in baseline_page_diagnostics if item.low_quality)
+                scanned_candidate_pages = sum(1 for item in baseline_page_diagnostics if item.scanned_candidate)
                 self._log(
-                    "Hybrid preprocess kept the local parser because the baseline extraction looked healthy.",
+                    "Hybrid preprocess kept the local parser because the baseline extraction looked healthy "
+                    f"(text_length={baseline_text_length}, low_quality_pages={low_quality_pages}/{total_pages}, "
+                    f"scanned_candidate_pages={scanned_candidate_pages}/{total_pages}).",
                     level="info",
                 )
-
-        effective_mineru_token_present = mineru_token_present if remote_enabled else False
 
         if remote_enabled and mineru_token_present:
             mineru_attempted = True
@@ -354,7 +370,9 @@ class PreprocessManager:
                 if remote_result and (remote_result.get("markdown_text") or remote_result.get("plain_text")):
                     remote_result["mineru_attempted"] = True
                     remote_result["mineru_succeeded"] = True
-                    remote_result["mineru_token_present"] = effective_mineru_token_present
+                    remote_result["mineru_token_present"] = mineru_token_present
+                    remote_result["mineru_remote_requested"] = remote_requested
+                    remote_result["mineru_remote_enabled"] = remote_enabled
                     return remote_result
             except Exception as exc:  # pragma: no cover - remote integration path.
                 self._log(f"MinerU remote parsing failed, falling back to local parser: {exc}", level="warning")
@@ -376,7 +394,9 @@ class PreprocessManager:
                 "structured_payload": {},
                 "mineru_attempted": mineru_attempted,
                 "mineru_succeeded": mineru_succeeded,
-                "mineru_token_present": effective_mineru_token_present,
+                "mineru_token_present": mineru_token_present,
+                "mineru_remote_requested": remote_requested,
+                "mineru_remote_enabled": remote_enabled,
             }
 
         local_result = self._extract_with_local_fallbacks(
@@ -391,7 +411,9 @@ class PreprocessManager:
 
         local_result["mineru_attempted"] = mineru_attempted
         local_result["mineru_succeeded"] = mineru_succeeded
-        local_result["mineru_token_present"] = effective_mineru_token_present
+        local_result["mineru_token_present"] = mineru_token_present
+        local_result["mineru_remote_requested"] = remote_requested
+        local_result["mineru_remote_enabled"] = remote_enabled
         return local_result
 
     def _should_try_remote_in_hybrid(
@@ -424,6 +446,18 @@ class PreprocessManager:
         baseline_page_blocks: List[Dict[str, Any]],
         baseline_page_index: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        if self.force_docling_strategy:
+            self._log(
+                "Forced Docling strategy bypassed the existing local pipeline and called Docling directly.",
+                level="info",
+            )
+            return self._extract_with_docling(
+                pdf_path=pdf_path,
+                baseline_page_diagnostics=baseline_page_diagnostics,
+                baseline_page_blocks=baseline_page_blocks,
+                baseline_page_index=baseline_page_index,
+            )
+
         local_result = self._extract_with_existing_local_pipeline(pdf_path)
         if local_result and not self._should_try_docling_fallback(
             plain_text=str(local_result.get("plain_text", "") or ""),
@@ -838,6 +872,26 @@ class PreprocessManager:
         pdf_path: str,
         allow_ocr: bool,
     ) -> tuple[str, List[PageDiagnostics], List[Dict[str, Any]]]:
+        import warnings
+        
+        # 捕获 MuPDF 警告
+        parser_warnings = []
+        
+        def warning_handler(message, category, filename, lineno, file=None, line=None):
+            warning_str = str(message)
+            # 捕获 MuPDF 特定警告
+            if ("No common ancestor in structure tree" in warning_str or 
+                "OCR on page.number=" in warning_str or
+                "pixScaleSmooth" in warning_str or
+                "Image too small to scale" in warning_str or
+                "Line cannot be recognized" in warning_str):
+                parser_warnings.append(warning_str)
+            return False
+        
+        # 临时设置警告处理器
+        original_handler = warnings.showwarning
+        warnings.showwarning = warning_handler
+        
         doc = fitz.open(pdf_path)
         plain_parts: List[str] = []
         page_diagnostics: List[PageDiagnostics] = []
@@ -867,6 +921,7 @@ class PreprocessManager:
                         "text": effective_text,
                         "image_count": image_count,
                         "blocks": self._make_json_safe(page.get_text("dict")),
+                        "parser_warnings": [w for w in parser_warnings if f"page.number={page_number + 1}" in w]
                     }
                 )
                 page_diagnostics.append(
@@ -881,8 +936,24 @@ class PreprocessManager:
                 )
         finally:
             doc.close()
+            # 恢复原始警告处理器
+            warnings.showwarning = original_handler
+        
+        # 记录解析器警告
+        if parser_warnings:
+            self._log(
+                f"第三方解析器警告（非致命错误）: {len(parser_warnings)} 条",
+                level="info"
+            )
+            for warning in parser_warnings[:3]:  # 只显示前3条
+                self._log(f"  - {warning}", level="info")
+            if len(parser_warnings) > 3:
+                self._log(f"  ... 还有 {len(parser_warnings) - 3} 条警告", level="info")
 
         return "".join(plain_parts).strip(), page_diagnostics, page_blocks
+
+    # 添加线程锁，确保 PyMuPDF4LLM 在多线程环境中安全使用
+    _pymupdf4llm_lock = threading.Lock()
 
     def _extract_with_pymupdf4llm(self, pdf_path: str) -> str:
         try:
@@ -891,20 +962,22 @@ class PreprocessManager:
 
             # 捕获可能的崩溃级错误
             try:
-                markdown_output = pymupdf4llm.to_markdown(pdf_path)
-                if isinstance(markdown_output, str):
-                    return markdown_output
-                if isinstance(markdown_output, list):
-                    texts: List[str] = []
-                    for item in markdown_output:
-                        if isinstance(item, str):
-                            texts.append(item)
-                        elif isinstance(item, dict):
-                            texts.append(str(item.get("text") or item.get("markdown") or ""))
-                    return "\n\n".join([item for item in texts if item.strip()])
-                if isinstance(markdown_output, dict):
-                    return str(markdown_output.get("text") or markdown_output.get("markdown") or "")
-                return ""
+                # 使用线程锁确保同一时间只有一个线程使用 PyMuPDF4LLM
+                with self._pymupdf4llm_lock:
+                    markdown_output = pymupdf4llm.to_markdown(pdf_path)
+                    if isinstance(markdown_output, str):
+                        return markdown_output
+                    if isinstance(markdown_output, list):
+                        texts: List[str] = []
+                        for item in markdown_output:
+                            if isinstance(item, str):
+                                texts.append(item)
+                            elif isinstance(item, dict):
+                                texts.append(str(item.get("text") or item.get("markdown") or ""))
+                        return "\n\n".join([item for item in texts if item.strip()])
+                    if isinstance(markdown_output, dict):
+                        return str(markdown_output.get("text") or markdown_output.get("markdown") or "")
+                    return ""
             except Exception as exc:
                 self._log(f"PyMuPDF4LLM to_markdown failed: {exc}", level="warning")
                 return ""
@@ -1268,6 +1341,8 @@ class PreprocessManager:
                 mineru_attempted=bool(manifest.get("mineru_attempted")),
                 mineru_succeeded=bool(manifest.get("mineru_succeeded")),
                 mineru_token_present=bool(manifest.get("mineru_token_present")),
+                mineru_remote_requested=bool(manifest.get("mineru_remote_requested")),
+                mineru_remote_enabled=bool(manifest.get("mineru_remote_enabled")),
                 mineru_base_url=str(manifest.get("mineru_base_url", self.mineru_base_url)),
             )
         except Exception as exc:

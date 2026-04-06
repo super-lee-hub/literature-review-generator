@@ -283,7 +283,7 @@ def test_process_paper_backfills_metadata_before_quality_check(tmp_path, monkeyp
     pdf_path = tmp_path / "paper.pdf"
     pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
 
-    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda _path: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
     monkeypatch.setattr(
@@ -360,7 +360,7 @@ def test_process_paper_backfills_metadata_from_stage1_text_when_ai_metadata_is_e
     ABSTRACT
     """ + ("x" * 1200)
 
-    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda _path: (stage1_text, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: (stage1_text, {"analysis_input_kind": "text", "extractor_used": "mock"}))
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
     monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
@@ -409,7 +409,7 @@ def test_process_paper_backfills_inverted_citation_authors_from_stage1_text(tmp_
     ABSTRACT
     """ + ("x" * 1200)
 
-    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda _path: (stage1_text, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: (stage1_text, {"analysis_input_kind": "text", "extractor_used": "mock"}))
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
     monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
@@ -432,6 +432,78 @@ def test_process_paper_backfills_inverted_citation_authors_from_stage1_text(tmp_
     assert paper["year"] == "2024"
     assert paper["journal"] == "Journal of AI Studies"
     assert paper["doi"] == "10.1234/example"
+
+
+def test_process_paper_returns_failed_when_all_stage1_strategies_fail(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "backup", "model": "m2", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+    monkeypatch.setenv("MINERU_API_TOKEN", "token")
+
+    def _prepare_stage1_input(_path, preprocess_strategy="hybrid"):
+        return (
+            "A" * 1600,
+            {
+                "analysis_input_kind": "text",
+                "extractor_used": f"mock-{preprocess_strategy}",
+                "preprocess_profile": f"profile-{preprocess_strategy}",
+            },
+        )
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", _prepare_stage1_input)
+    monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_build_stage1_model_input",
+        lambda **_kwargs: {
+            "input_mode": "text_only",
+            "prompt_text": "prompt",
+            "user_message_content": None,
+            "selected_visual_refs": [],
+            "visual_manifest_path": "",
+            "visual_bundle_path": "",
+            "visual_selection_policy_snapshot": {},
+            "multimodal_capability": {},
+            "fallback_reason": "",
+        },
+    )
+    monkeypatch.setattr(generator, "_apply_stage1_text_metadata_backfill", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generator, "_apply_ai_metadata_backfill", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: {"bad": "primary"})
+    monkeypatch.setattr(main, "get_summary_from_ai", lambda *args, **kwargs: {"bad": "backup"})
+    monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (False, "quality failed"))
+    monkeypatch.setattr(
+        generator,
+        "_persist_paper_artifact",
+        lambda _result: (_ for _ in ()).throw(AssertionError("paper artifact should not persist for failed stage one")),
+    )
+
+    paper: PaperInfo = {
+        "title": "Demo Paper",
+        "authors": ["Alice Example"],
+        "year": "2024",
+        "journal": "Journal of Tests",
+        "doi": "",
+        "pdf_path": str(pdf_path),
+    }
+
+    result = generator.process_paper(paper, 0, None, 1)
+
+    assert result is not None
+    assert result["status"] == "failed"
+    assert "failure_reason" in result
+    assert result["failure_reason"] is not None
+    assert "所有预处理策略都失败" in result["failure_reason"]
+    assert "Profile: profile-hybrid" in result["failure_reason"]
+    assert "模型: backup" in result["failure_reason"]
+    assert "attempt_history" in result
+    assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling", "mineru", "legacy"]
 
 
 def test_generate_review_outline_prefers_outline_api_config(tmp_path, monkeypatch) -> None:

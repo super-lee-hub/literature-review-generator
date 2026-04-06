@@ -150,7 +150,7 @@ def _stub_stage1_success(monkeypatch, generator) -> None:
     monkeypatch.setattr(
         generator,
         "_prepare_stage1_input",
-        lambda _path: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}),
+        lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}),
     )
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
@@ -207,7 +207,7 @@ def test_failed_process_paper_does_not_create_or_register_paper_artifact(tmp_pat
     monkeypatch.setattr(
         generator,
         "_prepare_stage1_input",
-        lambda _path: ("too short", {"analysis_input_kind": "text", "extractor_used": "mock"}),
+        lambda *_args, **_kwargs: ("too short", {"analysis_input_kind": "text", "extractor_used": "mock"}),
     )
 
     result = generator.process_paper(paper, 0, None, 1)

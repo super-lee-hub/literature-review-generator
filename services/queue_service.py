@@ -352,10 +352,18 @@ class QueueRunner:
         self._running = False
         self._lock = threading.Lock()
         self._cancel_tokens: Dict[str, CancelToken] = {}
+        self._workspace_locks: Dict[str, threading.Lock] = {}
 
     def is_running(self) -> bool:
         with self._lock:
             return self._running
+
+    def _get_workspace_lock(self, workspace_path: str) -> threading.Lock:
+        """获取工作区的锁，确保同一工作区不会并发执行"""
+        with self._lock:
+            if workspace_path not in self._workspace_locks:
+                self._workspace_locks[workspace_path] = threading.Lock()
+            return self._workspace_locks[workspace_path]
 
     def _process_job(self, job_spec: QueueJobSpec) -> None:
         cancel_token = CancelToken()
@@ -425,11 +433,21 @@ class QueueRunner:
                 library_path=params.get("library_path"),
             )
             
-            # 更新当前阶段
-            self._update_job_stage(job_spec.job_id, "executing")
+            # 计算工作区路径（基于项目名称和任务ID）
+            import os
+            base_output_dir = os.path.join(os.getcwd(), "output")
+            workspace_path = os.path.join(base_output_dir, f"{project_name}__{job_spec.job_id}")
             
-            # 执行任务，传入cancel_token
-            result = self.job_runner.run(request, cancel_token=cancel_token)
+            # 获取工作区锁
+            workspace_lock = self._get_workspace_lock(workspace_path)
+            
+            # 用工作区锁保护任务执行
+            with workspace_lock:
+                # 更新当前阶段
+                self._update_job_stage(job_spec.job_id, "executing")
+                
+                # 执行任务，传入cancel_token
+                result = self.job_runner.run(request, cancel_token=cancel_token)
             
             # 最后检查一次任务状态
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)

@@ -74,7 +74,15 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
                 "(enable_stage1_validation 或 enable_stage2_validation) 时，必须提供 [Validator_API] 配置段。"
             )
 
-    load_dotenv()
+    # 加载 .env 文件，使用项目根目录作为基础路径
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+        logger.info(f"从 {env_path} 加载环境变量")
+    else:
+        # 尝试在当前工作目录加载 .env 文件
+        load_dotenv()
+        logger.info("从当前工作目录加载环境变量")
 
     api_sections_dict: Dict[str, str] = {
         "Primary_Reader_API": "LLM_PRIMARY_READER_API",

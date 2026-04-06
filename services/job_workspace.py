@@ -12,20 +12,39 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+import time
+
 def atomic_write_json(path: str, payload: Any) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
 
-    fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    max_retries = 3
+    retry_delay = 1.0
+
+    for attempt in range(max_retries):
+        fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.replace(temp_path, path)
+                return  # 成功写入，退出函数
+            except PermissionError as e:
+                if attempt < max_retries - 1:
+                    # 退避重试
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    # 达到最大重试次数，抛出异常
+                    raise
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
 
 @dataclass(frozen=True)
@@ -72,7 +91,7 @@ class JobWorkspace:
 
     @staticmethod
     def generate_job_id() -> str:
-        return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     @classmethod
     def from_workspace_path(cls, workspace_path: str, project_name: str, job_id: str | None = None) -> "JobWorkspace":

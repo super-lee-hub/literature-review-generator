@@ -37,6 +37,18 @@ def test_apply_validation_compat_sections_mirrors_legacy_performance_flags() -> 
     assert normalized["Performance"]["enable_stage2_validation"] == "false"
 
 
+def test_apply_validation_compat_sections_reads_legacy_checkpoint_flag_from_performance() -> None:
+    normalized = apply_validation_compat_sections(
+        {
+            "Performance": {
+                "keep_checkpoints_after_completion": "true",
+            }
+        }
+    )
+
+    assert normalized["Validation"]["keep_checkpoints_after_completion"] == "true"
+
+
 def test_compat_config_view_updates_raw_config_in_place() -> None:
     config = {
         "Performance": {

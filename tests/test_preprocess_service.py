@@ -6,6 +6,20 @@ import fitz  # type: ignore
 from preprocess.service import PageDiagnostics, PreprocessManager
 
 
+class _ListLogger:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str]] = []
+
+    def info(self, message: str) -> None:
+        self.records.append(("info", message))
+
+    def warning(self, message: str) -> None:
+        self.records.append(("warning", message))
+
+    def error(self, message: str) -> None:
+        self.records.append(("error", message))
+
+
 def _make_text_pdf(path: Path) -> None:
     doc = fitz.open()
     page = doc.new_page()
@@ -75,6 +89,53 @@ def test_preprocess_manager_defaults_to_local_even_with_ambient_mineru_token(tmp
     assert result is not None
     assert result.extractor_used in {"fitz", "pymupdf4llm", "legacy_pdf_extractor"}
     assert result.mineru_attempted is False
+    assert result.mineru_token_present is True
+    assert result.mineru_remote_requested is False
+    assert result.mineru_remote_enabled is False
+
+
+def test_preprocess_manager_records_hybrid_skip_reason_without_losing_token_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    monkeypatch.setenv("MINERU_API_TOKEN", "token")
+
+    config = {
+        "Paths": {"output_path": str(tmp_path)},
+        "Preprocess": {
+            "enabled": "true",
+            "cache_dir": str(cache_dir),
+            "parser_mode": "hybrid",
+            "primary_parser": "mineru_remote",
+            "fallback_parser": "local",
+            "ocr_mode": "off",
+            "force_rebuild": "true",
+            "extractor_profile": "fitz",
+        },
+    }
+    manager = PreprocessManager(config=config, logger=None)
+    monkeypatch.setattr(manager, "_should_try_remote_in_hybrid", lambda **_kwargs: False)
+    result = manager.prepare_pdf(str(pdf_path))
+
+    assert result is not None
+    assert result.extractor_used in {"fitz", "pymupdf4llm", "legacy_pdf_extractor"}
+    assert result.mineru_attempted is False
+    assert result.mineru_succeeded is False
+    assert result.mineru_token_present is True
+    assert result.mineru_remote_requested is True
+    assert result.mineru_remote_enabled is False
+
+    diagnostics = json.loads(Path(result.diagnostics_path).read_text(encoding="utf-8"))
+    manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert diagnostics["mineru_token_present"] is True
+    assert diagnostics["mineru_remote_requested"] is True
+    assert diagnostics["mineru_remote_enabled"] is False
+    assert manifest["mineru_token_present"] is True
+    assert manifest["mineru_remote_requested"] is True
+    assert manifest["mineru_remote_enabled"] is False
 
 
 def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path) -> None:
@@ -311,3 +372,113 @@ def test_preprocess_manager_uses_docling_when_local_pipeline_is_low_quality(monk
     )
 
     assert result == docling_result
+
+
+def test_preprocess_manager_force_docling_strategy_bypasses_local_pipeline(monkeypatch) -> None:
+    manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "enabled": "true",
+                "ocr_mode": "off",
+            },
+        },
+        logger=None,
+    )
+    manager.force_docling_strategy = True
+
+    diagnostics = [
+        PageDiagnostics(
+            page_number=1,
+            text_length=600,
+            image_count=0,
+            scanned_candidate=False,
+            used_ocr=False,
+            low_quality=False,
+        )
+    ]
+    docling_result = {
+        "markdown_text": "# Docling\n\ncontent",
+        "plain_text": "Docling content",
+        "page_index": [{"page_number": 1, "text": "Docling content"}],
+        "page_diagnostics": diagnostics,
+        "page_blocks": [],
+        "structured_payload": {"source": "docling"},
+        "extractor_used": "docling",
+        "layout_fidelity": "layout_aware",
+        "conversion_used": "native_pdf",
+        "used_ocr": False,
+    }
+
+    monkeypatch.setattr(
+        manager,
+        "_extract_with_existing_local_pipeline",
+        lambda _pdf_path: (_ for _ in ()).throw(AssertionError("local pipeline should not run")),
+    )
+    monkeypatch.setattr(manager, "_extract_with_docling", lambda *_args, **_kwargs: docling_result)
+
+    result = manager._extract_with_local_fallbacks(
+        pdf_path="sample.pdf",
+        baseline_plain_text="Healthy content",
+        baseline_page_diagnostics=diagnostics,
+        baseline_page_blocks=[],
+        baseline_page_index=[{"page_number": 1, "text": "Healthy content"}],
+    )
+
+    assert result == docling_result
+
+
+def test_hybrid_skip_logs_baseline_quality_metrics(monkeypatch) -> None:
+    logger = _ListLogger()
+    manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "enabled": "true",
+                "parser_mode": "hybrid",
+                "primary_parser": "mineru_remote",
+                "ocr_mode": "off",
+            },
+        },
+        logger=logger,
+    )
+
+    diagnostics = [
+        PageDiagnostics(
+            page_number=1,
+            text_length=1600,
+            image_count=0,
+            scanned_candidate=False,
+            used_ocr=False,
+            low_quality=False,
+        )
+    ]
+    local_result = {
+        "markdown_text": "# Local\n\ncontent",
+        "plain_text": "content",
+        "page_index": [{"page_number": 1, "text": "content"}],
+        "page_diagnostics": diagnostics,
+        "page_blocks": [],
+        "structured_payload": {},
+        "extractor_used": "fitz",
+        "layout_fidelity": "page_text",
+        "conversion_used": "native_pdf",
+        "used_ocr": False,
+    }
+
+    monkeypatch.setattr(
+        manager,
+        "_extract_local_page_data",
+        lambda _pdf_path, allow_ocr: ("A" * 1600, diagnostics, []),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_extract_with_local_fallbacks",
+        lambda **_kwargs: local_result,
+    )
+
+    result = manager._extract_preferred_content("sample.pdf")
+
+    assert result == local_result
+    assert any(
+        "text_length=1600" in message and "low_quality_pages=0/1" in message and "scanned_candidate_pages=0/1" in message
+        for _level, message in logger.records
+    )

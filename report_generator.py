@@ -243,6 +243,22 @@ def _workspace_report_path(generator_instance: Any, suffix: str, fallback_name: 
     return os.path.join(generator_instance.output_dir, fallback_name)  # type: ignore
 
 
+def _write_attempt_history(handle: Any, attempt_history: Sequence[Mapping[str, Any]]) -> None:
+    if not attempt_history:
+        return
+
+    handle.write("   尝试明细:\n")
+    for attempt_index, attempt in enumerate(attempt_history, 1):
+        handle.write(
+            "     "
+            f"[{attempt_index}] 策略={attempt.get('preprocess_strategy', '')} | "
+            f"profile={attempt.get('preprocess_profile', '')} | "
+            f"提取器={attempt.get('extractor_used', '')} | "
+            f"模型={attempt.get('model_used', '')} | "
+            f"原因={attempt.get('quality_reason', '')}\n"
+        )
+
+
 def generate_excel_report(generator_instance: Any) -> bool:  # type: ignore
     try:
         generator_instance.logger.info("正在生成多工作表 Excel 分析报告...")  # type: ignore
@@ -404,6 +420,7 @@ def generate_failure_report(generator_instance: Any) -> bool:  # type: ignore
                 handle.write(f"   期刊: {paper.get('journal', '未知期刊')}\n")
                 handle.write(f"   DOI: {paper.get('doi', '')}\n")
                 handle.write(f"   失败原因: {failed_item.get('failure_reason', '未知原因')}\n")
+                _write_attempt_history(handle, failed_item.get("attempt_history", []))
                 handle.write("-" * 60 + "\n")
 
         generator_instance.logger.success(f"失败报告已生成: {failure_report_file}")  # type: ignore

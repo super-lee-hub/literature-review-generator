@@ -333,7 +333,7 @@ def test_process_paper_links_visual_bundle_into_paper_artifact_with_text_only_fa
     monkeypatch.setattr(
         generator,
         "_prepare_stage1_input",
-        lambda _path: ("A" * 1400, {"analysis_input_kind": "text", "extractor_used": "mock"}),
+        lambda *_args, **_kwargs: ("A" * 1400, {"analysis_input_kind": "text", "extractor_used": "mock"}),
     )
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)

@@ -41,7 +41,10 @@ def read_validation_settings(config: Mapping[str, Any] | None) -> ValidationComp
         ),
         keep_checkpoints_after_completion=_as_bool(
             validation_section.get("keep_checkpoints_after_completion"),
-            default=_as_bool(config.get("keep_checkpoints_after_completion"), default=False) if config else False,
+            default=_as_bool(
+                performance_section.get("keep_checkpoints_after_completion"),
+                default=_as_bool(config.get("keep_checkpoints_after_completion"), default=False) if config else False,
+            ),
         ),
     )
 

@@ -5,7 +5,7 @@ from typing import cast
 
 import pandas as pd
 
-from report_generator import generate_excel_report
+from report_generator import generate_excel_report, generate_failure_report
 
 
 class _DummyLogger:
@@ -198,3 +198,47 @@ def test_generate_excel_report_uses_canonical_multisheet_layout(tmp_path: Path) 
     uncertain_df = cast(pd.DataFrame, workbook.parse("未确定论文"))
     assert uncertain_df.shape[0] == 2
     assert set(uncertain_df["论文标题"].tolist()) == {"Review Paper", "Uncertain Paper"}
+
+
+def test_generate_failure_report_includes_attempt_history_details(tmp_path: Path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generator = SimpleNamespace(
+        output_dir=str(output_dir),
+        project_name="demo",
+        logger=_DummyLogger(),
+        failed_papers=[
+            {
+                "paper_info": {
+                    "title": "Failed Paper",
+                    "authors": ["Alice", "Bob"],
+                    "year": "2024",
+                    "journal": "Journal of Testing",
+                    "doi": "10.1000/test",
+                },
+                "failure_reason": "All stage-one strategies failed",
+                "attempt_history": [
+                    {
+                        "preprocess_strategy": "hybrid",
+                        "preprocess_profile": "hybrid",
+                        "extractor_used": "pymupdf4llm",
+                        "model_used": "backup",
+                        "quality_reason": "primary low quality; backup low quality",
+                    }
+                ],
+            }
+        ],
+    )
+
+    generator._get_report_file_path = lambda suffix: str(output_dir / f"demo{suffix}")
+
+    assert generate_failure_report(generator) is True
+
+    report_path = output_dir / "demo_failed_papers_report.txt"
+    content = report_path.read_text(encoding="utf-8")
+    assert "尝试明细" in content
+    assert "策略=hybrid" in content
+    assert "profile=hybrid" in content
+    assert "提取器=pymupdf4llm" in content
+    assert "模型=backup" in content
+    assert "原因=primary low quality; backup low quality" in content

@@ -164,6 +164,8 @@ class ProcessingResult(TypedDict):
     preprocess: NotRequired[Dict[str, Any]]
     stage1_input: NotRequired[Dict[str, Any]]
     failure_reason: NotRequired[Optional[str]]
+    attempt_history: NotRequired[List[Dict[str, Any]]]
+    model_used: NotRequired[str]
 
 
 class FailedPaper(TypedDict):

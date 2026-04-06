@@ -175,6 +175,7 @@ class JobRunner:
         pointer_payload: dict[str, Any] | None,
         fingerprint_bundle: dict[str, Any],
     ) -> JobWorkspace:
+        # 策略1：优先检查是否有完全匹配的工作空间
         if pointer_payload:
             pointer_fingerprint = pointer_payload.get("fingerprint_bundle", {})
             workspace_path = str(pointer_payload.get("workspace_path", "") or "")
@@ -185,7 +186,30 @@ class JobRunner:
                     project_name=project_name,
                     job_id=str(pointer_job_id) if pointer_job_id else None,
                 )
+        
+        # 策略2：查找最近的工作空间，即使不完全匹配
+        import glob
+        workspace_pattern = os.path.join(os.path.abspath(base_output_dir), f"{project_name}__*")
+        workspaces = glob.glob(workspace_pattern)
+        
+        if workspaces:
+            # 按修改时间排序，找到最新的工作空间
+            workspaces.sort(key=os.path.getmtime, reverse=True)
+            latest_workspace_path = workspaces[0]
+            
+            # 检查这个工作空间是否有摘要文件或其他产出物
+            has_summaries = os.path.exists(os.path.join(latest_workspace_path, "artifacts", f"{project_name}_summaries.json"))
+            has_outline = os.path.exists(os.path.join(latest_workspace_path, "artifacts", f"{project_name}_literature_review_outline.md"))
+            
+            if has_summaries or has_outline:
+                # 如果有摘要或大纲，就重用这个工作空间
+                return JobWorkspace.from_workspace_path(
+                    workspace_path=latest_workspace_path,
+                    project_name=project_name,
+                    job_id=None,
+                )
 
+        # 如果找不到合适的工作空间，创建新的
         return JobWorkspace.create(base_output_dir=base_output_dir, project_name=project_name)
 
     def _write_resume_report(self, workspace: JobWorkspace, report: Any) -> str:

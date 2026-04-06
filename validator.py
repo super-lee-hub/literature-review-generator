@@ -515,16 +515,26 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
                     report_lines.append(f"   根本原因: {[rc.value for rc in result.root_causes]}")
                     report_lines.append(f"   证据候选数: {len(result.evidence_candidates)}")
             
-            # 保存报告到 workspace 目录
+            # 保存报告到当前 job workspace 的 reports/ 目录
             try:
                 from services.job_workspace import JobWorkspace
-                # 使用 project_name 和生成的 job_id
-                project_name = generator_instance.project_name or "unknown_project"
-                job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
-                workspace = JobWorkspace(generator_instance.output_dir, project_name, job_id)
+                from services.artifact_registry import ArtifactRegistry
+                
+                # 优先使用已存在的 job_workspace
+                if hasattr(generator_instance, 'job_workspace') and generator_instance.job_workspace:
+                    workspace = generator_instance.job_workspace
+                    project_name = workspace.project_name
+                else:
+                    # 回退到使用 project_name
+                    project_name = generator_instance.project_name or "unknown_project"
+                    job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+                    workspace = JobWorkspace(generator_instance.output_dir, project_name, job_id)
+                
+                # 报告写入当前 workspace 的 reports/ 目录
                 report_file: str = os.path.join(workspace.paths.reports_dir, f'{project_name}_validation_report.txt')
                 # 确保目录存在
                 os.makedirs(os.path.dirname(report_file), exist_ok=True)
+                generator_instance.logger.info(f"验证报告将保存到: {report_file}")
             except Exception as e:
                 generator_instance.logger.warning(f"创建 workspace 目录失败: {e}，回退到旧路径")
                 report_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_validation_report.txt')

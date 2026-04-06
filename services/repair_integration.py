@@ -152,9 +152,28 @@ def run_repair_pipeline(
     from validation.repair_planner import RepairPlanner
     from validation.repair_models import RepairPolicy
     from services.review_draft import build_review_draft_v2
-    from services.citation_manifest import build_citation_manifest_v2, build_citation_manifest_v2_from_review_draft
+    from services.citation_manifest import build_citation_manifest_v2, build_citation_manifest_v2_from_review_draft, unresolved_occurrences
     from docx_writer import create_word_document, generate_apa_references_from_manifest
     from validator import run_review_validation
+    
+    # 检查 citation manifest 是否完整
+    if citation_manifest:
+        unresolved_cites = unresolved_occurrences(citation_manifest)
+        if unresolved_cites:
+            result = {
+                "repair_pipeline": True,
+                "status": "skipped_due_to_manifest_integrity",
+                "message": f"Citation manifest has {len(unresolved_cites)} unresolved citations, skipping repair pipeline",
+                "unresolved_citations_count": len(unresolved_cites)
+            }
+            return result
+    else:
+        result = {
+            "repair_pipeline": True,
+            "status": "skipped_due_to_manifest_integrity",
+            "message": "Citation manifest is missing or empty, skipping repair pipeline"
+        }
+        return result
     
     # Step 1: Create repair plan
     policy = RepairPolicy.AUTO_APPLY_SAFE if auto_apply else RepairPolicy.REPORT_FIRST
@@ -308,7 +327,10 @@ def run_repair_pipeline(
                 result["recheck_success"] = False
     else:
         # Report-only mode
-        result["message"] = "Repair plan created but not applied (report-first policy). Use auto_apply=True to apply repairs."
+        if not repair_plan.proposals:
+            result["message"] = "No repair proposals generated (citation manifest is complete and validation passed)"
+        else:
+            result["message"] = "Repair plan created but not applied (report-first policy). Use auto_apply=True to apply repairs."
     
     return result
 

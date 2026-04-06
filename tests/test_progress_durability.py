@@ -5,7 +5,12 @@ from config_loader import ConfigDict
 from services.artifact_registry import ArtifactRegistry
 from services.config_compat import CompatConfigView
 from services.job_workspace import JobWorkspace
-from services.progress_state import ResumeStateReport, determine_resume_state
+from services.progress_state import (
+    ResumeStateReport,
+    Stage1ProgressSnapshot,
+    determine_resume_state,
+    write_stage1_progress_snapshot,
+)
 
 
 class _DummyLogger:
@@ -93,3 +98,72 @@ def test_summaries_without_progress_snapshot_are_weak_resumable(tmp_path) -> Non
     )
 
     assert report.state == "weak_resumable"
+
+
+def test_restore_stage1_progress_from_snapshot_recovers_processed_and_failed_sets(tmp_path) -> None:
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    config = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Validation": {"stage1_enabled": "false", "stage2_enabled": "false"}})
+    compat_view = CompatConfigView.from_config(config)
+
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = _DummyLogger()  # type: ignore[assignment]
+    generator.config = config
+    generator.bind_job_workspace(
+        workspace=workspace,
+        artifact_registry=registry,
+        compat_config=compat_view,
+        fingerprint_bundle={"request": "demo"},
+        resume_state_report=_resume_report(workspace),
+    )
+
+    snapshot = Stage1ProgressSnapshot(
+        artifact_type="stage1_progress_snapshot",
+        artifact_version="v1",
+        created_from_job_id=workspace.job_id,
+        created_at="2026-04-06T00:00:00Z",
+        project_name="demo",
+        job_id=workspace.job_id,
+        summary_file=workspace.artifact_path("demo_summaries.json"),
+        summary_count=2,
+        processed_papers=["paper-a"],
+        failed_papers=["paper-b"],
+        fingerprint_bundle={"request": "demo"},
+        checkpoint_file=workspace.checkpoint_path("demo_checkpoint.json"),
+    )
+    snapshot_path = workspace.artifact_path("stage1_progress_snapshot.json")
+    write_stage1_progress_snapshot(snapshot_path, snapshot)
+
+    assert generator._restore_stage1_progress_from_snapshot(snapshot_path) is True
+    assert generator._checkpoint_processed_papers == {"paper-a"}
+    assert generator._checkpoint_failed_papers == {"paper-b"}
+    assert generator.processed_count.value == 1
+    assert generator.failed_count.value == 1
+
+
+def test_rebuild_stage1_progress_from_loaded_summaries_marks_processed_papers(tmp_path) -> None:
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    config = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Validation": {"stage1_enabled": "false", "stage2_enabled": "false"}})
+    compat_view = CompatConfigView.from_config(config)
+
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = _DummyLogger()  # type: ignore[assignment]
+    generator.config = config
+    generator.bind_job_workspace(
+        workspace=workspace,
+        artifact_registry=registry,
+        compat_config=compat_view,
+        fingerprint_bundle={"request": "demo"},
+        resume_state_report=_resume_report(workspace),
+    )
+    generator.summaries = [
+        {"status": "success", "paper_info": {"title": "Paper A"}},
+        {"status": "failed", "paper_info": {"title": "Paper B"}},
+    ]
+
+    assert generator._rebuild_stage1_progress_from_loaded_summaries() is True
+    assert generator._checkpoint_processed_papers == {"paper a_unknown_author"}
+    assert generator._checkpoint_failed_papers == {"paper b_unknown_author"}
+    assert generator.processed_count.value == 1
+    assert generator.failed_count.value == 1

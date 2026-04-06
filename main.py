@@ -4,7 +4,8 @@
 """
 文献综述自动生成器 - 工业级版本
 支持身份基断点续传、双重工作模式、智能续写、项目命名空间、智能文件查找、双引擎PDF提取、适应性速率控制、并发处理、错误管理、自动重试机制和交互式安装向导。
-# 作者: auto-generate 文献综述自动生成器开发团队
+
+# 作者: auto-generate 文献综述自动生成器开发团队
 版本: 1.2
 更新日期: 2025-10-15
 """
@@ -52,7 +53,12 @@ from services.environment_service import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
-from services.progress_state import ResumeStateReport, Stage1ProgressSnapshot, write_stage1_progress_snapshot
+from services.progress_state import (
+    ResumeStateReport,
+    Stage1ProgressSnapshot,
+    load_stage1_progress_snapshot,
+    write_stage1_progress_snapshot,
+)
 from services.queue_service import CancelToken, JobCancelledError, PersistentQueueService, QueueJobSpec, QueueState, create_queue_job_id
 from services.review_draft import build_review_draft_v1, build_review_draft_v2
 from services.citation_manifest import (
@@ -478,12 +484,10 @@ class LiteratureReviewGenerator:
     def _init_queue_service(self) -> None:
         """初始化队列服务（向后兼容：在没有 job_workspace 时使用）"""
         if self.queue_service is None:
-            if self.output_dir:
-                # 如果提供了 output_dir，使用 job_workspace 路径结构
-                queue_file_path = Path(self.output_dir) / "_queue" / "queue.json"
-            else:
-                # 否则使用传入的 queue_file 参数
-                queue_file_path = Path(self.queue_file)
+            # 始终使用传入的 queue_file 参数，确保所有队列操作使用同一个队列文件
+            queue_file_path = Path(self.queue_file)
+            # 确保队列文件目录存在
+            queue_file_path.parent.mkdir(parents=True, exist_ok=True)
             self.queue_service = PersistentQueueService(queue_file_path)
 
     def submit_job_to_queue(self, job_type: str, parameters: Dict[str, Any]) -> str:
@@ -583,6 +587,88 @@ class LiteratureReviewGenerator:
         if self.compat_config:
             return self.compat_config.stage2_validation_enabled()
         return False
+
+    def adopt_outline(self) -> bool:
+        """执行大纲采纳操作"""
+        try:
+            self.logger.info("开始执行大纲采纳操作...")
+            
+            # 加载大纲文件
+            outline_path = self._get_outline_file_path()
+            if not os.path.exists(outline_path):
+                self.logger.error(f"大纲文件不存在: {outline_path}")
+                return False
+            
+            # 加载大纲数据
+            with open(outline_path, 'r', encoding='utf-8') as f:
+                outline_data = json.load(f)
+            
+            # 转换为 OutlineDocument 对象
+            from outline.models import OutlineDocument
+            outline = OutlineDocument.from_dict(outline_data)
+            
+            # 检查大纲是否有 critiques
+            if not outline.critiques:
+                self.logger.warning("大纲没有 critiques，无法执行采纳操作")
+                return False
+            
+            # 加载仲裁结果（如果存在）
+            if not self.output_dir:
+                self.logger.error("输出目录未设置")
+                return False
+            arbitration_result_path = os.path.join(self.output_dir, f'{self.project_name}_outline_arbitration_result.json')
+            if not os.path.exists(arbitration_result_path):
+                self.logger.error(f"仲裁结果文件不存在: {arbitration_result_path}")
+                return False
+            
+            with open(arbitration_result_path, 'r', encoding='utf-8') as f:
+                arbitration_data = json.load(f)
+            
+            # 转换为 OutlineArbitrationResult 对象
+            from outline.models import OutlineArbitrationResult, CritiqueArbitration, ArbitrationDecision
+            arbitrations = [
+                CritiqueArbitration(
+                    critique_id=arb['critique_id'],
+                    decision=ArbitrationDecision(arb['decision']),
+                    reason=arb['reason'],
+                    arbitrated_at=arb['arbitrated_at'],
+                    arbitrated_by=arb['arbitrated_by']
+                )
+                for arb in arbitration_data['arbitrations']
+            ]
+            
+            from outline.arbitration import run_arbitration
+            arbitration_result = run_arbitration(
+                outline=outline,
+                critiques=outline.critiques,
+                arbitrations=arbitrations,
+                job_id=self.job_workspace.job_id if hasattr(self, 'job_workspace') and self.job_workspace else str(int(time.time())),
+                arbitrated_by="user"
+            )
+            
+            # 执行采纳操作
+            from outline.arbitration import adopt_outline
+            reviewed_outline = adopt_outline(
+                outline=outline,
+                arbitration_result=arbitration_result,
+                job_id=self.job_workspace.job_id if hasattr(self, 'job_workspace') and self.job_workspace else str(int(time.time())),
+                adopted_by="user"
+            )
+            
+            # 保存采纳后的大纲
+            if not self.output_dir:
+                self.logger.error("输出目录未设置")
+                return False
+            adopted_outline_path = os.path.join(self.output_dir, f'{self.project_name}_adopted_outline.json')
+            atomic_write_json(adopted_outline_path, reviewed_outline.to_dict())
+            
+            self.logger.success(f"大纲采纳成功，已保存到: {adopted_outline_path}")
+            return True
+        except Exception as e:
+            self.logger.error(f"执行大纲采纳操作时出错: {e}")
+            import traceback
+            self.logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return False
 
     def _check_cancelled(self) -> None:
         if self.cancel_token is not None:
@@ -1296,31 +1382,141 @@ class LiteratureReviewGenerator:
     def load_existing_summaries(self) -> bool:
         """加载现有摘要文件（用于断点续传）"""
         try:
-            if not self.summary_file or not os.path.exists(self.summary_file):
-                self.logger.info("未找到现有摘要文件，将开始全新处理")
-                self.summaries = []
+            # 首先检查当前工作空间的摘要文件
+            if self.summary_file and os.path.exists(self.summary_file):
+                with open(self.summary_file, 'r', encoding='utf-8') as f:
+                    loaded_data = json.load(f)
+                    self.summaries = loaded_data if isinstance(loaded_data, list) else []
+                
+                # 验证数据格式
+                if not isinstance(self.summaries, list):  # type: ignore
+                    self.logger.warning("现有摘要文件格式不正确，将开始全新处理")
+                    self.summaries = []
+                    return True
+                
+                success_count = len([s for s in self.summaries if s.get('status') == 'success'])
+                failed_count = len([s for s in self.summaries if s.get('status') == 'failed'])
+                
+                self.logger.success(f"已加载现有摘要文件: {success_count}成功, {failed_count}失败")
                 return True
             
-            with open(self.summary_file, 'r', encoding='utf-8') as f:
-                loaded_data = json.load(f)
-                self.summaries = loaded_data if isinstance(loaded_data, list) else []
+            # 如果当前工作空间找不到摘要文件，检查历史工作空间
+            if self.project_name:
+                paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
+                output_base_path: str = paths_config.get('output_path', './output')
+                output_base_path_abs = os.path.abspath(output_base_path)
+                
+                # 查找所有历史工作空间（直接在output目录中查找）
+                import glob
+                workspace_pattern = os.path.join(output_base_path_abs, f"{self.project_name}__*")
+                workspaces = glob.glob(workspace_pattern)
+                
+                # 按修改时间排序，找到最新的工作空间
+                workspaces.sort(key=os.path.getmtime, reverse=True)
+                
+                for workspace_path in workspaces:
+                    # 检查该工作空间是否有摘要文件
+                    summary_file = os.path.join(workspace_path, "artifacts", f"{self.project_name}_summaries.json")
+                    if os.path.exists(summary_file):
+                        self.logger.info(f"在历史工作空间中找到摘要文件: {summary_file}")
+                        with open(summary_file, 'r', encoding='utf-8') as f:
+                            loaded_data = json.load(f)
+                            self.summaries = loaded_data if isinstance(loaded_data, list) else []
+                        
+                        # 验证数据格式
+                        if not isinstance(self.summaries, list):  # type: ignore
+                            self.logger.warning("历史摘要文件格式不正确，将继续查找")
+                            continue
+                        
+                        success_count = len([s for s in self.summaries if s.get('status') == 'success'])
+                        failed_count = len([s for s in self.summaries if s.get('status') == 'failed'])
+                        
+                        self.logger.success(f"已加载历史摘要文件: {success_count}成功, {failed_count}失败")
+                        return True
             
-            # 验证数据格式
-            if not isinstance(self.summaries, list):  # type: ignore
-                self.logger.warning("现有摘要文件格式不正确，将开始全新处理")
-                self.summaries = []
-                return True
-            
-            success_count = len([s for s in self.summaries if s.get('status') == 'success'])
-            failed_count = len([s for s in self.summaries if s.get('status') == 'failed'])
-            
-            self.logger.success(f"已加载现有摘要文件: {success_count}成功, {failed_count}失败")
+            self.logger.info("未找到现有摘要文件，将开始全新处理")
+            self.summaries = []
             return True
             
         except Exception as e:
             self.logger.warning(f"加载现有摘要文件失败，将开始全新处理: {e}")
             self.summaries = []
             return True  # 即使加载失败也返回True，因为我们仍可以继续处理
+
+    def _restore_stage1_progress_from_snapshot(self, snapshot_path: str) -> bool:
+        """从 progress snapshot 中恢复阶段一跳过集合。"""
+        try:
+            snapshot = load_stage1_progress_snapshot(snapshot_path)
+            if snapshot is None:
+                return False
+            if snapshot.project_name != self.project_name:
+                self.logger.warning(
+                    f"[进度恢复] snapshot 项目名称不匹配({snapshot.project_name} != {self.project_name})，忽略该快照"
+                )
+                return False
+
+            processed_papers = {
+                paper_key.strip()
+                for paper_key in snapshot.processed_papers
+                if isinstance(paper_key, str) and paper_key.strip()
+            }
+            failed_papers = {
+                paper_key.strip()
+                for paper_key in snapshot.failed_papers
+                if isinstance(paper_key, str) and paper_key.strip()
+            }
+
+            self._checkpoint_processed_papers = processed_papers
+            self._checkpoint_failed_papers = failed_papers
+            self.processed_count.set(len(processed_papers))
+            self.failed_count.set(len(failed_papers))
+
+            self.logger.info(
+                f"[进度恢复] 已从 progress snapshot 恢复: {len(processed_papers)}成功, {len(failed_papers)}失败"
+            )
+            return True
+        except Exception as exc:
+            self.logger.warning(f"[进度恢复] 读取 progress snapshot 失败，将继续尝试其他恢复路径: {exc}")
+            return False
+
+    def _rebuild_stage1_progress_from_loaded_summaries(self) -> bool:
+        """在缺少 checkpoint 时，根据已加载摘要重建阶段一跳过集合。"""
+        if not self.summaries:
+            return False
+
+        processed_papers: Set[str] = set()
+        failed_papers: Set[str] = set()
+
+        for summary in self.summaries:
+            if not isinstance(summary, Mapping):
+                continue
+            paper_info = summary.get("paper_info")
+            if not isinstance(paper_info, Mapping):
+                continue
+
+            status = str(summary.get("status") or "").strip().lower()
+            paper_key = LiteratureReviewGenerator.get_paper_key(dict(paper_info))
+            if not paper_key:
+                continue
+
+            if status == "success":
+                processed_papers.add(paper_key)
+                failed_papers.discard(paper_key)
+            elif status == "failed":
+                failed_papers.add(paper_key)
+
+        if not processed_papers and not failed_papers:
+            return False
+
+        self._checkpoint_processed_papers = processed_papers
+        self._checkpoint_failed_papers = failed_papers
+        self.processed_count.set(len(processed_papers))
+        self.failed_count.set(len(failed_papers))
+
+        self.logger.info(
+            f"[进度恢复] 已根据现有摘要重建处理进度: {len(processed_papers)}成功, {len(failed_papers)}失败"
+        )
+        return True
     
     def reset_counters(self):
         """重置计数器"""
@@ -1375,14 +1571,51 @@ class LiteratureReviewGenerator:
         with open('prompts/optimized_prompt_analyze_router.txt', 'r', encoding='utf-8') as handle:
             return handle.read()
 
-    def _prepare_stage1_input(self, pdf_path: str) -> Tuple[str, Dict[str, Any]]:
+    def _prepare_stage1_input(self, pdf_path: str, preprocess_strategy: str = 'hybrid') -> Tuple[str, Dict[str, Any]]:
         """优先使用预处理工件，必要时回退到旧版文本提取。"""
 
         preprocess_metadata: Dict[str, Any] = {}
+        preprocess_metadata['preprocess_strategy'] = preprocess_strategy
+        preprocess_metadata['preprocess_profile'] = {
+            'hybrid': 'hybrid',
+            'docling': 'forced_docling',
+            'mineru': 'forced_mineru_remote',
+            'legacy': 'legacy_extractor',
+        }.get(preprocess_strategy, preprocess_strategy)
 
         if self.preprocess_manager:
+            original_parser_mode = self.preprocess_manager.parser_mode
+            original_primary_parser = self.preprocess_manager.primary_parser
+            original_force_rebuild = self.preprocess_manager.force_rebuild
+            original_allow_local_parse_fallback = self.preprocess_manager.allow_local_parse_fallback
+            original_force_docling_strategy = self.preprocess_manager.force_docling_strategy
             try:
-                preprocess_result = self.preprocess_manager.prepare_pdf(pdf_path)
+                # 根据策略调整配置
+                if preprocess_strategy == 'mineru':
+                    # 强制使用 MinerU 远程解析
+                    self.preprocess_manager.parser_mode = 'remote'
+                    self.preprocess_manager.force_rebuild = True
+                    self.preprocess_manager.allow_local_parse_fallback = False
+                    self.preprocess_manager.force_docling_strategy = False
+                    self.logger.info(f"强制使用 MinerU 远程解析策略: {os.path.basename(pdf_path)}")
+                elif preprocess_strategy == 'docling':
+                    # 强制使用 Docling 解析
+                    self.preprocess_manager.parser_mode = 'local'
+                    self.preprocess_manager.force_rebuild = True
+                    self.preprocess_manager.allow_local_parse_fallback = False
+                    self.preprocess_manager.force_docling_strategy = True
+                    self.logger.info(f"强制使用 Docling 解析策略: {os.path.basename(pdf_path)}")
+                else:
+                    # 其他策略保持默认配置
+                    self.preprocess_manager.force_rebuild = True
+                    self.preprocess_manager.allow_local_parse_fallback = original_allow_local_parse_fallback
+                    self.preprocess_manager.force_docling_strategy = False
+                
+                # 准备PDF
+                preprocess_result = self.preprocess_manager.prepare_pdf(
+                    pdf_path
+                )
+
                 if preprocess_result:
                     stage1_text = (
                         preprocess_result.markdown_text
@@ -1391,7 +1624,7 @@ class LiteratureReviewGenerator:
                     )
                     if stage1_text and len(stage1_text.strip()) >= 500:
                         input_kind = "normalized_markdown" if self.preprocess_manager.use_markdown_as_stage1_input else "plain_text"
-                        preprocess_metadata = {
+                        preprocess_metadata.update({
                             'analysis_input_kind': input_kind,
                             'extractor_used': preprocess_result.extractor_used,
                             'layout_fidelity': preprocess_result.layout_fidelity,
@@ -1402,6 +1635,8 @@ class LiteratureReviewGenerator:
                             'mineru_attempted': preprocess_result.mineru_attempted,
                             'mineru_succeeded': preprocess_result.mineru_succeeded,
                             'mineru_token_present': preprocess_result.mineru_token_present,
+                            'mineru_remote_requested': preprocess_result.mineru_remote_requested,
+                            'mineru_remote_enabled': preprocess_result.mineru_remote_enabled,
                             'mineru_base_url': preprocess_result.mineru_base_url,
                             'markdown_path': preprocess_result.markdown_path,
                             'plain_text_path': preprocess_result.plain_text_path,
@@ -1411,36 +1646,54 @@ class LiteratureReviewGenerator:
                             'manifest_path': preprocess_result.manifest_path,
                             'chunk_count': preprocess_result.chunk_count,
                             'cache_dir': preprocess_result.cache_dir,
-                        }
+                        })
                         self.logger.info(
                             f"阶段一输入使用预处理结果: {os.path.basename(pdf_path)} -> "
-                            f"{preprocess_result.extractor_used} / {input_kind}"
+                            f"{preprocess_result.extractor_used} / {input_kind} (策略: {preprocess_strategy})"
                         )
                         return stage1_text, preprocess_metadata
 
                     self.logger.warning(
-                        f"预处理结果文本过短，回退旧版 PDF 文本提取: {os.path.basename(pdf_path)} "
+                        f"预处理结果文本过短，尝试其他策略: {os.path.basename(pdf_path)} "
                         f"({len(stage1_text) if stage1_text else 0} 字符)"
                     )
             except Exception as exc:
-                self.logger.warning(f"预处理阶段失败，回退旧版 PDF 文本提取: {exc}")
+                self.logger.warning(f"预处理阶段失败，尝试其他策略: {exc}")
+            finally:
+                self.preprocess_manager.parser_mode = original_parser_mode
+                self.preprocess_manager.primary_parser = original_primary_parser
+                self.preprocess_manager.force_rebuild = original_force_rebuild
+                self.preprocess_manager.allow_local_parse_fallback = original_allow_local_parse_fallback
+                self.preprocess_manager.force_docling_strategy = original_force_docling_strategy
 
-        self.logger.info(f"阶段一输入回退到旧版 PDF 文本提取: {os.path.basename(pdf_path)}")
-        legacy_text = str(extract_text_from_pdf(pdf_path) or "")  # type: ignore
-        preprocess_metadata = {
-            'analysis_input_kind': 'legacy_text',
-            'extractor_used': 'legacy_pdf_extractor',
-            'layout_fidelity': 'plain_text_only',
-            'conversion_used': 'native_pdf',
-            'used_ocr': False,
-            'low_quality': False,
-            'scanned_like': False,
-            'mineru_attempted': bool(self.preprocess_manager.mineru_api_token) if self.preprocess_manager else False,
-            'mineru_succeeded': False,
-            'mineru_token_present': bool(self.preprocess_manager.mineru_api_token) if self.preprocess_manager else False,
-            'mineru_base_url': self.preprocess_manager.mineru_base_url if self.preprocess_manager else '',
-        }
-        return legacy_text, preprocess_metadata
+        # 如果是legacy策略或其他策略失败，使用旧版文本提取
+        if preprocess_strategy == 'legacy':
+            self.logger.info(f"阶段一输入使用旧版 PDF 文本提取: {os.path.basename(pdf_path)}")
+            legacy_text = str(extract_text_from_pdf(pdf_path) or "")  # type: ignore
+            # 直接从环境变量读取 MinerU 配置
+            mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
+            mineru_base_url = str(os.getenv("MINERU_BASE_URL", "https://mineru.net/api/v4")).strip().rstrip("/")
+            preprocess_metadata.update({
+                'analysis_input_kind': 'legacy_text',
+                'extractor_used': 'legacy_pdf_extractor',
+                'layout_fidelity': 'plain_text_only',
+                'conversion_used': 'native_pdf',
+                'used_ocr': False,
+                'low_quality': False,
+                'scanned_like': False,
+                'mineru_attempted': False,
+                'mineru_succeeded': False,
+                'mineru_token_present': bool(mineru_api_token),
+                'mineru_base_url': mineru_base_url,
+            })
+            return legacy_text, preprocess_metadata
+
+        # 策略失败，返回空文本和元数据
+        # 确保即使在策略失败的情况下，也能正确设置 mineru_token_present
+        if not preprocess_metadata.get('mineru_token_present'):
+            mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
+            preprocess_metadata['mineru_token_present'] = bool(mineru_api_token)
+        return "", preprocess_metadata
 
     @staticmethod
     def _normalize_metadata_scan_text(value: Any) -> str:
@@ -1971,6 +2224,7 @@ class LiteratureReviewGenerator:
         2. Registered outline artifact from registry
         3. Workspace outline file
         4. Legacy outline file (fallback)
+        5. Historical workspace outline files
         """
         # Week5: Check for reviewed outline first
         reviewed_outline_content = self._load_reviewed_outline_as_markdown()
@@ -1981,16 +2235,41 @@ class LiteratureReviewGenerator:
             return reviewed_outline_path, reviewed_outline_content
 
         outline_file = self._resolve_outline_file_path()
-        if not outline_file:
-            self.logger.error("No outline artifact was found in the current workspace/registry or legacy fallback path")
-            return None
+        if outline_file:
+            try:
+                with open(outline_file, "r", encoding="utf-8") as handle:
+                    return outline_file, handle.read()
+            except Exception as exc:
+                self.logger.error(f"Failed to read outline artifact: {exc}")
 
-        try:
-            with open(outline_file, "r", encoding="utf-8") as handle:
-                return outline_file, handle.read()
-        except Exception as exc:
-            self.logger.error(f"Failed to read outline artifact: {exc}")
-            return None
+        # 如果当前工作空间找不到大纲文件，检查历史工作空间
+        if self.project_name:
+            paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
+            output_base_path: str = paths_config.get('output_path', './output')
+            output_base_path_abs = os.path.abspath(output_base_path)
+            
+            # 查找所有历史工作空间
+            import glob
+            workspace_pattern = os.path.join(output_base_path_abs, f"{self.project_name}__*")
+            workspaces = glob.glob(workspace_pattern)
+            
+            # 按修改时间排序，找到最新的工作空间
+            workspaces.sort(key=os.path.getmtime, reverse=True)
+            
+            for workspace_path in workspaces:
+                # 检查该工作空间是否有大纲文件
+                outline_file = os.path.join(workspace_path, "artifacts", f"{self.project_name}_literature_review_outline.md")
+                if os.path.exists(outline_file):
+                    self.logger.info(f"在历史工作空间中找到大纲文件: {outline_file}")
+                    try:
+                        with open(outline_file, "r", encoding="utf-8") as handle:
+                            return outline_file, handle.read()
+                    except Exception as exc:
+                        self.logger.warning(f"读取历史大纲文件失败: {exc}")
+                        continue
+
+        self.logger.error("No outline artifact was found in the current workspace/registry or legacy fallback path")
+        return None
 
     def _load_reviewed_outline_as_markdown(self) -> Optional[str]:
         """Load reviewed outline and convert to markdown if it exists and is adopted.
@@ -2342,213 +2621,314 @@ class LiteratureReviewGenerator:
                     'failure_reason': failure_reason
                 }
             
-            # 准备阶段一输入
-            self.logger.info(f"正在准备阶段一输入: {os.path.basename(pdf_path)}")
-            self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在准备阶段一输入: {os.path.basename(pdf_path)}")
-            pdf_text, preprocess_metadata = self._prepare_stage1_input(pdf_path)
-
-            if not pdf_text or len(pdf_text.strip()) < 500:  # type: ignore
-                failure_reason = f"阶段一输入准备失败或内容过少({len(pdf_text) if pdf_text else 0}字符)"  # type: ignore
-                self.logger.error(failure_reason)
-                return {
-                    'paper_info': paper,
-                    'status': 'failed',
-                    'failure_reason': failure_reason
-                }
-
-            input_kind = preprocess_metadata.get('analysis_input_kind', 'text')
-            extractor_used = preprocess_metadata.get('extractor_used', 'unknown')
-            self.logger.success(
-                f"阶段一输入准备成功: {len(pdf_text)}字符 "
-                f"({input_kind} / {extractor_used})"
-            )
-            self._check_cancelled()
-
-            try:
-                updated_fields = self._apply_stage1_text_metadata_backfill(paper, pdf_text)
-                if updated_fields:
-                    self.logger.info(f"已从阶段一输入回填元数据字段: {', '.join(updated_fields)}")
-            except Exception as e:
-                self.logger.warning(f"阶段一输入元数据回填失败: {e}")
-            
-            # 调用AI API生成摘要
-            self.logger.info("正在调用AI生成摘要...")
-            
-            # 提取分析引擎API配置
-            self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在调用AI生成摘要: {paper_label}")
-            primary_reader_config: Dict[str, str] = self.config.get('Primary_Reader_API', {}) if self.config else {}
-            reader_api_config: APIConfig = {
-                'api_key': primary_reader_config.get('api_key', ''),
-                'model': primary_reader_config.get('model', ''),
-                'api_base': primary_reader_config.get('api_base', 'https://api.openai.com/v1')
-            }
-            
-            # 提取备用引擎API配置（用于超长论文）
-            backup_reader_config: Dict[str, str] = self.config.get('Backup_Reader_API', {}) if self.config else {}
-            backup_api_config: APIConfig = {
-                'api_key': backup_reader_config.get('api_key', ''),
-                'model': backup_reader_config.get('model', ''),
-                'api_base': backup_reader_config.get('api_base', 'https://api.openai.com/v1')
-            }
-            
-            visual_bundle = self._build_stage1_visual_bundle(
-                paper=paper,
-                pdf_path=pdf_path,
-                preprocess_metadata=preprocess_metadata,
-            )
-
-            # 构建显式的阶段一输入：文本始终是主输入，视觉证据只作为受控补充
-            try:
-                stage1_input = self._build_stage1_model_input(
-                    pdf_text=pdf_text,
-                    reader_api_config=reader_api_config,
-                    visual_bundle=visual_bundle,
-                    paper=paper,
+            # 四级尝试序列：hybrid → 本地强制 Docling → 强制 MinerU remote（已配置时）→ legacy extractor
+            mineru_configured = bool(
+                (
+                    getattr(self.preprocess_manager, 'mineru_api_token', '')
+                    if self.preprocess_manager is not None
+                    else os.getenv('MINERU_API_TOKEN', '')
                 )
-                analysis_prompt = str(stage1_input.get("prompt_text") or pdf_text)
-            except Exception as e:
-                self.logger.warning(f"无法构建显式阶段一输入，回退到文本提示词: {e}")
-                stage1_input = {
-                    "input_mode": "text_only",
-                    "prompt_text": f"请分析以下论文内容，生成结构化摘要：\n\n{pdf_text}",
-                    "user_message_content": None,
-                    "selected_visual_refs": [],
-                    "visual_manifest_path": "",
-                    "visual_bundle_path": "",
-                    "visual_selection_policy_snapshot": {},
-                    "multimodal_capability": {},
-                    "fallback_reason": "stage1_input_builder_error",
-                }
-                analysis_prompt = str(stage1_input.get("prompt_text") or pdf_text)
-
-            stage1_user_content = stage1_input.get("user_message_content")
-            stage1_input_snapshot = {
-                key: value
-                for key, value in stage1_input.items()
-                if key not in {"prompt_text", "user_message_content"}
-            }
-            preprocess_metadata["visual_artifact_manifest_path"] = str(stage1_input.get("visual_manifest_path") or "")
-            preprocess_metadata["visual_bundle_path"] = str(stage1_input.get("visual_bundle_path") or "")
-            preprocess_metadata["selected_visual_count"] = len(stage1_input.get("selected_visual_refs") or [])
-            preprocess_metadata["stage1_input_mode"] = str(stage1_input.get("input_mode") or "text_only")
-            preprocess_metadata["stage1_input_fallback_reason"] = str(stage1_input.get("fallback_reason") or "")
-
-            # 调用AI接口生成摘要（自动处理引擎切换）
-            ai_result = get_summary_from_ai_with_fallback(
-                analysis_prompt,
-                reader_api_config,
-                backup_api_config,
-                logger=self.logger,
-                config=self.config,
-                user_content=stage1_user_content,
+                or ''
             )
+            preprocess_strategies = ['hybrid', 'docling']
+            if mineru_configured:
+                preprocess_strategies.append('mineru')
+            preprocess_strategies.append('legacy')
+            attempt_history = []
             
-            if not ai_result:
-                failure_reason = "AI摘要生成失败"
+            # 初始化变量，确保在所有路径中都有定义
+            preprocess_metadata = {}
+            stage1_input_snapshot = {}
+            model_used = 'primary'
+            ai_result = None
+            strategy_succeeded = False
+
+            def record_attempt_failure(
+                strategy_name: str,
+                current_metadata: Dict[str, Any],
+                *,
+                model_name: str,
+                quality_reason: str,
+                extractor_name: Optional[str] = None,
+            ) -> None:
+                attempt_history.append({
+                    'preprocess_strategy': strategy_name,
+                    'preprocess_profile': str(current_metadata.get('preprocess_profile', strategy_name)),
+                    'extractor_used': extractor_name or str(current_metadata.get('extractor_used', 'unknown')),
+                    'model_used': model_name,
+                    'quality_reason': quality_reason,
+                    'success': False,
+                })
+            
+            for strategy in preprocess_strategies:
+                self._check_cancelled()
+                ai_result = None
+                
+                # 准备阶段一输入
+                self.logger.info(f"正在准备阶段一输入 (策略: {strategy}): {os.path.basename(pdf_path)}")
+                self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在准备阶段一输入 (策略: {strategy}): {os.path.basename(pdf_path)}")
+                
+                pdf_text, preprocess_metadata = self._prepare_stage1_input(pdf_path, strategy)
+
+                if not pdf_text or len(pdf_text.strip()) < 500:  # type: ignore
+                    failure_reason = f"阶段一输入准备失败或内容过少({len(pdf_text) if pdf_text else 0}字符)"  # type: ignore
+                    self.logger.warning(f"策略 {strategy} 失败: {failure_reason}")
+                    record_attempt_failure(
+                        strategy,
+                        preprocess_metadata,
+                        model_name='N/A',
+                        quality_reason=failure_reason,
+                    )
+                    continue
+
+                input_kind = preprocess_metadata.get('analysis_input_kind', 'text')
+                extractor_used = preprocess_metadata.get('extractor_used', 'unknown')
+                self.logger.success(
+                    f"阶段一输入准备成功 (策略: {strategy}): {len(pdf_text)}字符 "
+                    f"({input_kind} / {extractor_used})"
+                )
+                
+                # 记录为什么没用 MinerU 的原因
+                if strategy == 'hybrid' and not preprocess_metadata.get('mineru_succeeded', False):
+                    if not preprocess_metadata.get('mineru_remote_requested', False):
+                        self.logger.info("未触发 MinerU: 当前预处理配置未请求远程解析")
+                    elif not preprocess_metadata.get('mineru_remote_enabled', False):
+                        self.logger.info("未触发 MinerU: hybrid 模式判定本地基线质量可接受，无需使用远程解析")
+                    elif not preprocess_metadata.get('mineru_token_present', False):
+                        self.logger.info("未触发 MinerU: 已请求远程解析，但 MINERU_API_TOKEN 不存在")
+                    elif not preprocess_metadata.get('mineru_attempted', False):
+                        self.logger.info("未触发 MinerU: 远程解析未实际发起")
+                    else:
+                        self.logger.info("未使用 MinerU: MinerU 尝试失败，使用本地解析作为回退")
+
+                self._check_cancelled()
+
+                try:
+                    updated_fields = self._apply_stage1_text_metadata_backfill(paper, pdf_text)
+                    if updated_fields:
+                        self.logger.info(f"已从阶段一输入回填元数据字段: {', '.join(updated_fields)}")
+                except Exception as e:
+                    self.logger.warning(f"阶段一输入元数据回填失败: {e}")
+                
+                # 调用AI API生成摘要
+                self.logger.info("正在调用AI生成摘要...")
+                
+                # 提取分析引擎API配置
+                self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在调用AI生成摘要: {paper_label}")
+                primary_reader_config: Dict[str, str] = self.config.get('Primary_Reader_API', {}) if self.config else {}
+                reader_api_config: APIConfig = {
+                    'api_key': primary_reader_config.get('api_key', ''),
+                    'model': primary_reader_config.get('model', ''),
+                    'api_base': primary_reader_config.get('api_base', 'https://api.openai.com/v1')
+                }
+                
+                # 提取备用引擎API配置（用于超长论文）
+                backup_reader_config: Dict[str, str] = self.config.get('Backup_Reader_API', {}) if self.config else {}
+                backup_api_config: APIConfig = {
+                    'api_key': backup_reader_config.get('api_key', ''),
+                    'model': backup_reader_config.get('model', ''),
+                    'api_base': backup_reader_config.get('api_base', 'https://api.openai.com/v1')
+                }
+                
+                visual_bundle = self._build_stage1_visual_bundle(
+                    paper=paper,
+                    pdf_path=pdf_path,
+                    preprocess_metadata=preprocess_metadata,
+                )
+
+                # 构建显式的阶段一输入：文本始终是主输入，视觉证据只作为受控补充
+                try:
+                    stage1_input = self._build_stage1_model_input(
+                        pdf_text=pdf_text,
+                        reader_api_config=reader_api_config,
+                        visual_bundle=visual_bundle,
+                        paper=paper,
+                    )
+                    analysis_prompt = str(stage1_input.get("prompt_text") or pdf_text)
+                except Exception as e:
+                    self.logger.warning(f"无法构建显式阶段一输入，回退到文本提示词: {e}")
+                    stage1_input = {
+                        "input_mode": "text_only",
+                        "prompt_text": f"请分析以下论文内容，生成结构化摘要：\n\n{pdf_text}",
+                        "user_message_content": None,
+                        "selected_visual_refs": [],
+                        "visual_manifest_path": "",
+                        "visual_bundle_path": "",
+                        "visual_selection_policy_snapshot": {},
+                        "multimodal_capability": {},
+                        "fallback_reason": "stage1_input_builder_error",
+                    }
+                    analysis_prompt = str(stage1_input.get("prompt_text") or pdf_text)
+
+                stage1_user_content = stage1_input.get("user_message_content")
+                stage1_input_snapshot = {
+                    key: value
+                    for key, value in stage1_input.items()
+                    if key not in {"prompt_text", "user_message_content"}
+                }
+                preprocess_metadata["visual_artifact_manifest_path"] = str(stage1_input.get("visual_manifest_path") or "")
+                preprocess_metadata["visual_bundle_path"] = str(stage1_input.get("visual_bundle_path") or "")
+                preprocess_metadata["selected_visual_count"] = len(stage1_input.get("selected_visual_refs") or [])
+                preprocess_metadata["stage1_input_mode"] = str(stage1_input.get("input_mode") or "text_only")
+                preprocess_metadata["stage1_input_fallback_reason"] = str(stage1_input.get("fallback_reason") or "")
+
+                # 调用AI接口生成摘要（自动处理引擎切换）
+                ai_result = get_summary_from_ai_with_fallback(
+                    analysis_prompt,
+                    reader_api_config,
+                    backup_api_config,
+                    logger=self.logger,
+                    config=self.config,
+                    user_content=stage1_user_content,
+                )
+                
+                if not ai_result:
+                    failure_reason = "AI摘要生成失败"
+                    self.logger.warning(f"策略 {strategy} 失败: {failure_reason}")
+                    record_attempt_failure(
+                        strategy,
+                        preprocess_metadata,
+                        model_name='primary',
+                        quality_reason=failure_reason,
+                        extractor_name=extractor_used,
+                    )
+                    continue
+                
+                self.logger.success("AI摘要生成成功")
+                
+                # =================== CONTENT QUALITY CHECK ===================
+                # 使用新的上下文管理模块进行质量检查，如果质量不达标则标记为失败
+                
+                # 构建模拟的ProcessingResult对象用于质量检查
+                try:
+                    updated_fields = self._apply_ai_metadata_backfill(paper, ai_result)
+                    if updated_fields:
+                        self.logger.info(f"已从 AI 结果回填元数据字段: {', '.join(updated_fields)}")
+                    else:
+                        self.logger.info("未检测到可回填的论文元数据，继续保留现有 paper_info。")
+                except Exception as e:
+                    self.logger.warning(f"元数据回填失败: {e}")
+
+                temp_result: Dict[str, Any] = {
+                    'paper_info': paper,
+                    'status': 'success',
+                    'ai_summary': ai_result,
+                    'source_mode': self.mode,
+                }
+                
+                # 使用context_manager的质量检查功能
+                is_quality_ok, quality_reason = validate_summary_quality(temp_result)
+                
+                if not is_quality_ok:
+                    # 🚨 内容质量检查失败，尝试备用引擎
+                    failure_reason = f"AI生成内容为空或不完整: {quality_reason}"
+                    self.logger.warning(f"策略 {strategy} 主引擎质量检查失败: {failure_reason}")
+                    
+                    # 检查是否配置了备用引擎
+                    backup_api_key = backup_api_config.get('api_key', '')
+                    if backup_api_key and backup_api_key.strip():
+                        self.logger.info("主引擎内容质量检查失败，尝试备用引擎...")
+                        
+                        # 使用备用引擎直接调用（绕过主引擎）
+                        backup_result = get_summary_from_ai(
+                            analysis_prompt,
+                            reader_api_config,
+                            backup_api_config,
+                            engine_type='backup',
+                            logger=self.logger,
+                            config=self.config,
+                            user_content=stage1_user_content,
+                        )
+                        
+                        if backup_result:
+                            self.logger.success("备用引擎AI摘要生成成功")
+                            
+                            # 检查备用引擎结果的质量
+                            try:
+                                updated_fields = self._apply_ai_metadata_backfill(paper, backup_result)
+                                if updated_fields:
+                                    self.logger.info(f"已从备用 AI 结果回填元数据字段: {', '.join(updated_fields)}")
+                            except Exception as e:
+                                self.logger.warning(f"备用 AI 元数据回填失败: {e}")
+
+                            temp_result_backup: Dict[str, Any] = {
+                                'paper_info': paper,
+                                'status': 'success',
+                                'ai_summary': backup_result,
+                                'source_mode': self.mode,
+                            }
+                            
+                            is_quality_ok_backup, quality_reason_backup = validate_summary_quality(temp_result_backup)
+                            
+                            if is_quality_ok_backup:
+                                self.logger.info("备用引擎内容质量检查通过")
+                                ai_result = backup_result  # 使用备用引擎的结果
+                                # 继续后续处理
+                                model_used = 'backup'
+                                strategy_succeeded = True
+                                break
+                            else:
+                                self.logger.warning(f"备用引擎内容质量检查也失败: {quality_reason_backup}")
+                                # 备用引擎也失败，记录尝试并继续下一个策略
+                                record_attempt_failure(
+                                    strategy,
+                                    preprocess_metadata,
+                                    model_name='backup',
+                                    quality_reason=f"主引擎: {quality_reason}; 备用引擎: {quality_reason_backup}",
+                                    extractor_name=extractor_used,
+                                )
+                                continue
+                        else:
+                            self.logger.error("备用引擎AI摘要生成失败")
+                            # 记录尝试并继续下一个策略
+                            record_attempt_failure(
+                                strategy,
+                                preprocess_metadata,
+                                model_name='backup',
+                                quality_reason=f"主引擎: {quality_reason}; 备用引擎调用失败",
+                                extractor_name=extractor_used,
+                            )
+                            continue
+                    else:
+                        # 没有配置备用引擎，记录尝试并继续下一个策略
+                        self.logger.info("未配置备用引擎，尝试下一个预处理策略")
+                        record_attempt_failure(
+                            strategy,
+                            preprocess_metadata,
+                            model_name='primary',
+                            quality_reason=quality_reason,
+                            extractor_name=extractor_used,
+                        )
+                        continue
+                else:
+                    # 质量检查通过
+                    model_used = 'primary'
+                    strategy_succeeded = True
+                    break
+            
+            # 检查是否所有策略都失败了
+            if not strategy_succeeded:
+                # 所有策略都失败，返回详细的失败报告
+                failure_reason = "所有预处理策略都失败"
                 self.logger.error(failure_reason)
-                return {
+                
+                # 构建详细的失败报告
+                detailed_reason = f"所有预处理策略都失败: \n"
+                for i, attempt in enumerate(attempt_history):
+                    detailed_reason += (
+                        f"  尝试 {i+1} (策略: {attempt['preprocess_strategy']}, "
+                        f"Profile: {attempt.get('preprocess_profile', '')}, "
+                        f"提取器: {attempt['extractor_used']}, "
+                        f"模型: {attempt['model_used']}): {attempt['quality_reason']}\n"
+                    )
+                
+                failed_result: ProcessingResult = {
                     'paper_info': paper,
                     'status': 'failed',
-                    'failure_reason': failure_reason
+                    'failure_reason': detailed_reason,
+                    'attempt_history': attempt_history
                 }
-            
-            self.logger.success("AI摘要生成成功")
-            
-            # =================== CONTENT QUALITY CHECK ===================
-            # 使用新的上下文管理模块进行质量检查，如果质量不达标则标记为失败
-            
-            # 构建模拟的ProcessingResult对象用于质量检查
-            try:
-                updated_fields = self._apply_ai_metadata_backfill(paper, ai_result)
-                if updated_fields:
-                    self.logger.info(f"已从 AI 结果回填元数据字段: {', '.join(updated_fields)}")
-                else:
-                    self.logger.info("未检测到可回填的论文元数据，继续保留现有 paper_info。")
-            except Exception as e:
-                self.logger.warning(f"元数据回填失败: {e}")
-
-            temp_result: Dict[str, Any] = {
-                'paper_info': paper,
-                'status': 'success',
-                'ai_summary': ai_result,
-                'source_mode': self.mode,
-            }
-            
-            # 使用context_manager的质量检查功能
-            is_quality_ok, quality_reason = validate_summary_quality(temp_result)
-            
-            if not is_quality_ok:
-                # 🚨 内容质量检查失败，尝试备用引擎
-                failure_reason = f"AI生成内容为空或不完整: {quality_reason}"
-                self.logger.warning(failure_reason)
-                
-                # 检查是否配置了备用引擎
-                backup_api_key = backup_api_config.get('api_key', '')
-                if backup_api_key and backup_api_key.strip():
-                    self.logger.info("主引擎内容质量检查失败，尝试备用引擎...")
-                    
-                    # 使用备用引擎直接调用（绕过主引擎）
-                    backup_result = get_summary_from_ai(
-                        analysis_prompt,
-                        reader_api_config,
-                        backup_api_config,
-                        engine_type='backup',
-                        logger=self.logger,
-                        config=self.config,
-                        user_content=stage1_user_content,
-                    )
-                    
-                    if backup_result:
-                        self.logger.success("备用引擎AI摘要生成成功")
-                        
-                        # 检查备用引擎结果的质量
-                        try:
-                            updated_fields = self._apply_ai_metadata_backfill(paper, backup_result)
-                            if updated_fields:
-                                self.logger.info(f"已从备用 AI 结果回填元数据字段: {', '.join(updated_fields)}")
-                        except Exception as e:
-                            self.logger.warning(f"备用 AI 元数据回填失败: {e}")
-
-                        temp_result_backup: Dict[str, Any] = {
-                            'paper_info': paper,
-                            'status': 'success',
-                            'ai_summary': backup_result,
-                            'source_mode': self.mode,
-                        }
-                        
-                        is_quality_ok_backup, quality_reason_backup = validate_summary_quality(temp_result_backup)
-                        
-                        if is_quality_ok_backup:
-                            self.logger.info("备用引擎内容质量检查通过")
-                            ai_result = backup_result  # 使用备用引擎的结果
-                            # 继续后续处理
-                        else:
-                            self.logger.warning(f"备用引擎内容质量检查也失败: {quality_reason_backup}")
-                            # 备用引擎也失败，返回失败结果
-                            failed_result: ProcessingResult = {
-                                'paper_info': paper,
-                                'status': 'failed',
-                                'failure_reason': f"主引擎和备用引擎都失败: {quality_reason}; 备用引擎: {quality_reason_backup}"
-                            }
-                            return failed_result
-                    else:
-                        self.logger.error("备用引擎AI摘要生成失败")
-                        # 返回失败结果
-                        failed_result: ProcessingResult = {
-                            'paper_info': paper,
-                            'status': 'failed',
-                            'failure_reason': f"主引擎和备用引擎都失败: {quality_reason}; 备用引擎调用失败"
-                        }
-                        return failed_result
-                else:
-                    # 没有配置备用引擎，直接返回失败
-                    self.logger.info("未配置备用引擎，直接返回失败以触发重试机制")
-                    failed_result: ProcessingResult = {
-                        'paper_info': paper,
-                        'status': 'failed',
-                        'failure_reason': failure_reason
-                    }
-                    return failed_result
+                return failed_result
             
             self.logger.info("内容质量检查通过")
             # ================================================================
@@ -2683,6 +3063,8 @@ class LiteratureReviewGenerator:
                 'preprocess': preprocess_metadata,
                 'stage1_input': stage1_input_snapshot,
                 'source_mode': self.mode,
+                'model_used': model_used,
+                'attempt_history': attempt_history
             }
 
             if not self._persist_paper_artifact(result):
@@ -2690,6 +3072,7 @@ class LiteratureReviewGenerator:
                     'paper_info': paper,
                     'status': 'failed',
                     'failure_reason': 'paper_artifact_v1 persistence failed',
+                    'attempt_history': attempt_history
                 }
             
             return result
@@ -3351,18 +3734,36 @@ class LiteratureReviewGenerator:
                 return False
             
             # 加载基于身份的断点文件
+            # 先尝试加载旧 checkpoint
             checkpoint_loaded = self.load_checkpoint()
-            if not checkpoint_loaded:
-                self.logger.info("[全新开始] 未找到有效断点，将开始全新处理")
-                self.reset_counters()
-                # 初始化断点跟踪变量
-                self._checkpoint_processed_papers = set()
-                self._checkpoint_failed_papers = set()
-            else:
-                self.logger.info("[断点续传] 已加载处理进度，将跳过已处理的论文")
             
+            # 检查是否有新的 progress snapshot
+            progress_snapshot_path: Optional[str] = None
+            if hasattr(self, 'job_workspace') and self.job_workspace:
+                snapshot_path = self.job_workspace.artifact_path("stage1_progress_snapshot.json")
+                if os.path.exists(snapshot_path):
+                    progress_snapshot_path = snapshot_path
+
             # 加载现有摘要（兼容旧版本）
             self.load_existing_summaries()
+            
+            if checkpoint_loaded:
+                self.logger.info("[断点恢复] 成功加载旧 checkpoint，将从上次中断处继续处理")
+                self.logger.info("[断点续传] 已加载处理进度，将跳过已处理的论文")
+            elif progress_snapshot_path and self._restore_stage1_progress_from_snapshot(progress_snapshot_path):
+                self.logger.info("[进度恢复] 找到新的 progress snapshot，将从上次中断处继续处理")
+                self.logger.info("[断点续传] 已加载处理进度，将跳过已处理的论文")
+            elif self._rebuild_stage1_progress_from_loaded_summaries():
+                self.logger.info("[进度恢复] 未找到有效 checkpoint，但已根据现有摘要恢复处理进度")
+                self.logger.info("[断点续传] 已根据摘要重建跳过集合，将跳过已处理的论文")
+            else:
+                self.logger.info("[全新开始] 未找到有效断点或 progress snapshot，将开始全新处理")
+                
+                # 确保重置断点数据
+                self._checkpoint_processed_papers = set()
+                self._checkpoint_failed_papers = set()
+                self.processed_count.set(0)
+                self.failed_count.set(0)
             
             # 逻辑分叉：根据运行模式选择数据源
             if self.mode == "zotero":
@@ -3547,6 +3948,12 @@ class LiteratureReviewGenerator:
                 section_content = result.get('content', '')  # type: ignore
 
                 finish_reason = result.get('finish_reason', 'stop')  # type: ignore
+
+                # 截取 === 正文 === 后的内容
+                if '=== 正文 ===' in section_content:
+                    section_content = section_content.split('=== 正文 ===')[1].strip()
+                # 移除其他中间文本标记
+                section_content = section_content.replace('=== 逻辑规划 ===', '').replace('=== 文献矩阵 ===', '').replace('=== 核查计划 ===', '').strip()
 
                 if not section_content or len(section_content.strip()) < 100:
                     self.logger.warning(f"[章节生成] 返回内容过短({len(section_content)}字符)，重试...")
@@ -4017,8 +4424,22 @@ class LiteratureReviewGenerator:
 
                     run.font.size = Pt(font_size_heading1)  # type: ignore
                 
+                # 渲染结构化引用
+                from docx_writer import render_structured_citations
+                rendered_section_text, unresolved_tokens = render_structured_citations(section_content, self)
+                if unresolved_tokens:
+                    self.logger.warning(f"第{section_num}章存在未解析的引用标记: {', '.join(sorted(set(unresolved_tokens))[:5])}")
+                    failed_sections.append(
+                        {
+                            "section_number": int(section_num),
+                            "section_title": section_title,
+                            "failure_reason": "unresolved_citation_tokens",
+                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
+                
                 # 将章节内容按段落分割并添加到文档
-                paragraphs = section_content.split('\n\n')
+                paragraphs = rendered_section_text.split('\n\n')
                 for para in paragraphs:
                     para = para.strip()
                     if para:
@@ -4044,6 +4465,30 @@ class LiteratureReviewGenerator:
             # 在所有章节处理完成后，一次性保存文档
             doc.save(word_file)
             self.logger.success(f"完整文献综述已保存: {word_file}")
+            
+            # 检查 citation manifest 是否有未解析的引用
+            self.logger.info("正在检查 citation manifest 中的引用解析状态...")
+            citation_manifest = self._load_citation_manifest()
+            from services.citation_manifest import unresolved_occurrences
+            unresolved_cites = unresolved_occurrences(citation_manifest) if citation_manifest else []
+            
+            if unresolved_cites:
+                self.logger.error(f"发现 {len(unresolved_cites)} 个未解析的引用，阻止 Word 导出")
+                self.logger.error("请修复以下未解析的引用:")
+                for cite in unresolved_cites[:5]:  # 只显示前5个
+                    self.logger.error(f"  - {cite}")
+                if len(unresolved_cites) > 5:
+                    self.logger.error(f"  ... 还有 {len(unresolved_cites) - 5} 个未解析引用")
+                
+                # 保存失败报告
+                self._save_failed_review_sections(failed_sections + [{
+                    "section_number": 999,
+                    "section_title": "参考文献",
+                    "failure_reason": f"unresolved_citations",
+                    "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }])
+                
+                return False
             
             # 生成APA参考文献（总是执行，确保参考文献总是存在）
             self.logger.info("正在生成APA参考文献...")
@@ -5198,19 +5643,33 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             print(f"[环境]   {recommended_conda_create_command()}")
             print(f"[环境]   {recommended_conda_activate_command()}")
 
+        cleanup_requested = bool(getattr(args, "cleanup", False))
+        setup_requested = bool(getattr(args, "setup", False))
+        prime_with_folder = getattr(args, "prime_with_folder", None)
+        concept = getattr(args, "concept", None)
+        retry_failed = bool(getattr(args, "retry_failed", False))
+        merge_target = getattr(args, "merge", None)
+        project_name = getattr(args, "project_name", None)
+        pdf_folder = getattr(args, "pdf_folder", None)
+
+        # 清理模式
+        if cleanup_requested:
+            handle_cleanup_mode(args)
+            return
+        
         # 检查是否为安装模式
-        if args.setup:
+        if setup_requested:
             run_setup_wizard()
             return
         
         # 概念学习模式（Priming Phase）
-        if args.prime_with_folder and args.concept:
+        if prime_with_folder and concept:
             # 检查是否提供了项目名称
-            if not args.project_name:
+            if not project_name:
                 logging.error("概念学习模式需要指定 --project-name 参数")
                 sys.exit(1)
             
-            generator = LiteratureReviewGenerator(args.config, args.project_name, None, getattr(args, "queue_file", "output/_queue/queue.json"))
+            generator = LiteratureReviewGenerator(args.config, project_name, None, getattr(args, "queue_file", "output/_queue/queue.json"))
             generator.logger.info("*** 概念学习模式已启动 ***")
             generator.logger.info("=" * 60)
             
@@ -5224,7 +5683,7 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
                 sys.exit(1)
             
             # 执行概念学习阶段
-            success = generator.run_priming_phase(args.concept, args.prime_with_folder)
+            success = generator.run_priming_phase(concept, prime_with_folder)
             if success:
                 generator.logger.success("概念学习阶段完成！概念配置文件已生成")
             else:
@@ -5233,12 +5692,12 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             return
         
         # 重试模式
-        if args.retry_failed:
+        if retry_failed:
             handle_retry_failed(args)
             return
         
         # 合并模式
-        if args.merge:
+        if merge_target:
             handle_merge_mode(args)
             return
         
@@ -5272,15 +5731,20 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             handle_queue_run_mode(args)
             return
         
+        # 大纲采纳命令
+        if hasattr(args, 'outline_adopt') and args.outline_adopt:
+            handle_outline_adopt_mode(args)
+            return
+        
         # 正常执行模式 - 验证参数
-        if not args.project_name and not args.pdf_folder:
+        if not project_name and not pdf_folder:
             logging.error("必须指定--project-name或--pdf-folder参数中的一个")
             sys.exit(1)
         
         # 验证project_name格式
-        if args.project_name:
+        if project_name:
             # 检查是否可能是完整路径（常见错误）
-            if len(args.project_name) > 100 or '\\' in args.project_name or '/' in args.project_name:
+            if len(project_name) > 100 or '\\' in project_name or '/' in project_name:
                 logging.error("❌ --project-name 参数错误")
                 logging.error("💡 请不要使用完整路径，应该使用简洁的项目名称")
                 logging.error("📝 示例：--project-name \"案例分析\" 而非 --project-name \"C:\\Users\\123\\Desktop\\我的项目\"")
@@ -5288,8 +5752,8 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
                 sys.exit(1)
             
             # 检查project_name长度
-            if len(args.project_name) > 50:
-                logging.warning(f"⚠️  项目名称过长（{len(args.project_name)}字符），建议使用更简洁的名称")
+            if len(project_name) > 50:
+                logging.warning(f"⚠️  项目名称过长（{len(project_name)}字符），建议使用更简洁的名称")
             
         from services.job_runner import JobRunner
         from services.workflow_facade import build_job_request
@@ -5890,13 +6354,59 @@ def handle_queue_add_mode(args: argparse.Namespace):  # type: ignore
         elif getattr(args, "validate_review", False):
             job_type = "validate_review"
         
+        # 确定项目名称
+        project_name = args.project_name
+        if not project_name and args.pdf_folder:
+            # 如果未传 --project-name，使用 pdf_folder 的 basename 作为项目名
+            import os
+            project_name = os.path.basename(args.pdf_folder)
+            # 清理项目名称，移除特殊字符
+            import re
+            project_name = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5]', '_', project_name)
+            generator.logger.info(f"自动生成项目名称: {project_name}")
+        else:
+            project_name = project_name or "literature_review"
+        
+        # 计算配置指纹
+        import hashlib
+        config_content = str(generator.config) if generator.config else ""
+        config_fingerprint = hashlib.md5(config_content.encode('utf-8')).hexdigest()[:16]
+        
+        # 检查队列中是否已存在相同的任务
+        existing_job = None
+        for job in generator.queue_service.list_jobs():
+            job_params = job.parameters
+            job_action = job.job_type
+            job_pdf_folder = job_params.get('pdf_folder')
+            job_config_fingerprint = job.config_fingerprint
+            
+            # 检查任务状态是否为 pending 或 running
+            job_runtime = generator.queue_service.get_job_runtime(job.job_id)
+            if job_runtime and job_runtime.state in ['pending', 'running']:
+                # 检查 pdf_folder、action 和 config fingerprint 是否相同
+                if (job_pdf_folder == args.pdf_folder and 
+                    job_action == job_type and 
+                    job_config_fingerprint == config_fingerprint):
+                    existing_job = job
+                    break
+        
+        if existing_job:
+            # 已存在相同任务，返回已有 job
+            generator.logger.info(f"已存在相同的任务: {existing_job.job_id}")
+            job_runtime = generator.queue_service.get_job_runtime(existing_job.job_id)
+            job_state = job_runtime.state if job_runtime else "unknown"
+            generator.logger.info(f"任务状态: {job_state}")
+            generator.logger.success(f"返回已有任务: {existing_job.job_id}")
+            return
+        
         # 创建任务规格
         from services.queue_service import QueueJobSpec, create_queue_job_id
         job_spec = QueueJobSpec(
             job_id=create_queue_job_id(),
             job_type=job_type,
-            project_name=args.project_name or "literature_review",
-            parameters=params
+            project_name=project_name,
+            parameters=params,
+            config_fingerprint=config_fingerprint
         )
         
         # 添加任务到队列
@@ -6158,6 +6668,16 @@ def main() -> None:  # type: ignore
         action='store_true',
         help='验证生成的综述'
     )
+    workflow_group.add_argument(
+        '--outline-adopt',
+        action='store_true',
+        help='显式采纳 Week5 大纲仲裁结果'
+    )
+    workflow_group.add_argument(
+        '--cleanup',
+        action='store_true',
+        help='清理旧工作空间，只保留最新的'
+    )
     
     # 高级选项
     advanced_group = parser.add_argument_group('高级选项')
@@ -6264,6 +6784,138 @@ def main() -> None:  # type: ignore
 
     args = parser.parse_args()
     dispatch_command(args)
+
+def handle_cleanup_mode(args: argparse.Namespace):  # type: ignore
+    """清理旧工作空间模式"""
+    try:
+        from utils import sanitize_path_component
+        
+        # 确定项目名称
+        project_name = None
+        if args.project_name:
+            project_name = sanitize_path_component(args.project_name)
+        elif args.pdf_folder:
+            project_name = sanitize_path_component(os.path.basename(os.path.abspath(args.pdf_folder.rstrip("/\\"))))
+        
+        if not project_name:
+            logging.error("必须指定 --project-name 或 --pdf-folder 参数中的一个")
+            sys.exit(1)
+        
+        # 加载配置以获取输出路径
+        temp_generator = LiteratureReviewGenerator(args.config, project_name, args.pdf_folder, "output/_queue/queue.json")
+        if not temp_generator.load_configuration():
+            logging.error("配置加载失败")
+            sys.exit(1)
+        
+        paths_config = temp_generator.config.get('Paths', {}) if temp_generator.config else {}
+        output_base_path = paths_config.get('output_path', './output')
+        output_base_path_abs = os.path.abspath(output_base_path)
+        
+        # 查找所有工作空间
+        import glob
+        import shutil
+        workspace_pattern = os.path.join(output_base_path_abs, f"{project_name}__*")
+        workspaces = glob.glob(workspace_pattern)
+        
+        if not workspaces:
+            print(f"未找到项目 '{project_name}' 的任何工作空间")
+            sys.exit(0)
+        
+        if len(workspaces) <= 1:
+            print(f"项目 '{project_name}' 只有 1 个工作空间，无需清理")
+            sys.exit(0)
+        
+        # 评估每个工作空间的完整性
+        def score_workspace(workspace_path: str) -> int:
+            """给工作空间打分，分数越高越完整"""
+            score = 0
+            artifacts_dir = os.path.join(workspace_path, "artifacts")
+            reports_dir = os.path.join(workspace_path, "reports")
+            
+            # 检查重要文件
+            if os.path.exists(os.path.join(artifacts_dir, f"{project_name}_summaries.json")):
+                score += 10
+            if os.path.exists(os.path.join(artifacts_dir, f"{project_name}_literature_review_outline.md")):
+                score += 10
+            if os.path.exists(os.path.join(reports_dir, f"{project_name}_literature_review.docx")):
+                score += 10
+            if os.path.exists(os.path.join(reports_dir, f"{project_name}_analyzed_papers.xlsx")):
+                score += 5
+            
+            # 检查文件数量
+            try:
+                artifact_files = len([f for f in os.listdir(artifacts_dir) if os.path.isfile(os.path.join(artifacts_dir, f))])
+                score += min(artifact_files, 10)
+            except:
+                pass
+            
+            # 检查修改时间（越新越好，但不如文件完整重要）
+            mtime = os.path.getmtime(workspace_path)
+            score += int(mtime / 1000000000)  # 时间戳的年分数部分
+            
+            return score
+        
+        # 按完整性评分排序
+        workspaces_with_scores = [(score_workspace(ws), ws) for ws in workspaces]
+        workspaces_with_scores.sort(key=lambda x: x[0], reverse=True)
+        
+        best_workspace = workspaces_with_scores[0][1]
+        other_workspaces = [ws for (score, ws) in workspaces_with_scores[1:]]
+        
+        print(f"找到 {len(workspaces)} 个工作空间，将保留文件最完整的 1 个，删除其余的 {len(other_workspaces)} 个:")
+        print(f"  保留: {os.path.basename(best_workspace)} (得分: {workspaces_with_scores[0][0]})")
+        
+        deleted_count = 0
+        for workspace_path in other_workspaces:
+            try:
+                print(f"  删除: {os.path.basename(workspace_path)}")
+                shutil.rmtree(workspace_path)
+                deleted_count += 1
+            except Exception as e:
+                print(f"  ❌ 删除失败: {os.path.basename(workspace_path)} - {e}")
+        
+        print(f"\n✅ 清理完成！共删除了 {deleted_count} 个旧工作空间")
+        
+    except Exception as e:
+        logging.error(f"处理清理模式时出错: {e}")
+        import traceback
+        logging.debug(f"详细错误信息: {traceback.format_exc()}")
+        sys.exit(1)
+
+def handle_outline_adopt_mode(args: argparse.Namespace):  # type: ignore
+    """处理大纲采纳模式"""
+    try:
+        # 验证参数
+        if not args.project_name and not args.pdf_folder:
+            logging.error("必须指定--project-name或--pdf-folder参数中的一个")
+            sys.exit(1)
+        
+        # 初始化生成器
+        generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
+        generator.logger.info("=== 大纲采纳模式已启动 ===")
+        generator.logger.info("=" * 60)
+        
+        # 加载配置
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+        
+        # 设置输出目录
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+        
+        # 执行大纲采纳
+        if not generator.adopt_outline():
+            generator.logger.error("大纲采纳失败")
+            sys.exit(1)
+        else:
+            generator.logger.success("大纲采纳成功！")
+    except Exception as e:
+        logging.error(f"处理大纲采纳模式时出错: {e}")
+        import traceback
+        logging.debug(f"详细错误信息: {traceback.format_exc()}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
