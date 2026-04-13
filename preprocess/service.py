@@ -873,24 +873,14 @@ class PreprocessManager:
         allow_ocr: bool,
     ) -> tuple[str, List[PageDiagnostics], List[Dict[str, Any]]]:
         import warnings
-        
-        # 捕获 MuPDF 警告
-        parser_warnings = []
-        
-        def warning_handler(message, category, filename, lineno, file=None, line=None):
-            warning_str = str(message)
-            # 捕获 MuPDF 特定警告
-            if ("No common ancestor in structure tree" in warning_str or 
-                "OCR on page.number=" in warning_str or
-                "pixScaleSmooth" in warning_str or
-                "Image too small to scale" in warning_str or
-                "Line cannot be recognized" in warning_str):
-                parser_warnings.append(warning_str)
-            return False
-        
-        # 临时设置警告处理器
-        original_handler = warnings.showwarning
-        warnings.showwarning = warning_handler
+        parser_warnings: List[str] = []
+        warning_markers = (
+            "No common ancestor in structure tree",
+            "OCR on page.number=",
+            "pixScaleSmooth",
+            "Image too small to scale",
+            "Line cannot be recognized",
+        )
         
         doc = fitz.open(pdf_path)
         plain_parts: List[str] = []
@@ -898,46 +888,52 @@ class PreprocessManager:
         page_blocks: List[Dict[str, Any]] = []
 
         try:
-            for page_number in range(doc.page_count):
-                page = doc.load_page(page_number)
-                raw_text_value = page.get_text("text")
-                raw_text = raw_text_value if isinstance(raw_text_value, str) else ""
-                image_count = len(page.get_images(full=True))
-                scanned_candidate = len(raw_text.strip()) < 50 and image_count > 0
-                used_ocr = False
-                effective_text = raw_text
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                warnings.simplefilter("always")
+                for page_number in range(doc.page_count):
+                    page = doc.load_page(page_number)
+                    raw_text_value = page.get_text("text")
+                    raw_text = raw_text_value if isinstance(raw_text_value, str) else ""
+                    image_count = len(page.get_images(full=True))
+                    scanned_candidate = len(raw_text.strip()) < 50 and image_count > 0
+                    used_ocr = False
+                    effective_text = raw_text
 
-                # 避免 OCR 操作以减少崩溃风险
-                # if allow_ocr and self._should_try_ocr(scanned_candidate):
-                #     ocr_text = self._ocr_page(page)
-                #     if ocr_text:
-                #         effective_text = ocr_text
-                #         used_ocr = True
+                    # 避免 OCR 操作以减少崩溃风险
+                    # if allow_ocr and self._should_try_ocr(scanned_candidate):
+                    #     ocr_text = self._ocr_page(page)
+                    #     if ocr_text:
+                    #         effective_text = ocr_text
+                    #         used_ocr = True
 
-                plain_parts.append(f"\n--- Page {page_number + 1} ---\n{effective_text.strip()}\n")
-                page_blocks.append(
-                    {
-                        "page_number": page_number + 1,
-                        "text": effective_text,
-                        "image_count": image_count,
-                        "blocks": self._make_json_safe(page.get_text("dict")),
-                        "parser_warnings": [w for w in parser_warnings if f"page.number={page_number + 1}" in w]
-                    }
-                )
-                page_diagnostics.append(
-                    PageDiagnostics(
-                        page_number=page_number + 1,
-                        text_length=len(effective_text.strip()),
-                        image_count=image_count,
-                        scanned_candidate=scanned_candidate,
-                        used_ocr=used_ocr,
-                        low_quality=len(effective_text.strip()) < 80,
+                    plain_parts.append(f"\n--- Page {page_number + 1} ---\n{effective_text.strip()}\n")
+                    page_blocks.append(
+                        {
+                            "page_number": page_number + 1,
+                            "text": effective_text,
+                            "image_count": image_count,
+                            "blocks": self._make_json_safe(page.get_text("dict")),
+                            "parser_warnings": [w for w in parser_warnings if f"page.number={page_number + 1}" in w],
+                        }
                     )
+                    page_diagnostics.append(
+                        PageDiagnostics(
+                            page_number=page_number + 1,
+                            text_length=len(effective_text.strip()),
+                            image_count=image_count,
+                            scanned_candidate=scanned_candidate,
+                            used_ocr=used_ocr,
+                            low_quality=len(effective_text.strip()) < 80,
+                        )
+                    )
+
+                parser_warnings.extend(
+                    str(item.message)
+                    for item in caught_warnings
+                    if any(marker in str(item.message) for marker in warning_markers)
                 )
         finally:
             doc.close()
-            # 恢复原始警告处理器
-            warnings.showwarning = original_handler
         
         # 记录解析器警告
         if parser_warnings:
