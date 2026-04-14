@@ -314,6 +314,19 @@ TRANSLATIONS["en"].update(
         "队列服务未初始化": "Queue service not initialized.",
         "已清空已完成任务 {count}": "Cleared {count} completed jobs",
         "清空失败: {e}": "Clear failed: {e}",
+        "添加任务到队列": "Add Jobs to Queue",
+        "可先批量添加多个任务到草稿，再统一提交到队列。支持 PDF 文件夹和 Zotero 报告混合排队。":
+            "Draft multiple jobs first, then submit them to the queue together. PDF-folder and Zotero-report jobs can be mixed.",
+        "请输入项目名": "Enter a project name",
+        "请输入 PDF 文件夹路径": "Enter a PDF folder path",
+        "请输入 Zotero 报告路径": "Enter a Zotero report path",
+        "加入草稿": "Add to Draft",
+        "立即入队": "Queue Now",
+        "提交草稿": "Commit Draft",
+        "清空草稿": "Clear Draft",
+        "移除": "Remove",
+        "队列草稿为空。你可以先添加多个任务，再统一提交到队列。":
+            "The queue draft is empty. Add multiple jobs first, then commit them to the queue together.",
     }
 )
 

@@ -1,5 +1,8 @@
 # Development Guide
 
+> Audience: contributors and maintainers.
+> This file is intentionally development-facing; end users should start from the README files instead.
+
 This file is for contributors and local development workflows.
 
 ## Recommended Environment

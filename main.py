@@ -2254,31 +2254,6 @@ class LiteratureReviewGenerator:
         self.logger.error("No outline artifact was found in the current workspace/registry or legacy fallback path")
         return None
 
-    def _load_reviewed_outline_as_markdown(self) -> Optional[str]:
-        """Load reviewed outline and convert to markdown if it exists and is adopted.
-
-        Returns:
-            Markdown string if reviewed outline exists and is adopted, None otherwise
-        """
-        if not self.job_workspace or not self.project_name:
-            return None
-
-        try:
-            from outline.legacy_adapter import OutlineLegacyAdapter
-
-            adapter = OutlineLegacyAdapter.from_workspace(
-                workspace_path=self.job_workspace.paths.artifacts_dir,
-                project_name=self.project_name,
-                legacy_markdown="",
-            )
-
-            if adapter.has_adopted_outline():
-                return adapter.get_markdown()
-        except Exception as exc:
-            self.logger.debug(f"Could not load reviewed outline: {exc}")
-
-        return None
-
     def _get_review_checkpoint_file_path(self) -> str:
         if not self.output_dir:
             raise ValueError("输出目录未设置")
@@ -4433,16 +4408,9 @@ class LiteratureReviewGenerator:
                 
                 # 检查章节内容是否包含结构化citation token
                 if "[[cite:" not in section_content:
-                    self.logger.warning(f"第{section_num}章内容缺少结构化citation token，标记为生成异常")
-                    failed_sections.append(
-                        {
-                            "section_number": int(section_num),
-                            "section_title": section_title,
-                            "failure_reason": "missing_structured_citation_token",
-                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
+                    self.logger.warning(
+                        f"第{section_num}章内容缺少结构化citation token；继续保留章节内容，并在后续工件中按可用信息持久化。"
                     )
-                    continue
 
                 review_sections_by_number[int(section_num)] = {
                     "section_number": int(section_num),

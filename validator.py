@@ -119,24 +119,9 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
 
     try:
         # 安全获取配置
-        validator_config: Dict[str, str] = generator_instance.config.get('Validator_API', {})
-        if not validator_config:
-            generator_instance.logger.error("未找到[Validator_API]配置段，跳过验证。")  # type: ignore
-            return ai_result
-
-        validator_api_config: Dict[str, str] = {  # type: ignore
-            'api_key': validator_config.get('api_key', ''),  # type: ignore
-            'model': validator_config.get('model', ''),  # type: ignore
-            'api_base': validator_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
-        }  # type: ignore
-
-        # 验证配置完整性
-        if not validator_api_config['api_key'] or not validator_api_config['api_key'].strip():
-            generator_instance.logger.error("Validator_API的api_key未配置或为空，跳过验证。")
-            return ai_result
-
-        if not validator_api_config['model'] or not validator_api_config['model'].strip():
-            generator_instance.logger.error("Validator_API的model未配置或为空，跳过验证。")
+        validator_api_config = _get_validator_api_config(generator_instance)
+        if not validator_api_config:
+            generator_instance.logger.error("未找到有效的[Validator_API]配置，跳过验证。")
             return ai_result
 
         # 使用严格验证提示词，只检查客观事实错误
@@ -374,12 +359,12 @@ def _get_validation_workspace(generator_instance: Any) -> Any:
 def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     review_draft_path = generator_instance._review_draft_v2_path()
     if not os.path.exists(review_draft_path):
-        generator_instance.logger.error(f"??? review_draft_v2 ??: {review_draft_path}")
+        generator_instance.logger.error(f"Missing review_draft_v2 file: {review_draft_path}")
         return None, None, [], {}, {}
 
     citation_manifest_path = generator_instance._citation_manifest_path()
     if not os.path.exists(citation_manifest_path):
-        generator_instance.logger.error(f"??? citation_manifest ??: {citation_manifest_path}")
+        generator_instance.logger.error(f"Missing citation_manifest file: {citation_manifest_path}")
         return None, None, [], {}, {}
 
     with open(review_draft_path, "r", encoding="utf-8") as handle:
@@ -401,7 +386,9 @@ def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str,
                 except Exception as exc:
                     generator_instance.logger.warning(f"?? paper artifact ??: {exc}")
     except Exception as exc:
-        generator_instance.logger.warning(f"? artifact registry ?? paper artifact ??????? summaries: {exc}")
+        generator_instance.logger.warning(
+            f"Failed to load paper artifacts from the artifact registry; falling back to summaries: {exc}"
+        )
 
     if not paper_artifacts:
         for summary in getattr(generator_instance, "summaries", []) or []:
@@ -453,17 +440,17 @@ def _build_report_from_results(citation_results: List[Any]) -> Any:
     )
 
 
-def _get_validator_api_config(generator_instance: Any) -> Optional[Dict[str, str]]:
-    validator_config: Dict[str, str] = (generator_instance.config.get("Validator_API") or {}) if generator_instance.config else {}
+def _get_validator_api_config(generator_instance: Any) -> Optional[APIConfig]:
+    validator_config: Dict[str, Any] = (generator_instance.config.get("Validator_API") or {}) if generator_instance.config else {}
     api_key = str(validator_config.get("api_key") or "").strip()
     model = str(validator_config.get("model") or "").strip()
     if not api_key or not model:
         return None
-    return {
-        "api_key": api_key,
-        "model": model,
-        "api_base": str(validator_config.get("api_base") or "https://api.openai.com/v1").strip(),
-    }
+    return APIConfig(
+        api_key=api_key,
+        model=model,
+        api_base=str(validator_config.get("api_base") or "https://api.openai.com/v1").strip(),
+    )
 
 
 def _load_source_text_for_artifact(paper_artifact: Dict[str, Any]) -> str:

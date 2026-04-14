@@ -2,6 +2,10 @@
 
 Last updated: `2026-04-02`
 
+> Historical note: this file is a migration-era baseline, not the current runtime truth.
+> For the current repository reality, prefer `AGENTS.md`, `README.md`, and `TRUTH_SOURCES.md`.
+> Audience: maintainers / AI agents.
+
 ## Baseline
 
 - Repository: `super-lee-hub/literature-review-generator`

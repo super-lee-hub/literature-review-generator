@@ -2531,28 +2531,32 @@ def launch_gui(
                     
                     # 添加任务到队列
                     with ui.card().classes("ag-card p-6 q-mt-md"):
-                        ui.label(t("?????????")).classes("ag-section-title")
-                        ui.label(t("??????????????????????? PDF ???? Zotero ?????????"))                            .classes("ag-subtle q-mt-sm")
+                        ui.label(t("添加任务到队列")).classes("ag-section-title")
+                        ui.label(
+                            t("可先批量添加多个任务到草稿，再统一提交到队列。支持 PDF 文件夹和 Zotero 报告混合排队。")
+                        ).classes("ag-subtle q-mt-sm")
                         with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                            project_name_input = ui.input(t("???"), placeholder=t("??????")).classes("w-full")
+                            project_name_input = ui.input(t("项目名"), placeholder=t("请输入项目名")).classes("w-full")
                             action_select = ui.select(
                                 {
-                                    "analyze": t("?????"),
-                                    "outline": t("????"),
-                                    "review": t("????"),
-                                    "validate": t("??????"),
-                                    "retry_failed": t("??????"),
-                                    "retry_review_failed": t("??????"),
-                                    "run_all": t("????"),
+                                    "analyze": controller.action_label("analyze"),
+                                    "outline": controller.action_label("outline"),
+                                    "review": controller.action_label("review"),
+                                    "validate": controller.action_label("validate"),
+                                    "retry_failed": controller.action_label("retry_failed"),
+                                    "retry_review_failed": controller.action_label("retry_review_failed"),
+                                    "run_all": controller.action_label("run_all"),
                                 },
-                                label=t("????"),
+                                label=t("任务类型"),
                                 value="analyze",
                             ).classes("w-full")
-                            pdf_folder_input = ui.input(t("PDF ???"), placeholder=t("??? PDF ?????")).classes("w-full")
-                            zotero_report_input = ui.input(t("Zotero ????"), placeholder=t("??? Zotero ????")).classes("w-full")
+                            pdf_folder_input = ui.input(t("PDF 文件夹"), placeholder=t("请输入 PDF 文件夹路径")).classes("w-full")
+                            zotero_report_input = ui.input(
+                                t("Zotero 报告路径"), placeholder=t("请输入 Zotero 报告路径")
+                            ).classes("w-full")
                         with ui.row().classes("gap-2 q-mt-md flex-wrap"):
                             ui.button(
-                                t("????"),
+                                t("加入草稿"),
                                 on_click=lambda: controller.add_queue_builder_item(
                                     project_name_input.value,
                                     pdf_folder_input.value,
@@ -2561,7 +2565,7 @@ def launch_gui(
                                 ),
                             ).props("unelevated")
                             ui.button(
-                                t("????"),
+                                t("立即入队"),
                                 on_click=lambda: controller.add_job_to_queue(
                                     project_name_input.value,
                                     pdf_folder_input.value,
@@ -2569,8 +2573,8 @@ def launch_gui(
                                     action_select.value or "analyze",
                                 ),
                             ).props("outline")
-                            ui.button(t("??????"), on_click=controller.commit_queue_builder).props("unelevated color=primary")
-                            ui.button(t("????"), on_click=controller.clear_queue_builder).props("flat")
+                            ui.button(t("提交草稿"), on_click=controller.commit_queue_builder).props("unelevated color=primary")
+                            ui.button(t("清空草稿"), on_click=controller.clear_queue_builder).props("flat")
 
                         draft_items = controller.state["queue_builder"]["items"]
                         if draft_items:
@@ -2578,14 +2582,14 @@ def launch_gui(
                                 for index, item in enumerate(draft_items, start=1):
                                     with ui.row().classes("w-full items-center justify-between rounded-xl ag-card p-3"):
                                         ui.label(
-                                            f"{index}. {item.get('project_name', '')} ? {controller.action_label(str(item.get('action') or 'analyze'))}"
+                                            f"{index}. {item.get('project_name', '')} · {controller.action_label(str(item.get('action') or 'analyze'))}"
                                         ).classes("text-body1")
                                         ui.button(
-                                            t("??"),
+                                            t("移除"),
                                             on_click=lambda _event=None, idx=index - 1: controller.remove_queue_builder_item(idx),
                                         ).props("flat color=negative size=sm")
                         else:
-                            ui.label(t("????????????????????????")).classes("ag-subtle q-mt-md")
+                            ui.label(t("队列草稿为空。你可以先添加多个任务，再统一提交到队列。")).classes("ag-subtle q-mt-md")
                     with ui.card().classes("ag-card p-6 q-mt-md"):
                         ui.label(t("队列文件操作")).classes("ag-section-title")
                         queue_file_input = ui.input(t("队列文件路径"), placeholder=t("请输入队列文件路径")).classes("w-full q-mt-md")

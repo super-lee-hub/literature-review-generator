@@ -28,10 +28,11 @@ def _make_text_pdf(path: Path) -> None:
     doc.close()
 
 
-def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path) -> None:
+def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "sample.pdf"
     cache_dir = tmp_path / "cache"
     _make_text_pdf(pdf_path)
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
 
     config = {
         "Paths": {"output_path": str(tmp_path)},

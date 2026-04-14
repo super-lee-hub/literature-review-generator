@@ -1,5 +1,8 @@
 # Feature Reality Matrix
 
+> Audience: maintainers / AI agents / contributors.
+> This is an internal status document, not the primary end-user guide.
+
 ## Overview
 This matrix provides a comprehensive view of the current implementation status of features in the auto-generate project. It helps track what's implemented, what's partially implemented, what's legacy, and what's planned for future development.
 
@@ -22,7 +25,7 @@ This matrix provides a comprehensive view of the current implementation status o
 | Citation Object Main Chain | implemented | Citation object as primary truth source | Fully functional - structured citations are now the default truth source |
 | Validation/Repair | implemented | Validation and repair pipeline | Fully functional - includes preprocess evidence loader and semi-closed loop repair |
 | Queue System | implemented | Job queue management | Fully functional - includes complete task snapshots and dependency tracking |
-| Outline Arbitration | implemented | Outline arbitration system | Fully functional - includes explicit adopt and no auto-adopt |
+| Outline Review Compatibility | partial | Optional outline critique/arbitration/adopt surface | Present as an explicit/manual compatibility path; normal outline/review workflow does not require it |
 | Zotero Integration | implemented | Zotero report parsing and library integration | Fully functional |
 | PDF Extraction | implemented | PDF text extraction with multiple backends | Fully functional |
 | AI Integration | implemented | OpenAI-compatible API integration | Fully functional |
@@ -76,10 +79,10 @@ This matrix provides a comprehensive view of the current implementation status o
 - **Description**: Job queue management
 - **Notes**: Fully functional - includes complete task snapshots and dependency tracking
 
-### Outline Arbitration
-- **Status**: implemented
-- **Description**: Outline arbitration system
-- **Notes**: Fully functional - includes explicit adopt and no auto-adopt
+### Outline Review Compatibility
+- **Status**: partial
+- **Description**: Optional outline critique/arbitration/adopt compatibility surface
+- **Notes**: The normal runtime generates and consumes the markdown outline artifact directly. Explicit/manual outline review helpers still exist, but they are not part of the default outline → review chain.
 
 ### Zotero Integration
 - **Status**: implemented
@@ -106,7 +109,9 @@ This matrix provides a comprehensive view of the current implementation status o
 - **Description**: Command-line interface
 - **Notes**: Fully functional with support for all core commands
 
-## Roadmap
+## Roadmap Notes
+
+This section records implementation direction/history. It should not be read as a promise that every item is the default end-user workflow today.
 
 ### P0: Stability and Truth Alignment
 - Fix Windows pymupdf4llm/onnxruntime access violation
@@ -128,11 +133,10 @@ This matrix provides a comprehensive view of the current implementation status o
 - Add complete queue operations to GUI
 - Update CLI to support batch queue files
 
-### P4: Outline Arbitration
-- Update Outline artifact generator_model
-- Implement critique process
-- Remove auto-accept/auto-adopt
-- Complete arbitration application logic
+### P4: Outline review simplification
+- Keep markdown outline generation as the normal path
+- Avoid claiming critique/arbitration/adopt is part of the default workflow
+- Treat any remaining outline-review helpers as optional compatibility code until explicitly removed
 
 ### P5: Documentation and GUI Updates
 - Update GUI validation entry and configuration text

@@ -1,306 +1,187 @@
 # LLM Literature Review Generator
 
-[中文说明](./README.zh-CN.md) | [English](./README.en.md)
+[Chinese guide](./README.zh-CN.md) | [Project landing page](./README.md)
 
-This project is a local AI literature analysis and literature review generation workbench with two main input modes:
+This is a local AI literature workbench for ordinary users. You can give it a folder of PDFs or a Zotero library, then generate paper summaries, an outline, and a full literature review.
 
-- `PDF folder mode`: analyze a folder of PDFs directly
-- `Zotero mode`: use a Zotero report plus library path
+## What you can do
 
-It runs in stages:
+- Analyze a folder of PDF papers
+- Use a Zotero report plus library path
+- Generate paper summaries, an outline, and a full review
+- Retry failed papers or failed review sections
+- Regenerate one section when only part of the review needs a fix
+- Use either the command line or the GUI
+- Queue multiple jobs and run them later
 
-1. preprocessing and stage-1 paper analysis
-2. outline generation
-3. full review generation
+## Before you start
 
-The GUI and CLI are now aligned:
-
-- major CLI features are available in the GUI
-- both GUI and CLI show clear progress
-- stage 2 supports both automatic retry and manual retry for failed sections
-
-## 1. Install
-
-### Runtime only
+1. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For development setup, testing, type checking, and Playwright GUI tests, see [DEVELOPMENT.md](./DEVELOPMENT.md).
-
-Recommended first step after installation:
+2. Run setup once:
 
 ```bash
 python main.py --setup
 ```
 
-## 2. Most Common Commands
+3. If your project needs API keys or file paths, fill them in through `config.ini` or the GUI setup page.
 
-### 2.1 Run stage 1 only
+## Quick start
+
+If you already have a PDF folder, this is the easiest path:
 
 ```bash
-python main.py --pdf-folder "D:\YourPdfFolder"
+python main.py --pdf-folder "D:\YourPdfFolder" --analyze-only
 ```
 
-### 2.2 Generate the outline
+Then continue with:
 
 ```bash
 python main.py --pdf-folder "D:\YourPdfFolder" --generate-outline
-```
-
-### 2.3 Generate the full review
-
-```bash
 python main.py --pdf-folder "D:\YourPdfFolder" --generate-review
 ```
 
-### 2.4 Run the full pipeline
+Or run the full pipeline:
 
 ```bash
 python main.py --pdf-folder "D:\YourPdfFolder" --run-all
 ```
 
-### 2.5 Regenerate one specific section
+If you want a named output, add `--project-name`:
+
+```bash
+python main.py --pdf-folder "D:\YourPdfFolder" --project-name "my_review" --run-all
+```
+
+## Use PDF folders
+
+Use this mode when your papers are already in one folder.
+
+Common commands:
+
+```bash
+python main.py --pdf-folder "D:\YourPdfFolder" --analyze-only
+python main.py --pdf-folder "D:\YourPdfFolder" --generate-outline
+python main.py --pdf-folder "D:\YourPdfFolder" --generate-review
+python main.py --pdf-folder "D:\YourPdfFolder" --run-all
+```
+
+If you only need to redo one section:
 
 ```bash
 python main.py --pdf-folder "D:\YourPdfFolder" --generate-section <section_number>
 ```
 
-Replace `<section_number>` with the section number from your outline or the chapter you want to regenerate. It is not a fixed default value.
+Use the real section number from your outline.
 
-### 2.6 Retry failed review sections only
-
-```bash
-python main.py --pdf-folder "D:\YourPdfFolder" --retry-review-failed
-```
-
-### 2.7 Retry failed stage-1 papers
+If some papers failed in stage 1:
 
 ```bash
 python main.py --pdf-folder "D:\YourPdfFolder" --retry-failed
 ```
 
-### 2.8 Start the GUI
+## Use Zotero
+
+If you use Zotero, set these paths in `config.ini` or the GUI:
+
+- `Paths.zotero_report`
+- `Paths.library_path`
+
+You can also pass them on the command line when you start a run:
 
 ```bash
-python main.py --gui
+python main.py --project-name "my_review" --zotero-report "D:\zotero_report.txt" --library-path "D:\ZoteroLibrary" --analyze-only
 ```
 
-Or use:
+Then run the same main flows:
 
 ```bash
-start_gui.bat
+python main.py --project-name "my_review" --analyze-only
+python main.py --project-name "my_review" --generate-outline
+python main.py --project-name "my_review" --generate-review
 ```
 
-## 2.9 Queue Commands
+## GUI
 
-### 2.9.1 Add task to queue
+Start the GUI with:
 
 ```bash
-python main.py --queue-add --pdf-folder "D:\YourPdfFolder" --project-name "your-project" --analyze-only
+python launch_gui.py
 ```
 
-### 2.9.2 Run queue tasks
+Use the GUI if you prefer clicking through setup, analysis, queue management, and progress tracking.
+
+## Queue runs
+
+Queue mode is useful when you want to prepare multiple jobs first and run them later.
+
+Common queue commands:
 
 ```bash
+python main.py --queue-add --pdf-folder "D:\YourPdfFolder" --project-name "my_review" --analyze-only
 python main.py --queue-run
-```
-
-### 2.9.3 List queue tasks
-
-```bash
 python main.py --queue-list
-```
-
-### 2.9.4 Cancel task
-
-```bash
 python main.py --queue-cancel <job_id>
-```
-
-### 2.9.5 Retry task
-
-```bash
 python main.py --queue-retry <job_id>
-```
-
-### 2.9.6 Clear completed tasks
-
-```bash
 python main.py --queue-clear
 ```
 
-### 2.9.7 Specify queue file
+If you want to use a specific queue file:
 
 ```bash
 python main.py --queue-file "custom_queue_file.json" --queue-list
 ```
 
-### 2.9.8 Batch load queue files
+If you want to load several queue files at once:
 
 ```bash
 python main.py --queue-run --queue-files "queue1.json" "queue2.json"
 ```
 
-## 3. Zotero Mode
+## Optional features
 
-If you use Zotero, configure these paths in `config.ini` or in the GUI:
+These are useful, but not required for a basic run:
 
-- `Paths.zotero_report`
-- `Paths.library_path`
+- `--prime-with-folder` + `--concept`: warm up the run with a concept folder
+- `--free-mode-profile`: load a free-mode profile JSON
+- `--free-mode-idea`: pass a free-mode idea text directly
+- `--merge`: merge multiple `summaries.json` files
+- `--validate-review`: validate a generated review when you want an extra check
+- `--outline-adopt`: use a manually adopted outline when needed
+- `--cleanup`: remove old workspace files and keep the latest job files
+- `--retry-review-failed`: retry failed or missing review sections only
 
-Then run:
+## Output files
 
-```bash
-python main.py --project-name "your-project"
-python main.py --project-name "your-project" --generate-outline
-python main.py --project-name "your-project" --generate-review
-```
-
-## 4. GUI / CLI Mapping
-
-The GUI workspace now maps directly to CLI actions:
-
-- `Analyze Only` -> `python main.py --pdf-folder "..."`
-- `Generate Outline` -> `python main.py --pdf-folder "..." --generate-outline`
-- `Generate Full Review` -> `python main.py --pdf-folder "..." --generate-review`
-- `Run All` -> `python main.py --pdf-folder "..." --run-all`
-- `Retry Failed Papers` -> `python main.py --pdf-folder "..." --retry-failed`
-- `Generate Selected Section` -> `python main.py --pdf-folder "..." --generate-section N`
-- `Retry Failed Sections` -> `python main.py --pdf-folder "..." --retry-review-failed`
-
-`validate` is still available, but it is now off by default and moved into the GUI’s `Advanced / Experimental` area.
-
-## 5. Progress Visualization
-
-Progress is now exposed across all main steps:
-
-- PDF preprocessing
-- stage-1 paper analysis
-- stage-1 failed-paper retry
-- outline generation
-- stage-2 section generation
-- stage-2 failed-section retry
-- single-section regeneration
-
-Display behavior:
-
-- CLI keeps `tqdm` plus logs
-- GUI shows a persistent task progress card with current task, stage, current paper/section, success/failed/remaining counts, retry round, and elapsed time
-
-Notes:
-
-- countable stages use determinate progress bars
-- long single API calls use indeterminate progress bars
-
-## 6. Stage-2 Automatic and Manual Retry
-
-### Automatic retry
-
-After the first `--generate-review` pass, the program automatically retries failed sections.
-
-Config:
-
-```ini
-[Stage2_Retry]
-enabled = true
-max_retry_rounds = 2
-base_retry_delay = 30
-max_retry_delay = 120
-```
-
-### Manual retry
-
-If sections are still missing after a run, use:
-
-```bash
-python main.py --pdf-folder "D:\YourPdfFolder" --retry-review-failed
-```
-
-This retries only failed or missing sections and keeps successful ones intact.
-
-### Single section regeneration
-
-If you only want one section:
-
-```bash
-python main.py --pdf-folder "D:\YourPdfFolder" --generate-section <section_number>
-```
-
-Use the actual outline section number here, for example the chapter number you need to rerun.
-
-## 7. Output Files
-
-After a run, check:
+Most current results are written to the active job workspace:
 
 ```text
-output/project_name/
+output/<project_name>__<job_id>/
 ```
 
-Common files:
+Typical files:
 
-- `*_summaries.json`: structured stage-1 summaries
-- `*_analyzed_papers.xlsx`: Excel export
-- `*_literature_review_outline.md`: outline
-- `*_literature_review.docx`: full review
-- `*_failed_papers_report.txt`: stage-1 failure report
-- `*_review_checkpoint.json`: stage-2 checkpoint
-- `*_sections/`: per-section artifacts for stage 2
+- `artifacts/*_summaries.json`
+- `artifacts/*_literature_review_outline.md`
+- `reports/*_analyzed_papers.xlsx`
+- `reports/*_literature_review.docx`
+- `reports/*_failed_papers_report.txt`
+- `checkpoints/*_review_checkpoint.json`
+- `logs/`
 
-## 8. Paper-Type Routing
+If you see a compatibility folder under `output/<project_name>/`, treat it as a pointer or legacy path, not the first place to look.
 
-Stage 1 now keeps the cost model of one main call per paper. That call handles:
+## Troubleshooting
 
-1. `paper_type` routing
-2. `common_core` extraction
-3. routed `type_specific_details`
+- Not sure where to begin? Start with `--analyze-only`.
+- Want the GUI? Run `python launch_gui.py`.
+- Need only part of a review? Use `--generate-section <section_number>`.
+- Want to retry only failures? Use `--retry-failed` or `--retry-review-failed`.
+- Want to name the run? Add `--project-name`.
+- Using Zotero? Make sure the report path and library path are set.
 
-Current top-level types:
-
-- `empirical`
-- `review`
-- `conceptual`
-- `uncertain`
-
-Compatibility is preserved, so older `summaries.json`, Excel export, and stage-2 flows still work.
-
-## 9. Validate
-
-`validate` is still present, but it was not expanded in this round and is not recommended as part of the default workflow.
-
-Default status:
-
-- `enable_stage1_validation = false`
-- `enable_stage2_validation = false`
-
-In the GUI, it now lives under `Advanced / Experimental`.
-
-## 10. Recommended Order
-
-For a stable first run:
-
-1. `python main.py --setup`
-2. run stage 1 first:
-
-```bash
-python main.py --pdf-folder "D:\YourPdfFolder"
-```
-
-3. check the summaries and Excel export
-4. generate the outline:
-
-```bash
-python main.py --pdf-folder "D:\YourPdfFolder" --generate-outline
-```
-
-5. generate the full review:
-
-```bash
-python main.py --pdf-folder "D:\YourPdfFolder" --generate-review
-```
-
-If a chapter is missing afterward:
-
-- use `--generate-section N` for one section
-- use `--retry-review-failed` for all failed / missing sections
+If you need technical or development-only details, use the separate internal docs instead of this README.

@@ -1,5 +1,8 @@
 # MIGRATION_NOTES.md
 
+> Audience: maintainers / AI agents.
+> This file explains migration-era behavior and compatibility decisions. It is not the primary user-facing guide.
+
 ## Purpose
 
 This document tracks operational migration behavior introduced by the job-workspace execution model.

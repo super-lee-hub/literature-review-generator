@@ -39,6 +39,12 @@ def _build_citation_entry_lookup(generator_instance: Any) -> Dict[str, Any]:
     return alias_map
 
 
+class _LegacyGeneratorAdapter:
+    def __init__(self, styling_config: Optional[Dict[str, Any]] = None) -> None:
+        self.logger = logging.getLogger(__name__)
+        self.config = {'Styling': styling_config or {}}
+
+
 def render_structured_citations(text: str, generator_instance: Any) -> tuple[str, List[str]]:
     alias_map = _build_citation_entry_lookup(generator_instance)
     unresolved: List[str] = []
@@ -679,17 +685,37 @@ def create_word_document(*args: Any, **kwargs: Any) -> Any:
         generator_instance, markdown_text, output_path = args[:3]
         return _create_word_document_from_markdown(generator_instance, markdown_text, output_path)
 
+    if len(args) >= 5 and isinstance(args[0], (str, os.PathLike)):
+        output_path, title, section_titles, body_text, references = args[:5]
+
+        markdown_parts: list[str] = [f"# {title or 'Literature Review'}"]
+        if isinstance(body_text, str) and body_text.strip():
+            markdown_parts.extend(["", body_text.strip()])
+        if isinstance(section_titles, list):
+            for section_title in section_titles:
+                if section_title:
+                    markdown_parts.extend(["", f"## {section_title}", ""])
+        if isinstance(references, list) and references:
+            markdown_parts.extend(["", "## References", ""])
+            markdown_parts.extend(str(reference) for reference in references if reference)
+
+        final_output = str(output_path)
+        if not final_output.lower().endswith('.docx'):
+            final_output = f"{final_output}.docx"
+        legacy_generator = _LegacyGeneratorAdapter()
+        success = _create_word_document_from_markdown(
+            legacy_generator,
+            "\n".join(markdown_parts).strip(),
+            final_output,
+        )
+        return final_output if success else None
+
     if len(args) >= 4 and isinstance(args[0], dict):
         outline, summaries, output_path, styling_config = args[:4]
 
-        class _LegacyGenerator:
-            def __init__(self, config: Dict[str, Any]) -> None:
-                self.logger = logging.getLogger(__name__)
-                self.config = {'Styling': config or {}}
-
         markdown_text = _outline_to_markdown(outline, summaries if isinstance(summaries, list) else [])
         final_output = output_path if str(output_path).lower().endswith('.docx') else f"{output_path}.docx"
-        legacy_generator = _LegacyGenerator(styling_config if isinstance(styling_config, dict) else {})
+        legacy_generator = _LegacyGeneratorAdapter(styling_config if isinstance(styling_config, dict) else None)
         success = _create_word_document_from_markdown(legacy_generator, markdown_text, final_output)
         return final_output if success else None
 
