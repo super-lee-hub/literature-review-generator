@@ -217,6 +217,8 @@ def _extract_citations_from_text(
             mode=mode,
             locator=locator,
             block_id=block_id,
+            span_start=match.start(),
+            span_end=match.end(),
             source_type="legacy_regex",
         )
         citations.append(citation.to_dict())
@@ -237,6 +239,8 @@ def _extract_citations_from_text(
                 mode="parenthetical",
                 locator=None,
                 block_id=block_id,
+                span_start=match.start(),
+                span_end=match.end(),
                 source_type="legacy_regex",
             ).to_dict()
         )
@@ -254,6 +258,8 @@ def _extract_citations_from_text(
                 mode="narrative",
                 locator=None,
                 block_id=block_id,
+                span_start=match.start(),
+                span_end=match.end(),
                 source_type="legacy_regex",
             ).to_dict()
         )

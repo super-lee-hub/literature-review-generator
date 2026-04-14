@@ -27,6 +27,7 @@ class JobRunRequest:
     generate_review: bool = False
     generate_section: Optional[int] = None
     validate_review: bool = False
+    retry_failed: bool = False
     retry_review_failed: bool = False
     concept: Optional[str] = None
     free_mode_profile: Optional[str] = None
@@ -62,6 +63,8 @@ def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
         action = "generate_outline"
     elif getattr(args, "generate_section", None):
         action = "generate_section"
+    elif getattr(args, "retry_failed", False):
+        action = "retry_failed"
     elif getattr(args, "generate_review", False):
         action = "generate_review"
     elif getattr(args, "retry_review_failed", False):
@@ -85,6 +88,7 @@ def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
         generate_review=getattr(args, "generate_review", False),
         generate_section=getattr(args, "generate_section", None),
         validate_review=getattr(args, "validate_review", False),
+        retry_failed=getattr(args, "retry_failed", False),
         retry_review_failed=getattr(args, "retry_review_failed", False),
         concept=getattr(args, "concept", None),
         free_mode_profile=getattr(args, "free_mode_profile", None),
@@ -110,6 +114,7 @@ class JobRunner:
             generate_review=request.generate_review,
             generate_section=request.generate_section,
             validate_review=request.validate_review,
+            retry_failed=request.retry_failed,
             retry_review_failed=request.retry_review_failed,
             concept=request.concept,
             free_mode_profile=request.free_mode_profile,
@@ -163,6 +168,7 @@ class JobRunner:
             "project_name": request.project_name or "",
             "pdf_folder": os.path.abspath(request.pdf_folder) if request.pdf_folder else "",
             "generate_section": request.generate_section,
+            "retry_failed": request.retry_failed,
             "concept": request.concept or "",
             "gui": bool(request.gui),
         }
@@ -275,6 +281,8 @@ class JobRunner:
                 result = legacy_main.handle_generate_outline_mode(generator, legacy_args)
             elif request.action == "generate_section" and request.generate_section:
                 result = legacy_main.handle_generate_section_mode(generator, legacy_args)
+            elif request.retry_failed:
+                result = legacy_main.handle_retry_failed(legacy_args)
             elif request.generate_review:
                 result = legacy_main.handle_generate_review_mode(generator)
             elif request.retry_review_failed:

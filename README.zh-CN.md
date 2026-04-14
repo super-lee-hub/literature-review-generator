@@ -93,6 +93,56 @@ python main.py --gui
 start_gui.bat
 ```
 
+## 2.9 排队功能命令
+
+### 2.9.1 添加任务到队列
+
+```bash
+python main.py --queue-add --pdf-folder "D:\你的PDF文件夹路径" --project-name "你的项目名" --analyze-only
+```
+
+### 2.9.2 运行队列任务
+
+```bash
+python main.py --queue-run
+```
+
+### 2.9.3 查看队列任务
+
+```bash
+python main.py --queue-list
+```
+
+### 2.9.4 取消任务
+
+```bash
+python main.py --queue-cancel <job_id>
+```
+
+### 2.9.5 重试任务
+
+```bash
+python main.py --queue-retry <job_id>
+```
+
+### 2.9.6 清空已完成任务
+
+```bash
+python main.py --queue-clear
+```
+
+### 2.9.7 指定队列文件
+
+```bash
+python main.py --queue-file "自定义队列文件路径" --queue-list
+```
+
+### 2.9.8 批量加载队列文件
+
+```bash
+python main.py --queue-run --queue-files "队列文件1.json" "队列文件2.json"
+```
+
 ## 3. Zotero 模式
 
 如果你平时用 Zotero，可以先导出 Zotero Report，然后在 `config.ini` 或 GUI 里配置：

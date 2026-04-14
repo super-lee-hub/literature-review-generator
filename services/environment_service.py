@@ -57,39 +57,39 @@ def detect_runtime_environment(
         name = conda_name or Path(conda_prefix or current_prefix).name or "unknown"
         is_base_conda = name.lower() == "base"
         return RuntimeEnvironment(
-            kind="conda",
-            name=name,
-            executable=current_executable,
-            prefix=current_prefix,
-            is_conda=True,
-            is_base_conda=is_base_conda,
-            is_virtual_env=False,
-            is_isolated=not is_base_conda,
-        )
+        "conda",
+        name,
+        current_executable,
+        current_prefix,
+        True,
+        is_base_conda,
+        False,
+        not is_base_conda,
+    )
 
     if virtual_env or current_prefix != current_base_prefix:
         env_root = virtual_env or current_prefix
         env_name = Path(env_root).name or "venv"
         return RuntimeEnvironment(
-            kind="venv",
-            name=env_name,
-            executable=current_executable,
-            prefix=current_prefix,
-            is_conda=False,
-            is_base_conda=False,
-            is_virtual_env=True,
-            is_isolated=True,
-        )
+        "venv",
+        env_name,
+        current_executable,
+        current_prefix,
+        False,
+        False,
+        True,
+        True,
+    )
 
     return RuntimeEnvironment(
-        kind="global",
-        name=Path(current_prefix).name or "python",
-        executable=current_executable,
-        prefix=current_prefix,
-        is_conda=False,
-        is_base_conda=False,
-        is_virtual_env=False,
-        is_isolated=False,
+        "global",
+        Path(current_prefix).name or "python",
+        current_executable,
+        current_prefix,
+        False,
+        False,
+        False,
+        False,
     )
 
 

@@ -55,13 +55,17 @@ def render_structured_citations(text: str, generator_instance: Any) -> tuple[str
         if entry is None:
             unresolved.append(raw_key or match.group(0))
             return match.group(0)
-        return format_in_text_citation(
+        citation = format_in_text_citation(
             entry,
             mode=params.get("mode", "parenthetical"),
             locator=params.get("locator"),
         )
+        # Remove any backticks from the citation
+        return citation.replace("`", "")
 
     rendered = re.sub(r"\[\[cite:([^|\]]+)(?:\|([^\]]*))?\]\]", _replace, str(text or ""))
+    # Also clean any remaining backticks in the text
+    rendered = rendered.replace("`", "")
     return rendered, unresolved
 
 
@@ -391,26 +395,65 @@ def generate_apa_references(generator_instance: Any) -> List[str]:
             journal: str = paper_info.get('journal', '')
             doi: str = paper_info.get('doi', '')
             
-            # 格式化作者（即使没有作者信息也要生成参考文献）
+            # 清理字段
+            def clean_field(value: Any) -> str:
+                if not value:
+                    return ""
+                text = str(value).strip()
+                # Remove placeholder values
+                placeholders = ['未知年份', '未知期刊', '无标题', 'n.d.']
+                for placeholder in placeholders:
+                    if text == placeholder:
+                        return ""
+                return text
+            
+            # 清理各个字段
+            authors = [clean_field(author) for author in authors if clean_field(author)]
+            year = clean_field(year)
+            title = clean_field(title)
+            journal = clean_field(journal)
+            doi = clean_field(doi)
+            
+            # 跳过没有基本信息的条目
+            if not (authors or title):
+                continue
+            
+            # 格式化作者
             if authors:
                 if len(authors) <= 7:
                     author_list: str = ', '.join(authors)
                 else:
                     author_list: str = ', '.join(authors[:6]) + ', ..., ' + authors[-1]
             else:
-                # 没有作者信息时使用占位符
+                # 没有作者信息时使用Anonymous
                 author_list: str = "Anonymous"
             
-            # 构建引用字符串，即使部分信息缺失也继续
+            # 构建引用字符串
             ref_parts: List[str] = [author_list]
-            ref_parts.append(f"({year or 'n.d.'}).")
-            ref_parts.append(f"{title or '无标题'}.")
+            if year:
+                ref_parts.append(f"({year}).")
+            else:
+                ref_parts.append("(n.d.).")
+            
+            if title:
+                ref_parts.append(f"{title}.")
+            else:
+                ref_parts.append("Untitled.")
+            
             if journal:
                 ref_parts.append(f"*{journal}*")
+            
             if doi:
-                ref_parts.append(f"https://doi.org/{doi}")
+                # 确保DOI格式正确
+                if not doi.startswith('https://doi.org/'):
+                    ref_parts.append(f"https://doi.org/{doi}")
+                else:
+                    ref_parts.append(doi)
 
-            references.append(" ".join(ref_parts))
+            reference = " ".join(ref_parts)
+            # Skip references that are just placeholders
+            if reference and not reference.strip() == "Anonymous (n.d.). Untitled.":
+                references.append(reference)
         
         # 去除重复的参考文献条目
         references = list(dict.fromkeys(references))

@@ -93,6 +93,56 @@ Or use:
 start_gui.bat
 ```
 
+## 2.9 Queue Commands
+
+### 2.9.1 Add task to queue
+
+```bash
+python main.py --queue-add --pdf-folder "D:\YourPdfFolder" --project-name "your-project" --analyze-only
+```
+
+### 2.9.2 Run queue tasks
+
+```bash
+python main.py --queue-run
+```
+
+### 2.9.3 List queue tasks
+
+```bash
+python main.py --queue-list
+```
+
+### 2.9.4 Cancel task
+
+```bash
+python main.py --queue-cancel <job_id>
+```
+
+### 2.9.5 Retry task
+
+```bash
+python main.py --queue-retry <job_id>
+```
+
+### 2.9.6 Clear completed tasks
+
+```bash
+python main.py --queue-clear
+```
+
+### 2.9.7 Specify queue file
+
+```bash
+python main.py --queue-file "custom_queue_file.json" --queue-list
+```
+
+### 2.9.8 Batch load queue files
+
+```bash
+python main.py --queue-run --queue-files "queue1.json" "queue2.json"
+```
+
 ## 3. Zotero Mode
 
 If you use Zotero, configure these paths in `config.ini` or in the GUI:

@@ -47,6 +47,8 @@ class EvidenceResolver:
         candidates: List[EvidenceCandidate] = []
 
         # Explicit tier order as required
+        # Tier 0: AI Summary (highest priority)
+        candidates.extend(self._resolve_from_ai_summary(cited_span))
         # Tier 1: Locator + Page Index
         candidates.extend(self._resolve_from_locator_page_index(cited_span, locator))
         # Tier 2: Preprocess chunks
@@ -65,6 +67,135 @@ class EvidenceResolver:
 
         # Sort by confidence (descending) and window_rank (ascending)
         candidates.sort(key=lambda x: (-x.confidence, x.window_rank))
+        return candidates
+
+    def _resolve_from_ai_summary(self, cited_span: str) -> List[EvidenceCandidate]:
+        """Resolve evidence from AI summary in paper artifact."""
+        candidates: List[EvidenceCandidate] = []
+        
+        # Get AI summary from paper artifact
+        ai_summary = self.context.paper_artifact.get("analysis", {}).get("ai_summary", {})
+        if not ai_summary:
+            return candidates
+        
+        # Extract relevant fields from AI summary
+        summary_fields = []
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("summary", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("key_points", []))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("methodology", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("findings", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("conclusions", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("relevance", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("limitations", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("theoretical_framework", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("research_gap", ""))
+        summary_fields.append(ai_summary.get("core_analysis", {}).get("future_research_directions", []))
+        
+        # Check specialized details
+        specialized_details = ai_summary.get("specialized_details", {})
+        for detail_type in ["empirical", "review", "conceptual"]:
+            detail = specialized_details.get(detail_type, {})
+            if detail:
+                for key, value in detail.items():
+                    if isinstance(value, str):
+                        summary_fields.append(value)
+                    elif isinstance(value, list):
+                        summary_fields.extend(value)
+        
+        # Flatten the list
+        flattened_fields = []
+        for field in summary_fields:
+            if isinstance(field, list):
+                flattened_fields.extend(field)
+            else:
+                flattened_fields.append(field)
+        
+        # Check each field for matches
+        for idx, field_text in enumerate(flattened_fields):
+            if isinstance(field_text, str) and field_text:
+                # More flexible matching: check if any significant words from cited_span are in field_text
+                # Split cited_span into words and remove common stop words
+                import re
+                cited_words = re.findall(r'\b\w+\b', cited_span.lower())
+                # Filter out common stop words
+                stop_words = set(['的', '了', '是', '在', '我', '有', '和', '就', '不', '人', '都', '一', '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好', '自己', '这'])
+                significant_words = [word for word in cited_words if word not in stop_words and len(word) > 1]
+                
+                # Check if any significant words are in field_text
+                if significant_words:
+                    matching_words = [word for word in significant_words if word in field_text.lower()]
+                    
+                    # More flexible matching criteria
+                    # If at least 1 significant word matches and there are few significant words
+                    # OR at least 2 significant words match
+                    # OR more than 20% of significant words match
+                    if (len(significant_words) <= 3 and len(matching_words) >= 1) or \
+                       len(matching_words) >= 2 or \
+                       (len(significant_words) > 0 and len(matching_words) / len(significant_words) > 0.2):
+                        confidence = self._calculate_confidence(cited_span, field_text)
+                        # AI summary gets highest confidence
+                        confidence = min(confidence + 0.1, 0.99)
+                        candidates.append(
+                            EvidenceCandidate(
+                                match_reason="ai_summary_match",
+                                resolver_tier="ai_summary",
+                                window_rank=idx,
+                                confidence=confidence,
+                                artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
+                                page_span=None,
+                                chunk_ids=None,
+                                text_excerpt=field_text[:500],
+                                negative_evidence_reason=None,
+                                visual_refs=None,
+                                caption_excerpt=None,
+                                evidence_scope="ai_summary",
+                            )
+                        )
+                
+                # Additional check: if cited_span is in Chinese and field_text is in English,
+                # check if the paper title or key concepts from the paper are mentioned in the field_text
+                elif any(char >= '\u4e00' and char <= '\u9fff' for char in cited_span):
+                    # Get paper title from multiple sources
+                    paper_title = self.context.paper_artifact.get("paper_metadata", {}).get("title", "")
+                    if not paper_title:
+                        # Try to get title from analysis section
+                        paper_title = self.context.paper_artifact.get("analysis", {}).get("paper_metadata", {}).get("title", "")
+                    if not paper_title:
+                        # Try to get title from paper_info in analysis section
+                        paper_title = self.context.paper_artifact.get("analysis", {}).get("paper_info", {}).get("title", "")
+                    if not paper_title:
+                        # Try to extract title from canonical_paper_key
+                        canonical_paper_key = self.context.paper_artifact.get("paper_identity", {}).get("canonical_paper_key", "")
+                        if canonical_paper_key:
+                            # Extract title from canonical_paper_key (before the first underscore)
+                            paper_title = canonical_paper_key.split('_')[0].replace('_', ' ')
+                    
+                    if paper_title:
+                        # Split title into significant words
+                        title_words = re.findall(r'\b\w+\b', paper_title.lower())
+                        title_significant_words = [word for word in title_words if len(word) > 2]
+                        if title_significant_words:
+                            # Check if any title words are in field_text
+                            title_matching_words = [word for word in title_significant_words if word in field_text.lower()]
+                            if len(title_matching_words) >= 2:
+                                confidence = 0.85  # Slightly lower confidence for title-based matching
+                                candidates.append(
+                                    EvidenceCandidate(
+                                        match_reason="ai_summary_title_match",
+                                        resolver_tier="ai_summary",
+                                        window_rank=idx,
+                                        confidence=confidence,
+                                        artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
+                                        page_span=None,
+                                        chunk_ids=None,
+                                        text_excerpt=field_text[:500],
+                                        negative_evidence_reason=None,
+                                        visual_refs=None,
+                                        caption_excerpt=None,
+                                        evidence_scope="ai_summary",
+                                    )
+                                )
+        
         return candidates
 
     def _create_negative_evidence_candidate(self, cited_span: str) -> EvidenceCandidate:

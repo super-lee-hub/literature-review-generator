@@ -47,10 +47,11 @@ BUILD_STAMP = datetime.fromtimestamp(Path(__file__).stat().st_mtime).strftime("%
 
 NAV_GROUPS = [
     {
-        "title": "开始",
+        "title": "工作流",
         "items": [
             ("总览", "/", "项目入口与推荐流程", "home"),
-            ("核心工作台", "/workflow", "分析、写作与一键运行", "dashboard_customize"),
+            ("任务构建", "/workflow", "配置单次任务并加入队列", "dashboard_customize"),
+            ("队列与执行", "/queue", "批量任务、执行进度与恢复", "pending_actions"),
         ],
     },
     {
@@ -62,15 +63,9 @@ NAV_GROUPS = [
         ],
     },
     {
-        "title": "任务",
+        "title": "结果与恢复",
         "items": [
-            ("队列管理", "/queue", "管理后台任务队列", "pending_actions"),
-        ],
-    },
-    {
-        "title": "结果",
-        "items": [
-            ("日志与产物", "/logs", "查看状态、日志和输出目录", "receipt_long"),
+            ("日志与产物", "/logs", "查看状态、日志、输出与验证报告", "receipt_long"),
             ("使用引导", "/guide", "给第一次使用的人看的说明", "menu_book"),
         ],
     },
@@ -79,8 +74,8 @@ NAV_GROUPS = [
 SEARCH_ITEMS = [
     {
         "route": "/workflow",
-        "label": "核心工作台",
-        "keywords": ["工作台", "workflow", "run", "analyze", "outline", "review", "自由模式", "free mode", "概念", "concept"],
+        "label": "任务构建",
+        "keywords": ["工作台", "workflow", "run", "analyze", "outline", "review", "自由模式", "free mode", "概念", "concept", "job builder", "queue draft"],
     },
     {
         "route": "/setup",
@@ -99,8 +94,8 @@ SEARCH_ITEMS = [
     },
     {
         "route": "/queue",
-        "label": "队列管理",
-        "keywords": ["queue", "队列", "任务", "后台", "background", "cancel", "取消", "retry", "重试"],
+        "label": "队列与执行",
+        "keywords": ["queue", "队列", "任务", "后台", "background", "cancel", "取消", "retry", "重试", "progress", "run"],
     },
     {
         "route": "/logs",
@@ -726,7 +721,6 @@ class WorkspaceController:
             "performance": {
                 "max_workers": self.sections["Performance"].get("max_workers", "3"),
                 "api_retry_attempts": self.sections["Performance"].get("api_retry_attempts", "5"),
-                "enable_stage1_validation": validation_settings.stage1_enabled,
                 "enable_stage2_validation": validation_settings.stage2_enabled,
             },
             "stage2_retry": {
@@ -751,6 +745,9 @@ class WorkspaceController:
                 "concept": "",
                 "free_mode_idea": "",
                 "section_number": "1",
+            },
+            "queue_builder": {
+                "items": [],
             },
         }
         self.api_cards: Dict[str, Dict[str, str]] = {}
@@ -861,34 +858,121 @@ class WorkspaceController:
         else:
             ui.notify(self.t("队列服务未初始化"), type="warning")
 
-    def add_job_to_queue(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> None:
-        """添加任务到队列"""
-        if self._queue_service:
-            try:
-                from services.queue_service import QueueJobSpec, create_queue_job_id
-                # 构建参数字典
-                parameters = {
-                    "action": action,
-                    "project_name": project_name,
-                    "pdf_folder": pdf_folder if pdf_folder else None,
-                    "zotero_report": zotero_report if zotero_report else None,
-                    "library_path": self.state["paths"]["library_path"] if self.state["paths"]["library_path"] else None,
-                    "config": self.config_path,
-                    "gui": True
-                }
-                # 创建 QueueJobSpec
-                spec = QueueJobSpec(
-                    job_id=create_queue_job_id(),
-                    job_type=action,
-                    project_name=project_name,
-                    parameters=parameters
-                )
-                job_id = self._queue_service.add_job(spec)
-                ui.notify(self.tf("任务已添加到队列: {job_id}", job_id=job_id), type="positive")
-            except Exception as e:
-                ui.notify(self.tf("添加任务失败: {e}", e=str(e)), type="negative")
-        else:
-            ui.notify(self.t("队列服务未初始化"), type="warning")
+    def _build_queue_job_spec(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> Any:
+        from services.queue_service import QueueJobSpec, create_queue_job_id
+
+        workflow_state = self.state["workflow"]
+        library_path = str(self.state["paths"].get("library_path") or "").strip() or None
+        effective_pdf_folder = str(pdf_folder or "").strip() or None
+        effective_zotero_report = str(zotero_report or "").strip() or None
+        free_mode_profile = self.free_mode_profile_path or None
+        free_mode_idea = None if free_mode_profile else (str(workflow_state.get("free_mode_idea") or "").strip() or None)
+        generate_section = None
+        if action == "generate_section":
+            section_number_raw = str(workflow_state.get("section_number") or "").strip()
+            if section_number_raw.isdigit() and int(section_number_raw) > 0:
+                generate_section = int(section_number_raw)
+
+        parameters = {
+            "action": action,
+            "project_name": project_name,
+            "pdf_folder": effective_pdf_folder,
+            "zotero_report": effective_zotero_report,
+            "library_path": library_path,
+            "config": self.config_path,
+            "gui": True,
+            "source_mode": "zotero" if effective_zotero_report else "direct",
+            "run_all": action == "run_all",
+            "analyze_only": action == "analyze",
+            "generate_outline": action == "outline",
+            "generate_review": action == "review",
+            "generate_section": generate_section,
+            "validate_review": action == "validate",
+            "retry_failed": action == "retry_failed",
+            "retry_review_failed": action == "retry_review_failed",
+            "concept": str(workflow_state.get("concept") or "").strip() or None,
+            "free_mode_profile": free_mode_profile,
+            "free_mode_idea": free_mode_idea,
+            "queue_file": str(Path(self.state["paths"]["output_path"]) / "_queue" / "queue.json"),
+        }
+
+        return QueueJobSpec(
+            job_id=create_queue_job_id(),
+            job_type=action,
+            project_name=project_name,
+            parameters=parameters,
+        )
+
+    def _ensure_queue_runner(self) -> Optional[Any]:
+        if not self._queue_service:
+            return None
+        if self._queue_runner is None:
+            from services.job_runner import JobRunner
+            from services.queue_service import QueueRunner
+
+            self._queue_runner = QueueRunner(self._queue_service, JobRunner())
+        return self._queue_runner
+
+    def add_job_to_queue(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> Optional[str]:
+        """Add a job to the persistent queue and return the created job id."""
+        if not self._queue_service:
+            self.notify("Queue service is not initialized.", color="warning")
+            return None
+
+        try:
+            spec = self._build_queue_job_spec(project_name, pdf_folder, zotero_report, action)
+            job_id = self._queue_service.add_job(spec)
+            self.refresh_queue()
+            self.notify(f"Added job to queue: {job_id}", color="positive")
+            return job_id
+        except Exception as e:
+            self.notify(f"Failed to add job to queue: {e}", color="negative", multi_line=True)
+            return None
+
+    def add_queue_builder_item(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> None:
+        item = {
+            "project_name": str(project_name or "").strip(),
+            "pdf_folder": str(pdf_folder or "").strip(),
+            "zotero_report": str(zotero_report or "").strip(),
+            "action": str(action or "analyze").strip() or "analyze",
+        }
+        if not item["project_name"]:
+            self.notify("Please enter a project name first.", color="warning")
+            return
+        if not item["pdf_folder"] and not item["zotero_report"]:
+            self.notify("Please provide either a PDF folder or a Zotero report.", color="warning")
+            return
+        self.state["queue_builder"]["items"].append(item)
+        self.notify(f"Added {item['project_name']} to the queue draft.", color="positive")
+
+    def remove_queue_builder_item(self, index: int) -> None:
+        items = self.state["queue_builder"]["items"]
+        if 0 <= index < len(items):
+            removed = items.pop(index)
+            self.notify(f"Removed {removed.get('project_name', '')} from the queue draft.", color="positive")
+
+    def clear_queue_builder(self) -> None:
+        self.state["queue_builder"]["items"].clear()
+        self.notify("Cleared queue draft.", color="positive")
+
+    def commit_queue_builder(self) -> None:
+        items = list(self.state["queue_builder"]["items"])
+        if not items:
+            self.notify("Queue draft is empty.", color="warning")
+            return
+        created_ids = []
+        for item in items:
+            job_id = self.add_job_to_queue(
+                str(item.get("project_name") or ""),
+                str(item.get("pdf_folder") or ""),
+                str(item.get("zotero_report") or ""),
+                str(item.get("action") or "analyze"),
+            )
+            if job_id:
+                created_ids.append(job_id)
+        if created_ids:
+            self.state["queue_builder"]["items"].clear()
+            self.notify(f"Committed {len(created_ids)} drafted job(s) to the queue.", color="positive")
 
     def remove_job(self, job_id: str) -> None:
         """删除指定任务"""
@@ -1251,7 +1335,7 @@ class WorkspaceController:
         updated_sections.setdefault("Validation", {})
         updated_sections["Validation"].update(
             {
-                "stage1_enabled": "true" if self.state["performance"]["enable_stage1_validation"] else "false",
+                "stage1_enabled": "false",
                 "stage2_enabled": "true" if self.state["performance"]["enable_stage2_validation"] else "false",
             }
         )
@@ -1646,12 +1730,12 @@ class WorkspaceController:
             return
 
         if self.workflow_running:
-            self.notify(self.t("正在刷新任务进度…"), color="info")
+            self.notify("A workflow is already running.", color="info")
             return
 
         self.persist_config(notify_user=False)
         action_label_text = self.action_label(action)
-        self.set_status(self.tf("正在执行 {action_label}，请稍候……", action_label=action_label_text))
+        self.set_status(f"Running {action_label_text}...")
         self.progress_tracker = ProgressTracker()
         self.progress_tracker.reset(task_type=action_label_text, stage=action, message=self.status_message, indeterminate=True)
         self.progress_snapshot = self.progress_tracker.snapshot()
@@ -1661,7 +1745,7 @@ class WorkspaceController:
         if self.test_mode:
             self.progress_tracker.finish(
                 success=True,
-                message=self.tf("测试模式：已模拟执行 {action_label}", action_label=action_label_text),
+                message=f"Test mode: simulated {action_label_text}.",
             )
             self.progress_snapshot = self.progress_tracker.snapshot()
             self.update_progress_widgets()
@@ -1670,55 +1754,51 @@ class WorkspaceController:
             self.notify(self.status_message, color="positive")
             return
 
-        project_name = str(self.state["workflow"]["project_name"]).strip() or None
-        pdf_folder = str(self.state["workflow"]["pdf_folder"]).strip() or None
-        concept = str(self.state["workflow"]["concept"]).strip() or None
-        free_mode_profile = self.free_mode_profile_path or None
-        free_mode_idea = None
-        if not free_mode_profile:
-            free_mode_idea = str(self.state["workflow"]["free_mode_idea"]).strip() or None
-
-        generate_section = None
-        if action == "generate_section":
-            generate_section = int(str(self.state["workflow"]["section_number"]).strip())
+        project_name = str(self.state["workflow"]["project_name"]).strip()
+        pdf_folder = str(self.state["workflow"]["pdf_folder"]).strip()
+        zotero_report = str(self.state["paths"].get("zotero_report") or "").strip()
+        job_id: Optional[str] = None
+        runtime: Optional[Any] = None
 
         try:
-            result = await asyncio.to_thread(
-                run_dispatch,
-                build_args(
-                    config=self.config_path,
-                    project_name=project_name,
-                    pdf_folder=pdf_folder,
-                    concept=concept,
-                    free_mode_profile=free_mode_profile,
-                    free_mode_idea=free_mode_idea,
-                    progress_tracker=self.progress_tracker,
-                    run_all=action == "run_all",
-                    analyze_only=action == "analyze",
-                    generate_outline=action == "outline",
-                    generate_review=action == "review",
-                    generate_section=generate_section,
-                    validate_review=action == "validate",
-                    retry_failed=action == "retry_failed",
-                    retry_review_failed=action == "retry_review_failed",
-                ),
-            )
+            job_id = self.add_job_to_queue(project_name, pdf_folder, zotero_report, action)
+            if not job_id:
+                self.progress_tracker.finish(success=False, message="Failed to enqueue the job.")
+                return
+
+            runner = self._ensure_queue_runner()
+            if runner is None:
+                self.progress_tracker.finish(success=False, message="Queue service is not initialized.")
+                return
+
+            self.refresh_queue()
+            ran = await asyncio.to_thread(runner.run_single_job, job_id)
+            self.refresh_queue()
+            runtime = self._queue_service.get_job_runtime(job_id) if self._queue_service else None
+
+            if ran and runtime and runtime.state == QueueState.COMPLETED:
+                message = f"{action_label_text} completed."
+                self.progress_tracker.finish(success=True, message=message)
+                self.set_status(message)
+                self.notify(message, color="positive")
+            else:
+                failure_reason = ""
+                if runtime and runtime.error_message:
+                    failure_reason = runtime.error_message
+                elif runtime and runtime.result_summary:
+                    failure_reason = str(runtime.result_summary.get("message") or "")
+                if not failure_reason:
+                    failure_reason = "Queue runner returned an unknown error."
+                message = f"{action_label_text} failed: {failure_reason}"
+                self.progress_tracker.finish(success=False, message=message)
+                self.set_status(message)
+                self.notify(message, color="negative", multi_line=True)
         finally:
-            self.refresh_progress()
+            self.progress_snapshot = self.progress_tracker.snapshot()
+            self.update_progress_widgets()
+            self.refresh_logs()
+            self.refresh_queue()
             self.set_workflow_running(False)
-        self.refresh_logs()
-        if result.success:
-            self.set_status(self.tf("{action_label} 已执行完成。", action_label=action_label_text))
-            self.notify(self.status_message, color="positive")
-        else:
-            self.set_status(
-                self.tf(
-                    "{action_label} 执行失败：{reason}",
-                    action_label=action_label_text,
-                    reason=result.message or result.exit_code,
-                )
-            )
-            self.notify(self.status_message, color="negative", multi_line=True)
 
 
 def _render_progress_card(controller: WorkspaceController) -> None:
@@ -2367,10 +2447,9 @@ def launch_gui(
 
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("高级 / 实验功能")).classes("ag-section-title")
-                    ui.label(t("验证功能默认关闭，暂时作为实验功能保留。")).classes("ag-subtle")
+                    ui.label(t("这里只保留仍然建议用户直接控制的高级项。新的验证模式只针对综述阶段。")).classes("ag-subtle")
                     with ui.expansion(t("高级 / 实验功能"), icon="science").classes("w-full q-mt-md"):
                         with ui.column().classes("gap-2 q-pa-sm"):
-                            ui.switch(t("启用摘要验证"), value=controller.state["performance"]["enable_stage1_validation"]).bind_value(controller.state["performance"], "enable_stage1_validation")
                             ui.switch(t("启用综述验证"), value=controller.state["performance"]["enable_stage2_validation"]).bind_value(controller.state["performance"], "enable_stage2_validation")
 
     @ui.page("/logs")
@@ -2452,29 +2531,61 @@ def launch_gui(
                     
                     # 添加任务到队列
                     with ui.card().classes("ag-card p-6 q-mt-md"):
-                        ui.label(t("添加任务到队列")).classes("ag-section-title")
+                        ui.label(t("?????????")).classes("ag-section-title")
+                        ui.label(t("??????????????????????? PDF ???? Zotero ?????????"))                            .classes("ag-subtle q-mt-sm")
                         with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                            project_name_input = ui.input(t("项目名"), placeholder=t("请输入项目名")).classes("w-full")
+                            project_name_input = ui.input(t("???"), placeholder=t("??????")).classes("w-full")
                             action_select = ui.select(
-                                {"analyze": t("仅分析文献"), "outline": t("生成大纲"), "review": t("生成全文"), "run_all": t("一键运行")},
-                                label=t("任务类型"),
-                                value="analyze"
+                                {
+                                    "analyze": t("?????"),
+                                    "outline": t("????"),
+                                    "review": t("????"),
+                                    "validate": t("??????"),
+                                    "retry_failed": t("??????"),
+                                    "retry_review_failed": t("??????"),
+                                    "run_all": t("????"),
+                                },
+                                label=t("????"),
+                                value="analyze",
                             ).classes("w-full")
-                            pdf_folder_input = ui.input(t("PDF 文件夹"), placeholder=t("请输入 PDF 文件夹路径")).classes("w-full")
-                            zotero_report_input = ui.input(t("Zotero 报告路径"), placeholder=t("请输入 Zotero 报告路径")).classes("w-full")
-                        with ui.row().classes("gap-2 q-mt-md"):
+                            pdf_folder_input = ui.input(t("PDF ???"), placeholder=t("??? PDF ?????")).classes("w-full")
+                            zotero_report_input = ui.input(t("Zotero ????"), placeholder=t("??? Zotero ????")).classes("w-full")
+                        with ui.row().classes("gap-2 q-mt-md flex-wrap"):
                             ui.button(
-                                t("添加任务"),
-                                on_click=lambda:
-                                    controller.add_job_to_queue(
-                                        project_name_input.value,
-                                        pdf_folder_input.value,
-                                        zotero_report_input.value,
-                                        action_select.value or ""
-                                    )
+                                t("????"),
+                                on_click=lambda: controller.add_queue_builder_item(
+                                    project_name_input.value,
+                                    pdf_folder_input.value,
+                                    zotero_report_input.value,
+                                    action_select.value or "analyze",
+                                ),
                             ).props("unelevated")
-                    
-                    # 保存/加载队列
+                            ui.button(
+                                t("????"),
+                                on_click=lambda: controller.add_job_to_queue(
+                                    project_name_input.value,
+                                    pdf_folder_input.value,
+                                    zotero_report_input.value,
+                                    action_select.value or "analyze",
+                                ),
+                            ).props("outline")
+                            ui.button(t("??????"), on_click=controller.commit_queue_builder).props("unelevated color=primary")
+                            ui.button(t("????"), on_click=controller.clear_queue_builder).props("flat")
+
+                        draft_items = controller.state["queue_builder"]["items"]
+                        if draft_items:
+                            with ui.column().classes("w-full gap-2 q-mt-md"):
+                                for index, item in enumerate(draft_items, start=1):
+                                    with ui.row().classes("w-full items-center justify-between rounded-xl ag-card p-3"):
+                                        ui.label(
+                                            f"{index}. {item.get('project_name', '')} ? {controller.action_label(str(item.get('action') or 'analyze'))}"
+                                        ).classes("text-body1")
+                                        ui.button(
+                                            t("??"),
+                                            on_click=lambda _event=None, idx=index - 1: controller.remove_queue_builder_item(idx),
+                                        ).props("flat color=negative size=sm")
+                        else:
+                            ui.label(t("????????????????????????")).classes("ag-subtle q-mt-md")
                     with ui.card().classes("ag-card p-6 q-mt-md"):
                         ui.label(t("队列文件操作")).classes("ag-section-title")
                         queue_file_input = ui.input(t("队列文件路径"), placeholder=t("请输入队列文件路径")).classes("w-full q-mt-md")

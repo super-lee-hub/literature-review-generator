@@ -1,11 +1,13 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
+from typing import Any, Dict, List, Optional, Sequence
 
-from .evidence_resolver import EvidenceCandidate, EvidenceResolver, EvidenceResolverContext, build_evidence_resolver_context
-from . import PreprocessEvidence, PreprocessEvidenceLoader, build_evidence_context_from_preprocess
+from services.citation_manifest import normalize_citation_set_key
+from . import PreprocessEvidenceLoader
+from .evidence_resolver import EvidenceCandidate, EvidenceResolver, EvidenceResolverContext
 
 
 class ValidationConclusion(Enum):
@@ -22,9 +24,11 @@ class RootCause(Enum):
     CITATION_MAPPING_ERROR = "citation_mapping_error"
     INSUFFICIENT_CONTEXT = "insufficient_context"
     VISUAL_UNDERSTANDING_GAP = "visual_understanding_gap"
+    COMPOUND_DRIFT = "compound_drift"
+    LOW_CONFIDENCE = "low_confidence"
 
 
-@dataclass(frozen=True)
+@dataclass
 class CitationValidationResult:
     citation_id: str
     paper_id: str
@@ -32,15 +36,18 @@ class CitationValidationResult:
     root_causes: List[RootCause]
     evidence_candidates: List[EvidenceCandidate]
     details: Dict[str, Any]
-    # 新增结构化字段
     claim_text: str
     claim_context: str
     evidence_excerpt_list: List[str]
     reasoning_summary: str
     repair_hint: str
+    citation_set_key: str = ""
+    paper_ids: List[str] = field(default_factory=list)
+    block_ids: List[str] = field(default_factory=list)
+    low_confidence: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass
 class ReviewValidationReport:
     report_id: str
     created_at: str
@@ -62,120 +69,98 @@ class ReviewValidator:
         preprocess_evidence: Optional[Dict[str, Any]] = None,
         paper_metadata: Optional[Dict[str, Any]] = None,
     ):
-        self.review_draft = review_draft
-        self.citation_manifest = citation_manifest
-        self.paper_artifacts = {
-            pa.get("paper_identity", {}).get("canonical_paper_key", ""): pa
-            for pa in paper_artifacts
-        }
-        self.paper_artifacts.update({
-            pa.get("paper_identity", {}).get("source_paper_id", ""): pa
-            for pa in paper_artifacts
-        })
+        self.review_draft = review_draft or {}
+        self.citation_manifest = citation_manifest or {}
+        self.paper_artifacts: Dict[str, Dict[str, Any]] = {}
+        for artifact in paper_artifacts:
+            identity = artifact.get("paper_identity", {})
+            for key in (
+                str(identity.get("canonical_paper_key") or "").strip(),
+                str(identity.get("source_paper_id") or "").strip(),
+            ):
+                if key:
+                    self.paper_artifacts[key] = artifact
         self.preprocess_evidence = preprocess_evidence or {}
         self.paper_metadata = paper_metadata or {}
         self.evidence_loader = PreprocessEvidenceLoader()
 
     def validate(self) -> ReviewValidationReport:
-        from datetime import datetime
-
-        # Primary path: consume v2 occurrences/clusters/bibliography
-        occurrences = self._get_occurrences_from_manifest()
-        citation_results: List[CitationValidationResult] = []
-
-        for occurrence in occurrences:
-            citation_results.append(self._validate_occurrence(occurrence))
-
-        supported_count = sum(1 for r in citation_results if r.conclusion == ValidationConclusion.SUPPORTED)
-        partial_count = sum(1 for r in citation_results if r.conclusion == ValidationConclusion.PARTIAL_SUPPORT)
-        unsupported_count = sum(1 for r in citation_results if r.conclusion == ValidationConclusion.UNSUPPORTED)
-        wrong_source_count = sum(1 for r in citation_results if r.conclusion == ValidationConclusion.WRONG_SOURCE)
-        needs_review_count = sum(1 for r in citation_results if r.conclusion == ValidationConclusion.NEEDS_REVIEW)
-
+        citation_sets = self._get_citation_sets_from_manifest()
+        citation_results = [self._validate_citation_set(bundle) for bundle in citation_sets]
         return ReviewValidationReport(
             report_id=f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             created_at=datetime.now().isoformat(),
-            total_citations=len(occurrences),
-            supported_count=supported_count,
-            partial_support_count=partial_count,
-            unsupported_count=unsupported_count,
-            wrong_source_count=wrong_source_count,
-            needs_review_count=needs_review_count,
+            total_citations=len(citation_sets),
+            supported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.SUPPORTED),
+            partial_support_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.PARTIAL_SUPPORT),
+            unsupported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.UNSUPPORTED),
+            wrong_source_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.WRONG_SOURCE),
+            needs_review_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.NEEDS_REVIEW),
             citation_results=citation_results,
         )
 
     def _get_block_from_review_draft(self, block_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve a block from review_draft_v2 using block_id."""
         sections = self.review_draft.get("content", {}).get("sections", [])
         for section in sections:
-            blocks = section.get("blocks", [])
-            for block in blocks:
+            for block in section.get("blocks", []):
                 if block.get("block_id") == block_id:
                     return block
         return None
 
     def _get_occurrences_from_manifest(self) -> List[Dict[str, Any]]:
-        """Extract occurrences from citation manifest, preferring v2 structure."""
-        # Primary: v2 occurrences (primary runtime truth source)
         occurrences = self.citation_manifest.get("occurrences", [])
         if occurrences:
             return occurrences
-        
-        # Fallback: v1 citations (legacy compatibility)
-        citations = self.citation_manifest.get("citations", [])
-        return citations
+        return self.citation_manifest.get("citations", [])
 
-    def _validate_citation_generic(
-        self,
-        citation_id: str,
-        paper_id: str,
-        cited_text: str,
-        context: str,
-        block_text: Optional[str] = None,
-        locator: Optional[str] = None,
-    ) -> CitationValidationResult:
-        """Generic citation validation logic shared by occurrence and citation.
-        
-        Primary path prefers block_text from review_draft_v2 over just context.
-        Now also incorporates preprocess/visual evidence and paper metadata.
-        """
-        paper_artifact = self.paper_artifacts.get(paper_id)
-        details: Dict[str, Any] = {"used_block_text": bool(block_text)}
+    def _get_citation_sets_from_manifest(self) -> List[Dict[str, Any]]:
+        bundles = self.citation_manifest.get("citation_sets", [])
+        if bundles:
+            return bundles
 
-        if not paper_artifact:
-            details["reason"] = "paper_not_found_in_artifacts"
-            # 构建结构化输出
-            claim_text = cited_text
-            claim_context = context
-            evidence_excerpt_list = []
-            
-            # 生成 reasoning summary
-            reasoning_summary = "引用来源错误: 未找到对应论文 artifact"
-            
-            # 生成 repair hint
-            repair_hint = "请检查引用的论文ID是否正确; 确认是否引用了正确的文献; 请检查引用映射是否正确"
-            
-            return CitationValidationResult(
-                citation_id=citation_id,
-                paper_id=paper_id,
-                conclusion=ValidationConclusion.WRONG_SOURCE,
-                root_causes=[RootCause.CITATION_MAPPING_ERROR],
-                evidence_candidates=[],
-                details=details,
-                claim_text=claim_text,
-                claim_context=claim_context,
-                evidence_excerpt_list=evidence_excerpt_list,
-                reasoning_summary=reasoning_summary,
-                repair_hint=repair_hint,
+        fallback_bundles: Dict[str, Dict[str, Any]] = {}
+        for occurrence in self._get_occurrences_from_manifest():
+            paper_id = str(occurrence.get("paper_id") or "").strip()
+            paper_key = str(occurrence.get("paper_key") or paper_id).strip()
+            citation_set_key = normalize_citation_set_key([paper_id], [paper_key]) or "unknown"
+            bundle = fallback_bundles.setdefault(
+                citation_set_key,
+                {
+                    "bundle_id": str(occurrence.get("occurrence_id") or occurrence.get("citation_id") or f"bundle_{len(fallback_bundles) + 1}"),
+                    "citation_set_key": citation_set_key,
+                    "paper_ids": [paper_id] if paper_id else [],
+                    "paper_keys": [paper_key] if paper_key else [],
+                    "occurrence_ids": [],
+                    "block_ids": [],
+                    "section_numbers": [],
+                    "section_titles": [],
+                    "claim_texts": [],
+                    "citation_tokens": [],
+                },
             )
+            occurrence_id = str(occurrence.get("occurrence_id") or occurrence.get("citation_id") or "").strip()
+            if occurrence_id and occurrence_id not in bundle["occurrence_ids"]:
+                bundle["occurrence_ids"].append(occurrence_id)
+            block_id = str(occurrence.get("block_id") or "").strip()
+            if block_id and block_id not in bundle["block_ids"]:
+                bundle["block_ids"].append(block_id)
+            section_number = int(occurrence.get("section_number") or 0)
+            if section_number and section_number not in bundle["section_numbers"]:
+                bundle["section_numbers"].append(section_number)
+            section_title = str(occurrence.get("section_title") or "").strip()
+            if section_title and section_title not in bundle["section_titles"]:
+                bundle["section_titles"].append(section_title)
+            claim_text = str(occurrence.get("context_before") or occurrence.get("context") or occurrence.get("text") or "").strip()
+            if claim_text and claim_text not in bundle["claim_texts"]:
+                bundle["claim_texts"].append(claim_text)
+            citation_token = str(occurrence.get("citation_token") or occurrence.get("text") or "").strip()
+            if citation_token and citation_token not in bundle["citation_tokens"]:
+                bundle["citation_tokens"].append(citation_token)
+        return list(fallback_bundles.values())
 
-        # Get preprocess evidence for this paper if available
+    def _resolver_context_for_paper(self, paper_id: str, paper_artifact: Dict[str, Any]) -> EvidenceResolverContext:
         paper_preprocess_evidence = self.preprocess_evidence.get(paper_id, {})
-        
-        # Get paper metadata for this paper if available
         paper_specific_metadata = self.paper_metadata.get(paper_id, {})
-
-        # Load evidence using PreprocessEvidenceLoader
         evidence = self.evidence_loader.load_evidence(
             plain_text_path=paper_preprocess_evidence.get("plain_text_path"),
             page_index_path=paper_preprocess_evidence.get("page_index_path"),
@@ -183,12 +168,10 @@ class ReviewValidator:
             structured_json_path=paper_preprocess_evidence.get("structured_json_path"),
             manifest_path=paper_preprocess_evidence.get("manifest_path"),
             visual_artifacts_path=paper_preprocess_evidence.get("visual_artifacts_path"),
-            diagnostics_path=paper_preprocess_evidence.get("diagnostics_path")
+            diagnostics_path=paper_preprocess_evidence.get("diagnostics_path"),
         )
-
-        # Create resolver context with loaded evidence and paper metadata
-        resolver_context = EvidenceResolverContext(
-            paper_key=paper_artifact.get("paper_identity", {}).get("canonical_paper_key", ""),
+        return EvidenceResolverContext(
+            paper_key=paper_id,
             paper_identity=paper_artifact.get("paper_identity", {}),
             preprocess_artifacts={
                 "normalized_text": evidence.normalized_text,
@@ -198,60 +181,141 @@ class ReviewValidator:
                 "structured_json": evidence.structured_json,
                 "manifest": evidence.manifest,
                 "visual_artifacts": evidence.visual_artifacts,
-                "diagnostics": evidence.diagnostics
+                "diagnostics": evidence.diagnostics,
             },
             paper_artifact=paper_artifact,
             preprocess_evidence=paper_preprocess_evidence,
-            paper_metadata=paper_specific_metadata
-        )
-        
-        resolver = EvidenceResolver(resolver_context)
-        selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
-        
-        # Prioritize block text from review_draft_v2 for evidence resolution
-        # Use block_text if available, otherwise fall back to cited_text
-        search_span = block_text if block_text else cited_text
-        
-        evidence_candidates = resolver.resolve_evidence(
-            cited_span=search_span,
-            locator=locator,
-            selected_visual_refs=selected_visual_refs,
+            paper_metadata=paper_specific_metadata,
         )
 
-        conclusion, root_causes = self._classify_citation(
-            cited_text=cited_text,
-            context=context,
-            evidence_candidates=evidence_candidates,
-            has_visual_refs=bool(selected_visual_refs),
-        )
+    def _validate_citation_set(self, bundle: Dict[str, Any]) -> CitationValidationResult:
+        citation_set_key = str(bundle.get("citation_set_key") or bundle.get("bundle_id") or "unknown")
+        paper_ids = [str(item).strip() for item in bundle.get("paper_ids", []) if str(item).strip()]
+        block_ids = [str(item).strip() for item in bundle.get("block_ids", []) if str(item).strip()]
+        claim_texts = [str(item).strip() for item in bundle.get("claim_texts", []) if str(item).strip()]
+        claim_context = "; ".join(str(item).strip() for item in bundle.get("section_titles", []) if str(item).strip())
 
-        # Add preprocess and metadata info to details
-        details["has_preprocess_evidence"] = bool(paper_preprocess_evidence)
-        details["has_paper_metadata"] = bool(paper_specific_metadata)
+        block_claims: List[str] = []
+        for block_id in block_ids:
+            block = self._get_block_from_review_draft(block_id)
+            block_text = str(block.get("text") or "").strip() if block else ""
+            if block_text:
+                block_claims.append(block_text)
+        used_block_text = bool(block_claims)
+        claim_text = "\n".join(block_claims or claim_texts).strip()
 
-        # 构建结构化输出
-        claim_text = cited_text
-        claim_context = context
-        evidence_excerpt_list = [candidate.text_excerpt for candidate in evidence_candidates if candidate.text_excerpt]
-        
-        # 生成 reasoning summary
-        reasoning_summary = self._generate_reasoning_summary(
-            conclusion=conclusion,
-            root_causes=root_causes,
-            evidence_candidates=evidence_candidates
-        )
-        
-        # 生成 repair hint
-        repair_hint = self._generate_repair_hint(
-            conclusion=conclusion,
-            root_causes=root_causes,
-            claim_text=claim_text,
-            claim_context=claim_context
-        )
-        
+        if not paper_ids:
+            return CitationValidationResult(
+                citation_id=str(bundle.get("bundle_id") or citation_set_key),
+                paper_id=citation_set_key,
+                conclusion=ValidationConclusion.WRONG_SOURCE,
+                root_causes=[RootCause.CITATION_MAPPING_ERROR],
+                evidence_candidates=[],
+                details={
+                    "citation_set_key": citation_set_key,
+                    "bundle": bundle,
+                    "reason": "empty_citation_set",
+                    "used_block_text": used_block_text,
+                },
+                claim_text=claim_text,
+                claim_context=claim_context,
+                evidence_excerpt_list=[],
+                reasoning_summary="The citation set could not be resolved to any source paper.",
+                repair_hint="Check whether the citation tokens can still be mapped to real papers.",
+                citation_set_key=citation_set_key,
+                paper_ids=[],
+                block_ids=block_ids,
+                low_confidence=False,
+            )
+
+        evidence_candidates: List[EvidenceCandidate] = []
+        missing_papers: List[str] = []
+        per_paper_support: Dict[str, Dict[str, int]] = {}
+        any_visual_refs = False
+
+        for paper_id in paper_ids:
+            paper_artifact = self.paper_artifacts.get(paper_id)
+            if not paper_artifact:
+                missing_papers.append(paper_id)
+                continue
+
+            resolver = EvidenceResolver(self._resolver_context_for_paper(paper_id, paper_artifact))
+            selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", []) or []
+            any_visual_refs = any_visual_refs or bool(selected_visual_refs)
+            candidates = resolver.resolve_evidence(
+                cited_span=claim_text or str((bundle.get("citation_tokens") or [""])[0]),
+                locator=None,
+                selected_visual_refs=selected_visual_refs,
+            )
+            evidence_candidates.extend(candidates)
+            per_paper_support[paper_id] = {
+                "high": sum(1 for item in candidates if item.confidence >= 0.8),
+                "medium": sum(1 for item in candidates if 0.5 <= item.confidence < 0.8),
+            }
+
+        evidence_excerpt_list = [item.text_excerpt for item in evidence_candidates if item.text_excerpt][:8]
+        details: Dict[str, Any] = {
+            "citation_set_key": citation_set_key,
+            "paper_ids": paper_ids,
+            "block_ids": block_ids,
+            "bundle": bundle,
+            "per_paper_support": per_paper_support,
+            "missing_papers": missing_papers,
+            "used_block_text": used_block_text,
+        }
+
+        if missing_papers:
+            details["reason"] = "paper_not_found_in_artifacts"
+            return CitationValidationResult(
+                citation_id=str(bundle.get("bundle_id") or citation_set_key),
+                paper_id=paper_ids[0] if len(paper_ids) == 1 else citation_set_key,
+                conclusion=ValidationConclusion.WRONG_SOURCE,
+                root_causes=[RootCause.CITATION_MAPPING_ERROR],
+                evidence_candidates=evidence_candidates,
+                details=details,
+                claim_text=claim_text,
+                claim_context=claim_context,
+                evidence_excerpt_list=evidence_excerpt_list,
+                reasoning_summary=f"{len(missing_papers)} cited paper(s) could not be resolved to validation artifacts.",
+                repair_hint="Repair the citation-to-paper mapping first, then rerun validation.",
+                citation_set_key=citation_set_key,
+                paper_ids=paper_ids,
+                block_ids=block_ids,
+                low_confidence=False,
+            )
+
+        per_paper_high = [stats["high"] > 0 for stats in per_paper_support.values()]
+        per_paper_medium = [stats["high"] > 0 or stats["medium"] > 0 for stats in per_paper_support.values()]
+        visual_candidates = [item for item in evidence_candidates if item.evidence_scope == "visual"]
+
+        if per_paper_high and all(per_paper_high):
+            conclusion = ValidationConclusion.SUPPORTED
+            root_causes: List[RootCause] = []
+            reasoning = "Every paper in the exact citation set has high-confidence supporting evidence."
+            repair_hint = ""
+            low_confidence = False
+        elif per_paper_medium and all(per_paper_medium):
+            conclusion = ValidationConclusion.PARTIAL_SUPPORT
+            root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+            reasoning = "Each cited paper has at least medium-confidence evidence, but the support is not strong enough for a full pass."
+            repair_hint = "Make the claim more specific or reduce the strength of the wording."
+            low_confidence = False
+        elif visual_candidates and any_visual_refs:
+            conclusion = ValidationConclusion.NEEDS_REVIEW
+            root_causes = [RootCause.VISUAL_UNDERSTANDING_GAP, RootCause.LOW_CONFIDENCE]
+            reasoning = "The bundle is supported mainly by visual evidence, so it should be kept for manual review."
+            repair_hint = "Manually inspect the referenced figures or tables before editing the review."
+            low_confidence = True
+        else:
+            conclusion = ValidationConclusion.UNSUPPORTED
+            root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+            reasoning = "Not enough evidence was found for this exact citation set."
+            repair_hint = "Check for miscitation, overclaiming, or rewrite the passage more conservatively."
+            low_confidence = False
+
         return CitationValidationResult(
-            citation_id=citation_id,
-            paper_id=paper_id,
+            citation_id=str(bundle.get("bundle_id") or citation_set_key),
+            paper_id=paper_ids[0] if len(paper_ids) == 1 else citation_set_key,
             conclusion=conclusion,
             root_causes=root_causes,
             evidence_candidates=evidence_candidates,
@@ -259,137 +323,10 @@ class ReviewValidator:
             claim_text=claim_text,
             claim_context=claim_context,
             evidence_excerpt_list=evidence_excerpt_list,
-            reasoning_summary=reasoning_summary,
+            reasoning_summary=reasoning,
             repair_hint=repair_hint,
+            citation_set_key=citation_set_key,
+            paper_ids=paper_ids,
+            block_ids=block_ids,
+            low_confidence=low_confidence,
         )
-
-    def _validate_occurrence(self, occurrence: Dict[str, Any]) -> CitationValidationResult:
-        """Validate a single citation occurrence (v2-style, primary path).
-        
-        This uses block_id to retrieve the full block text from review_draft_v2
-        as the primary context for evidence resolution.
-        """
-        occurrence_id = occurrence.get("occurrence_id") or occurrence.get("citation_id", "")
-        paper_id = occurrence.get("paper_id", "")
-        cited_text = occurrence.get("citation_token") or occurrence.get("text", "")
-        context = occurrence.get("context_before") or occurrence.get("context", "")
-        block_id = occurrence.get("block_id", "")
-        
-        # Get block text from review_draft_v2 for richer context
-        block = self._get_block_from_review_draft(block_id)
-        block_text = block.get("text") if block else None
-        locator = None  # Could be extended in future if needed
-        
-        return self._validate_citation_generic(
-            citation_id=occurrence_id,
-            paper_id=paper_id,
-            cited_text=cited_text,
-            context=context,
-            block_text=block_text,
-            locator=locator,
-        )
-
-    def _validate_citation(self, citation: Dict[str, Any]) -> CitationValidationResult:
-        """Validate a single citation (v1-style, legacy fallback)."""
-        citation_id = citation.get("citation_id", "")
-        paper_id = citation.get("paper_id", "")
-        cited_text = citation.get("text", "")
-        context = citation.get("context", "")
-
-        return self._validate_citation_generic(
-            citation_id=citation_id,
-            paper_id=paper_id,
-            cited_text=cited_text,
-            context=context,
-        )
-
-    def _classify_citation(
-        self,
-        cited_text: str,
-        context: str,
-        evidence_candidates: List[EvidenceCandidate],
-        has_visual_refs: bool,
-    ) -> tuple[ValidationConclusion, List[RootCause]]:
-        high_confidence = [c for c in evidence_candidates if c.confidence >= 0.8]
-        medium_confidence = [c for c in evidence_candidates if 0.5 <= c.confidence < 0.8]
-        visual_candidates = [c for c in evidence_candidates if c.evidence_scope == "visual"]
-
-        if high_confidence:
-            return ValidationConclusion.SUPPORTED, []
-        elif medium_confidence:
-            return ValidationConclusion.PARTIAL_SUPPORT, [RootCause.INSUFFICIENT_CONTEXT]
-        elif visual_candidates and has_visual_refs:
-            return ValidationConclusion.NEEDS_REVIEW, [RootCause.VISUAL_UNDERSTANDING_GAP]
-        else:
-            return ValidationConclusion.UNSUPPORTED, [RootCause.INSUFFICIENT_CONTEXT]
-    
-    def _generate_reasoning_summary(
-        self,
-        conclusion: ValidationConclusion,
-        root_causes: List[RootCause],
-        evidence_candidates: List[EvidenceCandidate]
-    ) -> str:
-        """生成推理摘要"""
-        reasoning_parts = []
-        
-        # 结论部分
-        if conclusion == ValidationConclusion.SUPPORTED:
-            reasoning_parts.append("该引用得到了充分的证据支持")
-        elif conclusion == ValidationConclusion.PARTIAL_SUPPORT:
-            reasoning_parts.append("该引用得到了部分证据支持")
-        elif conclusion == ValidationConclusion.UNSUPPORTED:
-            reasoning_parts.append("该引用未得到证据支持")
-        elif conclusion == ValidationConclusion.WRONG_SOURCE:
-            reasoning_parts.append("引用来源错误")
-        elif conclusion == ValidationConclusion.NEEDS_REVIEW:
-            reasoning_parts.append("需要人工审核")
-        
-        # 根本原因部分
-        if root_causes:
-            causes = [rc.value for rc in root_causes]
-            reasoning_parts.append(f"根本原因: {', '.join(causes)}")
-        
-        # 证据部分
-        if evidence_candidates:
-            high_confidence_count = len([c for c in evidence_candidates if c.confidence >= 0.8])
-            medium_confidence_count = len([c for c in evidence_candidates if 0.5 <= c.confidence < 0.8])
-            reasoning_parts.append(f"高置信度证据: {high_confidence_count}, 中等置信度证据: {medium_confidence_count}")
-        
-        return ". ".join(reasoning_parts)
-    
-    def _generate_repair_hint(
-        self,
-        conclusion: ValidationConclusion,
-        root_causes: List[RootCause],
-        claim_text: str,
-        claim_context: str
-    ) -> str:
-        """生成修复提示"""
-        hints = []
-        
-        if conclusion == ValidationConclusion.WRONG_SOURCE:
-            hints.append("请检查引用的论文ID是否正确")
-            hints.append("确认是否引用了正确的文献")
-        elif conclusion == ValidationConclusion.UNSUPPORTED:
-            hints.append("请修改引用的内容，使其与原文献一致")
-            hints.append("考虑引用其他支持该观点的文献")
-        elif conclusion == ValidationConclusion.PARTIAL_SUPPORT:
-            hints.append("请补充更多上下文信息，增强引用的说服力")
-            hints.append("考虑添加更多支持该观点的证据")
-        elif conclusion == ValidationConclusion.NEEDS_REVIEW:
-            hints.append("请人工审核该引用，特别是视觉证据部分")
-        
-        # 针对具体根因的提示
-        for root_cause in root_causes:
-            if root_cause == RootCause.CITATION_MAPPING_ERROR:
-                hints.append("请检查引用映射是否正确")
-            elif root_cause == RootCause.REVIEW_DRIFT:
-                hints.append("请确保综述内容与原文献保持一致")
-            elif root_cause == RootCause.SUMMARY_DRIFT:
-                hints.append("请检查摘要内容是否准确反映了原文献")
-            elif root_cause == RootCause.INSUFFICIENT_CONTEXT:
-                hints.append("请提供更多上下文信息")
-            elif root_cause == RootCause.VISUAL_UNDERSTANDING_GAP:
-                hints.append("请检查视觉证据是否正确理解")
-        
-        return "; ".join(hints)

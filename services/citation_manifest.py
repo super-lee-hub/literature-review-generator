@@ -93,6 +93,27 @@ class CitationCluster:
 
 
 @dataclass(frozen=True)
+class CitationSetBundle:
+    bundle_id: str
+    citation_set_key: str
+    paper_ids: List[str] = field(default_factory=list)
+    paper_keys: List[str] = field(default_factory=list)
+    occurrence_ids: List[str] = field(default_factory=list)
+    block_ids: List[str] = field(default_factory=list)
+    section_numbers: List[int] = field(default_factory=list)
+    section_titles: List[str] = field(default_factory=list)
+    claim_texts: List[str] = field(default_factory=list)
+    citation_tokens: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CitationSetBundle":
+        return cls(**data)
+
+
+@dataclass(frozen=True)
 class BibliographyEntry:
     entry_id: str
     paper_id: str
@@ -133,6 +154,7 @@ class CitationManifestV2:
     review_reference: Dict[str, Any]
     occurrences: List[CitationOccurrence] = field(default_factory=list)
     clusters: List[CitationCluster] = field(default_factory=list)
+    citation_sets: List[CitationSetBundle] = field(default_factory=list)
     bibliography: List[BibliographyEntry] = field(default_factory=list)
     review_draft_version: str = "v2"
 
@@ -146,6 +168,7 @@ class CitationManifestV2:
             "review_reference": self.review_reference,
             "occurrences": [occ.to_dict() for occ in self.occurrences],
             "clusters": [cluster.to_dict() for cluster in self.clusters],
+            "citation_sets": [bundle.to_dict() for bundle in self.citation_sets],
             "bibliography": [entry.to_dict() for entry in self.bibliography],
             "review_draft_version": self.review_draft_version,
         }
@@ -161,6 +184,7 @@ class CitationManifestV2:
             review_reference=data["review_reference"],
             occurrences=[CitationOccurrence.from_dict(o) for o in data.get("occurrences", [])],
             clusters=[CitationCluster.from_dict(c) for c in data.get("clusters", [])],
+            citation_sets=[CitationSetBundle.from_dict(c) for c in data.get("citation_sets", [])],
             bibliography=[BibliographyEntry.from_dict(b) for b in data.get("bibliography", [])],
             review_draft_version=data.get("review_draft_version", "v2"),
         )
@@ -236,6 +260,7 @@ def build_citation_manifest_v2(
     occurrences: Optional[List[CitationOccurrence]] = None,
     clusters: Optional[List[CitationCluster]] = None,
     bibliography: Optional[List[BibliographyEntry]] = None,
+    citation_sets: Optional[List[CitationSetBundle]] = None,
 ) -> CitationManifestV2:
     return CitationManifestV2(
         artifact_type="citation_manifest",
@@ -253,6 +278,7 @@ def build_citation_manifest_v2(
         },
         occurrences=occurrences or [],
         clusters=clusters or [],
+        citation_sets=citation_sets or [],
         bibliography=bibliography or [],
         review_draft_version=review_draft_version,
     )
@@ -316,6 +342,7 @@ def migrate_v1_to_v2(v1_manifest: CitationManifestV1) -> CitationManifestV2:
         review_reference=v1_manifest.review_reference,
         occurrences=occurrences,
         clusters=clusters,
+        citation_sets=[],
         bibliography=bibliography,
         review_draft_version="v2",
     )
@@ -400,6 +427,158 @@ def _resolve_entry(
     return None, raw_key
 
 
+def normalize_citation_set_key(paper_ids: Sequence[str], paper_keys: Sequence[str] | None = None) -> str:
+    normalized = [str(item).strip() for item in paper_ids if str(item).strip() and str(item).strip() != "unknown"]
+    if not normalized and paper_keys is not None:
+        normalized = [str(item).strip() for item in paper_keys if str(item).strip() and str(item).strip() != "unknown"]
+    normalized = sorted(dict.fromkeys(normalized))
+    return "+".join(normalized)
+
+
+def _strip_citation_tokens(text: str) -> str:
+    cleaned = re.sub(r"\[\[cite:[^\]]+\]\]", "", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _sentence_spans(block_text: str) -> List[tuple[int, int, str]]:
+    text = block_text or ""
+    spans: List[tuple[int, int, str]] = []
+    start = 0
+    for match in re.finditer(r"[。！？!?\.]+(?:\s+|$)", text):
+        end = match.end()
+        chunk = text[start:end].strip()
+        if chunk:
+            spans.append((start, end, chunk))
+        start = end
+    if start < len(text):
+        chunk = text[start:].strip()
+        if chunk:
+            spans.append((start, len(text), chunk))
+    if not spans and text.strip():
+        spans.append((0, len(text), text.strip()))
+    return spans
+
+
+def _build_citation_set_bundles(
+    *,
+    occurrences: Sequence[CitationOccurrence],
+    review_draft_v2: Dict[str, Any],
+) -> List[CitationSetBundle]:
+    sections = review_draft_v2.get("content", {}).get("sections", [])
+    occurrences_by_block: Dict[str, List[CitationOccurrence]] = {}
+    for occurrence in occurrences:
+        occurrences_by_block.setdefault(occurrence.block_id, []).append(occurrence)
+
+    bundles_by_key: Dict[str, Dict[str, Any]] = {}
+    for section in sections:
+        section_number = int(section.get("section_number") or 0)
+        section_title = str(section.get("section_title") or "")
+        for block in section.get("blocks", []):
+            block_id = str(block.get("block_id") or "")
+            block_text = str(block.get("text") or "")
+            block_occurrences = occurrences_by_block.get(block_id, [])
+            if not block_occurrences:
+                continue
+
+            sentence_spans = _sentence_spans(block_text)
+            for sentence_index, (sent_start, sent_end, sentence_text) in enumerate(sentence_spans, start=1):
+                sentence_occurrences = [
+                    occurrence
+                    for occurrence in block_occurrences
+                    if any(
+                        max(sent_start, span.start_offset) < min(sent_end, span.end_offset)
+                        for span in occurrence.spans
+                    ) or not occurrence.spans
+                ]
+                if not sentence_occurrences:
+                    continue
+
+                paper_ids = [occ.paper_id for occ in sentence_occurrences]
+                paper_keys = [occ.paper_key for occ in sentence_occurrences]
+                citation_set_key = normalize_citation_set_key(paper_ids, paper_keys)
+                if not citation_set_key:
+                    continue
+
+                aggregate = bundles_by_key.setdefault(
+                    citation_set_key,
+                    {
+                        "bundle_id": f"bundle_{len(bundles_by_key) + 1}",
+                        "citation_set_key": citation_set_key,
+                        "paper_ids": sorted(dict.fromkeys(paper_ids)),
+                        "paper_keys": sorted(dict.fromkeys(paper_keys)),
+                        "occurrence_ids": [],
+                        "block_ids": [],
+                        "section_numbers": [],
+                        "section_titles": [],
+                        "claim_texts": [],
+                        "citation_tokens": [],
+                    },
+                )
+
+                aggregate["occurrence_ids"].extend(occ.occurrence_id for occ in sentence_occurrences)
+                if block_id not in aggregate["block_ids"]:
+                    aggregate["block_ids"].append(block_id)
+                if section_number not in aggregate["section_numbers"]:
+                    aggregate["section_numbers"].append(section_number)
+                if section_title and section_title not in aggregate["section_titles"]:
+                    aggregate["section_titles"].append(section_title)
+
+                cleaned_sentence = _strip_citation_tokens(sentence_text)
+                if cleaned_sentence:
+                    claim_marker = f"{block_id}:{sentence_index}:{cleaned_sentence}"
+                    if claim_marker not in aggregate.setdefault("_claim_markers", []):
+                        aggregate["_claim_markers"].append(claim_marker)
+                        aggregate["claim_texts"].append(cleaned_sentence)
+
+                for occurrence in sentence_occurrences:
+                    if occurrence.citation_token not in aggregate["citation_tokens"]:
+                        aggregate["citation_tokens"].append(occurrence.citation_token)
+
+    bundles: List[CitationSetBundle] = []
+    for aggregate in bundles_by_key.values():
+        aggregate.pop("_claim_markers", None)
+        aggregate["occurrence_ids"] = list(dict.fromkeys(aggregate["occurrence_ids"]))
+        bundles.append(CitationSetBundle(**aggregate))
+    bundles.sort(key=lambda bundle: (len(bundle.paper_ids), bundle.citation_set_key))
+    return bundles
+
+
+def _resolve_bibliography_source_entry(
+    *,
+    paper_id: str,
+    occurrences: Sequence[CitationOccurrence],
+    entries: Sequence[Any],
+    alias_map: Dict[str, Any],
+) -> Optional[Any]:
+    for entry in entries:
+        if entry.paper_id == paper_id:
+            return entry
+
+    direct_match = alias_map.get(normalize_alias(paper_id))
+    if direct_match is not None:
+        return direct_match
+
+    related_occurrences = [occ for occ in occurrences if occ.paper_id == paper_id]
+    for occurrence in related_occurrences:
+        for candidate in (
+            occurrence.paper_key,
+            extract_citation_key(occurrence.citation_token),
+            occurrence.citation_token,
+        ):
+            matched = alias_map.get(normalize_alias(candidate))
+            if matched is not None:
+                return matched
+
+    suffix_match = re.search(r"(\d+)$", paper_id)
+    if suffix_match:
+        index = int(suffix_match.group(1)) - 1
+        if 0 <= index < len(entries):
+            return entries[index]
+
+    return None
+
+
 def build_citation_manifest_v2_from_review_draft(
     *,
     job_id: str,
@@ -412,6 +591,7 @@ def build_citation_manifest_v2_from_review_draft(
 ) -> CitationManifestV2:
     occurrences: List[CitationOccurrence] = []
     clusters: List[CitationCluster] = []
+    citation_sets: List[CitationSetBundle] = []
     bibliography: List[BibliographyEntry] = []
 
     entries, alias_map = build_citation_catalog(paper_summaries)
@@ -499,19 +679,30 @@ def build_citation_manifest_v2_from_review_draft(
             )
         )
 
-    for entry in entries:
-        if entry.paper_id not in paper_occurrence_map:
+    for paper_id in paper_occurrence_map:
+        entry = _resolve_bibliography_source_entry(
+            paper_id=paper_id,
+            occurrences=occurrences,
+            entries=entries,
+            alias_map=alias_map,
+        )
+        if entry is None:
             continue
         bibliography.append(
             BibliographyEntry(
                 entry_id=f"bib_{entry.index:03d}",
-                paper_id=entry.paper_id,
+                paper_id=paper_id,
                 paper_key=entry.paper_key,
                 citation_text=format_reference_entry(entry),
                 is_cited=True,
-                cluster_id=f"cluster_{entry.paper_id}",
+                cluster_id=f"cluster_{paper_id}",
             )
         )
+
+    citation_sets = _build_citation_set_bundles(
+        occurrences=occurrences,
+        review_draft_v2=review_draft_v2,
+    )
 
     return CitationManifestV2(
         artifact_type="citation_manifest",
@@ -529,6 +720,7 @@ def build_citation_manifest_v2_from_review_draft(
         },
         occurrences=occurrences,
         clusters=clusters,
+        citation_sets=citation_sets,
         bibliography=bibliography,
         review_draft_version="v2",
     )

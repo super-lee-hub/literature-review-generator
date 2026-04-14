@@ -126,20 +126,98 @@ def format_in_text_citation(
 
 
 def format_reference_entry(entry: CitationCatalogEntry) -> str:
-    if entry.authors:
-        if len(entry.authors) <= 7:
-            author_text = ", ".join(entry.authors)
+    # Clean metadata fields
+    def clean_field(value: Any) -> str:
+        if not value:
+            return ""
+        text = str(value).strip()
+        # Remove placeholder values
+        placeholders = ['未知年份', '未知期刊', '无标题', 'n.d.']
+        for placeholder in placeholders:
+            if text == placeholder:
+                return ""
+        # Remove common noise patterns
+        noise_patterns = [
+            "Contents lists available at ScienceDirect",
+            "RESEARCH ARTICLE",
+            "Article",
+            "Abstract",
+            "摘要",
+            "Introduction",
+            "引言",
+            "Keywords",
+            "关键词",
+            "References",
+            "参考文献",
+            "Copyright",
+            "版权",
+            "©",
+            "Published by",
+            "Elsevier",
+            "Springer",
+            "Taylor & Francis",
+            "Wiley",
+            "Oxford University Press",
+            "Cambridge University Press",
+            "American Psychological Association",
+            "APA",
+            "IEEE",
+            "ACM",
+            "SpringerLink",
+            "ScienceDirect",
+            "PubMed",
+            "Google Scholar",
+            "DOI:",
+            "doi:",
+        ]
+        for pattern in noise_patterns:
+            text = text.replace(pattern, "").strip()
+        # Remove excessive whitespace
+        text = ' '.join(text.split())
+        return text
+
+    def clean_doi(value: Any) -> str:
+        if not value:
+            return ""
+        text = str(value).strip()
+        # Extract only the DOI part (10.xxxx/xxxx)
+        import re
+        doi_match = re.search(r'10\.\d{4,}/[^\s]+', text)
+        if doi_match:
+            return doi_match.group(0)
+        # Remove any non-DOI content
+        text = text.replace("https://doi.org/", "").strip()
+        # Keep only alphanumeric, dots, slashes, hyphens, and underscores
+        text = re.sub(r'[^a-zA-Z0-9./\-_]', '', text)
+        return text
+
+    # Clean authors
+    cleaned_authors = [clean_field(author) for author in (entry.authors or []) if clean_field(author)]
+    if cleaned_authors:
+        if len(cleaned_authors) <= 7:
+            author_text = ", ".join(cleaned_authors)
         else:
-            author_text = ", ".join(entry.authors[:6]) + ", ..., " + entry.authors[-1]
+            author_text = ", ".join(cleaned_authors[:6]) + ", ..., " + cleaned_authors[-1]
     else:
         author_text = "Anonymous"
 
-    parts = [author_text, f"({entry.year or 'n.d.'}).", f"{entry.title or 'Untitled.'}"]
-    if entry.journal:
-        parts.append(f"*{entry.journal}*")
-    if entry.doi:
-        parts.append(f"https://doi.org/{entry.doi}")
-    return " ".join(part for part in parts if part).strip()
+    # Clean other fields
+    cleaned_year = clean_field(entry.year)
+    cleaned_title = clean_field(entry.title)
+    cleaned_journal = clean_field(entry.journal)
+    cleaned_doi = clean_doi(entry.doi)
+
+    parts = [author_text, f"({cleaned_year or 'n.d.'}).", f"{cleaned_title or 'Untitled.'}"]
+    if cleaned_journal:
+        parts.append(f"*{cleaned_journal}*")
+    if cleaned_doi:
+        parts.append(f"https://doi.org/{cleaned_doi}")
+    
+    reference = " ".join(part for part in parts if part).strip()
+    # Skip references that are just placeholders
+    if reference and not reference.strip() == "Anonymous (n.d.). Untitled.":
+        return reference
+    return ""
 
 
 def build_citation_catalog(
@@ -173,14 +251,37 @@ def build_citation_catalog(
         title = str(paper_info.get("title") or "").strip()
         if title:
             aliases.add(title)
+        
+        # Add author-based aliases
+        author_list = [str(author).strip() for author in authors if str(author).strip()]
+        year = str(paper_info.get("year") or "").strip()
+        
+        # Add aliases for each author
+        for author in author_list:
+            aliases.add(author)
+            # Add surname-only alias
+            surname = _author_surname(author)
+            aliases.add(surname)
+            # Add author-year combination
+            if year:
+                aliases.add(f"{surname}{year}")
+                aliases.add(f"{surname}, {year}")
+        
+        # Add et al. variations for multiple authors
+        if len(author_list) > 1:
+            first_author_surname = _author_surname(author_list[0])
+            aliases.add(f"{first_author_surname} et al.")
+            if year:
+                aliases.add(f"{first_author_surname} et al.{year}")
+                aliases.add(f"{first_author_surname} et al., {year}")
 
         entry = CitationCatalogEntry(
             index=index,
             paper_id=paper_key,
             paper_key=paper_key,
             title=title,
-            authors=[str(author).strip() for author in authors if str(author).strip()],
-            year=str(paper_info.get("year") or "").strip(),
+            authors=author_list,
+            year=year,
             journal=str(paper_info.get("journal") or "").strip(),
             doi=str(paper_info.get("doi") or "").strip(),
             aliases=sorted(alias for alias in aliases if alias),

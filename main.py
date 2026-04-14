@@ -593,14 +593,18 @@ class LiteratureReviewGenerator:
         try:
             self.logger.info("开始执行大纲采纳操作...")
             
-            # 加载大纲文件
-            outline_path = self._get_outline_file_path()
-            if not os.path.exists(outline_path):
-                self.logger.error(f"大纲文件不存在: {outline_path}")
+            # 加载大纲文件（使用 JSON 格式的 OutlineDocument）
+            if not self.job_workspace or not self.project_name:
+                self.logger.error("工作空间或项目名称未设置")
+                return False
+            
+            outline_doc_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_document.json")
+            if not os.path.exists(outline_doc_path):
+                self.logger.error(f"大纲文档文件不存在: {outline_doc_path}")
                 return False
             
             # 加载大纲数据
-            with open(outline_path, 'r', encoding='utf-8') as f:
+            with open(outline_doc_path, 'r', encoding='utf-8') as f:
                 outline_data = json.load(f)
             
             # 转换为 OutlineDocument 对象
@@ -613,15 +617,12 @@ class LiteratureReviewGenerator:
                 return False
             
             # 加载仲裁结果（如果存在）
-            if not self.output_dir:
-                self.logger.error("输出目录未设置")
-                return False
-            arbitration_result_path = os.path.join(self.output_dir, f'{self.project_name}_outline_arbitration_result.json')
-            if not os.path.exists(arbitration_result_path):
-                self.logger.error(f"仲裁结果文件不存在: {arbitration_result_path}")
+            arbitration_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_arbitration.json")
+            if not os.path.exists(arbitration_path):
+                self.logger.error(f"仲裁结果文件不存在: {arbitration_path}")
                 return False
             
-            with open(arbitration_result_path, 'r', encoding='utf-8') as f:
+            with open(arbitration_path, 'r', encoding='utf-8') as f:
                 arbitration_data = json.load(f)
             
             # 转换为 OutlineArbitrationResult 对象
@@ -634,7 +635,7 @@ class LiteratureReviewGenerator:
                     arbitrated_at=arb['arbitrated_at'],
                     arbitrated_by=arb['arbitrated_by']
                 )
-                for arb in arbitration_data['arbitrations']
+                for arb in arbitration_data.get('arbitrations', [])
             ]
             
             from outline.arbitration import run_arbitration
@@ -642,7 +643,7 @@ class LiteratureReviewGenerator:
                 outline=outline,
                 critiques=outline.critiques,
                 arbitrations=arbitrations,
-                job_id=self.job_workspace.job_id if hasattr(self, 'job_workspace') and self.job_workspace else str(int(time.time())),
+                job_id=self.job_workspace.job_id,
                 arbitrated_by="user"
             )
             
@@ -651,18 +652,16 @@ class LiteratureReviewGenerator:
             reviewed_outline = adopt_outline(
                 outline=outline,
                 arbitration_result=arbitration_result,
-                job_id=self.job_workspace.job_id if hasattr(self, 'job_workspace') and self.job_workspace else str(int(time.time())),
+                job_id=self.job_workspace.job_id,
                 adopted_by="user"
             )
             
-            # 保存采纳后的大纲
-            if not self.output_dir:
-                self.logger.error("输出目录未设置")
-                return False
-            adopted_outline_path = os.path.join(self.output_dir, f'{self.project_name}_adopted_outline.json')
-            atomic_write_json(adopted_outline_path, reviewed_outline.to_dict())
+            # 保存采纳后的大纲（使用正确的文件名）
+            reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.json")
+            from services.job_workspace import atomic_write_json
+            atomic_write_json(reviewed_outline_path, reviewed_outline.to_dict())
             
-            self.logger.success(f"大纲采纳成功，已保存到: {adopted_outline_path}")
+            self.logger.success(f"大纲采纳成功，已保存到: {reviewed_outline_path}")
             return True
         except Exception as e:
             self.logger.error(f"执行大纲采纳操作时出错: {e}")
@@ -2217,23 +2216,7 @@ class LiteratureReviewGenerator:
         return None
 
     def _load_outline_artifact(self) -> Optional[Tuple[str, str]]:
-        """Load outline artifact, preferring reviewed outline if available and adopted.
-
-        Priority:
-        1. ReviewedOutlineDocument (if exists and adopted) - converted to markdown
-        2. Registered outline artifact from registry
-        3. Workspace outline file
-        4. Legacy outline file (fallback)
-        5. Historical workspace outline files
-        """
-        # Week5: Check for reviewed outline first
-        reviewed_outline_content = self._load_reviewed_outline_as_markdown()
-        if reviewed_outline_content:
-            self.logger.info("Using Week5 reviewed outline (adopted) as downstream truth")
-            # Return a virtual path indicating this came from reviewed outline
-            reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.md") if self.job_workspace else "reviewed_outline.md"
-            return reviewed_outline_path, reviewed_outline_content
-
+        """Load the primary markdown outline artifact used by downstream review generation."""
         outline_file = self._resolve_outline_file_path()
         if outline_file:
             try:
@@ -2357,11 +2340,78 @@ class LiteratureReviewGenerator:
         metadata = get_paper_metadata(ai_summary or {})
         updated_fields: List[str] = []
 
-        extracted_title = str(metadata.get("title") or "").strip()
-        extracted_authors = list(metadata.get("authors") or [])
-        extracted_year = str(metadata.get("year") or "").strip()
-        extracted_journal = str(metadata.get("journal") or "").strip()
-        extracted_doi = str(metadata.get("doi") or "").strip()
+        # Clean extracted metadata to remove noise
+        def clean_field(value: Any) -> str:
+            if not value:
+                return ""
+            text = str(value).strip()
+            # Remove common noise patterns
+            noise_patterns = [
+                "Contents lists available at ScienceDirect",
+                "RESEARCH ARTICLE",
+                "Article",
+                "Abstract",
+                "摘要",
+                "Introduction",
+                "引言",
+                "Keywords",
+                "关键词",
+                "References",
+                "参考文献",
+                "Copyright",
+                "版权",
+                "©",
+                "Published by",
+                "Elsevier",
+                "Springer",
+                "Taylor & Francis",
+                "Wiley",
+                "Oxford University Press",
+                "Cambridge University Press",
+                "American Psychological Association",
+                "APA",
+                "IEEE",
+                "ACM",
+                "SpringerLink",
+                "ScienceDirect",
+                "PubMed",
+                "Google Scholar",
+                "DOI:",
+                "doi:",
+            ]
+            for pattern in noise_patterns:
+                text = text.replace(pattern, "").strip()
+            # Remove excessive whitespace
+            text = ' '.join(text.split())
+            return text
+
+        def clean_doi(value: Any) -> str:
+            if not value:
+                return ""
+            text = str(value).strip()
+            # Extract only the DOI part (10.xxxx/xxxx)
+            import re
+            doi_match = re.search(r'10\.\d{4,}/[^\s]+', text)
+            if doi_match:
+                return doi_match.group(0)
+            # Remove any non-DOI content
+            text = text.replace("https://doi.org/", "").strip()
+            # Keep only alphanumeric, dots, slashes, hyphens, and underscores
+            text = re.sub(r'[^a-zA-Z0-9./\-_]', '', text)
+            return text
+
+        extracted_title = clean_field(metadata.get("title"))
+        extracted_authors = [clean_field(author) for author in (metadata.get("authors") or []) if clean_field(author)]
+        extracted_year = clean_field(metadata.get("year"))
+        # Validate year format (4 digits)
+        import re
+        year_match = re.search(r'20\d{2}', extracted_year)
+        if year_match:
+            extracted_year = year_match.group(0)
+        else:
+            extracted_year = ""
+        extracted_journal = clean_field(metadata.get("journal"))
+        extracted_doi = clean_doi(metadata.get("doi"))
 
         if extracted_title and extracted_title != str(paper.get("title") or "").strip():
             paper["title"] = extracted_title
@@ -2932,11 +2982,6 @@ class LiteratureReviewGenerator:
             
             self.logger.info("内容质量检查通过")
             # ================================================================
-            
-            # =================== STAGE 1 VALIDATION (MODULAR) ===================
-            if self._stage1_validation_enabled():
-                ai_result = validator.validate_paper_analysis(self, pdf_text, ai_result)  # type: ignore
-            # ===================================================================
             
             # 概念增强分析（如果启用）
             if self.concept_mode and self.concept_profile and ai_result:
@@ -4654,56 +4699,6 @@ class LiteratureReviewGenerator:
                     validation_result: Dict[str, Any] = run_review_validation(self)  # type: ignore
                     if validation_result.get("success"):
                         self.logger.success("第二阶段验证完成！验证报告已生成。")
-                        
-                        # Week4: Run repair pipeline (report-first policy)
-                        validation_report = validation_result.get("report")
-                        review_draft = validation_result.get("review_draft")
-                        citation_manifest = validation_result.get("citation_manifest")
-                        paper_artifacts = validation_result.get("paper_artifacts")
-                        
-                        job_workspace = self.job_workspace
-                        artifact_registry = self.artifact_registry
-                        has_repair_inputs = (
-                            job_workspace is not None
-                            and artifact_registry is not None
-                            and isinstance(review_draft, dict)
-                            and isinstance(citation_manifest, dict)
-                            and isinstance(paper_artifacts, list)
-                            and all(isinstance(item, dict) for item in paper_artifacts)
-                        )
-
-                        if has_repair_inputs:
-                            try:
-                                assert job_workspace is not None
-                                assert artifact_registry is not None
-                                assert isinstance(review_draft, dict)
-                                assert isinstance(citation_manifest, dict)
-                                assert isinstance(paper_artifacts, list)
-
-                                self.logger.info("Starting Week4 repair pipeline (report-first policy)...")
-                                from services.repair_integration import run_repair_pipeline
-                                from validation.review_validator import ReviewValidationReport
-
-                                if not isinstance(validation_report, ReviewValidationReport):
-                                    self.logger.warning("Week4 repair pipeline skipped: invalid validation report type.")
-                                else:
-                                    typed_review_draft = cast(Dict[str, Any], review_draft)
-                                    typed_citation_manifest = cast(Dict[str, Any], citation_manifest)
-                                    typed_paper_artifacts = cast(List[Dict[str, Any]], paper_artifacts)
-                                    repair_result = run_repair_pipeline(
-                                        validation_report=validation_report,
-                                        review_draft=typed_review_draft,
-                                        citation_manifest=typed_citation_manifest,
-                                        paper_artifacts=typed_paper_artifacts,
-                                        job_id=job_workspace.job_id,
-                                        workspace=job_workspace,
-                                        registry=artifact_registry,
-                                        auto_apply=False,  # Default: report-first policy
-                                    )
-                                    self.logger.success(f"Week4 repair pipeline completed: {repair_result}")
-                            except Exception as repair_error:
-                                self.logger.error(f"Week4 repair pipeline failed: {repair_error}")
-                                self.logger.warning("修复管道失败，但验证流程将继续。请检查修复相关文件。")
                     else:
                         self.logger.warning("第二阶段验证失败，请检查验证报告文件。")
                 else:
@@ -4796,151 +4791,6 @@ class LiteratureReviewGenerator:
                 outline_text,
                 producer="main.LiteratureReviewGenerator.create_literature_review_outline",
             )
-            
-            # Week5: Generate and persist JSON-first OutlineDocument
-            if self.job_workspace and self.artifact_registry:
-                self.logger.info("Generating Week5 JSON-first OutlineDocument...")
-                from outline.generator import run_outline_generation
-                from outline.arbitration import run_outline_critique, run_outline_arbitration, run_outline_adopt
-                from services.artifact_registry import ArtifactDependencyRef
-                
-                from services.model_selection import get_outline_api_config
-                outline_api_config = get_outline_api_config(self.config)
-                generator_model = outline_api_config.get('model') or 'gpt-4'
-                outline_summaries: List[Dict[str, Any]] = [dict(summary) for summary in self.summaries]
-                
-                # Generate OutlineDocument from markdown
-                outline_result = run_outline_generation(
-                    markdown_text=outline_text,
-                    sections_data=None,
-                    job_id=self.job_workspace.job_id,
-                    generator_model=generator_model,
-                    summaries=outline_summaries,
-                )
-                outline_dict_raw = outline_result.get('outline')
-                if not isinstance(outline_dict_raw, dict):
-                    raise ValueError("Week5 outline generation did not return a valid outline payload.")
-                outline_dict: Dict[str, Any] = outline_dict_raw
-                
-                # Persist OutlineDocument
-                outline_doc_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_document.json")
-                from services.job_workspace import atomic_write_json
-                if outline_dict:
-                    atomic_write_json(outline_doc_path, outline_dict)
-                    
-                    # Register in artifact registry
-                    self.artifact_registry.register_file(
-                        artifact_role="outline",
-                        artifact_type="outline_document",
-                        artifact_version="v1",
-                        path=outline_doc_path,
-                        producer="main.LiteratureReviewGenerator.create_literature_review_outline",
-                        artifact_id="outline_document:v1",
-                        depends_on=[
-                            ArtifactDependencyRef(
-                                artifact_type=self.OUTLINE_ARTIFACT_TYPE,
-                                path=outline_file,
-                            )
-                        ],
-                    )
-                    
-                    self.logger.success(f"Week5 OutlineDocument saved to: {outline_doc_path}")
-                
-                # Run peer critique
-                self.logger.info("Running Week5 peer critique...")
-                from outline.models import OutlineDocument
-                outline_doc = OutlineDocument.from_dict(outline_dict)
-                
-                # Get different API configs for different critique types
-                writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
-                primary_reader_config: Dict[str, Any] = (self.config or {}).get('Primary_Reader_API', {})  # type: ignore
-                
-                # Writer_API for structure critique, Primary_Reader_API for coverage critique
-                structure_critic_model = writer_config.get('model', 'gpt-4')
-                coverage_critic_model = primary_reader_config.get('model', 'gpt-4-turbo')
-                
-                critique_result = run_outline_critique(
-                    outline=outline_doc,
-                    critic_model=structure_critic_model,
-                    coverage_critic_model=coverage_critic_model,
-                    summaries=outline_summaries,
-                    job_id=self.job_workspace.job_id,
-                )
-                
-                # Save critique result
-                critique_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_critique.json")
-                atomic_write_json(critique_path, critique_result)
-                
-                self.artifact_registry.register_file(
-                    artifact_role="outline_critique",
-                    artifact_type="outline_critique",
-                    artifact_version="v1",
-                    path=critique_path,
-                    producer="main.LiteratureReviewGenerator.create_literature_review_outline",
-                    artifact_id="outline_critique:v1",
-                    depends_on=[
-                        ArtifactDependencyRef(
-                            artifact_type="outline_document",
-                            path=outline_doc_path,
-                        )
-                    ],
-                )
-                
-                self.logger.success(f"Week5 outline critique saved to: {critique_path}")
-                
-                # Week5: Run arbitration and explicit adopt
-                self.logger.info("Running Week5 arbitration and adopt...")
-                from outline.arbitration import run_outline_arbitration, run_outline_adopt
-                from outline.models import ArbitrationDecision, CritiqueArbitration
-                
-                # Remove auto-accept - require explicit adopt
-                critiques_list = critique_result.get("critiques", [])
-                # No auto-accept - arbitrations will be created through explicit user action
-                arbitrations = []
-                
-                # Run arbitration with error handling
-                arbitration_result = None
-                arbitration_path = None
-                try:
-                    # Outline_API for arbitration
-                    arbitration_result = run_outline_arbitration(
-                        outline=outline_doc,
-                        arbitrations=arbitrations,
-                        job_id=self.job_workspace.job_id,
-                        arbitrated_by="workflow",
-                        arbitrator_model=generator_model,  # Use Outline_API model for arbitration
-                    )
-                    
-                    # Save arbitration result
-                    arbitration_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_arbitration.json")
-                    atomic_write_json(arbitration_path, arbitration_result)
-                    
-                    self.artifact_registry.register_file(
-                        artifact_role="outline_arbitration",
-                        artifact_type="outline_arbitration_result",
-                        artifact_version="v1",
-                        path=arbitration_path,
-                        producer="main.LiteratureReviewGenerator.create_literature_review_outline",
-                        artifact_id="outline_arbitration:v1",
-                        depends_on=[
-                            ArtifactDependencyRef(
-                                artifact_type="outline_critique",
-                                path=critique_path,
-                            )
-                        ],
-                    )
-                    
-                    self.logger.success(f"Week5 outline arbitration saved to: {arbitration_path}")
-                except Exception as arb_exc:
-                    self.logger.error(f"Week5 outline arbitration failed: {arb_exc}")
-                    import traceback
-                    traceback.print_exc()
-                    self.logger.warning("Skipping Week5 arbitration and adopt steps due to error")
-                
-                # 停止自动adopt，需要显式用户操作
-                self.logger.info("Week5: 停止自动adopt，需要显式用户操作")
-                # 移除自动adopt代码，改为提示用户进行显式adopt
-                self.logger.info("请通过GUI或CLI执行显式adopt操作来应用大纲修改")
             
             # 保存大纲文件
             

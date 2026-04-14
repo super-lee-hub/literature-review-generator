@@ -31,7 +31,7 @@ def atomic_write_json(path: str, payload: Any) -> None:
             try:
                 os.replace(temp_path, path)
                 return  # 成功写入，退出函数
-            except PermissionError as e:
+            except (PermissionError, OSError, IOError) as e:
                 if attempt < max_retries - 1:
                     # 退避重试
                     time.sleep(retry_delay)

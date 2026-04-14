@@ -423,6 +423,7 @@ class QueueRunner:
                 generate_review=params.get("generate_review", False),
                 generate_section=params.get("generate_section"),
                 validate_review=params.get("validate_review", False),
+                retry_failed=params.get("retry_failed", False),
                 retry_review_failed=params.get("retry_review_failed", False),
                 concept=params.get("concept"),
                 free_mode_profile=params.get("free_mode_profile"),

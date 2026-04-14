@@ -360,623 +360,518 @@ def _validate_claims_for_single_paper(source_summary: dict, sentences: List[str]
         # 注意：这里没有generator_instance的引用，所以暂时不记录日志
         return None
 
-def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
-    """
-    [第二阶段验证] 对生成的文献综述进行高效、批量的验证（使用工件而非docx）。
-    """
-    generator_instance.logger.info("=" * 60 + "\n文献综述验证阶段 (高效版)\n" + "=" * 60)  # type: ignore
+def _get_validation_workspace(generator_instance: Any) -> Any:
+    if hasattr(generator_instance, "job_workspace") and generator_instance.job_workspace:
+        return generator_instance.job_workspace
+
+    from services.job_workspace import JobWorkspace
+
+    project_name = generator_instance.project_name or "unknown_project"
+    job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+    return JobWorkspace(generator_instance.output_dir, project_name, job_id)
+
+
+def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    review_draft_path = generator_instance._review_draft_v2_path()
+    if not os.path.exists(review_draft_path):
+        generator_instance.logger.error(f"??? review_draft_v2 ??: {review_draft_path}")
+        return None, None, [], {}, {}
+
+    citation_manifest_path = generator_instance._citation_manifest_path()
+    if not os.path.exists(citation_manifest_path):
+        generator_instance.logger.error(f"??? citation_manifest ??: {citation_manifest_path}")
+        return None, None, [], {}, {}
+
+    with open(review_draft_path, "r", encoding="utf-8") as handle:
+        review_draft = json.load(handle)
+    with open(citation_manifest_path, "r", encoding="utf-8") as handle:
+        citation_manifest = json.load(handle)
+
+    paper_artifacts: List[Dict[str, Any]] = []
     try:
-        if not generator_instance.config.getboolean('Performance', 'enable_stage2_validation', fallback=False):  # type: ignore
-            generator_instance.logger.warn("第二阶段验证未在配置中启用。跳过此步骤。")  # type: ignore
+        from services.artifact_registry import ArtifactRegistry
+
+        workspace = _get_validation_workspace(generator_instance)
+        registry = generator_instance.artifact_registry or ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+        for record in registry.list_records():
+            if record.artifact_type == "paper_artifact" and record.status == "ready":
+                try:
+                    with open(record.path, "r", encoding="utf-8") as handle:
+                        paper_artifacts.append(json.load(handle))
+                except Exception as exc:
+                    generator_instance.logger.warning(f"?? paper artifact ??: {exc}")
+    except Exception as exc:
+        generator_instance.logger.warning(f"? artifact registry ?? paper artifact ??????? summaries: {exc}")
+
+    if not paper_artifacts:
+        for summary in getattr(generator_instance, "summaries", []) or []:
+            paper_info = summary.get("paper_info", {})
+            ai_summary = summary.get("ai_summary", {})
+            canonical_key = generator_instance.get_paper_key(paper_info)
+            paper_artifacts.append(
+                {
+                    "paper_identity": {
+                        "canonical_paper_key": canonical_key,
+                        "source_paper_id": paper_info.get("pdf_path", ""),
+                    },
+                    "analysis": {"ai_summary": ai_summary},
+                    "source": {"source_pdf": paper_info.get("pdf_path", "")},
+                    "stage1_inputs": {},
+                }
+            )
+
+    preprocess_evidence: Dict[str, Any] = {}
+    paper_metadata: Dict[str, Any] = {}
+    for artifact in paper_artifacts:
+        paper_key = artifact.get("paper_identity", {}).get("canonical_paper_key", "")
+        source_paper_id = artifact.get("paper_identity", {}).get("source_paper_id", "")
+        stage1_inputs = artifact.get("stage1_inputs", {})
+        identity = artifact.get("paper_identity", {})
+        if paper_key:
+            preprocess_evidence[paper_key] = stage1_inputs.get("preprocess_evidence", {})
+            paper_metadata[paper_key] = identity
+        if source_paper_id:
+            preprocess_evidence[source_paper_id] = stage1_inputs.get("preprocess_evidence", {})
+            paper_metadata[source_paper_id] = identity
+
+    return review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata
+
+
+def _build_report_from_results(citation_results: List[Any]) -> Any:
+    from validation.review_validator import ReviewValidationReport, ValidationConclusion
+
+    return ReviewValidationReport(
+        report_id=f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        created_at=datetime.now().isoformat(),
+        total_citations=len(citation_results),
+        supported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.SUPPORTED),
+        partial_support_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.PARTIAL_SUPPORT),
+        unsupported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.UNSUPPORTED),
+        wrong_source_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.WRONG_SOURCE),
+        needs_review_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.NEEDS_REVIEW),
+        citation_results=citation_results,
+    )
+
+
+def _get_validator_api_config(generator_instance: Any) -> Optional[Dict[str, str]]:
+    validator_config: Dict[str, str] = (generator_instance.config.get("Validator_API") or {}) if generator_instance.config else {}
+    api_key = str(validator_config.get("api_key") or "").strip()
+    model = str(validator_config.get("model") or "").strip()
+    if not api_key or not model:
+        return None
+    return {
+        "api_key": api_key,
+        "model": model,
+        "api_base": str(validator_config.get("api_base") or "https://api.openai.com/v1").strip(),
+    }
+
+
+def _load_source_text_for_artifact(paper_artifact: Dict[str, Any]) -> str:
+    preprocess_evidence = paper_artifact.get("stage1_inputs", {}).get("preprocess_evidence", {})
+    candidate_paths = [
+        preprocess_evidence.get("normalized_md_path"),
+        preprocess_evidence.get("normalized_path"),
+        preprocess_evidence.get("plain_text_path"),
+    ]
+    for file_path in candidate_paths:
+        if file_path and os.path.exists(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as handle:
+                    content = handle.read().strip()
+                if content:
+                    return content
+            except Exception:
+                pass
+    return str(paper_artifact.get("source", {}).get("source_text") or "")
+
+
+def _map_ai_bundle_result(result: Any, ai_report: Dict[str, Any]) -> Any:
+    from validation.review_validator import CitationValidationResult, RootCause, ValidationConclusion
+
+    status = str(ai_report.get("status") or "").strip().lower()
+    confidence = float(ai_report.get("confidence") or 0.0)
+    repair_scope = str(ai_report.get("repair_scope") or "none").strip().lower()
+    low_confidence = bool(ai_report.get("low_confidence")) or confidence < 0.55 or status == "low_confidence"
+
+    if status == "supported":
+        conclusion = ValidationConclusion.SUPPORTED
+        root_causes: List[RootCause] = []
+    elif status in {"partial_support", "partial"}:
+        conclusion = ValidationConclusion.PARTIAL_SUPPORT
+        root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+    elif status in {"wrong_source", "mapping_error"}:
+        conclusion = ValidationConclusion.WRONG_SOURCE
+        root_causes = [RootCause.CITATION_MAPPING_ERROR]
+    elif low_confidence:
+        conclusion = ValidationConclusion.NEEDS_REVIEW
+        root_causes = [RootCause.LOW_CONFIDENCE]
+    else:
+        conclusion = ValidationConclusion.UNSUPPORTED
+        root_causes = []
+
+    if repair_scope == "summary":
+        root_causes.append(RootCause.SUMMARY_DRIFT)
+    elif repair_scope == "review":
+        root_causes.append(RootCause.REVIEW_DRIFT)
+    elif repair_scope == "both":
+        root_causes.extend([RootCause.SUMMARY_DRIFT, RootCause.REVIEW_DRIFT, RootCause.COMPOUND_DRIFT])
+
+    if not root_causes and conclusion == ValidationConclusion.UNSUPPORTED:
+        root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+
+    details = dict(result.details)
+    details.update(
+        {
+            "ai_validation": ai_report,
+            "ai_confidence": confidence,
+            "repair_scope": repair_scope,
+            "summary_paper_ids": list(ai_report.get("summary_paper_ids") or result.paper_ids),
+            "manual_review_reason": str(ai_report.get("manual_review_reason") or "").strip(),
+        }
+    )
+
+    reasoning_summary = str(ai_report.get("reasoning") or result.reasoning_summary).strip() or result.reasoning_summary
+    repair_hint = str(ai_report.get("repair_hint") or result.repair_hint).strip() or result.repair_hint
+
+    return CitationValidationResult(
+        citation_id=result.citation_id,
+        paper_id=result.paper_id,
+        conclusion=conclusion,
+        root_causes=root_causes,
+        evidence_candidates=result.evidence_candidates,
+        details=details,
+        claim_text=result.claim_text,
+        claim_context=result.claim_context,
+        evidence_excerpt_list=result.evidence_excerpt_list,
+        reasoning_summary=reasoning_summary,
+        repair_hint=repair_hint,
+        citation_set_key=result.citation_set_key,
+        paper_ids=result.paper_ids,
+        block_ids=result.block_ids,
+        low_confidence=low_confidence,
+    )
+
+
+def _run_ai_bundle_validation(generator_instance: Any, result: Any) -> Any:
+    validator_api_config = _get_validator_api_config(generator_instance)
+    if not validator_api_config or not result.claim_text.strip() or not result.paper_ids:
+        return result
+
+    try:
+        max_tokens = int((generator_instance.config.get("API_Parameters") or {}).get("claims_max_tokens", 4096))
+        temperature = float((generator_instance.config.get("API_Parameters") or {}).get("claims_temperature", 0.2))
+    except Exception:
+        max_tokens = 4096
+        temperature = 0.2
+
+    payload = {
+        "citation_set_key": result.citation_set_key,
+        "paper_ids": result.paper_ids,
+        "claim_text": result.claim_text,
+        "claim_context": result.claim_context,
+        "evidence_excerpt_list": result.evidence_excerpt_list[:8],
+    }
+    prompt = (
+        "You are validating a literature-review claim bundle against the exact cited paper set. "
+        "Judge whether the claim is supported by the cited sources, whether the problem appears to come from "
+        "the stage-1 summary, the review draft, both, or is too uncertain for automatic repair. "
+        "Return JSON with keys: status, confidence, repair_scope, low_confidence, reasoning, repair_hint, "
+        "summary_paper_ids, manual_review_reason.\n\n"
+        f"Bundle payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+    system_prompt = (
+        "Return JSON only. status must be one of supported, partial_support, unsupported, "
+        "wrong_source, low_confidence. repair_scope must be one of none, summary, review, both, manual_review."
+    )
+
+    try:
+        ai_report = _call_ai_api(
+            prompt,
+            validator_api_config,
+            system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format="json",
+            logger=generator_instance.logger,
+        )
+    except Exception as exc:
+        generator_instance.logger.warning(f"AI citation-set validation failed: {exc}")
+        return result
+
+    if not isinstance(ai_report, dict):
+        return result
+    return _map_ai_bundle_result(result, ai_report)
+
+
+def _find_summary_entry_for_paper(generator_instance: Any, paper_id: str) -> Optional[Dict[str, Any]]:
+    for summary in getattr(generator_instance, "summaries", []) or []:
+        paper_info = summary.get("paper_info", {})
+        if generator_instance.get_paper_key(paper_info) == paper_id:
+            return summary
+        if str(paper_info.get("pdf_path") or "").strip() == paper_id:
+            return summary
+    return None
+
+
+def _apply_summary_repairs(generator_instance: Any, citation_results: List[Any], paper_artifacts: List[Dict[str, Any]]) -> List[str]:
+    touched_papers: List[str] = []
+    artifact_lookup = {
+        artifact.get("paper_identity", {}).get("canonical_paper_key", ""): artifact
+        for artifact in paper_artifacts
+        if artifact.get("paper_identity", {}).get("canonical_paper_key")
+    }
+    for result in citation_results:
+        repair_scope = str(result.details.get("repair_scope") or "").lower()
+        if repair_scope not in {"summary", "both"} or result.low_confidence:
+            continue
+        for paper_id in list(dict.fromkeys(result.details.get("summary_paper_ids") or result.paper_ids)):
+            summary_entry = _find_summary_entry_for_paper(generator_instance, paper_id)
+            paper_artifact = artifact_lookup.get(paper_id)
+            if summary_entry is None or paper_artifact is None:
+                continue
+            source_text = _load_source_text_for_artifact(paper_artifact)
+            if not source_text:
+                continue
+            updated_summary = validate_paper_analysis(generator_instance, source_text, summary_entry.get("ai_summary", {}), use_cache=False)
+            summary_entry["ai_summary"] = updated_summary
+            paper_artifact.setdefault("analysis", {})["ai_summary"] = updated_summary
+            touched_papers.append(paper_id)
+            try:
+                generator_instance._persist_paper_artifact(summary_entry)
+            except Exception:
+                pass
+
+    if touched_papers:
+        generator_instance.save_summaries()
+    return list(dict.fromkeys(touched_papers))
+
+
+def _rewrite_block_with_ai(
+    generator_instance: Any,
+    *,
+    block_text: str,
+    citation_tokens: List[str],
+    claim_text: str,
+    evidence_excerpt_list: List[str],
+    paper_ids: List[str],
+) -> Optional[str]:
+    validator_api_config = _get_validator_api_config(generator_instance)
+    if not validator_api_config:
+        return None
+
+    prompt = (
+        "Rewrite the review block so that it remains academically toned, preserves the citation tokens exactly, "
+        "and better matches the available source evidence. Return JSON with rewritten_block only.\n\n"
+        f"Citation tokens: {json.dumps(citation_tokens, ensure_ascii=False)}\n"
+        f"Paper ids: {json.dumps(paper_ids, ensure_ascii=False)}\n"
+        f"Original block:\n{block_text}\n\n"
+        f"Claim bundle summary:\n{claim_text}\n\n"
+        f"Evidence excerpts:\n{json.dumps(evidence_excerpt_list[:8], ensure_ascii=False, indent=2)}"
+    )
+    system_prompt = "Return JSON only with rewritten_block. Preserve all citation tokens exactly."
+    try:
+        response = _call_ai_api(
+            prompt,
+            validator_api_config,
+            system_prompt,
+            max_tokens=4096,
+            temperature=0.2,
+            response_format="json",
+            logger=generator_instance.logger,
+        )
+    except Exception as exc:
+        generator_instance.logger.warning(f"AI review-block rewrite failed: {exc}")
+        return None
+    rewritten_block = str((response or {}).get("rewritten_block") or "").strip()
+    if not rewritten_block:
+        return None
+    for token in citation_tokens:
+        if token and token not in rewritten_block:
+            rewritten_block = f"{rewritten_block} {token}".strip()
+    return rewritten_block
+
+
+def _apply_review_repairs(generator_instance: Any, review_draft: Dict[str, Any], citation_results: List[Any]) -> List[str]:
+    touched_blocks: List[str] = []
+    for result in citation_results:
+        repair_scope = str(result.details.get("repair_scope") or "").lower()
+        if repair_scope not in {"review", "both"} or result.low_confidence:
+            continue
+        citation_tokens = list(result.details.get("bundle", {}).get("citation_tokens") or [])
+        for block_id in result.block_ids:
+            for section in review_draft.get("content", {}).get("sections", []):
+                for block in section.get("blocks", []):
+                    if block.get("block_id") != block_id:
+                        continue
+                    rewritten = _rewrite_block_with_ai(
+                        generator_instance,
+                        block_text=str(block.get("text") or ""),
+                        citation_tokens=citation_tokens,
+                        claim_text=result.claim_text,
+                        evidence_excerpt_list=result.evidence_excerpt_list,
+                        paper_ids=result.paper_ids,
+                    )
+                    if rewritten and rewritten != block.get("text"):
+                        block["text"] = rewritten
+                        touched_blocks.append(block_id)
+    return list(dict.fromkeys(touched_blocks))
+
+
+def _rebuild_review_docx(generator_instance: Any, review_draft: Dict[str, Any], citation_manifest: Dict[str, Any], output_path: str) -> None:
+    from docx_writer import append_section_to_word_document, generate_apa_references_from_manifest
+
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    for section in review_draft.get("content", {}).get("sections", []):
+        section_text = "\n\n".join(
+            str(block.get("text") or "").strip()
+            for block in section.get("blocks", [])
+            if str(block.get("text") or "").strip()
+        )
+        append_section_to_word_document(
+            generator_instance,
+            int(section.get("section_number") or 0),
+            str(section.get("section_title") or ""),
+            section_text,
+            output_path,
+        )
+
+    if DOCX_AVAILABLE and Document is not None:
+        doc = Document(output_path)
+        doc.add_heading("References", level=1)
+        for reference in generate_apa_references_from_manifest(citation_manifest, generator_instance):
+            doc.add_paragraph(reference)
+        doc.save(output_path)
+
+
+def _persist_repaired_review_artifacts(generator_instance: Any, review_draft: Dict[str, Any]) -> Dict[str, Any]:
+    from services.job_workspace import atomic_write_json
+
+    review_draft_path = generator_instance._review_draft_v2_path()
+    word_path = generator_instance._get_review_word_file_path()
+    atomic_write_json(review_draft_path, review_draft)
+    generator_instance._persist_citation_manifest(
+        review_draft_path=review_draft_path,
+        review_word_path=word_path,
+        citations=[],
+    )
+    with open(generator_instance._citation_manifest_path(), "r", encoding="utf-8") as handle:
+        citation_manifest = json.load(handle)
+    _rebuild_review_docx(generator_instance, review_draft, citation_manifest, word_path)
+    return citation_manifest
+
+
+def _write_validation_reports(generator_instance: Any, report: Any, manual_review_items: List[Any]) -> Dict[str, str]:
+    workspace = _get_validation_workspace(generator_instance)
+    project_name = workspace.project_name
+    os.makedirs(workspace.paths.reports_dir, exist_ok=True)
+    report_file = os.path.join(workspace.paths.reports_dir, f"{project_name}_validation_report.txt")
+    manual_report_file = os.path.join(workspace.paths.reports_dir, f"{project_name}_manual_review_report.json")
+
+    lines = ["auto-generate validation report", f"generated_at: {datetime.now().isoformat()}", "=" * 40]
+    lines.append("summary")
+    lines.append(f"total_citation_sets: {report.total_citations}")
+    lines.append(f"supported: {report.supported_count}")
+    lines.append(f"partial_support: {report.partial_support_count}")
+    lines.append(f"unsupported: {report.unsupported_count}")
+    lines.append(f"wrong_source: {report.wrong_source_count}")
+    lines.append(f"needs_review: {report.needs_review_count}")
+    lines.append("")
+    lines.append("details")
+    for index, result in enumerate(report.citation_results, start=1):
+        lines.append(f"{index}. citation_set: {result.citation_set_key or result.citation_id}")
+        lines.append(f"   papers: {', '.join(result.paper_ids) if result.paper_ids else result.paper_id}")
+        lines.append(f"   conclusion: {result.conclusion.value}")
+        lines.append(f"   root_causes: {', '.join(root.value for root in result.root_causes) or '?'}")
+        lines.append(f"   claim: {result.claim_text[:300]}")
+        lines.append(f"   reasoning: {result.reasoning_summary}")
+        if result.repair_hint:
+            lines.append(f"   repair_hint: {result.repair_hint}")
+        lines.append("")
+
+    with open(report_file, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+
+    manual_payload = {
+        "generated_at": datetime.now().isoformat(),
+        "total_items": len(manual_review_items),
+        "items": [
+            {
+                "citation_set_key": item.citation_set_key,
+                "paper_ids": item.paper_ids,
+                "claim_text": item.claim_text,
+                "reasoning_summary": item.reasoning_summary,
+                "repair_hint": item.repair_hint,
+                "manual_review_reason": item.details.get("manual_review_reason", ""),
+            }
+            for item in manual_review_items
+        ],
+    }
+    with open(manual_report_file, "w", encoding="utf-8") as handle:
+        json.dump(manual_payload, handle, ensure_ascii=False, indent=2)
+
+    return {"report_file": report_file, "manual_report_file": manual_report_file}
+
+
+def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
+    generator_instance.logger.info("=" * 60 + "\nStarting review validation\n" + "=" * 60)
+    try:
+        if not generator_instance.config.getboolean("Performance", "enable_stage2_validation", fallback=False):  # type: ignore
+            generator_instance.logger.warning("Stage-2 validation is disabled; skipping review validation.")  # type: ignore
             return {"success": True, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
 
-        # 尝试使用Week 3验证流程（基于工件）
-        try:
-            # 加载review_draft_v2
-            review_draft_path = generator_instance._review_draft_v2_path()
-            if not os.path.exists(review_draft_path):
-                generator_instance.logger.error(f"找不到review_draft_v2文件: {review_draft_path}。请先生成综述。")
+        review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata = _load_validation_inputs(generator_instance)
+        if review_draft is None or citation_manifest is None:
+            return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+
+        from validation.review_validator import ReviewValidator
+
+        validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
+        base_report = validator.validate()
+        enriched_results = [_run_ai_bundle_validation(generator_instance, result) for result in base_report.citation_results]
+        final_report = _build_report_from_results(enriched_results)
+
+        touched_summaries = _apply_summary_repairs(generator_instance, enriched_results, paper_artifacts)
+        touched_blocks = _apply_review_repairs(generator_instance, review_draft, enriched_results)
+        if touched_blocks:
+            citation_manifest = _persist_repaired_review_artifacts(generator_instance, review_draft)
+
+        if touched_summaries or touched_blocks:
+            generator_instance.logger.info("Repairs applied; re-running review validation.")
+            review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata = _load_validation_inputs(generator_instance)
+            if review_draft is None or citation_manifest is None:
                 return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
-            
-            with open(review_draft_path, 'r', encoding='utf-8') as f:
-                review_draft = json.load(f)
-            
-            # 加载citation_manifest
-            citation_manifest_path = generator_instance._citation_manifest_path()
-            if not os.path.exists(citation_manifest_path):
-                generator_instance.logger.error(f"找不到citation_manifest文件: {citation_manifest_path}。请先生成综述。")
-                return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
-            
-            with open(citation_manifest_path, 'r', encoding='utf-8') as f:
-                citation_manifest = json.load(f)
-            
-            # 优先从 workspace / artifact registry 加载持久化 artifact
-            paper_artifacts = []
-            try:
-                # 尝试从 artifact registry 加载
-                from services.artifact_registry import ArtifactRegistry
-                from services.job_workspace import JobWorkspace
-                
-                # 构建 workspace 和 registry
-                if hasattr(generator_instance, 'job_workspace') and generator_instance.job_workspace:
-                    workspace = generator_instance.job_workspace
-                    job_id = workspace.job_id
-                    registry = generator_instance.artifact_registry or ArtifactRegistry(workspace.paths.registry_path, job_id)
-                else:
-                    # 回退到使用 project_name 和生成的 job_id
-                    project_name = generator_instance.project_name or "unknown_project"
-                    job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
-                    workspace = JobWorkspace(generator_instance.output_dir, project_name, job_id)
-                    registry = ArtifactRegistry(workspace.paths.registry_path, job_id)
-                
-                # 加载 paper artifacts
-                for record in registry.list_records():
-                    if record.artifact_type == "paper_artifact" and record.status == "ready":
-                        try:
-                            with open(record.path, 'r', encoding='utf-8') as f:
-                                paper_artifact = json.load(f)
-                            paper_artifacts.append(paper_artifact)
-                        except Exception as e:
-                            generator_instance.logger.warning(f"加载 paper artifact 失败: {e}")
-                
-                # 如果没有从 registry 加载到，回退到从 summaries 构建
-                if not paper_artifacts:
-                    generator_instance.logger.info("从 artifact registry 加载失败，回退到从 summaries 构建 paper_artifacts")
-                    for summary in generator_instance.summaries:
-                        paper_info = summary.get('paper_info', {})
-                        ai_summary = summary.get('ai_summary', {})
-                        
-                        paper_artifact = {
-                            "paper_identity": {
-                                "canonical_paper_key": generator_instance.get_paper_key(paper_info),
-                                "source_paper_id": paper_info.get('pdf_path', '')
-                            },
-                            "analysis": {
-                                "ai_summary": ai_summary
-                            },
-                            "source": {
-                                "source_pdf": paper_info.get('pdf_path', '')
-                            }
-                        }
-                        paper_artifacts.append(paper_artifact)
-            except Exception as e:
-                generator_instance.logger.warning(f"从 artifact registry 加载失败: {e}，回退到从 summaries 构建")
-                # 回退到从 summaries 构建
-                for summary in generator_instance.summaries:
-                    paper_info = summary.get('paper_info', {})
-                    ai_summary = summary.get('ai_summary', {})
-                    
-                    paper_artifact = {
-                        "paper_identity": {
-                            "canonical_paper_key": generator_instance.get_paper_key(paper_info),
-                            "source_paper_id": paper_info.get('pdf_path', '')
-                        },
-                        "analysis": {
-                            "ai_summary": ai_summary
-                        },
-                        "source": {
-                            "source_pdf": paper_info.get('pdf_path', '')
-                        }
-                    }
-                    paper_artifacts.append(paper_artifact)
-            
-            # 构建 preprocess_evidence 和 paper_metadata
-            preprocess_evidence = {}
-            paper_metadata = {}
-            
-            # 从 paper_artifacts 中提取相关信息
-            for artifact in paper_artifacts:
-                paper_key = artifact.get('paper_identity', {}).get('canonical_paper_key', '')
-                if paper_key:
-                    # 提取 preprocess evidence
-                    preprocess_evidence[paper_key] = artifact.get('stage1_inputs', {}).get('preprocess_evidence', {})
-                    # 提取 paper metadata
-                    paper_metadata[paper_key] = artifact.get('paper_identity', {})
-            
-            # 运行Week 3验证
-            from validation.review_validator import ReviewValidator
             validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
-            report = validator.validate()
-            
-            # 运行summary_recheck
-            from validation.summary_recheck import run_summary_rechecks
-            recheck_reports = run_summary_rechecks(paper_artifacts)
-            
-            # 生成验证报告
-            report_lines = ["auto-generate文献综述验证报告", f"生成时间: {datetime.now().isoformat()}\n", "="*30]
-            report_lines.append(f"【验证摘要】")
-            report_lines.append(f"总引用数: {report.total_citations}")
-            report_lines.append(f"支持: {report.supported_count}")
-            report_lines.append(f"部分支持: {report.partial_support_count}")
-            report_lines.append(f"不支持: {report.unsupported_count}")
-            report_lines.append(f"错误来源: {report.wrong_source_count}")
-            report_lines.append(f"需要审核: {report.needs_review_count}")
-            
-            # 添加summary_recheck结果
-            if recheck_reports:
-                report_lines.append("\n【摘要检查结果】")
-                report_lines.append(f"检查论文数: {len(recheck_reports)}")
-                total_candidates = sum(len(report.correction_candidates) for report in recheck_reports)
-                report_lines.append(f"修正建议数: {total_candidates}")
-                
-                for i, recheck_report in enumerate(recheck_reports, 1):
-                    if recheck_report.correction_candidates:
-                        report_lines.append(f"\n{i}. 论文: {recheck_report.paper_key}")
-                        for j, candidate in enumerate(recheck_report.correction_candidates, 1):
-                            report_lines.append(f"   {j}. 字段: {candidate.field_path}")
-                            report_lines.append(f"      原因: {candidate.reason}")
-            
-            if report.citation_results:
-                report_lines.append("\n【详细结果】")
-                for i, result in enumerate(report.citation_results, 1):
-                    report_lines.append(f"\n{i}. 引用ID: {result.citation_id}")
-                    report_lines.append(f"   论文ID: {result.paper_id}")
-                    report_lines.append(f"   结论: {result.conclusion.value}")
-                    report_lines.append(f"   根本原因: {[rc.value for rc in result.root_causes]}")
-                    report_lines.append(f"   证据候选数: {len(result.evidence_candidates)}")
-            
-            # 保存报告到当前 job workspace 的 reports/ 目录
-            try:
-                from services.job_workspace import JobWorkspace
-                from services.artifact_registry import ArtifactRegistry
-                
-                # 优先使用已存在的 job_workspace
-                if hasattr(generator_instance, 'job_workspace') and generator_instance.job_workspace:
-                    workspace = generator_instance.job_workspace
-                    project_name = workspace.project_name
-                else:
-                    # 回退到使用 project_name
-                    project_name = generator_instance.project_name or "unknown_project"
-                    job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
-                    workspace = JobWorkspace(generator_instance.output_dir, project_name, job_id)
-                
-                # 报告写入当前 workspace 的 reports/ 目录
-                report_file: str = os.path.join(workspace.paths.reports_dir, f'{project_name}_validation_report.txt')
-                # 确保目录存在
-                os.makedirs(os.path.dirname(report_file), exist_ok=True)
-                generator_instance.logger.info(f"验证报告将保存到: {report_file}")
-            except Exception as e:
-                generator_instance.logger.warning(f"创建 workspace 目录失败: {e}，回退到旧路径")
-                report_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_validation_report.txt')
-            
-            with open(report_file, 'w', encoding='utf-8') as f:
-                f.write('\n'.join(report_lines))
-            
-            generator_instance.logger.info(f"验证报告已保存到: {report_file}")
-            generator_instance.logger.success("Week 3验证流程完成！")
-            return {"success": True, "report": report, "review_draft": review_draft, "citation_manifest": citation_manifest, "paper_artifacts": paper_artifacts}
-            
-        except Exception as e:
-            generator_instance.logger.warning(f"Week 3验证流程失败，回退到传统验证: {e}")
-            # 继续执行传统验证流程（docx-based）
-            pass
+            revalidated = validator.validate()
+            final_report = _build_report_from_results([_run_ai_bundle_validation(generator_instance, result) for result in revalidated.citation_results])
 
-        # 传统验证流程（回退）
-        if not DOCX_AVAILABLE:
-            generator_instance.logger.error("python-docx模块未安装，无法进行第二阶段验证。请运行: pip install python-docx")  # type: ignore
-            return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+        manual_review_items = [
+            result
+            for result in final_report.citation_results
+            if result.low_confidence or result.conclusion.value == "NEEDS_REVIEW" or str(result.details.get("repair_scope") or "").lower() == "manual_review"
+        ]
+        report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items)
+        generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
+        generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
 
-        word_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_literature_review.docx')  # type: ignore
-        if not os.path.exists(word_file):
-            generator_instance.logger.error(f"找不到文献综述文件: {word_file}。请先生成综述。")  # type: ignore
-            return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
-            
-        validator_api_config: Dict[str, str] = {
-            'api_key': (generator_instance.config.get('Validator_API') or {}).get('api_key', ''),  # type: ignore
-            'model': (generator_instance.config.get('Validator_API') or {}).get('model', ''),  # type: ignore
-            'api_base': (generator_instance.config.get('Validator_API') or {}).get('api_base', 'https://api.openai.com/v1')  # type: ignore
+        return {
+            "success": True,
+            "report": final_report,
+            "review_draft": review_draft,
+            "citation_manifest": citation_manifest,
+            "paper_artifacts": paper_artifacts,
+            "manual_review_items": manual_review_items,
+            **report_paths,
         }
-        api_config_valid: bool = bool(validator_api_config['api_key'] and validator_api_config['model'])  # type: ignore
 
-        doc = Document(word_file)  # type: ignore
-        
-        # --- 1. 建立文献库索引和引用索引 ---
-        generator_instance.logger.info("步骤1/3: 正在索引文献库和综述中的所有引用...")
-        valid_citation_map: Dict[str, Dict[str, Any]] = {} # {'(Author, YYYY)': summary}
-        citation_to_key: Dict[str, str] = {}    # {'(Author et al., YYYY)': '(Author, YYYY)'}
-        for i, summary in enumerate(generator_instance.summaries):  # type: ignore
-            info: Dict[str, Any] = summary.get('paper_info', {})
-            authors: List[str] = info.get('authors', [])
-            year: str = str(info.get('year', 'N/A'))
-            if authors and year != 'N/A':
-                # 创建标准引用格式 (Author, YYYY)
-                if len(authors) == 1:
-                    standard_citation: str = f"({authors[0]}, {year})"
-                elif len(authors) <= 3:
-                    standard_citation: str = f"({', '.join(authors[:-1])} & {authors[-1]}, {year})"
-                else:
-                    standard_citation: str = f"({authors[0]} et al., {year})"
-                
-                valid_citation_map[standard_citation] = summary
-                
-                # 创建多种引用格式的映射，支持中文和英文格式变体
-                # 首先定义标准化函数（局部使用）
-                def normalize_citation_for_mapping(citation: str) -> str:
-                    """标准化引用字符串用于映射键，与normalize_citation保持相同逻辑"""
-                    if not citation:
-                        return citation
-                    
-                    # 1. 移除多余空格，将多个空格合并为一个
-                    citation = re.sub(r'\s+', ' ', citation).strip()
-                    
-                    # 2. 统一标点：中文标点替换为英文标点
-                    citation = citation.replace('；', ';').replace('，', ',').replace('、', ',')
-                    
-                    # 3. 移除常见的中文前缀
-                    citation = re.sub(r'\(支持文献[:：]\s*', '(', citation)
-                    citation = re.sub(r'\(参见[:：]\s*', '(', citation)
-                    citation = re.sub(r'\(来源[:：]\s*', '(', citation)
-                    citation = re.sub(r'\(引用自[:：]\s*', '(', citation)
-                    
-                    # 4. 统一"和"与"&" - 使用与normalize_citation相同的安全替换
-                    citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)\s+和\s+([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
-                    citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)和([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
-                    
-                    # 5. 统一"等"与"et al." - 与normalize_citation保持一致
-                    citation = re.sub(r'等\s*,', ' et al.,', citation)
-                    citation = re.sub(r'等\s*;', ' et al.;', citation)
-                    citation = re.sub(r'等\s*\)', ' et al.)', citation)
-                    citation = re.sub(r'\s等\s*,', ' et al.,', citation)
-                    citation = re.sub(r'等\s+', ' et al. ', citation)
-                    
-                    # 6. 确保年份前有空格，同时处理年份后的空格
-                    citation = re.sub(r',(\d{4})', r', \1', citation)
-                    citation = re.sub(r',\s+(\d{4})', r', \1', citation)  # 多个空格变体
-                    citation = re.sub(r',\s*(\d{4})\s*\)', r', \1)', citation)  # 年份后空格
-                    
-                    # 7. 规范化作者分隔符和空格
-                    citation = re.sub(r'\(\s*', '(', citation)
-                    citation = re.sub(r'\s*\)', ')', citation)
-                    citation = re.sub(r'\s*,\s*', ', ', citation)
-                    citation = re.sub(r'\s*&\s*', ' & ', citation)
-                    
-                    # 7.5 处理逗号+&格式（如"作者1, & 作者2"）
-                    citation = re.sub(r',\s*&', ' &', citation)
-                    
-                    # 8. 清理可能产生的双逗号和多余空格
-                    citation = re.sub(r',\s*,', ', ', citation)
-                    citation = re.sub(r'et al\.\s*,', 'et al.,', citation)
-                    citation = re.sub(r'\s+', ' ', citation)
-                    
-                    # 8.5 最终空格规范化
-                    citation = citation.replace('( ', '(').replace(' )', ')')
-                    citation = re.sub(r'\s+', ' ', citation)  # 最终空格合并
-                    
-                    return citation
-                
-                # 生成所有可能的引用格式变体
-                citation_variants: List[str] = []
-                
-                if len(authors) == 1:
-                    # 单作者变体（包括AI可能错误生成的'等'格式）
-                    base_formats: List[str] = [
-                        # 标准格式
-                        f"({authors[0]}, {year})",
-                        f"({authors[0]},  {year})",  # 双空格
-                        f"({authors[0]},{year})",    # 无空格
-                        # 等格式变体
-                        f"({authors[0]} 等, {year})",
-                        f"({authors[0]}等, {year})",
-                        f"({authors[0]}等, {year})",
-                        f"({authors[0]} 等,{year})",
-                        f"({authors[0]}等,{year})",
-                        # et al.格式变体
-                        f"({authors[0]} et al., {year})",
-                        f"({authors[0]}et al., {year})",
-                        f"({authors[0]} et al.,{year})",
-                        f"({authors[0]}et al.,{year})",
-                        # 其他可能变体
-                        f"({authors[0]}, {year})",  # 原始格式重复
-                        f"({authors[0]}, {year})",  # 无空格变体
-                    ]
-                    citation_variants.extend(base_formats)
-                    
-                elif len(authors) == 2:
-                    # 双作者变体
-                    base_formats: List[str] = [
-                        f"({authors[0]} & {authors[1]}, {year})",
-                        f"({authors[0]}&{authors[1]}, {year})",
-                        f"({authors[0]} &{authors[1]}, {year})",
-                        f"({authors[0]}& {authors[1]}, {year})",
-                        f"({authors[0]}, {authors[1]}, {year})",
-                        f"({authors[0]}, {authors[1]}, {year})",  # 带空格变体
-                        f"({authors[0]},{authors[1]}, {year})",   # 无空格变体
-                        f"({authors[0]} 和 {authors[1]}, {year})",
-                        f"({authors[0]}和 {authors[1]}, {year})",
-                        f"({authors[0]}和{authors[1]}, {year})",
-                        f"({authors[0]} 和{authors[1]}, {year})",
-                        f"({authors[0]}、{authors[1]}, {year})",
-                        f"({authors[0]}、{authors[1]}, {year})",  # 中文顿号
-                        f"({authors[0]} 等, {year})",          # 中文等格式
-                        f"({authors[0]}等, {year})",           # 中文等格式（无空格）
-                        f"({authors[0]}等, {year})",           # 中文等格式（紧贴）
-                        f"({authors[0]} et al., {year})",
-                        f"({authors[0]}et al., {year})"
-                    ]
-                    citation_variants.extend(base_formats)
-                    
-                elif len(authors) == 3:
-                    # 三作者变体
-                    base_formats: List[str] = [
-                        # 英文格式变体
-                        f"({authors[0]}, {authors[1]} & {authors[2]}, {year})",
-                        f"({authors[0]},{authors[1]} & {authors[2]}, {year})",
-                        f"({authors[0]}, {authors[1]}&{authors[2]}, {year})",
-                        f"({authors[0]},{authors[1]}&{authors[2]}, {year})",
-                        # 逗号分隔变体
-                        f"({authors[0]}, {authors[1]}, {authors[2]}, {year})",
-                        f"({authors[0]},{authors[1]}, {authors[2]}, {year})",
-                        f"({authors[0]}, {authors[1]},{authors[2]}, {year})",
-                        f"({authors[0]},{authors[1]},{authors[2]}, {year})",
-                        # 逗号+&格式变体（针对类似'王希鹏, 王京龙, & 王仲孝'的格式）
-                        f"({authors[0]}, {authors[1]}, & {authors[2]}, {year})",
-                        f"({authors[0]},{authors[1]},& {authors[2]}, {year})",
-                        f"({authors[0]}, {authors[1]},& {authors[2]}, {year})",
-                        f"({authors[0]},{authors[1]}, &{authors[2]}, {year})",
-                        # 中文格式变体
-                        f"({authors[0]}、{authors[1]}和{authors[2]}, {year})",
-                        f"({authors[0]}、{authors[1]}和 {authors[2]}, {year})",
-                        f"({authors[0]}、{authors[1]} 和{authors[2]}, {year})",
-                        f"({authors[0]}、{authors[1]} 和 {authors[2]}, {year})",
-                        # 等格式变体
-                        f"({authors[0]} et al., {year})",
-                        f"({authors[0]}et al., {year})",
-                        f"({authors[0]} 等, {year})",
-                        f"({authors[0]}等, {year})",
-                        f"({authors[0]}等, {year})"
-                    ]
-                    citation_variants.extend(base_formats)
-                    
-                else:
-                    # 四位及以上作者变体
-                    base_formats: List[str] = [
-                        # et al.格式变体
-                        f"({authors[0]} et al., {year})",
-                        f"({authors[0]}et al., {year})",
-                        f"({authors[0]} et al.,{year})",
-                        f"({authors[0]}et al.,{year})",
-                        # 等格式变体
-                        f"({authors[0]} 等, {year})",
-                        f"({authors[0]}等, {year})",
-                        f"({authors[0]}等, {year})",
-                        f"({authors[0]} 等,{year})",
-                        f"({authors[0]}等,{year})",
-                        # 可能的多作者完整格式（虽然少见但AI可能生成）
-                        f"({authors[0]}, {authors[1]} et al., {year})",
-                        f"({authors[0]}, {authors[1]}, et al., {year})",
-                    ]
-                    citation_variants.extend(base_formats)
-                
-                # 为所有变体创建映射
-                for variant in citation_variants:
-                    # 原始格式映射
-                    citation_to_key[variant] = standard_citation
-                    # 标准化格式映射（处理空格和标点差异）
-                    normalized_variant = normalize_citation_for_mapping(variant)
-                    if normalized_variant != variant:
-                        citation_to_key[normalized_variant] = standard_citation
-                
-                # 额外处理：作者名之间可能有空格变体
-                if len(authors) >= 2:
-                    # 为双作者添加无空格变体
-                    no_space_variant = f"({authors[0]}&{authors[1]}, {year})"
-                    citation_to_key[no_space_variant] = standard_citation
-
-        # 从Word文档中提取所有引用
-        full_text: str = "\n".join([p.text for p in doc.paragraphs])
-        sentences: List[str] = re.split(r'(?<=[.。?？!！])\s+', full_text)
-
-        # 辅助函数：标准化引用字符串
-        def normalize_citation(citation: str) -> str:
-            """标准化引用字符串，统一标点和空格，处理中文格式变体"""
-            if not citation:
-                return citation
-            
-            # 1. 移除多余空格，将多个空格合并为一个
-            citation = re.sub(r'\s+', ' ', citation).strip()
-            
-            # 2. 统一标点：中文标点替换为英文标点
-            citation = citation.replace('；', ';').replace('，', ',').replace('、', ',')
-            
-            # 3. 移除常见的中文前缀（如"支持文献:"、"参见:"、"来源:"等）
-            citation = re.sub(r'\(支持文献[:：]\s*', '(', citation)
-            citation = re.sub(r'\(参见[:：]\s*', '(', citation)
-            citation = re.sub(r'\(来源[:：]\s*', '(', citation)
-            citation = re.sub(r'\(引用自[:：]\s*', '(', citation)
-            
-            # 4. 统一"和"与"&" - 更安全的替换，避免替换作者名中的"和"
-            # 只替换作为连接词的"和"（前面有作者名，后面有作者名或空格）
-            # 先处理带空格的" 和 "，再处理紧邻的"和"
-            citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)\s+和\s+([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
-            citation = re.sub(r'([a-zA-Z\u4e00-\u9fff]+)和([a-zA-Z\u4e00-\u9fff]+)', r'\1 & \2', citation)
-            
-            # 5. 统一"等"与"et al." - 更全面的处理
-            # 处理"等"后面跟逗号的情况，包括中文逗号（已统一为英文逗号）
-            citation = re.sub(r'等\s*,', ' et al.,', citation)
-            # 处理"等"后面跟分号的情况
-            citation = re.sub(r'等\s*;', ' et al.;', citation)
-            # 处理"等"后面跟右括号的情况
-            citation = re.sub(r'等\s*\)', ' et al.)', citation)
-            # 处理"等"前面有空格的情况
-            citation = re.sub(r'\s等\s*,', ' et al.,', citation)
-            # 处理单独的"等"（后面没有标点，理论上不应该出现）
-            citation = re.sub(r'等\s+', ' et al. ', citation)
-            
-            # 6. 确保年份前有空格，同时处理年份后的空格
-            citation = re.sub(r',(\d{4})', r', \1', citation)
-            citation = re.sub(r',\s+(\d{4})', r', \1', citation)  # 多个空格变体
-            citation = re.sub(r',\s*(\d{4})\s*\)', r', \1)', citation)  # 年份后空格
-            
-            # 7. 规范化作者分隔符和空格
-            citation = re.sub(r'\(\s*', '(', citation)
-            citation = re.sub(r'\s*\)', ')', citation)
-            citation = re.sub(r'\s*,\s*', ', ', citation)
-            citation = re.sub(r'\s*&\s*', ' & ', citation)
-            
-            # 7.5 处理逗号+&格式（如"作者1, & 作者2"）
-            citation = re.sub(r',\s*&', ' &', citation)
-            
-            # 8. 清理可能产生的双逗号（如"et al.,,"）和多余空格
-            citation = re.sub(r',\s*,', ', ', citation)
-            citation = re.sub(r'et al\.\s*,', 'et al.,', citation)
-            citation = re.sub(r'\s+', ' ', citation)  # 再次合并多余空格
-            
-            # 8.5 最终空格规范化
-            citation = citation.replace('( ', '(').replace(' )', ')')
-            citation = re.sub(r'\s+', ' ', citation)  # 最终空格合并
-            
-            return citation
-        
-        # 辅助函数：从句子中提取所有引用（正确处理多个引用）
-        def extract_citations_from_sentence(sentence: str) -> List[str]:
-            """从句子中提取所有引用，正确处理多个引用和中文标点"""
-            citations: List[str] = []
-            
-            # 首先，匹配所有可能包含多个引用的模式
-            # 模式：以括号开头，包含逗号和年份，可能由分号分隔多个引用
-            # 例如：(作者1, 年份; 作者2, 年份) 或 (作者1, 年份) 等
-            multi_citation_pattern = r'\([^)]+,\s*\d{4}(?:[;；]\s*[^)]+,\s*\d{4})*\)'
-            multi_matches = re.findall(multi_citation_pattern, sentence)
-            
-            for match in multi_matches:
-                # 移除外层括号
-                inner = match[1:-1].strip()
-                if not inner:
-                    continue
-                    
-                # 按中文或英文分号分割
-                parts = re.split(r'[；;]\s*', inner)
-                for part in parts:
-                    if not part.strip():
-                        continue
-                        
-                    # 确保部分有括号
-                    part_stripped = part.strip()
-                    if not part_stripped.startswith('('):
-                        part_stripped = '(' + part_stripped
-                    if not part_stripped.endswith(')'):
-                        part_stripped = part_stripped + ')'
-                    
-                    # 验证是否为有效的引用格式
-                    if re.match(r'^\([^)]+,\s*\d{4}\)$', part_stripped):
-                        citations.append(part_stripped)
-            
-            # 如果未找到多个引用模式，尝试直接匹配单个引用
-            if not citations:
-                single_matches = re.findall(r'\([^)]+,\s*\d{4}\)', sentence)
-                citations.extend(single_matches)
-            
-            # 去重并返回
-            return list(dict.fromkeys(citations))  # 保持顺序的去重
-
-        all_found_citations: set[str] = set()
-        citation_locations: Dict[str, List[str]] = {}  # {'(Author, YYYY)': [sentence1, sentence2, ...]}
-
-        for sentence in sentences:
-            citations_in_sentence: List[str] = extract_citations_from_sentence(sentence)
-            for citation in citations_in_sentence:
-                # 标准化引用
-                normalized_citation = normalize_citation(citation)
-                
-                # 尝试查找映射：先尝试原始引用，再尝试标准化后的引用
-                mapped_key: str = citation_to_key.get(citation, citation)
-                if mapped_key == citation:  # 原始引用未找到映射
-                    mapped_key = citation_to_key.get(normalized_citation, citation)
-                
-                all_found_citations.add(citation)
-                if mapped_key not in citation_locations:
-                    citation_locations[mapped_key] = []
-                citation_locations[mapped_key].append(sentence.strip())
-
-        # --- 2. 幻觉引用检查 ---
-        phantom_citations: List[str] = sorted(list(all_found_citations - set(citation_to_key.keys()) - set(valid_citation_map.keys())))
-        report_lines: List[str] = ["auto-generate文献综述验证报告", f"生成时间: {datetime.now().isoformat()}\n", "="*30]
-        if phantom_citations:
-            generator_instance.logger.error(f"发现 {len(phantom_citations)} 处可能的幻觉引用！")
-            report_lines.append("【幻觉引用检查 - 失败】\n以下引用未在您的文献库中找到：\n" + "\n".join(phantom_citations))
-        else:
-            generator_instance.logger.success("引用来源检查通过，未发现幻觉引用。")
-            report_lines.append("【幻觉引用检查 - 通过】\n所有引用均来自提供的文献库。")
-
-        # --- 3. 批量观点-引用匹配检查 ---
-        generator_instance.logger.info("步骤2/3: 正在批量进行观点-引用匹配检查...")
-        mismatch_reports: List[Dict[str, str]] = []
-        if not api_config_valid:
-            generator_instance.logger.error("Validator_API的api_key或model未在配置中找到。跳过观点匹配检查。")
-        else:
-            papers_to_validate: Dict[str, List[str]] = {key: sentences for key, sentences in citation_locations.items() if sentences and key in valid_citation_map}
-            
-            iterator = papers_to_validate.items()
-            if TQDM_AVAILABLE:
-                iterator = tqdm(iterator, desc="[验证] 逐篇文献批量核对")
-
-            for paper_key, sentences_for_validation in iterator:
-                source_summary: Dict[str, Any] = valid_citation_map[paper_key]
-                title: str = source_summary.get('paper_info', {}).get('title', 'N/A')
-                if TQDM_AVAILABLE:
-                    iterator.set_postfix_str(f"核对: {title[:30]}...")  # type: ignore
-                else:
-                    generator_instance.logger.info(f"正在核对: {title[:30]}...")
-                
-                # 去重句子列表，减少不必要的API调用
-                unique_sentences: List[str] = sorted(list(set(sentences_for_validation)))
-
-                validation_result: Optional[Dict[str, Any]] = _validate_claims_for_single_paper(source_summary, unique_sentences, validator_api_config, generator_instance.config)  # type: ignore
-                
-                if validation_result:
-                    for claim in validation_result.get('claims', []):
-                        sentence: str = claim.get('sentence', '')
-                        status: str = claim.get('status', 'UNKNOWN')
-                        reason: str = claim.get('reason', '')
-                        suggestion: str = claim.get('suggestion', '')
-                        
-                        if status in ['UNSUPPORTED', 'PARTIAL_SUPPORT']:
-                            mismatch_reports.append({
-                                'citation': paper_key,
-                                'title': title,
-                                'sentence': sentence,
-                                'status': status,
-                                'reason': reason,
-                                'suggestion': suggestion
-                            })
-
-        # --- 4. 生成结构化报告 ---
-        generator_instance.logger.info("步骤3/3: 正在生成验证报告...")
-        if mismatch_reports:
-            generator_instance.logger.error(f"发现 {len(mismatch_reports)} 处观点-引用不匹配！")
-            report_lines.append("\n【观点-引用匹配检查 - 失败】\n以下论点可能未得到文献充分支持：\n")
-            
-            for i, report in enumerate(mismatch_reports, 1):
-                report_lines.append(f"\n{i}. 引用: {report['citation']}")
-                report_lines.append(f"   论文: {report['title']}")
-                report_lines.append(f"   状态: {report['status']}")
-                report_lines.append(f"   原句: {report['sentence']}")
-                report_lines.append(f"   理由: {report['reason']}")
-                if report['suggestion']:
-                    report_lines.append(f"   建议: {report['suggestion']}")
-        else:
-            if api_config_valid:
-                generator_instance.logger.success("观点-引用匹配检查通过，所有论点均得到文献支持。")
-                report_lines.append("\n【观点-引用匹配检查 - 通过】\n所有论点均得到文献支持。")
-            else:
-                report_lines.append("\n【观点-引用匹配检查 - 跳过】\n由于API配置问题，跳过此项检查。")
-
-        # 保存报告
-        report_file: str = os.path.join(generator_instance.output_dir, f'{generator_instance.project_name}_validation_report.txt')
-        with open(report_file, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(report_lines))
-        
-        generator_instance.logger.info(f"验证报告已保存到: {report_file}")
-        return {"success": True, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
-        
     except (configparser.NoSectionError, configparser.NoOptionError):
-        generator_instance.logger.error("无法找到[Validator_API]或[Performance]中的验证配置，跳过验证。")
+        generator_instance.logger.error("Validation configuration is incomplete.")
         return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
-    except Exception as e:
-        generator_instance.logger.error(f"验证综述时发生未知异常: {e}")
+    except Exception as exc:
+        generator_instance.logger.error(f"Review validation failed: {exc}")
         traceback.print_exc()
         return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
-
 
 def run_week3_review_validation(
     review_draft: Dict[str, Any],
