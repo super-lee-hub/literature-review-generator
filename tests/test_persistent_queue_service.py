@@ -1,13 +1,10 @@
-import json
 from pathlib import Path
-
-import pytest
 
 from services.queue_service import (
     QueueJobSpec,
-    QueueJobRuntime,
     QueueState,
     PersistentQueueService,
+    QueueRunner,
     create_queue_job_id,
 )
 
@@ -187,3 +184,57 @@ def test_remove_job(tmp_path: Path) -> None:
     result = service.remove_job(job_id)
     assert result is True
     assert service.get_job(job_id) is None
+
+
+def test_queue_runner_reconstructs_summary_source_and_reuse_fields(tmp_path: Path) -> None:
+    queue_file = tmp_path / "test_queue.json"
+    service = PersistentQueueService(queue_file)
+
+    captured = {}
+
+    class _Runner:
+        def run(self, request, cancel_token=None):
+            captured["request"] = request
+            return type(
+                "_Result",
+                (),
+                {
+                    "success": True,
+                    "exit_code": 0,
+                    "message": "ok",
+                    "workspace_path": str(tmp_path / "workspace"),
+                    "job_id": "job123",
+                    "resume_state": "fresh",
+                    "produced_artifacts": [],
+                    "log_path": "",
+                    "report_paths": [],
+                    "failure_summary": None,
+                },
+            )()
+
+    job_id = create_queue_job_id()
+    service.add_job(
+        QueueJobSpec(
+            job_id=job_id,
+            job_type="generate_outline",
+            project_name="demo",
+            parameters={
+                "config": "config.ini",
+                "project_name": "demo",
+                "pdf_folder": "D:/papers",
+                "action": "generate_outline",
+                "generate_outline": True,
+                "summary_file": "D:/subset.json",
+                "summary_sources": ["D:/subset-b.json"],
+                "reuse_stage1": True,
+                "reuse_summary_files": ["D:/reuse-a.json"],
+            },
+        )
+    )
+
+    queue_runner = QueueRunner(service, _Runner())
+    assert queue_runner.run_single_job(job_id) is True
+    assert captured["request"].summary_file == "D:/subset.json"
+    assert captured["request"].summary_sources == ("D:/subset.json", "D:/subset-b.json")
+    assert captured["request"].reuse_stage1 is True
+    assert captured["request"].reuse_summary_files == ("D:/reuse-a.json",)

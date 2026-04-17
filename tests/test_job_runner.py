@@ -2,7 +2,7 @@ import json
 import threading
 
 import main
-from services.job_runner import JobRunRequest, JobRunResult, JobRunner
+from services.job_runner import JobRunRequest, JobRunResult, JobRunner, build_job_request_from_mapping
 from services.queue_service import CancelToken
 
 
@@ -209,3 +209,24 @@ def test_job_runner_marks_failed_handler_in_result_pointer_and_resume_report(tmp
     assert pointer_payload["status"] == "failed"
     assert resume_report["state"] != "strong_resumable"
     assert not any(item["artifact_type"] == "summary_file" for item in registry_payload["artifacts"])
+
+
+def test_build_job_request_from_mapping_supports_summary_source_and_reuse_fields() -> None:
+    request = build_job_request_from_mapping(
+        {
+            "config": "config.ini",
+            "project_name": "demo",
+            "pdf_folder": "D:/papers",
+            "generate_outline": True,
+            "summary_file": "D:/subset.json",
+            "summary_sources": ["D:/subset-b.json"],
+            "reuse_stage1": True,
+            "reuse_summary_files": ["D:/reuse-a.json", "D:/reuse-b.json"],
+        }
+    )
+
+    assert request.action == "generate_outline"
+    assert request.summary_file == "D:/subset.json"
+    assert request.summary_sources == ("D:/subset.json", "D:/subset-b.json")
+    assert request.reuse_stage1 is True
+    assert request.reuse_summary_files == ("D:/reuse-a.json", "D:/reuse-b.json")

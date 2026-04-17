@@ -30,7 +30,6 @@ from services.environment_service import (
     recommended_conda_activate_command,
     recommended_conda_create_command,
 )
-from services.workflow_facade import build_args, run_dispatch
 from services.progress_service import ProgressTracker
 from services.queue_service import PersistentQueueService, QueueState
 from gui.i18n import LANGUAGE_OPTIONS, action_label, translate
@@ -742,6 +741,10 @@ class WorkspaceController:
             "workflow": {
                 "project_name": "",
                 "pdf_folder": "",
+                "summary_file": "",
+                "summary_sources": "",
+                "reuse_stage1": False,
+                "reuse_summary_files": "",
                 "concept": "",
                 "free_mode_idea": "",
                 "section_number": "1",
@@ -771,7 +774,7 @@ class WorkspaceController:
             output_path = Path(self.state["paths"]["output_path"])
             queue_file_path = output_path / "_queue" / "queue.json"
             self._queue_service = PersistentQueueService(queue_file_path)
-        except Exception as e:
+        except Exception:
             self._queue_service = None
 
     def refresh_queue(self) -> None:
@@ -873,6 +876,16 @@ class WorkspaceController:
             if section_number_raw.isdigit() and int(section_number_raw) > 0:
                 generate_section = int(section_number_raw)
 
+        reuse_summary_files = [
+            item.strip()
+            for item in str(workflow_state.get("reuse_summary_files") or "").splitlines()
+            if item.strip()
+        ]
+        summary_sources = [
+            item.strip()
+            for item in str(workflow_state.get("summary_sources") or "").splitlines()
+            if item.strip()
+        ]
         parameters = {
             "action": action,
             "project_name": project_name,
@@ -893,6 +906,10 @@ class WorkspaceController:
             "concept": str(workflow_state.get("concept") or "").strip() or None,
             "free_mode_profile": free_mode_profile,
             "free_mode_idea": free_mode_idea,
+            "summary_file": str(workflow_state.get("summary_file") or "").strip() or None,
+            "summary_sources": summary_sources,
+            "reuse_stage1": bool(workflow_state.get("reuse_stage1")),
+            "reuse_summary_files": reuse_summary_files,
             "queue_file": str(Path(self.state["paths"]["output_path"]) / "_queue" / "queue.json"),
         }
 
@@ -923,10 +940,10 @@ class WorkspaceController:
             spec = self._build_queue_job_spec(project_name, pdf_folder, zotero_report, action)
             job_id = self._queue_service.add_job(spec)
             self.refresh_queue()
-            self.notify(f"Added job to queue: {job_id}", color="positive")
+            self.notify(self.tf("Added job to queue: {job_id}", job_id=job_id), color="positive")
             return job_id
         except Exception as e:
-            self.notify(f"Failed to add job to queue: {e}", color="negative", multi_line=True)
+            self.notify(self.tf("Failed to add job to queue: {error}", error=str(e)), color="negative", multi_line=True)
             return None
 
     def add_queue_builder_item(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> None:
@@ -937,28 +954,28 @@ class WorkspaceController:
             "action": str(action or "analyze").strip() or "analyze",
         }
         if not item["project_name"]:
-            self.notify("Please enter a project name first.", color="warning")
+            self.notify(self.t("Please enter a project name first."), color="warning")
             return
         if not item["pdf_folder"] and not item["zotero_report"]:
-            self.notify("Please provide either a PDF folder or a Zotero report.", color="warning")
+            self.notify(self.t("Please provide either a PDF folder or a Zotero report."), color="warning")
             return
         self.state["queue_builder"]["items"].append(item)
-        self.notify(f"Added {item['project_name']} to the queue draft.", color="positive")
+        self.notify(self.tf("Added {project_name} to the queue draft.", project_name=item['project_name']), color="positive")
 
     def remove_queue_builder_item(self, index: int) -> None:
         items = self.state["queue_builder"]["items"]
         if 0 <= index < len(items):
             removed = items.pop(index)
-            self.notify(f"Removed {removed.get('project_name', '')} from the queue draft.", color="positive")
+            self.notify(self.tf("Removed {project_name} from the queue draft.", project_name=removed.get('project_name', '')), color="positive")
 
     def clear_queue_builder(self) -> None:
         self.state["queue_builder"]["items"].clear()
-        self.notify("Cleared queue draft.", color="positive")
+        self.notify(self.t("Cleared queue draft."), color="positive")
 
     def commit_queue_builder(self) -> None:
         items = list(self.state["queue_builder"]["items"])
         if not items:
-            self.notify("Queue draft is empty.", color="warning")
+            self.notify(self.t("Queue draft is empty."), color="warning")
             return
         created_ids = []
         for item in items:
@@ -972,7 +989,7 @@ class WorkspaceController:
                 created_ids.append(job_id)
         if created_ids:
             self.state["queue_builder"]["items"].clear()
-            self.notify(f"Committed {len(created_ids)} drafted job(s) to the queue.", color="positive")
+            self.notify(self.tf("Committed {count} drafted job(s) to the queue.", count=len(created_ids)), color="positive")
 
     def remove_job(self, job_id: str) -> None:
         """删除指定任务"""
@@ -1844,33 +1861,66 @@ def _render_progress_card(controller: WorkspaceController) -> None:
 
 
 def _render_workflow_input_card(controller: WorkspaceController) -> None:
-    t = controller.t
     with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
-        ui.label(t("任务输入")).classes("ag-section-title")
-        ui.label(t("先确定这次任务从 PDF 文件夹还是 Zotero 报告开始，再补充项目名。")).classes("ag-subtle")
+        ui.label(controller.t("Task input")).classes("ag-section-title")
+        ui.label(
+            controller.t(
+                "Choose the PDF folder or Zotero report first, then fill in the project name. Stage-1 reuse now scans historical outputs automatically, and manual summary paths are only needed for advanced cases."
+            )
+        ).classes("ag-subtle")
         with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-            ui.input(t("项目名"), value=controller.state["workflow"]["project_name"]).bind_value(controller.state["workflow"], "project_name")
+            ui.input(controller.t("Project name"), value=controller.state["workflow"]["project_name"]).bind_value(controller.state["workflow"], "project_name")
             _render_path_field(
                 controller,
-                label="PDF 文件夹",
+                label=controller.t("PDF folder"),
                 section="workflow",
                 key="pdf_folder",
                 pick="directory",
-                title="选择 PDF 文件夹",
+                title=controller.t("Select PDF folder"),
             )
             _render_path_field(
                 controller,
-                label="Zotero 报告路径",
+                label=controller.t("Zotero report"),
                 section="paths",
                 key="zotero_report",
                 pick="file",
-                title="选择 Zotero 报告文件",
+                title=controller.t("Select Zotero report file"),
                 filetypes=[("Report Files", "*.html *.htm *.txt *.md *.csv *.json"), ("All Files", "*.*")],
             )
+            with ui.column().classes("gap-2"):
+                ui.checkbox(
+                    controller.t("Auto reuse historical stage-1 summaries"),
+                    value=controller.state["workflow"]["reuse_stage1"],
+                ).bind_value(controller.state["workflow"], "reuse_stage1")
+                ui.label(
+                    controller.t(
+                        "When enabled, stage 1 scans all historical project outputs plus compatible legacy summaries under the configured output path, then only analyzes the papers that are still missing."
+                    )
+                ).classes("ag-subtle")
+        with ui.expansion(controller.t("Advanced summary source options"), icon="tune").classes("w-full q-mt-md"):
+            with ui.column().classes("gap-3 q-pa-sm"):
+                _render_path_field(
+                    controller,
+                    label=controller.t("Summary file"),
+                    section="workflow",
+                    key="summary_file",
+                    pick="file",
+                    title=controller.t("Select summaries.json file"),
+                    filetypes=[("Summary Files", "*.json"), ("All Files", "*.*")],
+                )
+                ui.textarea(
+                    controller.t("Additional downstream summary sources (one path per line)"),
+                    value=controller.state["workflow"]["summary_sources"],
+                ).bind_value(controller.state["workflow"], "summary_sources").props("outlined autogrow").classes("w-full")
+                ui.textarea(
+                    controller.t("Additional stage-1 reuse summary files outside output_path (one path per line)"),
+                    value=controller.state["workflow"]["reuse_summary_files"],
+                ).bind_value(controller.state["workflow"], "reuse_summary_files").props("outlined autogrow").classes("w-full")
         with ui.row().classes("gap-2 q-mt-sm flex-wrap"):
-            ui.button(t("打开 PDF 文件夹"), on_click=lambda: _open_path(controller.state["workflow"]["pdf_folder"], controller.language)).props("outline")
-            ui.button(t("打开 Zotero 报告"), on_click=lambda: _open_path(controller.state["paths"]["zotero_report"], controller.language)).props("outline")
-            ui.button(t("前往 Setup"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
+            ui.button(controller.t("Open PDF folder"), on_click=lambda: _open_path(controller.state["workflow"]["pdf_folder"], controller.language)).props("outline")
+            ui.button(controller.t("Open Zotero report"), on_click=lambda: _open_path(controller.state["paths"]["zotero_report"], controller.language)).props("outline")
+            ui.button(controller.t("Open summary file"), on_click=lambda: _open_path(controller.state["workflow"]["summary_file"], controller.language)).props("outline")
+            ui.button(controller.t("Open Setup"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
 
 
 def _render_workflow_concept_card(controller: WorkspaceController) -> None:
@@ -1900,7 +1950,7 @@ def _render_free_mode_planner_card(controller: WorkspaceController) -> None:
                 label=t("当前 profile 草案"),
                 value="",
             ).props("outlined readonly autogrow").classes("w-full")
-        planner_input = ui.textarea(
+        ui.textarea(
             label=t("继续告诉规划助手"),
             value=controller.free_mode_chat_input,
             placeholder=t("例如：文件夹里主要有概念 A 和 B，我想写 A 如何推导到 B，重点比较理论解释、变量链路和 research gap。"),
@@ -2309,7 +2359,6 @@ def launch_gui(
 
     @ui.page("/workflow")
     def workflow_page() -> None:
-        t = controller.t
         with _page_shell(
             controller,
             "核心工作台",

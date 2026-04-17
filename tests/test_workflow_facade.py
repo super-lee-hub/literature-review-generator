@@ -6,6 +6,10 @@ def test_build_args_supports_free_mode_and_gui_flags() -> None:
         config='config.ini',
         project_name='demo',
         pdf_folder='D:/papers',
+        summary_file='D:/subset.json',
+        summary_sources=['D:/subset.json', 'D:/subset-b.json'],
+        reuse_stage1=True,
+        reuse_summary_files=['D:/reuse-a.json', 'D:/reuse-b.json'],
         run_all=True,
         free_mode_profile='profile.json',
         free_mode_idea='I want to compare concept A and B.',
@@ -15,6 +19,10 @@ def test_build_args_supports_free_mode_and_gui_flags() -> None:
     assert args.config == 'config.ini'
     assert args.project_name == 'demo'
     assert args.pdf_folder == 'D:/papers'
+    assert args.summary_file == 'D:/subset.json'
+    assert args.summary_sources == ['D:/subset.json', 'D:/subset-b.json']
+    assert args.reuse_stage1 is True
+    assert args.reuse_summary_files == ['D:/reuse-a.json', 'D:/reuse-b.json']
     assert args.run_all is True
     assert args.gui is True
     assert args.free_mode_profile == 'profile.json'
@@ -42,6 +50,10 @@ def test_build_job_request_maps_legacy_args_to_shared_request() -> None:
         config='config.ini',
         project_name='demo',
         pdf_folder='D:/papers',
+        summary_file='D:/subset.json',
+        summary_sources=['D:/subset-b.json'],
+        reuse_stage1=True,
+        reuse_summary_files=['D:/reuse-a.json'],
         generate_review=True,
         free_mode_profile='profile.json',
         free_mode_idea='Focus on mechanism differences.',
@@ -54,6 +66,10 @@ def test_build_job_request_maps_legacy_args_to_shared_request() -> None:
     assert request.config == 'config.ini'
     assert request.project_name == 'demo'
     assert request.pdf_folder == 'D:/papers'
+    assert request.summary_file == 'D:/subset.json'
+    assert request.summary_sources == ('D:/subset.json', 'D:/subset-b.json')
+    assert request.reuse_stage1 is True
+    assert request.reuse_summary_files == ('D:/reuse-a.json',)
     assert request.action == 'generate_review'
     assert request.generate_review is True
     assert request.free_mode_profile == 'profile.json'

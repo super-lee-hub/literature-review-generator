@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Mapping, cast
 
 from models import PaperInfo
+from services.paper_identity import build_paper_key, normalize_doi
 
 
 def _safe_text(value: Any) -> str:
@@ -13,13 +14,7 @@ def _safe_text(value: Any) -> str:
 
 
 def _paper_key_from_metadata(paper: Mapping[str, Any]) -> str:
-    doi = _safe_text(paper.get("doi"))
-    if doi:
-        return doi.lower()
-    title = _safe_text(paper.get("title")).lower()
-    authors = [_safe_text(item).lower() for item in (paper.get("authors") or []) if _safe_text(item)]
-    author_key = "_".join(authors[:3]) if authors else "unknown_author"
-    return f"{title}_{author_key}" if title else author_key
+    return build_paper_key(paper)
 
 
 def fingerprint_pdf_file(pdf_path: str | None) -> str:
@@ -58,11 +53,11 @@ def normalize_source_papers(source_mode: str, papers: Iterable[Mapping[str, Any]
         canonical_key = _paper_key_from_metadata(paper)
         aliases = [canonical_key]
         title = _safe_text(paper.get("title"))
-        doi = _safe_text(paper.get("doi"))
+        doi = normalize_doi(paper.get("doi"))
         if title:
             aliases.append(title.lower())
         if doi:
-            aliases.append(doi.lower())
+            aliases.append(doi)
 
         if source_mode == "zotero":
             source_paper_id = doi or title or f"zotero-{index + 1}"

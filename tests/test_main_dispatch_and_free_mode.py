@@ -26,6 +26,9 @@ def _make_args(**overrides):
         "retry_failed": False,
         "retry_review_failed": False,
         "merge": None,
+        "summary_file": None,
+        "reuse_stage1": False,
+        "reuse_summary_files": None,
         "free_mode_profile": None,
         "free_mode_idea": None,
     }
@@ -626,6 +629,26 @@ def test_dispatch_command_injects_progress_tracker(monkeypatch) -> None:
 
     assert captured["handled"] is True
     assert captured["tracker"] is tracker
+
+
+def test_dispatch_command_rejects_summary_file_for_stage1_actions(monkeypatch) -> None:
+    monkeypatch.setattr(main, "detect_runtime_environment", lambda: SimpleNamespace(display_name="test", needs_isolation_recommendation=False))
+    monkeypatch.setattr(
+        "services.workflow_facade.build_job_request",
+        lambda _args: SimpleNamespace(
+            action="analyze",
+            summary_file="D:/subset.json",
+            reuse_stage1=False,
+            reuse_summary_files=(),
+        ),
+    )
+
+    try:
+        main.dispatch_command(_make_args(analyze_only=True, summary_file="D:/subset.json"))
+    except SystemExit as exc:
+        assert int(exc.code or 0) == 1
+    else:  # pragma: no cover
+        raise AssertionError("dispatch_command should reject --summary-file for stage1 actions")
 
 
 def test_generator_validation_helpers_read_via_compat_layer(tmp_path) -> None:

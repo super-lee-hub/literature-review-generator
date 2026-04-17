@@ -94,7 +94,6 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "API Key 还没有填写。": "API Key has not been filled in yet.",
         "当前配置格式看起来正确，可以点击“测试连接”。":
             "The current configuration format looks valid. You can click Test Connection next.",
-        "总览": "Overview",
         "这个入口页负责给第一次使用的人建立清晰路径。真正的核心操作已经单独放到“核心工作台”，不再堆在页面最底部。":
             "This page gives first-time users a clear path. The real work area now lives in its own Workspace page instead of being buried at the bottom.",
         "本地网页工作台": "Local Web Workspace",
@@ -470,9 +469,43 @@ TRANSLATIONS["en"].update(
 )
 
 
+EN_TO_ZH = {
+    "Task input": "????",
+    "Choose the PDF folder or Zotero report first, then fill in the project name and any reuse settings.": "???????? PDF ????? Zotero ?????????????????",
+    "Choose the PDF folder or Zotero report first, then fill in the project name. Stage-1 reuse now scans historical outputs automatically, and manual summary paths are only needed for advanced cases.": "先选择 PDF 文件夹或 Zotero 报告，再填写项目名。第一阶段复用现在会自动扫描历史输出；手动填写 summary 路径只用于高级场景。",
+    "Project name": "???",
+    "PDF folder": "PDF ???",
+    "Select PDF folder": "?? PDF ???",
+    "Zotero report": "Zotero ??",
+    "Select Zotero report file": "?? Zotero ????",
+    "Summary file": "Summary ??",
+    "Select summaries.json file": "?? summaries.json ??",
+    "Enable DOI-only stage-1 reuse": "?????? DOI ????",
+    "Auto reuse historical stage-1 summaries": "自动复用历史第一阶段摘要",
+    "When enabled, stage 1 scans all historical project outputs plus compatible legacy summaries under the configured output path, then only analyzes the papers that are still missing.": "启用后，第一阶段会自动扫描 output_path 下的所有历史项目结果和兼容旧版摘要，只分析当前仍然缺失的论文。",
+    "Advanced summary source options": "高级摘要来源选项",
+    "Additional downstream summary sources (one path per line)": "额外的下游 summary 来源（每行一个路径）",
+    "Additional reuse summary files (one path per line)": "????? summary ??????????",
+    "Additional stage-1 reuse summary files outside output_path (one path per line)": "位于 output_path 之外的第一阶段复用 summary 文件（每行一个路径）",
+    "Open PDF folder": "?? PDF ???",
+    "Open Zotero report": "?? Zotero ??",
+    "Open summary file": "?? Summary ??",
+    "Open Setup": "?? Setup",
+    "Please enter a project name first.": "????????",
+    "Please provide either a PDF folder or a Zotero report.": "??????? PDF ???? Zotero ???",
+    "Added {project_name} to the queue draft.": "?? {project_name} ???????",
+    "Removed {project_name} from the queue draft.": "???????? {project_name}?",
+    "Cleared queue draft.": "????????",
+    "Queue draft is empty.": "???????",
+    "Committed {count} drafted job(s) to the queue.": "?? {count} ??????????",
+    "Added job to queue: {job_id}": "?????????{job_id}",
+    "Failed to add job to queue: {error}": "???????{error}",
+}
+
+
 def translate(language: str, key: str) -> str:
     if language == "zh-CN":
-        return key
+        return EN_TO_ZH.get(key, key)
     return TRANSLATIONS.get(language, {}).get(key, key)
 
 
