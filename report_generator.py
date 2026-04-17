@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Sequence, Tuple, cast
 
@@ -99,6 +100,33 @@ def _stringify_list(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+_ILLEGAL_EXCEL_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]")
+
+
+def _sanitize_excel_string(value: str) -> str:
+    """Remove characters that Excel/openpyxl cannot serialize into worksheets."""
+
+    cleaned = _ILLEGAL_EXCEL_CONTROL_CHARS_RE.sub("", value)
+    if not cleaned:
+        return cleaned
+
+    filtered_chars: List[str] = []
+    for char in cleaned:
+        codepoint = ord(char)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            continue
+        if codepoint in {0xFFFE, 0xFFFF}:
+            continue
+        filtered_chars.append(char)
+    return "".join(filtered_chars)
+
+
+def _sanitize_excel_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_excel_string(value)
+    return value
 
 
 def _has_content(value: Any) -> bool:
@@ -231,7 +259,11 @@ def _auto_fit_sheet(worksheet: Any) -> None:
 
 
 def _build_dataframe(rows: List[Dict[str, Any]], columns: Sequence[str]) -> pd.DataFrame:
-    return pd.DataFrame(rows, columns=cast(Any, list(columns)))
+    sanitized_rows = [
+        {key: _sanitize_excel_value(value) for key, value in row.items()}
+        for row in rows
+    ]
+    return pd.DataFrame(sanitized_rows, columns=cast(Any, list(columns)))
 
 
 def _workspace_report_path(generator_instance: Any, suffix: str, fallback_name: str) -> str:  # type: ignore
