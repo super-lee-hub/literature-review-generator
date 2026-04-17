@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, MutableMapping, Optional, cast
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, cast
 
 from services.artifact_registry import ArtifactRegistry
 from services.config_compat import CompatConfigView
@@ -21,6 +21,10 @@ class JobRunRequest:
     project_name: Optional[str]
     pdf_folder: Optional[str]
     action: str
+    summary_file: Optional[str] = None
+    summary_sources: tuple[str, ...] = ()
+    reuse_stage1: bool = False
+    reuse_summary_files: tuple[str, ...] = ()
     run_all: bool = False
     analyze_only: bool = False
     generate_outline: bool = False
@@ -55,51 +59,97 @@ class JobRunResult:
     failure_summary: Optional[str]
 
 
-def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
+def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
     action = "analyze"
-    if getattr(args, "run_all", False):
+    if bool(params.get("run_all", False)):
         action = "run_all"
-    elif getattr(args, "generate_outline", False):
+    elif bool(params.get("generate_outline", False)):
         action = "generate_outline"
-    elif getattr(args, "generate_section", None):
+    elif params.get("generate_section", None):
         action = "generate_section"
-    elif getattr(args, "retry_failed", False):
+    elif bool(params.get("retry_failed", False)):
         action = "retry_failed"
-    elif getattr(args, "generate_review", False):
+    elif bool(params.get("generate_review", False)):
         action = "generate_review"
-    elif getattr(args, "retry_review_failed", False):
+    elif bool(params.get("retry_review_failed", False)):
         action = "retry_review_failed"
-    elif getattr(args, "validate_review", False):
+    elif bool(params.get("validate_review", False)):
         action = "validate_review"
 
-    # 确定 source_mode
     source_mode = "direct"
-    if getattr(args, "zotero_report", None):
+    if params.get("zotero_report", None):
         source_mode = "zotero"
 
+    def _normalize_string_list(raw_value: Any) -> tuple[str, ...]:
+        if isinstance(raw_value, str):
+            return tuple(
+                item.strip()
+                for item in raw_value.splitlines()
+                if item.strip()
+            )
+        return tuple(
+            str(item).strip()
+            for item in raw_value or ()
+            if str(item).strip()
+        )
+
+    normalized_summary_sources = _normalize_string_list(params.get("summary_sources", ()))
+    summary_file = cast(Optional[str], params.get("summary_file", None))
+    summary_source_items = list(normalized_summary_sources)
+    if summary_file and summary_file not in summary_source_items:
+        summary_source_items.insert(0, summary_file)
+
+    normalized_reuse_files = _normalize_string_list(params.get("reuse_summary_files", ()))
+
     return JobRunRequest(
-        config=getattr(args, "config", "config.ini"),
-        project_name=getattr(args, "project_name", None),
-        pdf_folder=getattr(args, "pdf_folder", None),
+        config=str(params.get("config", "config.ini")),
+        project_name=cast(Optional[str], params.get("project_name", None)),
+        pdf_folder=cast(Optional[str], params.get("pdf_folder", None)),
         action=action,
-        run_all=getattr(args, "run_all", False),
-        analyze_only=getattr(args, "analyze_only", False),
-        generate_outline=getattr(args, "generate_outline", False),
-        generate_review=getattr(args, "generate_review", False),
-        generate_section=getattr(args, "generate_section", None),
-        validate_review=getattr(args, "validate_review", False),
-        retry_failed=getattr(args, "retry_failed", False),
-        retry_review_failed=getattr(args, "retry_review_failed", False),
-        concept=getattr(args, "concept", None),
-        free_mode_profile=getattr(args, "free_mode_profile", None),
-        free_mode_idea=getattr(args, "free_mode_idea", None),
-        progress_tracker=getattr(args, "_progress_tracker", None),
-        gui=getattr(args, "gui", False),
+        summary_file=summary_file,
+        summary_sources=tuple(summary_source_items),
+        reuse_stage1=bool(params.get("reuse_stage1", False)),
+        reuse_summary_files=normalized_reuse_files,
+        run_all=bool(params.get("run_all", False)),
+        analyze_only=bool(params.get("analyze_only", False)),
+        generate_outline=bool(params.get("generate_outline", False)),
+        generate_review=bool(params.get("generate_review", False)),
+        generate_section=cast(Optional[int], params.get("generate_section", None)),
+        validate_review=bool(params.get("validate_review", False)),
+        retry_failed=bool(params.get("retry_failed", False)),
+        retry_review_failed=bool(params.get("retry_review_failed", False)),
+        concept=cast(Optional[str], params.get("concept", None)),
+        free_mode_profile=cast(Optional[str], params.get("free_mode_profile", None)),
+        free_mode_idea=cast(Optional[str], params.get("free_mode_idea", None)),
+        progress_tracker=params.get("_progress_tracker", None),
+        gui=bool(params.get("gui", False)),
         source_mode=source_mode,
-        zotero_report=getattr(args, "zotero_report", None),
-        library_path=getattr(args, "library_path", None),
-        queue_file=getattr(args, "queue_file", "output/_queue/queue.json"),
+        zotero_report=cast(Optional[str], params.get("zotero_report", None)),
+        library_path=cast(Optional[str], params.get("library_path", None)),
+        queue_file=str(params.get("queue_file", "output/_queue/queue.json")),
     )
+
+
+def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
+    return build_job_request_from_mapping(vars(args))
+
+
+def validate_job_request_options(request: Any) -> Optional[str]:
+    summary_file = getattr(request, "summary_file", None)
+    summary_sources = getattr(request, "summary_sources", ()) or ()
+    reuse_stage1 = bool(getattr(request, "reuse_stage1", False))
+    reuse_summary_files = getattr(request, "reuse_summary_files", ()) or ()
+    action = str(getattr(request, "action", "analyze") or "analyze")
+
+    if summary_file and action not in {"generate_outline", "generate_review", "generate_section", "validate_review"}:
+        return "--summary-file can only be used with generate-outline, generate-review, generate-section, or validate-review"
+    if summary_sources and action not in {"generate_outline", "generate_review", "generate_section", "validate_review"}:
+        return "--summary-source can only be used with generate-outline, generate-review, generate-section, or validate-review"
+    if reuse_stage1 and action not in {"analyze", "run_all"}:
+        return "--reuse-stage1 can only be used with stage1 analysis or --run-all"
+    if reuse_summary_files and not reuse_stage1:
+        return "--reuse-summary-file requires --reuse-stage1"
+    return None
 
 
 class JobRunner:
@@ -108,6 +158,10 @@ class JobRunner:
             config=request.config,
             project_name=request.project_name or project_name,
             pdf_folder=request.pdf_folder,
+            summary_file=request.summary_file,
+            summary_sources=list(request.summary_sources),
+            reuse_stage1=request.reuse_stage1,
+            reuse_summary_files=list(request.reuse_summary_files),
             run_all=request.run_all,
             analyze_only=request.analyze_only,
             generate_outline=request.generate_outline,
@@ -146,6 +200,9 @@ class JobRunner:
             "pdf_folder": os.path.abspath(request.pdf_folder) if request.pdf_folder else "",
             "zotero_report": os.path.abspath(request.zotero_report) if request.zotero_report else os.path.abspath(paths_config.get("zotero_report", "")) if paths_config.get("zotero_report") else "",
             "library_path": os.path.abspath(request.library_path) if request.library_path else os.path.abspath(paths_config.get("library_path", "")) if paths_config.get("library_path") else "",
+            "summary_file": os.path.abspath(request.summary_file) if request.summary_file else "",
+            "summary_sources": [os.path.abspath(item) for item in request.summary_sources],
+            "reuse_summary_files": [os.path.abspath(item) for item in request.reuse_summary_files],
             "project_name": self._resolve_project_name(request),
         }
 
@@ -167,6 +224,10 @@ class JobRunner:
             "action": request.action,
             "project_name": request.project_name or "",
             "pdf_folder": os.path.abspath(request.pdf_folder) if request.pdf_folder else "",
+            "summary_file": os.path.abspath(request.summary_file) if request.summary_file else "",
+            "summary_sources": [os.path.abspath(item) for item in request.summary_sources],
+            "reuse_stage1": bool(request.reuse_stage1),
+            "reuse_summary_files": [os.path.abspath(item) for item in request.reuse_summary_files],
             "generate_section": request.generate_section,
             "retry_failed": request.retry_failed,
             "concept": request.concept or "",
@@ -317,6 +378,21 @@ class JobRunner:
         fingerprint_bundle_dict: dict[str, Any] = {}
         active_cancel_token = cancel_token or CancelToken()
 
+        request_error = validate_job_request_options(request)
+        if request_error:
+            return JobRunResult(
+                success=False,
+                exit_code=1,
+                message=request_error,
+                workspace_path="",
+                job_id="",
+                resume_state="non_resumable",
+                produced_artifacts=[],
+                log_path="",
+                report_paths=[],
+                failure_summary=request_error,
+            )
+
         try:
             active_cancel_token.check_cancelled()
         except JobCancelledError as exc:
@@ -339,6 +415,10 @@ class JobRunner:
         generator.progress_tracker = request.progress_tracker
         generator.free_mode_profile_path = request.free_mode_profile
         generator.free_mode_idea = request.free_mode_idea
+        generator.summary_file_override = request.summary_file
+        generator.summary_source_overrides = list(request.summary_sources)
+        generator.reuse_stage1 = request.reuse_stage1
+        generator.reuse_summary_files = list(request.reuse_summary_files)
 
         if not generator.load_configuration():
             return JobRunResult(

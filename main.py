@@ -22,7 +22,7 @@ import hashlib
 import logging
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, cast
+from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, Sequence
 from datetime import datetime
 
 ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
@@ -53,6 +53,7 @@ from services.environment_service import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
+from services.paper_identity import build_paper_key as build_canonical_paper_key, normalize_doi
 from services.progress_state import (
     ResumeStateReport,
     Stage1ProgressSnapshot,
@@ -72,6 +73,18 @@ from services.citation_manifest import (
 from services.stage1_input_builder import Stage1InputBuilder
 from services.model_selection import get_outline_api_config
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
+from services.summary_reuse import (
+    ResolvedSummarySet,
+    SummaryCatalog,
+    SummaryMatch,
+    SummarySource,
+    SummarySourceError,
+    build_effective_summary_set,
+    build_reused_summary,
+    collect_summary_sources,
+    describe_summary_candidate,
+    load_summary_records,
+)
 from services.text_io import load_json_file_with_fallbacks
 from utils import ensure_dir, sanitize_path_component
 from setup_wizard import run_setup_wizard
@@ -81,70 +94,14 @@ import validator
 
 
 def get_paper_key(paper: 'Dict[str, Any] | PaperInfo') -> str:
-    """为论文生成唯一身份标识（模块级别函数）
-    
-    优先使用DOI作为唯一标识
-    如果没有DOI，使用标题+作者组合
-    
-    Args:
-        paper: 论文信息字典或PaperInfo对象
-    
-    Returns:
-        唯一身份标识字符串
-    """
-    from typing import Dict, Any, List
-    
-    # 优先使用DOI作为唯一标识
-    doi = paper.get('doi', '').strip()
-    if doi and doi.lower() != 'unknown' and doi.lower() != 'n/a':
-        # DOI标准化处理：提取纯粹的ID部分
-        import re
-        # 匹配DOI ID模式：以10.开头，后跟数字和斜杠
-        doi_pattern = r'(10\.\d+/.+)'
-        match = re.search(doi_pattern, doi)
-        
-        if match:
-            # 返回标准化的DOI ID部分
-            return match.group(1)
-        else:
-            # 如果无法提取标准格式，返回原始DOI（但进行基本清理）
-            # 移除常见的DOI前缀
-            doi_clean = re.sub(r'^https?://(doi\.org|dx\.doi\.org)/', '', doi, flags=re.IGNORECASE)
-            return doi_clean
-    
-    # 如果没有DOI，使用标题+作者组合
-    title = paper.get('title', '').strip()
-    authors = paper.get('authors', [])
-    
-    # 清理和标准化标题
-    if title:
-        import re
-        title_clean = re.sub(r'[^\w\s]', '', title.lower())
-        title_clean = re.sub(r'\s+', ' ', title_clean).strip()
-    else:
-        title_clean = 'unknown_title'
-    
-    # 处理作者列表
-    if authors and isinstance(authors, list):
-        author_surnames: List[str] = []
-        for author in authors[:3]:
-            if isinstance(author, str):
-                name_parts: List[str] = author.strip().split()
-                if name_parts:
-                    surname: str = name_parts[-1].lower()
-                    author_surnames.append(surname)
-        
-        if len(authors) > 3:
-            author_surnames.append('et_al')
-        
-        authors_str = '_'.join(author_surnames) if author_surnames else 'unknown_author'
-    else:
-        authors_str = 'unknown_author'
-    
-    # 组合标题和作者作为唯一标识
-    return f"{title_clean}_{authors_str}"
+    return build_canonical_paper_key(paper)
 
-# 导入上下文管理模块
+def normalize_checkpoint_paper_key(paper_key: str) -> str:
+    normalized = normalize_doi(paper_key)
+    if normalized:
+        return normalized
+    return str(paper_key or "").strip()
+
 from context_manager import validate_summary_quality, optimize_context_for_synthesis, optimize_context_for_outline, estimate_tokens
 
 
@@ -352,8 +309,16 @@ class CheckpointManager:
                 return False
 
             # 提取已处理和失败的论文身份
-            processed_papers = set(checkpoint_data.get('processed_papers', []))
-            failed_papers = set(checkpoint_data.get('failed_papers', []))
+            processed_papers = {
+                normalize_checkpoint_paper_key(item)
+                for item in checkpoint_data.get('processed_papers', [])
+                if isinstance(item, str) and normalize_checkpoint_paper_key(item)
+            }
+            failed_papers = {
+                normalize_checkpoint_paper_key(item)
+                for item in checkpoint_data.get('failed_papers', [])
+                if isinstance(item, str) and normalize_checkpoint_paper_key(item)
+            }
             update_time = checkpoint_data.get('update_time', '未知时间')
 
             self.logger.info(f"[断点加载] 成功加载断点文件 (更新时间: {update_time})")
@@ -411,6 +376,10 @@ class LiteratureReviewGenerator:
         self.compat_config: Optional[CompatConfigView] = None
         self.output_dir: Optional[str] = None
         self.summary_file: Optional[str] = None
+        self.summary_file_override: Optional[str] = None
+        self.summary_source_overrides: List[str] = []
+        self.reuse_stage1: bool = False
+        self.reuse_summary_files: List[str] = []
         self.papers: List[PaperInfo] = []
         self.source_descriptors: List[Dict[str, Any]] = []
         self.summaries: SummariesList = []
@@ -429,6 +398,8 @@ class LiteratureReviewGenerator:
         self.job_fingerprint_bundle: Dict[str, Any] = {}
         self.resume_state_report: Optional[ResumeStateReport] = None
         self.queue_service: Optional[PersistentQueueService] = None
+        self._stage1_reuse_report: Optional[Dict[str, Any]] = None
+        self._stage1_reused_paper_keys: Set[str] = set()
 
         # 身份基断点续传相关变量
         self._checkpoint_processed_papers: Set[str] = set()
@@ -554,6 +525,20 @@ class LiteratureReviewGenerator:
         if self.output_dir and self.project_name:
             return os.path.join(self.output_dir, f"{self.project_name}_summaries.json")
         return "summaries.json"
+
+    def _get_summary_source_manifest_path(self) -> str:
+        if self.job_workspace and self.project_name:
+            return self.job_workspace.artifact_path(f"{self.project_name}_summary_source_manifest.json")
+        if self.output_dir and self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_summary_source_manifest.json")
+        return "summary_source_manifest.json"
+
+    def _get_summary_reuse_report_path(self) -> str:
+        if self.job_workspace and self.project_name:
+            return self.job_workspace.artifact_path(f"{self.project_name}_summary_reuse_report.json")
+        if self.output_dir and self.project_name:
+            return os.path.join(self.output_dir, f"{self.project_name}_summary_reuse_report.json")
+        return "summary_reuse_report.json"
 
     def _get_report_file_path(self, suffix: str) -> str:
         if self.job_workspace and self.project_name:
@@ -1378,69 +1363,213 @@ class LiteratureReviewGenerator:
         """为论文生成唯一身份标识（调用模块级别函数）"""
         return get_paper_key(paper)
     
+    def _load_summary_records_from_path(self, path: str) -> List[Dict[str, Any]]:
+        return load_summary_records(path, logger=self.logger)
+
+    def _explicit_summary_source_paths(self) -> List[str]:
+        paths: List[str] = []
+        seen: Set[str] = set()
+        for raw_path in [self.summary_file_override, *self.summary_source_overrides]:
+            value = str(raw_path or "").strip()
+            if not value:
+                continue
+            normalized = os.path.abspath(value)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            paths.append(normalized)
+        return paths
+
+    def _materialize_effective_summaries(
+        self,
+        summaries: List[Dict[str, Any]],
+        *,
+        source_path: str = "",
+        source_kind: str,
+        producer: str,
+        source_items: Optional[List[Dict[str, Any]]] = None,
+        rejected_candidates: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        if not self.summary_file:
+            return False
+
+        Path(self.summary_file).parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.summary_file, summaries)
+        effective_source_items = list(source_items or [])
+        if not effective_source_items and source_path:
+            effective_source_items = [
+                {
+                    "path": os.path.abspath(source_path),
+                    "source_type": "explicit",
+                    "label": source_kind,
+                    "priority": 0,
+                }
+            ]
+        self._register_workspace_artifact(
+            artifact_role="summary",
+            artifact_type="summary_file",
+            artifact_version="v1",
+            path=self.summary_file,
+            producer=producer,
+            depends_on=[
+                ArtifactDependencyRef(
+                    artifact_type="summary_source",
+                    path=str(item.get("path") or ""),
+                )
+                for item in effective_source_items
+                if str(item.get("path") or "").strip()
+            ],
+        )
+
+        manifest_path = self._get_summary_source_manifest_path()
+        primary_source_path = ""
+        if source_path:
+            primary_source_path = os.path.abspath(source_path)
+        elif effective_source_items:
+            primary_source_path = str(effective_source_items[0].get("path") or "")
+        manifest_payload = {
+            "artifact_type": "summary_source_manifest",
+            "artifact_version": "v2",
+            "created_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "project_name": self.project_name or "",
+            "source_kind": source_kind,
+            "source_path": primary_source_path,
+            "source_items": effective_source_items,
+            "rejected_candidates": list(rejected_candidates or []),
+            "materialized_summary_file": self.summary_file,
+            "summary_count": len(summaries),
+        }
+        atomic_write_json(manifest_path, manifest_payload)
+        self._register_workspace_artifact(
+            artifact_role="summary_source",
+            artifact_type="summary_source_manifest",
+            artifact_version="v1",
+            path=manifest_path,
+            producer=producer,
+            depends_on=[
+                ArtifactDependencyRef(
+                    artifact_type="summary_file",
+                    path=self.summary_file,
+                )
+            ],
+        )
+        return True
+
+    def _load_summaries_from_sources(
+        self,
+        paths: Sequence[str],
+        *,
+        source_kind: str = "explicit_summary_sources",
+        producer: str = "main.LiteratureReviewGenerator.load_existing_summaries",
+    ) -> bool:
+        sources = [
+            SummarySource(
+                path=os.path.abspath(path),
+                source_type="explicit",
+                priority=index,
+                label=f"explicit:{index + 1}",
+            )
+            for index, path in enumerate(paths)
+        ]
+        resolved: ResolvedSummarySet = build_effective_summary_set(sources, logger=self.logger)
+        self.summaries = [dict(item) for item in resolved.summaries]
+        success_count = len(self.summaries)
+        self.logger.success(f"Loaded summary sources: {success_count} success, 0 failed")
+        if resolved.rejected_candidates:
+            self.logger.info(f"Summary source merge skipped {len(resolved.rejected_candidates)} non-reusable records")
+        self._materialize_effective_summaries(
+            self.summaries,
+            source_path=str(paths[0]) if len(paths) == 1 else "",
+            source_kind=source_kind,
+            producer=producer,
+            source_items=resolved.source_items,
+            rejected_candidates=resolved.rejected_candidates,
+        )
+        return True
+
+    def _load_summaries_from_path(
+        self,
+        path: str,
+        *,
+        materialize: bool = False,
+        source_kind: str = "existing_summary_file",
+        producer: str = "main.LiteratureReviewGenerator.load_existing_summaries",
+    ) -> bool:
+        loaded_summaries = self._load_summary_records_from_path(path)
+        self.summaries = [dict(item) for item in loaded_summaries]
+
+        success_count = len([s for s in self.summaries if s.get("status") == "success"])
+        failed_count = len([s for s in self.summaries if s.get("status") == "failed"])
+        self.logger.success(f"Loaded summary file: {success_count} success, {failed_count} failed")
+
+        if materialize:
+            self._materialize_effective_summaries(
+                self.summaries,
+                source_path=path,
+                source_kind=source_kind,
+                producer=producer,
+                source_items=[
+                    {
+                        "path": os.path.abspath(path),
+                        "source_type": "explicit",
+                        "label": source_kind,
+                        "priority": 0,
+                    }
+                ],
+            )
+        return True
+
     def load_existing_summaries(self) -> bool:
-        """加载现有摘要文件（用于断点续传）"""
+        """Load an existing summaries file for resume or downstream generation."""
         try:
-            # 首先检查当前工作空间的摘要文件
+            explicit_summary_sources = self._explicit_summary_source_paths()
+            if explicit_summary_sources:
+                source_kind = "explicit_summary_file" if len(explicit_summary_sources) == 1 else "explicit_summary_sources"
+                return self._load_summaries_from_sources(
+                    explicit_summary_sources,
+                    source_kind=source_kind,
+                )
+
             if self.summary_file and os.path.exists(self.summary_file):
-                with open(self.summary_file, 'r', encoding='utf-8') as f:
-                    loaded_data = json.load(f)
-                    self.summaries = loaded_data if isinstance(loaded_data, list) else []
-                
-                # 验证数据格式
-                if not isinstance(self.summaries, list):  # type: ignore
-                    self.logger.warning("现有摘要文件格式不正确，将开始全新处理")
+                try:
+                    return self._load_summaries_from_path(self.summary_file)
+                except SummarySourceError as exc:
+                    self.logger.warning(f"Current summary file is invalid; starting fresh instead: {exc}")
                     self.summaries = []
-                    return True
-                
-                success_count = len([s for s in self.summaries if s.get('status') == 'success'])
-                failed_count = len([s for s in self.summaries if s.get('status') == 'failed'])
-                
-                self.logger.success(f"已加载现有摘要文件: {success_count}成功, {failed_count}失败")
-                return True
-            
-            # 如果当前工作空间找不到摘要文件，检查历史工作空间
+
             if self.project_name:
                 paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
                 output_base_path: str = paths_config.get('output_path', './output')
                 output_base_path_abs = os.path.abspath(output_base_path)
-                
-                # 查找所有历史工作空间（直接在output目录中查找）
+
                 import glob
                 workspace_pattern = os.path.join(output_base_path_abs, f"{self.project_name}__*")
                 workspaces = glob.glob(workspace_pattern)
-                
-                # 按修改时间排序，找到最新的工作空间
                 workspaces.sort(key=os.path.getmtime, reverse=True)
-                
+
                 for workspace_path in workspaces:
-                    # 检查该工作空间是否有摘要文件
                     summary_file = os.path.join(workspace_path, "artifacts", f"{self.project_name}_summaries.json")
-                    if os.path.exists(summary_file):
-                        self.logger.info(f"在历史工作空间中找到摘要文件: {summary_file}")
-                        with open(summary_file, 'r', encoding='utf-8') as f:
-                            loaded_data = json.load(f)
-                            self.summaries = loaded_data if isinstance(loaded_data, list) else []
-                        
-                        # 验证数据格式
-                        if not isinstance(self.summaries, list):  # type: ignore
-                            self.logger.warning("历史摘要文件格式不正确，将继续查找")
-                            continue
-                        
-                        success_count = len([s for s in self.summaries if s.get('status') == 'success'])
-                        failed_count = len([s for s in self.summaries if s.get('status') == 'failed'])
-                        
-                        self.logger.success(f"已加载历史摘要文件: {success_count}成功, {failed_count}失败")
-                        return True
-            
-            self.logger.info("未找到现有摘要文件，将开始全新处理")
+                    if not os.path.exists(summary_file):
+                        continue
+                    try:
+                        self.logger.info(f"Found historical summary file: {summary_file}")
+                        return self._load_summaries_from_path(summary_file)
+                    except SummarySourceError as exc:
+                        self.logger.warning(f"Historical summary file is invalid; checking the next candidate: {exc}")
+                        continue
+
+            self.logger.info("No existing summary file was found; starting a fresh run")
             self.summaries = []
             return True
-            
-        except Exception as e:
-            self.logger.warning(f"加载现有摘要文件失败，将开始全新处理: {e}")
+
+        except SummarySourceError as exc:
+            self.logger.error(f"Failed to load summary file: {exc}")
             self.summaries = []
-            return True  # 即使加载失败也返回True，因为我们仍可以继续处理
+            return False
+        except Exception as e:
+            self.logger.warning(f"Failed to load existing summary file; starting a fresh run: {e}")
+            self.summaries = []
+            return True
 
     def _restore_stage1_progress_from_snapshot(self, snapshot_path: str) -> bool:
         """从 progress snapshot 中恢复阶段一跳过集合。"""
@@ -1455,14 +1584,14 @@ class LiteratureReviewGenerator:
                 return False
 
             processed_papers = {
-                paper_key.strip()
+                normalize_checkpoint_paper_key(paper_key)
                 for paper_key in snapshot.processed_papers
-                if isinstance(paper_key, str) and paper_key.strip()
+                if isinstance(paper_key, str) and normalize_checkpoint_paper_key(paper_key)
             }
             failed_papers = {
-                paper_key.strip()
+                normalize_checkpoint_paper_key(paper_key)
                 for paper_key in snapshot.failed_papers
-                if isinstance(paper_key, str) and paper_key.strip()
+                if isinstance(paper_key, str) and normalize_checkpoint_paper_key(paper_key)
             }
 
             self._checkpoint_processed_papers = processed_papers
@@ -2586,12 +2715,8 @@ class LiteratureReviewGenerator:
                 return None
             
             if paper_key in self._checkpoint_failed_papers:
-                self.logger.info(f"跳过已失败论文: {paper.get('title', '未知标题')}")
-                # 从现有摘要中找到对应的条目
-                for summary in self.summaries:
-                    if summary.get('status') == 'failed' and LiteratureReviewGenerator.get_paper_key(summary.get('paper_info', {})) == paper_key:
-                        return summary
-                return None
+                self.logger.info(f"重新尝试上次失败论文: {paper.get('title', '未知标题')}")
+                self._checkpoint_failed_papers.discard(paper_key)
             
             self.logger.info(f"[{paper_index+1}/{total_papers}] 正在处理: {paper.get('title', '未知标题')}")
             
@@ -2622,11 +2747,11 @@ class LiteratureReviewGenerator:
                 # 使用 file_finder.py 中强大的 find_pdf 函数
                 find_result = find_pdf(dict(paper), library_path, file_index)
                 
-                if find_result and find_result[0]:
-                    pdf_path = find_result[0]
+                if find_result:
+                    pdf_path = find_result
                     self.logger.info(f"智能查找到PDF: {os.path.basename(pdf_path)}")
                 else:
-                    failure_reason: str = find_result[1] if find_result and len(find_result) > 1 else "未找到PDF文件"
+                    failure_reason = "未找到PDF文件"
                     self.logger.error(f"未找到PDF文件: {file_title} - 原因: {failure_reason}")
                     return {
                         'paper_info': paper,
@@ -3242,6 +3367,261 @@ class LiteratureReviewGenerator:
             self.logger.error(f"生成重跑报告失败: {e}")
             return False
     
+    def _paper_reuse_entry(self, paper: Mapping[str, Any], *, paper_key: str) -> Dict[str, Any]:
+        return {
+            "paper_key": paper_key,
+            "title": str(paper.get("title") or ""),
+            "doi": normalize_doi(paper.get("doi")),
+            "canonical_paper_key": str(paper.get("canonical_paper_key") or paper_key),
+        }
+
+    def _build_stage1_reuse_report(self, sources: List[SummarySource], rejected_candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        source_items = [
+            {
+                "path": source.path,
+                "source_type": source.source_type,
+                "label": source.label,
+                "priority": source.priority,
+            }
+            for source in sources
+        ]
+        return {
+            "artifact_type": "summary_reuse_report",
+            "artifact_version": "v2",
+            "created_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "project_name": self.project_name or "",
+            "mode": self.mode,
+            "summary_file": self.summary_file or "",
+            "configured_reuse_sources": source_items,
+            "source_items": source_items,
+            "rejected_candidates": list(rejected_candidates),
+            "reused_papers": [],
+            "not_reused": [],
+            "skipped_papers": [],
+            "newly_analyzed_papers": [],
+            "failed_papers": [],
+            "degraded_artifacts": [],
+            "preview": {
+                "source_count": len(source_items),
+                "reusable_record_count": 0,
+                "matched_count": 0,
+                "ambiguous_count": 0,
+                "needs_analysis_count": 0,
+            },
+        }
+
+    def _log_stage1_reuse_preview(self, report: Mapping[str, Any]) -> None:
+        preview = report.get("preview", {}) if isinstance(report, Mapping) else {}
+        source_count = int(preview.get("source_count", 0) or 0)
+        reusable_record_count = int(preview.get("reusable_record_count", 0) or 0)
+        matched_count = int(preview.get("matched_count", 0) or 0)
+        ambiguous_count = int(preview.get("ambiguous_count", 0) or 0)
+        needs_analysis_count = int(preview.get("needs_analysis_count", 0) or 0)
+        self.logger.info(
+            f"[stage1 reuse] Preview: {source_count} sources, {reusable_record_count} reusable summaries, "
+            f"{matched_count} direct matches, {ambiguous_count} ambiguous, {needs_analysis_count} still need analysis"
+        )
+
+    def _apply_stage1_cross_run_reuse(self) -> bool:
+        self._stage1_reuse_report = None
+        self._stage1_reused_paper_keys = set()
+
+        if not self.reuse_stage1:
+            return True
+
+        paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
+        output_root = paths_config.get('output_path', './output')
+        sources = collect_summary_sources(
+            explicit_paths=self.reuse_summary_files,
+            output_root=output_root,
+            current_workspace_root=self.output_dir,
+            current_summary_file=self.summary_file,
+        )
+        self.logger.info(f"[stage1 reuse] Found {len(sources)} candidate summary sources")
+
+        try:
+            catalog = SummaryCatalog.from_sources(sources, logger=self.logger)
+        except SummarySourceError as exc:
+            self.logger.error(f"[stage1 reuse] Failed to load an explicit reuse source: {exc}")
+            return False
+
+        report = self._build_stage1_reuse_report(sources, catalog.rejected_candidates)
+        preview = report["preview"]
+        preview["reusable_record_count"] = len(catalog.records)
+        reused_any = False
+
+        for paper in self.papers:
+            paper_key = LiteratureReviewGenerator.get_paper_key(paper)  # type: ignore[arg-type]
+            paper_entry = self._paper_reuse_entry(paper, paper_key=paper_key)
+            if paper_key in self._checkpoint_processed_papers or paper_key in self._checkpoint_failed_papers:
+                report["skipped_papers"].append(
+                    {
+                        **paper_entry,
+                        "reason": "already_processed" if paper_key in self._checkpoint_processed_papers else "already_failed",
+                    }
+                )
+                continue
+
+            match: Optional[SummaryMatch] = catalog.resolve_for_paper(paper)
+            if match is None:
+                report["not_reused"].append({**paper_entry, "reason": "no_matching_summary"})
+                preview["needs_analysis_count"] += 1
+                continue
+
+            if match.is_ambiguous:
+                report["not_reused"].append(
+                    {
+                        **paper_entry,
+                        "reason": "ambiguous_match",
+                        "match_type": match.match_type,
+                        "ambiguous_candidates": [
+                            {
+                                **describe_summary_candidate(candidate.summary),
+                                "source_path": candidate.source.path,
+                                "source_type": candidate.source.source_type,
+                            }
+                            for candidate in match.ambiguous_candidates
+                        ],
+                    }
+                )
+                preview["ambiguous_count"] += 1
+                preview["needs_analysis_count"] += 1
+                continue
+
+            if match.winner is None:
+                report["not_reused"].append({**paper_entry, "reason": "no_matching_summary"})
+                preview["needs_analysis_count"] += 1
+                continue
+
+            canonical_doi = normalize_doi(paper.get("doi"))
+            reused_summary = build_reused_summary(
+                current_paper=paper,
+                matched_summary=match.winner.summary,
+                reuse_source=match.winner.source,
+                match_type=match.match_type,
+                canonical_doi=canonical_doi,
+            )
+
+            replaced = False
+            for index, existing_summary in enumerate(self.summaries):
+                existing_paper_info = existing_summary.get('paper_info', {})
+                if LiteratureReviewGenerator.get_paper_key(existing_paper_info) == paper_key:
+                    self.summaries[index] = reused_summary  # type: ignore[index]
+                    replaced = True
+                    break
+            if not replaced:
+                self.summaries.append(reused_summary)  # type: ignore[arg-type]
+
+            self._checkpoint_processed_papers.add(paper_key)
+            self._checkpoint_failed_papers.discard(paper_key)
+            self._stage1_reused_paper_keys.add(paper_key)
+            reused_any = True
+
+            artifact_ready = self._persist_paper_artifact(reused_summary)
+            report_entry = {
+                **paper_entry,
+                "reason": match.match_type,
+                "match_type": match.match_type,
+                "winner_source": {
+                    "path": match.winner.source.path,
+                    "source_type": match.winner.source.source_type,
+                    "label": match.winner.source.label,
+                },
+                "source_path": match.winner.source.path,
+                "source_type": match.winner.source.source_type,
+                "ambiguous_candidates": [],
+                "artifact_ready": artifact_ready,
+            }
+            report["reused_papers"].append(report_entry)
+            if not artifact_ready:
+                report["degraded_artifacts"].append(report_entry)
+            preview["matched_count"] += 1
+
+        preview["needs_analysis_count"] = len(report["not_reused"])
+
+        self._stage1_reuse_report = report
+        self._log_stage1_reuse_preview(report)
+
+        if reused_any:
+            self.save_summaries()
+            self.save_checkpoint()
+            self.logger.info(f"[stage1 reuse] Reused {len(report['reused_papers'])} papers via global summary catalog")
+        else:
+            self.logger.info("[stage1 reuse] No reusable summaries matched the current paper set")
+
+        return True
+
+    def _persist_stage1_reuse_report(self) -> bool:
+        if not self._stage1_reuse_report:
+            return True
+
+        report = dict(self._stage1_reuse_report)
+        current_paper_keys = {
+            LiteratureReviewGenerator.get_paper_key(paper): paper
+            for paper in self.papers
+        }
+
+        newly_analyzed: List[Dict[str, Any]] = []
+        for summary in self.summaries:
+            if str(summary.get('status') or '').strip().lower() != 'success':
+                continue
+            paper_info = summary.get('paper_info', {})
+            if not isinstance(paper_info, Mapping):
+                continue
+            paper_key = LiteratureReviewGenerator.get_paper_key(dict(paper_info))
+            if paper_key not in current_paper_keys or paper_key in self._stage1_reused_paper_keys:
+                continue
+            newly_analyzed.append(
+                {
+                    "paper_key": paper_key,
+                    "title": str(paper_info.get('title') or ''),
+                    "doi": normalize_doi(paper_info.get('doi')),
+                }
+            )
+
+        failed_papers: List[Dict[str, Any]] = []
+        for failed in self.failed_papers:
+            paper_info = failed.get('paper_info', {})
+            if not isinstance(paper_info, Mapping):
+                continue
+            paper_key = LiteratureReviewGenerator.get_paper_key(dict(paper_info))
+            if paper_key not in current_paper_keys or paper_key in self._stage1_reused_paper_keys:
+                continue
+            failed_papers.append(
+                {
+                    "paper_key": paper_key,
+                    "title": str(paper_info.get('title') or ''),
+                    "doi": normalize_doi(paper_info.get('doi')),
+                    "failure_reason": str(failed.get('failure_reason') or ''),
+                }
+            )
+
+        report["newly_analyzed_papers"] = newly_analyzed
+        report["failed_papers"] = failed_papers
+        report["counts"] = {
+            "configured_reuse_sources": len(report.get("configured_reuse_sources", [])),
+            "reused": len(report.get("reused_papers", [])),
+            "not_reused": len(report.get("not_reused", [])),
+            "skipped": len(report.get("skipped_papers", [])),
+            "newly_analyzed": len(newly_analyzed),
+            "failed": len(failed_papers),
+        }
+
+        report_path = self._get_summary_reuse_report_path()
+        atomic_write_json(report_path, report)
+        self._register_workspace_artifact(
+            artifact_role="summary_reuse",
+            artifact_type="summary_reuse_report",
+            artifact_version="v1",
+            path=report_path,
+            producer="main.LiteratureReviewGenerator.run_stage_one",
+            depends_on=[
+                ArtifactDependencyRef(artifact_type="summary_file", path=self.summary_file or ""),
+            ] if self.summary_file else [],
+        )
+        self._stage1_reuse_report = report
+        return True
+
     def process_all_papers(self) -> bool:
         """处理所有论文（并发处理版本）"""
         try:
@@ -3275,7 +3655,7 @@ class LiteratureReviewGenerator:
             for i, paper in enumerate(self.papers):
                 self._check_cancelled()
                 paper_key = LiteratureReviewGenerator.get_paper_key(paper)  # type: ignore
-                if paper_key in self._checkpoint_processed_papers or paper_key in self._checkpoint_failed_papers:
+                if paper_key in self._checkpoint_processed_papers:
                     skipped_count += 1
                     continue
                 papers_to_process.append((i, paper))
@@ -3800,12 +4180,17 @@ class LiteratureReviewGenerator:
                 self.logger.error("未找到任何论文数据")
                 return False
             
-            self.logger.info(f"论文数据加载完成: {len(self.papers)}篇论文")
+            self.logger.info(f"Paper metadata loaded: {len(self.papers)} papers")
+
+            if not self._apply_stage1_cross_run_reuse():
+                return False
             
-            # 处理所有论文（使用身份基断点续传）
+            # Process all papers after same-project resume and optional cross-run DOI reuse
             success = self.process_all_papers()
+            if self.reuse_stage1 and not self._persist_stage1_reuse_report():
+                self.logger.warning("[stage1 reuse] Failed to persist the reuse report")
             
-            # 如果处理成功，生成报告
+            # If processing succeeded, continue with report generation and cleanup
             if success:
                 # 清除断点文件（表示全部完成）
                 if self.output_dir and self.project_name:
@@ -5569,14 +5954,18 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
                 logging.error("🔄 或者使用 --pdf-folder 指定PDF文件夹路径")
                 sys.exit(1)
             
-            # 检查project_name长度
+                # project_name length warning
             if len(project_name) > 50:
-                logging.warning(f"⚠️  项目名称过长（{len(project_name)}字符），建议使用更简洁的名称")
+                logging.warning(f"Project name is quite long ({len(project_name)} chars); a shorter name is recommended.")
             
-        from services.job_runner import JobRunner
+        from services.job_runner import JobRunner, validate_job_request_options
         from services.workflow_facade import build_job_request
 
         request = build_job_request(args)
+        request_error = validate_job_request_options(request)
+        if request_error:
+            logging.error(request_error)
+            sys.exit(1)
         result = JobRunner().run(request, cancel_token=getattr(args, "_cancel_token", None))
         if not result.success:
             sys.exit(result.exit_code or 1)
@@ -6152,6 +6541,10 @@ def handle_queue_add_mode(args: argparse.Namespace):  # type: ignore
             "concept": getattr(args, "concept", None),
             "free_mode_profile": getattr(args, "free_mode_profile", None),
             "free_mode_idea": getattr(args, "free_mode_idea", None),
+            "summary_file": getattr(args, "summary_file", None),
+            "summary_sources": getattr(args, "summary_sources", None),
+            "reuse_stage1": getattr(args, "reuse_stage1", False),
+            "reuse_summary_files": getattr(args, "reuse_summary_files", None),
             "source_mode": "zotero" if args.zotero_report else "direct",
             "zotero_report": args.zotero_report,
             "library_path": args.library_path,
@@ -6527,17 +6920,38 @@ def main() -> None:  # type: ignore
     advanced_group.add_argument(
         '--free-mode-profile',
         type=str,
-        help='自由模式：加载 profile JSON 文件'
+        help='Free mode: load a profile JSON file'
     )
     advanced_group.add_argument(
         '--free-mode-idea',
         type=str,
-        help='自由模式：直接输入想法文本'
+        help='Free mode: pass an idea as plain text'
     )
     advanced_group.add_argument(
         '--merge',
         type=str,
-        help='合并：指定要合并的 summaries.json 文件'
+        help='Merge another summaries.json file into the current summaries file'
+    )
+    advanced_group.add_argument(
+        '--summary-file',
+        type=str,
+        help='Explicitly select a summaries.json file for outline/review/section/validation'
+    )
+    advanced_group.add_argument(
+        '--summary-source',
+        dest='summary_sources',
+        action='append',
+        help='Add a summaries.json file to the current downstream summary source set (repeatable)'
+    )
+    advanced_group.add_argument(
+        '--reuse-stage1',
+        action='store_true',
+        help='Enable DOI-only reuse of earlier stage-1 summaries during stage-1 analysis'
+    )
+    advanced_group.add_argument(
+        '--reuse-summary-file',
+        action='append',
+        help='Add an extra summaries.json file to the stage-1 reuse pool (repeatable)'
     )
     
     # 队列选项

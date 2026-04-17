@@ -200,6 +200,58 @@ def test_generate_excel_report_uses_canonical_multisheet_layout(tmp_path: Path) 
     assert set(uncertain_df["论文标题"].tolist()) == {"Review Paper", "Uncertain Paper"}
 
 
+def test_generate_excel_report_strips_illegal_excel_control_characters(tmp_path: Path) -> None:
+    summary = _build_summary(
+        "Illegal\x0bTitle",
+        {
+            "paper_type": "empirical",
+            "paper_subtype_raw": "survey study",
+            "paper_subtype_normalized": "survey",
+            "classification_status": "resolved",
+            "route_confidence": "high",
+            "classification_rationale": None,
+            "secondary_candidates": [],
+        },
+        {
+            "empirical": {
+                "research_questions_or_hypotheses": ["H1\x0c"],
+                "data_source_and_size": "survey,\x0b n=300",
+                "analysis_technique": "SEM",
+                "core_variables": {
+                    "independent": ["trust"],
+                    "dependent": ["adoption"],
+                    "mediators": [],
+                    "moderators": [],
+                    "controls": [],
+                    "other_core_constructs": [],
+                },
+                "sample_characteristics_or_context": "hotel customers",
+            },
+            "review": None,
+            "conceptual": None,
+        },
+    )
+    summary["ai_summary"]["core_analysis"]["summary"] = "bad\x0btext\x0cfor excel"
+
+    summary_file = tmp_path / "demo_summaries.json"
+    summary_file.write_text(json.dumps([summary], ensure_ascii=False), encoding="utf-8")
+
+    generator = SimpleNamespace(
+        summary_file=str(summary_file),
+        output_dir=str(tmp_path),
+        project_name="demo",
+        logger=_DummyLogger(),
+    )
+
+    assert generate_excel_report(generator) is True
+
+    workbook = pd.ExcelFile(tmp_path / "demo_analyzed_papers.xlsx")
+    total_df = cast(pd.DataFrame, workbook.parse(workbook.sheet_names[0]))
+
+    assert total_df.iloc[0, 0] == "IllegalTitle"
+    assert total_df.iloc[0, 5] == "badtextfor excel"
+
+
 def test_generate_failure_report_includes_attempt_history_details(tmp_path: Path) -> None:
     output_dir = tmp_path / "output"
     output_dir.mkdir(parents=True, exist_ok=True)

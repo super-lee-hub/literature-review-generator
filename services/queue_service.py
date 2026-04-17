@@ -405,34 +405,11 @@ class QueueRunner:
             
             # 从job_spec参数构建JobRunRequest
             params = job_spec.parameters
-            config = params.get("config", "config.ini")
             project_name = params.get("project_name")
-            pdf_folder = params.get("pdf_folder")
-            action = params.get("action", "analyze")
+            # Build JobRunRequest from queued parameters
+            from services.job_runner import build_job_request_from_mapping
+            request = build_job_request_from_mapping(params)
             
-            # 构建JobRunRequest
-            from services.job_runner import JobRunRequest
-            request = JobRunRequest(
-                config=config,
-                project_name=project_name,
-                pdf_folder=pdf_folder,
-                action=action,
-                run_all=params.get("run_all", False),
-                analyze_only=params.get("analyze_only", False),
-                generate_outline=params.get("generate_outline", False),
-                generate_review=params.get("generate_review", False),
-                generate_section=params.get("generate_section"),
-                validate_review=params.get("validate_review", False),
-                retry_failed=params.get("retry_failed", False),
-                retry_review_failed=params.get("retry_review_failed", False),
-                concept=params.get("concept"),
-                free_mode_profile=params.get("free_mode_profile"),
-                free_mode_idea=params.get("free_mode_idea"),
-                gui=params.get("gui", False),
-                source_mode=params.get("source_mode", "direct"),
-                zotero_report=params.get("zotero_report"),
-                library_path=params.get("library_path"),
-            )
             
             # 计算工作区路径（基于项目名称和任务ID）
             import os

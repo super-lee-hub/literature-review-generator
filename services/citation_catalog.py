@@ -4,31 +4,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from services.paper_identity import build_paper_key as build_legacy_paper_key
+
 
 def build_paper_key(paper: Mapping[str, Any]) -> str:
-    doi = str(paper.get("doi") or "").strip()
-    if doi and doi.lower() not in {"unknown", "n/a"}:
-        match = re.search(r"(10\.\d+/.+)", doi)
-        if match:
-            return match.group(1)
-        return re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi, flags=re.IGNORECASE)
-
-    title = str(paper.get("title") or "").strip()
-    title_clean = re.sub(r"[^\w\s]", "", title.lower())
-    title_clean = re.sub(r"\s+", " ", title_clean).strip() or "unknown_title"
-
-    authors = paper.get("authors") or []
-    if not isinstance(authors, list):
-        authors = [authors]
-    surnames: List[str] = []
-    for author in authors[:3]:
-        parts = str(author or "").strip().split()
-        if parts:
-            surnames.append(parts[-1].lower())
-    if len(authors) > 3:
-        surnames.append("et_al")
-    authors_clean = "_".join(surnames) if surnames else "unknown_author"
-    return f"{title_clean}_{authors_clean}"
+    return build_legacy_paper_key(paper)
 
 
 def normalize_alias(value: Any) -> str:

@@ -105,6 +105,46 @@ python main.py --project-name "我的综述项目" --generate-outline
 python main.py --project-name "我的综述项目" --generate-review
 ```
 
+## 复用已有的第一阶段摘要
+
+现在可以用两种方式复用以前跑过的第一阶段结果：
+
+1. **为后续阶段加载一个或多个历史 summary 文件**
+   - 常见场景继续用 `--summary-file`。
+   - 如果要把多个历史 `summaries.json` 一起作为当前任务输入，可以重复使用 `--summary-source <path>`。
+   - 程序会先把这些 summary 合并并物化到当前 workspace，再继续生成 outline / review / section / validation，保证后续生成和复跑的一致性。
+2. **在第一阶段自动扫描历史结果并增量复用**
+   - 在第一阶段（`--analyze-only` 或 `--run-all`）加上 `--reuse-stage1`。
+   - 程序会自动扫描 `Paths.output_path` 下的历史结果，包括当前 workspace 结构和兼容的旧版 `output/<project>/<project>_summaries.json`。
+   - 自动匹配优先级是：`DOI 完全一致` -> `canonical paper key 完全一致` -> `title + first author + year` 的唯一高置信命中。
+   - 只有唯一高置信候选才会自动复用；如果候选有歧义，会写进 reuse report，然后该论文继续正常分析。
+   - 如果你还有位于 `output_path` 之外的额外摘要缓存，也可以重复使用 `--reuse-summary-file <path>` 把它们补充进复用池。
+
+示例：
+
+```bash
+# 用单个显式 summary 文件生成子集 outline
+python main.py --project-name "subset_outline" --summary-file "D:\subset\subset_summaries.json" --generate-outline
+
+# 用多个历史 summary 文件共同生成综述正文
+python main.py --project-name "subset_review" --summary-file "D:\subset\subset_a_summaries.json" --summary-source "D:\subset\subset_b_summaries.json" --generate-review
+
+# PDF 模式：第一阶段自动扫描历史输出，唯一命中的论文会直接复用
+python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1
+
+# Zotero 模式：同样支持自动扫描历史输出并增量复用
+python main.py --project-name "zotero_overlap" --zotero-report "D:\zotero_report.txt" --library-path "D:\ZoteroLibrary" --analyze-only --reuse-stage1
+
+# 额外追加一个位于 output_path 之外的手工复用摘要池
+python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1 --reuse-summary-file "D:\cache\curated_summaries.json"
+```
+
+规则：
+- 自动跨运行复用不再只看 DOI。现在会先复用 `DOI 完全一致`，再尝试 `canonical paper key 完全一致`，最后才是唯一的 `title + first author + year` 命中。
+- 如果同一优先级下匹配到多个历史候选，程序不会自动复用，而是把它标记为 `ambiguous`，然后继续正常分析，避免误复用。
+- 如果当前项目只是部分论文重叠，程序会直接复用已命中的论文，只分析剩余没命中的论文，不需要重新全量跑第一阶段。
+- 如果你想同时保留“大组版本”和“子集版本”，请使用不同的 `--project-name`，避免它们共享同一个 workspace 状态。
+
 ## GUI
 
 用这个命令启动 GUI：
@@ -149,7 +189,8 @@ python main.py --queue-run --queue-files "queue1.json" "queue2.json"
 - `--prime-with-folder` + `--concept`：用概念文件夹做预热
 - `--free-mode-profile`：加载 free mode 的 profile JSON
 - `--free-mode-idea`：直接输入 free mode 想法文本
-- `--merge`：合并多个 `summaries.json`
+- `--summary-source`：在 `--summary-file` 之外继续追加多个下游 `summaries.json` 输入
+- `--merge`：把多个 `summaries.json` 合并成一个文件的兼容工具
 - `--validate-review`：在需要时额外检查已生成的综述
 - `--outline-adopt`：在需要时使用手动采纳的提纲
 - `--cleanup`：清理旧工作区文件，只保留最新任务文件
@@ -166,6 +207,8 @@ output/<project_name>__<job_id>/
 常见文件：
 
 - `artifacts/*_summaries.json`
+- `artifacts/*_summary_source_manifest.json`
+- `artifacts/*_summary_reuse_report.json`
 - `artifacts/*_literature_review_outline.md`
 - `reports/*_analyzed_papers.xlsx`
 - `reports/*_literature_review.docx`
