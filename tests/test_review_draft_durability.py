@@ -75,7 +75,7 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
         fingerprint_bundle={"request": "demo"},
         resume_state_report=_resume_report(workspace),
     )
-    generator.summaries = [{"status": "success", "paper_info": {"title": "Paper A"}}]
+    generator.summaries = [{"status": "success", "paper_info": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "canonical_paper_key": "paper_a"}, "ai_summary": {"paper_metadata": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "journal": "Journal of Tests", "doi": "10.1000/test.paper"}}}]
     generator.summary_file = workspace.artifact_path(f"{project_name}_summaries.json")
     Path(generator.summary_file).write_text(json.dumps(generator.summaries), encoding="utf-8")
     return generator, workspace, registry
@@ -101,7 +101,7 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content.",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -126,8 +126,10 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
     assert artifact_payload["generation_context"]["outline_source_path"] == str(outline_path)
     assert len(artifact_payload["content"]["sections"]) == 2
     assert artifact_payload["content"]["sections"][0]["section_title"] == "First Section"
-    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content."
-    assert artifact_payload["content"]["references"] == ["Author, A. (2024). Demo reference."]
+    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content. [[cite:paper_a|mode=parenthetical]]"
+    assert artifact_payload["content"]["references"] == [
+        "Alice Smith (2024). Paper A *Journal of Tests* https://doi.org/10.1000/test.paper"
+    ]
     assert artifact_payload["projections"]["docx_path"] == str(word_path)
     assert "First Section generated content." in document_text
     assert any(dep["artifact_type"] == "literature_review_outline" for dep in review_records[0]["depends_on"])
@@ -144,20 +146,20 @@ def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Pa
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
             return None
-        return f"{section_title} generated content."
+        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
     monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
 
-    assert generator.generate_full_review_from_outline() is True
+    assert generator.generate_full_review_from_outline() is False
 
     word_path = Path(workspace.report_path("demo_literature_review.docx"))
     draft_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v1.json"))
     failed_sections_path = Path(workspace.report_path("demo_failed_review_sections.json"))
     registry_path = Path(workspace.paths.registry_path)
 
-    assert word_path.exists() is True
+    assert word_path.exists() is False
     assert draft_path.exists() is False
     assert failed_sections_path.exists() is True
     if registry_path.exists():
@@ -199,7 +201,7 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content.",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -213,7 +215,7 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     assert len(review_records) == 1
     assert [section["section_number"] for section in artifact_payload["content"]["sections"]] == [1, 2]
     assert artifact_payload["content"]["sections"][0]["content"] == "Existing section content."
-    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content."
+    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content. [[cite:paper_a|mode=parenthetical]]"
 
 
 def test_retry_failed_review_sections_still_reenters_full_review_generation(
@@ -273,7 +275,7 @@ def test_successful_stage2_generation_creates_registered_review_draft_v2(tmp_pat
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content.\n\nSecond paragraph for {section_title}.",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]\n\nSecond paragraph for {section_title}. [[cite:paper_a|mode=narrative]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -316,13 +318,13 @@ def test_stage2_with_failed_sections_does_not_register_review_draft_v2(tmp_path:
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
             return None
-        return f"{section_title} generated content."
+        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
     monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
 
-    assert generator.generate_full_review_from_outline() is True
+    assert generator.generate_full_review_from_outline() is False
 
     v2_draft_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v2.json"))
     registry_path = Path(workspace.paths.registry_path)
@@ -346,7 +348,7 @@ def test_review_draft_v2_written_to_job_workspace_not_project_root(tmp_path: Pat
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} content.",
+        lambda section_title, _outline: f"{section_title} content. [[cite:paper_a|mode=parenthetical]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
 
@@ -375,7 +377,7 @@ def test_review_draft_v1_and_v2_coexist_in_registry(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} content.",
+        lambda section_title, _outline: f"{section_title} content. [[cite:paper_a|mode=parenthetical]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
 

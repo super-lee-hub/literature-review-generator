@@ -90,7 +90,7 @@ enable_stage1_validation = false
 # 第二阶段验证：对生成的整体文献综述进行引用准确性和一致性验证
 #   true: 启用综述级验证，检查引用准确性和逻辑一致性
 #   false: 跳过综述级验证（推荐）
-enable_stage2_validation = false
+enable_stage2_validation = true
 
 # 📝 速度 vs 准确性权衡建议：
 # - 大批量文献分析（>50篇）：建议都设为 false（速度优先）
@@ -99,7 +99,7 @@ enable_stage2_validation = false
 [Validation]
 # Week 1 起，Validation 段作为验证与 checkpoint 保留策略的真值层。
 stage1_enabled = false
-stage2_enabled = false
+stage2_enabled = true
 keep_checkpoints_after_completion = false
 
 [Retry_Settings]

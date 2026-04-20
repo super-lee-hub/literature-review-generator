@@ -73,7 +73,7 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
         fingerprint_bundle={"request": "demo"},
         resume_state_report=_resume_report(workspace),
     )
-    generator.summaries = [{"status": "success", "paper_info": {"title": "Paper A"}}]
+    generator.summaries = [{"status": "success", "paper_info": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "canonical_paper_key": "paper_a"}, "ai_summary": {"paper_metadata": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "journal": "Journal of Tests", "doi": "10.1000/test.paper"}}}]
     generator.summary_file = workspace.artifact_path(f"{project_name}_summaries.json")
     Path(generator.summary_file).write_text(json.dumps(generator.summaries), encoding="utf-8")
     return generator, workspace, registry
@@ -98,7 +98,7 @@ def test_successful_stage2_generation_creates_registered_citation_manifest(tmp_p
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
         generator, "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content.",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -115,9 +115,9 @@ def test_successful_stage2_generation_creates_registered_citation_manifest(tmp_p
     artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
 
     assert artifact_payload["artifact_type"] == "citation_manifest"
-    assert artifact_payload["artifact_version"] == "v2"
+    assert artifact_payload["artifact_version"] == "v3"
     assert artifact_payload["created_from_job_id"] == workspace.job_id
-    assert artifact_payload["manifest_identity"]["manifest_id"] == "citation_manifest:v1"
+    assert artifact_payload["manifest_identity"]["manifest_id"] == "citation_manifest:v3"
     assert artifact_payload["review_reference"]["review_word_path"] == str(word_path)
     # V2 uses occurrences/clusters/bibliography instead of flat citations
     assert "occurrences" in artifact_payload
@@ -137,20 +137,20 @@ def test_stage2_with_failed_sections_does_not_register_citation_manifest(tmp_pat
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
             return None
-        return f"{section_title} generated content."
+        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
     monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
 
-    assert generator.generate_full_review_from_outline() is True
+    assert generator.generate_full_review_from_outline() is False
 
     word_path = Path(workspace.report_path("demo_literature_review.docx"))
-    citation_path = Path(workspace.artifact_path("citation_manifests/demo_citation_manifest_v1.json"))
+    citation_path = Path(workspace.artifact_path("citation_manifests/demo_citation_manifest_v3.json"))
     failed_sections_path = Path(workspace.report_path("demo_failed_review_sections.json"))
     registry_path = Path(workspace.paths.registry_path)
 
-    assert word_path.exists() is True
+    assert word_path.exists() is False
     assert citation_path.exists() is False
     assert failed_sections_path.exists() is True
     if registry_path.exists():

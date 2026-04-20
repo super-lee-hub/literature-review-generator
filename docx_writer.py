@@ -6,21 +6,23 @@ Word文档生成模块
 import os
 import re
 import logging
-from typing import Optional, Any, Dict, List, cast  # type: ignore
+from datetime import datetime
+from typing import Optional, Any, Dict, List, Mapping, cast  # type: ignore
 from pathlib import Path
 from docx import Document  # type: ignore
 from docx.shared import Pt, Inches, Cm  # type: ignore
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT  # type: ignore
 from docx.oxml.ns import qn  # type: ignore
 from docx.oxml import OxmlElement  # type: ignore
-from docx.oxml.ns import qn  # type: ignore
+
+DOCX_AVAILABLE = True
 
 from services.citation_catalog import (
     build_citation_catalog,
+    build_citation_catalog_from_manifest,
     format_in_text_citation,
     normalize_alias,
 )
-from services.citation_manifest import unresolved_occurrences
 
 
 def _log(logger: Any, level: str, message: str) -> None:
@@ -33,7 +35,17 @@ def _log(logger: Any, level: str, message: str) -> None:
         fallback(message)
 
 
-def _build_citation_entry_lookup(generator_instance: Any) -> Dict[str, Any]:
+def _build_citation_entry_lookup(
+    generator_instance: Any,
+    citation_manifest: Optional[Mapping[str, Any]] = None,
+    *,
+    allow_compat_fallback: bool = False,
+) -> Dict[str, Any]:
+    manifest_data = citation_manifest or {}
+    if manifest_data.get("paper_entries"):
+        return build_citation_catalog_from_manifest(manifest_data)
+    if not allow_compat_fallback:
+        return {}
     summaries = getattr(generator_instance, "summaries", []) or []
     _entries, alias_map = build_citation_catalog(summaries)
     return alias_map
@@ -45,8 +57,18 @@ class _LegacyGeneratorAdapter:
         self.config = {'Styling': styling_config or {}}
 
 
-def render_structured_citations(text: str, generator_instance: Any) -> tuple[str, List[str]]:
-    alias_map = _build_citation_entry_lookup(generator_instance)
+def render_structured_citations(
+    text: str,
+    generator_instance: Any,
+    citation_manifest: Optional[Mapping[str, Any]] = None,
+    *,
+    allow_compat_fallback: bool = False,
+) -> tuple[str, List[str]]:
+    alias_map = _build_citation_entry_lookup(
+        generator_instance,
+        citation_manifest,
+        allow_compat_fallback=allow_compat_fallback,
+    )
     unresolved: List[str] = []
 
     def _replace(match: re.Match[str]) -> str:
@@ -188,7 +210,16 @@ def add_page_number_field(paragraph: Any) -> None:
     run._element.append(fld_char2)  # type: ignore
 
 
-def append_section_to_word_document(generator_instance: Any, section_number: int, section_title: str, section_text: str, word_file: str) -> bool:
+def append_section_to_word_document(
+    generator_instance: Any,
+    section_number: int,
+    section_title: str,
+    section_text: str,
+    word_file: str,
+    *,
+    citation_manifest: Optional[Mapping[str, Any]] = None,
+    allow_compat_fallback: bool = False,
+) -> bool:
     """
     将章节内容追加到Word文档（带高级样式配置）
     
@@ -242,8 +273,17 @@ def append_section_to_word_document(generator_instance: Any, section_number: int
         
         # 添加章节内容
         # 将文本按段落分割
-        rendered_section_text, unresolved_tokens = render_structured_citations(section_text, generator_instance)
+        rendered_section_text, unresolved_tokens = render_structured_citations(
+            section_text,
+            generator_instance,
+            citation_manifest,
+            allow_compat_fallback=allow_compat_fallback,
+        )
         if unresolved_tokens:
+            if not allow_compat_fallback:
+                raise ValueError(
+                    f"Unresolved citation tokens in canonical DOCX render: {', '.join(sorted(set(unresolved_tokens))[:5])}"
+                )
             generator_instance.logger.warning(
                 f"Word 导出时发现未解析 citation token: {', '.join(sorted(set(unresolved_tokens))[:5])}"
             )
@@ -323,7 +363,9 @@ def generate_word_table_of_contents(doc: Any) -> bool:  # type: ignore
 
 def generate_apa_references_from_manifest(
     citation_manifest: Optional[Dict[str, Any]],
-    generator_instance: Any
+    generator_instance: Any,
+    *,
+    allow_compat_fallback: bool = False,
 ) -> List[str]:
     """
     从 citation manifest 生成APA格式的参考文献列表
@@ -355,24 +397,101 @@ def generate_apa_references_from_manifest(
                     references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
                     generator_instance.logger.info("使用 v2 manifest 中的 bibliography 生成参考文献")
                     return references
-                else:
+                elif allow_compat_fallback:
                     # v2 manifest 存在但 bibliography 为空，继续检查 v1 citations
                     generator_instance.logger.warning("v2 manifest 存在但 bibliography 为空，检查 v1 citations")
+                else:
+                    raise ValueError("Canonical citation manifest bibliography is empty")
             
             # 尝试从 v1 manifest 中获取 citations
-            if 'citations' in citation_manifest:
+            if 'citations' in citation_manifest and allow_compat_fallback:
                 generator_instance.logger.warning("只有 v1 manifest，回退到旧方法")
                 # 回退到旧方法
                 return generate_apa_references(generator_instance)
+            if not allow_compat_fallback:
+                raise ValueError("Canonical citation manifest v3 is required for bibliography rendering")
         else:
             # manifest 不存在，记录日志并回退
-            generator_instance.logger.warning("citation manifest 不存在，回退到旧方法")
+            if allow_compat_fallback:
+                generator_instance.logger.warning("citation manifest 不存在，回退到旧方法")
+            else:
+                raise ValueError("Canonical citation manifest v3 is required for bibliography rendering")
     
     except Exception as e:
-        generator_instance.logger.warning(f"从 citation manifest 生成参考文献失败，回退到旧方法: {e}")
+        if allow_compat_fallback:
+            generator_instance.logger.warning(f"从 citation manifest 生成参考文献失败，回退到旧方法: {e}")
+        else:
+            raise
     
     # 回退到旧方法
     return generate_apa_references(generator_instance)
+
+
+def _initialize_review_document(generator_instance: Any, output_path: str) -> None:
+    doc = Document()
+    style_config: Dict[str, Any] = generator_instance.config.get('Styling') or {}
+    font_name: str = style_config.get('font_name', 'Times New Roman')
+    font_size_body: int = int(style_config.get('font_size_body', '12'))
+    font_size_heading1: int = int(style_config.get('font_size_heading1', '16'))
+    font_size_heading2: int = int(style_config.get('font_size_heading2', '14'))
+
+    set_advanced_document_styles(doc, font_name, font_size_body, font_size_heading1, font_size_heading2)
+    add_header_and_footer(doc, "文献综述")
+
+    title = doc.add_heading('文献综述', level=0)
+    title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+    for run in title.runs:
+        run.font.name = font_name
+        run.font.size = Pt(font_size_heading1 + 2)
+
+    date_para = doc.add_paragraph(f"生成时间: {datetime.now().strftime('%Y-%m-%d')}")
+    date_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+    for run in date_para.runs:
+        run.font.name = font_name
+        run.font.size = Pt(font_size_body)
+
+    doc.save(output_path)
+
+
+def rebuild_review_docx_from_structured_artifacts(
+    generator_instance: Any,
+    review_draft: Mapping[str, Any],
+    citation_manifest: Mapping[str, Any],
+    output_path: str,
+    *,
+    allow_compat_fallback: bool = False,
+) -> None:
+    if os.path.exists(output_path):
+        os.remove(output_path)
+    _initialize_review_document(generator_instance, output_path)
+
+    for section in review_draft.get("content", {}).get("sections", []):
+        section_text = "\n\n".join(
+            str(block.get("text") or "").strip()
+            for block in section.get("blocks", [])
+            if str(block.get("text") or "").strip()
+        )
+        append_section_to_word_document(
+            generator_instance,
+            int(section.get("section_number") or 0),
+            str(section.get("section_title") or ""),
+            section_text,
+            output_path,
+            citation_manifest=citation_manifest,
+            allow_compat_fallback=allow_compat_fallback,
+        )
+
+    if DOCX_AVAILABLE and Document is not None:
+        doc = Document(output_path)
+        doc.add_heading("References", level=1)
+        for reference in generate_apa_references_from_manifest(
+            dict(citation_manifest),
+            generator_instance,
+            allow_compat_fallback=allow_compat_fallback,
+        ):
+            doc.add_paragraph(reference)
+        generate_word_table_of_contents(doc)
+        doc.save(output_path)
 
 
 def generate_apa_references(generator_instance: Any) -> List[str]:

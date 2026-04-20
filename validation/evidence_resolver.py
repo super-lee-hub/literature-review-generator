@@ -1,11 +1,40 @@
 from __future__ import annotations
 
-import os
 import json
-from dataclasses import asdict, dataclass, field
+import os
+import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from services.visual_artifact_resolver import normalize_visual_artifact
+
+
+_CORE_ANALYSIS_FIELD_DEFAULTS: Sequence[tuple[str, Any]] = (
+    ("summary", ""),
+    ("key_points", []),
+    ("methodology", ""),
+    ("methods", ""),
+    ("findings", ""),
+    ("key_findings", []),
+    ("conclusions", ""),
+    ("conclusion", ""),
+    ("relevance", ""),
+    ("limitations", ""),
+    ("theoretical_framework", ""),
+    ("research_gap", ""),
+    ("future_research_directions", []),
+)
+
+SOURCE_GROUNDED_RESOLVER_TIERS = frozenset(
+    {
+        "locator_page_index",
+        "preprocess_chunks",
+        "normalized_text",
+        "plain_text_fallback",
+        "visual_refs",
+    }
+)
+SUMMARY_HINT_RESOLVER_TIERS = frozenset({"ai_summary"})
 
 
 @dataclass(frozen=True)
@@ -37,6 +66,111 @@ class EvidenceResolverContext:
 class EvidenceResolver:
     def __init__(self, context: EvidenceResolverContext):
         self.context = context
+        self._stop_words = {
+            "的",
+            "了",
+            "是",
+            "在",
+            "我",
+            "有",
+            "和",
+            "就",
+            "不",
+            "人",
+            "都",
+            "一",
+            "一个",
+            "上",
+            "也",
+            "很",
+            "到",
+            "说",
+            "要",
+            "去",
+            "你",
+            "会",
+            "着",
+            "没有",
+            "看",
+            "好",
+            "自己",
+            "这",
+            "the",
+            "and",
+            "with",
+            "that",
+            "this",
+            "from",
+            "were",
+            "was",
+            "for",
+            "into",
+            "under",
+        }
+
+    @staticmethod
+    def _flatten_summary_fields(fields: Sequence[Any]) -> List[Any]:
+        flattened_fields: List[Any] = []
+        for field_value in fields:
+            if isinstance(field_value, list):
+                flattened_fields.extend(field_value)
+                continue
+            flattened_fields.append(field_value)
+        return flattened_fields
+
+    def _paper_title_for_summary_match(self) -> str:
+        paper_artifact = self.context.paper_artifact
+        for title in (
+            paper_artifact.get("paper_metadata", {}).get("title"),
+            paper_artifact.get("analysis", {}).get("paper_metadata", {}).get("title"),
+            paper_artifact.get("analysis", {}).get("paper_info", {}).get("title"),
+        ):
+            if title:
+                return str(title)
+
+        canonical_paper_key = paper_artifact.get("paper_identity", {}).get("canonical_paper_key", "")
+        if not canonical_paper_key:
+            return ""
+        return str(canonical_paper_key).split("_")[0].replace("_", " ")
+
+    def _significant_words(self, text: str) -> List[str]:
+        return [
+            word
+            for word in re.findall(r"\b\w+\b", str(text or "").lower())
+            if word not in self._stop_words and len(word) > 2
+        ]
+
+    def _build_excerpt_for_overlap(self, context_text: str, matching_words: Sequence[str]) -> str:
+        lowered = context_text.lower()
+        positions = [lowered.find(word) for word in matching_words if word and lowered.find(word) >= 0]
+        anchor = min(positions) if positions else 0
+        start = max(anchor - 200, 0)
+        end = min(len(context_text), start + 500)
+        return context_text[start:end]
+
+    def _source_grounded_overlap(
+        self,
+        cited_span: str,
+        context_text: str,
+    ) -> tuple[float, str]:
+        if not cited_span or not context_text:
+            return (0.0, "")
+        lowered_context = context_text.lower()
+        lowered_span = cited_span.lower()
+        if lowered_span in lowered_context:
+            return (self._calculate_confidence(cited_span, context_text), self._build_excerpt_for_overlap(context_text, [lowered_span]))
+
+        significant_words = self._significant_words(cited_span)
+        if not significant_words:
+            return (0.0, "")
+
+        matching_words = [word for word in significant_words if word in lowered_context]
+        overlap_ratio = len(matching_words) / max(len(significant_words), 1)
+        if len(matching_words) < 3 and overlap_ratio < 0.45:
+            return (0.0, "")
+
+        confidence = min(0.58 + overlap_ratio * 0.32, 0.9)
+        return (confidence, self._build_excerpt_for_overlap(context_text, matching_words))
 
     def resolve_evidence(
         self,
@@ -79,17 +213,11 @@ class EvidenceResolver:
             return candidates
         
         # Extract relevant fields from AI summary
-        summary_fields = []
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("summary", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("key_points", []))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("methodology", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("findings", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("conclusions", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("relevance", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("limitations", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("theoretical_framework", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("research_gap", ""))
-        summary_fields.append(ai_summary.get("core_analysis", {}).get("future_research_directions", []))
+        core_analysis = ai_summary.get("core_analysis", {})
+        summary_fields = [
+            core_analysis.get(field_name, default_value)
+            for field_name, default_value in _CORE_ANALYSIS_FIELD_DEFAULTS
+        ]
         
         # Check specialized details
         specialized_details = ai_summary.get("specialized_details", {})
@@ -103,19 +231,13 @@ class EvidenceResolver:
                         summary_fields.extend(value)
         
         # Flatten the list
-        flattened_fields = []
-        for field in summary_fields:
-            if isinstance(field, list):
-                flattened_fields.extend(field)
-            else:
-                flattened_fields.append(field)
+        flattened_fields = self._flatten_summary_fields(summary_fields)
         
         # Check each field for matches
         for idx, field_text in enumerate(flattened_fields):
             if isinstance(field_text, str) and field_text:
                 # More flexible matching: check if any significant words from cited_span are in field_text
                 # Split cited_span into words and remove common stop words
-                import re
                 cited_words = re.findall(r'\b\w+\b', cited_span.lower())
                 # Filter out common stop words
                 stop_words = set(['的', '了', '是', '在', '我', '有', '和', '就', '不', '人', '都', '一', '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好', '自己', '这'])
@@ -132,9 +254,11 @@ class EvidenceResolver:
                     if (len(significant_words) <= 3 and len(matching_words) >= 1) or \
                        len(matching_words) >= 2 or \
                        (len(significant_words) > 0 and len(matching_words) / len(significant_words) > 0.2):
-                        confidence = self._calculate_confidence(cited_span, field_text)
-                        # AI summary gets highest confidence
-                        confidence = min(confidence + 0.1, 0.99)
+                        overlap_ratio = len(matching_words) / max(len(significant_words), 1)
+                        if cited_span.lower() in field_text.lower():
+                            confidence = min(self._calculate_confidence(cited_span, field_text) + 0.1, 0.99)
+                        else:
+                            confidence = min(0.55 + (overlap_ratio * 0.3), 0.79 if overlap_ratio < 0.8 else 0.85)
                         candidates.append(
                             EvidenceCandidate(
                                 match_reason="ai_summary_match",
@@ -155,21 +279,7 @@ class EvidenceResolver:
                 # Additional check: if cited_span is in Chinese and field_text is in English,
                 # check if the paper title or key concepts from the paper are mentioned in the field_text
                 elif any(char >= '\u4e00' and char <= '\u9fff' for char in cited_span):
-                    # Get paper title from multiple sources
-                    paper_title = self.context.paper_artifact.get("paper_metadata", {}).get("title", "")
-                    if not paper_title:
-                        # Try to get title from analysis section
-                        paper_title = self.context.paper_artifact.get("analysis", {}).get("paper_metadata", {}).get("title", "")
-                    if not paper_title:
-                        # Try to get title from paper_info in analysis section
-                        paper_title = self.context.paper_artifact.get("analysis", {}).get("paper_info", {}).get("title", "")
-                    if not paper_title:
-                        # Try to extract title from canonical_paper_key
-                        canonical_paper_key = self.context.paper_artifact.get("paper_identity", {}).get("canonical_paper_key", "")
-                        if canonical_paper_key:
-                            # Extract title from canonical_paper_key (before the first underscore)
-                            paper_title = canonical_paper_key.split('_')[0].replace('_', ' ')
-                    
+                    paper_title = self._paper_title_for_summary_match()
                     if paper_title:
                         # Split title into significant words
                         title_words = re.findall(r'\b\w+\b', paper_title.lower())
@@ -212,7 +322,7 @@ class EvidenceResolver:
         if not available_artifacts:
             reason = "no_preprocess_artifacts_available"
         else:
-            reason = f"cited_text_not_found_in_any_tier"
+            reason = "cited_text_not_found_in_any_tier"
         
         return EvidenceCandidate(
             match_reason="negative_evidence",
@@ -267,8 +377,8 @@ class EvidenceResolver:
             # If we have a locator, try to find relevant pages
             for idx, page_entry in enumerate(page_index):
                 page_text = page_entry.get("text", "")
-                if cited_span.lower() in page_text.lower():
-                    confidence = self._calculate_confidence(cited_span, page_text)
+                confidence, excerpt = self._source_grounded_overlap(cited_span, page_text)
+                if confidence > 0:
                     confidence = min(confidence + 0.05, 0.98)  # Page index with locator gets a small boost
                     candidates.append(
                         EvidenceCandidate(
@@ -279,7 +389,7 @@ class EvidenceResolver:
                             artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
                             page_span=page_entry.get("page_range", [page_entry.get("page_number", 0)]),
                             chunk_ids=None,
-                            text_excerpt=page_text[:500],
+                            text_excerpt=excerpt or page_text[:500],
                             negative_evidence_reason=None,
                             visual_refs=None,
                             caption_excerpt=None,
@@ -291,8 +401,8 @@ class EvidenceResolver:
         if not locator:
             for idx, page_entry in enumerate(page_index):
                 page_text = page_entry.get("text", "")
-                if cited_span.lower() in page_text.lower():
-                    confidence = self._calculate_confidence(cited_span, page_text)
+                confidence, excerpt = self._source_grounded_overlap(cited_span, page_text)
+                if confidence > 0:
                     candidates.append(
                         EvidenceCandidate(
                             match_reason="page_index_match",
@@ -302,7 +412,7 @@ class EvidenceResolver:
                             artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
                             page_span=page_entry.get("page_range", [page_entry.get("page_number", 0)]),
                             chunk_ids=None,
-                            text_excerpt=page_text[:500],
+                            text_excerpt=excerpt or page_text[:500],
                             negative_evidence_reason=None,
                             visual_refs=None,
                             caption_excerpt=None,
@@ -317,8 +427,8 @@ class EvidenceResolver:
         chunks = self.context.preprocess_artifacts.get("chunks", [])
         for idx, chunk in enumerate(chunks):
             chunk_text = chunk.get("text", "")
-            if cited_span.lower() in chunk_text.lower():
-                confidence = self._calculate_confidence(cited_span, chunk_text)
+            confidence, excerpt = self._source_grounded_overlap(cited_span, chunk_text)
+            if confidence > 0:
                 candidates.append(
                     EvidenceCandidate(
                         match_reason="chunk_text_match",
@@ -328,7 +438,7 @@ class EvidenceResolver:
                         artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
                         page_span=chunk.get("page_range"),
                         chunk_ids=[chunk.get("chunk_id", str(idx))],
-                        text_excerpt=chunk_text[:500],
+                        text_excerpt=excerpt or chunk_text[:500],
                         negative_evidence_reason=None,
                         visual_refs=None,
                         caption_excerpt=None,
@@ -340,10 +450,10 @@ class EvidenceResolver:
     def _resolve_from_normalized_text(self, cited_span: str) -> List[EvidenceCandidate]:
         candidates: List[EvidenceCandidate] = []
         normalized_text = self.context.preprocess_artifacts.get("normalized_text", "")
-        if normalized_text and cited_span.lower() in normalized_text.lower():
-            excerpt_start = max(0, normalized_text.lower().find(cited_span.lower()) - 200)
-            excerpt_end = min(len(normalized_text), excerpt_start + len(cited_span) + 400)
-            confidence = self._calculate_confidence(cited_span, normalized_text)
+        if normalized_text:
+            confidence, excerpt = self._source_grounded_overlap(cited_span, normalized_text)
+            if confidence <= 0:
+                return candidates
             # Normalized text gets slightly lower base confidence
             confidence = max(0.6, confidence * 0.9)
             candidates.append(
@@ -355,7 +465,7 @@ class EvidenceResolver:
                     artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
                     page_span=None,
                     chunk_ids=None,
-                    text_excerpt=normalized_text[excerpt_start:excerpt_end],
+                    text_excerpt=excerpt or normalized_text[:500],
                     negative_evidence_reason=None,
                     visual_refs=None,
                     caption_excerpt=None,
@@ -368,10 +478,10 @@ class EvidenceResolver:
         """Resolve evidence from plain text fallback."""
         candidates: List[EvidenceCandidate] = []
         plain_text = self.context.preprocess_artifacts.get("plain_text", "")
-        if plain_text and cited_span.lower() in plain_text.lower():
-            excerpt_start = max(0, plain_text.lower().find(cited_span.lower()) - 200)
-            excerpt_end = min(len(plain_text), excerpt_start + len(cited_span) + 400)
-            confidence = self._calculate_confidence(cited_span, plain_text)
+        if plain_text:
+            confidence, excerpt = self._source_grounded_overlap(cited_span, plain_text)
+            if confidence <= 0:
+                return candidates
             # Plain text fallback gets lower confidence
             confidence = max(0.5, confidence * 0.85)
             candidates.append(
@@ -383,7 +493,7 @@ class EvidenceResolver:
                     artifact_path=self.context.paper_artifact.get("source", {}).get("source_pdf", ""),
                     page_span=None,
                     chunk_ids=None,
-                    text_excerpt=plain_text[excerpt_start:excerpt_end],
+                    text_excerpt=excerpt or plain_text[:500],
                     negative_evidence_reason=None,
                     visual_refs=None,
                     caption_excerpt=None,

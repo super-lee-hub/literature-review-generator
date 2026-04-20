@@ -40,11 +40,12 @@ from zotero_parser import parse_zotero_report
 from file_finder import create_file_index, FileIndex, find_pdf
 from pdf_extractor import extract_text_from_pdf  # type: ignore
 from ai_interface import get_summary_from_ai, get_summary_from_ai_with_fallback, get_concept_analysis, _call_ai_api  # type: ignore
-from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references, generate_apa_references_from_manifest
+from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references_from_manifest
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from preprocess.service import PreprocessManager
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
+from services.citation_metadata import sanitize_metadata_fields
 from services.config_compat import CompatConfigView
 from services.environment_service import (
     detect_runtime_environment,
@@ -60,16 +61,8 @@ from services.progress_state import (
     load_stage1_progress_snapshot,
     write_stage1_progress_snapshot,
 )
-from services.queue_service import CancelToken, JobCancelledError, PersistentQueueService, QueueJobSpec, QueueState, create_queue_job_id
+from services.queue_service import CancelToken, PersistentQueueService, QueueJobSpec, QueueState, create_queue_job_id
 from services.review_draft import build_review_draft_v1, build_review_draft_v2
-from services.citation_manifest import (
-    build_citation_manifest_v1,
-    build_citation_manifest_v2,
-    CitationOccurrence,
-    CitationCluster,
-    BibliographyEntry,
-    CitationSpan,
-)
 from services.stage1_input_builder import Stage1InputBuilder
 from services.model_selection import get_outline_api_config
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
@@ -86,11 +79,10 @@ from services.summary_reuse import (
     load_summary_records,
 )
 from services.text_io import load_json_file_with_fallbacks
-from utils import ensure_dir, sanitize_path_component
+from utils import ensure_dir
 from setup_wizard import run_setup_wizard
 from summary_schema import get_core_analysis, get_paper_metadata
 from free_mode.profile_manager import build_profile_context, load_profile
-import validator
 
 
 def get_paper_key(paper: 'Dict[str, Any] | PaperInfo') -> str:
@@ -360,10 +352,10 @@ class LiteratureReviewGenerator:
     REVIEW_DRAFT_V2_ARTIFACT_TYPE = "review_draft"
     REVIEW_DRAFT_V2_ARTIFACT_ROLE = "review_draft_v2"
     REVIEW_DRAFT_V2_ARTIFACT_VERSION = "v2"
-    CITATION_MANIFEST_ARTIFACT_ID = "citation_manifest:v1"
+    CITATION_MANIFEST_ARTIFACT_ID = "citation_manifest:v3"
     CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
     CITATION_MANIFEST_ARTIFACT_ROLE = "citation_manifest"
-    CITATION_MANIFEST_ARTIFACT_VERSION = "v1"
+    CITATION_MANIFEST_ARTIFACT_VERSION = "v3"
     
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None, queue_file: str = 'output/_queue/queue.json', zotero_report: Optional[str] = None, library_path: Optional[str] = None):
         self.config_file: str = config_file
@@ -611,7 +603,7 @@ class LiteratureReviewGenerator:
                 arbitration_data = json.load(f)
             
             # 转换为 OutlineArbitrationResult 对象
-            from outline.models import OutlineArbitrationResult, CritiqueArbitration, ArbitrationDecision
+            from outline.models import CritiqueArbitration, ArbitrationDecision
             arbitrations = [
                 CritiqueArbitration(
                     critique_id=arb['critique_id'],
@@ -805,6 +797,12 @@ class LiteratureReviewGenerator:
         if not self.job_workspace:
             raise ValueError("job workspace is not configured")
         project_name = self.project_name or "review"
+        return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_manifest_v3.json")
+
+    def _citation_manifest_v2_path(self) -> str:
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        project_name = self.project_name or "review"
         return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_manifest_v2.json")
 
     def _citation_manifest_v1_path(self) -> str:
@@ -813,6 +811,12 @@ class LiteratureReviewGenerator:
             raise ValueError("job workspace is not configured")
         project_name = self.project_name or "review"
         return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_manifest_v1.json")
+
+    def _citation_migration_report_path(self) -> str:
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        project_name = self.project_name or "review"
+        return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_migration_report.json")
 
     def _extract_review_sections_from_word_document(
         self,
@@ -951,6 +955,7 @@ class LiteratureReviewGenerator:
                 references=references,
                 generation_mode=generation_mode,
                 paper_summaries=paper_summaries,
+                allow_legacy_regex_citations=False,
             )
             artifact_path = self._review_draft_v2_path()
             atomic_write_json(artifact_path, review_draft.to_dict())
@@ -985,18 +990,13 @@ class LiteratureReviewGenerator:
             self.logger.error(f"Failed to persist review_draft_v2: {exc}")
             return False
 
-    def _build_citation_manifest_v2_from_review_draft(
+    def _build_citation_manifest_v3_from_review_draft(
         self,
         review_draft_path: str,
         review_word_path: str,
-        citations: list[dict[str, Any]],
     ) -> Any:
-        """Build CitationManifestV2 from review_draft_v2 block structure and citation data.
-        
-        This creates occurrence/cluster/bibliography truth from the review draft blocks,
-        not just from the final reference list.
-        """
-        from services.citation_manifest import build_citation_manifest_v2_from_review_draft
+        """Build canonical CitationManifestV3 from review_draft_v2 block structure."""
+        from services.citation_manifest import build_citation_manifest_v3_from_review_draft
         
         # Load review_draft_v2 to get block structure
         try:
@@ -1004,21 +1004,9 @@ class LiteratureReviewGenerator:
                 review_draft_v2 = json.load(f)
         except Exception as e:
             self.logger.error(f"Failed to load review_draft_v2: {e}")
-            # Fallback to v1 migration path if review_draft_v2 is not available
-            from services.citation_manifest import migrate_v1_to_v2
-            v1_manifest = build_citation_manifest_v1(
-                job_id=self.job_workspace.job_id if self.job_workspace else "unknown",
-                project_name=self.project_name or "review",
-                manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
-                review_draft_path=review_draft_path,
-                review_word_path=review_word_path,
-                citations=citations,
-            )
-            v2_manifest = migrate_v1_to_v2(v1_manifest)
-            return v2_manifest
+            raise
         
-        # Use direct v2 builder from review_draft_v2 block structure
-        v2_manifest = build_citation_manifest_v2_from_review_draft(
+        return build_citation_manifest_v3_from_review_draft(
             job_id=self.job_workspace.job_id if self.job_workspace else "unknown",
             project_name=self.project_name or "review",
             manifest_id=self.CITATION_MANIFEST_ARTIFACT_ID,
@@ -1027,30 +1015,26 @@ class LiteratureReviewGenerator:
             review_draft_v2=review_draft_v2,
             paper_summaries=[dict(summary) for summary in self.summaries],
         )
-        
-        return v2_manifest
 
     def _persist_citation_manifest(
         self,
         *, 
         review_draft_path: str,
         review_word_path: str,
-        citations: list[dict[str, Any]],
+        citations: Optional[list[dict[str, Any]]] = None,
     ) -> bool:
         if not self.job_workspace or not self.artifact_registry:
             return True
 
         try:
-            # Build v2 as primary truth source with occurrence/cluster/bibliography
-            citation_manifest_v2 = self._build_citation_manifest_v2_from_review_draft(
+            citation_manifest_v3 = self._build_citation_manifest_v3_from_review_draft(
                 review_draft_path=review_draft_path,
                 review_word_path=review_word_path,
-                citations=citations,
             )
             
-            # Persist v2 as primary artifact
-            artifact_path_v2 = self._citation_manifest_path()
-            atomic_write_json(artifact_path_v2, citation_manifest_v2.to_dict())
+            artifact_path_v3 = self._citation_manifest_path()
+            atomic_write_json(artifact_path_v3, citation_manifest_v3.to_dict())
+            atomic_write_json(self._citation_migration_report_path(), citation_manifest_v3.migration_report.to_dict())
 
             depends_on: List[ArtifactDependencyRef] = []
             if review_draft_path:
@@ -1061,29 +1045,27 @@ class LiteratureReviewGenerator:
                     )
                 )
 
-            # Register v2 as primary artifact
             self.artifact_registry.register_file(
                 artifact_role=self.CITATION_MANIFEST_ARTIFACT_ROLE,
                 artifact_type=self.CITATION_MANIFEST_ARTIFACT_TYPE,
-                artifact_version="v2",  # Now v2 is the primary version
-                path=artifact_path_v2,
+                artifact_version="v3",
+                path=artifact_path_v3,
                 producer="main.LiteratureReviewGenerator.generate_full_review_from_outline",
                 depends_on=depends_on,
                 artifact_id=self.CITATION_MANIFEST_ARTIFACT_ID,
             )
-            
-            # Also persist v1 as explicit compatibility projection
+
             artifact_path_v1 = self._citation_manifest_v1_path()
             v1_compatible = {
                 "artifact_type": "citation_manifest",
                 "artifact_version": "v1",
-                "created_from_job_id": citation_manifest_v2.created_from_job_id,
-                "created_at": citation_manifest_v2.created_at,
+                "created_from_job_id": citation_manifest_v3.created_from_job_id,
+                "created_at": citation_manifest_v3.created_at,
                 "manifest_identity": {
-                    **citation_manifest_v2.manifest_identity,
-                    "projection_from": "v2",
+                    **citation_manifest_v3.manifest_identity,
+                    "projection_from": "v3",
                 },
-                "review_reference": citation_manifest_v2.review_reference,
+                "review_reference": citation_manifest_v3.review_reference,
                 "citations": [
                     {
                         "citation_id": occ.occurrence_id,
@@ -1096,7 +1078,7 @@ class LiteratureReviewGenerator:
                         "block_order": occ.block_order,
                         "review_draft_version": "v2",
                     }
-                    for occ in citation_manifest_v2.occurrences
+                    for occ in citation_manifest_v3.occurrences
                 ],
             }
             atomic_write_json(artifact_path_v1, v1_compatible)
@@ -2115,7 +2097,7 @@ class LiteratureReviewGenerator:
         if not needs_backfill:
             return []
 
-        metadata = self._extract_stage1_metadata(stage1_text, paper)
+        metadata = sanitize_metadata_fields(self._extract_stage1_metadata(stage1_text, paper))
         updated_fields: List[str] = []
 
         extracted_authors = list(metadata.get("authors") or [])
@@ -2146,6 +2128,7 @@ class LiteratureReviewGenerator:
             updated_fields.append("DOI")
 
         return updated_fields
+
 
     def _resolve_free_mode_context(self) -> str:
         """Build prompt context from a saved free-mode profile or an ad-hoc idea."""
@@ -2441,81 +2424,14 @@ class LiteratureReviewGenerator:
         )
 
     def _apply_ai_metadata_backfill(self, paper: PaperInfo, ai_summary: Any) -> List[str]:
-        metadata = get_paper_metadata(ai_summary or {})
+        metadata = sanitize_metadata_fields(get_paper_metadata(ai_summary or {}))
         updated_fields: List[str] = []
 
-        # Clean extracted metadata to remove noise
-        def clean_field(value: Any) -> str:
-            if not value:
-                return ""
-            text = str(value).strip()
-            # Remove common noise patterns
-            noise_patterns = [
-                "Contents lists available at ScienceDirect",
-                "RESEARCH ARTICLE",
-                "Article",
-                "Abstract",
-                "摘要",
-                "Introduction",
-                "引言",
-                "Keywords",
-                "关键词",
-                "References",
-                "参考文献",
-                "Copyright",
-                "版权",
-                "©",
-                "Published by",
-                "Elsevier",
-                "Springer",
-                "Taylor & Francis",
-                "Wiley",
-                "Oxford University Press",
-                "Cambridge University Press",
-                "American Psychological Association",
-                "APA",
-                "IEEE",
-                "ACM",
-                "SpringerLink",
-                "ScienceDirect",
-                "PubMed",
-                "Google Scholar",
-                "DOI:",
-                "doi:",
-            ]
-            for pattern in noise_patterns:
-                text = text.replace(pattern, "").strip()
-            # Remove excessive whitespace
-            text = ' '.join(text.split())
-            return text
-
-        def clean_doi(value: Any) -> str:
-            if not value:
-                return ""
-            text = str(value).strip()
-            # Extract only the DOI part (10.xxxx/xxxx)
-            import re
-            doi_match = re.search(r'10\.\d{4,}/[^\s]+', text)
-            if doi_match:
-                return doi_match.group(0)
-            # Remove any non-DOI content
-            text = text.replace("https://doi.org/", "").strip()
-            # Keep only alphanumeric, dots, slashes, hyphens, and underscores
-            text = re.sub(r'[^a-zA-Z0-9./\-_]', '', text)
-            return text
-
-        extracted_title = clean_field(metadata.get("title"))
-        extracted_authors = [clean_field(author) for author in (metadata.get("authors") or []) if clean_field(author)]
-        extracted_year = clean_field(metadata.get("year"))
-        # Validate year format (4 digits)
-        import re
-        year_match = re.search(r'20\d{2}', extracted_year)
-        if year_match:
-            extracted_year = year_match.group(0)
-        else:
-            extracted_year = ""
-        extracted_journal = clean_field(metadata.get("journal"))
-        extracted_doi = clean_doi(metadata.get("doi"))
+        extracted_title = str(metadata.get("title") or "").strip()
+        extracted_authors = list(metadata.get("authors") or [])
+        extracted_year = str(metadata.get("year") or "").strip()
+        extracted_journal = str(metadata.get("journal") or "").strip()
+        extracted_doi = str(metadata.get("doi") or "").strip()
 
         if extracted_title and extracted_title != str(paper.get("title") or "").strip():
             paper["title"] = extracted_title
@@ -2544,6 +2460,7 @@ class LiteratureReviewGenerator:
             updated_fields.append("DOI")
 
         return updated_fields
+
 
     def _save_failed_review_sections(self, failed_sections: List[Dict[str, Any]]) -> None:
         failed_sections_file = self._get_failed_review_sections_file_path()
@@ -4793,9 +4710,18 @@ class LiteratureReviewGenerator:
                 
                 # 检查章节内容是否包含结构化citation token
                 if "[[cite:" not in section_content:
-                    self.logger.warning(
-                        f"第{section_num}章内容缺少结构化citation token；继续保留章节内容，并在后续工件中按可用信息持久化。"
+                    self.logger.error(
+                        f"Section {section_num} is missing structured citation tokens; canonical review generation is blocked."
                     )
+                    failed_sections.append(
+                        {
+                            "section_number": int(section_num),
+                            "section_title": section_title,
+                            "failure_reason": "missing_structured_citation_tokens",
+                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
+                    continue
 
                 review_sections_by_number[int(section_num)] = {
                     "section_number": int(section_num),
@@ -4803,55 +4729,7 @@ class LiteratureReviewGenerator:
                     "content": section_content,
                 }
                 
-                # 添加章节标题和内容到Word文档
-                doc.add_paragraph()  # 空行分隔
-                
-                heading = doc.add_heading(f'第{section_num}章 {section_title}', level=1)
-                heading.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT  # type: ignore
-                
-                # 加载样式配置
-                style_config = self.config.get('Styling') if self.config else {}  # type: ignore
-                font_name = style_config.get('font_name', 'Times New Roman')  # type: ignore
-                font_size_body = int(style_config.get('font_size_body', '12'))  # type: ignore
-                font_size_heading1 = int(style_config.get('font_size_heading1', '16'))  # type: ignore
-                
-                # 应用标题样式
-                for run in heading.runs:
-
-                    run.font.name = font_name  # type: ignore
-
-                    run.font.size = Pt(font_size_heading1)  # type: ignore
-                
-                # 渲染结构化引用
-                from docx_writer import render_structured_citations
-                rendered_section_text, unresolved_tokens = render_structured_citations(section_content, self)
-                if unresolved_tokens:
-                    self.logger.warning(f"第{section_num}章存在未解析的引用标记: {', '.join(sorted(set(unresolved_tokens))[:5])}")
-                    failed_sections.append(
-                        {
-                            "section_number": int(section_num),
-                            "section_title": section_title,
-                            "failure_reason": "unresolved_citation_tokens",
-                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
-                    )
-                
-                # 将章节内容按段落分割并添加到文档
-                paragraphs = rendered_section_text.split('\n\n')
-                for para in paragraphs:
-                    para = para.strip()
-                    if para:
-                        p = doc.add_paragraph(para)
-                        # 应用正文字体样式
-
-                        for run in p.runs:
-
-                            run.font.name = font_name  # type: ignore
-
-                            run.font.size = Pt(font_size_body)  # type: ignore
-                
-                # 更新断点文件（每完成一章就更新断点，但不立即保存文档）
-                checkpoint_data: Dict[str, Any] = {  # type: ignore
+                checkpoint_data: Dict[str, Any] = {
                     'last_completed_section': i,
                     'last_section_title': section_title,
                     'update_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -4861,81 +4739,15 @@ class LiteratureReviewGenerator:
                 self.logger.success(f"第{section_num}章已处理并更新断点")
             
             # 在所有章节处理完成后，一次性保存文档
-            doc.save(word_file)
-            self.logger.success(f"完整文献综述已保存: {word_file}")
-            
-            # 检查 citation manifest 是否有未解析的引用
-            self.logger.info("正在检查 citation manifest 中的引用解析状态...")
-            citation_manifest = self._load_citation_manifest()
-            from services.citation_manifest import unresolved_occurrences
-            unresolved_cites = unresolved_occurrences(citation_manifest) if citation_manifest else []
-            
-            if unresolved_cites:
-                self.logger.error(f"发现 {len(unresolved_cites)} 个未解析的引用，阻止 Word 导出")
-                self.logger.error("请修复以下未解析的引用:")
-                for cite in unresolved_cites[:5]:  # 只显示前5个
-                    self.logger.error(f"  - {cite}")
-                if len(unresolved_cites) > 5:
-                    self.logger.error(f"  ... 还有 {len(unresolved_cites) - 5} 个未解析引用")
-                
-                # 保存失败报告
-                self._save_failed_review_sections(failed_sections + [{
-                    "section_number": 999,
-                    "section_title": "参考文献",
-                    "failure_reason": f"unresolved_citations",
-                    "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }])
-                
-                return False
-            
-            # 生成APA参考文献（总是执行，确保参考文献总是存在）
-            self.logger.info("正在生成APA参考文献...")
-            references = self.generate_apa_references()
-            if references:
-                doc.add_paragraph()  # 空行分隔
-                ref_heading = doc.add_heading('参考文献', level=1)
-                ref_heading.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT  # type: ignore
-                
-                # 加载样式配置
-                style_config = self.config.get('Styling') if self.config else {}  # type: ignore
-                font_name = style_config.get('font_name', 'Times New Roman')  # type: ignore
-                font_size_body = int(style_config.get('font_size_body', '12'))  # type: ignore
-                
-                # 应用参考文献标题样式
-                for run in ref_heading.runs:
-
-                    run.font.name = font_name  # type: ignore
-                
-                # 添加参考文献，应用APA悬挂缩进
-                for ref in references:
-                    p = doc.add_paragraph(ref)
-                    # 应用正文字体样式
-
-                    for run in p.runs:
-
-                        run.font.name = font_name  # type: ignore
-
-                        run.font.size = Pt(font_size_body)  # type: ignore
-                    # 设置APA悬挂缩进：首行不缩进，后续行缩进1.27厘米（0.5英寸）
-                    p.paragraph_format.first_line_indent = 0
-                    p.paragraph_format.left_indent = Pt(36)  # type: ignore
-                
-                self.logger.success(f"已添加 {len(references)} 条参考文献（APA格式）")
-            else:
-                self.logger.warning("未生成任何参考文献，请检查摘要数据是否完整")
-            
-            # 最终保存
-            doc.save(word_file)
-            
             self._save_failed_review_sections(failed_sections)
             
-            # 发送阶段二完成的进度
+            # Emit final stage-two progress after all sections are processed.
             if not failed_sections:
                 self._emit_progress(
                     stage="outline",
                     total=total_sections,
                     current=total_sections,
-                    message="所有章节生成成功！",
+                    message="All review sections generated successfully.",
                     indeterminate=False
                 )
             else:
@@ -4943,46 +4755,30 @@ class LiteratureReviewGenerator:
                     stage="outline",
                     total=total_sections,
                     current=total_sections - len(failed_sections),
-                    message=f"章节生成完成，有 {len(failed_sections)} 个章节生成失败",
+                    message=f"Review generation finished with {len(failed_sections)} failed sections.",
                     indeterminate=False
                 )
 
-            # 清除断点文件（表示全部完成）
             if os.path.exists(review_checkpoint_file):
-                # 检查是否应保留检查点文件
                 keep_checkpoints = self._keep_checkpoints_after_completion()
                 if not keep_checkpoints:
                     os.remove(review_checkpoint_file)
-                    self.logger.info("已清除断点文件，所有章节生成完成")
+                    self.logger.info("Removed review checkpoint after section generation completed.")
                 else:
-                    self.logger.info("配置要求保留检查点文件，已跳过清理")
-            
-            # 生成目录（在最终保存前）
-            if last_completed_section < len(section_matches) or not os.path.exists(review_checkpoint_file):
-                self.logger.info("正在生成Word文档目录...")
-                self.generate_word_table_of_contents(doc)  # type: ignore
-                self.logger.success("目录已生成")
-                
-                # 最终保存
-                doc.save(word_file)
+                    self.logger.info("Keeping review checkpoint because configuration requires it.")
 
             if failed_sections:
                 self.logger.warning("Skipping review_draft_v1 registration because one or more review sections failed")
+                return False
             else:
                 review_sections = [
                     review_sections_by_number[int(section_num)]
                     for section_num, _section_title in section_matches
                     if int(section_num) in review_sections_by_number
                 ]
-                if not self._persist_review_draft(
-                    outline_file=outline_file,
-                    review_sections=review_sections,
-                    references=references,
-                    word_file=word_file,
-                ):
-                    return False
+                references: List[str] = []
 
-                # Persist review_draft_v2 (block-structured durability)
+                # Persist review_draft_v2 once with empty references so the canonical manifest can be built from block citations.
                 if not self._persist_review_draft_v2(
                     outline_file=outline_file,
                     review_sections=review_sections,
@@ -4991,57 +4787,53 @@ class LiteratureReviewGenerator:
                 ):
                     return False
 
-                # Create minimal citation manifest
                 review_draft_path = self._review_draft_v2_path()
-                # Generate minimal citation data with real paper IDs using deterministic mapping
-                minimal_citations = []
-                
-                # Build a mapping from canonical paper key to paper info for deterministic matching
-                paper_key_to_info = {}
-                for summary in self.summaries:
-                    paper_info = summary.get('paper_info', {})
-                    canonical_key = self.get_paper_key(paper_info)
-                    if canonical_key:
-                        paper_key_to_info[canonical_key] = paper_info
-                
-                for i, ref in enumerate(references):
-                    # Get real paper ID using deterministic matching
-                    paper_id = f"paper_{i+1}"  # Fallback to placeholder
-                    
-                    # Try to find a matching paper by checking all summaries
-                    # This is more robust than index-based matching
-                    for summary in self.summaries:
-                        paper_info = summary.get('paper_info', {})
-                        canonical_key = self.get_paper_key(paper_info)
-                        
-                        # Check if this paper's info matches the reference
-                        title = paper_info.get('title', '').lower()
-                        authors = ''.join(paper_info.get('authors', [])).lower()
-                        
-                        # Simple heuristic: check if title or authors are in the reference
-                        ref_lower = ref.lower()
-                        if (title and title in ref_lower) or (authors and authors in ref_lower):
-                            paper_id = canonical_key
-                            break
-                    
-                    minimal_citations.append({
-                        "citation_id": f"cite_{i+1}",
-                        "paper_id": paper_id,
-                        "text": ref,
-                        "context": "Reference list",
-                        "section_number": len(section_matches) + 1,  # References section
-                        "section_title": "参考文献",
-                        "block_id": f"ref_block_{i+1}",
-                        "block_order": i + 1,
-                    })
-                
                 if not self._persist_citation_manifest(
                     review_draft_path=review_draft_path,
                     review_word_path=word_file,
-                    citations=minimal_citations,
                 ):
                     return False
-            
+
+                citation_manifest = self._load_citation_manifest()
+                if not citation_manifest:
+                    self.logger.error("Canonical citation_manifest_v3 was not persisted.")
+                    return False
+
+                from docx_writer import generate_apa_references_from_manifest, rebuild_review_docx_from_structured_artifacts
+
+                references = generate_apa_references_from_manifest(
+                    citation_manifest,
+                    self,
+                    allow_compat_fallback=False,
+                )
+
+                # Persist both draft projections again with canonical references attached.
+                if not self._persist_review_draft(
+                    outline_file=outline_file,
+                    review_sections=review_sections,
+                    references=references,
+                    word_file=word_file,
+                ):
+                    return False
+
+                if not self._persist_review_draft_v2(
+                    outline_file=outline_file,
+                    review_sections=review_sections,
+                    references=references,
+                    word_file=word_file,
+                ):
+                    return False
+
+                with open(review_draft_path, "r", encoding="utf-8") as handle:
+                    review_draft = json.load(handle)
+                rebuild_review_docx_from_structured_artifacts(
+                    self,
+                    review_draft,
+                    citation_manifest,
+                    word_file,
+                    allow_compat_fallback=False,
+                )
+
             self.logger.success(f"完整文献综述已生成: {word_file}")
             
             # 第二阶段验证（根据配置决定是否自动运行）
@@ -5070,27 +4862,38 @@ class LiteratureReviewGenerator:
         """为Word文档生成自动目录"""
         return generate_word_table_of_contents(doc)
 
-    def _load_citation_manifest(self) -> Optional[Dict[str, Any]]:
-        """尝试加载 citation manifest（优先 v2，回退到 v1）"""
+    def _load_citation_manifest(self, *, allow_legacy: bool = False) -> Optional[Dict[str, Any]]:
+        """Load the canonical citation manifest, optionally falling back to legacy artifacts for migration or compatibility only."""
         try:
-            v2_path = self._citation_manifest_path()
+            v3_path = self._citation_manifest_path()
+            if os.path.exists(v3_path):
+                with open(v3_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            if not allow_legacy:
+                return None
+            v2_path = self._citation_manifest_v2_path()
             if os.path.exists(v2_path):
                 with open(v2_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    manifest = json.load(f)
+                manifest.setdefault("migration_report", {})
+                manifest["migration_report"].setdefault("load_source", "v2")
+                return manifest
             v1_path = self._citation_manifest_v1_path()
             if os.path.exists(v1_path):
                 with open(v1_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    manifest = json.load(f)
+                manifest.setdefault("migration_report", {})
+                manifest["migration_report"].setdefault("load_source", "v1")
+                return manifest
         except Exception as e:
-            self.logger.warning(f"加载 citation manifest 失败: {e}")
+            self.logger.warning(f"Failed to load citation manifest: {e}")
         return None
 
     def generate_apa_references(self) -> List[str]:
-        """生成APA格式的参考文献列表（优先使用 citation manifest）"""
+        """Generate APA references from the canonical citation manifest."""
         citation_manifest = self._load_citation_manifest()
-        return generate_apa_references_from_manifest(citation_manifest, self)
+        return generate_apa_references_from_manifest(citation_manifest, self, allow_compat_fallback=False)
 
-    
 
     def generate_literature_review_outline(self) -> bool:
         """生成文献综述大纲（带智能续写循环）"""

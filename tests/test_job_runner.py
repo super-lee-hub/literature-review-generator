@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 
 import main
@@ -230,3 +231,86 @@ def test_build_job_request_from_mapping_supports_summary_source_and_reuse_fields
     assert request.summary_sources == ("D:/subset.json", "D:/subset-b.json")
     assert request.reuse_stage1 is True
     assert request.reuse_summary_files == ("D:/reuse-a.json", "D:/reuse-b.json")
+
+
+def test_job_runner_validate_review_uses_validator_module_directly(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    called: dict[str, object] = {}
+
+    class _Generator(_DummyGenerator):
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
+            super().__init__(config_file, project_name, pdf_folder, queue_file, zotero_report, library_path)
+            self.config = {"Paths": {"output_path": str(output_dir)}}
+
+    def _fake_run_review_validation(generator):
+        called["generator"] = generator
+        return {"success": True, "report": None, "manual_review_items": [], "report_file": "report.txt", "manual_report_file": "manual.json"}
+
+    monkeypatch.setattr(main, "LiteratureReviewGenerator", _Generator)
+    monkeypatch.setattr("validator.run_review_validation", _fake_run_review_validation)
+
+    result = JobRunner().run(
+        JobRunRequest(
+            config="config.ini",
+            project_name="demo",
+            pdf_folder=None,
+            action="validate_review",
+            validate_review=True,
+        )
+    )
+
+    assert result.success is True
+    assert isinstance(called["generator"], _Generator)
+
+
+def test_job_runner_validate_review_recovers_lossy_project_name_from_existing_workspace(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    requested_project_name = "_______must"
+    recovered_project_name = "\u4fc3\u9500\u7efc\u8ff0\u7b2c\u4e8c\u8282must"
+    stale_project_name = "\u4fc3\u9500\u7efc\u8ff0\u7b2c\u4e00\u8282must"
+    called: dict[str, object] = {}
+
+    class _Generator(_DummyGenerator):
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
+            super().__init__(config_file, project_name, pdf_folder, queue_file, zotero_report, library_path)
+            self.config = {"Paths": {"output_path": str(output_dir)}}
+
+    def _touch_validation_artifacts(project_name: str, job_id: str, *, mtime: int) -> None:
+        workspace = output_dir / f"{project_name}__{job_id}"
+        (workspace / "artifacts" / "review_drafts").mkdir(parents=True, exist_ok=True)
+        (workspace / "artifacts" / "citation_manifests").mkdir(parents=True, exist_ok=True)
+        (workspace / "artifacts" / f"{project_name}_summaries.json").write_text("[]", encoding="utf-8")
+        (workspace / "artifacts" / "review_drafts" / f"{project_name}_review_draft_v2.json").write_text("{}", encoding="utf-8")
+        (workspace / "artifacts" / "citation_manifests" / f"{project_name}_citation_manifest_v3.json").write_text("{}", encoding="utf-8")
+        os.utime(workspace, (mtime, mtime))
+
+    empty_workspace = output_dir / f"{requested_project_name}__20260419_164547"
+    (empty_workspace / "artifacts").mkdir(parents=True, exist_ok=True)
+    _touch_validation_artifacts(stale_project_name, "20260418_041144", mtime=100)
+    _touch_validation_artifacts(recovered_project_name, "20260418_041739", mtime=200)
+
+    def _fake_run_review_validation(generator):
+        called["project_name"] = generator.project_name
+        called["workspace"] = generator.job_workspace.root_dir
+        return {"success": True, "report": None, "manual_review_items": [], "report_file": "report.txt", "manual_report_file": "manual.json"}
+
+    monkeypatch.setattr(main, "LiteratureReviewGenerator", _Generator)
+    monkeypatch.setattr("validator.run_review_validation", _fake_run_review_validation)
+
+    result = JobRunner().run(
+        JobRunRequest(
+            config="config.ini",
+            project_name=requested_project_name,
+            pdf_folder=None,
+            action="validate_review",
+            validate_review=True,
+        )
+    )
+
+    pointer_path = output_dir / recovered_project_name / "_latest_job.json"
+    pointer_payload = json.loads(pointer_path.read_text(encoding="utf-8"))
+
+    assert result.success is True
+    assert called["project_name"] == recovered_project_name
+    assert str(called["workspace"]).endswith(f"{recovered_project_name}__20260418_041739")
+    assert pointer_payload["workspace_path"].endswith(f"{recovered_project_name}__20260418_041739")

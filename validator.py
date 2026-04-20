@@ -7,8 +7,9 @@
 """
 import os
 import json
-import re
 import traceback
+import hashlib
+import time
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import configparser
@@ -41,6 +42,7 @@ except ImportError:
 # 导入主程序中的AI接口调用函数
 from ai_interface import _call_ai_api  # type: ignore
 from summary_schema import get_core_analysis
+from validation.llm_adjudicator import build_adjudication_packet, run_adjudication_stage
 
 def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: Dict[str, Any],
                            use_cache: bool = True) -> Dict[str, Any]:
@@ -384,7 +386,7 @@ def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str,
                     with open(record.path, "r", encoding="utf-8") as handle:
                         paper_artifacts.append(json.load(handle))
                 except Exception as exc:
-                    generator_instance.logger.warning(f"?? paper artifact ??: {exc}")
+                    generator_instance.logger.warning(f"Failed to load paper artifact: {exc}")
     except Exception as exc:
         generator_instance.logger.warning(
             f"Failed to load paper artifacts from the artifact registry; falling back to summaries: {exc}"
@@ -424,6 +426,24 @@ def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str,
     return review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata
 
 
+def _bundle_progress_label(bundle: Dict[str, Any]) -> str:
+    citation_set_key = str(bundle.get("citation_set_key") or bundle.get("bundle_id") or "unknown").strip()
+    paper_count = len([str(item).strip() for item in bundle.get("paper_ids", []) if str(item).strip()])
+    block_count = len([str(item).strip() for item in bundle.get("block_ids", []) if str(item).strip()])
+    claim_unit_count = len(bundle.get("claim_units", []) or [])
+    preview = citation_set_key if len(citation_set_key) <= 80 else f"{citation_set_key[:77]}..."
+    return f"{preview} (papers={paper_count}, blocks={block_count}, claim_units={claim_unit_count})"
+
+
+def _run_base_review_validation(validator: Any, progress_callback: Any = None) -> Any:
+    if progress_callback is None:
+        return validator.validate()
+    try:
+        return validator.validate(progress_callback=progress_callback)
+    except TypeError:
+        return validator.validate()
+
+
 def _build_report_from_results(citation_results: List[Any]) -> Any:
     from validation.review_validator import ReviewValidationReport, ValidationConclusion
 
@@ -431,17 +451,70 @@ def _build_report_from_results(citation_results: List[Any]) -> Any:
         report_id=f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         created_at=datetime.now().isoformat(),
         total_citations=len(citation_results),
-        supported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.SUPPORTED),
+        supported_count=sum(
+            1
+            for item in citation_results
+            if item.conclusion == ValidationConclusion.SUPPORTED
+            and _result_disposition(item) != "narrowed_and_kept"
+        ),
         partial_support_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.PARTIAL_SUPPORT),
         unsupported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.UNSUPPORTED),
         wrong_source_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.WRONG_SOURCE),
         needs_review_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.NEEDS_REVIEW),
         citation_results=citation_results,
+        narrowed_and_kept_count=sum(1 for item in citation_results if _result_disposition(item) == "narrowed_and_kept"),
+        evidence_gap_count=sum(1 for item in citation_results if _result_evidence_status(item) == "evidence_gap"),
+    )
+
+
+def _result_evidence_status(result: Any) -> str:
+    return str(getattr(result, "evidence_status", "") or result.details.get("evidence_status", "") or "")
+
+
+def _result_disposition(result: Any) -> str:
+    return str(getattr(result, "disposition", "") or result.details.get("disposition", "") or "")
+
+
+def _serialize_evidence_candidates(result: Any) -> List[Dict[str, Any]]:
+    return [
+        {
+            "match_reason": candidate.match_reason,
+            "resolver_tier": candidate.resolver_tier,
+            "confidence": candidate.confidence,
+            "page_span": candidate.page_span,
+            "chunk_ids": candidate.chunk_ids,
+            "text_excerpt": candidate.text_excerpt,
+            "negative_evidence_reason": candidate.negative_evidence_reason,
+            "caption_excerpt": candidate.caption_excerpt,
+            "evidence_scope": candidate.evidence_scope,
+            "source_grounded": candidate.resolver_tier
+            in {"locator_page_index", "preprocess_chunks", "normalized_text", "plain_text_fallback", "visual_refs"},
+        }
+        for candidate in getattr(result, "evidence_candidates", [])[:8]
+    ]
+
+
+def _is_manual_review_item(result: Any) -> bool:
+    repair_scope = str(result.details.get("repair_scope") or "").lower()
+    return (
+        result.low_confidence
+        or result.conclusion.value == "NEEDS_REVIEW"
+        or repair_scope == "manual_review"
+        or _result_disposition(result).lower() == "manual_review"
     )
 
 
 def _get_validator_api_config(generator_instance: Any) -> Optional[APIConfig]:
-    validator_config: Dict[str, Any] = (generator_instance.config.get("Validator_API") or {}) if generator_instance.config else {}
+    validator_section: Dict[str, Any] = {}
+    config_obj = getattr(generator_instance, "config", None)
+    if config_obj:
+        getter = getattr(config_obj, "get", None)
+        if callable(getter):
+            try:
+                validator_section = getter("Validator_API") or {}
+            except TypeError:
+                validator_section = {}
+    validator_config: Dict[str, Any] = validator_section
     api_key = str(validator_config.get("api_key") or "").strip()
     model = str(validator_config.get("model") or "").strip()
     if not api_key or not model:
@@ -472,18 +545,124 @@ def _load_source_text_for_artifact(paper_artifact: Dict[str, Any]) -> str:
     return str(paper_artifact.get("source", {}).get("source_text") or "")
 
 
+def _normalize_ai_confidence(value: Any) -> float:
+    if value is None:
+        return 0.0
+
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    else:
+        text = str(value).strip().lower()
+        if not text:
+            return 0.0
+
+        label_map = {
+            "very_low": 0.1,
+            "low": 0.25,
+            "medium": 0.55,
+            "moderate": 0.55,
+            "high": 0.85,
+            "very_high": 0.95,
+        }
+        if text in label_map:
+            return label_map[text]
+
+        if text.endswith("%"):
+            text = text[:-1].strip()
+            try:
+                numeric = float(text) / 100.0
+            except ValueError:
+                return 0.0
+        else:
+            try:
+                numeric = float(text)
+            except ValueError:
+                return 0.0
+
+    if numeric > 1.0 and numeric <= 100.0:
+        numeric /= 100.0
+
+    if numeric < 0.0:
+        return 0.0
+    if numeric > 1.0:
+        return 1.0
+    return numeric
+
+
+def _attach_adjudication_metadata(
+    result: Any,
+    *,
+    packet: Optional[Dict[str, Any]] = None,
+    adjudication_stage: str = "preflight",
+    adjudication_status: Optional[str] = None,
+    escalated: Optional[bool] = None,
+) -> Any:
+    details = dict(getattr(result, "details", {}) or {})
+    if packet:
+        details["adjudication_packet"] = packet
+        details["packet_trimmed_candidate_counts"] = dict(packet.get("trimmed_candidate_counts") or {})
+        details.setdefault("claim_type", packet.get("claim_type", ""))
+        details.setdefault("claim_type_confidence", packet.get("claim_type_confidence", 0.0))
+        details.setdefault("claim_type_rationale", packet.get("claim_type_rationale", ""))
+    status_value = adjudication_status or str(details.get("adjudication_status") or getattr(result, "adjudication_status", "") or getattr(result, "evidence_status", "") or "")
+    details["adjudication_stage"] = adjudication_stage
+    details["adjudication_status"] = status_value
+    if escalated is None:
+        escalated = adjudication_stage == "stronger" or bool(details.get("escalated") or getattr(result, "escalated", False))
+    details["escalated"] = bool(escalated)
+
+    try:
+        result.details = details
+    except Exception:
+        pass
+    for attr, value in (
+        ("claim_type", details.get("claim_type", "")),
+        ("claim_type_confidence", float(details.get("claim_type_confidence") or 0.0)),
+        ("adjudication_stage", adjudication_stage),
+        ("adjudication_status", status_value),
+        ("escalated", bool(details.get("escalated"))),
+    ):
+        try:
+            setattr(result, attr, value)
+        except Exception:
+            pass
+    return result
+
+
 def _map_ai_bundle_result(result: Any, ai_report: Dict[str, Any]) -> Any:
     from validation.review_validator import CitationValidationResult, RootCause, ValidationConclusion
 
     status = str(ai_report.get("status") or "").strip().lower()
-    confidence = float(ai_report.get("confidence") or 0.0)
+    confidence = _normalize_ai_confidence(ai_report.get("confidence"))
     repair_scope = str(ai_report.get("repair_scope") or "none").strip().lower()
+    disposition = str(ai_report.get("disposition") or "").strip().lower()
+    adjudication_stage = str(ai_report.get("adjudication_stage") or getattr(result, "adjudication_stage", "") or "primary").strip().lower() or "primary"
+    adjudication_status = str(ai_report.get("adjudication_status") or status or "").strip().lower()
     low_confidence = bool(ai_report.get("low_confidence")) or confidence < 0.55 or status == "low_confidence"
+    existing_disposition = str(getattr(result, "disposition", "") or result.details.get("disposition") or "").strip().lower()
+    existing_status = str(getattr(result, "evidence_status", "") or result.details.get("evidence_status") or "").strip().lower()
+
+    if not status:
+        status = existing_status or "evidence_gap"
+    if not disposition:
+        if repair_scope == "summary":
+            disposition = "summary_repair"
+        elif repair_scope == "review":
+            disposition = "review_repair"
+        elif repair_scope == "both":
+            disposition = "both_repair"
+        elif low_confidence:
+            disposition = "manual_review"
+        else:
+            disposition = existing_disposition or "keep_as_is"
 
     if status == "supported":
-        conclusion = ValidationConclusion.SUPPORTED
+        conclusion = ValidationConclusion.SUPPORTED if disposition != "narrowed_and_kept" else ValidationConclusion.PARTIAL_SUPPORT
         root_causes: List[RootCause] = []
-    elif status in {"partial_support", "partial"}:
+    elif status in {"partial_support", "partial", "evidence_gap"}:
         conclusion = ValidationConclusion.PARTIAL_SUPPORT
         root_causes = [RootCause.INSUFFICIENT_CONTEXT]
     elif status in {"wrong_source", "mapping_error"}:
@@ -514,6 +693,16 @@ def _map_ai_bundle_result(result: Any, ai_report: Dict[str, Any]) -> Any:
             "repair_scope": repair_scope,
             "summary_paper_ids": list(ai_report.get("summary_paper_ids") or result.paper_ids),
             "manual_review_reason": str(ai_report.get("manual_review_reason") or "").strip(),
+            "evidence_status": status,
+            "disposition": disposition,
+            "adjudication_stage": adjudication_stage,
+            "adjudication_status": adjudication_status or status,
+            "claim_type": str(ai_report.get("claim_type") or details.get("claim_type") or getattr(result, "claim_type", "") or "").strip(),
+            "claim_type_confidence": _normalize_ai_confidence(
+                ai_report.get("claim_type_confidence") if ai_report.get("claim_type_confidence") is not None else details.get("claim_type_confidence")
+            ),
+            "claim_type_rationale": str(ai_report.get("claim_type_rationale") or details.get("claim_type_rationale") or "").strip(),
+            "escalated": bool(details.get("escalated") or getattr(result, "escalated", False) or adjudication_stage == "stronger"),
         }
     )
 
@@ -536,58 +725,111 @@ def _map_ai_bundle_result(result: Any, ai_report: Dict[str, Any]) -> Any:
         paper_ids=result.paper_ids,
         block_ids=result.block_ids,
         low_confidence=low_confidence,
+        evidence_status=status,
+        disposition=disposition,
+        block_context=getattr(result, "block_context", ""),
+        claim_units=getattr(result, "claim_units", []),
+        target_claim_unit=getattr(result, "target_claim_unit", {}),
+        claim_type=str(details.get("claim_type") or ""),
+        claim_type_confidence=float(details.get("claim_type_confidence") or 0.0),
+        adjudication_status=str(details.get("adjudication_status") or status or ""),
+        adjudication_stage=adjudication_stage,
+        escalated=bool(details.get("escalated")),
     )
 
 
 def _run_ai_bundle_validation(generator_instance: Any, result: Any) -> Any:
     validator_api_config = _get_validator_api_config(generator_instance)
     if not validator_api_config or not result.claim_text.strip() or not result.paper_ids:
-        return result
+        return _attach_adjudication_metadata(result, adjudication_stage="preflight", adjudication_status=existing_status if (existing_status := _result_evidence_status(result)) else "preflight")
 
-    try:
-        max_tokens = int((generator_instance.config.get("API_Parameters") or {}).get("claims_max_tokens", 4096))
-        temperature = float((generator_instance.config.get("API_Parameters") or {}).get("claims_temperature", 0.2))
-    except Exception:
-        max_tokens = 4096
-        temperature = 0.2
-
-    payload = {
-        "citation_set_key": result.citation_set_key,
-        "paper_ids": result.paper_ids,
-        "claim_text": result.claim_text,
-        "claim_context": result.claim_context,
-        "evidence_excerpt_list": result.evidence_excerpt_list[:8],
-    }
-    prompt = (
-        "You are validating a literature-review claim bundle against the exact cited paper set. "
-        "Judge whether the claim is supported by the cited sources, whether the problem appears to come from "
-        "the stage-1 summary, the review draft, both, or is too uncertain for automatic repair. "
-        "Return JSON with keys: status, confidence, repair_scope, low_confidence, reasoning, repair_hint, "
-        "summary_paper_ids, manual_review_reason.\n\n"
-        f"Bundle payload:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    packet = build_adjudication_packet(result, stage="primary")
+    packet_dict = json.loads(json.dumps(packet, default=lambda item: item.__dict__, ensure_ascii=False))
+    result = _attach_adjudication_metadata(
+        result,
+        packet=packet_dict,
+        adjudication_stage="primary",
+        adjudication_status=_result_evidence_status(result) or "preflight",
+        escalated=False,
     )
-    system_prompt = (
-        "Return JSON only. status must be one of supported, partial_support, unsupported, "
-        "wrong_source, low_confidence. repair_scope must be one of none, summary, review, both, manual_review."
-    )
-
-    try:
-        ai_report = _call_ai_api(
-            prompt,
-            validator_api_config,
-            system_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            response_format="json",
-            logger=generator_instance.logger,
-        )
-    except Exception as exc:
-        generator_instance.logger.warning(f"AI citation-set validation failed: {exc}")
-        return result
-
+    ai_report = run_adjudication_stage(generator_instance, validator_api_config, packet)
     if not isinstance(ai_report, dict):
         return result
-    return _map_ai_bundle_result(result, ai_report)
+    mapped = _map_ai_bundle_result(result, ai_report)
+    return _attach_adjudication_metadata(
+        mapped,
+        packet=packet_dict,
+        adjudication_stage=str(ai_report.get("adjudication_stage") or "primary"),
+        adjudication_status=str(ai_report.get("adjudication_status") or ai_report.get("status") or _result_evidence_status(mapped) or ""),
+        escalated=False,
+    )
+
+
+def _needs_stronger_ai_adjudication(result: Any) -> bool:
+    adjudication_status = str(
+        result.details.get("adjudication_status")
+        or getattr(result, "adjudication_status", "")
+        or result.details.get("evidence_status")
+        or getattr(result, "evidence_status", "")
+        or ""
+    ).strip().lower()
+    disposition = _result_disposition(result).strip().lower()
+    return bool(
+        getattr(result, "low_confidence", False)
+        or adjudication_status in {"evidence_gap", "needs_review", "low_confidence", "partial_support", "uncertain"}
+        or disposition == "manual_review"
+    )
+
+
+def _run_stronger_ai_bundle_validation(generator_instance: Any, result: Any) -> Any:
+    validator_api_config = _get_validator_api_config(generator_instance)
+    if not validator_api_config or not result.claim_text.strip() or not result.paper_ids:
+        return result
+
+    packet = build_adjudication_packet(result, stage="stronger")
+    packet_dict = json.loads(json.dumps(packet, default=lambda item: item.__dict__, ensure_ascii=False))
+    pending = _attach_adjudication_metadata(
+        result,
+        packet=packet_dict,
+        adjudication_stage="stronger",
+        adjudication_status=str(result.details.get("adjudication_status") or _result_evidence_status(result) or "evidence_gap"),
+        escalated=True,
+    )
+    ai_report = run_adjudication_stage(generator_instance, validator_api_config, packet)
+    if not isinstance(ai_report, dict):
+        return pending
+    mapped = _map_ai_bundle_result(pending, ai_report)
+    return _attach_adjudication_metadata(
+        mapped,
+        packet=packet_dict,
+        adjudication_stage=str(ai_report.get("adjudication_stage") or "stronger"),
+        adjudication_status=str(ai_report.get("adjudication_status") or ai_report.get("status") or _result_evidence_status(mapped) or ""),
+        escalated=True,
+    )
+
+
+def _run_adjudication_ladder(generator_instance: Any, citation_results: List[Any]) -> List[Any]:
+    adjudicated_results: List[Any] = []
+    logger = getattr(generator_instance, "logger", None)
+    total = len(citation_results)
+    if logger and total:
+        logger.info(f"Starting AI adjudication for {total} citation set(s).")
+    for index, result in enumerate(citation_results, start=1):
+        citation_set_key = str(getattr(result, "citation_set_key", "") or getattr(result, "citation_id", "") or "unknown")
+        preview = citation_set_key if len(citation_set_key) <= 80 else f"{citation_set_key[:77]}..."
+        bundle_started_at = time.monotonic()
+        if logger:
+            logger.info(f"[adjudication {index}/{total}] primary -> {preview}")
+        primary = _run_ai_bundle_validation(generator_instance, result)
+        needs_stronger = _needs_stronger_ai_adjudication(primary)
+        if needs_stronger and logger:
+            logger.info(f"[adjudication {index}/{total}] stronger -> {preview}")
+        final = _run_stronger_ai_bundle_validation(generator_instance, primary) if needs_stronger else primary
+        if logger:
+            elapsed = time.monotonic() - bundle_started_at
+            logger.info(f"[adjudication {index}/{total}] done in {elapsed:.1f}s -> {preview}")
+        adjudicated_results.append(final)
+    return adjudicated_results
 
 
 def _find_summary_entry_for_paper(generator_instance: Any, paper_id: str) -> Optional[Dict[str, Any]]:
@@ -639,6 +881,7 @@ def _rewrite_block_with_ai(
     block_text: str,
     citation_tokens: List[str],
     claim_text: str,
+    target_claim_unit: Optional[Dict[str, Any]],
     evidence_excerpt_list: List[str],
     paper_ids: List[str],
 ) -> Optional[str]:
@@ -647,15 +890,16 @@ def _rewrite_block_with_ai(
         return None
 
     prompt = (
-        "Rewrite the review block so that it remains academically toned, preserves the citation tokens exactly, "
-        "and better matches the available source evidence. Return JSON with rewritten_block only.\n\n"
+        "Rewrite only the targeted claim unit so that it remains academically toned, stays as conservative as needed, "
+        "and preserves the citation tokens exactly. Return JSON with rewritten_claim_unit only.\n\n"
         f"Citation tokens: {json.dumps(citation_tokens, ensure_ascii=False)}\n"
         f"Paper ids: {json.dumps(paper_ids, ensure_ascii=False)}\n"
         f"Original block:\n{block_text}\n\n"
+        f"Target claim unit:\n{json.dumps(target_claim_unit or {}, ensure_ascii=False, indent=2)}\n\n"
         f"Claim bundle summary:\n{claim_text}\n\n"
         f"Evidence excerpts:\n{json.dumps(evidence_excerpt_list[:8], ensure_ascii=False, indent=2)}"
     )
-    system_prompt = "Return JSON only with rewritten_block. Preserve all citation tokens exactly."
+    system_prompt = "Return JSON only with rewritten_claim_unit. Preserve all citation tokens exactly."
     try:
         response = _call_ai_api(
             prompt,
@@ -669,67 +913,105 @@ def _rewrite_block_with_ai(
     except Exception as exc:
         generator_instance.logger.warning(f"AI review-block rewrite failed: {exc}")
         return None
-    rewritten_block = str((response or {}).get("rewritten_block") or "").strip()
-    if not rewritten_block:
+    rewritten_claim_unit = str((response or {}).get("rewritten_claim_unit") or (response or {}).get("rewritten_block") or "").strip()
+    if not rewritten_claim_unit:
         return None
     for token in citation_tokens:
-        if token and token not in rewritten_block:
-            rewritten_block = f"{rewritten_block} {token}".strip()
-    return rewritten_block
+        if token and token not in rewritten_claim_unit:
+            rewritten_claim_unit = f"{rewritten_claim_unit} {token}".strip()
+    return rewritten_claim_unit
+
+
+def _apply_claim_unit_patch_to_block(
+    *,
+    block_text: str,
+    block_id: str,
+    block_anchor_hash: str,
+    target_claim_unit: Dict[str, Any],
+    rewritten_claim_unit: str,
+) -> Optional[str]:
+    if not target_claim_unit:
+        return None
+    if str(target_claim_unit.get("block_id") or "").strip() != str(block_id).strip():
+        return None
+    expected_anchor_hash = str(target_claim_unit.get("block_anchor_hash") or "").strip()
+    if expected_anchor_hash and expected_anchor_hash != block_anchor_hash:
+        return None
+    span_start = target_claim_unit.get("span_start")
+    span_end = target_claim_unit.get("span_end")
+    if not isinstance(span_start, int) or not isinstance(span_end, int):
+        return None
+    if span_start < 0 or span_end <= span_start or span_end > len(block_text):
+        return None
+
+    replacement = rewritten_claim_unit.strip()
+    if not replacement:
+        return None
+    return f"{block_text[:span_start]}{replacement}{block_text[span_end:]}"
+
+
+def _recompute_block_metadata(block: Dict[str, Any]) -> None:
+    from services.review_draft import _build_block_span_map
+
+    text = str(block.get("text") or "").strip()
+    block["text"] = text
+    block["anchor_text"] = text[:80] if len(text) <= 80 else text[:80] + "..."
+    block["anchor_hash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8] if text else ""
+    block["span_map"] = _build_block_span_map(text)
 
 
 def _apply_review_repairs(generator_instance: Any, review_draft: Dict[str, Any], citation_results: List[Any]) -> List[str]:
     touched_blocks: List[str] = []
     for result in citation_results:
         repair_scope = str(result.details.get("repair_scope") or "").lower()
-        if repair_scope not in {"review", "both"} or result.low_confidence:
+        disposition = str(result.details.get("disposition") or getattr(result, "disposition", "") or "").lower()
+        if repair_scope not in {"review", "both"} or result.low_confidence or disposition == "manual_review":
             continue
         citation_tokens = list(result.details.get("bundle", {}).get("citation_tokens") or [])
+        target_claim_unit = result.details.get("target_claim_unit") or getattr(result, "target_claim_unit", {}) or {}
+        target_block_id = str(target_claim_unit.get("block_id") or "").strip()
         for block_id in result.block_ids:
+            if target_block_id and block_id != target_block_id:
+                continue
             for section in review_draft.get("content", {}).get("sections", []):
                 for block in section.get("blocks", []):
                     if block.get("block_id") != block_id:
                         continue
-                    rewritten = _rewrite_block_with_ai(
+                    rewritten_claim_unit = _rewrite_block_with_ai(
                         generator_instance,
                         block_text=str(block.get("text") or ""),
                         citation_tokens=citation_tokens,
                         claim_text=result.claim_text,
+                        target_claim_unit=target_claim_unit,
                         evidence_excerpt_list=result.evidence_excerpt_list,
                         paper_ids=result.paper_ids,
                     )
-                    if rewritten and rewritten != block.get("text"):
-                        block["text"] = rewritten
+                    if not rewritten_claim_unit:
+                        continue
+                    rewritten_block = _apply_claim_unit_patch_to_block(
+                        block_text=str(block.get("text") or ""),
+                        block_id=block_id,
+                        block_anchor_hash=str(block.get("anchor_hash") or ""),
+                        target_claim_unit=target_claim_unit,
+                        rewritten_claim_unit=rewritten_claim_unit,
+                    )
+                    if rewritten_block and rewritten_block != block.get("text"):
+                        block["text"] = rewritten_block
+                        _recompute_block_metadata(block)
                         touched_blocks.append(block_id)
     return list(dict.fromkeys(touched_blocks))
 
 
 def _rebuild_review_docx(generator_instance: Any, review_draft: Dict[str, Any], citation_manifest: Dict[str, Any], output_path: str) -> None:
-    from docx_writer import append_section_to_word_document, generate_apa_references_from_manifest
+    from docx_writer import rebuild_review_docx_from_structured_artifacts
 
-    if os.path.exists(output_path):
-        os.remove(output_path)
-
-    for section in review_draft.get("content", {}).get("sections", []):
-        section_text = "\n\n".join(
-            str(block.get("text") or "").strip()
-            for block in section.get("blocks", [])
-            if str(block.get("text") or "").strip()
-        )
-        append_section_to_word_document(
-            generator_instance,
-            int(section.get("section_number") or 0),
-            str(section.get("section_title") or ""),
-            section_text,
-            output_path,
-        )
-
-    if DOCX_AVAILABLE and Document is not None:
-        doc = Document(output_path)
-        doc.add_heading("References", level=1)
-        for reference in generate_apa_references_from_manifest(citation_manifest, generator_instance):
-            doc.add_paragraph(reference)
-        doc.save(output_path)
+    rebuild_review_docx_from_structured_artifacts(
+        generator_instance,
+        review_draft,
+        citation_manifest,
+        output_path,
+        allow_compat_fallback=False,
+    )
 
 
 def _persist_repaired_review_artifacts(generator_instance: Any, review_draft: Dict[str, Any]) -> Dict[str, Any]:
@@ -741,7 +1023,6 @@ def _persist_repaired_review_artifacts(generator_instance: Any, review_draft: Di
     generator_instance._persist_citation_manifest(
         review_draft_path=review_draft_path,
         review_word_path=word_path,
-        citations=[],
     )
     with open(generator_instance._citation_manifest_path(), "r", encoding="utf-8") as handle:
         citation_manifest = json.load(handle)
@@ -760,6 +1041,8 @@ def _write_validation_reports(generator_instance: Any, report: Any, manual_revie
     lines.append("summary")
     lines.append(f"total_citation_sets: {report.total_citations}")
     lines.append(f"supported: {report.supported_count}")
+    lines.append(f"narrowed_and_kept: {getattr(report, 'narrowed_and_kept_count', 0)}")
+    lines.append(f"evidence_gap: {getattr(report, 'evidence_gap_count', 0)}")
     lines.append(f"partial_support: {report.partial_support_count}")
     lines.append(f"unsupported: {report.unsupported_count}")
     lines.append(f"wrong_source: {report.wrong_source_count}")
@@ -770,6 +1053,8 @@ def _write_validation_reports(generator_instance: Any, report: Any, manual_revie
         lines.append(f"{index}. citation_set: {result.citation_set_key or result.citation_id}")
         lines.append(f"   papers: {', '.join(result.paper_ids) if result.paper_ids else result.paper_id}")
         lines.append(f"   conclusion: {result.conclusion.value}")
+        lines.append(f"   evidence_status: {_result_evidence_status(result) or '?'}")
+        lines.append(f"   disposition: {_result_disposition(result) or '?'}")
         lines.append(f"   root_causes: {', '.join(root.value for root in result.root_causes) or '?'}")
         lines.append(f"   claim: {result.claim_text[:300]}")
         lines.append(f"   reasoning: {result.reasoning_summary}")
@@ -791,6 +1076,8 @@ def _write_validation_reports(generator_instance: Any, report: Any, manual_revie
                 "reasoning_summary": item.reasoning_summary,
                 "repair_hint": item.repair_hint,
                 "manual_review_reason": item.details.get("manual_review_reason", ""),
+                "evidence_status": _result_evidence_status(item),
+                "disposition": _result_disposition(item),
             }
             for item in manual_review_items
         ],
@@ -804,24 +1091,46 @@ def _write_validation_reports(generator_instance: Any, report: Any, manual_revie
 def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
     generator_instance.logger.info("=" * 60 + "\nStarting review validation\n" + "=" * 60)
     try:
-        if not generator_instance.config.getboolean("Performance", "enable_stage2_validation", fallback=False):  # type: ignore
+        stage2_enabled = (
+            generator_instance._stage2_validation_enabled()
+            if hasattr(generator_instance, "_stage2_validation_enabled")
+            else generator_instance.config.getboolean("Performance", "enable_stage2_validation", fallback=False)
+        )
+        if not stage2_enabled:  # type: ignore
             generator_instance.logger.warning("Stage-2 validation is disabled; skipping review validation.")  # type: ignore
             return {"success": True, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
 
         review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata = _load_validation_inputs(generator_instance)
         if review_draft is None or citation_manifest is None:
             return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+        sections = review_draft.get("content", {}).get("sections", []) if isinstance(review_draft, dict) else []
+        block_count = sum(len(section.get("blocks", [])) for section in sections)
+        citation_sets = citation_manifest.get("citation_sets", []) if isinstance(citation_manifest, dict) else []
+        occurrences = citation_manifest.get("occurrences", []) if isinstance(citation_manifest, dict) else []
+        generator_instance.logger.info(
+            "Validation inputs loaded: "
+            f"citation_sets={len(citation_sets)}, occurrences={len(occurrences)}, "
+            f"sections={len(sections)}, blocks={block_count}, paper_artifacts={len(paper_artifacts)}"
+        )
 
         from validation.review_validator import ReviewValidator
 
         validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
-        base_report = validator.validate()
-        enriched_results = [_run_ai_bundle_validation(generator_instance, result) for result in base_report.citation_results]
+        def _progress_callback(index: int, total: int, bundle: Dict[str, Any]) -> None:
+            generator_instance.logger.info(f"[base validation {index}/{total}] {_bundle_progress_label(bundle)}")
+
+        generator_instance.logger.info("Running base review validation across citation sets.")
+        base_started_at = time.monotonic()
+        base_report = _run_base_review_validation(validator, progress_callback=_progress_callback)
+        generator_instance.logger.info(
+            f"Base review validation finished in {time.monotonic() - base_started_at:.1f}s."
+        )
+        enriched_results = _run_adjudication_ladder(generator_instance, base_report.citation_results)
         final_report = _build_report_from_results(enriched_results)
 
         touched_summaries = _apply_summary_repairs(generator_instance, enriched_results, paper_artifacts)
         touched_blocks = _apply_review_repairs(generator_instance, review_draft, enriched_results)
-        if touched_blocks:
+        if touched_summaries or touched_blocks:
             citation_manifest = _persist_repaired_review_artifacts(generator_instance, review_draft)
 
         if touched_summaries or touched_blocks:
@@ -830,14 +1139,11 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             if review_draft is None or citation_manifest is None:
                 return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
             validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
-            revalidated = validator.validate()
-            final_report = _build_report_from_results([_run_ai_bundle_validation(generator_instance, result) for result in revalidated.citation_results])
+            revalidated = _run_base_review_validation(validator, progress_callback=_progress_callback)
+            rerun_results = _run_adjudication_ladder(generator_instance, revalidated.citation_results)
+            final_report = _build_report_from_results(rerun_results)
 
-        manual_review_items = [
-            result
-            for result in final_report.citation_results
-            if result.low_confidence or result.conclusion.value == "NEEDS_REVIEW" or str(result.details.get("repair_scope") or "").lower() == "manual_review"
-        ]
+        manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
         report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items)
         generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
         generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")

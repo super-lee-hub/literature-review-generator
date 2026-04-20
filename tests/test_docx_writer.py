@@ -1,12 +1,9 @@
-"""测试 docx_writer 模块"""
+"""Tests for DOCX bibliography rendering behavior."""
 
-import os
-import tempfile
-from typing import Dict, List, Any
 
 import pytest
 
-from docx_writer import generate_apa_references_from_manifest, generate_apa_references
+from docx_writer import generate_apa_references_from_manifest
 
 
 class MockGenerator:
@@ -46,7 +43,7 @@ def test_manifest_first_bibliography():
     generator = MockGenerator()
     
     # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
     
     # 验证结果
     assert len(references) == 1
@@ -79,7 +76,7 @@ def test_v2_bibliography_cited_only():
     generator = MockGenerator()
     
     # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
     
     # 验证结果（只包含被引用的条目）
     assert len(references) == 1
@@ -106,7 +103,7 @@ def test_manifest_not_available_fallback():
     generator = MockGenerator(summaries=summaries)
     
     # 调用函数（citation_manifest 为 None）
-    references = generate_apa_references_from_manifest(None, generator)
+    references = generate_apa_references_from_manifest(None, generator, allow_compat_fallback=True)
     
     # 验证结果
     assert len(references) == 1
@@ -150,7 +147,7 @@ def test_v1_manifest_fallback():
     generator = MockGenerator(summaries=summaries)
     
     # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
     
     # 验证结果（应该回退到使用 summaries 生成）
     assert len(references) == 1
@@ -183,10 +180,16 @@ def test_empty_bibliography_fallback():
     generator = MockGenerator(summaries=summaries)
     
     # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator)
+    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
     
     # 验证结果（应该回退到使用 summaries 生成）
     assert len(references) == 1
     assert 'Author A, Author B' in references[0]
     assert '2023' in references[0]
     assert 'Test Paper 1' in references[0]
+
+
+def test_manifest_not_available_raises_without_compat_flag():
+    generator = MockGenerator()
+    with pytest.raises(ValueError):
+        generate_apa_references_from_manifest(None, generator)

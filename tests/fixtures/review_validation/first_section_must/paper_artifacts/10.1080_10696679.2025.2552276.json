@@ -1,0 +1,31 @@
+{
+  "artifact_type": "paper_artifact",
+  "artifact_version": "v1",
+  "paper_identity": {
+    "canonical_paper_key": "10.1080/10696679.2025.2552276",
+    "source_paper_id": "10.1080/10696679.2025.2552276"
+  },
+  "paper_info": {
+    "title": "Existing customers' reaction to new customers' exclusive discounts",
+    "authors": [
+      "Veli-Matti Rikala"
+    ],
+    "year": "2025"
+  },
+  "analysis": {
+    "ai_summary": {
+      "core_analysis": {
+        "summary": "The paper examines existing customers? reactions to new-customer exclusive discounts and tests first-purchase limitation and equivalent introductory pricing in fitness center and hotel settings."
+      }
+    },
+    "preprocess": {
+      "normalized_text": "Existing customers react to new customer exclusive discounts. The paper studies first-purchase limitation and equivalent introductory pricing in fitness center and hotel settings."
+    }
+  },
+  "stage1_inputs": {
+    "selected_visual_refs": []
+  },
+  "source": {
+    "source_pdf": "fixture-future.pdf"
+  }
+}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
@@ -103,6 +104,7 @@ class CitationSetBundle:
     section_numbers: List[int] = field(default_factory=list)
     section_titles: List[str] = field(default_factory=list)
     claim_texts: List[str] = field(default_factory=list)
+    claim_units: List[Dict[str, Any]] = field(default_factory=list)
     citation_tokens: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -128,6 +130,39 @@ class BibliographyEntry:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "BibliographyEntry":
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class CitationPaperEntry:
+    entry_id: str
+    paper_id: str
+    paper_key: str
+    title: str
+    authors: List[str] = field(default_factory=list)
+    year: str = ""
+    journal: str = ""
+    doi: str = ""
+    aliases: List[str] = field(default_factory=list)
+    status: str = "clean_canonical"
+    reasons: List[str] = field(default_factory=list)
+    confidence_score: float = 1.0
+    decision_threshold: float = 0.85
+    decision_source: str = "rule"
+    source_fields: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CitationMigrationReport:
+    contract_version: str
+    load_source: str
+    fallback_counters: Dict[str, int] = field(default_factory=dict)
+    paper_statuses: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -205,6 +240,42 @@ class CitationManifestV2:
             if cluster.paper_id == paper_identifier or cluster.paper_key == paper_identifier:
                 return cluster
         return None
+
+
+@dataclass(frozen=True)
+class CitationManifestV3:
+    artifact_type: str
+    artifact_version: str
+    created_from_job_id: str
+    created_at: str
+    manifest_identity: Dict[str, Any]
+    review_reference: Dict[str, Any]
+    paper_entries: List[CitationPaperEntry] = field(default_factory=list)
+    occurrences: List[CitationOccurrence] = field(default_factory=list)
+    clusters: List[CitationCluster] = field(default_factory=list)
+    citation_sets: List[CitationSetBundle] = field(default_factory=list)
+    bibliography: List[BibliographyEntry] = field(default_factory=list)
+    migration_report: CitationMigrationReport = field(
+        default_factory=lambda: CitationMigrationReport(contract_version="v3", load_source="v3")
+    )
+    review_draft_version: str = "v2"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": self.artifact_type,
+            "artifact_version": self.artifact_version,
+            "created_from_job_id": self.created_from_job_id,
+            "created_at": self.created_at,
+            "manifest_identity": self.manifest_identity,
+            "review_reference": self.review_reference,
+            "paper_entries": [entry.to_dict() for entry in self.paper_entries],
+            "occurrences": [occ.to_dict() for occ in self.occurrences],
+            "clusters": [cluster.to_dict() for cluster in self.clusters],
+            "citation_sets": [bundle.to_dict() for bundle in self.citation_sets],
+            "bibliography": [entry.to_dict() for entry in self.bibliography],
+            "migration_report": self.migration_report.to_dict(),
+            "review_draft_version": self.review_draft_version,
+        }
 
 
 def build_citation_manifest_v1(
@@ -460,6 +531,33 @@ def _sentence_spans(block_text: str) -> List[tuple[int, int, str]]:
     return spans
 
 
+def _build_claim_unit(
+    *,
+    claim_marker: str,
+    citation_set_key: str,
+    block_id: str,
+    sentence_index: int,
+    span_start: int,
+    span_end: int,
+    claim_text: str,
+    sentence_occurrences: Sequence[CitationOccurrence],
+    block_text: str,
+) -> Dict[str, Any]:
+    return {
+        "claim_unit_id": hashlib.sha256(claim_marker.encode("utf-8")).hexdigest()[:16],
+        "citation_set_key": citation_set_key,
+        "block_id": block_id,
+        "sentence_index": sentence_index,
+        "span_start": span_start,
+        "span_end": span_end,
+        "claim_text": claim_text,
+        "citation_tokens": sorted(
+            dict.fromkeys(occ.citation_token for occ in sentence_occurrences if occ.citation_token)
+        ),
+        "block_anchor_hash": hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8],
+    }
+
+
 def _build_citation_set_bundles(
     *,
     occurrences: Sequence[CitationOccurrence],
@@ -512,6 +610,7 @@ def _build_citation_set_bundles(
                         "section_numbers": [],
                         "section_titles": [],
                         "claim_texts": [],
+                        "claim_units": [],
                         "citation_tokens": [],
                     },
                 )
@@ -530,6 +629,19 @@ def _build_citation_set_bundles(
                     if claim_marker not in aggregate.setdefault("_claim_markers", []):
                         aggregate["_claim_markers"].append(claim_marker)
                         aggregate["claim_texts"].append(cleaned_sentence)
+                        aggregate["claim_units"].append(
+                            _build_claim_unit(
+                                claim_marker=claim_marker,
+                                citation_set_key=citation_set_key,
+                                block_id=block_id,
+                                sentence_index=sentence_index,
+                                span_start=sent_start,
+                                span_end=sent_end,
+                                claim_text=cleaned_sentence,
+                                sentence_occurrences=sentence_occurrences,
+                                block_text=block_text,
+                            )
+                        )
 
                 for occurrence in sentence_occurrences:
                     if occurrence.citation_token not in aggregate["citation_tokens"]:
@@ -588,6 +700,7 @@ def build_citation_manifest_v2_from_review_draft(
     review_word_path: str,
     review_draft_v2: Dict[str, Any],
     paper_summaries: List[Dict[str, Any]],
+    allow_legacy_regex: bool = True,
 ) -> CitationManifestV2:
     occurrences: List[CitationOccurrence] = []
     clusters: List[CitationCluster] = []
@@ -613,7 +726,7 @@ def build_citation_manifest_v2_from_review_draft(
             block_citations = block.get("citations", [])
 
             extracted_citations = list(block_citations)
-            if not extracted_citations:
+            if not extracted_citations and allow_legacy_regex:
                 for match in fallback_cite_pattern.finditer(block_text):
                     extracted_citations.append(
                         {
@@ -723,4 +836,100 @@ def build_citation_manifest_v2_from_review_draft(
         citation_sets=citation_sets,
         bibliography=bibliography,
         review_draft_version="v2",
+    )
+
+
+def build_citation_manifest_v3_from_review_draft(
+    *,
+    job_id: str,
+    project_name: str,
+    manifest_id: str,
+    review_draft_path: str,
+    review_word_path: str,
+    review_draft_v2: Dict[str, Any],
+    paper_summaries: List[Dict[str, Any]],
+    load_source: str = "v3",
+) -> CitationManifestV3:
+    legacy_manifest = build_citation_manifest_v2_from_review_draft(
+        job_id=job_id,
+        project_name=project_name,
+        manifest_id=manifest_id,
+        review_draft_path=review_draft_path,
+        review_word_path=review_word_path,
+        review_draft_v2=review_draft_v2,
+        paper_summaries=paper_summaries,
+        allow_legacy_regex=False,
+    )
+
+    entries, _alias_map = build_citation_catalog(paper_summaries)
+    cited_paper_ids = {cluster.paper_id for cluster in legacy_manifest.clusters}
+    paper_entries: List[CitationPaperEntry] = []
+    paper_statuses: List[Dict[str, Any]] = []
+
+    for entry in entries:
+        if entry.paper_id not in cited_paper_ids:
+            continue
+        paper_entry = CitationPaperEntry(
+            entry_id=f"paper_{entry.index:03d}",
+            paper_id=entry.paper_id,
+            paper_key=entry.paper_key,
+            title=entry.title,
+            authors=list(entry.authors),
+            year=entry.year,
+            journal=entry.journal,
+            doi=entry.doi,
+            aliases=list(entry.aliases),
+            status=entry.migration_status,
+            reasons=list(entry.migration_reasons or []),
+            confidence_score=entry.confidence_score,
+            decision_threshold=entry.decision_threshold,
+            decision_source=entry.decision_source,
+            source_fields=dict(entry.source_fields or {}),
+        )
+        paper_entries.append(paper_entry)
+        paper_statuses.append(
+            {
+                "paper_id": paper_entry.paper_id,
+                "paper_key": paper_entry.paper_key,
+                "status": paper_entry.status,
+                "reason_codes": list(paper_entry.reasons),
+                "confidence_score": paper_entry.confidence_score,
+                "decision_threshold": paper_entry.decision_threshold,
+                "decision_source": paper_entry.decision_source,
+                "source_fields": dict(paper_entry.source_fields),
+                "rerun_required": paper_entry.status == "rerun_required",
+            }
+        )
+
+    return CitationManifestV3(
+        artifact_type="citation_manifest",
+        artifact_version="v3",
+        created_from_job_id=legacy_manifest.created_from_job_id,
+        created_at=legacy_manifest.created_at,
+        manifest_identity={
+            "manifest_id": manifest_id,
+            "project_name": project_name,
+            "scope": "review_citations_truth_source",
+            "contract_version": "v3",
+        },
+        review_reference=legacy_manifest.review_reference,
+        paper_entries=paper_entries,
+        occurrences=legacy_manifest.occurrences,
+        clusters=legacy_manifest.clusters,
+        citation_sets=legacy_manifest.citation_sets,
+        bibliography=legacy_manifest.bibliography,
+        migration_report=CitationMigrationReport(
+            contract_version="v3",
+            load_source=load_source,
+            fallback_counters={
+                "summary_bibliography_fallback": 0,
+                "legacy_regex_extraction": 0,
+                "legacy_manifest_load": 0,
+                "synthetic_citation_sets": 0,
+                "summary_generated_reference": 0,
+                "unresolved_occurrences": len(unresolved_occurrences(legacy_manifest.to_dict())),
+            },
+            paper_statuses=paper_statuses,
+        ),
+        review_draft_version=legacy_manifest.review_draft_version,
     )

@@ -1,27 +1,18 @@
 import pytest
-import json
-import os
-from dataclasses import asdict
 
 from validation.evidence_resolver import (
     EvidenceCandidate,
     EvidenceResolver,
     EvidenceResolverContext,
-    build_evidence_resolver_context,
 )
 from validation.review_validator import (
-    CitationValidationResult,
-    ReviewValidationReport,
     ReviewValidator,
     RootCause,
     ValidationConclusion,
 )
 from validation.summary_recheck import (
-    SummaryCorrectionCandidate,
-    SummaryRecheckReport,
     SummaryRechecker,
     WHITELISTED_FIELDS,
-    run_summary_rechecks,
 )
 from validator import run_week3_review_validation, run_week3_summary_recheck
 
@@ -530,8 +521,8 @@ def test_citation_manifest_uses_real_paper_ids():
 
 def test_evidence_resolver_receives_preprocess_and_visual_inputs():
     """Test that evidence resolver receives preprocess/visual inputs in Week 3 path."""
-    from validation.evidence_resolver import EvidenceResolver, build_evidence_resolver_context
-    
+    from validation.evidence_resolver import build_evidence_resolver_context
+
     # Create paper artifact with preprocess and visual refs
     paper_artifact = {
         "paper_identity": {
@@ -643,11 +634,11 @@ def test_citation_paper_mapping_is_deterministic():
 
 def test_validator_loads_real_paper_artifacts():
     """Test that validator loads real persisted paper artifact files from disk."""
-    import tempfile
-    import os
     import json
+    import os
+    import tempfile
     from validator import run_week3_review_validation
-    
+
     # Create a mock paper artifact file on disk
     with tempfile.TemporaryDirectory() as temp_dir:
         # Create paper_artifacts directory
@@ -928,7 +919,7 @@ def test_negative_evidence_candidate_generation(tmp_path):
 
 
 def test_validator_uses_review_draft_v2_block_context(tmp_path):
-    """Test that validator uses review_draft_v2 block text as primary context."""
+    """Test that validator keeps review_draft_v2 block text as contextual evidence."""
     from validation.review_validator import ReviewValidator
     
     # Create review_draft_v2 with blocks
@@ -987,10 +978,118 @@ def test_validator_uses_review_draft_v2_block_context(tmp_path):
     validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
     report = validator.validate()
     
-    # Check that validation ran and used block text
+    # Check that validation ran and kept block text as contextual evidence
     assert report.total_citations == 1
     result = report.citation_results[0]
-    assert result.details.get("used_block_text") is True
+    assert result.details.get("used_block_text") is False
+    assert result.block_context == "This is the full block text with important findings from Smith (2024)."
+
+
+def test_validator_prefers_claim_units_over_full_block_text():
+    """Validation should target minimal claim units even when the block contains broader rhetoric."""
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Methods",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_kind": "paragraph",
+                            "block_order": 1,
+                            "text": (
+                                "This study scraped Booking.com hotel data and used the difference between "
+                                "value-for-money and overall ratings as a fairness proxy [[cite:paper_1|mode=parenthetical]]. "
+                                "This proves every future digital pricing context can be unified under one framework."
+                            ),
+                            "anchor_hash": "deadbeef",
+                            "span_map": {
+                                "sentences": [
+                                    {
+                                        "sentence_index": 1,
+                                        "span_start": 0,
+                                        "span_end": 151,
+                                        "text": "This study scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a fairness proxy [[cite:paper_1|mode=parenthetical]].",
+                                    },
+                                    {
+                                        "sentence_index": 2,
+                                        "span_start": 152,
+                                        "span_end": 226,
+                                        "text": "This proves every future digital pricing context can be unified under one framework.",
+                                    },
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_1",
+                "citation_set_key": "paper_1",
+                "paper_ids": ["paper_1"],
+                "paper_keys": ["paper_1"],
+                "occurrence_ids": ["occ_1"],
+                "block_ids": ["s1_b1"],
+                "section_numbers": [1],
+                "section_titles": ["Methods"],
+                "claim_texts": [
+                    "This study scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a fairness proxy."
+                ],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_1",
+                        "citation_set_key": "paper_1",
+                        "block_id": "s1_b1",
+                        "sentence_index": 1,
+                        "span_start": 0,
+                        "span_end": 151,
+                        "claim_text": "This study scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a fairness proxy.",
+                        "citation_tokens": ["[[cite:paper_1|mode=parenthetical]]"],
+                        "block_anchor_hash": "deadbeef",
+                    }
+                ],
+                "citation_tokens": ["[[cite:paper_1|mode=parenthetical]]"],
+            }
+        ]
+    }
+    paper_artifacts = [
+            {
+                "paper_identity": {
+                    "canonical_paper_key": "paper_1",
+                    "source_paper_id": "paper_1",
+                },
+                "analysis": {
+                    "ai_summary": {
+                        "core_analysis": {
+                            "summary": "This study scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a fairness proxy."
+                        }
+                    },
+                    "preprocess": {
+                        "normalized_text": "This study scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a fairness proxy."
+                    },
+                },
+                "paper_info": {
+                    "title": "Consumer perception of price fairness and dynamic pricing",
+                    "authors": ["Marco Alderighi"],
+                "year": "2022",
+            },
+            "stage1_inputs": {"selected_visual_refs": []},
+        }
+    ]
+
+    validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
+    report = validator.validate()
+    result = report.citation_results[0]
+
+    assert result.claim_text == "This study scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a fairness proxy."
+    assert "future digital pricing context" not in result.claim_text
+    assert result.target_claim_unit["claim_unit_id"] == "cu_1"
+    assert result.evidence_status == "clean_supported"
 
 
 def test_summary_recheck_source_grounded_path(tmp_path):
@@ -1024,6 +1123,478 @@ def test_summary_recheck_source_grounded_path(tmp_path):
     )
     assert abstract_candidate is not None
     assert abstract_candidate.evidence_source == "preprocess_artifacts.normalized_text"
+
+
+def test_review_validator_uses_markdown_path_for_normalized_text(tmp_path):
+    """ReviewValidator should feed markdown_path into the normalized-text evidence tier."""
+    normalized_path = tmp_path / "normalized.md"
+    normalized_path.write_text("Normalized markdown with Booking.com fairness proxy", encoding="utf-8")
+
+    review_draft = {"content": {"sections": []}}
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_1",
+                "citation_set_key": "paper_1",
+                "paper_ids": ["paper_1"],
+                "paper_keys": ["paper_1"],
+                "claim_texts": ["Booking.com fairness proxy"],
+                "block_ids": [],
+                "section_titles": ["Methods"],
+            }
+        ]
+    }
+    paper_artifacts = [
+        {
+            "paper_identity": {"canonical_paper_key": "paper_1", "source_paper_id": "paper_1"},
+            "analysis": {"preprocess": {"markdown_path": str(normalized_path)}},
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "paper.pdf"},
+        }
+    ]
+
+    validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
+    result = validator.validate().citation_results[0]
+    assert any(candidate.resolver_tier == "normalized_text" for candidate in result.evidence_candidates)
+
+
+def test_fallback_claim_unit_ids_are_deterministic():
+    """Legacy fallback claim-unit IDs should remain stable across runs."""
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Methods",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_kind": "paragraph",
+                            "block_order": 1,
+                            "text": "Booking.com hotel data was used to model price fairness.",
+                            "anchor_hash": "anchor123",
+                            "span_map": {
+                                "sentences": [
+                                    {
+                                        "sentence_index": 1,
+                                        "span_start": 0,
+                                        "span_end": 58,
+                                        "text": "Booking.com hotel data was used to model price fairness.",
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_1",
+                "citation_set_key": "paper_1",
+                "paper_ids": ["paper_1"],
+                "paper_keys": ["paper_1"],
+                "claim_texts": ["Booking.com hotel data was used to model price fairness."],
+                "block_ids": ["s1_b1"],
+                "section_titles": ["Methods"],
+                "citation_tokens": [],
+            }
+        ]
+    }
+    paper_artifacts = [
+        {
+            "paper_identity": {"canonical_paper_key": "paper_1", "source_paper_id": "paper_1"},
+            "analysis": {"ai_summary": {"core_analysis": {"summary": "Booking.com hotel data was used to model price fairness."}}},
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "paper.pdf"},
+        }
+    ]
+
+    validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
+    first = validator.validate().citation_results[0].target_claim_unit["claim_unit_id"]
+    second = validator.validate().citation_results[0].target_claim_unit["claim_unit_id"]
+    assert first == second
+
+
+def test_multi_paper_set_allows_clause_level_support_across_papers():
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Synthesis",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_kind": "paragraph",
+                            "block_order": 1,
+                            "text": (
+                                "Paper A shows that unfair pricing increases complaint behavior; "
+                                "Paper B shows that loyalty intensifies betrayal responses "
+                                "[[cite:paper_a|mode=parenthetical]] [[cite:paper_b|mode=parenthetical]]."
+                            ),
+                            "anchor_hash": "multi123",
+                            "span_map": {
+                                "sentences": [
+                                    {
+                                        "sentence_index": 1,
+                                        "span_start": 0,
+                                        "span_end": 166,
+                                        "text": "Paper A shows that unfair pricing increases complaint behavior; Paper B shows that loyalty intensifies betrayal responses [[cite:paper_a|mode=parenthetical]] [[cite:paper_b|mode=parenthetical]].",
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    claim_text = "Paper A shows that unfair pricing increases complaint behavior; Paper B shows that loyalty intensifies betrayal responses."
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_multi",
+                "citation_set_key": "paper_a+paper_b",
+                "paper_ids": ["paper_a", "paper_b"],
+                "paper_keys": ["paper_a", "paper_b"],
+                "occurrence_ids": ["occ_1", "occ_2"],
+                "block_ids": ["s1_b1"],
+                "section_numbers": [1],
+                "section_titles": ["Synthesis"],
+                "claim_texts": [claim_text],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_multi_1",
+                        "citation_set_key": "paper_a+paper_b",
+                        "block_id": "s1_b1",
+                        "sentence_index": 1,
+                        "span_start": 0,
+                        "span_end": 166,
+                        "claim_text": claim_text,
+                        "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]", "[[cite:paper_b|mode=parenthetical]]"],
+                        "block_anchor_hash": "multi123",
+                    }
+                ],
+                "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]", "[[cite:paper_b|mode=parenthetical]]"],
+            }
+        ]
+    }
+    paper_artifacts = [
+        {
+            "paper_identity": {"canonical_paper_key": "paper_a", "source_paper_id": "paper_a"},
+            "analysis": {
+                "ai_summary": {"core_analysis": {"summary": "Paper A shows that unfair pricing increases complaint behavior."}},
+                "preprocess": {"normalized_text": "Paper A shows that unfair pricing increases complaint behavior."},
+            },
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "a.pdf"},
+        },
+        {
+            "paper_identity": {"canonical_paper_key": "paper_b", "source_paper_id": "paper_b"},
+            "analysis": {
+                "ai_summary": {"core_analysis": {"summary": "Paper B shows that loyalty intensifies betrayal responses."}},
+                "preprocess": {"normalized_text": "Paper B shows that loyalty intensifies betrayal responses."},
+            },
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "b.pdf"},
+        },
+    ]
+
+    result = ReviewValidator(review_draft, citation_manifest, paper_artifacts).validate().citation_results[0]
+    assert result.evidence_status == "clean_supported"
+    assert result.conclusion == ValidationConclusion.SUPPORTED
+
+
+def test_multi_paper_set_with_partial_clause_coverage_does_not_drop_to_unsupported():
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Synthesis",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_kind": "paragraph",
+                            "block_order": 1,
+                            "text": (
+                                "Paper A shows that unfair pricing increases complaint behavior; "
+                                "Paper B shows that loyalty intensifies betrayal responses "
+                                "[[cite:paper_a|mode=parenthetical]] [[cite:paper_b|mode=parenthetical]]."
+                            ),
+                            "anchor_hash": "multi124",
+                            "span_map": {
+                                "sentences": [
+                                    {
+                                        "sentence_index": 1,
+                                        "span_start": 0,
+                                        "span_end": 166,
+                                        "text": "Paper A shows that unfair pricing increases complaint behavior; Paper B shows that loyalty intensifies betrayal responses [[cite:paper_a|mode=parenthetical]] [[cite:paper_b|mode=parenthetical]].",
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    claim_text = "Paper A shows that unfair pricing increases complaint behavior; Paper B shows that loyalty intensifies betrayal responses."
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_multi_gap",
+                "citation_set_key": "paper_a+paper_b",
+                "paper_ids": ["paper_a", "paper_b"],
+                "paper_keys": ["paper_a", "paper_b"],
+                "occurrence_ids": ["occ_1", "occ_2"],
+                "block_ids": ["s1_b1"],
+                "section_numbers": [1],
+                "section_titles": ["Synthesis"],
+                "claim_texts": [claim_text],
+                "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]", "[[cite:paper_b|mode=parenthetical]]"],
+            }
+        ]
+    }
+    paper_artifacts = [
+        {
+            "paper_identity": {"canonical_paper_key": "paper_a", "source_paper_id": "paper_a"},
+            "analysis": {"ai_summary": {"core_analysis": {"summary": "Paper A shows that unfair pricing increases complaint behavior."}}},
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "a.pdf"},
+        },
+        {
+            "paper_identity": {"canonical_paper_key": "paper_b", "source_paper_id": "paper_b"},
+            "analysis": {"ai_summary": {"core_analysis": {"summary": "Paper B discusses customer satisfaction."}}},
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "b.pdf"},
+        },
+    ]
+
+    result = ReviewValidator(review_draft, citation_manifest, paper_artifacts).validate().citation_results[0]
+    assert result.conclusion != ValidationConclusion.UNSUPPORTED
+    assert result.evidence_status == "evidence_gap"
+
+
+def test_uncited_bridge_sentence_does_not_create_citation_grounding_failure_row():
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Discussion",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_kind": "paragraph",
+                            "block_order": 1,
+                            "text": (
+                                "Paper A shows that unfair pricing increases complaint behavior "
+                                "[[cite:paper_a|mode=parenthetical]]. "
+                                "Future research should explore how platforms bridge this effect in emerging channels."
+                            ),
+                            "anchor_hash": "bridge123",
+                            "span_map": {
+                                "sentences": [
+                                    {
+                                        "sentence_index": 1,
+                                        "span_start": 0,
+                                        "span_end": 115,
+                                        "text": "Paper A shows that unfair pricing increases complaint behavior [[cite:paper_a|mode=parenthetical]].",
+                                    },
+                                    {
+                                        "sentence_index": 2,
+                                        "span_start": 116,
+                                        "span_end": 196,
+                                        "text": "Future research should explore how platforms bridge this effect in emerging channels.",
+                                    },
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_1",
+                "citation_set_key": "paper_a",
+                "paper_ids": ["paper_a"],
+                "paper_keys": ["paper_a"],
+                "block_ids": ["s1_b1"],
+                "section_titles": ["Discussion"],
+                "claim_texts": ["Paper A shows that unfair pricing increases complaint behavior."],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_bridge_1",
+                        "citation_set_key": "paper_a",
+                        "block_id": "s1_b1",
+                        "sentence_index": 1,
+                        "span_start": 0,
+                        "span_end": 115,
+                        "claim_text": "Paper A shows that unfair pricing increases complaint behavior.",
+                        "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],
+                        "block_anchor_hash": "bridge123",
+                    }
+                ],
+                "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],
+            }
+        ]
+    }
+    paper_artifacts = [
+        {
+            "paper_identity": {"canonical_paper_key": "paper_a", "source_paper_id": "paper_a"},
+            "analysis": {"ai_summary": {"core_analysis": {"summary": "Paper A shows that unfair pricing increases complaint behavior."}}},
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "a.pdf"},
+        }
+    ]
+
+    report = ReviewValidator(review_draft, citation_manifest, paper_artifacts).validate()
+
+    assert report.total_citations == 1
+    result = report.citation_results[0]
+    assert "Future research should explore" not in result.claim_text
+    assert result.details["claim_type"] == "result"
+
+
+def test_summary_only_evidence_does_not_yield_clean_supported():
+    review_draft = {"content": {"sections": []}}
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_summary_only",
+                "citation_set_key": "paper_summary",
+                "paper_ids": ["paper_summary"],
+                "paper_keys": ["paper_summary"],
+                "claim_texts": ["The study shows unfair pricing increases complaints."],
+                "block_ids": [],
+                "section_titles": ["Results"],
+            }
+        ]
+    }
+    paper_artifacts = [
+        {
+            "paper_identity": {"canonical_paper_key": "paper_summary", "source_paper_id": "paper_summary"},
+            "analysis": {"ai_summary": {"core_analysis": {"summary": "The study shows unfair pricing increases complaints."}}},
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "summary.pdf"},
+        }
+    ]
+
+    result = ReviewValidator(review_draft, citation_manifest, paper_artifacts).validate().citation_results[0]
+
+    assert result.evidence_status != "clean_supported"
+    assert result.conclusion != ValidationConclusion.SUPPORTED
+
+
+def test_per_paper_evidence_packets_preserve_multiple_claim_units():
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Results",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_kind": "paragraph",
+                            "block_order": 1,
+                            "text": (
+                                "Paper A shows complaint behavior increases under unfair pricing [[cite:paper_a|mode=parenthetical]]. "
+                                "Paper A also shows loyalty intensifies betrayal responses [[cite:paper_a|mode=parenthetical]]."
+                            ),
+                            "anchor_hash": "multi-cu",
+                            "span_map": {
+                                "sentences": [
+                                    {
+                                        "sentence_index": 1,
+                                        "span_start": 0,
+                                        "span_end": 102,
+                                        "text": "Paper A shows complaint behavior increases under unfair pricing [[cite:paper_a|mode=parenthetical]].",
+                                    },
+                                    {
+                                        "sentence_index": 2,
+                                        "span_start": 103,
+                                        "span_end": 195,
+                                        "text": "Paper A also shows loyalty intensifies betrayal responses [[cite:paper_a|mode=parenthetical]].",
+                                    },
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    citation_manifest = {
+        "citation_sets": [
+            {
+                "bundle_id": "bundle_multi_cu",
+                "citation_set_key": "paper_a",
+                "paper_ids": ["paper_a"],
+                "paper_keys": ["paper_a"],
+                "block_ids": ["s1_b1"],
+                "section_titles": ["Results"],
+                "claim_texts": [
+                    "Paper A shows complaint behavior increases under unfair pricing.",
+                    "Paper A also shows loyalty intensifies betrayal responses.",
+                ],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_a_1",
+                        "citation_set_key": "paper_a",
+                        "block_id": "s1_b1",
+                        "sentence_index": 1,
+                        "span_start": 0,
+                        "span_end": 102,
+                        "claim_text": "Paper A shows complaint behavior increases under unfair pricing.",
+                        "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],
+                        "block_anchor_hash": "multi-cu",
+                    },
+                    {
+                        "claim_unit_id": "cu_a_2",
+                        "citation_set_key": "paper_a",
+                        "block_id": "s1_b1",
+                        "sentence_index": 2,
+                        "span_start": 103,
+                        "span_end": 195,
+                        "claim_text": "Paper A also shows loyalty intensifies betrayal responses.",
+                        "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],
+                        "block_anchor_hash": "multi-cu",
+                    },
+                ],
+                "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],
+            }
+        ]
+    }
+    paper_artifacts = [
+        {
+            "paper_identity": {"canonical_paper_key": "paper_a", "source_paper_id": "paper_a"},
+            "analysis": {
+                "ai_summary": {"core_analysis": {"summary": "Paper A discusses complaint behavior and betrayal responses."}},
+                "preprocess": {
+                    "normalized_text": (
+                        "Paper A shows complaint behavior increases under unfair pricing. "
+                        "Paper A also shows loyalty intensifies betrayal responses."
+                    )
+                },
+            },
+            "stage1_inputs": {"selected_visual_refs": []},
+            "source": {"source_pdf": "paper_a.pdf"},
+        }
+    ]
+
+    result = ReviewValidator(review_draft, citation_manifest, paper_artifacts).validate().citation_results[0]
+    per_paper_packets = result.details["per_paper_evidence_packets"]["paper_a"]
+
+    assert set(per_paper_packets) == {"cu_a_1", "cu_a_2"}
+    assert all(packet["claim_unit_id"] in {"cu_a_1", "cu_a_2"} for packets in per_paper_packets.values() for packet in packets)
 
 
 if __name__ == "__main__":
