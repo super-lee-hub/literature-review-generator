@@ -1,0 +1,31 @@
+{
+  "artifact_type": "paper_artifact",
+  "artifact_version": "v1",
+  "paper_identity": {
+    "canonical_paper_key": "10.1007/s11129-017-9181-1",
+    "source_paper_id": "10.1007/s11129-017-9181-1"
+  },
+  "paper_info": {
+    "title": "Why offer lower prices to past customers?",
+    "authors": [
+      "Seung Hwan Lee"
+    ],
+    "year": "2017"
+  },
+  "analysis": {
+    "ai_summary": {
+      "core_analysis": {
+        "summary": "A vertical differentiation duopoly model showed that, when social price comparison is strong, firms may offer lower prices to past customers and increase profits."
+      }
+    },
+    "preprocess": {
+      "normalized_text": "A vertical differentiation duopoly model can make lower prices to past customers profitable when social price comparisons are strong."
+    }
+  },
+  "stage1_inputs": {
+    "selected_visual_refs": []
+  },
+  "source": {
+    "source_pdf": "fixture-game-theory.pdf"
+  }
+}

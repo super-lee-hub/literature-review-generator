@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 import os
 import json
 
@@ -21,6 +21,7 @@ class PreprocessEvidenceLoader:
     
     def load_evidence(
         self,
+        normalized_text_path: Optional[str] = None,
         plain_text_path: Optional[str] = None,
         page_index_path: Optional[str] = None,
         chunks_path: Optional[str] = None,
@@ -43,8 +44,9 @@ class PreprocessEvidenceLoader:
         Returns:
             PreprocessEvidence: 加载的证据对象
         """
-        normalized_text = self._load_text(plain_text_path)
-        plain_text = normalized_text  # 默认为相同内容
+        loaded_plain_text = self._load_text(plain_text_path)
+        normalized_text = self._load_text(normalized_text_path) or loaded_plain_text
+        plain_text = loaded_plain_text or normalized_text
         page_index = self._load_json(page_index_path, default=[])
         chunks = self._load_json(chunks_path, default=[])
         structured_json = self._load_json(structured_json_path, default={})

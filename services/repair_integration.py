@@ -8,14 +8,12 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.artifact_registry import ArtifactRegistry
 from validation.repair_models import RepairPlan, RepairApplyResult, AppliedPatchRecord, RepairReport
-from validation.repair_planner import RepairPlanner, run_repair_planning
-from validation.repair_apply import RepairApplier, run_repair_apply
+from validation.repair_apply import run_repair_apply
 from validation.review_validator import ReviewValidationReport
 
 
@@ -151,8 +149,7 @@ def run_repair_pipeline(
     """
     from validation.repair_planner import RepairPlanner
     from validation.repair_models import RepairPolicy
-    from services.review_draft import build_review_draft_v2
-    from services.citation_manifest import build_citation_manifest_v2, build_citation_manifest_v2_from_review_draft, unresolved_occurrences
+    from services.citation_manifest import build_citation_manifest_v2_from_review_draft, unresolved_occurrences
     from docx_writer import create_word_document, generate_apa_references_from_manifest
     from validator import run_review_validation
     
@@ -315,7 +312,11 @@ def run_repair_pipeline(
                     return True
             
             mock_generator = MockGenerator(workspace)
-            references = generate_apa_references_from_manifest(new_citation_manifest.to_dict(), mock_generator)
+            generate_apa_references_from_manifest(
+                new_citation_manifest.to_dict(),
+                mock_generator,
+                allow_compat_fallback=True,
+            )
             
             # Step 6: Run review recheck
             try:

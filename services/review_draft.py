@@ -182,6 +182,8 @@ def _extract_citations_from_text(
     text: str,
     block_id: str,
     paper_key_to_info: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    allow_legacy_regex: bool = False,
 ) -> List[Dict[str, Any]]:
     citations: List[Dict[str, Any]] = []
     paper_key_to_info = paper_key_to_info or {}
@@ -219,9 +221,12 @@ def _extract_citations_from_text(
             block_id=block_id,
             span_start=match.start(),
             span_end=match.end(),
-            source_type="legacy_regex",
+            source_type="structured_token",
         )
         citations.append(citation.to_dict())
+
+    if not allow_legacy_regex:
+        return citations
 
     parenthetical_pattern = r"\([^)]+,\s*\d{4}[^)]*\)"
     narrative_pattern = r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*\(\s*\d{4}\s*\)"
@@ -267,20 +272,66 @@ def _extract_citations_from_text(
     return citations
 
 
+def _sentence_spans(text: str) -> List[tuple[int, int, str]]:
+    spans: List[tuple[int, int, str]] = []
+    start = 0
+    for match in re.finditer(r"[。！？!?\.]+(?:\s+|$)", text):
+        end = match.end()
+        chunk = text[start:end].strip()
+        if chunk:
+            spans.append((start, end, chunk))
+        start = end
+    if start < len(text):
+        chunk = text[start:].strip()
+        if chunk:
+            spans.append((start, len(text), chunk))
+    if not spans and text.strip():
+        spans.append((0, len(text), text.strip()))
+    return spans
+
+
+def _build_block_span_map(text: str) -> Dict[str, Any]:
+    sentences = [
+        {
+            "sentence_index": sentence_index,
+            "span_start": span_start,
+            "span_end": span_end,
+            "text": sentence_text,
+        }
+        for sentence_index, (span_start, span_end, sentence_text) in enumerate(_sentence_spans(text), start=1)
+    ]
+    return {"sentences": sentences}
+
+
+def _build_anchor_text(text: str) -> str:
+    return text[:80] if len(text) <= 80 else text[:80] + "..."
+
+
+def _build_anchor_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+
+
 def _parse_section_into_blocks(
     section_number: int,
     section_title: str,
     content: str,
     paper_key_to_info: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    allow_legacy_regex: bool = False,
 ) -> List[ReviewBlock]:
     blocks: List[ReviewBlock] = []
     paragraphs = [paragraph.strip() for paragraph in content.split("\n\n") if paragraph.strip()]
 
     for order, paragraph in enumerate(paragraphs, start=1):
         block_id = f"s{section_number}_b{order}"
-        anchor_text = paragraph[:80] if len(paragraph) <= 80 else paragraph[:80] + "..."
-        anchor_hash = hashlib.sha256(paragraph.encode("utf-8")).hexdigest()[:8]
-        citations = _extract_citations_from_text(paragraph, block_id, paper_key_to_info)
+        anchor_text = _build_anchor_text(paragraph)
+        anchor_hash = _build_anchor_hash(paragraph)
+        citations = _extract_citations_from_text(
+            paragraph,
+            block_id,
+            paper_key_to_info,
+            allow_legacy_regex=allow_legacy_regex,
+        )
         blocks.append(
             ReviewBlock(
                 block_id=block_id,
@@ -291,7 +342,7 @@ def _parse_section_into_blocks(
                 anchor_hash=anchor_hash,
                 citations=citations,
                 block_source="model_generated",
-                span_map={},
+                span_map=_build_block_span_map(paragraph),
             )
         )
 
@@ -343,6 +394,7 @@ def build_review_draft_v2(
     references: Sequence[str],
     generation_mode: str,
     paper_summaries: Optional[List[Dict[str, Any]]] = None,
+    allow_legacy_regex_citations: bool = False,
 ) -> ReviewDraftV2:
     paper_key_to_info: Dict[str, Dict[str, Any]] = {}
     if paper_summaries:
@@ -370,13 +422,18 @@ def build_review_draft_v2(
                 block_kind = block_data.get("block_kind", "paragraph")
                 block_order = block_data.get("block_order", block_idx)
                 text = str(block_data.get("text", "")).strip()
-                anchor_text = block_data.get("anchor_text", text[:80] if len(text) <= 80 else text[:80] + "...")
-                anchor_hash = block_data.get("anchor_hash", hashlib.sha256(text.encode("utf-8")).hexdigest()[:8])
+                anchor_text = block_data.get("anchor_text", _build_anchor_text(text))
+                anchor_hash = block_data.get("anchor_hash", _build_anchor_hash(text))
                 citations = block_data.get("citations", [])
                 normalized_citations = (
                     _normalize_block_citations(citations, block_id)
                     if citations
-                    else _extract_citations_from_text(text, block_id, paper_key_to_info)
+                    else _extract_citations_from_text(
+                        text,
+                        block_id,
+                        paper_key_to_info,
+                        allow_legacy_regex=allow_legacy_regex_citations,
+                    )
                 )
                 blocks.append(
                     ReviewBlock(
@@ -388,11 +445,17 @@ def build_review_draft_v2(
                         anchor_hash=anchor_hash,
                         citations=normalized_citations,
                         block_source=block_data.get("block_source", "model_generated"),
-                        span_map=block_data.get("span_map", {}),
+                        span_map=block_data.get("span_map") or _build_block_span_map(text),
                     )
                 )
         else:
-            blocks = _parse_section_into_blocks(section_number, section_title, content, paper_key_to_info)
+            blocks = _parse_section_into_blocks(
+                section_number,
+                section_title,
+                content,
+                paper_key_to_info,
+                allow_legacy_regex=allow_legacy_regex_citations,
+            )
 
         normalized_sections.append(
             ReviewSection(

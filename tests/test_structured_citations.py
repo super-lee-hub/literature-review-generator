@@ -1,11 +1,6 @@
-"""测试结构化引用处理逻辑"""
+"""Tests for structured citation handling."""
 
-import json
-import os
-import tempfile
-from typing import Dict, List, Any
 
-import pytest
 
 from services.review_draft import build_review_draft_v2
 from services.citation_manifest import build_citation_manifest_v2_from_review_draft
@@ -151,7 +146,8 @@ def test_review_draft_v2_with_mixed_blocks():
         sections=sections,
         references=['Test reference 1'],
         generation_mode='full_review',
-        paper_summaries=paper_summaries
+        paper_summaries=paper_summaries,
+        allow_legacy_regex_citations=True,
     )
     
     # 验证结果
@@ -236,7 +232,7 @@ def test_citation_manifest_v2_priority_logic():
     
     # 验证 bibliography 只包含被引用的条目
     bibliography_entry = manifest.bibliography[0]
-    assert bibliography_entry.is_cited == True
+    assert bibliography_entry.is_cited
     assert 'Test Paper 1' in bibliography_entry.citation_text
 
 

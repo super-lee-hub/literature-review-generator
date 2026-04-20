@@ -95,12 +95,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "backup_tpm_limit": "2000000",
             "backup_rpm_limit": "9000",
             "enable_stage1_validation": "false",
-            "enable_stage2_validation": "false",
-        },
-        "Validation": {
-            "stage1_enabled": "false",
-            "stage2_enabled": "false",
-            "keep_checkpoints_after_completion": "false",
+            "enable_stage2_validation": "true",
         },
         "Preprocess": {
             "enabled": "true",
@@ -171,7 +166,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Validation": {
             "stage1_enabled": "false",
-            "stage2_enabled": "false",
+            "stage2_enabled": "true",
             "keep_checkpoints_after_completion": "false",
             "evidence_resolver_enabled": "true",
             "visual_refs_enabled": "true",

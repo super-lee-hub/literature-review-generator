@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from services.citation_metadata import normalize_summary_paper_metadata
 from services.paper_identity import build_paper_key as build_legacy_paper_key
 
 
@@ -75,6 +76,12 @@ class CitationCatalogEntry:
     journal: str
     doi: str
     aliases: List[str]
+    migration_status: str = "clean_canonical"
+    migration_reasons: List[str] | None = None
+    confidence_score: float = 1.0
+    decision_threshold: float = 0.85
+    decision_source: str = "rule"
+    source_fields: Dict[str, str] | None = None
 
 
 def _author_surname(author: str) -> str:
@@ -209,9 +216,8 @@ def build_citation_catalog(
     for index, summary in enumerate(paper_summaries, start=1):
         paper_info_raw = summary.get("paper_info", {})
         paper_info = paper_info_raw if isinstance(paper_info_raw, Mapping) else {}
-        authors = paper_info.get("authors") or []
-        if not isinstance(authors, list):
-            authors = [authors]
+        normalized_metadata = normalize_summary_paper_metadata(summary)
+        authors = normalized_metadata.authors
 
         paper_key = str(
             paper_info.get("canonical_paper_key")
@@ -228,13 +234,13 @@ def build_citation_catalog(
         }
         for item in paper_info.get("paper_key_aliases") or []:
             aliases.add(str(item).strip())
-        title = str(paper_info.get("title") or "").strip()
+        title = normalized_metadata.title or str(paper_info.get("title") or "").strip()
         if title:
             aliases.add(title)
         
         # Add author-based aliases
         author_list = [str(author).strip() for author in authors if str(author).strip()]
-        year = str(paper_info.get("year") or "").strip()
+        year = normalized_metadata.year or str(paper_info.get("year") or "").strip()
         
         # Add aliases for each author
         for author in author_list:
@@ -262,15 +268,53 @@ def build_citation_catalog(
             title=title,
             authors=author_list,
             year=year,
-            journal=str(paper_info.get("journal") or "").strip(),
-            doi=str(paper_info.get("doi") or "").strip(),
+            journal=normalized_metadata.journal,
+            doi=normalized_metadata.doi,
             aliases=sorted(alias for alias in aliases if alias),
+            migration_status=normalized_metadata.status,
+            migration_reasons=list(normalized_metadata.reasons),
+            confidence_score=normalized_metadata.confidence_score,
+            decision_threshold=normalized_metadata.decision_threshold,
+            decision_source=normalized_metadata.decision_source,
+            source_fields=dict(normalized_metadata.source_fields),
         )
         entries.append(entry)
         for alias in entry.aliases:
             alias_map[normalize_alias(alias)] = entry
 
     return entries, alias_map
+
+
+def build_citation_catalog_from_manifest(
+    citation_manifest: Mapping[str, Any],
+) -> Dict[str, CitationCatalogEntry]:
+    alias_map: Dict[str, CitationCatalogEntry] = {}
+    for index, entry_data in enumerate(citation_manifest.get("paper_entries", []), start=1):
+        aliases = [
+            str(item).strip()
+            for item in (entry_data.get("aliases") or [])
+            if str(item).strip()
+        ]
+        entry = CitationCatalogEntry(
+            index=index,
+            paper_id=str(entry_data.get("paper_id") or entry_data.get("paper_key") or ""),
+            paper_key=str(entry_data.get("paper_key") or entry_data.get("paper_id") or ""),
+            title=str(entry_data.get("title") or ""),
+            authors=[str(item).strip() for item in (entry_data.get("authors") or []) if str(item).strip()],
+            year=str(entry_data.get("year") or ""),
+            journal=str(entry_data.get("journal") or ""),
+            doi=str(entry_data.get("doi") or ""),
+            aliases=aliases,
+            migration_status=str(entry_data.get("status") or "clean_canonical"),
+            migration_reasons=list(entry_data.get("reasons") or []),
+            confidence_score=float(entry_data.get("confidence_score") or 1.0),
+            decision_threshold=float(entry_data.get("decision_threshold") or 0.85),
+            decision_source=str(entry_data.get("decision_source") or "rule"),
+            source_fields=dict(entry_data.get("source_fields") or {}),
+        )
+        for alias in entry.aliases:
+            alias_map[normalize_alias(alias)] = entry
+    return alias_map
 
 
 def resolve_citation_entry(

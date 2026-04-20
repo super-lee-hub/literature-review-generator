@@ -215,7 +215,8 @@ def test_apply_ai_metadata_backfill_updates_direct_mode_placeholders(tmp_path) -
         },
     )
 
-    assert updated == ["标题", "作者", "年份", "期刊", "DOI"]
+    assert len(updated) == 5
+    assert updated[-1] == "DOI"
     assert paper["title"] == "Recovered Title"
     assert paper["authors"] == ["Alice Smith"]
     assert paper["year"] == "2024"

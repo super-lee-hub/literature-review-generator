@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import glob
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, cast
 
@@ -153,10 +154,121 @@ def validate_job_request_options(request: Any) -> Optional[str]:
 
 
 class JobRunner:
+    @staticmethod
+    def _lossy_project_alias(project_name: str) -> str:
+        sanitized = sanitize_path_component(project_name)
+        alias_chars: list[str] = []
+        for char in sanitized:
+            if char.isascii() and (char.isalnum() or char in {"_", "-", ".", " "}):
+                alias_chars.append(char)
+            else:
+                alias_chars.append("_")
+        alias = "".join(alias_chars).strip(" .")
+        return alias or "unknown"
+
+    def _workspace_support_score(self, workspace_path: str, project_name: str, action: str) -> tuple[int, float]:
+        artifacts_dir = os.path.join(workspace_path, "artifacts")
+        summary_path = os.path.join(artifacts_dir, f"{project_name}_summaries.json")
+        outline_path = os.path.join(artifacts_dir, f"{project_name}_literature_review_outline.md")
+        review_draft_v2_path = os.path.join(
+            artifacts_dir,
+            "review_drafts",
+            f"{project_name}_review_draft_v2.json",
+        )
+        citation_manifest_v3_path = os.path.join(
+            artifacts_dir,
+            "citation_manifests",
+            f"{project_name}_citation_manifest_v3.json",
+        )
+        citation_manifest_v2_path = os.path.join(
+            artifacts_dir,
+            "citation_manifests",
+            f"{project_name}_citation_manifest_v2.json",
+        )
+
+        score = 0
+        has_summary = os.path.exists(summary_path)
+        has_outline = os.path.exists(outline_path)
+        has_review_draft = os.path.exists(review_draft_v2_path)
+        has_citation_manifest = os.path.exists(citation_manifest_v3_path) or os.path.exists(citation_manifest_v2_path)
+
+        if has_summary:
+            score += 10
+        if has_outline:
+            score += 20
+        if has_review_draft:
+            score += 30
+        if has_citation_manifest:
+            score += 30
+
+        if action == "generate_outline" and has_summary:
+            score += 100
+        if action in {"generate_review", "generate_section", "retry_review_failed"} and has_outline:
+            score += 100
+        if action == "validate_review":
+            if has_review_draft:
+                score += 100
+            if has_citation_manifest:
+                score += 100
+
+        try:
+            mtime = os.path.getmtime(workspace_path)
+        except OSError:
+            mtime = 0.0
+        return score, mtime
+
+    def _resolve_project_name_from_existing_workspaces(
+        self,
+        *,
+        base_output_dir: str,
+        requested_project_name: str,
+        action: str,
+    ) -> str:
+        if action not in {"generate_outline", "generate_review", "generate_section", "retry_review_failed", "validate_review"}:
+            return requested_project_name
+
+        base_output_dir = os.path.abspath(base_output_dir)
+        if not os.path.isdir(base_output_dir):
+            return requested_project_name
+
+        requested_alias = self._lossy_project_alias(requested_project_name)
+        if not requested_alias:
+            return requested_project_name
+
+        best_project_name = requested_project_name
+        best_score = (-1, -1.0)
+
+        candidate_project_names: set[str] = {requested_project_name}
+        for entry in os.listdir(base_output_dir):
+            entry_path = os.path.join(base_output_dir, entry)
+            if not os.path.isdir(entry_path) or entry.startswith("_"):
+                continue
+            if "__" in entry:
+                candidate_project_names.add(entry.split("__", 1)[0])
+            else:
+                candidate_project_names.add(entry)
+
+        for candidate_project_name in candidate_project_names:
+            if self._lossy_project_alias(candidate_project_name) != requested_alias:
+                continue
+
+            workspace_pattern = os.path.join(base_output_dir, f"{candidate_project_name}__*")
+            for workspace_path in glob.glob(workspace_pattern):
+                if not os.path.isdir(workspace_path):
+                    continue
+                candidate_score = self._workspace_support_score(workspace_path, candidate_project_name, action)
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_project_name = candidate_project_name
+
+        if best_project_name != requested_project_name and best_score[0] > 0:
+            return best_project_name
+        return requested_project_name
+
     def _legacy_args_namespace(self, request: JobRunRequest, project_name: str) -> argparse.Namespace:
         return argparse.Namespace(
             config=request.config,
-            project_name=request.project_name or project_name,
+            project_name=project_name,
             pdf_folder=request.pdf_folder,
             summary_file=request.summary_file,
             summary_sources=list(request.summary_sources),
@@ -350,7 +462,9 @@ class JobRunner:
                 result = legacy_main.handle_retry_review_failed_mode(generator)
             elif request.validate_review:
                 if generator.load_existing_summaries():
-                    result = legacy_main.validator.run_review_validation(generator)  # type: ignore[attr-defined]
+                    import validator as validator_module
+
+                    result = validator_module.run_review_validation(generator)
                 else:
                     generator.logger.error("无法加载摘要文件，请先运行阶段一")
                     return False, 1, "unable to load summaries for validation"
@@ -451,6 +565,17 @@ class JobRunner:
         generator_config = cast(MutableMapping[str, Dict[str, str]], generator.config)
         compat_view = CompatConfigView.from_config(generator_config)
         output_base_dir = generator_config.get("Paths", {}).get("output_path", "./output")
+        resolved_project_name = self._resolve_project_name_from_existing_workspaces(
+            base_output_dir=output_base_dir,
+            requested_project_name=project_name,
+            action=request.action,
+        )
+        if resolved_project_name != project_name:
+            project_name = resolved_project_name
+            generator.project_name = resolved_project_name
+            generator.logger.warning(
+                f"Recovered project name from lossy CLI input: {request.project_name or ''} -> {resolved_project_name}"
+            )
 
         fingerprint_bundle = build_fingerprint_bundle(
             FingerprintInputs(

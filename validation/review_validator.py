@@ -1,13 +1,20 @@
 ﻿from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence
+import hashlib
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from services.citation_manifest import normalize_citation_set_key
 from . import PreprocessEvidenceLoader
-from .evidence_resolver import EvidenceCandidate, EvidenceResolver, EvidenceResolverContext
+from .evidence_resolver import (
+    EvidenceCandidate,
+    EvidenceResolver,
+    EvidenceResolverContext,
+    SOURCE_GROUNDED_RESOLVER_TIERS,
+)
 
 
 class ValidationConclusion(Enum):
@@ -28,6 +35,24 @@ class RootCause(Enum):
     LOW_CONFIDENCE = "low_confidence"
 
 
+class EvidenceStatus(Enum):
+    CLEAN_SUPPORTED = "clean_supported"
+    EVIDENCE_GAP = "evidence_gap"
+    UNSUPPORTED = "unsupported"
+    WRONG_SOURCE = "wrong_source"
+    NEEDS_REVIEW = "needs_review"
+
+
+class ValidationDisposition(Enum):
+    KEEP_AS_IS = "keep_as_is"
+    NARROWED_AND_KEPT = "narrowed_and_kept"
+    MANUAL_REVIEW = "manual_review"
+    FAIL = "fail"
+    SUMMARY_REPAIR = "summary_repair"
+    REVIEW_REPAIR = "review_repair"
+    BOTH_REPAIR = "both_repair"
+
+
 @dataclass
 class CitationValidationResult:
     citation_id: str
@@ -45,6 +70,16 @@ class CitationValidationResult:
     paper_ids: List[str] = field(default_factory=list)
     block_ids: List[str] = field(default_factory=list)
     low_confidence: bool = False
+    evidence_status: str = EvidenceStatus.EVIDENCE_GAP.value
+    disposition: str = ValidationDisposition.KEEP_AS_IS.value
+    block_context: str = ""
+    claim_units: List[Dict[str, Any]] = field(default_factory=list)
+    target_claim_unit: Dict[str, Any] = field(default_factory=dict)
+    claim_type: str = ""
+    claim_type_confidence: float = 0.0
+    adjudication_status: str = ""
+    adjudication_stage: str = "preflight"
+    escalated: bool = False
 
 
 @dataclass
@@ -58,6 +93,290 @@ class ReviewValidationReport:
     wrong_source_count: int
     needs_review_count: int
     citation_results: List[CitationValidationResult]
+    narrowed_and_kept_count: int = 0
+    evidence_gap_count: int = 0
+
+
+def _sentence_spans(block_text: str) -> List[tuple[int, int, str]]:
+    text = block_text or ""
+    spans: List[tuple[int, int, str]] = []
+    start = 0
+    for match in re.finditer(r"[。！？!?\.]+(?:\s+|$)", text):
+        end = match.end()
+        chunk = text[start:end].strip()
+        if chunk:
+            spans.append((start, end, chunk))
+        start = end
+    if start < len(text):
+        chunk = text[start:].strip()
+        if chunk:
+            spans.append((start, len(text), chunk))
+    if not spans and text.strip():
+        spans.append((0, len(text), text.strip()))
+    return spans
+
+
+def _strip_citation_tokens(text: str) -> str:
+    return " ".join(re.sub(r"\[\[cite:[^\]]+\]\]", "", text or "").split()).strip()
+
+
+def _sentence_span_entries(block_text: str) -> List[Dict[str, Any]]:
+    return [
+        {
+            "sentence_index": sentence_index,
+            "span_start": span_start,
+            "span_end": span_end,
+            "text": sentence_text,
+        }
+        for sentence_index, (span_start, span_end, sentence_text) in enumerate(_sentence_spans(block_text), start=1)
+    ]
+
+
+_FUTURE_DIRECTION_HINTS = (
+    "future research",
+    "future studies",
+    "future work",
+    "further research",
+    "should explore",
+    "could explore",
+    "in future",
+    "future directions",
+    "future direction",
+    "后续研究",
+    "未来研究",
+    "未来方向",
+)
+_LIMITATION_METHOD_HINTS = (
+    "limitation",
+    "limitations",
+    "limited by",
+    "methodological",
+    "methodology",
+    "measurement",
+    "sample size",
+    "generalizability",
+    "bias",
+    "constraint",
+    "局限",
+    "方法",
+)
+_SYNTHESIS_HINTS = (
+    "collectively",
+    "together",
+    "across studies",
+    "overall",
+    "the literature",
+    "combined",
+    "jointly",
+    "synthes",
+)
+
+
+def _classify_claim_type(
+    claim_text: str,
+    claim_context: str,
+    paper_count: int,
+) -> tuple[str, float, str]:
+    combined = f"{claim_context} {claim_text}".lower()
+    if any(hint in combined for hint in _FUTURE_DIRECTION_HINTS):
+        return ("future_direction", 0.9, "future-direction cue detected in claim or section context")
+    if any(hint in combined for hint in _LIMITATION_METHOD_HINTS):
+        return (
+            "limitation_method_critique",
+            0.85,
+            "limitation or methodological critique cue detected in claim or section context",
+        )
+    if paper_count > 1 or any(hint in combined for hint in _SYNTHESIS_HINTS):
+        rationale = "multi-paper citation set defaults to synthesis" if paper_count > 1 else "synthesis cue detected in claim text"
+        return ("synthesis", 0.75 if paper_count > 1 else 0.65, rationale)
+    return ("result", 0.6, "defaulted to result because no stronger claim-type cue matched")
+
+
+def _serialize_evidence_candidate(
+    candidate: EvidenceCandidate,
+    *,
+    paper_id: str,
+    claim_unit_id: str,
+) -> Dict[str, Any]:
+    return {
+        "paper_id": paper_id,
+        "claim_unit_id": claim_unit_id,
+        "match_reason": candidate.match_reason,
+        "resolver_tier": candidate.resolver_tier,
+        "confidence": candidate.confidence,
+        "page_span": list(candidate.page_span or []),
+        "chunk_ids": list(candidate.chunk_ids or []),
+        "text_excerpt": candidate.text_excerpt,
+        "negative_evidence_reason": candidate.negative_evidence_reason,
+        "caption_excerpt": candidate.caption_excerpt,
+        "evidence_scope": candidate.evidence_scope,
+        "source_grounded": candidate.resolver_tier in SOURCE_GROUNDED_RESOLVER_TIERS,
+    }
+
+
+def _split_claim_into_segments(claim_text: str, *, max_segments: int = 6) -> List[str]:
+    text = " ".join(str(claim_text or "").split()).strip()
+    if not text:
+        return []
+
+    segments: List[str] = [text]
+    split_patterns = [
+        r"[；;]+",
+        r"(?:(?<=，)|(?<=,))\s*(?=(?:同时|此外|另外|然而|但|而且|并且|相反|且|而|并|也|进而|从而))",
+    ]
+    if len(text) >= 60:
+        split_patterns.append(r"[，,]+")
+
+    for pattern in split_patterns:
+        if len(segments) > 1:
+            break
+        candidate_parts = [part.strip() for part in re.split(pattern, text) if part and part.strip()]
+        filtered_parts = [part for part in candidate_parts if len(part) >= 8]
+        if len(filtered_parts) > 1:
+            segments = filtered_parts[:max_segments]
+
+    deduped: List[str] = []
+    for segment in segments:
+        if segment and segment not in deduped:
+            deduped.append(segment)
+    return deduped or [text]
+
+
+def _support_counts(candidates: Sequence[EvidenceCandidate]) -> Dict[str, int]:
+    source_grounded = [item for item in candidates if item.resolver_tier in SOURCE_GROUNDED_RESOLVER_TIERS]
+    return {
+        "high": sum(1 for item in source_grounded if item.confidence >= 0.8),
+        "medium": sum(1 for item in source_grounded if 0.5 <= item.confidence < 0.8),
+    }
+
+
+def _dedupe_evidence_candidates(candidates: Sequence[EvidenceCandidate]) -> List[EvidenceCandidate]:
+    unique: Dict[tuple[Any, ...], EvidenceCandidate] = {}
+    for candidate in candidates:
+        key = (
+            candidate.resolver_tier,
+            candidate.match_reason,
+            candidate.text_excerpt,
+            tuple(candidate.page_span or []),
+            tuple(candidate.chunk_ids or []),
+            candidate.evidence_scope,
+        )
+        existing = unique.get(key)
+        if existing is None or candidate.confidence > existing.confidence:
+            unique[key] = candidate
+    return sorted(unique.values(), key=lambda item: (-item.confidence, item.window_rank))
+
+
+def _build_claim_unit(
+    *,
+    bundle: Dict[str, Any],
+    block_id: str,
+    sentence_index: int,
+    span_start: Any,
+    span_end: Any,
+    claim_text: str,
+    citation_tokens: List[str],
+    block_anchor_hash: str,
+    claim_unit_id: str,
+) -> Dict[str, Any]:
+    return {
+        "claim_unit_id": claim_unit_id,
+        "citation_set_key": str(bundle.get("citation_set_key") or bundle.get("bundle_id") or "unknown"),
+        "block_id": block_id,
+        "sentence_index": sentence_index,
+        "span_start": span_start,
+        "span_end": span_end,
+        "claim_text": claim_text,
+        "citation_tokens": citation_tokens,
+        "block_anchor_hash": block_anchor_hash,
+    }
+
+
+def _fallback_claim_unit(
+    *,
+    bundle: Dict[str, Any],
+    citation_set_key: str,
+    claim_text: str,
+    block_ids: List[str],
+) -> Dict[str, Any]:
+    return _build_claim_unit(
+        bundle=bundle,
+        block_id=block_ids[0] if block_ids else "",
+        sentence_index=1,
+        span_start=None,
+        span_end=None,
+        claim_text=claim_text,
+        citation_tokens=list(bundle.get("citation_tokens", [])),
+        block_anchor_hash="",
+        claim_unit_id=citation_set_key,
+    )
+
+
+def _paper_identity_hint(
+    *,
+    paper_id: str,
+    paper_artifact: Dict[str, Any],
+    paper_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    paper_info = paper_artifact.get("paper_info", {})
+    analysis = paper_artifact.get("analysis", {})
+    analysis_metadata = analysis.get("paper_metadata", {})
+    analysis_paper_info = analysis.get("paper_info", {})
+    return {
+        "paper_id": paper_id,
+        "canonical_paper_key": paper_artifact.get("paper_identity", {}).get("canonical_paper_key", ""),
+        "source_paper_id": paper_artifact.get("paper_identity", {}).get("source_paper_id", ""),
+        "title": paper_info.get("title")
+        or analysis_metadata.get("title")
+        or analysis_paper_info.get("title")
+        or paper_metadata.get("title", ""),
+        "authors": paper_info.get("authors")
+        or analysis_metadata.get("authors")
+        or analysis_paper_info.get("authors")
+        or [],
+        "year": paper_info.get("year")
+        or analysis_metadata.get("year")
+        or analysis_paper_info.get("year")
+        or "",
+    }
+
+
+def _compat_conclusion_for_state(
+    evidence_status: str,
+    disposition: str,
+) -> ValidationConclusion:
+    if evidence_status == EvidenceStatus.WRONG_SOURCE.value:
+        return ValidationConclusion.WRONG_SOURCE
+    if evidence_status == EvidenceStatus.CLEAN_SUPPORTED.value and disposition == ValidationDisposition.KEEP_AS_IS.value:
+        return ValidationConclusion.SUPPORTED
+    if disposition == ValidationDisposition.NARROWED_AND_KEPT.value:
+        return ValidationConclusion.PARTIAL_SUPPORT
+    if evidence_status == EvidenceStatus.NEEDS_REVIEW.value or disposition == ValidationDisposition.MANUAL_REVIEW.value:
+        return ValidationConclusion.NEEDS_REVIEW
+    if evidence_status == EvidenceStatus.EVIDENCE_GAP.value:
+        return ValidationConclusion.PARTIAL_SUPPORT
+    return ValidationConclusion.UNSUPPORTED
+
+
+def _build_review_validation_report(citation_results: List[CitationValidationResult]) -> ReviewValidationReport:
+    return ReviewValidationReport(
+        report_id=f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        created_at=datetime.now().isoformat(),
+        total_citations=len(citation_results),
+        supported_count=sum(
+            1
+            for item in citation_results
+            if item.evidence_status == EvidenceStatus.CLEAN_SUPPORTED.value
+            and item.disposition == ValidationDisposition.KEEP_AS_IS.value
+        ),
+        partial_support_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.PARTIAL_SUPPORT),
+        unsupported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.UNSUPPORTED),
+        wrong_source_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.WRONG_SOURCE),
+        needs_review_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.NEEDS_REVIEW),
+        citation_results=citation_results,
+        narrowed_and_kept_count=sum(1 for item in citation_results if item.disposition == ValidationDisposition.NARROWED_AND_KEPT.value),
+        evidence_gap_count=sum(1 for item in citation_results if item.evidence_status == EvidenceStatus.EVIDENCE_GAP.value),
+    )
 
 
 class ReviewValidator:
@@ -84,20 +403,18 @@ class ReviewValidator:
         self.paper_metadata = paper_metadata or {}
         self.evidence_loader = PreprocessEvidenceLoader()
 
-    def validate(self) -> ReviewValidationReport:
+    def validate(
+        self,
+        progress_callback: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
+    ) -> ReviewValidationReport:
         citation_sets = self._get_citation_sets_from_manifest()
-        citation_results = [self._validate_citation_set(bundle) for bundle in citation_sets]
-        return ReviewValidationReport(
-            report_id=f"validation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            created_at=datetime.now().isoformat(),
-            total_citations=len(citation_sets),
-            supported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.SUPPORTED),
-            partial_support_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.PARTIAL_SUPPORT),
-            unsupported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.UNSUPPORTED),
-            wrong_source_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.WRONG_SOURCE),
-            needs_review_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.NEEDS_REVIEW),
-            citation_results=citation_results,
-        )
+        citation_results: List[CitationValidationResult] = []
+        total = len(citation_sets)
+        for index, bundle in enumerate(citation_sets, start=1):
+            if progress_callback is not None:
+                progress_callback(index, total, bundle)
+            citation_results.append(self._validate_citation_set(bundle))
+        return _build_review_validation_report(citation_results)
 
     def _get_block_from_review_draft(self, block_id: str) -> Optional[Dict[str, Any]]:
         sections = self.review_draft.get("content", {}).get("sections", [])
@@ -158,15 +475,75 @@ class ReviewValidator:
                 bundle["citation_tokens"].append(citation_token)
         return list(fallback_bundles.values())
 
+    def _build_claim_units_for_bundle(self, bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
+        claim_units = [dict(item) for item in bundle.get("claim_units", []) if isinstance(item, dict)]
+        if claim_units:
+            return claim_units
+
+        claim_texts = [str(item).strip() for item in bundle.get("claim_texts", []) if str(item).strip()]
+        block_ids = [str(item).strip() for item in bundle.get("block_ids", []) if str(item).strip()]
+        claim_units = []
+
+        for block_id in block_ids:
+            block = self._get_block_from_review_draft(block_id)
+            block_text = str(block.get("text") or "").strip() if block else ""
+            if not block_text:
+                continue
+            block_anchor_hash = str(block.get("anchor_hash") or "")
+            sentences = block.get("span_map", {}).get("sentences", []) if block else []
+            if not sentences:
+                sentences = _sentence_span_entries(block_text)
+
+            for sentence in sentences:
+                cleaned_sentence = _strip_citation_tokens(str(sentence.get("text") or ""))
+                if claim_texts and cleaned_sentence not in claim_texts:
+                    continue
+                claim_unit_id = hashlib.sha256(
+                    f"{block_id}:{sentence.get('sentence_index', len(claim_units) + 1)}:{cleaned_sentence}".encode("utf-8")
+                ).hexdigest()[:16]
+                claim_units.append(
+                    _build_claim_unit(
+                        bundle=bundle,
+                        block_id=block_id,
+                        sentence_index=int(sentence.get("sentence_index") or len(claim_units) + 1),
+                        span_start=sentence.get("span_start"),
+                        span_end=sentence.get("span_end"),
+                        claim_text=cleaned_sentence,
+                        citation_tokens=list(bundle.get("citation_tokens", [])),
+                        block_anchor_hash=block_anchor_hash,
+                        claim_unit_id=claim_unit_id,
+                    )
+                )
+
+        if claim_units:
+            return claim_units
+
+        for claim_index, claim_text in enumerate(claim_texts, start=1):
+            claim_units.append(
+                _build_claim_unit(
+                    bundle=bundle,
+                    block_id=block_ids[0] if block_ids else "",
+                    sentence_index=claim_index,
+                    span_start=None,
+                    span_end=None,
+                    claim_text=claim_text,
+                    citation_tokens=list(bundle.get("citation_tokens", [])),
+                    block_anchor_hash="",
+                    claim_unit_id=f"{bundle.get('citation_set_key', 'unknown')}:{claim_index}",
+                )
+            )
+        return claim_units
+
     def _resolver_context_for_paper(self, paper_id: str, paper_artifact: Dict[str, Any]) -> EvidenceResolverContext:
-        paper_preprocess_evidence = self.preprocess_evidence.get(paper_id, {})
+        paper_preprocess_evidence = self.preprocess_evidence.get(paper_id, {}) or paper_artifact.get("analysis", {}).get("preprocess", {})
         paper_specific_metadata = self.paper_metadata.get(paper_id, {})
         evidence = self.evidence_loader.load_evidence(
+            normalized_text_path=paper_preprocess_evidence.get("markdown_path"),
             plain_text_path=paper_preprocess_evidence.get("plain_text_path"),
             page_index_path=paper_preprocess_evidence.get("page_index_path"),
             chunks_path=paper_preprocess_evidence.get("chunks_path"),
             structured_json_path=paper_preprocess_evidence.get("structured_json_path"),
-            manifest_path=paper_preprocess_evidence.get("manifest_path"),
+            manifest_path=paper_preprocess_evidence.get("manifest_path") or paper_preprocess_evidence.get("prepare_manifest_path"),
             visual_artifacts_path=paper_preprocess_evidence.get("visual_artifacts_path"),
             diagnostics_path=paper_preprocess_evidence.get("diagnostics_path"),
         )
@@ -174,14 +551,14 @@ class ReviewValidator:
             paper_key=paper_id,
             paper_identity=paper_artifact.get("paper_identity", {}),
             preprocess_artifacts={
-                "normalized_text": evidence.normalized_text,
-                "plain_text": evidence.plain_text,
-                "page_index": evidence.page_index,
-                "chunks": evidence.chunks,
-                "structured_json": evidence.structured_json,
-                "manifest": evidence.manifest,
-                "visual_artifacts": evidence.visual_artifacts,
-                "diagnostics": evidence.diagnostics,
+                "normalized_text": paper_preprocess_evidence.get("normalized_text") or evidence.normalized_text,
+                "plain_text": paper_preprocess_evidence.get("plain_text") or evidence.plain_text,
+                "page_index": paper_preprocess_evidence.get("page_index") or evidence.page_index,
+                "chunks": paper_preprocess_evidence.get("chunks") or evidence.chunks,
+                "structured_json": paper_preprocess_evidence.get("structured_json") or evidence.structured_json,
+                "manifest": paper_preprocess_evidence.get("manifest") or evidence.manifest,
+                "visual_artifacts": paper_preprocess_evidence.get("visual_artifacts") or evidence.visual_artifacts,
+                "diagnostics": paper_preprocess_evidence.get("diagnostics") or evidence.diagnostics,
             },
             paper_artifact=paper_artifact,
             preprocess_evidence=paper_preprocess_evidence,
@@ -194,15 +571,14 @@ class ReviewValidator:
         block_ids = [str(item).strip() for item in bundle.get("block_ids", []) if str(item).strip()]
         claim_texts = [str(item).strip() for item in bundle.get("claim_texts", []) if str(item).strip()]
         claim_context = "; ".join(str(item).strip() for item in bundle.get("section_titles", []) if str(item).strip())
-
-        block_claims: List[str] = []
-        for block_id in block_ids:
-            block = self._get_block_from_review_draft(block_id)
-            block_text = str(block.get("text") or "").strip() if block else ""
-            if block_text:
-                block_claims.append(block_text)
-        used_block_text = bool(block_claims)
-        claim_text = "\n".join(block_claims or claim_texts).strip()
+        claim_units = self._build_claim_units_for_bundle(bundle)
+        used_block_text = False
+        claim_text = "\n".join(claim_texts or [item.get("claim_text", "") for item in claim_units]).strip()
+        claim_type, claim_type_confidence, claim_type_rationale = _classify_claim_type(
+            claim_text,
+            claim_context,
+            len(paper_ids),
+        )
 
         if not paper_ids:
             return CitationValidationResult(
@@ -216,6 +592,12 @@ class ReviewValidator:
                     "bundle": bundle,
                     "reason": "empty_citation_set",
                     "used_block_text": used_block_text,
+                    "claim_type": claim_type,
+                    "claim_type_confidence": claim_type_confidence,
+                    "claim_type_rationale": claim_type_rationale,
+                    "adjudication_status": "preflight",
+                    "adjudication_stage": "preflight",
+                    "escalated": False,
                 },
                 claim_text=claim_text,
                 claim_context=claim_context,
@@ -226,42 +608,225 @@ class ReviewValidator:
                 paper_ids=[],
                 block_ids=block_ids,
                 low_confidence=False,
+                evidence_status=EvidenceStatus.WRONG_SOURCE.value,
+                disposition=ValidationDisposition.FAIL.value,
+                claim_units=claim_units,
+                claim_type=claim_type,
+                claim_type_confidence=claim_type_confidence,
+                adjudication_status="preflight",
+                adjudication_stage="preflight",
+                escalated=False,
             )
 
         evidence_candidates: List[EvidenceCandidate] = []
         missing_papers: List[str] = []
-        per_paper_support: Dict[str, Dict[str, int]] = {}
-        any_visual_refs = False
+        claim_unit_results: List[Dict[str, Any]] = []
+        paper_identity_hints: Dict[str, Dict[str, Any]] = {}
+        per_paper_evidence_packets: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
 
-        for paper_id in paper_ids:
-            paper_artifact = self.paper_artifacts.get(paper_id)
-            if not paper_artifact:
-                missing_papers.append(paper_id)
-                continue
-
-            resolver = EvidenceResolver(self._resolver_context_for_paper(paper_id, paper_artifact))
-            selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", []) or []
-            any_visual_refs = any_visual_refs or bool(selected_visual_refs)
-            candidates = resolver.resolve_evidence(
-                cited_span=claim_text or str((bundle.get("citation_tokens") or [""])[0]),
-                locator=None,
-                selected_visual_refs=selected_visual_refs,
+        claim_units_to_validate = claim_units or [
+            _fallback_claim_unit(
+                bundle=bundle,
+                citation_set_key=citation_set_key,
+                claim_text=claim_text,
+                block_ids=block_ids,
             )
-            evidence_candidates.extend(candidates)
-            per_paper_support[paper_id] = {
-                "high": sum(1 for item in candidates if item.confidence >= 0.8),
-                "medium": sum(1 for item in candidates if 0.5 <= item.confidence < 0.8),
-            }
+        ]
+        for claim_unit in claim_units_to_validate:
+            unit_claim_text = str(claim_unit.get("claim_text") or "").strip()
+            unit_evidence_candidates: List[EvidenceCandidate] = []
+            unit_missing_papers: List[str] = []
+            per_paper_support: Dict[str, Dict[str, Any]] = {}
+            any_visual_refs = False
+            claim_segments = _split_claim_into_segments(unit_claim_text) if len(paper_ids) > 1 else ([unit_claim_text] if unit_claim_text else [])
+            segment_coverages: List[Dict[str, Any]] = []
+            if not claim_segments and unit_claim_text:
+                claim_segments = [unit_claim_text]
+            for segment_index, segment_text in enumerate(claim_segments, start=1):
+                segment_coverages.append(
+                    {
+                        "segment_id": f"{claim_unit.get('claim_unit_id', citation_set_key)}:{segment_index}",
+                        "segment_index": segment_index,
+                        "text": segment_text,
+                        "supported_by_high": [],
+                        "supported_by_medium": [],
+                    }
+                )
+
+            for paper_id in paper_ids:
+                paper_artifact = self.paper_artifacts.get(paper_id)
+                if not paper_artifact:
+                    unit_missing_papers.append(paper_id)
+                    continue
+                paper_identity_hints.setdefault(
+                    paper_id,
+                    _paper_identity_hint(
+                        paper_id=paper_id,
+                        paper_artifact=paper_artifact,
+                        paper_metadata=self.paper_metadata.get(paper_id, {}),
+                    ),
+                )
+
+                resolver = EvidenceResolver(self._resolver_context_for_paper(paper_id, paper_artifact))
+                selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", []) or []
+                any_visual_refs = any_visual_refs or bool(selected_visual_refs)
+                whole_claim_candidates = resolver.resolve_evidence(
+                    cited_span=unit_claim_text or str((bundle.get("citation_tokens") or [""])[0]),
+                    locator=None,
+                    selected_visual_refs=selected_visual_refs,
+                )
+                segment_support: List[Dict[str, Any]] = []
+                paper_candidates: List[EvidenceCandidate] = list(whole_claim_candidates)
+                for coverage in segment_coverages:
+                    segment_text = str(coverage.get("text") or "").strip()
+                    segment_candidates = resolver.resolve_evidence(
+                        cited_span=segment_text or unit_claim_text or str((bundle.get("citation_tokens") or [""])[0]),
+                        locator=None,
+                        selected_visual_refs=selected_visual_refs,
+                    )
+                    paper_candidates.extend(segment_candidates)
+                    support = _support_counts(segment_candidates)
+                    segment_support.append(
+                        {
+                            "segment_id": coverage["segment_id"],
+                            "segment_index": coverage["segment_index"],
+                            "text": segment_text,
+                            "high": support["high"],
+                            "medium": support["medium"],
+                        }
+                    )
+                    if support["high"] > 0:
+                        coverage["supported_by_high"].append(paper_id)
+                    elif support["medium"] > 0:
+                        coverage["supported_by_medium"].append(paper_id)
+
+                whole_claim_support = _support_counts(whole_claim_candidates)
+                paper_candidates = _dedupe_evidence_candidates(paper_candidates)
+                unit_evidence_candidates.extend(paper_candidates)
+                claim_unit_id = str(claim_unit.get("claim_unit_id") or citation_set_key)
+                per_paper_evidence_packets.setdefault(paper_id, {})[claim_unit_id] = [
+                    _serialize_evidence_candidate(
+                        candidate,
+                        paper_id=paper_id,
+                        claim_unit_id=claim_unit_id,
+                    )
+                    for candidate in paper_candidates
+                ]
+                per_paper_support[paper_id] = {
+                    "whole_claim": whole_claim_support,
+                    "segments": segment_support,
+                    "high": whole_claim_support["high"],
+                    "medium": whole_claim_support["medium"],
+                    "supports_any_segment_high": any(item["high"] > 0 for item in segment_support),
+                    "supports_any_segment_medium": any((item["high"] > 0 or item["medium"] > 0) for item in segment_support),
+                }
+
+            unit_evidence_status = EvidenceStatus.EVIDENCE_GAP.value
+            unit_disposition = ValidationDisposition.MANUAL_REVIEW.value
+            unit_root_causes: List[RootCause] = [RootCause.INSUFFICIENT_CONTEXT]
+            unit_low_confidence = False
+
+            if unit_missing_papers:
+                unit_evidence_status = EvidenceStatus.WRONG_SOURCE.value
+                unit_disposition = ValidationDisposition.FAIL.value
+                unit_root_causes = [RootCause.CITATION_MAPPING_ERROR]
+            else:
+                per_paper_high = [stats["high"] > 0 for stats in per_paper_support.values()]
+                per_paper_medium = [stats["high"] > 0 or stats["medium"] > 0 for stats in per_paper_support.values()]
+                visual_candidates = [item for item in unit_evidence_candidates if item.evidence_scope == "visual"]
+                fully_high_covered = bool(segment_coverages) and all(bool(item["supported_by_high"]) for item in segment_coverages)
+                fully_medium_covered = bool(segment_coverages) and all(
+                    bool(item["supported_by_high"] or item["supported_by_medium"]) for item in segment_coverages
+                )
+                paper_contributes_medium = all(bool(stats.get("supports_any_segment_high") or stats.get("supports_any_segment_medium")) for stats in per_paper_support.values())
+                partially_covered = any(bool(item["supported_by_high"] or item["supported_by_medium"]) for item in segment_coverages)
+
+                if len(paper_ids) > 1 and len(segment_coverages) > 1 and fully_high_covered and paper_contributes_medium:
+                    unit_evidence_status = EvidenceStatus.CLEAN_SUPPORTED.value
+                    unit_disposition = ValidationDisposition.KEEP_AS_IS.value
+                    unit_root_causes = []
+                elif len(paper_ids) > 1 and len(segment_coverages) > 1 and fully_medium_covered:
+                    unit_evidence_status = EvidenceStatus.EVIDENCE_GAP.value
+                    unit_disposition = ValidationDisposition.REVIEW_REPAIR.value if paper_contributes_medium else ValidationDisposition.MANUAL_REVIEW.value
+                    unit_root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+                elif len(paper_ids) > 1 and len(segment_coverages) > 1 and partially_covered:
+                    unit_evidence_status = EvidenceStatus.EVIDENCE_GAP.value
+                    unit_disposition = ValidationDisposition.MANUAL_REVIEW.value
+                    unit_root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+                elif per_paper_high and all(per_paper_high):
+                    unit_evidence_status = EvidenceStatus.CLEAN_SUPPORTED.value
+                    unit_disposition = ValidationDisposition.KEEP_AS_IS.value
+                    unit_root_causes = []
+                elif len(paper_ids) == 1 and per_paper_medium and all(per_paper_medium) and claim_type != "future_direction":
+                    unit_evidence_status = EvidenceStatus.CLEAN_SUPPORTED.value
+                    unit_disposition = ValidationDisposition.KEEP_AS_IS.value
+                    unit_root_causes = []
+                elif visual_candidates and any_visual_refs:
+                    unit_evidence_status = EvidenceStatus.NEEDS_REVIEW.value
+                    unit_disposition = ValidationDisposition.MANUAL_REVIEW.value
+                    unit_root_causes = [RootCause.VISUAL_UNDERSTANDING_GAP, RootCause.LOW_CONFIDENCE]
+                    unit_low_confidence = True
+                elif any(per_paper_medium):
+                    unit_evidence_status = EvidenceStatus.EVIDENCE_GAP.value
+                    unit_disposition = ValidationDisposition.REVIEW_REPAIR.value
+                    unit_root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+                else:
+                    unit_evidence_status = EvidenceStatus.EVIDENCE_GAP.value
+                    unit_disposition = ValidationDisposition.MANUAL_REVIEW.value
+                    unit_root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+
+            claim_unit_results.append(
+                {
+                    "claim_unit_id": claim_unit.get("claim_unit_id", citation_set_key),
+                    "claim_text": unit_claim_text,
+                    "evidence_status": unit_evidence_status,
+                    "disposition": unit_disposition,
+                    "root_causes": [item.value for item in unit_root_causes],
+                    "per_paper_support": per_paper_support,
+                    "segment_coverages": segment_coverages,
+                    "missing_papers": unit_missing_papers,
+                    "low_confidence": unit_low_confidence,
+                }
+            )
+            evidence_candidates.extend(unit_evidence_candidates)
+            missing_papers.extend(unit_missing_papers)
 
         evidence_excerpt_list = [item.text_excerpt for item in evidence_candidates if item.text_excerpt][:8]
+        missing_papers = list(dict.fromkeys(missing_papers))
+        target_claim_unit = next(
+            (
+                unit
+                for unit in claim_units
+                if any(
+                    item.get("claim_unit_id") == unit.get("claim_unit_id")
+                    and item.get("disposition") != ValidationDisposition.KEEP_AS_IS.value
+                    for item in claim_unit_results
+                )
+            ),
+            claim_units[0] if claim_units else {},
+        )
+        target_block_id = str(target_claim_unit.get("block_id") or (block_ids[0] if block_ids else "")).strip()
+        target_block = self._get_block_from_review_draft(target_block_id) if target_block_id else None
+        block_context = str(target_block.get("text") or "").strip() if target_block else ""
         details: Dict[str, Any] = {
             "citation_set_key": citation_set_key,
             "paper_ids": paper_ids,
             "block_ids": block_ids,
             "bundle": bundle,
-            "per_paper_support": per_paper_support,
+            "claim_units": claim_units,
+            "target_claim_unit": target_claim_unit,
+            "claim_unit_results": claim_unit_results,
+            "paper_identity_hints": paper_identity_hints,
+            "per_paper_evidence_packets": per_paper_evidence_packets,
             "missing_papers": missing_papers,
             "used_block_text": used_block_text,
+            "block_context": block_context,
+            "claim_type": claim_type,
+            "claim_type_confidence": claim_type_confidence,
+            "claim_type_rationale": claim_type_rationale,
+            "adjudication_status": "preflight",
+            "adjudication_stage": "preflight",
+            "escalated": False,
         }
 
         if missing_papers:
@@ -282,36 +847,58 @@ class ReviewValidator:
                 paper_ids=paper_ids,
                 block_ids=block_ids,
                 low_confidence=False,
+                evidence_status=EvidenceStatus.WRONG_SOURCE.value,
+                disposition=ValidationDisposition.FAIL.value,
+                block_context=block_context,
+                claim_units=claim_units,
+                target_claim_unit=target_claim_unit,
+                claim_type=claim_type,
+                claim_type_confidence=claim_type_confidence,
+                adjudication_status="preflight",
+                adjudication_stage="preflight",
+                escalated=False,
             )
 
-        per_paper_high = [stats["high"] > 0 for stats in per_paper_support.values()]
-        per_paper_medium = [stats["high"] > 0 or stats["medium"] > 0 for stats in per_paper_support.values()]
-        visual_candidates = [item for item in evidence_candidates if item.evidence_scope == "visual"]
+        aggregate_statuses = {item["evidence_status"] for item in claim_unit_results}
+        aggregate_dispositions = {item["disposition"] for item in claim_unit_results}
+        low_confidence = any(bool(item.get("low_confidence")) for item in claim_unit_results)
 
-        if per_paper_high and all(per_paper_high):
-            conclusion = ValidationConclusion.SUPPORTED
-            root_causes: List[RootCause] = []
-            reasoning = "Every paper in the exact citation set has high-confidence supporting evidence."
+        evidence_status = EvidenceStatus.EVIDENCE_GAP.value
+        disposition = ValidationDisposition.MANUAL_REVIEW.value
+        root_causes: List[RootCause] = [RootCause.INSUFFICIENT_CONTEXT]
+        reasoning = "The citation set contains claim units that need narrower, better-grounded validation."
+        repair_hint = "Narrow the claim to the smallest proposition directly supported by the cited evidence."
+
+        if EvidenceStatus.WRONG_SOURCE.value in aggregate_statuses:
+            evidence_status = EvidenceStatus.WRONG_SOURCE.value
+            disposition = ValidationDisposition.FAIL.value
+            root_causes = [RootCause.CITATION_MAPPING_ERROR]
+            reasoning = "At least one claim unit could not be mapped to the cited paper artifacts."
+            repair_hint = "Repair the citation-to-paper mapping before attempting review repair."
+        elif all(
+            item["evidence_status"] == EvidenceStatus.CLEAN_SUPPORTED.value
+            and item["disposition"] == ValidationDisposition.KEEP_AS_IS.value
+            for item in claim_unit_results
+        ):
+            evidence_status = EvidenceStatus.CLEAN_SUPPORTED.value
+            disposition = ValidationDisposition.KEEP_AS_IS.value
+            root_causes = []
+            reasoning = "Every claim unit in the exact citation set has strong supporting evidence."
             repair_hint = ""
-            low_confidence = False
-        elif per_paper_medium and all(per_paper_medium):
-            conclusion = ValidationConclusion.PARTIAL_SUPPORT
+        elif ValidationDisposition.REVIEW_REPAIR.value in aggregate_dispositions:
+            evidence_status = EvidenceStatus.EVIDENCE_GAP.value
+            disposition = ValidationDisposition.REVIEW_REPAIR.value
             root_causes = [RootCause.INSUFFICIENT_CONTEXT]
-            reasoning = "Each cited paper has at least medium-confidence evidence, but the support is not strong enough for a full pass."
-            repair_hint = "Make the claim more specific or reduce the strength of the wording."
-            low_confidence = False
-        elif visual_candidates and any_visual_refs:
-            conclusion = ValidationConclusion.NEEDS_REVIEW
-            root_causes = [RootCause.VISUAL_UNDERSTANDING_GAP, RootCause.LOW_CONFIDENCE]
-            reasoning = "The bundle is supported mainly by visual evidence, so it should be kept for manual review."
-            repair_hint = "Manually inspect the referenced figures or tables before editing the review."
-            low_confidence = True
-        else:
-            conclusion = ValidationConclusion.UNSUPPORTED
-            root_causes = [RootCause.INSUFFICIENT_CONTEXT]
-            reasoning = "Not enough evidence was found for this exact citation set."
-            repair_hint = "Check for miscitation, overclaiming, or rewrite the passage more conservatively."
-            low_confidence = False
+            reasoning = "Some claim units have partial support and should be narrowed before being kept."
+            repair_hint = "Rewrite only the targeted claim unit more conservatively while preserving the block structure."
+        elif EvidenceStatus.NEEDS_REVIEW.value in aggregate_statuses or ValidationDisposition.MANUAL_REVIEW.value in aggregate_dispositions:
+            evidence_status = EvidenceStatus.NEEDS_REVIEW.value if EvidenceStatus.NEEDS_REVIEW.value in aggregate_statuses else EvidenceStatus.EVIDENCE_GAP.value
+            disposition = ValidationDisposition.MANUAL_REVIEW.value
+            root_causes = [RootCause.VISUAL_UNDERSTANDING_GAP, RootCause.LOW_CONFIDENCE] if EvidenceStatus.NEEDS_REVIEW.value in aggregate_statuses else [RootCause.INSUFFICIENT_CONTEXT]
+            reasoning = "The available evidence is not strong enough for safe automatic narrowing."
+            repair_hint = "Review the cited source manually or improve the evidence retrieval bundle."
+
+        conclusion = _compat_conclusion_for_state(evidence_status, disposition)
 
         return CitationValidationResult(
             citation_id=str(bundle.get("bundle_id") or citation_set_key),
@@ -329,4 +916,14 @@ class ReviewValidator:
             paper_ids=paper_ids,
             block_ids=block_ids,
             low_confidence=low_confidence,
+            evidence_status=evidence_status,
+            disposition=disposition,
+            block_context=block_context,
+            claim_units=claim_units,
+            target_claim_unit=target_claim_unit,
+            claim_type=claim_type,
+            claim_type_confidence=claim_type_confidence,
+            adjudication_status="preflight",
+            adjudication_stage="preflight",
+            escalated=False,
         )

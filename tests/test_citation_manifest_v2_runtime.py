@@ -1,11 +1,9 @@
-"""测试 citation_manifest_v2 运行时逻辑"""
+"""Runtime tests for canonical citation manifest persistence."""
 
 import json
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, cast
-
-import pytest
+from typing import cast
 
 from main import LiteratureReviewGenerator
 from services.artifact_registry import ArtifactRegistry
@@ -15,210 +13,144 @@ from services.progress_state import ResumeStateReport
 
 
 class MockJobWorkspace:
-    """模拟 JobWorkspace 类"""
-    def __init__(self, root_dir):
+    def __init__(self, root_dir: str):
         self.root_dir = root_dir
-        self.job_id = 'test_job'
-        self.project_name = 'test_project'
-    
-    def ensure_exists(self):
+        self.job_id = "test_job"
+        self.project_name = "test_project"
+
+    def ensure_exists(self) -> None:
         os.makedirs(self.root_dir, exist_ok=True)
-    
-    def artifact_path(self, filename):
+
+    def artifact_path(self, filename: str) -> str:
         return os.path.join(self.root_dir, filename)
-    
-    def report_path(self, filename):
-        return os.path.join(self.root_dir, 'reports', filename)
-    
-    def checkpoint_path(self, filename):
-        return os.path.join(self.root_dir, 'checkpoints', filename)
+
+    def report_path(self, filename: str) -> str:
+        return os.path.join(self.root_dir, "reports", filename)
+
+    def checkpoint_path(self, filename: str) -> str:
+        return os.path.join(self.root_dir, "checkpoints", filename)
 
 
 class MockArtifactRegistry:
-    """模拟 ArtifactRegistry 类"""
-    def __init__(self):
+    def __init__(self) -> None:
         self.registered_files = []
-    
+
     def register_file(self, **kwargs):
         self.registered_files.append(kwargs)
 
 
 class MockCompatConfigView:
-    """模拟 CompatConfigView 类"""
     pass
 
 
 class MockResumeStateReport:
-    """模拟 ResumeStateReport 类"""
     pass
 
 
-def test_citation_manifest_v2_generation():
-    """测试 main.py 正常路径仍生成并注册 v2 manifest"""
-    # 创建临时目录
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # 创建模拟的 JobWorkspace 和 ArtifactRegistry
-        workspace = MockJobWorkspace(temp_dir)
-        workspace.ensure_exists()
-        
-        registry = MockArtifactRegistry()
-        compat_config = MockCompatConfigView()
-        resume_state_report = MockResumeStateReport()
-        
-        # 创建 LiteratureReviewGenerator 实例
-        generator = LiteratureReviewGenerator(project_name='test_project')
-        # 直接设置属性而不是调用 bind_job_workspace，避免类型错误
-        generator.job_workspace = cast(JobWorkspace, workspace)
-        generator.artifact_registry = cast(ArtifactRegistry, registry)
-        generator.compat_config = cast(CompatConfigView, compat_config)
-        generator.resume_state_report = cast(ResumeStateReport, resume_state_report)
-        generator.project_name = 'test_project'
-        generator.output_dir = temp_dir
-        generator.summary_file = os.path.join(temp_dir, 'test_summaries.json')
-        
-        # 模拟 summaries 数据（包含 status 字段）
-        generator.summaries = [
-            {
-                'status': 'success',
-                'paper_info': {
-                    'title': 'Test Paper 1',
-                    'authors': ['Author A', 'Author B'],
-                    'year': '2023'
+def _build_generator(temp_dir: str) -> LiteratureReviewGenerator:
+    workspace = MockJobWorkspace(temp_dir)
+    workspace.ensure_exists()
+    registry = MockArtifactRegistry()
+
+    generator = LiteratureReviewGenerator(project_name="test_project")
+    generator.job_workspace = cast(JobWorkspace, workspace)
+    generator.artifact_registry = cast(ArtifactRegistry, registry)
+    generator.compat_config = cast(CompatConfigView, MockCompatConfigView())
+    generator.resume_state_report = cast(ResumeStateReport, MockResumeStateReport())
+    generator.project_name = "test_project"
+    generator.output_dir = temp_dir
+    generator.summary_file = os.path.join(temp_dir, "test_summaries.json")
+    generator.summaries = [
+        {
+            "status": "success",
+            "paper_info": {
+                "title": "Test Paper 1",
+                "authors": ["Author A", "Author B"],
+                "year": "2023",
+                "canonical_paper_key": "test_paper_1",
+            },
+            "ai_summary": {
+                "paper_metadata": {
+                    "title": "Test Paper 1",
+                    "authors": ["Author A", "Author B"],
+                    "year": "2023",
+                    "journal": "Journal of Testing",
+                    "doi": "10.1000/test.paper",
                 }
-            }
-        ]
-        
-        # 创建模拟的 review_draft_v2 文件
+            },
+        }
+    ]
+    return generator
+
+
+def test_citation_manifest_v3_generation() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        generator = _build_generator(temp_dir)
         review_draft_v2 = {
-            'artifact_type': 'review_draft',
-            'artifact_version': 'v2',
-            'content': {
-                'sections': [
+            "artifact_type": "review_draft",
+            "artifact_version": "v2",
+            "content": {
+                "sections": [
                     {
-                        'section_number': 1,
-                        'section_title': 'Introduction',
-                        'blocks': [
+                        "section_number": 1,
+                        "section_title": "Introduction",
+                        "blocks": [
                             {
-                                'block_id': 's1_b1',
-                                'block_order': 1,
-                                'text': 'This is a test paragraph with citation.',
-                                'citations': [
+                                "block_id": "s1_b1",
+                                "block_order": 1,
+                                "text": "This is a test paragraph with [[cite:test_paper_1]].",
+                                "citations": [
                                     {
-                                        'local_ref_id': 'cit1',
-                                        'citation_token': '[[cite:test_paper_1]]',
-                                        'paper_id': 'test_paper_1',
-                                        'paper_key': 'test_paper_1'
+                                        "local_ref_id": "cit1",
+                                        "citation_token": "[[cite:test_paper_1]]",
+                                        "paper_id": "test_paper_1",
+                                        "paper_key": "test_paper_1",
                                     }
-                                ]
+                                ],
                             }
-                        ]
+                        ],
                     }
                 ],
-                'references': ['Author A, B. (2023). Test Paper 1. Journal of Testing.']
-            }
+                "references": ["Author A, B. (2023). Test Paper 1. Journal of Testing."],
+            },
         }
-        
-        # 写入 review_draft_v2 文件
-        review_draft_path = os.path.join(temp_dir, 'review_drafts', 'test_project_review_draft_v2.json')
+
+        review_draft_path = os.path.join(temp_dir, "review_drafts", "test_project_review_draft_v2.json")
         os.makedirs(os.path.dirname(review_draft_path), exist_ok=True)
-        with open(review_draft_path, 'w', encoding='utf-8') as f:
-            json.dump(review_draft_v2, f)
-        
-        # 调用 _persist_citation_manifest
+        with open(review_draft_path, "w", encoding="utf-8") as handle:
+            json.dump(review_draft_v2, handle)
+
         result = generator._persist_citation_manifest(
             review_draft_path=review_draft_path,
-            review_word_path=os.path.join(temp_dir, 'test_review.docx'),
-            citations=[]  # 空 citations，应该使用 v2 路径
+            review_word_path=os.path.join(temp_dir, "test_review.docx"),
         )
-        
-        # 验证结果
-        assert result == True
-        
-        # 验证 v2 manifest 文件已创建
-        citation_manifest_path = os.path.join(temp_dir, 'citation_manifests', 'test_project_citation_manifest_v2.json')
-        assert os.path.exists(citation_manifest_path)
-        
-        # 验证 v1 compatibility 文件已创建
-        citation_manifest_v1_path = os.path.join(temp_dir, 'citation_manifests', 'test_project_citation_manifest_v1.json')
-        assert os.path.exists(citation_manifest_v1_path)
-        
-        # 验证 artifact 已注册
-        assert len(registry.registered_files) > 0
-        v2_registration = None
-        for registration in registry.registered_files:
-            if registration.get('artifact_version') == 'v2':
-                v2_registration = registration
-                break
-        assert v2_registration is not None
-        assert v2_registration.get('artifact_type') == 'citation_manifest'
+
+        assert result is True
+
+        manifest_path = os.path.join(temp_dir, "citation_manifests", "test_project_citation_manifest_v3.json")
+        migration_report_path = os.path.join(temp_dir, "citation_manifests", "test_project_citation_migration_report.json")
+        compatibility_v1_path = os.path.join(temp_dir, "citation_manifests", "test_project_citation_manifest_v1.json")
+        assert os.path.exists(manifest_path)
+        assert os.path.exists(migration_report_path)
+        assert os.path.exists(compatibility_v1_path)
+
+        payload = json.loads(open(manifest_path, "r", encoding="utf-8").read())
+        assert payload["artifact_version"] == "v3"
+        assert payload["paper_entries"][0]["paper_id"] == "test_paper_1"
+        assert payload["migration_report"]["contract_version"] == "v3"
+
+        registrations = [item for item in generator.artifact_registry.registered_files if item.get("artifact_type") == "citation_manifest"]
+        assert any(item.get("artifact_version") == "v3" for item in registrations)
 
 
-def test_citation_manifest_v1_fallback():
-    """测试 review_draft_v2 不可加载时仍能走 v1 migration fallback"""
-    # 创建临时目录
+def test_citation_manifest_requires_review_draft_v2_on_normal_path() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
-        # 创建模拟的 JobWorkspace 和 ArtifactRegistry
-        workspace = MockJobWorkspace(temp_dir)
-        workspace.ensure_exists()
-        
-        registry = MockArtifactRegistry()
-        compat_config = MockCompatConfigView()
-        resume_state_report = MockResumeStateReport()
-        
-        # 创建 LiteratureReviewGenerator 实例
-        generator = LiteratureReviewGenerator(project_name='test_project')
-        # 直接设置属性而不是调用 bind_job_workspace，避免类型错误
-        generator.job_workspace = cast(JobWorkspace, workspace)
-        generator.artifact_registry = cast(ArtifactRegistry, registry)
-        generator.compat_config = cast(CompatConfigView, compat_config)
-        generator.resume_state_report = cast(ResumeStateReport, resume_state_report)
-        generator.project_name = 'test_project'
-        generator.output_dir = temp_dir
-        generator.summary_file = os.path.join(temp_dir, 'test_summaries.json')
-        
-        # 模拟 summaries 数据（包含 status 字段）
-        generator.summaries = [
-            {
-                'status': 'success',
-                'paper_info': {
-                    'title': 'Test Paper 1',
-                    'authors': ['Author A', 'Author B'],
-                    'year': '2023'
-                }
-            }
-        ]
-        
-        # 使用不存在的 review_draft_v2 文件路径
-        review_draft_path = os.path.join(temp_dir, 'non_existent_draft.json')
-        
-        # 准备 citations 数据用于 fallback
-        citations = [
-            {
-                'citation_id': 'cit1',
-                'paper_id': 'test_paper_1',
-                'text': '(Author A, 2023)',
-                'context': 'Test context',
-                'section_number': 1,
-                'section_title': 'Introduction',
-                'block_id': 's1_b1',
-                'block_order': 1
-            }
-        ]
-        
-        # 调用 _persist_citation_manifest
+        generator = _build_generator(temp_dir)
+        review_draft_path = os.path.join(temp_dir, "non_existent_draft.json")
+
         result = generator._persist_citation_manifest(
             review_draft_path=review_draft_path,
-            review_word_path=os.path.join(temp_dir, 'test_review.docx'),
-            citations=citations  # 提供 citations 用于 fallback
+            review_word_path=os.path.join(temp_dir, "test_review.docx"),
         )
-        
-        # 验证结果
-        assert result == True
-        
-        # 验证 v2 manifest 文件已创建（通过 migration）
-        citation_manifest_path = os.path.join(temp_dir, 'citation_manifests', 'test_project_citation_manifest_v2.json')
-        assert os.path.exists(citation_manifest_path)
-        
-        # 验证 v1 compatibility 文件已创建
-        citation_manifest_v1_path = os.path.join(temp_dir, 'citation_manifests', 'test_project_citation_manifest_v1.json')
-        assert os.path.exists(citation_manifest_v1_path)
+
+        assert result is False

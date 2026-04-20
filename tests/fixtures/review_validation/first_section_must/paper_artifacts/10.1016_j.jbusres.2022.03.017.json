@@ -1,0 +1,32 @@
+{
+  "artifact_type": "paper_artifact",
+  "artifact_version": "v1",
+  "paper_identity": {
+    "canonical_paper_key": "10.1016/j.jbusres.2022.03.017",
+    "source_paper_id": "10.1016/j.jbusres.2022.03.017"
+  },
+  "paper_info": {
+    "title": "Consumer perception of price fairness and dynamic pricing",
+    "authors": [
+      "Marco Alderighi"
+    ],
+    "year": "2022"
+  },
+  "analysis": {
+    "ai_summary": {
+      "core_analysis": {
+        "summary": "Researchers scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a proxy for price fairness.",
+        "methodology": "The study used Booking.com hotel data and customer ratings to measure perceived price fairness."
+      }
+    },
+    "preprocess": {
+      "normalized_text": "Booking.com hotel data and the difference between value-for-money and overall ratings were used as a fairness proxy."
+    }
+  },
+  "stage1_inputs": {
+    "selected_visual_refs": []
+  },
+  "source": {
+    "source_pdf": "fixture-booking.pdf"
+  }
+}
