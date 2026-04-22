@@ -7,9 +7,8 @@ import glob
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, cast
 
+from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from services.artifact_registry import ArtifactRegistry
-from services.config_compat import CompatConfigView
-from services.job_fingerprint import FingerprintInputs, build_fingerprint_bundle, sanitize_config_for_fingerprint
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.progress_state import determine_resume_state
 from services.queue_service import CancelToken, JobCancelledError
@@ -416,29 +415,25 @@ class JobRunner:
         fingerprint_bundle: dict[str, Any],
         status: str,
     ) -> str:
-        final_resume_report = determine_resume_state(
+        context = BootstrappedRuntimeContext(
             project_name=project_name,
-            job_id=workspace.job_id,
-            summary_file=summary_path,
-            progress_snapshot_file=progress_path,
-            checkpoint_file=checkpoint_path,
-            expected_fingerprint_bundle=fingerprint_bundle,
-        )
-        final_resume_report_path = self._write_resume_report(workspace, final_resume_report)
-        registry.register_file(
-            artifact_role="resume",
-            artifact_type="resume_state_report",
-            artifact_version="v1",
-            path=final_resume_report_path,
-            producer="services.job_runner",
-            artifact_id="resume_state_report",
-        )
-        workspace.write_latest_pointer(
-            resume_state=final_resume_report.state,
+            output_base_dir=os.path.dirname(os.path.dirname(workspace.root_dir)),
+            pointer_path=os.path.join(os.path.dirname(workspace.root_dir), "_latest_job.json"),
+            workspace=workspace,
+            registry=registry,
+            compat_view=None,  # type: ignore[arg-type]
+            summary_path=summary_path,
+            progress_path=progress_path,
+            checkpoint_path=checkpoint_path,
             fingerprint_bundle=fingerprint_bundle,
+            resume_report=None,
+            resume_report_path="",
+        )
+        return finalize_job_runtime(
+            context=context,
+            write_resume_report=self._write_resume_report,
             status=status,
         )
-        return final_resume_report.state
 
     def _execute_legacy_action(
         self,
@@ -563,7 +558,6 @@ class JobRunner:
             )
 
         generator_config = cast(MutableMapping[str, Dict[str, str]], generator.config)
-        compat_view = CompatConfigView.from_config(generator_config)
         output_base_dir = generator_config.get("Paths", {}).get("output_path", "./output")
         resolved_project_name = self._resolve_project_name_from_existing_workspaces(
             base_output_dir=output_base_dir,
@@ -577,59 +571,21 @@ class JobRunner:
                 f"Recovered project name from lossy CLI input: {request.project_name or ''} -> {resolved_project_name}"
             )
 
-        fingerprint_bundle = build_fingerprint_bundle(
-            FingerprintInputs(
-                config_snapshot=sanitize_config_for_fingerprint(generator_config),
-                source_snapshot=self._source_snapshot(generator, request),
-                request_snapshot=self._request_snapshot(request),
-            )
-        )
-        fingerprint_bundle_dict = fingerprint_bundle.to_dict()
-
-        pointer_path = os.path.join(os.path.abspath(output_base_dir), project_name, "_latest_job.json")
-        workspace = self._build_workspace(
-            base_output_dir=output_base_dir,
+        runtime_context = bootstrap_job_runtime(
+            request=request,
+            generator=generator,
             project_name=project_name,
-            pointer_payload=self._pointer_payload(pointer_path),
-            fingerprint_bundle=fingerprint_bundle_dict,
+            source_snapshot=self._source_snapshot(generator, request),
+            request_snapshot=self._request_snapshot(request),
+            build_workspace=self._build_workspace,
+            write_resume_report=self._write_resume_report,
         )
-        registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-
-        summary_path = workspace.artifact_path(f"{project_name}_summaries.json")
-        progress_path = workspace.artifact_path("stage1_progress_snapshot.json")
-        checkpoint_path = workspace.checkpoint_path(f"{project_name}_checkpoint.json")
-        resume_report = determine_resume_state(
-            project_name=project_name,
-            job_id=workspace.job_id,
-            summary_file=summary_path,
-            progress_snapshot_file=progress_path,
-            checkpoint_file=checkpoint_path,
-            expected_fingerprint_bundle=fingerprint_bundle_dict,
-        )
-
-        resume_report_path = self._write_resume_report(workspace, resume_report)
-        registry.register_file(
-            artifact_role="resume",
-            artifact_type="resume_state_report",
-            artifact_version="v1",
-            path=resume_report_path,
-            producer="services.job_runner",
-            artifact_id="resume_state_report",
-        )
-
-        generator.bind_job_workspace(
-            workspace=workspace,
-            artifact_registry=registry,
-            compat_config=compat_view,
-            fingerprint_bundle=fingerprint_bundle_dict,
-            resume_state_report=resume_report,
-        )
-
-        workspace.write_latest_pointer(
-            resume_state=resume_report.state,
-            fingerprint_bundle=fingerprint_bundle_dict,
-            status="running",
-        )
+        workspace = runtime_context.workspace
+        registry = runtime_context.registry
+        summary_path = runtime_context.summary_path
+        progress_path = runtime_context.progress_path
+        checkpoint_path = runtime_context.checkpoint_path
+        fingerprint_bundle_dict = runtime_context.fingerprint_bundle
 
         try:
             active_cancel_token.check_cancelled()

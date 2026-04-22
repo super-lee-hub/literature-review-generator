@@ -15,6 +15,7 @@ from free_mode.profile_manager import get_profile_path, normalize_profile
 from free_mode.service import generate_free_mode_profile, plan_free_mode_chat_turn
 from services.configuration_service import (
     API_ENV_MAPPING,
+    MINERU_ENV_KEYS,
     PROVIDER_PRESETS,
     ensure_config_sections,
     normalize_api_base,
@@ -46,26 +47,31 @@ BUILD_STAMP = datetime.fromtimestamp(Path(__file__).stat().st_mtime).strftime("%
 
 NAV_GROUPS = [
     {
-        "title": "工作流",
+        "title": "开始使用",
         "items": [
-            ("总览", "/", "项目入口与推荐流程", "home"),
-            ("任务构建", "/workflow", "配置单次任务并加入队列", "dashboard_customize"),
-            ("队列与执行", "/queue", "批量任务、执行进度与恢复", "pending_actions"),
+            ("总览", "/", "项目入口与第一轮路径", "home"),
+            ("使用引导", "/guide", "第一次使用先看这里", "menu_book"),
         ],
     },
     {
-        "title": "配置",
+        "title": "运行任务",
         "items": [
-            ("环境与路径", "/setup", "首次使用和基础 setup", "settings_suggest"),
-            ("API 与模型", "/setup/api", "阅读、写作、大纲和验证模型", "hub"),
-            ("性能与预处理", "/setup/processing", "并发、OCR、缓存与 RAG", "tune"),
+            ("工作台", "/workflow", "选择输入来源、运行方式与主流程", "dashboard_customize"),
+            ("结果与日志", "/logs", "查看最新工作区、主要产物与日志", "receipt_long"),
         ],
     },
     {
-        "title": "结果与恢复",
+        "title": "设置",
         "items": [
-            ("日志与产物", "/logs", "查看状态、日志、输出与验证报告", "receipt_long"),
-            ("使用引导", "/guide", "给第一次使用的人看的说明", "menu_book"),
+            ("环境与路径", "/setup", "基础路径与输出目录", "settings_suggest"),
+            ("API 与模型", "/setup/api", "阅读、写作、大纲、自由模式与验证模型", "hub"),
+            ("性能与预处理", "/setup/processing", "并发、OCR、缓存、RAG 与可选验证", "tune"),
+        ],
+    },
+    {
+        "title": "高级功能",
+        "items": [
+            ("队列", "/queue", "批量任务、后台恢复与重排", "pending_actions"),
         ],
     },
 ]
@@ -73,13 +79,13 @@ NAV_GROUPS = [
 SEARCH_ITEMS = [
     {
         "route": "/workflow",
-        "label": "任务构建",
-        "keywords": ["工作台", "workflow", "run", "analyze", "outline", "review", "自由模式", "free mode", "概念", "concept", "job builder", "queue draft"],
+        "label": "工作台",
+        "keywords": ["工作台", "workflow", "run", "analyze", "outline", "review", "自由模式", "free mode", "概念", "concept", "workspace"],
     },
     {
         "route": "/setup",
         "label": "环境与路径",
-        "keywords": ["setup", "路径", "path", "zotero", "output", "输出"],
+        "keywords": ["setup", "路径", "path", "zotero", "output", "输出", "配置"],
     },
     {
         "route": "/setup/api",
@@ -93,13 +99,13 @@ SEARCH_ITEMS = [
     },
     {
         "route": "/queue",
-        "label": "队列与执行",
-        "keywords": ["queue", "队列", "任务", "后台", "background", "cancel", "取消", "retry", "重试", "progress", "run"],
+        "label": "队列",
+        "keywords": ["queue", "队列", "任务", "后台", "background", "cancel", "取消", "retry", "重试", "progress", "run", "批量"],
     },
     {
         "route": "/logs",
-        "label": "日志与产物",
-        "keywords": ["log", "logs", "日志", "output", "产物", "失败", "report"],
+        "label": "结果与日志",
+        "keywords": ["log", "logs", "日志", "output", "产物", "失败", "report", "workspace", "结果"],
     },
     {
         "route": "/guide",
@@ -107,6 +113,8 @@ SEARCH_ITEMS = [
         "keywords": ["guide", "help", "帮助", "怎么用", "新手", "first time"],
     },
 ]
+
+DEFAULT_MINERU_BASE_URL = "https://mineru.net/api/v4"
 
 STYLE_BLOCK = """
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
@@ -116,15 +124,15 @@ STYLE_BLOCK = """
 :root {
   --paper: #f5f1e8;
   --paper-soft: #efe8dc;
-  --panel: rgba(255, 252, 247, 0.78);
-  --panel-strong: rgba(255, 252, 247, 0.92);
+  --panel: rgba(255, 252, 247, 0.92);
+  --panel-strong: rgba(255, 252, 247, 0.97);
   --ink: #202725;
-  --muted: #60706a;
+  --muted: #56645f;
   --accent: #5b6d66;
   --accent-soft: #dde5df;
   --line: rgba(32, 39, 37, 0.10);
   --line-strong: rgba(32, 39, 37, 0.16);
-  --shadow: 0 24px 48px rgba(31, 37, 35, 0.08);
+  --shadow: 0 12px 28px rgba(31, 37, 35, 0.05);
 }
 body, .nicegui-content {
   background:
@@ -136,8 +144,8 @@ body, .nicegui-content {
 }
 .ag-topbar,
 .ag-fixedbar {
-  background: rgba(245, 241, 232, 0.78);
-  backdrop-filter: blur(18px);
+  background: rgba(245, 241, 232, 0.94);
+  backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--line);
 }
 .ag-fixedbar {
@@ -146,7 +154,7 @@ body, .nicegui-content {
   left: 0;
   right: 0;
   z-index: 1000;
-  padding: 12px 18px 10px 18px;
+  padding: 10px 18px 8px 18px;
 }
 .ag-fixedbar,
 .ag-fixedbar *,
@@ -156,11 +164,10 @@ body, .nicegui-content {
 }
 .ag-topbar-title {
   color: #50675f !important;
-  font-weight: 700;
-  font-size: 1.28rem;
-  letter-spacing: 0.045em;
+  font-weight: 600;
+  font-size: 1.16rem;
+  letter-spacing: 0.02em;
   font-family: "Palatino Linotype", Georgia, "Times New Roman", serif;
-  font-variant: small-caps;
 }
 .ag-title-stack {
   display: flex;
@@ -171,12 +178,12 @@ body, .nicegui-content {
 .ag-build-badge {
   display: inline-flex;
   align-items: center;
-  padding: 4px 10px;
+  padding: 3px 10px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.62);
+  background: rgba(255, 255, 255, 0.48);
   border: 1px solid var(--line);
   color: var(--muted) !important;
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   line-height: 1;
   white-space: nowrap;
 }
@@ -220,8 +227,8 @@ body, .nicegui-content {
   align-items: center;
   gap: 10px;
   padding: 8px 14px;
-  border-radius: 14px;
-  background: rgba(221, 229, 223, 0.88);
+  border-radius: 12px;
+  background: rgba(237, 241, 235, 0.92);
   border: 1px solid var(--line-strong);
   color: var(--ink) !important;
   font-weight: 500;
@@ -261,15 +268,30 @@ body, .nicegui-content {
   background: rgba(255, 255, 255, 0.38);
   border-color: var(--line-strong);
 }
+.q-btn {
+  border-radius: 12px;
+  transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+}
+.q-btn:hover {
+  transform: translateY(-1px);
+}
+.q-field--focused .q-field__control {
+  border-color: rgba(91, 109, 102, 0.42) !important;
+  box-shadow: 0 0 0 3px rgba(91, 109, 102, 0.08);
+}
+*:focus-visible {
+  outline: 2px solid rgba(91, 109, 102, 0.48);
+  outline-offset: 2px;
+}
 .ag-drawer {
-  background: rgba(249, 246, 240, 0.88);
-  backdrop-filter: blur(20px);
+  background: rgba(249, 246, 240, 0.96);
+  backdrop-filter: blur(10px);
   border-right: 1px solid var(--line);
 }
 .ag-page {
   max-width: 1380px;
   min-height: calc(100vh - 132px);
-  margin: 180px auto 40px auto;
+  margin: 162px auto 40px auto;
   padding: 0 24px 32px 24px;
 }
 .ag-page-reminder {
@@ -295,9 +317,8 @@ body, .nicegui-content {
 .ag-card, .q-card {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 24px;
+  border-radius: 18px;
   box-shadow: var(--shadow);
-  backdrop-filter: blur(12px);
 }
 .ag-card-strong {
   background: var(--panel-strong);
@@ -317,7 +338,7 @@ body, .nicegui-content {
   gap: 6px;
   padding: 4px 12px;
   border-radius: 999px;
-  background: var(--accent-soft);
+  background: rgba(232, 238, 233, 0.9);
   color: var(--ink);
   font-size: 0.82rem;
   width: fit-content;
@@ -331,9 +352,8 @@ body, .nicegui-content {
 }
 .ag-nav-title {
   color: var(--muted);
-  font-size: 0.76rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
+  font-size: 0.78rem;
+  letter-spacing: 0.06em;
   margin: 0 0 8px 0;
 }
 .ag-nav-link {
@@ -410,7 +430,7 @@ body, .nicegui-content {
 }
 .ag-mini-card {
   padding: 16px;
-  border-radius: 18px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.55);
   border: 1px solid var(--line);
 }
@@ -423,7 +443,7 @@ body, .nicegui-content {
   align-items: flex-start;
   gap: 10px;
   padding: 12px 14px;
-  border-radius: 18px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.55);
   border: 1px solid var(--line);
 }
@@ -455,7 +475,7 @@ body, .nicegui-content {
   flex-direction: column;
   gap: 10px;
   padding: 16px;
-  border-radius: 18px;
+  border-radius: 14px;
   background: rgba(255, 255, 255, 0.55);
   border: 1px solid var(--line);
   min-height: 188px;
@@ -468,8 +488,189 @@ body, .nicegui-content {
   flex-direction: column;
   gap: 10px;
 }
+.ag-editorial-list {
+  display: grid;
+  gap: 14px;
+}
+.ag-editorial-step {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+.ag-editorial-step:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+.ag-step-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--accent);
+  font-family: Georgia, "Times New Roman", serif;
+}
+.ag-step-title {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 1.02rem;
+}
+.ag-step-note {
+  color: var(--muted);
+  line-height: 1.72;
+}
+.ag-summary-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.ag-summary-item {
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid var(--line);
+}
+.ag-ledger-list {
+  display: grid;
+  gap: 12px;
+}
+.ag-ledger-row {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.48);
+  border: 1px solid var(--line);
+}
+.ag-ledger-row .ag-build-badge {
+  align-self: start;
+}
+.ag-ledger-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+.ag-ledger-meta {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+.ag-note-block {
+  padding: 14px 16px;
+  border-left: 3px solid rgba(91, 109, 102, 0.35);
+  background: rgba(255, 255, 255, 0.44);
+  border-radius: 0 14px 14px 0;
+}
+.ag-mode-toggle {
+  width: 100%;
+}
+.ag-mode-toggle .q-btn-group {
+  width: 100%;
+  display: grid;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(228, 235, 229, 0.82);
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+.ag-mode-toggle-2 .q-btn-group {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.ag-mode-toggle-3 .q-btn-group {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.ag-mode-toggle .q-btn {
+  min-height: 48px;
+  border-radius: 14px !important;
+  padding: 4px 14px;
+  background: transparent;
+  color: var(--muted);
+  box-shadow: none !important;
+}
+.ag-mode-toggle .q-btn::before {
+  box-shadow: none !important;
+}
+.ag-mode-toggle .q-btn .q-btn__content {
+  width: 100%;
+  justify-content: center;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.38;
+  font-weight: 600;
+}
+.ag-mode-toggle .q-btn[aria-pressed="true"],
+.ag-mode-toggle .q-btn.q-btn--active,
+.ag-mode-toggle .q-btn.q-btn--outline.q-btn--active {
+  background: rgba(48, 58, 54, 0.92) !important;
+  color: #f7f4ed !important;
+}
+.ag-toggle-ledger {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+.ag-toggle-ledger-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.ag-toggle-ledger-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.ag-toggle-note {
+  display: grid;
+  gap: 6px;
+  min-height: 96px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.52);
+  border: 1px solid var(--line);
+}
+.ag-wrap-note {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.72;
+}
+.ag-status-block {
+  display: grid;
+  gap: 6px;
+  min-height: 92px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.54);
+  border: 1px solid var(--line);
+}
+.ag-kv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.ag-kv-item {
+  display: grid;
+  gap: 4px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid var(--line);
+}
+.ag-section-divider {
+  height: 1px;
+  background: var(--line);
+  width: 100%;
+}
 @media (max-width: 1100px) {
-  .ag-grid-2, .ag-grid-3, .ag-grid-compact, .ag-mini-grid, .ag-workflow-shell, .ag-mode-grid, .ag-action-grid {
+  .ag-grid-2, .ag-grid-3, .ag-grid-compact, .ag-mini-grid, .ag-workflow-shell, .ag-mode-grid, .ag-action-grid, .ag-summary-strip, .ag-toggle-ledger, .ag-kv-grid {
+    grid-template-columns: 1fr;
+  }
+  .ag-mode-toggle .q-btn-group {
     grid-template-columns: 1fr;
   }
   .ag-sidebar-stack {
@@ -522,6 +723,112 @@ def _latest_log_excerpt(language: str = "zh-CN") -> Tuple[str, str]:
         return str(latest), excerpt
     except Exception as exc:  # pragma: no cover - defensive.
         return str(latest), translate(language, "无法读取日志：{exc}").format(exc=exc)
+
+
+def _read_json_payload(path: Path) -> Dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _workspace_primary_artifacts(workspace_path: str, project_name: str) -> list[tuple[str, str]]:
+    workspace = Path(workspace_path)
+    if not workspace.exists():
+        return []
+
+    artifact_candidates: list[tuple[str, Path]] = [
+        ("结构化摘要", workspace / "artifacts" / f"{project_name}_summaries.json"),
+        ("综述大纲", workspace / "artifacts" / f"{project_name}_literature_review_outline.md"),
+        ("注册表", workspace / "artifact_registry.json"),
+    ]
+
+    reports_dir = workspace / "reports"
+    if reports_dir.exists():
+        for label, pattern in (
+            ("分析表", "*_analyzed_papers.xlsx"),
+            ("综述文档", "*_literature_review.docx"),
+            ("失败报告", "*_failed_papers_report.txt"),
+            ("验证报告", "*validation*.json"),
+        ):
+            match = next(iter(sorted(reports_dir.glob(pattern))), None)
+            if match is not None:
+                artifact_candidates.append((label, match))
+
+    return [(label, str(path)) for label, path in artifact_candidates if path.exists()]
+
+
+def _latest_workspace_snapshot(output_root: str, preferred_project: str = "") -> Dict[str, Any] | None:
+    output_dir = Path(output_root).expanduser()
+    if not output_dir.exists():
+        return None
+
+    pointer_candidates: list[Dict[str, Any]] = []
+    preferred_project = str(preferred_project or "").strip()
+
+    if preferred_project:
+        preferred_pointer = output_dir / preferred_project / "_latest_job.json"
+        payload = _read_json_payload(preferred_pointer)
+        if payload:
+            payload["_pointer_path"] = str(preferred_pointer)
+            pointer_candidates.append(payload)
+
+    for pointer_path in output_dir.glob("*/_latest_job.json"):
+        if pointer_path.parent.name.startswith("_"):
+            continue
+        payload = _read_json_payload(pointer_path)
+        if not payload:
+            continue
+        payload["_pointer_path"] = str(pointer_path)
+        if preferred_project and str(payload.get("project_name") or "") == preferred_project:
+            continue
+        pointer_candidates.append(payload)
+
+    def _sort_key(item: Dict[str, Any]) -> str:
+        return str(item.get("updated_at") or "")
+
+    if pointer_candidates:
+        pointer_candidates.sort(key=_sort_key, reverse=True)
+        selected = pointer_candidates[0]
+        workspace_path = str(selected.get("workspace_path") or "")
+        project_name = str(selected.get("project_name") or "")
+        if workspace_path and Path(workspace_path).exists():
+            return {
+                "project_name": project_name,
+                "job_id": str(selected.get("job_id") or ""),
+                "status": str(selected.get("status") or ""),
+                "updated_at": str(selected.get("updated_at") or ""),
+                "workspace_path": workspace_path,
+                "artifact_registry_path": str(selected.get("artifact_registry_path") or ""),
+                "pointer_path": str(selected.get("_pointer_path") or ""),
+                "artifacts": _workspace_primary_artifacts(workspace_path, project_name),
+            }
+
+    fallback_workspaces = sorted(
+        [
+            path
+            for path in output_dir.glob("*__*")
+            if path.is_dir()
+        ],
+        key=lambda item: item.stat().st_mtime,
+        reverse=True,
+    )
+    if not fallback_workspaces:
+        return None
+
+    workspace = fallback_workspaces[0]
+    project_name = workspace.name.split("__", 1)[0]
+    return {
+        "project_name": project_name,
+        "job_id": workspace.name.split("__", 1)[1] if "__" in workspace.name else "",
+        "status": "unknown",
+        "updated_at": "",
+        "workspace_path": str(workspace),
+        "artifact_registry_path": str(workspace / "artifact_registry.json"),
+        "pointer_path": "",
+        "artifacts": _workspace_primary_artifacts(str(workspace), project_name),
+    }
 
 
 def _open_path(path: str, language: str = "zh-CN") -> None:
@@ -709,8 +1016,14 @@ class WorkspaceController:
         self.free_mode_profile_path = ""
         self.free_mode_ready_to_apply = False
         self.free_mode_busy = False
-        self.status_message = f'{self.t("工作台已就绪。建议先进入“环境与路径”完成 setup，再回到“核心工作台”运行流程。")}  Build {BUILD_STAMP}'
+        self.status_message = self.t("工作台已就绪。先完成设置，再按“输入来源 → 运行方式 → 主流程”开始第一轮。")
         validation_settings = read_validation_settings(self.sections)
+        mineru_base_url = self.env_values.get("MINERU_BASE_URL", DEFAULT_MINERU_BASE_URL)
+        mineru_model_version = self.env_values.get("MINERU_MODEL_VERSION", "vlm") or "vlm"
+        allow_local_parse_fallback = str(
+            self.env_values.get("ALLOW_LOCAL_PARSE_FALLBACK", "true")
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        default_input_mode = "zotero" if self.sections["Paths"].get("zotero_report", "").strip() else "pdf"
         self.state: Dict[str, Any] = {
             "paths": {
                 "zotero_report": self.sections["Paths"].get("zotero_report", ""),
@@ -731,6 +1044,9 @@ class WorkspaceController:
             "preprocess": {
                 "enabled": self.sections["Preprocess"].get("enabled", "true") == "true",
                 "cache_dir": self.sections["Preprocess"].get("cache_dir", "./output/_preprocess_cache"),
+                "parser_mode": self.sections["Preprocess"].get("parser_mode", "local"),
+                "primary_parser": self.sections["Preprocess"].get("primary_parser", "local"),
+                "fallback_parser": self.sections["Preprocess"].get("fallback_parser", "local"),
                 "extractor_profile": self.sections["Preprocess"].get("extractor_profile", "auto"),
                 "ocr_mode": self.sections["Preprocess"].get("ocr_mode", "auto"),
                 "ocr_languages": self.sections["Preprocess"].get("ocr_languages", "eng"),
@@ -738,8 +1054,16 @@ class WorkspaceController:
                 "enable_local_rag": self.sections["Preprocess"].get("enable_local_rag", "false") == "true",
                 "rag_backend": self.sections["Preprocess"].get("rag_backend", "chroma"),
             },
+            "mineru": {
+                "base_url": mineru_base_url,
+                "api_token": self.env_values.get("MINERU_API_TOKEN", ""),
+                "model_version": mineru_model_version,
+                "allow_local_parse_fallback": allow_local_parse_fallback,
+            },
             "workflow": {
                 "project_name": "",
+                "input_mode": default_input_mode,
+                "work_mode": "normal",
                 "pdf_folder": "",
                 "summary_file": "",
                 "summary_sources": "",
@@ -777,12 +1101,16 @@ class WorkspaceController:
         except Exception:
             self._queue_service = None
 
-    def refresh_queue(self) -> None:
+    def refresh_queue(self, *, notify_user: bool = True) -> None:
         """刷新队列状态"""
+        self._init_queue_service()
         if self._queue_service:
-            ui.notify(self.t("队列已刷新"))
+            self.set_status(self.t("队列已刷新"))
+            if notify_user:
+                ui.notify(self.t("队列已刷新"))
         else:
-            ui.notify(self.t("队列服务未初始化"), type="warning")
+            if notify_user:
+                ui.notify(self.t("队列服务未初始化"), type="warning")
 
     def clear_completed_jobs(self) -> None:
         """清空已完成的任务"""
@@ -861,15 +1189,28 @@ class WorkspaceController:
         else:
             ui.notify(self.t("队列服务未初始化"), type="warning")
 
-    def _build_queue_job_spec(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> Any:
+    def _build_queue_job_spec(
+        self,
+        project_name: str,
+        pdf_folder: str,
+        zotero_report: str,
+        action: str,
+        *,
+        input_mode: str | None = None,
+        work_mode: str | None = None,
+    ) -> Any:
         from services.queue_service import QueueJobSpec, create_queue_job_id
 
         workflow_state = self.state["workflow"]
-        library_path = str(self.state["paths"].get("library_path") or "").strip() or None
-        effective_pdf_folder = str(pdf_folder or "").strip() or None
-        effective_zotero_report = str(zotero_report or "").strip() or None
-        free_mode_profile = self.free_mode_profile_path or None
-        free_mode_idea = None if free_mode_profile else (str(workflow_state.get("free_mode_idea") or "").strip() or None)
+        resolved_input_mode = str(input_mode or workflow_state.get("input_mode") or "pdf")
+        resolved_work_mode = str(work_mode or workflow_state.get("work_mode") or "normal")
+        library_path = str(self.state["paths"].get("library_path") or "").strip() or None if resolved_input_mode == "zotero" else None
+        effective_pdf_folder = str(pdf_folder or "").strip() or None if resolved_input_mode == "pdf" else None
+        effective_zotero_report = str(zotero_report or "").strip() or None if resolved_input_mode == "zotero" else None
+        free_mode_profile = self.free_mode_profile_path or None if resolved_work_mode == "free" else None
+        free_mode_idea = None
+        if resolved_work_mode == "free" and not free_mode_profile:
+            free_mode_idea = str(workflow_state.get("free_mode_idea") or "").strip() or None
         generate_section = None
         if action == "generate_section":
             section_number_raw = str(workflow_state.get("section_number") or "").strip()
@@ -903,7 +1244,7 @@ class WorkspaceController:
             "validate_review": action == "validate",
             "retry_failed": action == "retry_failed",
             "retry_review_failed": action == "retry_review_failed",
-            "concept": str(workflow_state.get("concept") or "").strip() or None,
+            "concept": str(workflow_state.get("concept") or "").strip() or None if resolved_work_mode == "concept" else None,
             "free_mode_profile": free_mode_profile,
             "free_mode_idea": free_mode_idea,
             "summary_file": str(workflow_state.get("summary_file") or "").strip() or None,
@@ -911,6 +1252,7 @@ class WorkspaceController:
             "reuse_stage1": bool(workflow_state.get("reuse_stage1")),
             "reuse_summary_files": reuse_summary_files,
             "queue_file": str(Path(self.state["paths"]["output_path"]) / "_queue" / "queue.json"),
+            "source_mode": "zotero" if effective_zotero_report else "direct",
         }
 
         return QueueJobSpec(
@@ -930,34 +1272,54 @@ class WorkspaceController:
             self._queue_runner = QueueRunner(self._queue_service, JobRunner())
         return self._queue_runner
 
-    def add_job_to_queue(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> Optional[str]:
+    def add_job_to_queue(
+        self,
+        project_name: str,
+        pdf_folder: str,
+        zotero_report: str,
+        action: str,
+        *,
+        input_mode: str | None = None,
+        work_mode: str | None = None,
+    ) -> Optional[str]:
         """Add a job to the persistent queue and return the created job id."""
         if not self._queue_service:
-            self.notify("Queue service is not initialized.", color="warning")
+            self.notify(self.t("队列服务未初始化"), color="warning")
             return None
 
         try:
-            spec = self._build_queue_job_spec(project_name, pdf_folder, zotero_report, action)
+            spec = self._build_queue_job_spec(
+                project_name,
+                pdf_folder,
+                zotero_report,
+                action,
+                input_mode=input_mode,
+                work_mode=work_mode,
+            )
             job_id = self._queue_service.add_job(spec)
-            self.refresh_queue()
+            self.refresh_queue(notify_user=False)
             self.notify(self.tf("Added job to queue: {job_id}", job_id=job_id), color="positive")
             return job_id
         except Exception as e:
             self.notify(self.tf("Failed to add job to queue: {error}", error=str(e)), color="negative", multi_line=True)
             return None
 
-    def add_queue_builder_item(self, project_name: str, pdf_folder: str, zotero_report: str, action: str) -> None:
+    def add_queue_builder_item(self, project_name: str, pdf_folder: str, zotero_report: str, action: str, *, input_mode: str = "pdf") -> None:
         item = {
             "project_name": str(project_name or "").strip(),
             "pdf_folder": str(pdf_folder or "").strip(),
             "zotero_report": str(zotero_report or "").strip(),
             "action": str(action or "analyze").strip() or "analyze",
+            "input_mode": str(input_mode or "pdf"),
         }
         if not item["project_name"]:
             self.notify(self.t("Please enter a project name first."), color="warning")
             return
-        if not item["pdf_folder"] and not item["zotero_report"]:
-            self.notify(self.t("Please provide either a PDF folder or a Zotero report."), color="warning")
+        if item["input_mode"] == "pdf" and not item["pdf_folder"]:
+            self.notify(self.t("当前选择的是 PDF 文件夹模式，请先填写 PDF 文件夹。"), color="warning")
+            return
+        if item["input_mode"] == "zotero" and not item["zotero_report"]:
+            self.notify(self.t("当前选择的是 Zotero 模式，请先填写 Zotero 报告路径。"), color="warning")
             return
         self.state["queue_builder"]["items"].append(item)
         self.notify(self.tf("Added {project_name} to the queue draft.", project_name=item['project_name']), color="positive")
@@ -984,6 +1346,8 @@ class WorkspaceController:
                 str(item.get("pdf_folder") or ""),
                 str(item.get("zotero_report") or ""),
                 str(item.get("action") or "analyze"),
+                input_mode=str(item.get("input_mode") or "pdf"),
+                work_mode="normal",
             )
             if job_id:
                 created_ids.append(job_id)
@@ -1016,6 +1380,29 @@ class WorkspaceController:
                 ui.notify(self.tf("重排任务失败: {e}", e=str(e)), type="negative")
         else:
             ui.notify(self.t("队列服务未初始化"), type="warning")
+
+    def move_queue_job(self, job_id: str, offset: int) -> None:
+        """按单步偏移量移动任务，避免出现“已选中”但实际上没有选择器的迷惑交互。"""
+        if not self._queue_service:
+            ui.notify(self.t("队列服务未初始化"), type="warning")
+            return
+
+        try:
+            ordered_ids = [job.job_id for job in self._queue_service.list_jobs()]
+            current_index = ordered_ids.index(job_id)
+        except ValueError:
+            return
+        except Exception as e:
+            ui.notify(self.tf("调整任务顺序失败: {e}", e=str(e)), type="negative")
+            return
+
+        target_index = current_index + offset
+        if target_index < 0 or target_index >= len(ordered_ids):
+            return
+
+        moving_job_id = ordered_ids.pop(current_index)
+        ordered_ids.insert(target_index, moving_job_id)
+        self.reorder_jobs(ordered_ids)
 
     def save_queue(self, file_path: str) -> None:
         """保存队列到文件"""
@@ -1289,11 +1676,66 @@ class WorkspaceController:
         ]
         return "\n\n".join(parts)
 
+    @staticmethod
+    def _compact_path_for_ui(raw_path: str, *, head: int = 24, tail: int = 32) -> str:
+        value = str(raw_path or "").strip()
+        if len(value) <= head + tail + 1:
+            return value
+        return f"{value[:head]}…{value[-tail:]}"
+
+    def _mineru_token_state_text(self) -> str:
+        if str(self.state["mineru"]["api_token"] or "").strip():
+            return self.t("MinerU token 已填写。")
+        return self.t("MinerU token 还没有填写。")
+
+    def _mineru_runtime_state_text(self) -> str:
+        parser_mode = str(self.state["preprocess"]["parser_mode"] or "local").strip().lower() or "local"
+        token_present = bool(str(self.state["mineru"]["api_token"] or "").strip())
+        allow_local_fallback = bool(self.state["mineru"]["allow_local_parse_fallback"])
+        if parser_mode == "local":
+            return self.t("当前 parser mode 是 local：即使保存了 MinerU token，运行时也只会走本地解析链。")
+        if parser_mode == "hybrid":
+            if token_present:
+                return self.t("当前 parser mode 是 hybrid：系统会先跑本地基线，只有质量不佳时才会尝试 MinerU。")
+            return self.t("当前 parser mode 是 hybrid，但还没有 MinerU token，因此最终仍只会保留本地解析。")
+        if parser_mode == "remote":
+            if token_present:
+                if allow_local_fallback:
+                    return self.t("当前 parser mode 是 remote：会直接请求 MinerU；远程失败时仍允许回退到本地解析。")
+                return self.t("当前 parser mode 是 remote：会直接请求 MinerU；你已经关闭本地回退，所以远程不可用时会直接失败。")
+            return self.t("当前 parser mode 是 remote，但还没有 MinerU token，因此远程解析不会真正发起。")
+        if token_present:
+            if allow_local_fallback:
+                return self.t("当前 parser mode 是 remote_first：会优先尝试 MinerU，失败后允许切回本地解析。")
+            return self.t("当前 parser mode 是 remote_first：会优先尝试 MinerU；你已经关闭本地回退，所以远程失败时会直接终止。")
+        return self.t("当前 parser mode 是 remote_first，但还没有 MinerU token，因此最终仍会落回本地解析。")
+
+    def _collect_extra_env_values(self) -> Dict[str, str]:
+        mineru_state = self.state["mineru"]
+        return {
+            "MINERU_BASE_URL": str(mineru_state["base_url"] or DEFAULT_MINERU_BASE_URL).strip().rstrip("/") or DEFAULT_MINERU_BASE_URL,
+            "MINERU_API_TOKEN": str(mineru_state["api_token"] or "").strip(),
+            "MINERU_MODEL_VERSION": str(mineru_state["model_version"] or "vlm").strip() or "vlm",
+            "ALLOW_LOCAL_PARSE_FALLBACK": "true" if mineru_state["allow_local_parse_fallback"] else "false",
+        }
+
+    def _sync_env_values_from_disk(self) -> None:
+        self.env_values = read_env_file(self.env_path)
+        for env_key in [*API_ENV_MAPPING.values(), *MINERU_ENV_KEYS]:
+            value = str(self.env_values.get(env_key, ""))
+            if value:
+                os.environ[env_key] = value
+            else:
+                os.environ.pop(env_key, None)
+
     def _free_mode_status_text(self) -> str:
         if self.free_mode_busy:
             return self.t("自由模式正在整理你的想法…")
         if self.free_mode_profile_path:
-            return self.tf("自由模式已应用到本次任务：{target}", target=self.free_mode_profile_path)
+            return self.tf(
+                "自由模式已应用到本次任务：{target}",
+                target=self._compact_path_for_ui(self.free_mode_profile_path),
+            )
         if self.free_mode_ready_to_apply and self.free_mode_messages:
             return self.t("当前规划已经比较完整，可以直接应用到本次任务。")
         if self.free_mode_messages:
@@ -1304,9 +1746,13 @@ class WorkspaceController:
         if self.free_mode_busy:
             return self.t("本轮对话返回后，这里会更新仍需补充的信息。")
         if self.free_mode_missing_information:
-            return self.tf("还建议再确认这些点：{items}", items="；".join(self.free_mode_missing_information))
+            items = "；".join(str(item).strip() for item in self.free_mode_missing_information[:3] if str(item).strip())
+            return self.tf("还建议再确认这些点：{items}", items=items)
         if self.free_mode_profile_path:
-            return self.t("后续运行会优先使用这份已应用的自由模式 profile。")
+            return self.tf(
+                "后续运行会优先使用这份已应用的自由模式 profile。完整路径：{target}",
+                target=self.free_mode_profile_path,
+            )
         return self.t("例如：我想围绕概念 A 如何推导到概念 B 来写综述，重点比较变量链路、理论解释和 research gap。")
 
     def update_free_mode_widgets(self) -> None:
@@ -1334,7 +1780,7 @@ class WorkspaceController:
             lambda element: element.enable() if can_apply else element.disable(),
         )
 
-    def _collect_config_payload(self) -> tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
+    def _collect_config_payload(self) -> tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, str]]:
         updated_sections = ensure_config_sections(self.sections)
         updated_sections["Paths"].update(
             {
@@ -1369,6 +1815,9 @@ class WorkspaceController:
             {
                 "enabled": "true" if self.state["preprocess"]["enabled"] else "false",
                 "cache_dir": self.state["preprocess"]["cache_dir"],
+                "parser_mode": self.state["preprocess"]["parser_mode"],
+                "primary_parser": self.state["preprocess"]["primary_parser"],
+                "fallback_parser": self.state["preprocess"]["fallback_parser"],
                 "extractor_profile": self.state["preprocess"]["extractor_profile"],
                 "ocr_mode": self.state["preprocess"]["ocr_mode"],
                 "ocr_languages": self.state["preprocess"]["ocr_languages"],
@@ -1388,10 +1837,11 @@ class WorkspaceController:
             updated_sections[section_name]["api_base"] = card["api_base"]
             api_keys[section_name] = card["api_key"]
 
-        return updated_sections, api_keys
+        extra_env_values = self._collect_extra_env_values()
+        return updated_sections, api_keys, extra_env_values
 
     def build_runtime_config(self) -> Dict[str, Dict[str, str]]:
-        runtime_sections, api_keys = self._collect_config_payload()
+        runtime_sections, api_keys, _extra_env_values = self._collect_config_payload()
         normalize_for_save(runtime_sections)
         runtime_config = ensure_config_sections(runtime_sections)
         for section_name, api_key in api_keys.items():
@@ -1582,10 +2032,18 @@ class WorkspaceController:
         self._safe_update_bound_list(self.bindings.log_views, lambda element: element.set_value(self.latest_log_excerpt))
 
     def persist_config(self, *, notify_user: bool = True) -> None:
-        updated_sections, api_keys = self._collect_config_payload()
+        updated_sections, api_keys, extra_env_values = self._collect_config_payload()
         normalize_for_save(updated_sections)
-        save_config_and_env(updated_sections, api_keys, config_path=self.config_path, env_path=self.env_path)
+        save_config_and_env(
+            updated_sections,
+            api_keys,
+            extra_env_values=extra_env_values,
+            config_path=self.config_path,
+            env_path=self.env_path,
+        )
         self.sections = ensure_config_sections(updated_sections)
+        self._sync_env_values_from_disk()
+        self._init_queue_service()
         self.set_status(self.tf("配置已保存到 {config_path} 和 {env_path}", config_path=self.config_path, env_path=self.env_path))
         if notify_user:
             self.notify(self.t("配置已保存。"), color="positive")
@@ -1699,20 +2157,31 @@ class WorkspaceController:
 
     def validate_workflow_request(self, action: str) -> bool:
         project_name = str(self.state["workflow"]["project_name"]).strip()
+        input_mode = str(self.state["workflow"].get("input_mode") or "pdf")
+        work_mode = str(self.state["workflow"].get("work_mode") or "normal")
         pdf_folder = str(self.state["workflow"]["pdf_folder"]).strip()
         zotero_report = str(self.state["paths"]["zotero_report"]).strip()
+        library_path = str(self.state["paths"]["library_path"]).strip()
 
         if not project_name:
             self.notify(self.t("请先填写项目名。"), color="warning")
             return False
 
-        if self.free_mode_messages and not self.free_mode_profile_path:
+        if work_mode == "free" and self.free_mode_messages and not self.free_mode_profile_path:
             self.notify(self.t("自由模式对话还没有应用到本次任务。请先应用当前规划，或清空对话后再运行。"), color="warning", multi_line=True)
             return False
 
-        if action in {"analyze", "run_all"} and not pdf_folder and not zotero_report:
-            self.notify(self.t("请填写 PDF 文件夹，或先在“环境与路径”页面填写 Zotero 报告路径。"), color="warning", multi_line=True)
-            return False
+        if action in {"analyze", "run_all"}:
+            if input_mode == "pdf" and not pdf_folder:
+                self.notify(self.t("当前选择的是 PDF 文件夹模式，请先填写 PDF 文件夹。"), color="warning")
+                return False
+            if input_mode == "zotero":
+                if not zotero_report:
+                    self.notify(self.t("当前选择的是 Zotero 模式，请先填写 Zotero 报告路径。"), color="warning")
+                    return False
+                if not library_path:
+                    self.notify(self.t("Zotero 模式还需要填写 Zotero 库路径。"), color="warning")
+                    return False
 
         if action == "generate_section":
             section_number_raw = str(self.state["workflow"]["section_number"]).strip()
@@ -1747,12 +2216,12 @@ class WorkspaceController:
             return
 
         if self.workflow_running:
-            self.notify("A workflow is already running.", color="info")
+            self.notify(self.t("当前已有任务正在运行。"), color="info")
             return
 
         self.persist_config(notify_user=False)
         action_label_text = self.action_label(action)
-        self.set_status(f"Running {action_label_text}...")
+        self.set_status(self.tf("正在执行 {action_label}，请稍候……", action_label=action_label_text))
         self.progress_tracker = ProgressTracker()
         self.progress_tracker.reset(task_type=action_label_text, stage=action, message=self.status_message, indeterminate=True)
         self.progress_snapshot = self.progress_tracker.snapshot()
@@ -1762,7 +2231,7 @@ class WorkspaceController:
         if self.test_mode:
             self.progress_tracker.finish(
                 success=True,
-                message=f"Test mode: simulated {action_label_text}.",
+                message=self.tf("测试模式：已模拟执行 {action_label}。", action_label=action_label_text),
             )
             self.progress_snapshot = self.progress_tracker.snapshot()
             self.update_progress_widgets()
@@ -1780,21 +2249,21 @@ class WorkspaceController:
         try:
             job_id = self.add_job_to_queue(project_name, pdf_folder, zotero_report, action)
             if not job_id:
-                self.progress_tracker.finish(success=False, message="Failed to enqueue the job.")
+                self.progress_tracker.finish(success=False, message=self.t("任务入队失败，请检查当前输入后重试。"))
                 return
 
             runner = self._ensure_queue_runner()
             if runner is None:
-                self.progress_tracker.finish(success=False, message="Queue service is not initialized.")
+                self.progress_tracker.finish(success=False, message=self.t("队列服务未初始化，无法启动任务。"))
                 return
 
-            self.refresh_queue()
+            self.refresh_queue(notify_user=False)
             ran = await asyncio.to_thread(runner.run_single_job, job_id)
-            self.refresh_queue()
+            self.refresh_queue(notify_user=False)
             runtime = self._queue_service.get_job_runtime(job_id) if self._queue_service else None
 
             if ran and runtime and runtime.state == QueueState.COMPLETED:
-                message = f"{action_label_text} completed."
+                message = self.tf("{action_label} 已执行完成。", action_label=action_label_text)
                 self.progress_tracker.finish(success=True, message=message)
                 self.set_status(message)
                 self.notify(message, color="positive")
@@ -1805,8 +2274,8 @@ class WorkspaceController:
                 elif runtime and runtime.result_summary:
                     failure_reason = str(runtime.result_summary.get("message") or "")
                 if not failure_reason:
-                    failure_reason = "Queue runner returned an unknown error."
-                message = f"{action_label_text} failed: {failure_reason}"
+                    failure_reason = self.t("请查看日志与最近产物了解失败原因。")
+                message = self.tf("{action_label} 执行失败：{reason}", action_label=action_label_text, reason=failure_reason)
                 self.progress_tracker.finish(success=False, message=message)
                 self.set_status(message)
                 self.notify(message, color="negative", multi_line=True)
@@ -1814,7 +2283,7 @@ class WorkspaceController:
             self.progress_snapshot = self.progress_tracker.snapshot()
             self.update_progress_widgets()
             self.refresh_logs()
-            self.refresh_queue()
+            self.refresh_queue(notify_user=False)
             self.set_workflow_running(False)
 
 
@@ -1861,72 +2330,100 @@ def _render_progress_card(controller: WorkspaceController) -> None:
 
 
 def _render_workflow_input_card(controller: WorkspaceController) -> None:
+    t = controller.t
     with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
-        ui.label(controller.t("Task input")).classes("ag-section-title")
-        ui.label(
-            controller.t(
-                "Choose the PDF folder or Zotero report first, then fill in the project name. Stage-1 reuse now scans historical outputs automatically, and manual summary paths are only needed for advanced cases."
-            )
-        ).classes("ag-subtle")
-        with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-            ui.input(controller.t("Project name"), value=controller.state["workflow"]["project_name"]).bind_value(controller.state["workflow"], "project_name")
-            _render_path_field(
-                controller,
-                label=controller.t("PDF folder"),
-                section="workflow",
-                key="pdf_folder",
-                pick="directory",
-                title=controller.t("Select PDF folder"),
-            )
-            _render_path_field(
-                controller,
-                label=controller.t("Zotero report"),
-                section="paths",
-                key="zotero_report",
-                pick="file",
-                title=controller.t("Select Zotero report file"),
-                filetypes=[("Report Files", "*.html *.htm *.txt *.md *.csv *.json"), ("All Files", "*.*")],
-            )
+        ui.label(t("任务起点")).classes("ag-section-title")
+        ui.label(t("先选输入来源，再填写项目名。第一轮建议优先跑“仅分析文献”，确认摘要质量后再继续。")).classes("ag-subtle")
+        with ui.grid(columns=2).classes("w-full gap-4 q-mt-md"):
             with ui.column().classes("gap-2"):
+                ui.label(t("输入来源")).classes("ag-subtle")
+                ui.toggle(
+                    {"pdf": t("PDF 文件夹模式"), "zotero": t("Zotero 报告模式")},
+                    value=controller.state["workflow"]["input_mode"],
+                ).bind_value(controller.state["workflow"], "input_mode").classes("ag-mode-toggle ag-mode-toggle-2 w-full")
+                with ui.element("div").classes("ag-toggle-ledger ag-toggle-ledger-2"):
+                    with ui.element("div").classes("ag-toggle-note"):
+                        ui.label(t("PDF 文件夹模式")).classes("text-body1")
+                        ui.label(t("适合你已经把文献 PDF 放在一个文件夹里，想直接开始批量分析。")).classes("ag-subtle ag-wrap-note")
+                    with ui.element("div").classes("ag-toggle-note"):
+                        ui.label(t("Zotero 报告模式")).classes("text-body1")
+                        ui.label(t("适合你已经有 Zotero report 和 library，希望沿着已有文献整理结果继续。")).classes("ag-subtle ag-wrap-note")
+            with ui.column().classes("gap-2"):
+                ui.input(t("项目名"), value=controller.state["workflow"]["project_name"]).bind_value(controller.state["workflow"], "project_name").classes("w-full")
                 ui.checkbox(
-                    controller.t("Auto reuse historical stage-1 summaries"),
+                    t("Auto reuse historical stage-1 summaries"),
                     value=controller.state["workflow"]["reuse_stage1"],
                 ).bind_value(controller.state["workflow"], "reuse_stage1")
                 ui.label(
-                    controller.t(
-                        "When enabled, stage 1 scans all historical project outputs plus compatible legacy summaries under the configured output path, then only analyzes the papers that are still missing."
-                    )
+                    t("When enabled, stage 1 scans all historical project outputs plus compatible legacy summaries under the configured output path, then only analyzes the papers that are still missing.")
                 ).classes("ag-subtle")
-        with ui.expansion(controller.t("Advanced summary source options"), icon="tune").classes("w-full q-mt-md"):
-            with ui.column().classes("gap-3 q-pa-sm"):
-                _render_path_field(
-                    controller,
-                    label=controller.t("Summary file"),
-                    section="workflow",
-                    key="summary_file",
-                    pick="file",
-                    title=controller.t("Select summaries.json file"),
-                    filetypes=[("Summary Files", "*.json"), ("All Files", "*.*")],
-                )
-                ui.textarea(
-                    controller.t("Additional downstream summary sources (one path per line)"),
-                    value=controller.state["workflow"]["summary_sources"],
-                ).bind_value(controller.state["workflow"], "summary_sources").props("outlined autogrow").classes("w-full")
-                ui.textarea(
-                    controller.t("Additional stage-1 reuse summary files outside output_path (one path per line)"),
-                    value=controller.state["workflow"]["reuse_summary_files"],
-                ).bind_value(controller.state["workflow"], "reuse_summary_files").props("outlined autogrow").classes("w-full")
-        with ui.row().classes("gap-2 q-mt-sm flex-wrap"):
-            ui.button(controller.t("Open PDF folder"), on_click=lambda: _open_path(controller.state["workflow"]["pdf_folder"], controller.language)).props("outline")
-            ui.button(controller.t("Open Zotero report"), on_click=lambda: _open_path(controller.state["paths"]["zotero_report"], controller.language)).props("outline")
-            ui.button(controller.t("Open summary file"), on_click=lambda: _open_path(controller.state["workflow"]["summary_file"], controller.language)).props("outline")
-            ui.button(controller.t("Open Setup"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
+
+        with ui.column().classes("w-full gap-3 q-mt-md").bind_visibility_from(controller.state["workflow"], "input_mode", value="pdf"):
+            _render_path_field(
+                controller,
+                label=t("PDF folder"),
+                section="workflow",
+                key="pdf_folder",
+                pick="directory",
+                title=t("Select PDF folder"),
+            )
+            with ui.row().classes("gap-2 flex-wrap"):
+                ui.button(t("Open PDF folder"), on_click=lambda: _open_path(controller.state["workflow"]["pdf_folder"], controller.language)).props("outline")
+
+        with ui.column().classes("w-full gap-3 q-mt-md").bind_visibility_from(controller.state["workflow"], "input_mode", value="zotero"):
+            _render_path_field(
+                controller,
+                label="Zotero 报告路径",
+                section="paths",
+                key="zotero_report",
+                pick="file",
+                title="选择 Zotero 报告文件",
+                filetypes=[("Report Files", "*.html *.htm *.txt *.md *.csv *.json"), ("All Files", "*.*")],
+            )
+            _render_path_field(
+                controller,
+                label="Zotero 库路径",
+                section="paths",
+                key="library_path",
+                pick="directory",
+                title="选择 Zotero 库目录",
+            )
+            ui.label(t("Zotero 模式需要 report 和 library 两个路径；如果没配好，先去“环境与路径”页面补齐。")).classes("ag-subtle")
+            with ui.row().classes("gap-2 flex-wrap"):
+                ui.button(t("Open Zotero report"), on_click=lambda: _open_path(controller.state["paths"]["zotero_report"], controller.language)).props("outline")
+                ui.button(t("打开 Zotero 库路径"), on_click=lambda: _open_path(controller.state["paths"]["library_path"], controller.language)).props("outline")
+                ui.button(t("Open Setup"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
+
+
+def _render_workflow_mode_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    with ui.card().classes("ag-card p-6 w-full"):
+        ui.label(t("运行方式")).classes("ag-section-title")
+        ui.label(t("先用普通模式跑通第一轮；只有在确实需要额外概念抽取或先聊清写作意图时，再切换模式。")).classes("ag-subtle")
+        ui.toggle(
+            {
+                "normal": t("普通模式"),
+                "concept": t("概念增强模式"),
+                "free": t("自由模式"),
+            },
+            value=controller.state["workflow"]["work_mode"],
+        ).bind_value(controller.state["workflow"], "work_mode").classes("ag-mode-toggle ag-mode-toggle-3 w-full q-mt-md")
+        with ui.element("div").classes("ag-toggle-ledger ag-toggle-ledger-3"):
+            with ui.element("div").classes("ag-toggle-note"):
+                ui.label(t("普通模式")).classes("text-body1")
+                ui.label(t("普通模式：适合第一次运行和大多数常规任务。")).classes("ag-subtle ag-wrap-note")
+            with ui.element("div").classes("ag-toggle-note"):
+                ui.label(t("概念增强模式")).classes("text-body1")
+                ui.label(t("概念增强：只在你要围绕某个核心概念补抓变量、定义和比较时使用。")).classes("ag-subtle ag-wrap-note")
+            with ui.element("div").classes("ag-toggle-note"):
+                ui.label(t("自由模式")).classes("text-body1")
+                ui.label(t("自由模式：先和规划助手聊清目标，再把规划应用到本次任务。")).classes("ag-subtle ag-wrap-note")
 
 
 def _render_workflow_concept_card(controller: WorkspaceController) -> None:
     t = controller.t
-    with ui.card().classes("ag-card p-6 w-full"):
-        ui.label(t("概念增强模式")).classes("ag-section-title")
+    with ui.card().classes("ag-card p-6 w-full").bind_visibility_from(controller.state["workflow"], "work_mode", value="concept"):
+        ui.label(t("概念增强（仅在概念模式下填写）")).classes("ag-section-title")
         ui.label(t("如果这次要围绕某个核心概念补抓变量、定义和比较关系，就填写概念词。普通模式可以留空。")).classes("ag-subtle")
         ui.input(
             t("概念增强模式概念词"),
@@ -1936,11 +2433,12 @@ def _render_workflow_concept_card(controller: WorkspaceController) -> None:
 
 def _render_free_mode_planner_card(controller: WorkspaceController) -> None:
     t = controller.t
-    with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
-        ui.label(t("自由模式对话规划器")).classes("ag-section-title")
+    with ui.card().classes("ag-card ag-card-strong p-6 w-full").bind_visibility_from(controller.state["workflow"], "work_mode", value="free"):
+        ui.label(t("自由模式规划（仅在自由模式下展开）")).classes("ag-section-title")
         ui.label(t("先和规划助手多轮聊清楚你的综述想法，再把当前规划应用到本次任务。")).classes("ag-subtle")
-        status_label = ui.label("").classes("text-body1 q-mt-sm")
-        hint_label = ui.label("").classes("ag-subtle")
+        with ui.element("div").classes("ag-status-block q-mt-md"):
+            status_label = ui.label("").classes("text-body1 ag-wrap-note")
+            hint_label = ui.label("").classes("ag-subtle ag-wrap-note")
         with ui.grid(columns=2).classes("w-full gap-4 q-mt-md"):
             transcript_view = ui.textarea(
                 label=t("对话记录"),
@@ -1981,92 +2479,125 @@ def _render_workflow_actions_card(controller: WorkspaceController) -> None:
 
     with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
         ui.label(t("主流程操作")).classes("ag-section-title")
-        ui.label(t("把主流程按钮集中放在一起，只保留真正代表分析链路的四个入口。")).classes("ag-subtle")
+        ui.label(t("第一次使用建议按这个顺序：仅分析文献 → 生成大纲 → 生成全文。只有在流程稳定后，再使用一键运行。")).classes("ag-subtle")
+        with ui.element("div").classes("ag-note-block q-mt-md"):
+            ui.label(t("如果你是第一次跑这个项目，先点“仅分析文献”。如果已有可靠摘要或历史工作区，再继续点大纲、全文或验证。")).classes("ag-subtle")
         with ui.element("div").classes("ag-action-grid w-full q-mt-md"):
             for label_key, desc_key, action in action_specs:
                 with ui.element("div").classes("ag-action-tile"):
                     ui.label(t(label_key)).classes("ag-section-title")
                     ui.label(t(desc_key)).classes("ag-subtle")
+                    button_props = "outline"
+                    if action == "analyze":
+                        button_props = "unelevated color=primary"
+                    elif action == "run_all":
+                        button_props = "unelevated"
                     button = ui.button(
                         t(label_key),
                         on_click=lambda event=None, current_action=action: asyncio.create_task(controller.run_workflow(current_action)),
-                    ).props("unelevated").classes("w-full")
+                    ).props(button_props).classes("w-full")
                     controller.register_action_button(button)
+
+
+def _render_workflow_summary_reuse_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    with ui.expansion(t("高级：复用已有摘要（一般可跳过）"), icon="tune").classes("w-full"):
+        with ui.card().classes("ag-card p-5 w-full q-mt-sm"):
+            ui.label(t("当你要从已有 summaries.json 继续生成大纲/正文，或想给阶段一提供额外复用池时，再展开这里。")).classes("ag-subtle")
+            with ui.column().classes("gap-3 q-mt-md"):
+                _render_path_field(
+                    controller,
+                    label=t("Summary file"),
+                    section="workflow",
+                    key="summary_file",
+                    pick="file",
+                    title=t("Select summaries.json file"),
+                    filetypes=[("Summary Files", "*.json"), ("All Files", "*.*")],
+                )
+                ui.textarea(
+                    t("Additional downstream summary sources (one path per line)"),
+                    value=controller.state["workflow"]["summary_sources"],
+                ).bind_value(controller.state["workflow"], "summary_sources").props("outlined autogrow").classes("w-full")
+                ui.textarea(
+                    t("Additional stage-1 reuse summary files outside output_path (one path per line)"),
+                    value=controller.state["workflow"]["reuse_summary_files"],
+                ).bind_value(controller.state["workflow"], "reuse_summary_files").props("outlined autogrow").classes("w-full")
+                with ui.row().classes("gap-2 flex-wrap"):
+                    ui.button(t("Open summary file"), on_click=lambda: _open_path(controller.state["workflow"]["summary_file"], controller.language)).props("outline")
 
 
 def _render_workflow_recovery_card(controller: WorkspaceController) -> None:
     t = controller.t
-    with ui.card().classes("ag-card p-6 w-full"):
-        ui.label(t("补跑与质检")).classes("ag-section-title")
-        ui.label(t("把修复、补跑和验证入口单独放在这里，避免和首次运行按钮混在一起。")).classes("ag-subtle")
-        with ui.element("div").classes("ag-mini-grid w-full q-mt-md"):
-            with ui.element("div").classes("ag-mini-card"):
-                ui.label(t("章节操作")).classes("ag-section-title")
-                ui.label(t("如果某一章中途失败，可以单独补写，或者只补跑失败章节。")).classes("ag-subtle")
-                ui.input(t("章节号"), value=controller.state["workflow"]["section_number"]).bind_value(controller.state["workflow"], "section_number").classes("w-full q-mt-sm")
-                with ui.column().classes("ag-button-column q-mt-md"):
-                    section_button = ui.button(
-                        t("补写指定章节"),
-                        on_click=lambda: asyncio.create_task(controller.run_workflow("generate_section")),
-                    ).props("unelevated").classes("w-full")
-                    retry_review_button = ui.button(
-                        t("重试失败章节"),
-                        on_click=lambda: asyncio.create_task(controller.run_workflow("retry_review_failed")),
-                    ).props("outline").classes("w-full")
-                controller.register_action_button(section_button)
-                controller.register_action_button(retry_review_button)
+    with ui.expansion(t("补跑、恢复与验证（按需展开）"), icon="build_circle").classes("w-full"):
+        with ui.card().classes("ag-card p-6 w-full q-mt-sm"):
+            ui.label(t("补跑与质检")).classes("ag-section-title")
+            ui.label(t("把修复、补跑和验证入口单独放在这里，避免和首次运行按钮混在一起。")).classes("ag-subtle")
+            with ui.element("div").classes("ag-mini-grid w-full q-mt-md"):
+                with ui.element("div").classes("ag-mini-card"):
+                    ui.label(t("章节操作")).classes("ag-section-title")
+                    ui.label(t("如果某一章中途失败，可以单独补写，或者只补跑失败章节。")).classes("ag-subtle")
+                    ui.input(t("章节号"), value=controller.state["workflow"]["section_number"]).bind_value(controller.state["workflow"], "section_number").classes("w-full q-mt-sm")
+                    with ui.column().classes("ag-button-column q-mt-md"):
+                        section_button = ui.button(
+                            t("补写指定章节"),
+                            on_click=lambda: asyncio.create_task(controller.run_workflow("generate_section")),
+                        ).props("unelevated").classes("w-full")
+                        retry_review_button = ui.button(
+                            t("重试失败章节"),
+                            on_click=lambda: asyncio.create_task(controller.run_workflow("retry_review_failed")),
+                        ).props("outline").classes("w-full")
+                    controller.register_action_button(section_button)
+                    controller.register_action_button(retry_review_button)
 
-            with ui.element("div").classes("ag-mini-card"):
-                ui.label(t("失败论文")).classes("ag-section-title")
-                ui.label(t("如果只有个别论文失败，可以单独补跑，不影响已经完成的结果。")).classes("ag-subtle")
-                retry_failed_button = ui.button(
-                    t("重试失败论文"),
-                    on_click=lambda: asyncio.create_task(controller.run_workflow("retry_failed")),
-                ).props("outline").classes("w-full q-mt-md")
-                controller.register_action_button(retry_failed_button)
+                with ui.element("div").classes("ag-mini-card"):
+                    ui.label(t("失败论文")).classes("ag-section-title")
+                    ui.label(t("如果只有个别论文失败，可以单独补跑，不影响已经完成的结果。")).classes("ag-subtle")
+                    retry_failed_button = ui.button(
+                        t("重试失败论文"),
+                        on_click=lambda: asyncio.create_task(controller.run_workflow("retry_failed")),
+                    ).props("outline").classes("w-full q-mt-md")
+                    controller.register_action_button(retry_failed_button)
 
-            with ui.element("div").classes("ag-mini-card"):
-                ui.label(t("质量检查")).classes("ag-section-title")
-                ui.label(t("验证功能默认关闭，暂时作为实验功能保留。")).classes("ag-subtle")
-                validate_button = ui.button(
-                    t("验证综述"),
-                    on_click=lambda: asyncio.create_task(controller.run_workflow("validate")),
-                ).props("outline").classes("w-full q-mt-md")
-                controller.register_action_button(validate_button)
+                with ui.element("div").classes("ag-mini-card"):
+                    ui.label(t("质量检查")).classes("ag-section-title")
+                    ui.label(t("综述验证是可选增强步骤。需要额外核查时再运行，不影响默认主流程。")).classes("ag-subtle")
+                    validate_button = ui.button(
+                        t("验证综述"),
+                        on_click=lambda: asyncio.create_task(controller.run_workflow("validate")),
+                    ).props("outline").classes("w-full q-mt-md")
+                    controller.register_action_button(validate_button)
 
 
 def _render_workflow_checklist_card(controller: WorkspaceController) -> None:
     t = controller.t
     with ui.card().classes("ag-card p-6 w-full"):
-        ui.label(t("开始前快速检查")).classes("ag-section-title")
-        ui.label(t("把准备项单独放到侧边后，这里只保留真正会影响流程成败的检查。")).classes("ag-subtle")
+        ui.label(t("第一次运行建议")).classes("ag-section-title")
+        ui.label(t("如果你是第一次使用，就按这条主路径走，不需要一次把所有高级能力都打开。")).classes("ag-subtle")
         with ui.column().classes("ag-checklist q-mt-md"):
             with ui.element("div").classes("ag-check-item"):
                 ui.icon("check_circle").classes("text-base")
-                ui.label(t("先确认输出目录和 Zotero / PDF 路径可用。")).classes("ag-subtle")
+                ui.label(t("先在“设置”里确认输出目录、输入路径和 API 模型都已连通。")).classes("ag-subtle")
             with ui.element("div").classes("ag-check-item"):
                 ui.icon("check_circle").classes("text-base")
-                ui.label(t("再检查阅读模型、写作模型、大纲模型和自由模式对话模型都已经连通。")).classes("ag-subtle")
+                ui.label(t("再到这里选择输入来源：PDF 文件夹或 Zotero。")).classes("ag-subtle")
             with ui.element("div").classes("ag-check-item"):
                 ui.icon("check_circle").classes("text-base")
-                ui.label(t("如果这批 PDF 质量参差不齐，建议先开预处理和 OCR 自动模式。")).classes("ag-subtle")
+                ui.label(t("首次运行优先点击“仅分析文献”，确认摘要、预处理和提取质量。")).classes("ag-subtle")
             with ui.element("div").classes("ag-check-item"):
                 ui.icon("check_circle").classes("text-base")
-                ui.label(t("最后决定是先跑分析，还是直接一键运行。")).classes("ag-subtle")
+                ui.label(t("确认第一轮结果没问题后，再继续生成大纲、全文，或最后再使用一键运行。")).classes("ag-subtle")
 
 
 def _render_workflow_navigation_card(controller: WorkspaceController) -> None:
     t = controller.t
     with ui.card().classes("ag-card p-6 w-full"):
-        ui.label(t("工作台导航")).classes("ag-section-title")
-        ui.label(t("配置、日志和目录入口单独收纳在这里，不再和运行按钮放在同一组。")).classes("ag-subtle")
+        ui.label(t("相关入口")).classes("ag-section-title")
+        ui.label(t("这里只保留工作台最常用的相关入口，减少工具按钮到处重复出现。")).classes("ag-subtle")
         with ui.column().classes("ag-button-column q-mt-md"):
-            ui.button(t("前往 Setup"), on_click=lambda: ui.navigate.to("/setup")).props("outline").classes("w-full")
+            ui.button(t("前往设置"), on_click=lambda: ui.navigate.to("/setup")).props("outline").classes("w-full")
             ui.button(t("打开 API 页面"), on_click=lambda: ui.navigate.to("/setup/api")).props("outline").classes("w-full")
-            ui.button(t("查看日志与产物"), on_click=lambda: ui.navigate.to("/logs")).props("outline").classes("w-full")
-            ui.button(t("刷新日志"), on_click=controller.refresh_logs).props("outline").classes("w-full")
+            ui.button(t("查看结果与日志"), on_click=lambda: ui.navigate.to("/logs")).props("outline").classes("w-full")
             ui.button(t("打开输出目录"), on_click=lambda: _open_path(controller.state["paths"]["output_path"], controller.language)).props("outline").classes("w-full")
-            ui.button(t("打开日志目录"), on_click=lambda: _open_path(str(REPO_ROOT / "logs"), controller.language)).props("outline").classes("w-full")
 
 
 def _render_path_field(
@@ -2121,7 +2652,7 @@ def _page_shell(controller: WorkspaceController, page_title: str, subtitle: str,
     ui.colors(primary="#5b6d66", secondary="#dde5df", accent="#8ea097")
     controller.register_client(ui.context.client)
     with ui.left_drawer(top_corner=True, bottom_corner=True).classes("ag-drawer").props("bordered"):
-        ui.label("Auto Generate").classes("ag-chip q-mb-sm")
+        ui.label("auto-generate").classes("ag-chip q-mb-sm")
         ui.label(controller.t("目录")).classes("ag-section-title q-mb-md")
         for group in _nav_groups():
             with ui.column().classes("ag-nav-group w-full"):
@@ -2138,8 +2669,8 @@ def _page_shell(controller: WorkspaceController, page_title: str, subtitle: str,
         with ui.element("div").classes("ag-fixedbar-shell"):
             with ui.element("div").classes("ag-fixedbar-main"):
                 with ui.element("div").classes("ag-title-stack"):
-                    ui.label(controller.t("AI 文献综述生成器")).classes("ag-section-title ag-topbar-title")
-                    ui.label(f"Build {BUILD_STAMP}").classes("ag-build-badge")
+                    ui.label("auto-generate").classes("ag-section-title ag-topbar-title")
+                    ui.label(controller.t(page_title)).classes("ag-build-badge")
                 with ui.row().classes("items-center gap-2 w-full no-wrap"):
                     search_input = ui.input(
                         controller.t("搜索功能"),
@@ -2161,9 +2692,6 @@ def _page_shell(controller: WorkspaceController, page_title: str, subtitle: str,
                         on_change=lambda event: controller.change_language(str(event.value)),
                     ).classes("min-w-[150px]")
                     ui.button(controller.t("保存配置"), on_click=lambda: controller.persist_config()).props("unelevated")
-                    ui.button(controller.t("核心工作台"), on_click=lambda: ui.navigate.to("/workflow")).props("outline")
-                    ui.button(controller.t("打开输出"), on_click=lambda: _open_path(controller.state["paths"]["output_path"], controller.language)).props("outline")
-                    ui.button(controller.t("打开日志"), on_click=lambda: _open_path(str(REPO_ROOT / "logs"), controller.language)).props("outline")
     with ui.column().classes("ag-page w-full gap-5"):
         with ui.element("div").classes("ag-reminder ag-page-reminder"):
             ui.icon("tips_and_updates").classes("text-lg")
@@ -2231,6 +2759,88 @@ def _render_api_card(controller: WorkspaceController, section_name: str, title: 
             ).props("outline")
 
 
+def _render_mineru_api_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    mineru = controller.state["mineru"]
+    with ui.card().classes("ag-card ag-card-strong p-5 w-full"):
+        ui.label(t("MinerU 远程解析")).classes("ag-section-title")
+        ui.label(
+            t("这是 PDF 预处理使用的远程解析后端，不属于 LLM 模型卡。是否真的调用，还取决于“性能与预处理”页里的解析策略。"),
+        ).classes("ag-subtle")
+        with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
+            ui.input("Base URL", value=mineru["base_url"]).bind_value(mineru, "base_url")
+            token_input = ui.input(
+                t("API Token"),
+                value=mineru["api_token"],
+                password=True,
+                password_toggle_button=True,
+            ).bind_value(mineru, "api_token")
+            ui.input(t("模型版本"), value=mineru["model_version"]).bind_value(mineru, "model_version")
+        with ui.element("div").classes("ag-note-block q-mt-md"):
+            token_label = ui.label(controller._mineru_token_state_text()).classes("ag-subtle ag-wrap-note")
+            runtime_label = ui.label(controller._mineru_runtime_state_text()).classes("ag-subtle ag-wrap-note q-mt-sm")
+
+        def refresh_mineru_notes() -> None:
+            token_label.set_text(controller._mineru_token_state_text())
+            runtime_label.set_text(controller._mineru_runtime_state_text())
+
+        token_input.on("update:model-value", lambda _: refresh_mineru_notes())
+        token_input.on("blur", lambda _: refresh_mineru_notes())
+        with ui.row().classes("gap-2 q-mt-sm"):
+            ui.button(t("前往性能与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
+
+
+def _render_processing_mineru_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    preprocess = controller.state["preprocess"]
+    mineru = controller.state["mineru"]
+    parser_mode_options = {
+        "local": t("local · 仅本地"),
+        "hybrid": t("hybrid · 先本地后判定"),
+        "remote_first": t("remote_first · 先尝试 MinerU"),
+        "remote": t("remote · 只走 MinerU"),
+    }
+    parser_options = {
+        "local": t("local · 本地解析链"),
+        "mineru_remote": t("mineru_remote · MinerU 远程"),
+    }
+    with ui.card().classes("ag-card ag-card-strong p-6"):
+        ui.label(t("解析策略与 MinerU")).classes("ag-section-title")
+        ui.label(t("MinerU 会不会真正用上，取决于这里的 parser mode、主解析器和回退策略，而不只是有没有填 token。")).classes("ag-subtle")
+        with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
+            parser_mode_select = ui.select(
+                parser_mode_options,
+                value=preprocess["parser_mode"],
+                label=t("Parser mode"),
+            ).bind_value(preprocess, "parser_mode")
+            primary_parser_select = ui.select(
+                parser_options,
+                value=preprocess["primary_parser"],
+                label=t("主解析器"),
+            ).bind_value(preprocess, "primary_parser")
+            fallback_parser_select = ui.select(
+                parser_options,
+                value=preprocess["fallback_parser"],
+                label=t("回退解析器"),
+            ).bind_value(preprocess, "fallback_parser")
+            fallback_switch = ui.switch(
+                t("允许本地回退"),
+                value=mineru["allow_local_parse_fallback"],
+            ).bind_value(mineru, "allow_local_parse_fallback")
+        with ui.element("div").classes("ag-note-block q-mt-md"):
+            token_label = ui.label(controller._mineru_token_state_text()).classes("ag-subtle ag-wrap-note")
+            runtime_label = ui.label(controller._mineru_runtime_state_text()).classes("ag-subtle ag-wrap-note q-mt-sm")
+
+        def refresh_mineru_notes() -> None:
+            token_label.set_text(controller._mineru_token_state_text())
+            runtime_label.set_text(controller._mineru_runtime_state_text())
+
+        parser_mode_select.on("update:model-value", lambda _: refresh_mineru_notes())
+        primary_parser_select.on("update:model-value", lambda _: refresh_mineru_notes())
+        fallback_parser_select.on("update:model-value", lambda _: refresh_mineru_notes())
+        fallback_switch.on("update:model-value", lambda _: refresh_mineru_notes())
+
+
 def _render_environment_card(controller: WorkspaceController) -> None:
     copy = _environment_ui_copy(controller.language, controller.runtime_environment)
     with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
@@ -2270,107 +2880,116 @@ def launch_gui(
     @ui.page("/")
     def dashboard_page() -> None:
         t = controller.t
+        latest_snapshot = _latest_workspace_snapshot(
+            controller.state["paths"]["output_path"],
+            preferred_project=str(controller.state["workflow"]["project_name"]).strip(),
+        )
         with _page_shell(
             controller,
             "总览",
-            "这个入口页负责给第一次使用的人建立清晰路径。真正的核心操作已经单独放到“核心工作台”，不再堆在页面最底部。",
+            "这里先帮你建立一条清楚、安静的第一轮路径：先设置，再选输入来源和运行方式，最后进入工作台执行。",
             "/",
         ):
             with ui.card().classes("ag-card ag-card-strong ag-hero p-7 w-full"):
                 with ui.grid(columns=2).classes("w-full items-stretch gap-6"):
                     with ui.column().classes("ag-card-stack"):
                         ui.label(t("本地网页工作台")).classes("ag-chip")
-                        ui.label(t("适合自己用，也适合交给第一次接触项目的人。")).classes("ag-section-title")
+                        ui.label(t("先跑通第一轮，再逐步打开高级能力。")).classes("ag-section-title")
                         ui.label(
-                            t("推荐顺序是：先完成 setup 和 API 连接，再去核心工作台填写项目名、PDF 文件夹或 Zotero 配置，最后运行分析、大纲或全文写作。"),
+                            t("这个项目最适合用“研究工作台”的方式理解：先准备路径和模型，再进入工作台按输入来源、运行方式和主流程顺序推进。"),
                         ).classes("ag-subtle")
-                        ui.label(t("这页先帮你把入口、模式和准备项理顺，再开始正式跑任务。")).classes("ag-subtle")
+                        ui.label(t("如果你是第一次使用，不需要一开始就接触队列、自由模式或恢复操作。先把第一轮摘要跑稳最重要。")).classes("ag-subtle")
                         with ui.row().classes("ag-card-actions"):
-                            ui.button(t("进入核心工作台"), on_click=lambda: ui.navigate.to("/workflow")).props("unelevated")
-                            ui.button(t("先做 setup"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
-                            ui.button(t("打开 API 页面"), on_click=lambda: ui.navigate.to("/setup/api")).props("outline")
+                            ui.button(t("前往设置"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
+                            ui.button(t("进入工作台"), on_click=lambda: ui.navigate.to("/workflow")).props("unelevated color=primary")
+                            ui.button(t("使用引导"), on_click=lambda: ui.navigate.to("/guide")).props("outline")
                     with ui.column().classes("ag-card-stack"):
-                        with ui.card().classes("ag-card p-4"):
+                        with ui.element("div").classes("ag-note-block"):
                             ui.label(t("当前输出目录")).classes("ag-subtle")
-                            ui.label(controller.state["paths"]["output_path"] or "./output").classes("text-body1")
-                        with ui.card().classes("ag-card p-4"):
+                            ui.label(controller._compact_path_for_ui(controller.state["paths"]["output_path"] or "./output")).classes("text-body1 ag-wrap-note")
+                        with ui.element("div").classes("ag-note-block"):
                             ui.label(t("最近日志数量")).classes("ag-subtle")
                             ui.label(str(_count_log_files())).classes("ag-kpi")
-                        with ui.card().classes("ag-card p-4"):
-                            ui.label(t("预处理状态")).classes("ag-subtle")
-                            ui.label(t("已启用") if controller.state["preprocess"]["enabled"] else t("未启用")).classes("ag-kpi")
-
-            with ui.element("div").classes("ag-grid-3 w-full"):
-                with ui.card().classes("ag-card p-5 h-full"):
-                    with ui.column().classes("ag-card-stack"):
-                        ui.label(t("1. 环境与路径")).classes("ag-section-title")
-                        ui.label(t("在 GUI 内完成 setup、路径填写和输出目录配置。")).classes("ag-subtle")
-                        with ui.row().classes("ag-card-actions"):
-                            ui.button(t("打开环境与路径"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
-                with ui.card().classes("ag-card p-5 h-full"):
-                    with ui.column().classes("ag-card-stack"):
-                        ui.label(t("2. API 与模型")).classes("ag-section-title")
-                        ui.label(t("阅读、写作、框架大纲和验证模型都可分别配置，并支持连通性测试。")).classes("ag-subtle")
-                        with ui.row().classes("ag-card-actions"):
-                            ui.button(t("打开 API 页面"), on_click=lambda: ui.navigate.to("/setup/api")).props("outline")
-                with ui.card().classes("ag-card p-5 h-full"):
-                    with ui.column().classes("ag-card-stack"):
-                        ui.label(t("3. 核心工作台")).classes("ag-section-title")
-                        ui.label(t("项目名、自由模式、分析、大纲和一键运行都集中在这里。")).classes("ag-subtle")
-                        with ui.row().classes("ag-card-actions"):
-                            ui.button(t("开始运行"), on_click=lambda: ui.navigate.to("/workflow")).props("outline")
+                        with ui.element("div").classes("ag-note-block"):
+                            ui.label(t("解析策略")).classes("ag-subtle")
+                            ui.label(str(controller.state["preprocess"]["parser_mode"] or "local")).classes("ag-kpi")
+                        if latest_snapshot:
+                            with ui.element("div").classes("ag-note-block"):
+                                ui.label(t("最近一次任务")).classes("ag-subtle")
+                                ui.label(f"{latest_snapshot['project_name']} · {latest_snapshot['status'] or '-'}").classes("text-body1")
+                                ui.button(t("查看结果与日志"), on_click=lambda: ui.navigate.to("/logs")).props("outline size=sm").classes("q-mt-sm")
 
             with ui.element("div").classes("ag-grid-2 w-full"):
-                with ui.card().classes("ag-card p-6 h-full"):
-                    with ui.column().classes("ag-card-stack"):
-                        ui.label(t("三种使用方式")).classes("ag-section-title")
-                        ui.label(t("不用先记命令。先选路径，再选模式，再决定是先分析还是直接一键运行。")).classes("ag-subtle")
-                        with ui.element("div").classes("ag-mini-grid"):
-                            with ui.element("div").classes("ag-mini-card"):
-                                ui.label(t("普通模式")).classes("ag-section-title")
-                                ui.label(t("普通模式适合先批量读文献，再统一生成大纲和正文。")).classes("ag-subtle")
-                            with ui.element("div").classes("ag-mini-card"):
-                                ui.label(t("概念增强模式")).classes("ag-section-title")
-                                ui.label(t("概念增强模式适合围绕某个核心概念补抓变量、定义与比较。")).classes("ag-subtle")
-                            with ui.element("div").classes("ag-mini-card"):
-                                ui.label(t("自由模式")).classes("ag-section-title")
-                                ui.label(t("自由模式适合先把你的研究意图聊清楚，再转成 prompt profile。")).classes("ag-subtle")
-                with ui.card().classes("ag-card p-6 h-full"):
-                    with ui.column().classes("ag-card-stack"):
-                        ui.label(t("开始前快速检查")).classes("ag-section-title")
-                        ui.label(t("先把这四件事看一遍，能减少很多中途报错和重复返工。")).classes("ag-subtle")
-                        with ui.column().classes("ag-checklist"):
-                            with ui.element("div").classes("ag-check-item"):
-                                ui.icon("check_circle").classes("text-base")
-                                ui.label(t("先确认输出目录和 Zotero / PDF 路径可用。")).classes("ag-subtle")
-                            with ui.element("div").classes("ag-check-item"):
-                                ui.icon("check_circle").classes("text-base")
-                                ui.label(t("再检查阅读模型、写作模型、大纲模型和自由模式对话模型都已经连通。")).classes("ag-subtle")
-                            with ui.element("div").classes("ag-check-item"):
-                                ui.icon("check_circle").classes("text-base")
-                                ui.label(t("如果这批 PDF 质量参差不齐，建议先开预处理和 OCR 自动模式。")).classes("ag-subtle")
-                            with ui.element("div").classes("ag-check-item"):
-                                ui.icon("check_circle").classes("text-base")
-                                ui.label(t("最后回到核心工作台，先跑分析，再决定是否一键运行。")).classes("ag-subtle")
-                        with ui.row().classes("ag-card-actions"):
-                            ui.button(t("打开环境与路径"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
-                            ui.button(t("打开 API 页面"), on_click=lambda: ui.navigate.to("/setup/api")).props("outline")
-                            ui.button(t("进入核心工作台"), on_click=lambda: ui.navigate.to("/workflow")).props("unelevated")
+                with ui.card().classes("ag-card p-6"):
+                    ui.label(t("现在建议做什么")).classes("ag-section-title")
+                    ui.label(t("总览页只保留方向和状态，不再重复输入来源和运行方式的长说明。")).classes("ag-subtle")
+                    with ui.element("div").classes("ag-editorial-list q-mt-md"):
+                        for step_index, title_key, note_key in [
+                            ("01", "先完成基础设置", "先在设置页填好输出目录、输入路径和必要的模型配置。"),
+                            ("02", "进入工作台选择输入来源", "工作台里只负责真正运行，不再把说明文字铺满整个页面。"),
+                            ("03", "第一轮先跑仅分析文献", "先确认摘要、预处理和抽取质量，再继续大纲和全文。"),
+                            ("04", "使用引导", "如果你需要完整的新手解释，再去“使用引导”页查看输入方式、运行方式和工作区说明。"),
+                        ]:
+                            with ui.element("div").classes("ag-editorial-step"):
+                                ui.label(step_index).classes("ag-step-index")
+                                with ui.column().classes("gap-1"):
+                                    ui.label(t(title_key)).classes("ag-step-title")
+                                    ui.label(t(note_key)).classes("ag-step-note")
+                with ui.card().classes("ag-card p-6"):
+                    ui.label(t("当前工作台快照")).classes("ag-section-title")
+                    ui.label(t("这里看当前配置状态；更完整的解释已经集中到“使用引导”页。")).classes("ag-subtle")
+                    with ui.element("div").classes("ag-kv-grid q-mt-md"):
+                        with ui.element("div").classes("ag-kv-item"):
+                            ui.label(t("输出目录")).classes("ag-subtle")
+                            ui.label(controller._compact_path_for_ui(controller.state["paths"]["output_path"] or "./output")).classes("ag-wrap-note")
+                        with ui.element("div").classes("ag-kv-item"):
+                            ui.label(t("解析策略")).classes("ag-subtle")
+                            ui.label(str(controller.state["preprocess"]["parser_mode"] or "local"))
+                        with ui.element("div").classes("ag-kv-item"):
+                            ui.label(t("MinerU")).classes("ag-subtle")
+                            ui.label(controller._mineru_token_state_text()).classes("ag-wrap-note")
+                        with ui.element("div").classes("ag-kv-item"):
+                            ui.label(t("最近日志数量")).classes("ag-subtle")
+                            ui.label(str(_count_log_files()))
+                    ui.label(controller._mineru_runtime_state_text()).classes("ag-subtle ag-wrap-note q-mt-md")
+
+            with ui.card().classes("ag-card p-6 w-full"):
+                ui.label(t("常用入口")).classes("ag-section-title")
+                ui.label(t("这里只保留最常回访的页面；第一次使用的完整解释请看“使用引导”。")).classes("ag-subtle")
+                with ui.element("div").classes("ag-grid-compact q-mt-md"):
+                    with ui.element("div").classes("ag-mini-card"):
+                        ui.label(t("环境与路径")).classes("ag-section-title")
+                        ui.label(t("先把输出目录、Zotero 路径和基础 setup 定下来。")).classes("ag-subtle ag-wrap-note")
+                        ui.button(t("前往设置"), on_click=lambda: ui.navigate.to("/setup")).props("outline").classes("q-mt-md")
+                    with ui.element("div").classes("ag-mini-card"):
+                        ui.label(t("工作台")).classes("ag-section-title")
+                        ui.label(t("真正的输入来源、运行方式和主流程按钮都在这里。")).classes("ag-subtle ag-wrap-note")
+                        ui.button(t("进入工作台"), on_click=lambda: ui.navigate.to("/workflow")).props("unelevated color=primary").classes("q-mt-md")
+                    with ui.element("div").classes("ag-mini-card"):
+                        ui.label(t("结果与日志")).classes("ag-section-title")
+                        ui.label(t("最近一次 job workspace、主要产物和日志入口都集中在这里。")).classes("ag-subtle ag-wrap-note")
+                        ui.button(t("查看结果与日志"), on_click=lambda: ui.navigate.to("/logs")).props("outline").classes("q-mt-md")
+                    with ui.element("div").classes("ag-mini-card"):
+                        ui.label(t("使用引导")).classes("ag-section-title")
+                        ui.label(t("输入方式、运行策略、OCR / MinerU、复用和工作区的完整说明都在这一页。")).classes("ag-subtle ag-wrap-note")
+                        ui.button(t("使用引导"), on_click=lambda: ui.navigate.to("/guide")).props("outline").classes("q-mt-md")
 
     @ui.page("/workflow")
     def workflow_page() -> None:
         with _page_shell(
             controller,
-            "核心工作台",
-            "把真正的工作区单独抽出来放在前面。你在这里输入项目、选择模式并直接运行，不需要翻很长的页面。",
+            "工作台",
+            "这里按“输入来源 → 运行方式 → 主流程”的顺序组织。高级复用、补跑和验证都放在次级区域，避免第一次使用被打断。",
             "/workflow",
         ):
             with ui.element("div").classes("ag-workflow-shell w-full"):
                 with ui.column().classes("gap-5 w-full"):
                     _render_workflow_input_card(controller)
+                    _render_workflow_mode_card(controller)
                     _render_workflow_concept_card(controller)
                     _render_free_mode_planner_card(controller)
                     _render_workflow_actions_card(controller)
+                    _render_workflow_summary_reuse_card(controller)
                     _render_workflow_recovery_card(controller)
                 with ui.column().classes("ag-sidebar-stack w-full"):
                     _render_progress_card(controller)
@@ -2428,6 +3047,7 @@ def launch_gui(
                     ui.label(t("2. 再去“API 与模型”页补模型、API Base 和 API Key。")).classes("ag-subtle")
                     ui.label(t("3. 如果 API Base 填错格式，保存时会自动规范化。")).classes("ag-subtle")
                     ui.label(t("4. 配置保存后，API Key 会写入 `.env`，不用手改文本文件。")).classes("ag-subtle")
+                    ui.label(t("5. MinerU token 在“API 与模型”页填写；真正是否调用，要到“性能与预处理”页选择解析策略。")).classes("ag-subtle")
                     with ui.row().classes("gap-2 q-mt-md"):
                         ui.button(t("前往 API 与模型"), on_click=lambda: ui.navigate.to("/setup/api")).props("outline")
                         ui.button(t("前往性能与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
@@ -2437,7 +3057,7 @@ def launch_gui(
         with _page_shell(
             controller,
             "API 与模型",
-            "阅读模型、写作模型、大纲模型、自由模式对话模型和验证模型都在这里分开配置。每块都支持 URL 预设、自动规范化和连通性测试。",
+            "阅读 / 写作 / 大纲 / 自由模式 / 验证模型都在这里配置；MinerU 远程解析的 token 也放在这里统一管理。",
             "/setup/api",
         ):
             with ui.column().classes("w-full gap-4"):
@@ -2447,6 +3067,7 @@ def launch_gui(
                 _render_api_card(controller, "Outline_API", "大纲模型", "优先负责框架大纲规划；未配置时可回退到写作模型。")
                 _render_api_card(controller, "Free_Mode_API", "自由模式对话模型", "优先负责自由模式前置对话规划；未配置时可回退到大纲模型。")
                 _render_api_card(controller, "Validator_API", "验证模型", "用于综述校验和质量复查。")
+                _render_mineru_api_card(controller)
 
     @ui.page("/setup/processing")
     def processing_page() -> None:
@@ -2454,7 +3075,7 @@ def launch_gui(
         with _page_shell(
             controller,
             "性能与预处理",
-            "这一页专门控制并发、验证、PDF 预处理、OCR 和本地 RAG。这样 setup 页面不会显得过于拥挤。",
+            "这一页专门控制并发、解析策略、PDF 预处理、OCR 和本地 RAG。MinerU 是否真正启用，也在这里决定。",
             "/setup/processing",
         ):
             with ui.element("div").classes("ag-grid-compact w-full"):
@@ -2494,10 +3115,12 @@ def launch_gui(
                         ui.select(["chroma"], value=controller.state["preprocess"]["rag_backend"], label=t("RAG 后端")).bind_value(controller.state["preprocess"], "rag_backend")
                     ui.label(t("OCR 默认只在疑似扫描页、无文本页或提取质量过低时触发，不会一上来就全量 OCR。")).classes("ag-subtle q-mt-md")
 
+                _render_processing_mineru_card(controller)
+
                 with ui.card().classes("ag-card p-6"):
-                    ui.label(t("高级 / 实验功能")).classes("ag-section-title")
-                    ui.label(t("这里只保留仍然建议用户直接控制的高级项。新的验证模式只针对综述阶段。")).classes("ag-subtle")
-                    with ui.expansion(t("高级 / 实验功能"), icon="science").classes("w-full q-mt-md"):
+                    ui.label(t("高级 / 可选功能")).classes("ag-section-title")
+                    ui.label(t("这里只保留仍然建议用户直接控制的高级项。综述验证是可选增强步骤，默认不改变主流程。")).classes("ag-subtle")
+                    with ui.expansion(t("高级 / 可选功能"), icon="science").classes("w-full q-mt-md"):
                         with ui.column().classes("gap-2 q-pa-sm"):
                             ui.switch(t("启用综述验证"), value=controller.state["performance"]["enable_stage2_validation"]).bind_value(controller.state["performance"], "enable_stage2_validation")
 
@@ -2506,222 +3129,299 @@ def launch_gui(
         t = controller.t
         with _page_shell(
             controller,
-            "日志与产物",
-            "这里集中放状态、日志和目录入口。运行任务后你可以直接在这里看最近进展，而不需要回命令行。",
+            "结果与日志",
+            "优先查看最近一次任务的工作区和主要产物；日志是辅助线索，不再是唯一入口。",
             "/logs",
         ):
             _render_progress_card(controller)
-            with ui.element("div").classes("ag-grid-2 w-full"):
+
+            def refresh_results_page() -> None:
+                controller.refresh_logs()
+                render_latest_workspace.refresh()
+                render_log_excerpt.refresh()
+
+            @ui.refreshable
+            def render_latest_workspace() -> None:
+                preferred_project = str(controller.state["workflow"]["project_name"]).strip()
+                latest_snapshot = _latest_workspace_snapshot(
+                    controller.state["paths"]["output_path"],
+                    preferred_project=preferred_project,
+                )
                 with ui.card().classes("ag-card ag-card-strong p-6"):
-                    ui.label(t("当前状态")).classes("ag-section-title")
-                    status_label = ui.label("").classes("text-body1 q-mt-sm")
-                    controller.register_status_label(status_label)
-                    with ui.row().classes("gap-2 q-mt-md"):
-                        ui.button(t("刷新日志"), on_click=controller.refresh_logs).props("unelevated")
-                        ui.button(t("打开日志目录"), on_click=lambda: _open_path(str(REPO_ROOT / "logs"), controller.language)).props("outline")
-                        ui.button(t("打开输出目录"), on_click=lambda: _open_path(controller.state["paths"]["output_path"], controller.language)).props("outline")
+                    ui.label(t("最近一次任务")).classes("ag-section-title")
+                    if not latest_snapshot:
+                        ui.label(t("当前还没有可识别的任务工作区。先去工作台运行一次任务。")).classes("ag-subtle q-mt-sm")
+                        with ui.row().classes("gap-2 q-mt-md"):
+                            ui.button(t("进入工作台"), on_click=lambda: ui.navigate.to("/workflow")).props("unelevated")
+                            ui.button(t("前往设置"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
+                        return
+
+                    with ui.element("div").classes("ag-summary-strip q-mt-md"):
+                        for label_key, value in [
+                            ("项目", latest_snapshot["project_name"] or "-"),
+                            ("任务 ID", latest_snapshot["job_id"] or "-"),
+                            ("工作区状态", latest_snapshot["status"] or "-"),
+                            ("更新时间", latest_snapshot["updated_at"] or "-"),
+                        ]:
+                            with ui.element("div").classes("ag-summary-item"):
+                                ui.label(t(label_key)).classes("ag-subtle")
+                                ui.label(str(value)).classes("text-body1")
+
+                    with ui.element("div").classes("ag-note-block q-mt-md"):
+                        ui.label(t("工作区路径")).classes("ag-subtle")
+                        ui.label(str(latest_snapshot["workspace_path"])).classes("text-body1")
+
+                    with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                        ui.button(t("打开工作区"), on_click=lambda path=latest_snapshot["workspace_path"]: _open_path(path, controller.language)).props("unelevated")
+                        ui.button(
+                            t("打开产物目录"),
+                            on_click=lambda path=str(Path(latest_snapshot["workspace_path"]) / "artifacts"): _open_path(path, controller.language),
+                        ).props("outline")
+                        ui.button(
+                            t("打开报告目录"),
+                            on_click=lambda path=str(Path(latest_snapshot["workspace_path"]) / "reports"): _open_path(path, controller.language),
+                        ).props("outline")
+                        ui.button(
+                            t("打开注册表"),
+                            on_click=lambda path=latest_snapshot["artifact_registry_path"]: _open_path(path, controller.language),
+                        ).props("outline")
+
+                    ui.label(t("主要产物")).classes("ag-subtle q-mt-md")
+                    if latest_snapshot["artifacts"]:
+                        with ui.row().classes("gap-2 q-mt-sm flex-wrap"):
+                            for label_key, path in latest_snapshot["artifacts"]:
+                                ui.button(t(label_key), on_click=lambda _event=None, target=path: _open_path(target, controller.language)).props("outline size=sm")
+                    else:
+                        ui.label(t("目前还没有检出的主要产物。")).classes("ag-subtle q-mt-sm")
+
+            @ui.refreshable
+            def render_log_excerpt() -> None:
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("最近日志文件")).classes("ag-section-title")
-                    log_path_label = ui.label("").classes("ag-subtle")
-                    log_view = ui.textarea(value="").props("outlined readonly autogrow").classes("w-full q-mt-sm")
-                    controller.register_log_widgets(log_path_label, log_view)
-            ui.timer(1.0, controller.refresh_progress)
+                    ui.label(controller.latest_log_path or t("暂无日志文件。")).classes("ag-subtle q-mt-sm")
+                    with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                        ui.button(t("刷新日志"), on_click=refresh_results_page).props("unelevated")
+                        ui.button(t("打开日志目录"), on_click=lambda: _open_path(str(REPO_ROOT / "logs"), controller.language)).props("outline")
+                        ui.button(t("打开输出目录"), on_click=lambda: _open_path(controller.state["paths"]["output_path"], controller.language)).props("outline")
+                    ui.textarea(value=controller.latest_log_excerpt).props("outlined readonly autogrow").classes("w-full q-mt-md")
+
+            with ui.element("div").classes("ag-grid-2 w-full"):
+                render_latest_workspace()
+                render_log_excerpt()
+            if not controller.test_mode:
+                ui.timer(1.2, controller.refresh_progress)
+                ui.timer(2.0, refresh_results_page)
 
     @ui.page("/queue")
     def queue_page() -> None:
         t = controller.t
         with _page_shell(
             controller,
-            "队列管理",
-            "管理后台任务队列，查看任务状态、取消任务或重试失败任务。",
+            "队列",
+            "适合稳定后批量跑、后台恢复和长任务管理；不建议作为第一次使用的主入口。",
             "/queue",
         ):
-            with ui.element("div").classes("ag-grid-2 w-full"):
-                with ui.card().classes("ag-card ag-card-strong p-6"):
-                    ui.label(t("队列状态")).classes("ag-section-title")
-                    with ui.row().classes("gap-2 q-mt-md"):
-                        ui.button(t("刷新队列"), on_click=controller.refresh_queue).props("unelevated")
-                        ui.button(t("运行队列"), on_click=controller.run_queue).props("unelevated color=primary")
-                        ui.button(t("清空已完成"), on_click=controller.clear_completed_jobs).props("outline")
-                    
-                    # 队列状态统计
-                    with ui.row().classes("gap-4 q-mt-md"):
-                        pending_count = 0
-                        running_count = 0
-                        completed_count = 0
-                        failed_count = 0
-                        
-                        if controller._queue_service:
-                            jobs = controller._queue_service.list_jobs()
-                            for job in jobs:
-                                runtime = controller._queue_service.get_job_runtime(job.job_id)
-                                if runtime:
-                                    if runtime.state == QueueState.PENDING:
-                                        pending_count += 1
-                                    elif runtime.state == QueueState.RUNNING:
-                                        running_count += 1
-                                    elif runtime.state == QueueState.COMPLETED:
-                                        completed_count += 1
-                                    elif runtime.state == QueueState.FAILED:
-                                        failed_count += 1
-                        
-                        with ui.card().classes("ag-card p-4"):
-                            ui.label(t("待处理")).classes("ag-subtle")
-                            ui.label(str(pending_count)).classes("text-xl font-bold")
-                        with ui.card().classes("ag-card p-4"):
-                            ui.label(t("运行中")).classes("ag-subtle")
-                            ui.label(str(running_count)).classes("text-xl font-bold")
-                        with ui.card().classes("ag-card p-4"):
-                            ui.label(t("已完成")).classes("ag-subtle")
-                            ui.label(str(completed_count)).classes("text-xl font-bold")
-                        with ui.card().classes("ag-card p-4"):
-                            ui.label(t("失败")).classes("ag-subtle")
-                            ui.label(str(failed_count)).classes("text-xl font-bold")
-                    
-                    # 添加任务到队列
-                    with ui.card().classes("ag-card p-6 q-mt-md"):
-                        ui.label(t("添加任务到队列")).classes("ag-section-title")
-                        ui.label(
-                            t("可先批量添加多个任务到草稿，再统一提交到队列。支持 PDF 文件夹和 Zotero 报告混合排队。")
-                        ).classes("ag-subtle q-mt-sm")
-                        with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                            project_name_input = ui.input(t("项目名"), placeholder=t("请输入项目名")).classes("w-full")
-                            action_select = ui.select(
-                                {
-                                    "analyze": controller.action_label("analyze"),
-                                    "outline": controller.action_label("outline"),
-                                    "review": controller.action_label("review"),
-                                    "validate": controller.action_label("validate"),
-                                    "retry_failed": controller.action_label("retry_failed"),
-                                    "retry_review_failed": controller.action_label("retry_review_failed"),
-                                    "run_all": controller.action_label("run_all"),
-                                },
-                                label=t("任务类型"),
-                                value="analyze",
-                            ).classes("w-full")
-                            pdf_folder_input = ui.input(t("PDF 文件夹"), placeholder=t("请输入 PDF 文件夹路径")).classes("w-full")
-                            zotero_report_input = ui.input(
-                                t("Zotero 报告路径"), placeholder=t("请输入 Zotero 报告路径")
-                            ).classes("w-full")
-                        with ui.row().classes("gap-2 q-mt-md flex-wrap"):
-                            ui.button(
-                                t("加入草稿"),
-                                on_click=lambda: controller.add_queue_builder_item(
-                                    project_name_input.value,
-                                    pdf_folder_input.value,
-                                    zotero_report_input.value,
-                                    action_select.value or "analyze",
-                                ),
-                            ).props("unelevated")
-                            ui.button(
-                                t("立即入队"),
-                                on_click=lambda: controller.add_job_to_queue(
-                                    project_name_input.value,
-                                    pdf_folder_input.value,
-                                    zotero_report_input.value,
-                                    action_select.value or "analyze",
-                                ),
-                            ).props("outline")
-                            ui.button(t("提交草稿"), on_click=controller.commit_queue_builder).props("unelevated color=primary")
-                            ui.button(t("清空草稿"), on_click=controller.clear_queue_builder).props("flat")
+            def refresh_queue_views(notify_user: bool = False) -> None:
+                controller.refresh_queue(notify_user=notify_user)
+                render_queue_summary.refresh()
+                render_queue_builder.refresh()
+                render_queue_jobs.refresh()
 
-                        draft_items = controller.state["queue_builder"]["items"]
-                        if draft_items:
+            @ui.refreshable
+            def render_queue_summary() -> None:
+                pending_count = 0
+                running_count = 0
+                completed_count = 0
+                failed_count = 0
+                if controller._queue_service:
+                    for job in controller._queue_service.list_jobs():
+                        runtime = controller._queue_service.get_job_runtime(job.job_id)
+                        if not runtime:
+                            continue
+                        if runtime.state == QueueState.PENDING:
+                            pending_count += 1
+                        elif runtime.state == QueueState.RUNNING:
+                            running_count += 1
+                        elif runtime.state == QueueState.COMPLETED:
+                            completed_count += 1
+                        elif runtime.state == QueueState.FAILED:
+                            failed_count += 1
+
+                with ui.card().classes("ag-card ag-card-strong p-6"):
+                    ui.label(t("队列摘要")).classes("ag-section-title")
+                    ui.label(t("当前队列顺序会直接影响后台执行顺序。批量任务稳定后再来这里会更轻松。")).classes("ag-subtle")
+                    with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                        ui.button(t("刷新队列"), on_click=lambda: refresh_queue_views(True)).props("unelevated")
+                        ui.button(t("运行队列"), on_click=lambda: (controller.run_queue(), refresh_queue_views())).props("unelevated color=primary")
+                        ui.button(t("清空已完成"), on_click=lambda: (controller.clear_completed_jobs(), refresh_queue_views())).props("outline")
+                    with ui.element("div").classes("ag-summary-strip q-mt-md"):
+                        for label_key, value in [
+                            ("待处理", pending_count),
+                            ("运行中", running_count),
+                            ("已完成", completed_count),
+                            ("失败", failed_count),
+                        ]:
+                            with ui.element("div").classes("ag-summary-item"):
+                                ui.label(t(label_key)).classes("ag-subtle")
+                                ui.label(str(value)).classes("text-body1")
+
+            @ui.refreshable
+            def render_queue_builder() -> None:
+                with ui.card().classes("ag-card p-6"):
+                    ui.label(t("添加任务到队列")).classes("ag-section-title")
+                    ui.label(t("可先批量添加多个任务到草稿，再统一提交到队列。支持 PDF 文件夹和 Zotero 报告混合排队。")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("队列页默认提交标准任务；如果要先做概念增强或自由模式规划，建议先在工作台确认后再入队。")).classes("ag-subtle q-mt-sm")
+                    queue_form_state = {"input_mode": "pdf"}
+                    with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
+                        project_name_input = ui.input(t("项目名"), placeholder=t("请输入项目名")).classes("w-full")
+                        source_select = ui.select(
+                            {"pdf": t("PDF 文件夹模式"), "zotero": t("Zotero 报告模式")},
+                            label=t("输入来源"),
+                            value="pdf",
+                        ).bind_value(queue_form_state, "input_mode").classes("w-full")
+                        action_select = ui.select(
+                            {
+                                "analyze": controller.action_label("analyze"),
+                                "outline": controller.action_label("outline"),
+                                "review": controller.action_label("review"),
+                                "validate": controller.action_label("validate"),
+                                "retry_failed": controller.action_label("retry_failed"),
+                                "retry_review_failed": controller.action_label("retry_review_failed"),
+                                "run_all": controller.action_label("run_all"),
+                            },
+                            label=t("任务类型"),
+                            value="analyze",
+                        ).classes("w-full")
+                        pdf_folder_input = ui.input(t("PDF 文件夹"), placeholder=t("请输入 PDF 文件夹路径")).classes("w-full")
+                        pdf_folder_input.bind_visibility_from(queue_form_state, "input_mode", value="pdf")
+                        zotero_report_input = ui.input(t("Zotero 报告路径"), placeholder=t("请输入 Zotero 报告路径")).classes("w-full")
+                        zotero_report_input.bind_visibility_from(queue_form_state, "input_mode", value="zotero")
+                    with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                        ui.button(
+                            t("加入草稿"),
+                            on_click=lambda: (
+                                controller.add_queue_builder_item(
+                                    project_name_input.value,
+                                    pdf_folder_input.value,
+                                    zotero_report_input.value,
+                                    action_select.value or "analyze",
+                                    input_mode=str(queue_form_state.get("input_mode") or "pdf"),
+                                ),
+                                render_queue_builder.refresh(),
+                            ),
+                        ).props("unelevated")
+                        ui.button(
+                            t("立即入队"),
+                            on_click=lambda: (
+                                controller.add_job_to_queue(
+                                    project_name_input.value,
+                                    pdf_folder_input.value,
+                                    zotero_report_input.value,
+                                    action_select.value or "analyze",
+                                    input_mode=str(queue_form_state.get("input_mode") or "pdf"),
+                                    work_mode="normal",
+                                ),
+                                refresh_queue_views(),
+                            ),
+                        ).props("outline")
+                        ui.button(t("提交草稿"), on_click=lambda: (controller.commit_queue_builder(), refresh_queue_views())).props("unelevated color=primary")
+                        ui.button(t("清空草稿"), on_click=lambda: (controller.clear_queue_builder(), render_queue_builder.refresh())).props("flat")
+
+                    draft_items = controller.state["queue_builder"]["items"]
+                    if draft_items:
                             with ui.column().classes("w-full gap-2 q-mt-md"):
                                 for index, item in enumerate(draft_items, start=1):
-                                    with ui.row().classes("w-full items-center justify-between rounded-xl ag-card p-3"):
+                                    with ui.element("div").classes("ag-ledger-row"):
                                         ui.label(
-                                            f"{index}. {item.get('project_name', '')} · {controller.action_label(str(item.get('action') or 'analyze'))}"
+                                            f"{index}. {item.get('project_name', '')} · {t('PDF 文件夹模式') if item.get('input_mode') == 'pdf' else t('Zotero 报告模式')} · {controller.action_label(str(item.get('action') or 'analyze'))}"
                                         ).classes("text-body1")
                                         ui.button(
                                             t("移除"),
-                                            on_click=lambda _event=None, idx=index - 1: controller.remove_queue_builder_item(idx),
+                                            on_click=lambda _event=None, idx=index - 1: (controller.remove_queue_builder_item(idx), render_queue_builder.refresh()),
                                         ).props("flat color=negative size=sm")
-                        else:
-                            ui.label(t("队列草稿为空。你可以先添加多个任务，再统一提交到队列。")).classes("ag-subtle q-mt-md")
-                    with ui.card().classes("ag-card p-6 q-mt-md"):
-                        ui.label(t("队列文件操作")).classes("ag-section-title")
-                        queue_file_input = ui.input(t("队列文件路径"), placeholder=t("请输入队列文件路径")).classes("w-full q-mt-md")
-                        with ui.row().classes("gap-2 q-mt-md"):
-                            ui.button(
-                                t("保存队列"),
-                                on_click=lambda: controller.save_queue(queue_file_input.value)
-                            ).props("outline")
-                            ui.button(
-                                t("加载队列"),
-                                on_click=lambda: controller.load_queue(queue_file_input.value)
-                            ).props("outline")
-                    
-                    # 任务列表
-                    with ui.card().classes("ag-card p-6 q-mt-md"):
-                        ui.label(t("队列任务列表")).classes("ag-section-title")
-                        
-                        if controller._queue_service:
-                            jobs = controller._queue_service.list_jobs()
-                            if jobs:
-                                # 按创建时间排序
-                                jobs.sort(key=lambda x: x.created_at)
-                                
-                                # 重排功能
-                                job_ids = [job.job_id for job in jobs]
-                                
-                                with ui.row().classes("gap-2 q-mb-md"):
-                                    ui.button(t("上移选中任务"), on_click=lambda: controller.reorder_jobs(job_ids)).props("outline size=sm")
-                                    ui.button(t("下移选中任务"), on_click=lambda: controller.reorder_jobs(job_ids[::-1])).props("outline size=sm")
-                                
-                                for job in jobs:
-                                    runtime = controller._queue_service.get_job_runtime(job.job_id)
-                                    state_str = runtime.state.value if runtime else "unknown"
-                                    
-                                    with ui.card().classes("ag-card p-4 q-mb-md"):
-                                        with ui.row().classes("justify-between items-center"):
-                                            with ui.column():
-                                                ui.label(f"{job.job_type} - {job.project_name}").classes("font-bold")
-                                                ui.label(f"ID: {job.job_id}").classes("text-sm text-gray-500")
-                                                ui.label(f"创建时间: {job.created_at}").classes("text-sm text-gray-500")
-                                                if runtime:
-                                                    if runtime.started_at:
-                                                        ui.label(f"开始时间: {runtime.started_at}").classes("text-sm text-gray-500")
-                                                    if runtime.completed_at:
-                                                        ui.label(f"完成时间: {runtime.completed_at}").classes("text-sm text-gray-500")
-                                                    if runtime.error_message:
-                                                        ui.label(f"错误: {runtime.error_message[:100]}...").classes("text-sm text-red-500")
-                                                
-                                            with ui.column().classes("items-end"):
-                                                # 状态标签
-                                                status_color = ""  
-                                                if state_str == "pending":
-                                                    status_color = "bg-yellow-100 text-yellow-800"
-                                                elif state_str == "running":
-                                                    status_color = "bg-blue-100 text-blue-800"
-                                                elif state_str == "completed":
-                                                    status_color = "bg-green-100 text-green-800"
-                                                elif state_str == "failed":
-                                                    status_color = "bg-red-100 text-red-800"
-                                                elif state_str == "cancelled":
-                                                    status_color = "bg-gray-100 text-gray-800"
-                                                
-                                                ui.label(state_str).classes(f"px-3 py-1 rounded-full text-xs font-medium {status_color} mb-2")
-                                                
-                                                # 操作按钮
-                                                with ui.row().classes("gap-2"):
-                                                    if runtime and runtime.state == QueueState.RUNNING:
-                                                        ui.button(t("取消"), on_click=lambda event=None, jid=job.job_id: controller.cancel_job(jid)).props("outline color=negative size=sm")
-                                                    elif runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
-                                                        ui.button(t("重试"), on_click=lambda event=None, jid=job.job_id: controller.retry_job(jid)).props("outline color=primary size=sm")
-                                                    if runtime and runtime.state != QueueState.RUNNING:
-                                                        ui.button(t("删除"), on_click=lambda event=None, jid=job.job_id: controller.remove_job(jid)).props("outline color=negative size=sm")
-                    
+                    else:
+                        ui.label(t("队列草稿为空。你可以先添加多个任务，再统一提交到队列。")).classes("ag-subtle q-mt-md")
+
+                    ui.label(t("队列文件操作")).classes("ag-section-title q-mt-lg")
+                    queue_file_input = ui.input(t("队列文件路径"), placeholder=t("请输入队列文件路径")).classes("w-full q-mt-sm")
+                    with ui.row().classes("gap-2 q-mt-md"):
+                        ui.button(t("保存队列"), on_click=lambda: controller.save_queue(queue_file_input.value)).props("outline")
+                        ui.button(t("加载队列"), on_click=lambda: (controller.load_queue(queue_file_input.value), refresh_queue_views())).props("outline")
+
+            @ui.refreshable
+            def render_queue_jobs() -> None:
                 with ui.card().classes("ag-card p-6"):
-                    ui.label(t("使用说明")).classes("ag-section-title")
-                    ui.label(t("队列管理功能已完全可用。你可以：")).classes("ag-subtle")
-                    ui.label(t("1. 点击'运行队列'按钮执行所有待处理任务")).classes("ag-subtle q-mt-sm")
-                    ui.label(t("2. 对失败或已取消的任务点击'重试'按钮")).classes("ag-subtle q-mt-sm")
-                    ui.label(t("3. 对运行中的任务点击'取消'按钮")).classes("ag-subtle q-mt-sm")
-                    ui.label(t("4. 点击'清空已完成'按钮清理已完成的任务")).classes("ag-subtle q-mt-sm")
-                    ui.label(t("5. 在'添加任务到队列'区域添加新任务")).classes("ag-subtle q-mt-sm")
-                    ui.label(t("6. 对非运行中的任务点击'删除'按钮移除任务")).classes("ag-subtle q-mt-sm")
-                    ui.label(t("7. 使用'保存队列'和'加载队列'功能管理队列文件")).classes("ag-subtle q-mt-sm")
+                    ui.label(t("队列任务列表")).classes("ag-section-title")
+                    if controller._queue_service:
+                        jobs = controller._queue_service.list_jobs()
+                    else:
+                        jobs = []
+
+                    if not jobs:
+                        ui.label(t("暂无队列任务")).classes("ag-subtle q-mt-md")
+                        with ui.row().classes("gap-2 q-mt-md"):
+                            ui.button(t("进入工作台"), on_click=lambda: ui.navigate.to("/workflow")).props("unelevated")
+                            ui.button(t("前往设置"), on_click=lambda: ui.navigate.to("/setup")).props("outline")
+                        return
+
+                    ui.label(t("队列按当前列表顺序执行；可用每行的“上移 / 下移”按钮调整顺序。")).classes("ag-subtle q-mb-md")
+                    state_labels = {
+                        "pending": t("待处理"),
+                        "running": t("运行中"),
+                        "completed": t("已完成"),
+                        "failed": t("失败"),
+                        "cancelled": t("已取消"),
+                    }
+
+                    with ui.element("div").classes("ag-ledger-list"):
+                        for index, job in enumerate(jobs, start=1):
+                            runtime = controller._queue_service.get_job_runtime(job.job_id) if controller._queue_service else None
+                            state_str = runtime.state.value if runtime else "unknown"
+                            source_mode = str((job.parameters or {}).get("source_mode") or "direct")
+                            source_label = t("PDF 文件夹模式") if source_mode == "direct" else t("Zotero 报告模式")
+                            with ui.element("div").classes("ag-ledger-row"):
+                                with ui.element("div").classes("ag-ledger-main"):
+                                    with ui.column().classes("gap-1"):
+                                        ui.label(f"#{index} · {controller.action_label(job.job_type)} · {job.project_name}").classes("ag-section-title")
+                                        with ui.element("div").classes("ag-ledger-meta"):
+                                            ui.label(f"{t('输入来源')}: {source_label}")
+                                            ui.label(f"ID: {job.job_id}")
+                                            ui.label(f"{t('创建时间')}: {job.created_at}")
+                                            if runtime and runtime.started_at:
+                                                ui.label(f"{t('开始时间')}: {runtime.started_at}")
+                                            if runtime and runtime.completed_at:
+                                                ui.label(f"{t('完成时间')}: {runtime.completed_at}")
+                                            if runtime and runtime.error_message:
+                                                ui.label(f"{t('错误信息')}: {runtime.error_message[:100]}...")
+                                    ui.label(state_labels.get(state_str, state_str)).classes("ag-build-badge")
+
+                                with ui.row().classes("gap-2 flex-wrap"):
+                                    ui.button(t("上移"), on_click=lambda _event=None, jid=job.job_id: (controller.move_queue_job(jid, -1), render_queue_jobs.refresh())).props("outline size=sm")
+                                    ui.button(t("下移"), on_click=lambda _event=None, jid=job.job_id: (controller.move_queue_job(jid, 1), render_queue_jobs.refresh())).props("outline size=sm")
+                                    if runtime and runtime.state == QueueState.RUNNING:
+                                        ui.button(t("取消"), on_click=lambda _event=None, jid=job.job_id: (controller.cancel_job(jid), refresh_queue_views())).props("outline color=negative size=sm")
+                                    elif runtime and runtime.state in (QueueState.FAILED, QueueState.CANCELLED):
+                                        ui.button(t("重试"), on_click=lambda _event=None, jid=job.job_id: (controller.retry_job(jid), refresh_queue_views())).props("outline color=primary size=sm")
+                                    if runtime and runtime.state != QueueState.RUNNING:
+                                        ui.button(t("删除"), on_click=lambda _event=None, jid=job.job_id: (controller.remove_job(jid), refresh_queue_views())).props("outline color=negative size=sm")
+
+            with ui.element("div").classes("ag-grid-2 w-full"):
+                with ui.column().classes("gap-5 w-full"):
+                    render_queue_summary()
+                    render_queue_builder()
+                with ui.column().classes("gap-5 w-full"):
+                    render_queue_jobs()
+                    with ui.card().classes("ag-card p-6"):
+                        ui.label(t("使用说明")).classes("ag-section-title")
+                        ui.label(t("队列页现在覆盖了常见的排队与恢复动作。你可以：")).classes("ag-subtle")
+                        ui.label(t("1. 点击'运行队列'按钮执行所有待处理任务")).classes("ag-subtle q-mt-sm")
+                        ui.label(t("2. 在任务列表里用'上移'和'下移'按钮调整执行顺序")).classes("ag-subtle q-mt-sm")
+                        ui.label(t("3. 对失败或已取消的任务点击'重试'按钮")).classes("ag-subtle q-mt-sm")
+                        ui.label(t("4. 对运行中的任务点击'取消'按钮")).classes("ag-subtle q-mt-sm")
+                        ui.label(t("5. 点击'清空已完成'按钮清理已完成的任务")).classes("ag-subtle q-mt-sm")
+                        ui.label(t("6. 在'添加任务到队列'区域添加新任务")).classes("ag-subtle q-mt-sm")
+                        ui.label(t("7. 对非运行中的任务点击'删除'按钮移除任务")).classes("ag-subtle q-mt-sm")
+                        ui.label(t("8. 使用'保存队列'和'加载队列'功能管理队列文件")).classes("ag-subtle q-mt-sm")
 
     @ui.page("/guide")
     def guide_page() -> None:
@@ -2729,28 +3429,70 @@ def launch_gui(
         with _page_shell(
             controller,
             "使用引导",
-            "这页是面向第一次使用者的说明，尽量把理解成本降下来。后面如果你愿意，我还可以继续做成更完整的新手向导。",
+            "这页保留第一次使用所需的完整说明：输入来源、运行方式、OCR / MinerU、复用和工作区应该怎么理解。",
             "/guide",
         ):
-            with ui.element("div").classes("ag-grid-3 w-full"):
-                with ui.card().classes("ag-card p-5"):
-                    ui.label(t("普通模式")).classes("ag-section-title")
-                    ui.label(t("适合常规综述。先分析文献，再生成大纲和正文。")).classes("ag-subtle")
-                with ui.card().classes("ag-card p-5"):
-                    ui.label(t("概念增强模式")).classes("ag-section-title")
-                    ui.label(t("适合围绕某个概念做更聚焦的抽取与比较。")).classes("ag-subtle")
-                with ui.card().classes("ag-card p-5"):
-                    ui.label(t("自由模式")).classes("ag-section-title")
-                    ui.label(t("适合先说出你的研究想法，让系统先整理成更好的 prompt profile。")).classes("ag-subtle")
             with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
-                ui.label(t("关于 OCR 和预处理")).classes("ag-section-title")
+                ui.label(t("第一次运行，只看这一页也能开始")).classes("ag-section-title")
+                ui.label(t("下面这五步对应 GUI 里最重要的页面和动作。先跑通，再回头用高级功能。")).classes("ag-subtle")
+                with ui.element("div").classes("ag-editorial-list q-mt-md"):
+                    for step_index, title_key, note_key in [
+                        ("01", "准备输入材料", "PDF 模式只需要文件夹；Zotero 模式需要 report 和 library。"),
+                        ("02", "完成设置与模型连接", "先去设置页填路径，再检查 Reader / Writer / Outline 等模型是否可用。"),
+                        ("03", "进入工作台选择运行方式", "普通模式最适合第一次跑；概念增强和自由模式只在有明确需要时再用。"),
+                        ("04", "先跑仅分析文献", "先确认结构化摘要、预处理和抽取质量，再决定是否继续大纲和全文。"),
+                        ("05", "去结果与日志页看工作区", "最新 job workspace 和主要产物比原始日志更值得先看。"),
+                    ]:
+                        with ui.element("div").classes("ag-editorial-step"):
+                            ui.label(step_index).classes("ag-step-index")
+                            with ui.column().classes("gap-1"):
+                                ui.label(t(title_key)).classes("ag-step-title")
+                                ui.label(t(note_key)).classes("ag-step-note")
+
+            with ui.element("div").classes("ag-grid-2 w-full"):
+                with ui.card().classes("ag-card p-6"):
+                    ui.label(t("输入方式说明")).classes("ag-section-title")
+                    with ui.element("div").classes("ag-editorial-list q-mt-md"):
+                        with ui.element("div").classes("ag-editorial-step"):
+                            ui.label("PDF").classes("ag-step-index")
+                            with ui.column().classes("gap-1"):
+                                ui.label(t("PDF 文件夹模式")).classes("ag-step-title")
+                                ui.label(t("适合你已经准备好 PDF 文件夹，想直接开始批量分析。")).classes("ag-step-note")
+                        with ui.element("div").classes("ag-editorial-step"):
+                            ui.label("ZT").classes("ag-step-index")
+                            with ui.column().classes("gap-1"):
+                                ui.label(t("Zotero 报告模式")).classes("ag-step-title")
+                                ui.label(t("适合你已经整理好 Zotero report 和文献库，希望沿着现有整理结果继续。")).classes("ag-step-note")
+                with ui.card().classes("ag-card p-6"):
+                    ui.label(t("运行方式说明")).classes("ag-section-title")
+                    with ui.element("div").classes("ag-editorial-list q-mt-md"):
+                        with ui.element("div").classes("ag-editorial-step"):
+                            ui.label("01").classes("ag-step-index")
+                            with ui.column().classes("gap-1"):
+                                ui.label(t("普通模式")).classes("ag-step-title")
+                                ui.label(t("最稳妥，最适合第一轮。")).classes("ag-step-note")
+                        with ui.element("div").classes("ag-editorial-step"):
+                            ui.label("02").classes("ag-step-index")
+                            with ui.column().classes("gap-1"):
+                                ui.label(t("概念增强模式")).classes("ag-step-title")
+                                ui.label(t("适合围绕某个概念做更聚焦的抽取、定义和比较。")).classes("ag-step-note")
+                        with ui.element("div").classes("ag-editorial-step"):
+                            ui.label("03").classes("ag-step-index")
+                            with ui.column().classes("gap-1"):
+                                ui.label(t("自由模式")).classes("ag-step-title")
+                                ui.label(t("适合先和规划助手聊清楚目标，再把当前规划应用到本次任务。")).classes("ag-step-note")
+
+            with ui.card().classes("ag-card p-6 w-full"):
+                ui.label(t("关于 OCR、MinerU、复用和工作区")).classes("ag-section-title")
                 ui.label(t("默认不是全量 OCR。系统会先判断 PDF 是否有可用文本，再只对异常页触发 OCR。这样更省性能，也更适合普通电脑。")).classes("ag-subtle")
-                ui.label(t("如果后续你想继续增强前端体验，最自然的下一步会是“Python 后端 + JavaScript 前端”。当前这个 NiceGUI 版本则更适合快速把本地工具做成可用的网页工作台。")).classes("ag-subtle q-mt-sm")
+                ui.label(t("MinerU 也不是默认常开：只有 parser mode 请求远程，且 hybrid 判定本地质量不足时，才会真正发起远程解析。")).classes("ag-subtle q-mt-sm")
+                ui.label(t("阶段一复用开启后，会自动扫描历史输出并尽量跳过已经分析过的论文。")).classes("ag-subtle q-mt-sm")
+                ui.label(t("大多数真实产物现在都写入 output/<project_name>__<job_id>/ 工作区；旧的 output/<project_name>/ 更像兼容指针目录。")).classes("ag-subtle q-mt-sm")
 
     ui.run(
         host="127.0.0.1",
         port=port,
-        title="Auto Generate GUI",
+        title="auto-generate",
         reload=reload,
         show=show,
     )

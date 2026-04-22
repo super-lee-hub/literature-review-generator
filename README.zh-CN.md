@@ -1,168 +1,202 @@
-# LLM 文献综述生成器
+# auto-generate 中文指南
 
-[英文指南](./README.en.md) | [项目首页](./README.md)
+> 根 README (`README.md`) 现在只做路由页；这份文档负责中文用户说明。
 
-这是一个面向普通用户的本地 AI 文献工作台。你可以把 PDF 文件夹或 Zotero 文献库交给它，然后生成论文摘要、提纲和完整综述。
+## 1. 文档怎么分工
 
-## 你可以做什么
+- `README.md`：项目首页 / 路由页 / 快速选入口
+- `README.zh-CN.md`：中文完整使用说明（就是这份）
+- `README.en.md`：英文完整使用说明
+- `AGENTS.md`：给 AI 和新维护者的接手文档
+- `TRUTH_SOURCES.md`：更底层的运行时事实来源、产物真相、兼容层说明
+- `FEATURE_MATRIX.md`：功能实现状态矩阵
 
-- 扫描一个 PDF 文件夹，批量分析论文
-- 使用 Zotero 报告 + 文献库路径来处理文献
-- 生成论文摘要、综述提纲和完整综述
-- 重试失败的论文或失败的综述章节
-- 只重跑某一章或某一节
-- 使用命令行或 GUI 操作
-- 先排队多个任务，之后再统一运行
+## 2. 项目定位
 
-## 开始之前
+`auto-generate` 是一个本地运行的 AI 文献分析与综述写作工作台，而不再只是早期的“单脚本综述生成器”。
 
-1. 安装依赖：
+它支持两种主输入模式：
+
+- **PDF folder 模式**：直接扫描一个 PDF 文件夹
+- **Zotero 模式**：读取 `Zotero report + Zotero library`
+
+它现在有三种主要入口面：
+
+- **CLI**：`python main.py ...`
+- **GUI**：`python launch_gui.py`
+- **Codex / OMX skill**：仓库内置的 `auto-generate-orchestrator`，适合在 Codex 会话里直接走 AI-native 执行链
+
+主流程仍然是经典三阶段：
+
+1. **阶段一：论文分析** -> 生成结构化 `summaries.json`
+2. **阶段二：综述大纲** -> 生成 `outline.md`
+3. **阶段三：综述正文** -> 生成 `docx`
+
+但现在项目外围已经扩展出：
+
+- 本地 GUI 工作台
+- Job workspace / artifact registry / resume state
+- 队列系统与任务恢复
+- PDF 预处理缓存、OCR fallback、`normalized.md` 中间产物
+- 阶段一历史摘要复用
+- free mode profile / idea
+- review draft + citation manifest 持久化
+- 可选验证 / repair 管线
+- 可选本地 RAG
+
+## 3. 当前能力一览
+
+### 3.1 你可以做什么
+
+- 扫描一个 PDF 文件夹批量分析论文
+- 通过 Zotero report + library 解析文献和附件
+- 生成阶段一摘要、阶段二提纲、阶段三综述正文
+- 只重跑某一章 / 某一节
+- 只重试失败论文或失败综述章节
+- 复用历史 `summaries.json`
+- 把多个历史 `summaries.json` 合并为当前下游输入
+- 用 GUI 管理 setup、workflow、queue、logs、guide
+- 用 CLI 批量执行或挂队列
+- 在 Codex / OMX 中使用仓库内置 skill 走 AI-native 运行时
+- 对已生成综述做额外验证
+
+### 3.2 当前工作方式
+
+- **GUI 与 CLI 共用同一条底层执行链**，不是两套完全独立引擎。
+- **Codex skill 模式是第三条加法入口**：它不会替代 GUI / CLI，而是复用现有 workspace / artifact / validation 基座。
+- 当前真实输出以 **job workspace** 为主，而不是老式 `output/<project>/` 混合目录。
+- Word / Excel 是重要导出物，但不是唯一或最高优先级的真相来源；一些更底层的产物已经转移到结构化 JSON。
+
+## 4. 安装与初始化
+
+### 4.1 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. 先执行一次初始化：
+### 4.2 运行 setup
 
 ```bash
 python main.py --setup
 ```
 
-3. 如果你的项目需要 API key 或文件路径，请在 `config.ini` 或 GUI 设置页里填好。
-
-## 快速开始
-
-如果你已经有 PDF 文件夹，最简单的方式是：
-
-```bash
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --analyze-only
-```
-
-然后继续执行：
-
-```bash
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --generate-outline
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --generate-review
-```
-
-也可以一次跑完全部流程：
-
-```bash
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --run-all
-```
-
-如果你想让输出文件带上自己的项目名，可以加 `--project-name`：
-
-```bash
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --project-name "我的综述项目" --run-all
-```
-
-## PDF 文件夹模式
-
-当你的论文 PDF 都放在同一个文件夹里时，用这个模式最方便。
-
-常用命令：
-
-```bash
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --analyze-only
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --generate-outline
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --generate-review
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --run-all
-```
-
-如果只想重做某一章：
-
-```bash
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --generate-section <章节号>
-```
-
-这里要填提纲里的「实际章节号」。
-
-如果第一阶段里有论文失败了：
-
-```bash
-python main.py --pdf-folder "D:\你的PDF文件夹路径" --retry-failed
-```
-
-## Zotero 模式
-
-如果你使用 Zotero，请先在 `config.ini` 或 GUI 里设置：
-
-- `Paths.zotero_report`
-- `Paths.library_path`
-
-你也可以在启动任务时直接在命令行里传入：
-
-```bash
-python main.py --project-name "我的综述项目" --zotero-report "D:\你的zotero_report.txt" --library-path "D:\你的Zotero文库路径" --analyze-only
-```
-
-然后继续跑同样的主流程：
-
-```bash
-python main.py --project-name "我的综述项目" --analyze-only
-python main.py --project-name "我的综述项目" --generate-outline
-python main.py --project-name "我的综述项目" --generate-review
-```
-
-## 复用已有的第一阶段摘要
-
-现在可以用两种方式复用以前跑过的第一阶段结果：
-
-1. **为后续阶段加载一个或多个历史 summary 文件**
-   - 常见场景继续用 `--summary-file`。
-   - 如果要把多个历史 `summaries.json` 一起作为当前任务输入，可以重复使用 `--summary-source <path>`。
-   - 程序会先把这些 summary 合并并物化到当前 workspace，再继续生成 outline / review / section / validation，保证后续生成和复跑的一致性。
-2. **在第一阶段自动扫描历史结果并增量复用**
-   - 在第一阶段（`--analyze-only` 或 `--run-all`）加上 `--reuse-stage1`。
-   - 程序会自动扫描 `Paths.output_path` 下的历史结果，包括当前 workspace 结构和兼容的旧版 `output/<project>/<project>_summaries.json`。
-   - 自动匹配优先级是：`DOI 完全一致` -> `canonical paper key 完全一致` -> `title + first author + year` 的唯一高置信命中。
-   - 只有唯一高置信候选才会自动复用；如果候选有歧义，会写进 reuse report，然后该论文继续正常分析。
-   - 如果你还有位于 `output_path` 之外的额外摘要缓存，也可以重复使用 `--reuse-summary-file <path>` 把它们补充进复用池。
-
-示例：
-
-```bash
-# 用单个显式 summary 文件生成子集 outline
-python main.py --project-name "subset_outline" --summary-file "D:\subset\subset_summaries.json" --generate-outline
-
-# 用多个历史 summary 文件共同生成综述正文
-python main.py --project-name "subset_review" --summary-file "D:\subset\subset_a_summaries.json" --summary-source "D:\subset\subset_b_summaries.json" --generate-review
-
-# PDF 模式：第一阶段自动扫描历史输出，唯一命中的论文会直接复用
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1
-
-# Zotero 模式：同样支持自动扫描历史输出并增量复用
-python main.py --project-name "zotero_overlap" --zotero-report "D:\zotero_report.txt" --library-path "D:\ZoteroLibrary" --analyze-only --reuse-stage1
-
-# 额外追加一个位于 output_path 之外的手工复用摘要池
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1 --reuse-summary-file "D:\cache\curated_summaries.json"
-```
-
-规则：
-- 自动跨运行复用不再只看 DOI。现在会先复用 `DOI 完全一致`，再尝试 `canonical paper key 完全一致`，最后才是唯一的 `title + first author + year` 命中。
-- 如果同一优先级下匹配到多个历史候选，程序不会自动复用，而是把它标记为 `ambiguous`，然后继续正常分析，避免误复用。
-- 如果当前项目只是部分论文重叠，程序会直接复用已命中的论文，只分析剩余没命中的论文，不需要重新全量跑第一阶段。
-- 如果你想同时保留“大组版本”和“子集版本”，请使用不同的 `--project-name`，避免它们共享同一个 workspace 状态。
-
-## GUI
-
-用这个命令启动 GUI：
+### 4.3 启动 GUI
 
 ```bash
 python launch_gui.py
 ```
 
-如果你更喜欢点按钮、看进度条、看队列，就用 GUI。
-
-## 队列任务
-
-当你想先准备多个任务，之后统一执行时，队列模式很有用。
-
-常用命令：
+开发时可用：
 
 ```bash
-python main.py --queue-add --pdf-folder "D:\你的PDF文件夹路径" --project-name "我的综述项目" --analyze-only
+python launch_gui.py --reload --no-show
+```
+
+## 5. 快速开始
+
+### 5.1 最短 CLI 路径（PDF 文件夹）
+
+```bash
+python main.py --pdf-folder "D:\papers" --analyze-only
+python main.py --pdf-folder "D:\papers" --generate-outline
+python main.py --pdf-folder "D:\papers" --generate-review
+```
+
+或者一次跑完：
+
+```bash
+python main.py --pdf-folder "D:\papers" --run-all
+```
+
+如果你希望输出更容易区分，建议显式指定项目名：
+
+```bash
+python main.py --pdf-folder "D:\papers" --project-name "my_review" --run-all
+```
+
+### 5.2 最短 GUI 路径
+
+1. `python launch_gui.py`
+2. 先在 Setup 页面填路径、API 和模型
+3. 到 Workflow 页面选择 PDF / Zotero 模式
+4. 直接运行，或先加入队列再批量执行
+
+## 6. 常用工作流
+
+### 6.1 PDF 文件夹模式
+
+```bash
+python main.py --pdf-folder "D:\papers" --analyze-only
+python main.py --pdf-folder "D:\papers" --generate-outline
+python main.py --pdf-folder "D:\papers" --generate-review
+python main.py --pdf-folder "D:\papers" --run-all
+```
+
+### 6.2 Zotero 模式
+
+先在 `config.ini` 或 GUI 中设置：
+
+- `Paths.zotero_report`
+- `Paths.library_path`
+
+也可以直接命令行传入：
+
+```bash
+python main.py --project-name "my_review" --zotero-report "D:\zotero_report.txt" --library-path "D:\ZoteroLibrary" --analyze-only
+python main.py --project-name "my_review" --generate-outline
+python main.py --project-name "my_review" --generate-review
+```
+
+### 6.3 复用已有阶段一摘要
+
+当前有两种复用方式：
+
+1. **下游步骤显式加载历史 summary 文件**
+   - `--summary-file`
+   - 可重复追加 `--summary-source <path>`
+2. **阶段一自动扫描历史输出并增量复用**
+   - `--reuse-stage1`
+   - 可重复追加 `--reuse-summary-file <path>`
+
+当前自动复用会优先尝试：
+
+1. DOI 完全一致
+2. canonical paper key 完全一致
+3. `title + first author + year` 的唯一高置信命中
+
+示例：
+
+```bash
+python main.py --project-name "subset_outline" --summary-file "D:\subset\subset_summaries.json" --generate-outline
+
+python main.py --project-name "subset_review" --summary-file "D:\subset\subset_a_summaries.json" --summary-source "D:\subset\subset_b_summaries.json" --generate-review
+
+python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1
+
+python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1 --reuse-summary-file "D:\cache\curated_summaries.json"
+```
+
+### 6.4 局部重跑与失败恢复
+
+```bash
+python main.py --pdf-folder "D:\papers" --generate-section 3
+python main.py --pdf-folder "D:\papers" --retry-failed
+python main.py --pdf-folder "D:\papers" --retry-review-failed
+python main.py --project-name "my_review" --validate-review
+```
+
+说明：
+
+- `--generate-section <n>`：只重做指定章节
+- `--retry-failed`：只重试阶段一失败论文
+- `--retry-review-failed`：只重试失败或缺失的综述章节
+- `--validate-review`：对当前综述做额外验证；更底层的 validation / repair 产物会写入当前 workspace
+
+### 6.5 队列系统
+
+```bash
+python main.py --queue-add --pdf-folder "D:\papers" --project-name "batch_a" --analyze-only
 python main.py --queue-run
 python main.py --queue-list
 python main.py --queue-cancel <job_id>
@@ -170,10 +204,10 @@ python main.py --queue-retry <job_id>
 python main.py --queue-clear
 ```
 
-如果你想指定某个队列文件：
+如果你想指定队列文件：
 
 ```bash
-python main.py --queue-file "custom_queue_file.json" --queue-list
+python main.py --queue-file "custom_queue.json" --queue-list
 ```
 
 如果你想一次加载多个队列文件：
@@ -182,49 +216,177 @@ python main.py --queue-file "custom_queue_file.json" --queue-list
 python main.py --queue-run --queue-files "queue1.json" "queue2.json"
 ```
 
-## 可选功能
+## 7. 进阶能力
 
-这些功能有用，但不是最基础的必需项：
+这些功能通常不是第一次使用时的必需项，但已经是当前产品的一部分：
 
-- `--prime-with-folder` + `--concept`：用概念文件夹做预热
-- `--free-mode-profile`：加载 free mode 的 profile JSON
-- `--free-mode-idea`：直接输入 free mode 想法文本
-- `--summary-source`：在 `--summary-file` 之外继续追加多个下游 `summaries.json` 输入
-- `--merge`：把多个 `summaries.json` 合并成一个文件的兼容工具
-- `--validate-review`：在需要时额外检查已生成的综述
-- `--outline-adopt`：在需要时使用手动采纳的提纲
-- `--cleanup`：清理旧工作区文件，只保留最新任务文件
-- `--retry-review-failed`：只重试失败或缺失的综述章节
+- `auto-generate-orchestrator`：在 Codex / OMX 中直接调用仓库内置 skill，走 AI-native 入口
+- `--prime-with-folder` + `--concept`：概念预热 / concept priming
+- `--free-mode-profile`：加载 free mode profile JSON
+- `--free-mode-idea`：直接输入 free mode idea 文本
+- `--merge`：把多个 `summaries.json` 合并成一个
+- `--outline-adopt`：大纲采纳兼容路径（手动 / 显式流程，不是默认主链）
+- PDF 预处理缓存：`normalized.md` / `page_index.json` / `diagnostics.json` / `chunks.json`
+- 可选本地 RAG：在预处理阶段构建索引
 
-## 输出文件
+### 7.1 Codex / skill AI-native 入口
 
-当前结果通常写到活动任务工作区：
+如果你是在 Codex / OMX 里直接操作这个仓库，而不是手动点 GUI 或敲 CLI，那么可以使用仓库内置的 `auto-generate-orchestrator` skill。
+
+它的定位是：
+
+- **第三入口面**，不是对 GUI / CLI 的替换
+- 仍然复用现有的 `job workspace`、`artifact registry`、`resume`、`validation / repair` 基座
+- 更适合让 Codex 在仓库里直接做“输入归一化 -> 阶段执行 -> 持久化产物 -> 验证”的 AI-native 编排
+
+当你走这条入口时，除了常规产物外，还可能看到：
+
+- `artifacts/source_bundle.json`
+- `artifacts/runtime_stage_trace.json`
+
+如果你是普通用户，优先理解 GUI / CLI 即可；如果你是在 Codex 里让仓库自主执行，再关注这个入口。
+
+## 8. 输出目录与关键产物
+
+### 8.1 当前主输出目录
+
+当前真实输出通常位于：
 
 ```text
 output/<project_name>__<job_id>/
 ```
 
-常见文件：
+典型结构：
 
-- `artifacts/*_summaries.json`
-- `artifacts/*_summary_source_manifest.json`
-- `artifacts/*_summary_reuse_report.json`
-- `artifacts/*_literature_review_outline.md`
+```text
+output/<project_name>__<job_id>/
+├─ artifacts/
+│  ├─ <project>_summaries.json
+│  ├─ <project>_summary_source_manifest.json
+│  ├─ <project>_summary_reuse_report.json
+│  ├─ <project>_literature_review_outline.md
+│  ├─ paper_artifacts/
+│  ├─ review_drafts/
+│  ├─ citation_manifests/
+│  └─ validation / repair 相关 JSON（启用时）
+├─ checkpoints/
+├─ logs/
+├─ reports/
+└─ artifact_registry.json
+```
+
+### 8.2 兼容目录
+
+```text
+output/<project_name>/
+```
+
+这个目录现在通常只保留指针，例如：
+
+- `_latest_job.json`
+
+不要优先把它当成真实产物主目录。
+
+### 8.3 常见导出物
+
 - `reports/*_analyzed_papers.xlsx`
 - `reports/*_literature_review.docx`
 - `reports/*_failed_papers_report.txt`
 - `checkpoints/*_review_checkpoint.json`
-- `logs/`
+- `artifacts/review_drafts/*_review_draft_v2.json`
+- `artifacts/citation_manifests/*_citation_manifest_v3.json`
 
-如果你看到 `output/<project_name>/`，它通常只是兼容路径或指针，先优先看活动任务工作区。
+### 8.4 预处理缓存
 
-## 排障提示
+```text
+output/_preprocess_cache/
+```
 
-- 不知道从哪里开始时，先跑 `--analyze-only`。
-- 想打开 GUI？运行 `python launch_gui.py`。
-- 只想重做综述的一部分？用 `--generate-section <section_number>`。
-- 只想重试失败项？用 `--retry-failed` 或 `--retry-review-failed`。
-- 想给这次运行起个名字？加 `--project-name`。
-- 用 Zotero 时，先确认报告路径和文献库路径已经填好。
+常见缓存产物：
 
-如果你需要技术详细或开发说明，请查看单独的内部文档，不要把这些内容放到 README 里。
+- `normalized.md`
+- `plain_text.txt`
+- `page_index.json`
+- `chunks.json`
+- `diagnostics.json`
+- `structured.json`
+- `prepare_manifest.json`
+
+### 8.5 AI-native runtime 附加产物
+
+当你使用仓库内置的 Codex skill 入口时，当前工作区里还可能出现：
+
+- `artifacts/source_bundle.json`：这次 AI-native 运行归一化后的输入快照
+- `artifacts/runtime_stage_trace.json`：阶段执行轨迹，区分本地步骤与 subagent 生成步骤
+
+## 9. 配置建议
+
+当前推荐约定：
+
+- **敏感信息** 放 `.env`
+- **非敏感运行参数** 放 `config.ini`
+
+关键配置段包括：
+
+- `Paths`
+- `Primary_Reader_API`
+- `Backup_Reader_API`
+- `Writer_API`
+- `Outline_API`
+- `Free_Mode_API`
+- `Validator_API`
+- `Performance`
+- `Preprocess`
+- `Retry_Settings`
+- `Stage2_Retry`
+- `Queue`
+- `Validation`
+- `Styling`
+- `GUI`
+- `API_Parameters`
+
+关键环境变量包括：
+
+- `LLM_PRIMARY_READER_API`
+- `LLM_BACKUP_READER_API`
+- `LLM_WRITER_API`
+- `LLM_OUTLINE_API`
+- `LLM_FREE_MODE_API`
+- `LLM_VALIDATOR_API`
+- `MINERU_*`
+
+## 10. 排障建议
+
+- **第一次跑**：从 `--analyze-only` 开始
+- **想用界面**：`python launch_gui.py`
+- **想在 Codex 里直接让仓库自主执行**：使用 repo-local skill `auto-generate-orchestrator`
+- **找不到输出**：先看 `output/<project_name>__<job_id>/`
+- **只修一部分**：`--generate-section` 或 `--retry-review-failed`
+- **想增量复用历史阶段一结果**：`--reuse-stage1`
+- **需要更深入的运行时真相**：看 `TRUTH_SOURCES.md`
+- **需要 AI / 维护者接手文档**：看 `AGENTS.md`
+
+## 11. 给开发者 / 维护者的入口
+
+如果你不是普通用户，而是来接手仓库或排查实现，请优先看：
+
+1. `AGENTS.md`
+2. `TRUTH_SOURCES.md`
+3. `FEATURE_MATRIX.md`
+4. `summary_schema.py`
+5. `services/job_runner.py`
+6. `main.py`
+7. `gui/app.py`
+8. `.codex/skills/auto-generate-orchestrator/SKILL.md`
+9. `runtime/orchestrator.py`
+10. `preprocess/service.py`
+11. `validation/review_validator.py`
+
+## 12. 一句话总结
+
+把这个项目理解成：
+
+- 一个以本地 GUI + CLI + repo-local Codex skill 为入口的 AI 文献分析 / 综述写作工作台
+- 已经具备 job workspace、artifact、queue、reuse、validation 等产品化能力
+- 用户文档以本文件和英文 README 为主
+- 更底层的真相和兼容细节请看 `AGENTS.md` 与 `TRUTH_SOURCES.md`

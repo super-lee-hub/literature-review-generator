@@ -1,260 +1,268 @@
 # AGENTS.md
 
-本文件用于让新的 AI 对话或新加入的开发者，在 3 到 5 分钟内快速理解 `d:/auto-generate` 这个仓库的真实现状。
+本文件用于让新的 AI 对话或新加入的开发者，在 3 到 5 分钟内快速理解 `D:/auto-generate` 这个仓库的当前现实。
 
 - 推荐项目名：`auto-generate`
 - 历史名称：`llm_reviewer_generator`
-- 文档定位：AI 接手文档 / 项目上下文速览 / 架构与现状说明
-- 最近更新：`2026-04-01`
+- 文档定位：AI 接手文档 / 维护者速览 / 架构与运行时真相入口
+- 最近更新：`2026-04-22`
 
-## 1. 一句话说明
+## 1. 先知道文档怎么分工
 
-这是一个本地运行的 AI 文献分析与综述写作工作台，支持两种输入模式：
+当前文档分工已经调整为：
 
-- 直接扫描 `PDF` 文件夹
-- 读取 `Zotero report + Zotero library`
+- `README.md`
+  - 项目首页 / 路由页
+  - 不再承载全部细节
+- `README.zh-CN.md`
+  - 中文用户完整指南
+- `README.en.md`
+  - 英文用户完整指南
+- `AGENTS.md`
+  - 给 AI / 新维护者的仓库接手文档（就是这份）
+- `TRUTH_SOURCES.md`
+  - 运行时真相、durable artifacts、兼容路径说明
+- `FEATURE_MATRIX.md`
+  - 功能状态矩阵：implemented / partial / legacy / planned
+- `ARCHITECTURE_BASELINE.md`
+  - 迁移时期基线；有参考价值，但不是当前主真相
 
-它的主流程仍然是经典三阶段：
+如果以后 README 再发生变化，优先保持上面这个分工，不要再让根 README 承担全部说明。
 
-1. 阶段一：逐篇论文分析，产出结构化摘要 `summaries.json`
-2. 阶段二：基于摘要生成综述大纲 `outline.md`
-3. 阶段三：基于大纲和摘要生成 `docx` 综述正文
+## 2. 一句话说明
 
-但仓库已经在主流程外围扩展出：
+这是一个本地运行的 AI 文献分析与综述写作工作台，支持：
 
-- 本地 GUI 工作台
-- 配置与环境检测服务层
-- PDF 预处理与缓存层
-- 可选本地 RAG
-- 自由模式规划器（free mode）
-- 新版结构化摘要 schema
+- `PDF folder` 输入
+- `Zotero report + Zotero library` 输入
+- CLI、GUI 与 repo-local Codex skill 三入口
+- 阶段一摘要 / 阶段二提纲 / 阶段三综述正文
+- 队列、断点恢复、历史摘要复用、预处理缓存、validation / repair、可选本地 RAG
 
-所以当前项目不应再简单理解成“单个脚本的文献综述生成器”，更接近“文献分析/综述写作工作台”。
+它已经不应再被理解成“单个脚本的文献综述生成器”，而是一个带 workspace / artifact / queue / GUI 的本地工作台。
 
-## 2. 先读哪些文件
+## 3. 推荐阅读顺序
 
-如果以后新开对话需要快速建立上下文，建议阅读顺序如下：
+如果你是新的 AI 对话，建议按下面顺序建立上下文：
 
 1. `AGENTS.md`
-2. `summary_schema.py`
-3. `main.py`
-4. `gui/app.py`
-5. `services/configuration_service.py`
-6. `preprocess/service.py`
-7. `report_generator.py`
-8. `tests/test_preprocess_service.py`
-9. `tests/test_configuration_service.py`
-10. `tests/test_gui_playwright.py`
+2. `TRUTH_SOURCES.md`
+3. `FEATURE_MATRIX.md`
+4. `summary_schema.py`
+5. `services/job_runner.py`
+6. `main.py`
+7. `gui/app.py`
+8. `.codex/skills/auto-generate-orchestrator/SKILL.md`
+9. `runtime/orchestrator.py`
+10. `preprocess/service.py`
+11. `services/summary_reuse.py`
+12. `validation/review_validator.py`
+13. `services/repair_integration.py`
+14. `tests/test_summary_reuse.py`
+15. `tests/test_gui_playwright.py`
+16. `tests/test_runtime_orchestrator.py` / `tests/test_runtime_subagent_contract.py`
+17. `tests/test_job_runner.py`
+18. `tests/test_week3_validation.py` / `tests/test_week4_repair_integration.py`
 
 其中：
 
-- `summary_schema.py` 是“阶段一输出长什么样”的当前事实来源
-- `main.py` 仍然是核心业务编排入口
-- `gui/app.py` 体现了当前产品化方向
-- `tests/*` 比很多老注释和旧文档更可信
+- `summary_schema.py` 是阶段一 canonical summary 的事实来源
+- `services/job_runner.py` 是当前 job workspace / resume / artifact 协调层的重要入口
+- `main.py` 仍然很大，但现在更多承担兼容入口与主流程编排角色
+- `tests/*` 往往比旧注释和旧帮助文本更可信
 
-## 3. 当前架构总览
+## 4. 当前架构总览
 
 ```text
 用户入口
-├─ CLI: main.py
-└─ GUI: launch_gui.py -> gui/app.py
+├─ CLI: main.py -> dispatch_command() -> services/job_runner.py
+└─ GUI: launch_gui.py -> gui/app.py -> services/workflow_facade.py -> services/job_runner.py
 
-共享服务层
-├─ services/workflow_facade.py
-├─ services/configuration_service.py
-├─ services/environment_service.py
-├─ services/progress_service.py
-└─ services/model_selection.py
+AI-native 入口
+└─ Codex / OMX: .codex/skills/auto-generate-orchestrator/SKILL.md
+   -> runtime/job_spec.py
+   -> runtime/orchestrator.py
+   -> services/job_runner.py / validator.py / workspace artifacts
 
-核心工作流
-├─ main.py / LiteratureReviewGenerator
+运行时 / 工作区层
+├─ services/job_workspace.py
+├─ services/artifact_registry.py
+├─ services/progress_state.py
+├─ services/job_fingerprint.py
+└─ services/queue_service.py
+
+阶段一：输入、预处理、结构化摘要
 ├─ zotero_parser.py
 ├─ file_finder.py
-├─ pdf_extractor.py
 ├─ preprocess/service.py
-├─ ai_interface.py
+├─ preprocess/visual_artifacts.py
+├─ services/stage1_input_builder.py
 ├─ summary_schema.py
-├─ report_generator.py
-├─ docx_writer.py
-└─ validator.py
+├─ services/paper_artifact.py
+└─ services/summary_reuse.py
 
-扩展能力
+阶段二 / 三：大纲、综述、引用主链
+├─ main.py / LiteratureReviewGenerator
+├─ services/review_draft.py
+├─ services/citation_manifest.py
+├─ report_generator.py
+└─ docx_writer.py
+
+验证 / 修复层
+├─ validator.py
+├─ validation/review_validator.py
+├─ validation/summary_recheck.py
+├─ validation/repair_planner.py
+├─ validation/repair_apply.py
+└─ services/repair_integration.py
+
+产品化 / 配置 / 扩展
+├─ gui/app.py
+├─ services/configuration_service.py
+├─ services/environment_service.py
 ├─ free_mode/service.py
 ├─ free_mode/profile_manager.py
-├─ rag/local_rag.py
-└─ generate_policy_analysis_excel.py
+└─ rag/local_rag.py
 ```
 
-## 4. 核心流程
+## 5. 当前真实主链
 
-### 4.1 输入模式
+### 5.1 输入模式
 
-项目有两种主输入模式：
+项目当前支持两条正式输入链：
 
-- `PDF folder` 模式：直接给一个 PDF 目录
-- `Zotero` 模式：通过 `Paths.zotero_report` 和 `Paths.library_path` 读取文献与附件
+- **PDF folder 模式**：直接扫描文件夹中的 PDF
+- **Zotero 模式**：通过 `Paths.zotero_report` + `Paths.library_path` 定位文献与附件
 
-### 4.2 阶段一：论文分析
+### 5.2 阶段一：论文分析
 
-阶段一目标是对每篇论文生成结构化摘要，关键路径如下：
+阶段一现在不只是“从 PDF 提取文本然后让模型总结”。真实链路已经扩展为：
 
-1. 收集论文来源信息
-2. 定位 PDF
-3. 预处理 PDF
-4. 调用 Reader API 进行结构化分析
-5. 标准化到统一 schema
-6. 写入 `*_summaries.json`
-7. 输出 Excel 分析表
+1. 收集源论文描述（PDF / Zotero）
+2. 解析并定位 PDF
+3. 进入预处理层（可能产生 `normalized.md`、`page_index.json`、`diagnostics.json` 等）
+4. 构建 stage1 输入（包括文本、可选 visual refs、多模态信息）
+5. 调用 Reader API 生成结构化摘要
+6. 归一化到 canonical summary schema
+7. 写入 `*_summaries.json`
+8. 为每篇论文额外写入 `paper_artifact`
+9. 输出 Excel 分析表
 
-阶段一的重要特点：
+### 5.3 阶段二：大纲
 
-- 支持 `Primary_Reader_API` + `Backup_Reader_API`
-- 支持 PDF 预处理缓存
-- 支持将预处理后的 `normalized.md` 作为阶段一输入
-- 支持论文类型路由：`empirical` / `review` / `conceptual`
-- 支持质量审计字段：完整度、冲突标记、人工复核建议
+当前默认下游真相来源是 markdown outline：
 
-### 4.3 阶段二：综述大纲
+- 主输出：`*_literature_review_outline.md`
+- 默认 API：`Outline_API`
+- `--outline-adopt` 仍然存在，但它是显式 / 手动兼容路径，不应被视为默认主链
 
-阶段二基于阶段一摘要生成综述大纲：
+### 5.4 阶段三：综述正文
 
-- 主要输入：`*_summaries.json`
-- 主要输出：`*_literature_review_outline.md`
-- 模型选择：优先 `Outline_API`，未配置时可回退到 `Writer_API`
+阶段三已经不再只依赖“summary + Word”这类松散结构，当前更接近：
 
-### 4.4 阶段三：综述正文
+- 先写出 `review_draft_v2`
+- 再写出 `citation_manifest_v3`
+- 再根据 draft + manifest 输出 DOCX
 
-阶段三基于大纲和摘要生成 Word 文档：
+也就是说：
 
-- 主要输出：`*_literature_review.docx`
-- 断点文件：`*_review_checkpoint.json`
-- 样式输出：`docx_writer.py`
+- `docx` 是最终导出物
+- `review_draft_v2 + citation_manifest_v3` 才是阶段三更重要的结构化真相来源
 
-### 4.5 可选能力
+### 5.5 验证 / 修复
 
-- 概念预热 / concept priming：`--prime-with-folder` + `--concept`
-- 综述验证：`validator.py`，默认关闭
-- 本地 RAG：预处理阶段可选构建 Chroma 索引
-- 自由模式：通过自然语言先规划 prompt/profile，再应用到任务
+项目现在已经有单独的 validation / repair 管线：
 
-## 5. 模块分工
+- `validation_report`
+- `repair_plan`
+- `repair_apply_result`
 
-### 5.1 主入口
+用户可见入口仍以 `--validate-review` 为主，但内部已经存在更细分的 evidence resolver、summary recheck、repair planner / apply 结构。
 
-- `main.py`
-  - 仓库的核心调度器仍在这里
-  - `LiteratureReviewGenerator` 是主业务类
-  - `dispatch_command()` 是 CLI 实际分发入口
+## 6. 当前数据契约与真相来源
 
-- `launch_gui.py`
-  - GUI 启动器
-  - 负责端口选择、环境提示、NiceGUI 启动
+### 6.1 阶段一
 
-- `gui/app.py`
-  - 本地 GUI 工作台
-  - 包含 workflow、setup、processing、logs、guide 等页面
+- 主真相来源：canonical `*_summaries.json`
+- 伴随 durable artifact：`paper_artifacts/*.json`
+- 结构事实来源：`summary_schema.py`
 
-### 5.2 配置与环境
-
-- `services/configuration_service.py`
-  - 当前默认配置结构的事实来源
-  - 定义了新段落：`Outline_API`、`Free_Mode_API`、`Preprocess`、`Stage2_Retry`
-
-- `config.ini.example`
-  - 用户配置模板
-
-- `.env.example`
-  - API key 与 MinerU 相关环境变量模板
-
-- `services/environment_service.py`
-  - 检测当前 Python 运行环境
-  - 给出 conda 隔离环境建议
-
-### 5.3 输入与预处理
-
-- `zotero_parser.py`
-  - 解析 Zotero report
-  - 兼容标准格式、简化 key-value 格式、正则增强解析
-
-- `file_finder.py`
-  - 在 Zotero 库里建立 PDF 索引并匹配附件
-
-- `pdf_extractor.py`
-  - 老的本地 PDF 文本提取链路
-  - 使用 `pdfplumber` 和 `PyMuPDF`
-
-- `preprocess/service.py`
-  - 当前较新的预处理层
-  - 支持 `MinerU remote -> local fallback`
-  - 生成稳定的中间产物和缓存
-
-### 5.4 AI 调用与摘要 schema
-
-- `ai_interface.py`
-  - 统一调用 OpenAI-compatible API
-  - 负责 JSON 响应解析与自动纠错
-
-- `summary_schema.py`
-  - 当前最重要的数据契约文件
-  - schema 版本：`summary_v2_lite`
-  - 负责 canonical schema 归一化、兼容旧字段、导出报表所需映射
-
-- `models.py`
-  - TypedDict 数据模型定义
-
-### 5.5 输出层
-
-- `report_generator.py`
-  - 生成多工作表 Excel
-  - 按论文类型拆 sheet
-
-- `docx_writer.py`
-  - 生成和追加 Word 综述内容
-
-- `validator.py`
-  - 阶段一交叉验证
-  - 阶段二引用/观点验证
-  - 默认不是主流程
-
-### 5.6 扩展层
-
-- `free_mode/service.py`
-  - 自由模式规划与 profile 生成
-
-- `free_mode/profile_manager.py`
-  - 负责 `*_free_mode_profile.json`
-
-- `rag/local_rag.py`
-  - 可选本地 Chroma 索引
-  - 依赖 `chromadb` + `sentence-transformers`
-
-- `generate_policy_analysis_excel.py`
-  - 项目特化脚本
-  - 不是通用主流程的一部分
-  - 目前更像示例/专项导出工具
-
-## 6. 当前数据契约
-
-阶段一输出的核心结构不再只是早期的松散摘要，而是 canonical summary：
+canonical summary 的核心块包括：
 
 - `routing`
-  - 论文类型、子类型、路由置信度、分类状态
-
+- `paper_metadata`
 - `core_analysis`
-  - 摘要、方法、发现、结论、相关性、局限、理论框架、研究空白等
-
 - `specialized_details`
-  - 按 `empirical / review / conceptual` 分类存放类型专属字段
-
 - `quality_audit`
-  - 抽取置信度、完整度、是否建议人工复核、缺失关键字段、冲突标记
 
-旧结构仍被兼容，但以后讨论阶段一结果时，应该默认以 `summary_schema.py` 的 canonical 结构为准。
+### 6.2 阶段二
 
-## 7. 预处理缓存与产物
+- 主真相来源：`*_literature_review_outline.md`
+- reviewed outline JSON 仅保留为兼容 / 手动路径，不是默认主链
 
-`preprocess/service.py` 会为每个 PDF 生成稳定缓存目录，典型产物包括：
+### 6.3 阶段三
+
+- 主真相来源：`review_drafts/*_review_draft_v2.json`
+- 引用主真相：`citation_manifests/*_citation_manifest_v3.json`
+- DOCX / Excel 都是重要导出物，但不要把它们误判成唯一真相来源
+
+### 6.4 阶段四（验证 / 修复）
+
+启用时会出现：
+
+- `validation_report*.json`
+- `repair_plan_*.json`
+- `repair_apply_result_*.json`
+- 以及相关 patch 记录
+
+更细节请看 `TRUTH_SOURCES.md`。
+
+## 7. Job workspace、输出目录与缓存
+
+### 7.1 当前真实输出目录
+
+当前主输出通常位于：
+
+```text
+output/<project_name>__<job_id>/
+```
+
+典型结构：
+
+```text
+output/<project_name>__<job_id>/
+├─ artifacts/
+│  ├─ <project>_summaries.json
+│  ├─ <project>_summary_source_manifest.json
+│  ├─ <project>_summary_reuse_report.json
+│  ├─ <project>_literature_review_outline.md
+│  ├─ paper_artifacts/
+│  ├─ review_drafts/
+│  ├─ citation_manifests/
+│  └─ validation / repair 相关 JSON
+├─ checkpoints/
+├─ logs/
+├─ reports/
+└─ artifact_registry.json
+```
+
+### 7.2 兼容目录
+
+```text
+output/<project_name>/
+```
+
+现在通常只保留指针（例如 `_latest_job.json`），不要再默认认为它是主产物目录。
+
+### 7.3 预处理缓存
+
+预处理缓存通常位于：
+
+```text
+output/_preprocess_cache/
+```
+
+常见缓存文件：
 
 - `normalized.md`
 - `plain_text.txt`
@@ -264,47 +272,42 @@
 - `structured.json`
 - `prepare_manifest.json`
 
-这些文件的意义：
+## 8. GUI 与 CLI 的真实关系
 
-- `normalized.md`：可作为阶段一输入
-- `page_index.json`：按页组织内容
-- `chunks.json`：为本地 RAG 准备
-- `diagnostics.json`：记录提取质量、OCR、MinerU 状态
-- `prepare_manifest.json`：记录缓存是否可复用
+这部分和旧版理解相比已经发生了明显变化：
 
-## 8. 输出目录约定
+### 8.1 稳定事实
 
-项目输出通常位于：
+- CLI 入口仍然是 `python main.py ...`
+- GUI 入口仍然是 `python launch_gui.py`
+- GUI 没有自建一套完全独立引擎；GUI 和 CLI 共享底层 job request / workspace / queue / artifact 逻辑
+- 仓库现在还有 **repo-local Codex skill** 这一条 AI-native 入口；它是加法面，不替代 GUI / CLI
 
-```text
-output/<project_name>/
-```
+### 8.2 当前执行链
 
-常见文件：
+- GUI 通过 `services/workflow_facade.py` 构造参数
+- 实际执行由 `services/job_runner.py` 协调
+- `main.py` 的 `dispatch_command()` 仍然是兼容入口，但真实运行已经越来越依赖 job workspace / artifact / resume 这一层
+- AI-native skill 通过 `runtime/job_spec.py` + `runtime/orchestrator.py` 归一化输入，并在本地复用同一套 workspace / artifact / validation 基座
 
-- `<project>_summaries.json`
-- `<project>_analyzed_papers.xlsx`
-- `<project>_failed_papers_report.txt`
-- `<project>_checkpoint.json`
-- `<project>_literature_review_outline.md`
-- `<project>_review_checkpoint.json`
-- `<project>_literature_review.docx`
-- `<project>_free_mode_profile.json`
+### 8.3 不要再沿用的旧判断
 
-预处理缓存通常位于：
+以后不要简单说：
 
-```text
-output/_preprocess_cache/
-```
+- “GUI 只是薄壳，核心只有 main.py”
+- “所有输出都在 `output/<project>/`”
+- “Word/Excel 就是唯一主产物”
+
+这些判断都已经不够准确。
 
 ## 9. 配置系统
 
-当前推荐约定是：
+当前推荐约定仍然是：
 
 - 敏感信息放 `.env`
 - 非敏感运行参数放 `config.ini`
 
-关键配置段：
+关键配置段包括：
 
 - `Paths`
 - `Primary_Reader_API`
@@ -317,11 +320,13 @@ output/_preprocess_cache/
 - `Preprocess`
 - `Retry_Settings`
 - `Stage2_Retry`
+- `Queue`
+- `Validation`
 - `Styling`
 - `GUI`
 - `API_Parameters`
 
-关键环境变量：
+关键环境变量包括：
 
 - `LLM_PRIMARY_READER_API`
 - `LLM_BACKUP_READER_API`
@@ -331,52 +336,50 @@ output/_preprocess_cache/
 - `LLM_VALIDATOR_API`
 - `MINERU_*`
 
-## 10. GUI 与 CLI 的真实关系
+## 10. 当前重要能力（不要再漏掉）
 
-这部分非常重要。
+如果以后更新 README、做项目介绍或回答“现在这个仓库支持什么”，至少要覆盖下面这些能力：
 
-稳定事实：
+- PDF folder / Zotero 双输入
+- GUI + CLI + repo-local Codex skill 三入口
+- job workspace + artifact registry + latest pointer
+- stage-1 summary reuse
+- downstream `--summary-file` + `--summary-source`
+- queue system
+- partial rerun / failed retry
+- preprocess cache + OCR fallback
+- free mode profile / idea
+- review_draft_v2 + citation_manifest_v3
+- optional validation / repair
+- optional local RAG
+- AI-native runtime bridge + `source_bundle.json` / `runtime_stage_trace.json`
 
-- CLI 核心入口是 `python main.py ...`
-- GUI 并没有自己重写核心引擎，而是通过 `services/workflow_facade.py -> main.dispatch_command()` 复用旧主流程
-- GUI 已经覆盖 setup、workflow、processing、logs、guide 等产品层页面
+## 11. 技术债与注意事项
 
-当前分叉状态：
+当前仓库最重要的技术现状如下：
 
-- `workflow_facade.py` 已经为 GUI 预留了 `generate_section`、`retry_review_failed`、`free_mode_profile`、`free_mode_idea`、`progress_tracker` 等参数
-- 但 `main.py` 的 CLI parser 和 `dispatch_command()` 目前仍主要暴露旧版参数集
-- 也就是说：GUI 层和服务层已经朝更完整工作台演进，但核心引擎对这些新能力的整合还没有完全闭环
+- `main.py` 依然很大，历史逻辑和新逻辑共存
+- 项目名称尚未完全统一，仍残留 `llm_reviewer_generator`
+- 有些旧帮助文本 / 老文档 / 迁移期说明会落后于当前 reality
+- 兼容路径仍然存在，尤其是 outline adopt、部分 legacy output / citation fallback
+- GUI 虽然已经产品化很多，但仍然共享历史主流程，不要假设所有页面文案都天然等于底层真实能力
+- Word / Excel 是导出层，不是所有问题都应该从这些导出层倒推
+- 看到老式 `output/<project>/` 内容时，先确认它是不是兼容指针而不是真实 workspace
 
-因此以后排查问题时要区分三件事：
-
-- 某能力是否出现在 GUI 上
-- 某能力是否在 `workflow_facade.py` 里留了接口
-- 某能力是否真的被 `main.py` 主流程完整支持
-
-不要仅凭 GUI 按钮或测试名称就假设主引擎已经完全支持。
-
-## 11. 当前技术债与注意事项
-
-这个仓库最重要的技术现状如下：
-
-- `main.py` 仍然很大，核心逻辑高度集中
-- 新能力在持续外移到 `services/`、`gui/`、`preprocess/`、`free_mode/`
-- 项目名称尚未完全统一，很多字符串仍保留历史名 `llm_reviewer_generator`
-- 旧文档、旧注释、旧帮助文本与当前实现之间存在偏差
-- 一些中文注释/字符串存在历史编码遗留，遇到可读性差的地方，优先以代码行为和测试为准
-- `ProgressTracker` 已存在，但目前主要是 GUI 外层包装级别的开始/结束状态，并未深度接入主引擎内部逐篇进度事件
-- `validator.py` 仍在，但默认配置是关闭的
-- `generate_policy_analysis_excel.py` 是专项导出脚本，不要误认成主流程必经步骤
-
-## 12. 以后改这个仓库时的建议
+## 12. 改这个仓库时先看哪里
 
 如果未来任务是：
 
-- 改阶段一摘要结构：先看 `summary_schema.py`、`models.py`、`report_generator.py`、相关 tests
-- 改 GUI 配置页：先看 `gui/app.py`、`services/configuration_service.py`、`tests/test_gui_playwright.py`
-- 改 PDF 预处理：先看 `preprocess/service.py`、`rag/local_rag.py`、`tests/test_preprocess_service.py`
-- 改 CLI/GUI 对齐：先看 `services/workflow_facade.py`、`main.py`、`gui/app.py`
-- 改 Word/Excel 输出：先看 `docx_writer.py`、`report_generator.py`
+- **改用户文档分工**：`README.md`、`README.zh-CN.md`、`README.en.md`、`AGENTS.md`
+- **改阶段一摘要结构**：`summary_schema.py`、`services/paper_artifact.py`、`report_generator.py`、相关 tests
+- **改阶段一复用**：`services/summary_reuse.py`、`tests/test_summary_reuse.py`
+- **改 workspace / output / resume**：`services/job_runner.py`、`services/job_workspace.py`、`services/artifact_registry.py`、`services/progress_state.py`
+- **改 GUI 工作台**：`gui/app.py`、`services/configuration_service.py`、`tests/test_gui_playwright.py`
+- **改 PDF 预处理**：`preprocess/service.py`、`rag/local_rag.py`、`tests/test_preprocess_service.py`
+- **改 review draft / citation 主链**：`services/review_draft.py`、`services/citation_manifest.py`、`docx_writer.py`
+- **改 validation / repair**：`validator.py`、`validation/*.py`、`services/repair_integration.py`
+- **改 queue**：`services/queue_service.py`、`gui/app.py`、`tests/test_queue_service.py`
+- **改 AI-native skill / runtime bridge**：`.codex/skills/auto-generate-orchestrator/SKILL.md`、`runtime/*.py`、`tests/test_runtime_*.py`
 
 ## 13. 推荐启动方式
 
@@ -384,10 +387,10 @@ CLI：
 
 ```bash
 python main.py --setup
-python main.py --pdf-folder "D:\\papers" --analyze-only
-python main.py --pdf-folder "D:\\papers" --generate-outline
-python main.py --pdf-folder "D:\\papers" --generate-review
-python main.py --pdf-folder "D:\\papers" --run-all
+python main.py --pdf-folder "D:\papers" --analyze-only
+python main.py --pdf-folder "D:\papers" --generate-outline
+python main.py --pdf-folder "D:\papers" --generate-review
+python main.py --pdf-folder "D:\papers" --run-all
 ```
 
 GUI：
@@ -406,9 +409,10 @@ python launch_gui.py --reload --no-show
 
 如果你是新的 AI 对话，请默认把这个项目理解为：
 
-- 一个以 `main.py` 为核心引擎的本地 AI 文献分析/综述写作工作台
-- 当前正在从“单文件脚本式工具”演进为“GUI + 服务层 + 预处理层 + schema 驱动”的结构
-- `summary_schema.py`、`preprocess/service.py`、`gui/app.py` 代表了较新的方向
-- `main.py`、`validator.py`、部分帮助文本和旧命名仍带有历史包袱
+- 一个以 job workspace / artifact / queue 为底层支撑的本地 AI 文献分析 / 综述写作工作台
+- 入口上既有 `main.py` CLI、`launch_gui.py` + `gui/app.py` GUI，也有 repo-local Codex skill
+- 阶段一主真相是 canonical summaries，阶段三主真相已经前移到 `review_draft_v2 + citation_manifest_v3`
+- `README.md` 现在只是路由页；用户细节看 `README.zh-CN.md` / `README.en.md`
+- 如果需要更底层的 artifact / compatibility 说明，请继续看 `TRUTH_SOURCES.md`
 
-先看本文件，再按任务切到对应模块，不要直接把旧版 `IFLOW.md` 或零散注释当作唯一事实来源。
+先看本文件，再按任务切到对应模块，不要直接把旧版迁移文档或零散注释当作唯一事实来源。

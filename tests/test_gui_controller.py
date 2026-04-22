@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import configparser
 import importlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -62,6 +64,14 @@ class _FakeClient:
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         return False
+
+
+class _FakeQueueService:
+    def __init__(self, job_ids: list[str]) -> None:
+        self._job_ids = list(job_ids)
+
+    def list_jobs(self):
+        return [types.SimpleNamespace(job_id=job_id) for job_id in self._job_ids]
 
 
 @pytest.fixture()
@@ -161,3 +171,129 @@ def test_refresh_progress_updates_live_widgets_and_prunes_deleted_ones(gui_app_m
     assert live_elapsed.text == "01:05"
     assert live_overall_bar.value == 0.5
     assert live_stage_bar.value == 0.5
+
+
+def test_move_queue_job_reorders_by_one_step(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller._queue_service = _FakeQueueService(["job-1", "job-2", "job-3"])
+
+    captured_orders: list[list[str]] = []
+    monkeypatch.setattr(controller, "reorder_jobs", lambda job_ids: captured_orders.append(list(job_ids)))
+
+    controller.move_queue_job("job-2", -1)
+    controller.move_queue_job("job-2", 1)
+    controller.move_queue_job("job-1", -1)
+    controller.move_queue_job("missing", 1)
+
+    assert captured_orders == [
+        ["job-2", "job-1", "job-3"],
+        ["job-1", "job-3", "job-2"],
+    ]
+
+
+def test_validate_workflow_request_respects_selected_input_mode(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    notifications: list[str] = []
+    monkeypatch.setattr(controller, "notify", lambda message, **_kwargs: notifications.append(message))
+
+    controller.state["workflow"]["project_name"] = "demo"
+    controller.state["workflow"]["input_mode"] = "pdf"
+    controller.state["workflow"]["pdf_folder"] = ""
+    assert controller.validate_workflow_request("analyze") is False
+    assert notifications[-1] == "当前选择的是 PDF 文件夹模式，请先填写 PDF 文件夹。"
+
+    controller.state["workflow"]["pdf_folder"] = "D:/papers"
+    assert controller.validate_workflow_request("analyze") is True
+
+    controller.state["workflow"]["input_mode"] = "zotero"
+    controller.state["paths"]["zotero_report"] = ""
+    controller.state["paths"]["library_path"] = ""
+    assert controller.validate_workflow_request("analyze") is False
+    assert notifications[-1] == "当前选择的是 Zotero 模式，请先填写 Zotero 报告路径。"
+
+    controller.state["paths"]["zotero_report"] = "D:/zotero/report.md"
+    assert controller.validate_workflow_request("analyze") is False
+    assert notifications[-1] == "Zotero 模式还需要填写 Zotero 库路径。"
+
+    controller.state["paths"]["library_path"] = "D:/Zotero"
+    assert controller.validate_workflow_request("analyze") is True
+
+
+def test_validate_workflow_request_only_blocks_pending_free_mode_when_free_mode_selected(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    notifications: list[str] = []
+    monkeypatch.setattr(controller, "notify", lambda message, **_kwargs: notifications.append(message))
+
+    controller.state["workflow"]["project_name"] = "demo"
+    controller.state["workflow"]["input_mode"] = "pdf"
+    controller.state["workflow"]["pdf_folder"] = "D:/papers"
+    controller.free_mode_messages = [{"role": "user", "content": "test"}]
+    controller.free_mode_profile_path = ""
+
+    controller.state["workflow"]["work_mode"] = "normal"
+    assert controller.validate_workflow_request("analyze") is True
+
+    controller.state["workflow"]["work_mode"] = "free"
+    assert controller.validate_workflow_request("analyze") is False
+    assert notifications[-1] == "自由模式对话还没有应用到本次任务。请先应用当前规划，或清空对话后再运行。"
+
+
+def test_build_queue_job_spec_can_use_explicit_input_mode(gui_app_module) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["workflow"]["input_mode"] = "pdf"
+    controller.state["workflow"]["work_mode"] = "free"
+    controller.state["paths"]["library_path"] = "D:/ZoteroLibrary"
+
+    spec = controller._build_queue_job_spec(
+        "demo",
+        "D:/papers",
+        "D:/zotero/report.md",
+        "analyze",
+        input_mode="zotero",
+        work_mode="normal",
+    )
+
+    assert spec.parameters["pdf_folder"] is None
+    assert spec.parameters["zotero_report"] == "D:/zotero/report.md"
+    assert spec.parameters["library_path"] == "D:/ZoteroLibrary"
+    assert spec.parameters["source_mode"] == "zotero"
+    assert spec.parameters["free_mode_profile"] is None
+    assert spec.parameters["free_mode_idea"] is None
+
+
+def test_persist_config_writes_and_applies_mineru_settings(gui_app_module, monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text((REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"), encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+    monkeypatch.setenv("MINERU_API_TOKEN", "")
+    monkeypatch.setenv("MINERU_BASE_URL", "")
+    monkeypatch.setenv("MINERU_MODEL_VERSION", "")
+    monkeypatch.setenv("ALLOW_LOCAL_PARSE_FALLBACK", "true")
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    controller.state["preprocess"]["parser_mode"] = "remote_first"
+    controller.state["preprocess"]["primary_parser"] = "mineru_remote"
+    controller.state["preprocess"]["fallback_parser"] = "local"
+    controller.state["mineru"]["base_url"] = "https://mineru.example/api/v4"
+    controller.state["mineru"]["api_token"] = "token-123"
+    controller.state["mineru"]["model_version"] = "vlm-pro"
+    controller.state["mineru"]["allow_local_parse_fallback"] = False
+
+    controller.persist_config(notify_user=False)
+
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    assert parser["Preprocess"]["parser_mode"] == "remote_first"
+    assert parser["Preprocess"]["primary_parser"] == "mineru_remote"
+    assert parser["Preprocess"]["fallback_parser"] == "local"
+
+    env_content = env_path.read_text(encoding="utf-8")
+    assert "MINERU_BASE_URL=https://mineru.example/api/v4" in env_content
+    assert "MINERU_API_TOKEN=token-123" in env_content
+    assert "MINERU_MODEL_VERSION=vlm-pro" in env_content
+    assert "ALLOW_LOCAL_PARSE_FALLBACK=false" in env_content
+
+    assert controller.env_values["MINERU_API_TOKEN"] == "token-123"
+    assert os.environ["MINERU_API_TOKEN"] == "token-123"

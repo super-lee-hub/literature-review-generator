@@ -25,14 +25,15 @@ This document defines the canonical truth sources, compatibility projections, de
   - `*_reviewed_outline.json` (manual compatibility artifact, not normal downstream default)
 
 ### Stage 3: Review Draft
-- **Primary Truth Source**: `*_review_draft.json` (v2 structure) + `*_citation_manifest.json`
+- **Primary Truth Source**: `*_review_draft_v2.json` + `*_citation_manifest_v3.json`
 - **Fallback**: Legacy review draft structure (marked as legacy in metadata)
 - **Key Artifacts**:
-  - `*_review_draft.json` (with `block_source`, `span_map`, and `local_ref_id`)
-  - `*_citation_manifest.json` (structured citations as primary truth)
+  - `*_review_draft_v2.json` (with block structure, `block_source`, `span_map`, and durable section context)
+  - `*_citation_manifest_v3.json` (structured citations as primary truth)
+  - `*_citation_manifest_v2.json` (legacy-compatible compatibility artifact when still present)
 
 ### Stage 4: DOCX Generation
-- **Primary Truth Source**: `*_review_draft.json` + `*_citation_manifest.json` (cited bibliography only)
+- **Primary Truth Source**: `*_review_draft_v2.json` + `*_citation_manifest_v3.json` (cited bibliography only)
 - **Fallback**: Legacy summary-based bibliography (explicit legacy mode only)
 - **Key Artifacts**:
   - `*_literature_review.docx` (generated from manifest cited references)
@@ -51,6 +52,13 @@ This document defines the canonical truth sources, compatibility projections, de
   - `queue.json` (persistent queue storage)
   - `QueueJobSpec` (complete task snapshots with fingerprints and paths)
   - `QueueJobRuntime` (runtime state tracking with retry counts)
+
+### Stage 7: AI-native Runtime Bridge
+- **Primary Truth Source**: the active job workspace + artifact registry, driven by `RuntimeJobSpec` and `AgentRuntimeBridge`
+- **Key Artifacts**:
+  - `source_bundle.json` (normalized AI-native input/source snapshot)
+  - `runtime_stage_trace.json` (local-vs-subagent stage execution trace)
+  - canonical downstream artifacts persisted through the same workspace/registry substrate as CLI/GUI runs
 
 ## Compatibility Projections
 
@@ -73,6 +81,7 @@ This document defines the canonical truth sources, compatibility projections, de
 - **PDF Folder Mode**: Direct input of PDF files
 - **Zotero Mode**: Input via `Zotero report + Zotero library`
 - **Queue Mode**: Batch processing via queue files
+- **AI-native Mode**: Repo-local Codex skill / runtime bridge that still writes into the same workspace layout
 - **Primary Durable Output Directory**: `output/<project_name>__<job_id>/`
 - **Compatibility Pointer Directory**: `output/<project_name>/` (for pointers such as `_latest_job.json`)
 - **Preprocess Cache**: All preprocess artifacts in `output/_preprocess_cache/`
@@ -113,7 +122,7 @@ This document defines the canonical truth sources, compatibility projections, de
 ## Key Implementation Notes
 
 ### Citation Object Main Chain
-- Structured citations in `citation_manifest_v2` are the primary truth source
+- Structured citations in `citation_manifest_v3` are the primary truth source
 - Regex-based citations are only allowed as legacy fallback
 - All citations must be mapped to canonical paper keys
 - DOCX bibliography only includes actually cited items
@@ -132,6 +141,12 @@ This document defines the canonical truth sources, compatibility projections, de
 - GUI supports complete queue operations: add, delete, reorder, save, load, run, cancel, retry, resume
 - CLI supports batch queue files and single task override
 - Default queue policy: serial execution, fail-continue, explicit recovery, retry failed items
+
+### AI-native Runtime Bridge
+- `RuntimeJobSpec` adapts AI-native requests into canonical `JobRunRequest`
+- `AgentRuntimeBridge` bootstraps workspace/latest-pointer handling locally and persists `source_bundle.json` + `runtime_stage_trace.json`
+- Generation stages may be delegated to subagents, but workspace/artifact/validation transitions remain local and canonical
+- This surface is additive: it does not replace the normal human CLI/GUI entrypoints
 
 ### Optional Outline Review Compatibility Surface
 - `Outline_API` remains the normal outline-generation API

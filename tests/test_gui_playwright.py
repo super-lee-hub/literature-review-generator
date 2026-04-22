@@ -159,7 +159,7 @@ def test_dashboard_shows_search_topbar(page, gui_server):
     _open_page(page, gui_server["base_url"])
 
     expect(page.locator(".ag-search")).to_be_visible()
-    expect(page.locator(".ag-topbar-title")).to_contain_text("AI 文献综述生成器")
+    expect(page.locator(".ag-topbar-title")).to_contain_text("auto-generate")
     expect(page.locator(".ag-reminder-text")).to_contain_text("工作台已就绪")
 
 
@@ -172,9 +172,9 @@ def test_dashboard_reminder_is_below_topbar_and_extra_sections_render(page, gui_
     assert reminder_box is not None
     assert reminder_box["y"] >= fixedbar_box["y"] + fixedbar_box["height"] - 1
 
-    expect(page.get_by_text("三种使用方式", exact=True)).to_be_visible()
-    expect(page.get_by_text("开始前快速检查", exact=True)).to_be_visible()
-    assert page.locator(".ag-page .ag-card").count() >= 9
+    expect(page.get_by_text("现在建议做什么", exact=True)).to_be_visible()
+    expect(page.get_by_text("当前工作台快照", exact=True)).to_be_visible()
+    assert page.locator(".ag-page .ag-card").count() >= 4
 
 
 @pytest.mark.parametrize(
@@ -197,17 +197,11 @@ def test_search_routes_cover_major_pages(page, gui_server, query, route_suffix):
 def test_topbar_buttons_and_dashboard_navigation(page, gui_server):
     _open_page(page, gui_server["base_url"])
 
-    page.get_by_role("button", name="打开输出").click()
-    expect(_notification(page)).to_contain_text("测试模式：已模拟打开路径")
-
-    page.get_by_role("button", name="打开日志").click()
-    expect(_notification(page)).to_contain_text("测试模式：已模拟打开路径")
-
-    page.get_by_role("button", name="进入核心工作台").first.click()
+    page.get_by_role("button", name="进入工作台").first.click()
     expect(page).to_have_url(re.compile(r"/workflow$"))
 
     _open_page(page, gui_server["base_url"])
-    page.get_by_role("button", name="先做 SETUP").click()
+    page.get_by_role("button", name="前往设置").first.click()
     expect(page).to_have_url(re.compile(r"/setup$"))
 
 
@@ -215,15 +209,16 @@ def test_sidebar_navigation_links(page, gui_server):
     _open_page(page, gui_server["base_url"])
 
     nav_targets = [
-        ("核心工作台", r"/workflow$"),
+        ("工作台", r"/workflow$"),
         ("环境与路径", r"/setup$"),
         ("API 与模型", r"/setup/api$"),
         ("性能与预处理", r"/setup/processing$"),
-        ("日志与产物", r"/logs$"),
+        ("结果与日志", r"/logs$"),
         ("使用引导", r"/guide$"),
+        ("队列", r"/queue$"),
     ]
     for label, pattern in nav_targets:
-        page.locator(".ag-nav-link", has_text=label).first.click()
+        page.locator(".ag-nav-link", has_text=label).first.click(no_wait_after=True)
         expect(page).to_have_url(re.compile(pattern))
 
 
@@ -263,8 +258,8 @@ def test_processing_page_can_persist_settings(page, gui_server):
     )
     _editable_field_input(page, "OCR 语言").fill("eng+chi_sim")
 
-    for toggle_index in range(4):
-        page.locator(".q-toggle").nth(toggle_index).click()
+    for label in ["启用阶段二自动重试", "启用预处理", "强制重建缓存", "启用本地 RAG"]:
+        page.locator(".q-toggle", has_text=label).click()
 
     page.get_by_role("button", name="保存配置").first.click()
     expect(_notification(page)).to_contain_text("配置已保存")
@@ -311,6 +306,32 @@ def test_all_api_cards_expose_actions(page, gui_server):
         card.get_by_role("button", name="测试连接").click()
         expect(page.locator(".ag-reminder-text")).to_contain_text("测试模式：已模拟 API 连通性检查")
 
+    mineru_card = _card(page, "MinerU 远程解析")
+    expect(mineru_card).to_be_visible()
+    expect(mineru_card.locator(".q-field", has_text="Base URL")).to_be_visible()
+    expect(mineru_card.locator(".q-field", has_text="API Token")).to_be_visible()
+    expect(mineru_card.get_by_role("button", name="前往性能与预处理")).to_be_visible()
+
+
+def test_mineru_api_card_can_persist_env_values(page, gui_server):
+    _open_page(page, f'{gui_server["base_url"]}/setup/api')
+
+    mineru_card = _card(page, "MinerU 远程解析")
+    mineru_card.locator(".q-field", has_text="Base URL").locator("input").first.fill("https://mineru.example/api/v4")
+    mineru_card.locator(".q-field", has_text="API Token").locator("input").first.fill("token-123")
+    mineru_card.locator(".q-field", has_text="模型版本").locator("input").first.fill("vlm-pro")
+
+    page.get_by_role("button", name="保存配置").first.click()
+    expect(_notification(page)).to_contain_text("配置已保存")
+
+    env_content = gui_server["env_path"].read_text(encoding="utf-8")
+    assert "MINERU_BASE_URL=https://mineru.example/api/v4" in env_content
+    assert "MINERU_API_TOKEN=token-123" in env_content
+    assert "MINERU_MODEL_VERSION=vlm-pro" in env_content
+
+    mineru_card.get_by_role("button", name="前往性能与预处理").click()
+    expect(page).to_have_url(re.compile(r"/setup/processing$"))
+
 
 def test_workflow_validation_warnings(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/workflow')
@@ -320,13 +341,13 @@ def test_workflow_validation_warnings(page, gui_server):
 
     _field_input(page, "项目名").fill("Need PDFs")
     page.get_by_role("button", name="一键运行").click()
-    expect(_notification(page)).to_contain_text("请填写 PDF 文件夹")
+    expect(_notification(page)).to_contain_text("PDF 文件夹模式")
 
 
 def test_workflow_page_groups_actions_and_idle_progress_is_static(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/workflow')
 
-    for title in ["任务输入", "概念增强模式", "自由模式对话规划器", "主流程操作", "补跑与质检", "工作台导航"]:
+    for title in ["任务起点", "运行方式", "主流程操作", "第一次运行建议", "相关入口"]:
         expect(page.get_by_text(title, exact=True)).to_be_visible()
 
     progress_card = _card(page, "任务进度")
@@ -361,6 +382,7 @@ def test_workflow_actions_and_links(page, gui_server):
 
     _set_path_value(page, open_button_name="选择 PDF 文件夹", label_text="PDF 文件夹", value=str(gui_server["pdf_dir"]))
     _editable_field_input(page, "项目名").fill("GUI Smoke Test")
+    page.get_by_role("button", name="自由模式").click()
     _editable_field_input(page, "继续告诉规划助手").fill("请围绕 research gap 和变量链路组织一个测试大纲。")
 
     page.get_by_role("button", name="打开 PDF 文件夹").click()
@@ -375,11 +397,16 @@ def test_workflow_actions_and_links(page, gui_server):
     page.get_by_role("button", name="应用到本次任务").click()
     expect(_notification(page)).to_contain_text("自由模式已应用到本次任务")
 
-    for button_name in ["仅分析文献", "生成大纲", "生成全文", "一键运行", "验证综述", "重试失败论文"]:
+    for button_name in ["仅分析文献", "生成大纲", "生成全文", "一键运行"]:
         page.get_by_role("button", name=button_name).click()
         expect(_notification(page)).to_contain_text("测试模式：已模拟执行")
 
-    _card(page, "工作台导航").get_by_role("button", name="前往 Setup").click()
+    page.get_by_role("button", name="补跑、恢复与验证（按需展开）").click()
+    for button_name in ["验证综述", "重试失败论文"]:
+        page.get_by_role("button", name=button_name).click()
+        expect(_notification(page)).to_contain_text("测试模式：已模拟执行")
+
+    _card(page, "相关入口").get_by_role("button", name="前往设置").click()
     expect(page).to_have_url(re.compile(r"/setup$"))
 
 
@@ -395,9 +422,10 @@ def test_logs_and_guide_pages_render(page, gui_server):
 
     _open_page(page, f'{gui_server["base_url"]}/guide')
     expect(page.locator(".ag-card")).to_have_count(4)
-    expect(page.get_by_text("普通模式", exact=True)).to_be_visible()
-    expect(page.get_by_text("概念增强模式", exact=True)).to_be_visible()
-    expect(page.get_by_text("自由模式", exact=True)).to_be_visible()
+    expect(page.get_by_text("第一次运行，只看这一页也能开始", exact=True)).to_be_visible()
+    expect(page.get_by_text("输入方式说明", exact=True)).to_be_visible()
+    expect(page.get_by_text("运行方式说明", exact=True)).to_be_visible()
+    expect(page.get_by_text("关于 OCR、MinerU、复用和工作区", exact=True)).to_be_visible()
 
 
 def test_language_switch_changes_labels(page, gui_server):
@@ -407,4 +435,4 @@ def test_language_switch_changes_labels(page, gui_server):
     page.get_by_text("English", exact=True).click()
     page.wait_for_load_state("networkidle")
     expect(page.get_by_role("button", name="Search")).to_be_visible()
-    expect(page.locator(".ag-topbar-title")).to_contain_text("AI Literature Review Generator")
+    expect(page.locator(".ag-topbar-title")).to_contain_text("auto-generate")

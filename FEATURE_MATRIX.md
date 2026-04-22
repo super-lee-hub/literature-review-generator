@@ -25,6 +25,8 @@ This matrix provides a comprehensive view of the current implementation status o
 | Citation Object Main Chain | implemented | Citation object as primary truth source | Fully functional - structured citations are now the default truth source |
 | Validation/Repair | implemented | Validation and repair pipeline | Fully functional - includes preprocess evidence loader and semi-closed loop repair |
 | Queue System | implemented | Job queue management | Fully functional - includes complete task snapshots and dependency tracking |
+| AI-native Skill Entrypoint | implemented | Repo-local Codex / OMX skill entry surface | Fully functional additive surface via `.codex/skills/auto-generate-orchestrator` + `runtime/*` |
+| Runtime Stage Trace | implemented | AI-native runtime source/trace artifacts | Fully functional - persists `source_bundle.json` and `runtime_stage_trace.json` into the job workspace |
 | Outline Review Compatibility | partial | Optional outline critique/arbitration/adopt surface | Present as an explicit/manual compatibility path; normal outline/review workflow does not require it |
 | Zotero Integration | implemented | Zotero report parsing and library integration | Fully functional |
 | PDF Extraction | implemented | PDF text extraction with multiple backends | Fully functional |
@@ -54,10 +56,10 @@ This matrix provides a comprehensive view of the current implementation status o
 - **Description**: Updated review draft structure with improved block management
 - **Notes**: Fully functional with support for block-based review drafts
 
-### Citation Manifest v2
+### Citation Manifest v3
 - **Status**: implemented
 - **Description**: Structured citation management with occurrence tracking
-- **Notes**: Fully functional with support for citation clusters and bibliography generation
+- **Notes**: Fully functional with v3 as the normal runtime truth; v2 may still appear as a compatibility artifact in some paths
 
 ### Stage1 Multimodal Input
 - **Status**: implemented
@@ -78,6 +80,16 @@ This matrix provides a comprehensive view of the current implementation status o
 - **Status**: implemented
 - **Description**: Job queue management
 - **Notes**: Fully functional - includes complete task snapshots and dependency tracking
+
+### AI-native Skill Entrypoint
+- **Status**: implemented
+- **Description**: Repo-local Codex / OMX skill entry surface that drives the same workspace/artifact substrate through `RuntimeJobSpec` and `AgentRuntimeBridge`
+- **Notes**: Additive surface; not a replacement for CLI or GUI
+
+### Runtime Stage Trace
+- **Status**: implemented
+- **Description**: AI-native runtime artifacts that record normalized input/source state and stage execution history
+- **Notes**: Persists `source_bundle.json` and `runtime_stage_trace.json` in the active job workspace
 
 ### Outline Review Compatibility
 - **Status**: partial

@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+import json
+from pathlib import Path
+from typing import Any, Dict, Literal, Mapping
+
+from services.job_runner import JobRunRequest
+
+
+SourceMode = Literal["direct", "zotero"]
+
+
+@dataclass(frozen=True)
+class RuntimeSourceSpec:
+    mode: SourceMode
+    pdf_folder: str = ""
+    zotero_report: str = ""
+    library_path: str = ""
+
+    def validate(self) -> None:
+        if self.mode == "direct":
+            if not self.pdf_folder:
+                raise ValueError("direct source mode requires pdf_folder")
+            return
+        if self.mode == "zotero":
+            if not self.zotero_report:
+                raise ValueError("zotero source mode requires zotero_report")
+            if not self.library_path:
+                raise ValueError("zotero source mode requires library_path")
+            return
+        raise ValueError(f"unsupported source mode: {self.mode}")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeSourceSpec":
+        return cls(
+            mode=str(payload.get("mode") or "direct"),
+            pdf_folder=str(payload.get("pdf_folder") or ""),
+            zotero_report=str(payload.get("zotero_report") or ""),
+            library_path=str(payload.get("library_path") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeJobSpec:
+    project_name: str
+    source: RuntimeSourceSpec
+    config: str = "config.ini"
+    action: str = "run_all"
+    summary_file: str = ""
+    summary_sources: tuple[str, ...] = ()
+    reuse_stage1: bool = False
+    reuse_summary_files: tuple[str, ...] = ()
+    generate_section: int | None = None
+    queue_file: str = "output/_queue/queue.json"
+    keep_legacy_projections: bool = True
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not str(self.project_name or "").strip():
+            raise ValueError("project_name is required")
+        self.source.validate()
+        allowed_actions = {
+            "analyze",
+            "generate_outline",
+            "generate_review",
+            "generate_section",
+            "validate_review",
+            "retry_failed",
+            "retry_review_failed",
+            "run_all",
+        }
+        if self.action not in allowed_actions:
+            raise ValueError(f"unsupported action: {self.action}")
+        if self.action == "generate_section":
+            if self.generate_section is None:
+                raise ValueError("generate_section action requires generate_section")
+            if self.generate_section <= 0:
+                raise ValueError("generate_section must be greater than 0")
+        requested_stages = self.metadata.get("requested_stages")
+        if requested_stages is not None:
+            allowed_stages = {"source_intake", "analyze", "outline", "review", "validate"}
+            invalid = [str(item) for item in requested_stages if str(item) not in allowed_stages]
+            if invalid:
+                raise ValueError(f"unsupported requested_stages entries: {invalid}")
+
+    def to_job_request(self) -> JobRunRequest:
+        self.validate()
+        return JobRunRequest(
+            config=self.config,
+            project_name=self.project_name,
+            pdf_folder=self.source.pdf_folder or None,
+            action=self.action,
+            summary_file=self.summary_file or None,
+            summary_sources=tuple(item for item in self.summary_sources if str(item).strip()),
+            reuse_stage1=self.reuse_stage1,
+            reuse_summary_files=tuple(item for item in self.reuse_summary_files if str(item).strip()),
+            run_all=self.action == "run_all",
+            analyze_only=self.action == "analyze",
+            generate_outline=self.action == "generate_outline",
+            generate_review=self.action == "generate_review",
+            generate_section=self.generate_section if self.action == "generate_section" else None,
+            validate_review=self.action == "validate_review",
+            retry_failed=self.action == "retry_failed",
+            retry_review_failed=self.action == "retry_review_failed",
+            progress_tracker=None,
+            gui=False,
+            source_mode=self.source.mode,
+            zotero_report=self.source.zotero_report or None,
+            library_path=self.source.library_path or None,
+            queue_file=self.queue_file,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["source"] = self.source.to_dict()
+        payload["summary_sources"] = list(self.summary_sources)
+        payload["reuse_summary_files"] = list(self.reuse_summary_files)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeJobSpec":
+        return cls(
+            project_name=str(payload.get("project_name") or ""),
+            source=RuntimeSourceSpec.from_dict(dict(payload.get("source") or {})),
+            config=str(payload.get("config") or "config.ini"),
+            action=str(payload.get("action") or "run_all"),
+            summary_file=str(payload.get("summary_file") or ""),
+            summary_sources=tuple(
+                str(item).strip()
+                for item in payload.get("summary_sources", [])
+                if str(item).strip()
+            ),
+            reuse_stage1=bool(payload.get("reuse_stage1", False)),
+            reuse_summary_files=tuple(
+                str(item).strip()
+                for item in payload.get("reuse_summary_files", [])
+                if str(item).strip()
+            ),
+            generate_section=(
+                int(payload["generate_section"])
+                if payload.get("generate_section") is not None
+                else None
+            ),
+            queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
+            keep_legacy_projections=bool(payload.get("keep_legacy_projections", True)),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "RuntimeJobSpec":
+        source_mode = "zotero" if payload.get("zotero_report") else str(payload.get("source_mode") or "direct")
+        return cls(
+            project_name=str(payload.get("project_name") or ""),
+            source=RuntimeSourceSpec(
+                mode=source_mode,
+                pdf_folder=str(payload.get("pdf_folder") or ""),
+                zotero_report=str(payload.get("zotero_report") or ""),
+                library_path=str(payload.get("library_path") or ""),
+            ),
+            config=str(payload.get("config") or "config.ini"),
+            action=str(payload.get("action") or "run_all"),
+            summary_file=str(payload.get("summary_file") or ""),
+            summary_sources=tuple(
+                str(item).strip()
+                for item in payload.get("summary_sources", [])
+                if str(item).strip()
+            ),
+            reuse_stage1=bool(payload.get("reuse_stage1", False)),
+            reuse_summary_files=tuple(
+                str(item).strip()
+                for item in payload.get("reuse_summary_files", [])
+                if str(item).strip()
+            ),
+            generate_section=(
+                int(payload["generate_section"])
+                if payload.get("generate_section") is not None
+                else None
+            ),
+            queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
+            keep_legacy_projections=bool(payload.get("keep_legacy_projections", True)),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+
+def load_runtime_job_spec(path: str | Path) -> RuntimeJobSpec:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    job_spec = RuntimeJobSpec.from_dict(payload)
+    job_spec.validate()
+    return job_spec
+
+
+def save_runtime_job_spec(path: str | Path, job_spec: RuntimeJobSpec) -> None:
+    job_spec.validate()
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(job_spec.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")

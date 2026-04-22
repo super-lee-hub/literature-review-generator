@@ -223,9 +223,9 @@ class PersistentQueueService:
     def list_jobs_by_state(self, state: QueueState) -> List[QueueJobSpec]:
         with self._lock:
             return [
-                self._jobs[job_id]
-                for job_id, runtime in self._runtimes.items()
-                if runtime.state == state and job_id in self._jobs
+                job
+                for job_id, job in self._jobs.items()
+                if job_id in self._runtimes and self._runtimes[job_id].state == state
             ]
 
     def update_job_state(self, job_id: str, state: QueueState) -> bool:
@@ -512,10 +512,7 @@ class QueueRunner:
                 pending_jobs = self.queue_service.list_jobs_by_state(QueueState.PENDING)
                 if not pending_jobs:
                     break
-                
-                # 按创建时间排序，先处理早创建的任务
-                pending_jobs.sort(key=lambda x: x.created_at)
-                
+
                 for job in pending_jobs:
                     with self._lock:
                         if not self._running:

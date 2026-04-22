@@ -238,3 +238,57 @@ def test_queue_runner_reconstructs_summary_source_and_reuse_fields(tmp_path: Pat
     assert captured["request"].summary_sources == ("D:/subset.json", "D:/subset-b.json")
     assert captured["request"].reuse_stage1 is True
     assert captured["request"].reuse_summary_files == ("D:/reuse-a.json",)
+
+
+def test_queue_runner_respects_reordered_job_order(tmp_path: Path) -> None:
+    queue_file = tmp_path / "test_queue.json"
+    service = PersistentQueueService(queue_file)
+
+    execution_order: list[str] = []
+
+    class _Runner:
+        def run(self, request, cancel_token=None):
+            execution_order.append(request.project_name)
+            return type(
+                "_Result",
+                (),
+                {
+                    "success": True,
+                    "exit_code": 0,
+                    "message": "ok",
+                    "workspace_path": str(tmp_path / f"{request.project_name}__workspace"),
+                    "job_id": request.project_name,
+                    "resume_state": "fresh",
+                    "produced_artifacts": [],
+                    "log_path": "",
+                    "report_paths": [],
+                    "failure_summary": None,
+                },
+            )()
+
+    job_a = create_queue_job_id()
+    job_b = create_queue_job_id()
+    job_c = create_queue_job_id()
+
+    for job_id, project_name in [(job_a, "A"), (job_b, "B"), (job_c, "C")]:
+        service.add_job(
+            QueueJobSpec(
+                job_id=job_id,
+                job_type="analyze",
+                project_name=project_name,
+                parameters={
+                    "config": "config.ini",
+                    "project_name": project_name,
+                    "pdf_folder": f"D:/{project_name}",
+                    "action": "analyze",
+                    "analyze_only": True,
+                },
+            )
+        )
+
+    service.reorder_jobs([job_c, job_a, job_b])
+
+    queue_runner = QueueRunner(service, _Runner())
+    queue_runner.run()
+
+    assert execution_order == ["C", "A", "B"]
