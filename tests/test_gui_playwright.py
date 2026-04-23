@@ -377,6 +377,35 @@ def test_switching_between_workflow_and_logs_keeps_ui_responsive(page, gui_serve
     expect(project_input).to_have_value("Still Responsive")
 
 
+def test_workflow_free_mode_layout_stays_readable(page, gui_server):
+    _open_page(page, f'{gui_server["base_url"]}/workflow')
+
+    work_mode_toggle = page.locator(".ag-mode-toggle").nth(1)
+    work_mode_toggle.locator(".q-btn").nth(2).click()
+
+    toggle_box = work_mode_toggle.bounding_box()
+    assert toggle_box is not None
+    button_boxes = [work_mode_toggle.locator(".q-btn").nth(index).bounding_box() for index in range(3)]
+    assert all(box is not None for box in button_boxes)
+    button_boxes = [box for box in button_boxes if box is not None]
+    assert min(box["width"] for box in button_boxes) >= (toggle_box["width"] / 3) - 20
+    assert button_boxes[0]["x"] - toggle_box["x"] <= 12
+    assert (toggle_box["x"] + toggle_box["width"]) - (button_boxes[-1]["x"] + button_boxes[-1]["width"]) <= 12
+
+    planner_outputs = page.locator(".ag-planner-output")
+    expect(planner_outputs).to_have_count(2)
+    for index in range(2):
+        field = planner_outputs.nth(index)
+        expect(field).to_be_visible()
+        field_box = field.bounding_box()
+        assert field_box is not None
+        assert field_box["height"] >= 160
+        metrics = field.locator("textarea").evaluate(
+            "el => ({clientHeight: el.clientHeight, scrollHeight: el.scrollHeight})"
+        )
+        assert metrics["clientHeight"] >= 120
+
+
 def test_workflow_actions_and_links(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/workflow')
 

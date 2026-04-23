@@ -569,9 +569,7 @@ body, .nicegui-content {
   background: rgba(255, 255, 255, 0.44);
   border-radius: 0 14px 14px 0;
 }
-.ag-mode-toggle {
-  width: 100%;
-}
+.ag-mode-toggle,
 .ag-mode-toggle .q-btn-group {
   width: 100%;
   display: grid;
@@ -582,13 +580,17 @@ body, .nicegui-content {
   border-radius: 18px;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
 }
+.ag-mode-toggle-2,
 .ag-mode-toggle-2 .q-btn-group {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
+.ag-mode-toggle-3,
 .ag-mode-toggle-3 .q-btn-group {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 .ag-mode-toggle .q-btn {
+  width: 100%;
+  min-width: 0;
   min-height: 48px;
   border-radius: 14px !important;
   padding: 4px 14px;
@@ -647,6 +649,16 @@ body, .nicegui-content {
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.54);
   border: 1px solid var(--line);
+}
+.ag-planner-output .q-field__control,
+.ag-planner-output .q-field__control-container {
+  min-height: 176px;
+  align-items: stretch;
+}
+.ag-planner-output textarea.q-field__native {
+  min-height: 132px !important;
+  line-height: 1.68;
+  overflow-y: auto !important;
 }
 .ag-kv-grid {
   display: grid;
@@ -2443,11 +2455,11 @@ def _render_free_mode_planner_card(controller: WorkspaceController) -> None:
             transcript_view = ui.textarea(
                 label=t("对话记录"),
                 value="",
-            ).props("outlined readonly autogrow").classes("w-full")
+            ).props("outlined readonly rows=8").classes("w-full ag-planner-output")
             profile_view = ui.textarea(
                 label=t("当前 profile 草案"),
                 value="",
-            ).props("outlined readonly autogrow").classes("w-full")
+            ).props("outlined readonly rows=8").classes("w-full ag-planner-output")
         ui.textarea(
             label=t("继续告诉规划助手"),
             value=controller.free_mode_chat_input,
