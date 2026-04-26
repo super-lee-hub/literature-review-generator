@@ -1,5 +1,9 @@
 import argparse
+import inspect
 import json
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import cast
 
@@ -7,6 +11,18 @@ from config_loader import ConfigDict
 from context_manager import validate_summary_quality
 import main
 from models import APIConfig, PaperInfo, ProcessingResult, SummariesList
+
+
+REMOVED_QUEUE_FLAGS = [
+    "--queue-add",
+    "--queue-run",
+    "--queue-file",
+    "--queue-files",
+    "--queue-list",
+    "--queue-cancel",
+    "--queue-retry",
+    "--queue-clear",
+]
 
 
 def _make_args(**overrides):
@@ -34,6 +50,53 @@ def _make_args(**overrides):
     }
     base.update(overrides)
     return argparse.Namespace(**base)
+
+
+def test_cli_help_excludes_removed_queue_flags() -> None:
+    result = subprocess.run(
+        [sys.executable, str(Path(main.__file__).resolve()), "--help"],
+        cwd=Path(main.__file__).resolve().parent,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    for flag in REMOVED_QUEUE_FLAGS:
+        assert flag not in result.stdout
+
+
+def test_removed_queue_flags_are_unknown_arguments() -> None:
+    result = subprocess.run(
+        [sys.executable, str(Path(main.__file__).resolve()), "--queue-list"],
+        cwd=Path(main.__file__).resolve().parent,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stdout
+    assert "--queue-list" in result.stdout
+
+
+def test_dispatch_command_has_no_public_queue_route() -> None:
+    dispatch_source = inspect.getsource(main.dispatch_command)
+
+    for attr in [
+        "handle_queue_list_mode",
+        "handle_queue_cancel_mode",
+        "handle_queue_retry_mode",
+        "handle_queue_clear_mode",
+        "handle_queue_add_mode",
+        "handle_queue_run_mode",
+    ]:
+        assert not hasattr(main, attr)
+        assert attr not in dispatch_source
+    for token in ["queue_list", "queue_cancel", "queue_retry", "queue_clear", "queue_add", "queue_run"]:
+        assert token not in dispatch_source
 
 
 class _DummyLogger:

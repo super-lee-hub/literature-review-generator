@@ -46,8 +46,8 @@ This document defines the canonical truth sources, compatibility projections, de
   - `repair_apply_result.json` (repair application results)
   - `applied_patch_*.json` (individual patch records)
 
-### Stage 6: Queue System
-- **Primary Truth Source**: `queue.json` with complete task snapshots
+### Stage 6: GUI Queue System
+- **Primary Truth Source**: GUI-internal `queue.json` with immutable workflow submission snapshots
 - **Key Artifacts**:
   - `queue.json` (persistent queue storage)
   - `QueueJobSpec` (complete task snapshots with fingerprints and paths)
@@ -80,7 +80,7 @@ This document defines the canonical truth sources, compatibility projections, de
 ### Input/Output Compatibility
 - **PDF Folder Mode**: Direct input of PDF files
 - **Zotero Mode**: Input via `Zotero report + Zotero library`
-- **Queue Mode**: Batch processing via queue files
+- **GUI Queue Mode**: Workflow-page submissions are persisted into a serial GUI background queue
 - **AI-native Mode**: Repo-local Codex skill / runtime bridge that still writes into the same workspace layout
 - **Primary Durable Output Directory**: `output/<project_name>__<job_id>/`
 - **Compatibility Pointer Directory**: `output/<project_name>/` (for pointers such as `_latest_job.json`)
@@ -136,11 +136,11 @@ This document defines the canonical truth sources, compatibility projections, de
   - `review_drift -> block/span patch`
 - Repair application triggers targeted recheck and persists secondary report
 
-### Queue System
-- `QueueJobSpec/QueueJobRuntime` extended with `source_snapshot`, `fingerprints`, `current_stage`, `paths`, and `produced_artifacts`
-- GUI supports complete queue operations: add, delete, reorder, save, load, run, cancel, retry, resume
-- CLI supports batch queue files and single task override
-- Default queue policy: serial execution, fail-continue, explicit recovery, retry failed items
+### GUI Queue System
+- `QueueJobSpec/QueueJobRuntime` remain the internal GUI queue storage contract, including `source_snapshot`, `fingerprints`, `current_stage`, `paths`, and `produced_artifacts` where present.
+- GUI workflow submissions enqueue immutable task snapshots and drain through a serial background processor; the workflow page owns normal queue monitoring and controls.
+- CLI and AI-native runtime are direct-run surfaces and do not expose or enter public queue workflows.
+- Default queue policy: serial execution, fail-continue, explicit recovery, and retry of failed/cancelled GUI jobs.
 
 ### AI-native Runtime Bridge
 - `RuntimeJobSpec` adapts AI-native requests into canonical `JobRunRequest`
@@ -165,13 +165,13 @@ This document defines the canonical truth sources, compatibility projections, de
 ### Validation Scenarios
 - **Citation Validation**: Structured citations on disk, manifest priority, legacy regex only in compat scenarios, bibliography with only cited items
 - **Validation/Repair**: Five conclusion types, root cause classification, mapping repair effects, auto-recheck after repair
-- **Queue Validation**: GUI/CLI mixed tasks, fail-continue, cancel, resume, `--queue-file` and `--zotero-report` functionality
+- **Queue Validation**: GUI workflow queue tasks, fail-continue, cancel, retry, resume, and AI-runtime out-of-queue boundary
 - **Outline Runtime**: Main generation, markdown outline loading, downstream review generation
 
 ### Manual Validation
 - **PDF analyze** path
 - **Zotero analyze** path
-- **Queue run_all** path
+- **GUI queued run_all** path
 - **Validate+repair** path
 - **Reviewed outline adopt** path (optional compatibility/manual flow only)
 

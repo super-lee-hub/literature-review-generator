@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import configparser
 import importlib
 import os
@@ -8,6 +9,7 @@ import types
 from pathlib import Path
 
 import pytest
+from services.queue_service import QueueJobSpec
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +74,14 @@ class _FakeQueueService:
 
     def list_jobs(self):
         return [types.SimpleNamespace(job_id=job_id) for job_id in self._job_ids]
+
+
+class _FakeBackgroundTask:
+    def __init__(self, done: bool = False) -> None:
+        self._done = done
+
+    def done(self) -> bool:
+        return self._done
 
 
 @pytest.fixture()
@@ -259,6 +269,144 @@ def test_build_queue_job_spec_can_use_explicit_input_mode(gui_app_module) -> Non
     assert spec.parameters["source_mode"] == "zotero"
     assert spec.parameters["free_mode_profile"] is None
     assert spec.parameters["free_mode_idea"] is None
+
+
+def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["workflow"].update(
+        {
+            "input_mode": "pdf",
+            "work_mode": "free",
+            "summary_file": "D:/summaries/a.json",
+            "summary_sources": "D:/summaries/b.json\nD:/summaries/c.json",
+            "reuse_stage1": True,
+            "reuse_summary_files": "D:/reuse/a.json",
+            "free_mode_idea": "original idea",
+            "section_number": "3",
+        }
+    )
+    controller.state["paths"]["library_path"] = "D:/Library"
+    controller.free_mode_profile_path = "D:/profiles/original.json"
+
+    spec = controller._build_queue_job_spec(
+        "original-project",
+        "D:/papers/original",
+        "",
+        "generate_section",
+    )
+
+    controller.state["workflow"].update(
+        {
+            "summary_file": "D:/summaries/edited.json",
+            "summary_sources": "D:/summaries/edited-source.json",
+            "reuse_stage1": False,
+            "reuse_summary_files": "D:/reuse/edited.json",
+            "free_mode_idea": "edited idea",
+            "section_number": "9",
+        }
+    )
+    controller.free_mode_profile_path = "D:/profiles/edited.json"
+
+    assert spec.source_snapshot == {
+        "project_name": "original-project",
+        "input_mode": "pdf",
+        "work_mode": "free",
+        "action": "generate_section",
+        "pdf_folder": "D:/papers/original",
+        "zotero_report": None,
+        "library_path": None,
+        "summary_file": "D:/summaries/a.json",
+        "summary_sources": ["D:/summaries/b.json", "D:/summaries/c.json"],
+        "reuse_stage1": True,
+        "reuse_summary_files": ["D:/reuse/a.json"],
+        "concept": None,
+        "free_mode_profile": "D:/profiles/original.json",
+        "free_mode_idea": None,
+        "generate_section": 3,
+    }
+    assert spec.parameters["summary_sources"] == ["D:/summaries/b.json", "D:/summaries/c.json"]
+    assert spec.parameters["reuse_summary_files"] == ["D:/reuse/a.json"]
+
+
+def test_schedule_queue_processor_keeps_single_background_task(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller._queue_runner = object()
+    scheduled = []
+
+    def fake_create_task(coro):
+        scheduled.append(coro)
+        coro.close()
+        return _FakeBackgroundTask(done=False)
+
+    monkeypatch.setattr(gui_app_module.asyncio, "create_task", fake_create_task)
+
+    assert controller._schedule_queue_processor() is True
+    assert controller._schedule_queue_processor() is False
+    assert len(scheduled) == 1
+
+    controller._queue_processor_task = None
+    controller.queue_processor_running = True
+    assert controller._schedule_queue_processor() is False
+    assert len(scheduled) == 1
+
+
+def test_run_workflow_enqueues_while_processor_running_without_block(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["workflow"]["project_name"] = "demo"
+    controller.state["workflow"]["input_mode"] = "pdf"
+    controller.state["workflow"]["pdf_folder"] = "D:/papers"
+    controller.queue_processor_running = True
+
+    added_actions: list[str] = []
+    notifications: list[str] = []
+    schedule_calls: list[bool] = []
+
+    monkeypatch.setattr(controller, "validate_workflow_request", lambda _action: True)
+    monkeypatch.setattr(controller, "persist_config", lambda **_kwargs: None)
+    monkeypatch.setattr(controller, "update_progress_widgets", lambda: None)
+    monkeypatch.setattr(controller, "refresh_logs", lambda: None)
+    monkeypatch.setattr(controller, "refresh_queue", lambda **_kwargs: None)
+    monkeypatch.setattr(controller, "_queue_position", lambda _job_id: 2)
+    monkeypatch.setattr(controller, "notify", lambda message, **_kwargs: notifications.append(message))
+
+    def fake_add_job(project_name, pdf_folder, zotero_report, action):
+        added_actions.append(action)
+        return "job-queued"
+
+    def fake_schedule():
+        schedule_calls.append(True)
+        return False
+
+    monkeypatch.setattr(controller, "add_job_to_queue", fake_add_job)
+    monkeypatch.setattr(controller, "_schedule_queue_processor", fake_schedule)
+
+    asyncio.run(controller.run_workflow("analyze"))
+
+    assert added_actions == ["analyze"]
+    assert schedule_calls == [True]
+    assert controller.workflow_running is False
+    assert any("排队位置：2" in message for message in notifications)
+
+
+def test_clear_completed_jobs_keeps_failed_and_cancelled(gui_app_module, tmp_path) -> None:
+    service = gui_app_module.PersistentQueueService(tmp_path / "queue.json")
+    states = {
+        "done": gui_app_module.QueueState.COMPLETED,
+        "failed": gui_app_module.QueueState.FAILED,
+        "cancelled": gui_app_module.QueueState.CANCELLED,
+    }
+    for job_id, state in states.items():
+        service.add_job(QueueJobSpec(job_id=job_id, job_type="analyze", project_name=job_id))
+        service.update_job_state(job_id, state)
+
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller._queue_service = service
+
+    controller.clear_completed_jobs()
+
+    assert service.get_job("done") is None
+    assert service.get_job("failed") is not None
+    assert service.get_job("cancelled") is not None
 
 
 def test_persist_config_writes_and_applies_mineru_settings(gui_app_module, monkeypatch, tmp_path) -> None:

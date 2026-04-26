@@ -37,9 +37,9 @@
 - `Zotero report + Zotero library` 输入
 - CLI、GUI 与 repo-local Codex skill 三入口
 - 阶段一摘要 / 阶段二提纲 / 阶段三综述正文
-- 队列、断点恢复、历史摘要复用、预处理缓存、validation / repair、可选本地 RAG
+- GUI 后台队列、断点恢复、历史摘要复用、预处理缓存、validation / repair、可选本地 RAG
 
-它已经不应再被理解成“单个脚本的文献综述生成器”，而是一个带 workspace / artifact / queue / GUI 的本地工作台。
+它已经不应再被理解成“单个脚本的文献综述生成器”，而是一个带 workspace / artifact / GUI 后台队列的本地工作台。
 
 ## 3. 推荐阅读顺序
 
@@ -280,7 +280,7 @@ output/_preprocess_cache/
 
 - CLI 入口仍然是 `python main.py ...`
 - GUI 入口仍然是 `python launch_gui.py`
-- GUI 没有自建一套完全独立引擎；GUI 和 CLI 共享底层 job request / workspace / queue / artifact 逻辑
+- GUI 没有自建一套完全独立引擎；GUI 和 CLI 共享底层 job request / workspace / artifact 逻辑，但只有 GUI 拥有用户可见的后台队列交互
 - 仓库现在还有 **repo-local Codex skill** 这一条 AI-native 入口；它是加法面，不替代 GUI / CLI
 
 ### 8.2 当前执行链
@@ -320,7 +320,6 @@ output/_preprocess_cache/
 - `Preprocess`
 - `Retry_Settings`
 - `Stage2_Retry`
-- `Queue`
 - `Validation`
 - `Styling`
 - `GUI`
@@ -345,7 +344,7 @@ output/_preprocess_cache/
 - job workspace + artifact registry + latest pointer
 - stage-1 summary reuse
 - downstream `--summary-file` + `--summary-source`
-- queue system
+- GUI workflow-page queue system
 - partial rerun / failed retry
 - preprocess cache + OCR fallback
 - free mode profile / idea
@@ -409,7 +408,7 @@ python launch_gui.py --reload --no-show
 
 如果你是新的 AI 对话，请默认把这个项目理解为：
 
-- 一个以 job workspace / artifact / queue 为底层支撑的本地 AI 文献分析 / 综述写作工作台
+- 一个以 job workspace / artifact / GUI 后台队列为底层支撑的本地 AI 文献分析 / 综述写作工作台
 - 入口上既有 `main.py` CLI、`launch_gui.py` + `gui/app.py` GUI，也有 repo-local Codex skill
 - 阶段一主真相是 canonical summaries，阶段三主真相已经前移到 `review_draft_v2 + citation_manifest_v3`
 - `README.md` 现在只是路由页；用户细节看 `README.zh-CN.md` / `README.en.md`

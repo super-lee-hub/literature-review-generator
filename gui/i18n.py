@@ -291,8 +291,6 @@ TRANSLATIONS["en"].update(
         "任务": "Tasks",
         "队列管理": "Queue Management",
         "管理后台任务队列": "Manage background task queue",
-        "管理后台任务队列，支持排队、重排、取消、重试以及队列文件导入导出。":
-            "Manage background jobs, including queueing, reordering, cancelling, retrying, and queue-file import/export.",
         "队列状态": "Queue Status",
         "待处理": "Pending",
         "运行中": "Running",
@@ -319,30 +317,15 @@ TRANSLATIONS["en"].update(
         "任务已重置并将重试: {job_id}": "Job reset and ready to retry: {job_id}",
         "只能重试失败或已取消的任务": "Only failed or cancelled jobs can be retried.",
         "重试任务失败: {e}": "Failed to retry job: {e}",
-        "队列已保存到: {file_path}": "Queue saved to: {file_path}",
-        "保存队列失败: {e}": "Failed to save queue: {e}",
-        "队列已从: {file_path} 加载": "Queue loaded from: {file_path}",
-        "加载队列失败: {e}": "Failed to load queue: {e}",
         "已清空已完成任务 {count}": "Cleared {count} completed jobs",
         "清空失败: {e}": "Clear failed: {e}",
-        "添加任务到队列": "Add Jobs to Queue",
-        "队列文件操作": "Queue File Operations",
         "队列任务列表": "Queued Jobs",
         "队列已刷新": "Queue refreshed.",
         "队列按当前列表顺序执行；可用每行的“上移 / 下移”按钮调整顺序。":
             "Jobs run in the order shown here. Use each row's Move Up / Move Down buttons to adjust the queue.",
-        "可先批量添加多个任务到草稿，再统一提交到队列。支持 PDF 文件夹和 Zotero 报告混合排队。":
-            "Draft multiple jobs first, then submit them to the queue together. PDF-folder and Zotero-report jobs can be mixed.",
-        "队列页默认提交标准任务；如果要先做概念增强或自由模式规划，建议先在工作台确认后再入队。":
-            "The queue page submits standard tasks by default. If you need concept-enhanced or free-mode planning first, confirm it in the workspace before queueing it.",
         "请输入项目名": "Enter a project name",
-        "请输入队列文件路径": "Enter a queue file path",
         "请输入 PDF 文件夹路径": "Enter a PDF folder path",
         "请输入 Zotero 报告路径": "Enter a Zotero report path",
-        "加入草稿": "Add to Draft",
-        "立即入队": "Queue Now",
-        "提交草稿": "Commit Draft",
-        "清空草稿": "Clear Draft",
         "移除": "Remove",
         "上移": "Move Up",
         "下移": "Move Down",
@@ -350,11 +333,26 @@ TRANSLATIONS["en"].update(
         "删除": "Delete",
         "任务顺序已更新": "Queue order updated",
         "调整任务顺序失败: {e}": "Failed to adjust queue order: {e}",
-        "保存队列": "Save Queue",
-        "加载队列": "Load Queue",
-        "队列文件路径": "Queue File Path",
-        "队列草稿为空。你可以先添加多个任务，再统一提交到队列。":
-            "The queue draft is empty. Add multiple jobs first, then commit them to the queue together.",
+        "后台队列": "Background Queue",
+        "工作台提交的任务会自动进入这里串行处理；表单可以继续配置下一项。":
+            "Jobs submitted from the workspace enter this serial background queue automatically; the form stays available for the next job.",
+        "这里不是额外的任务编辑器，而是工作台主流程按钮的后台执行区。你点“仅分析文献 / 生成大纲 / 生成全文 / 一键运行”后，任务会自动进队列并按顺序执行。":
+            "This is not a separate task editor. It is the background execution area for the workspace's primary workflow buttons. After you click Analyze Only / Generate Outline / Generate Full Review / Run All, the job enters the queue automatically and runs in order.",
+        "在左侧填写输入来源、项目名和运行方式。":
+            "Fill in the input source, project name, and run mode on the left.",
+        "点击主流程操作按钮，当前任务会自动加入后台队列。":
+            "Click a primary workflow action; the current job is added to the background queue automatically.",
+        "任务进入队列后，表单不会被锁死；你可以继续配置下一项。":
+            "After the job enters the queue, the form stays editable so you can prepare the next one.",
+        "如果任务失败，可以在队列列表里重试；待处理任务可以上移或下移。":
+            "If a job fails, retry it from the queue list; pending jobs can be moved up or down.",
+        "启动后台处理": "Start Background Processing",
+        "当前后台任务": "Current Background Job",
+        "当前阶段": "Current Stage",
+        "暂无队列任务。点击工作台主流程按钮后会自动加入队列。":
+            "No queued jobs yet. Use the main workflow buttons to add jobs automatically.",
+        "暂无队列任务。先在左侧配置任务，再点击“主流程操作”里的按钮，任务就会出现在这里。":
+            "No queued jobs yet. Configure the job on the left, then click a button in Primary Workflow Actions and it will appear here.",
     }
 )
 
@@ -469,12 +467,13 @@ TRANSLATIONS["en"].update(
             "Zotero mode is selected. Please fill in the Zotero report path first.",
         "Zotero 模式还需要填写 Zotero 库路径。":
             "Zotero mode also requires the Zotero library path.",
-        "当前已有任务正在运行。": "A task is already running.",
         "只能取消运行中的任务": "Only running jobs can be cancelled.",
-        "测试模式：已模拟执行 {action_label}。": "Test mode: simulated {action_label}.",
+        "正在提交 {action_label} 到后台队列……": "Submitting {action_label} to the background queue...",
+        "测试模式：已模拟提交 {action_label} 到后台队列。": "Test mode: simulated submitting {action_label} to the background queue.",
         "任务入队失败，请检查当前输入后重试。": "Failed to enqueue the task. Please check the current inputs and try again.",
-        "队列服务未初始化，无法启动任务。": "Queue service is not initialized, so the task cannot start.",
-        "请查看日志与最近产物了解失败原因。": "Check the logs and recent artifacts for the failure reason.",
+        "{action_label} 已加入队列并开始后台处理。": "{action_label} was queued and background processing has started.",
+        "{action_label} 已加入队列，当前排队位置：{position}。": "{action_label} was queued. Current position: {position}.",
+        "{action_label} 已加入队列。": "{action_label} was queued.",
         "总览": "Overview",
         "这里先帮你建立一条清楚、安静的第一轮路径：先设置，再选输入来源和运行方式，最后进入工作台执行。":
             "This page helps you build a calm and clear first-run path: setup first, then choose the input source and run mode, and finally open the workspace.",
@@ -521,7 +520,6 @@ TRANSLATIONS["en"].update(
             "Best when you want to clarify the goal with the planner first and then apply the current plan to this task.",
         "适合先和规划助手聊清楚目标，再把当前规划应用到本次任务。":
             "Best when you want to talk through the goal with the planner first and then apply the current plan to this task.",
-        "工作台": "Workspace",
         "这里按“输入来源 → 运行方式 → 主流程”的顺序组织。高级复用、补跑和验证都放在次级区域，避免第一次使用被打断。":
             "This page is organized as Input Source → Run Mode → Primary Flow. Advanced reuse, recovery, and validation are secondary so they do not interrupt the first run.",
         "第一次使用建议按这个顺序：仅分析文献 → 生成大纲 → 生成全文。只有在流程稳定后，再使用一键运行。":
@@ -529,7 +527,6 @@ TRANSLATIONS["en"].update(
         "如果你是第一次跑这个项目，先点“仅分析文献”。如果已有可靠摘要或历史工作区，再继续点大纲、全文或验证。":
             "If this is the first time you run this project, click Analyze Only first. Move on to outline, full review, or validation only when you already have reliable summaries or a previous workspace.",
         "补跑、恢复与验证（按需展开）": "Recovery, Retry, and Validation (Expand When Needed)",
-        "结果与日志": "Results & Logs",
         "优先查看最近一次任务的工作区和主要产物；日志是辅助线索，不再是唯一入口。":
             "Start with the latest workspace and primary artifacts; logs are supporting clues instead of the only entry point.",
         "最近一次任务": "Latest Task",
@@ -553,14 +550,15 @@ TRANSLATIONS["en"].update(
         "失败报告": "Failure Report",
         "验证报告": "Validation Report",
         "目前还没有检出的主要产物。": "No primary artifacts have been detected yet.",
-        "队列": "Queue",
-        "适合稳定后批量跑、后台恢复和长任务管理；不建议作为第一次使用的主入口。":
-            "Best for stable batch runs, background recovery, and long-job management. It is not the recommended first entry point for new users.",
-        "队列摘要": "Queue Summary",
-        "当前队列顺序会直接影响后台执行顺序。批量任务稳定后再来这里会更轻松。":
-            "The current queue order directly affects background execution order. This page becomes much easier once your batch workflow is stable.",
         "开始运行队列任务...": "Starting queued jobs...",
-        "队列运行完成！": "Queue run completed!",
+        "队列服务未初始化，或队列处理器已经在运行。": "The queue service is not initialized, or the queue processor is already running.",
+        "队列任务": "Queue Job",
+        "队列正在后台串行处理。你可以继续配置下一个任务。":
+            "The queue is processing serially in the background. You can keep configuring the next job.",
+        "队列仍有 {count} 个待处理任务，正在继续。":
+            "The queue still has {count} pending job(s); processing will continue.",
+        "队列后台处理完成。": "Background queue processing completed.",
+        "队列运行失败: {e}": "Queue run failed: {e}",
         "使用引导": "Guide",
         "这页按第一次使用的顺序讲清楚：输入、设置、运行、结果和恢复。尽量让你不需要先读命令行帮助也能跑通。":
             "This page explains the first-run order: input, setup, execution, results, and recovery. The goal is to let you succeed without reading the CLI help first.",
@@ -637,9 +635,15 @@ TRANSLATIONS["en"].update(
         "自由模式对话规划器": "Free-Mode Chat Planner",
         "先和规划助手多轮聊清楚你的综述想法，再把当前规划应用到本次任务。":
             "Clarify your review idea with the planner across multiple turns, then apply the current plan to this task.",
+        "像聊天一样把综述想法发给规划助手；每发一轮，左侧会追加对话记录，右侧会刷新当前 prompt profile 草案。":
+            "Send your review idea to the planner like a chat. Each turn appends to the conversation on the left and refreshes the prompt profile draft on the right.",
         "对话记录": "Conversation Log",
         "当前 profile 草案": "Current Profile Draft",
         "继续告诉规划助手": "Continue the Conversation",
+        "在这里继续对话": "Continue the Chat Here",
+        "补充研究对象、概念关系、边界条件或你想强调的章节主线；发送后 profile 草案会随对话更新。":
+            "Add the research object, concept relationship, boundaries, or chapter thread you want to emphasize. After sending, the profile draft updates with the conversation.",
+        "输入下一轮回复": "Type the Next Message",
         "例如：文件夹里主要有概念 A 和 B，我想写 A 如何推导到 B，重点比较理论解释、变量链路和 research gap。":
             "Example: The folder mainly contains concepts A and B. I want to explain how A leads to B, focusing on theoretical explanations, variable chains, and research gaps.",
         "发送给规划助手": "Send to Planner",
@@ -659,24 +663,6 @@ TRANSLATIONS["en"].update(
         "结构偏好": "Outline Preferences",
         "生成后的优化 prompt": "Generated Optimized Prompt",
         "使用说明": "How to Use It",
-        "队列页现在覆盖了常见的排队与恢复动作。你可以：":
-            "The queue page now covers the common queueing and recovery actions. You can:",
-        "1. 点击'运行队列'按钮执行所有待处理任务":
-            "1. Click Run Queue to execute all pending jobs.",
-        "2. 在任务列表里用'上移'和'下移'按钮调整执行顺序":
-            "2. Use Move Up and Move Down in the job list to adjust execution order.",
-        "3. 对失败或已取消的任务点击'重试'按钮":
-            "3. Click Retry for failed or cancelled jobs.",
-        "4. 对运行中的任务点击'取消'按钮":
-            "4. Click Cancel for running jobs.",
-        "5. 点击'清空已完成'按钮清理已完成的任务":
-            "5. Click Clear Completed to remove finished jobs.",
-        "6. 在'添加任务到队列'区域添加新任务":
-            "6. Add new jobs in the Add Jobs to Queue section.",
-        "7. 对非运行中的任务点击'删除'按钮移除任务":
-            "7. Click Delete on non-running jobs to remove them.",
-        "8. 使用'保存队列'和'加载队列'功能管理队列文件":
-            "8. Use Save Queue and Load Queue to manage queue files.",
         "对话摘要": "Conversation Notes",
         "自由模式正在整理你的想法…": "Free mode is organizing your idea...",
         "自由模式已应用到本次任务：{target}": "Free mode has been applied to this task: {target}",
@@ -796,6 +782,21 @@ TRANSLATIONS["en"].update(
         "关于 OCR、MinerU、复用和工作区": "About OCR, MinerU, Reuse, and Workspaces",
         "MinerU 也不是默认常开：只有 parser mode 请求远程，且 hybrid 判定本地质量不足时，才会真正发起远程解析。":
             "MinerU is not always-on by default either: the remote call happens only when the parser mode requests it, and in hybrid mode only when the local baseline looks insufficient.",
+        "后台队列怎么用": "How to Use the Background Queue",
+        "队列不是单独入口。它接住工作台提交的主流程任务，让任务在后台一个接一个跑，避免多个长任务互相抢资源。":
+            "The queue is not a separate entry point. It catches primary workflow jobs submitted from the workspace and runs them one by one in the background so long jobs do not compete for resources.",
+        "先在工作台配好当前任务": "Prepare the Current Job in the Workspace",
+        "选择输入来源、项目名、运行方式和必要路径。":
+            "Choose the input source, project name, run mode, and required paths.",
+        "点击主流程按钮提交": "Submit with a Primary Workflow Button",
+        "点击“仅分析文献 / 生成大纲 / 生成全文 / 一键运行”后，任务会自动入队。":
+            "After clicking Analyze Only / Generate Outline / Generate Full Review / Run All, the job is queued automatically.",
+        "继续准备下一项": "Prepare the Next Job",
+        "任务入队后表单仍可编辑，你可以继续配置下一个项目。":
+            "After a job is queued, the form stays editable so you can configure the next project.",
+        "在队列里处理异常": "Handle Exceptions in the Queue",
+        "待处理任务可调整顺序，失败任务可以重试，完成任务可以清空。":
+            "Pending jobs can be reordered, failed jobs can be retried, and completed jobs can be cleared.",
     }
 )
 
@@ -823,11 +824,6 @@ EN_TO_ZH = {
     "Open Setup": "打开 Setup 页面",
     "Please enter a project name first.": "请先填写项目名。",
     "Please provide either a PDF folder or a Zotero report.": "请提供 PDF 文件夹或 Zotero 报告路径。",
-    "Added {project_name} to the queue draft.": "已将 {project_name} 加入队列草稿。",
-    "Removed {project_name} from the queue draft.": "已从队列草稿中移除 {project_name}。",
-    "Cleared queue draft.": "已清空队列草稿。",
-    "Queue draft is empty.": "队列草稿为空。",
-    "Committed {count} drafted job(s) to the queue.": "已将 {count} 个草稿任务提交到队列。",
     "Added job to queue: {job_id}": "任务已加入队列：{job_id}",
     "Failed to add job to queue: {error}": "任务入队失败：{error}",
 }

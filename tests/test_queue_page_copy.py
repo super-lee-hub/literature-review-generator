@@ -17,16 +17,44 @@ def test_queue_page_copy_has_no_placeholder_question_marks() -> None:
     assert '"Please enter a project name first.": "????????"' not in i18n_content
 
 
-def test_queue_page_copy_uses_expected_labels() -> None:
+def test_old_queue_builder_copy_is_absent_from_normal_ui() -> None:
+    app_content = Path("gui/app.py").read_text(encoding="utf-8")
+    i18n_content = Path("gui/i18n.py").read_text(encoding="utf-8")
+
+    for old_copy in [
+        "加入草稿",
+        "立即入队",
+        "提交草稿",
+        "清空草稿",
+        "队列草稿",
+        "队列文件操作",
+        "队列文件路径",
+        "保存队列",
+        "加载队列",
+        "添加任务到队列",
+        "queue draft",
+        "Save Queue",
+        "Load Queue",
+    ]:
+        assert old_copy not in app_content
+        assert old_copy not in i18n_content
+
+
+def test_workflow_queue_panel_copy_is_present() -> None:
     content = Path("gui/app.py").read_text(encoding="utf-8")
-    assert 't("添加任务到队列")' in content
-    assert 't("输入来源")' in content
-    assert 't("加入草稿")' in content
-    assert 't("立即入队")' in content
-    assert 't("提交草稿")' in content
-    assert 't("清空草稿")' in content
-    assert 't("队列草稿为空。你可以先添加多个任务，再统一提交到队列。")' in content
-    assert 't("队列页默认提交标准任务；如果要先做概念增强或自由模式规划，建议先在工作台确认后再入队。")' in content
+
+    for expected_copy in [
+        "后台队列",
+        "工作台主流程按钮的后台执行区",
+        "点击主流程操作按钮",
+        "表单不会被锁死",
+        "启动后台处理",
+        "当前后台任务",
+        "队列任务列表",
+        "暂无队列任务",
+        "后台队列怎么用",
+    ]:
+        assert expected_copy in content
 
 
 def test_gui_copy_uses_current_reuse_and_queue_order_labels() -> None:

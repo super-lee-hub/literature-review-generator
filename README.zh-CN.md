@@ -36,7 +36,7 @@
 
 - 本地 GUI 工作台
 - Job workspace / artifact registry / resume state
-- 队列系统与任务恢复
+- GUI 工作台内置串行后台队列与任务恢复
 - PDF 预处理缓存、OCR fallback、`normalized.md` 中间产物
 - 阶段一历史摘要复用
 - free mode profile / idea
@@ -55,8 +55,8 @@
 - 只重试失败论文或失败综述章节
 - 复用历史 `summaries.json`
 - 把多个历史 `summaries.json` 合并为当前下游输入
-- 用 GUI 管理 setup、workflow、queue、logs、guide
-- 用 CLI 批量执行或挂队列
+- 用 GUI 管理 setup、workflow（含后台队列）、logs、guide
+- 用 CLI 直接批量执行（CLI 不再暴露公共队列命令）
 - 在 Codex / OMX 中使用仓库内置 skill 走 AI-native 运行时
 - 对已生成综述做额外验证
 
@@ -120,7 +120,7 @@ python main.py --pdf-folder "D:\papers" --project-name "my_review" --run-all
 1. `python launch_gui.py`
 2. 先在 Setup 页面填路径、API 和模型
 3. 到 Workflow 页面选择 PDF / Zotero 模式
-4. 直接运行，或先加入队列再批量执行
+4. 在 Workflow 页面点击主流程按钮提交任务；GUI 会自动加入串行后台队列，表单仍可继续配置下一项
 
 ## 6. 常用工作流
 
@@ -193,28 +193,11 @@ python main.py --project-name "my_review" --validate-review
 - `--retry-review-failed`：只重试失败或缺失的综述章节
 - `--validate-review`：对当前综述做额外验证；更底层的 validation / repair 产物会写入当前 workspace
 
-### 6.5 队列系统
+### 6.5 GUI 后台队列
 
-```bash
-python main.py --queue-add --pdf-folder "D:\papers" --project-name "batch_a" --analyze-only
-python main.py --queue-run
-python main.py --queue-list
-python main.py --queue-cancel <job_id>
-python main.py --queue-retry <job_id>
-python main.py --queue-clear
-```
+队列现在是 **GUI-first** 的交互模型：在 Workflow 页面点击“仅分析文献 / 生成大纲 / 生成全文 / 一键运行”等主流程按钮时，任务会进入 GUI 内部的持久化串行队列，并在后台按顺序处理。提交后表单保持可编辑，你可以继续配置并提交下一项。
 
-如果你想指定队列文件：
-
-```bash
-python main.py --queue-file "custom_queue.json" --queue-list
-```
-
-如果你想一次加载多个队列文件：
-
-```bash
-python main.py --queue-run --queue-files "queue1.json" "queue2.json"
-```
+CLI 不再暴露公共队列命令；命令行入口保持直接运行模式，例如 `--analyze-only`、`--generate-outline`、`--generate-review`、`--run-all`。AI-native Codex / OMX skill 也保持直接运行，不进入 GUI 队列。
 
 ## 7. 进阶能力
 
@@ -339,7 +322,6 @@ output/_preprocess_cache/
 - `Preprocess`
 - `Retry_Settings`
 - `Stage2_Retry`
-- `Queue`
 - `Validation`
 - `Styling`
 - `GUI`
@@ -387,6 +369,6 @@ output/_preprocess_cache/
 把这个项目理解成：
 
 - 一个以本地 GUI + CLI + repo-local Codex skill 为入口的 AI 文献分析 / 综述写作工作台
-- 已经具备 job workspace、artifact、queue、reuse、validation 等产品化能力
+- 已经具备 job workspace、artifact、GUI 后台队列、reuse、validation 等产品化能力
 - 用户文档以本文件和英文 README 为主
 - 更底层的真相和兼容细节请看 `AGENTS.md` 与 `TRUTH_SOURCES.md`

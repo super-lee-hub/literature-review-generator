@@ -161,6 +161,11 @@ def test_dashboard_shows_search_topbar(page, gui_server):
     expect(page.locator(".ag-search")).to_be_visible()
     expect(page.locator(".ag-topbar-title")).to_contain_text("auto-generate")
     expect(page.locator(".ag-reminder-text")).to_contain_text("工作台已就绪")
+    for button in [
+        page.locator(".ag-fixedbar .q-btn", has_text="搜索").last,
+        page.locator(".ag-fixedbar .q-btn", has_text="保存配置").last,
+    ]:
+        assert button.evaluate("el => getComputedStyle(el).color") == "rgb(255, 255, 255)"
 
 
 def test_dashboard_reminder_is_below_topbar_and_extra_sections_render(page, gui_server):
@@ -215,11 +220,18 @@ def test_sidebar_navigation_links(page, gui_server):
         ("性能与预处理", r"/setup/processing$"),
         ("结果与日志", r"/logs$"),
         ("使用引导", r"/guide$"),
-        ("队列", r"/queue$"),
     ]
     for label, pattern in nav_targets:
         page.locator(".ag-nav-link", has_text=label).first.click(no_wait_after=True)
         expect(page).to_have_url(re.compile(pattern))
+    assert page.locator(".ag-nav-link", has_text="队列").count() == 0
+
+
+def test_queue_route_redirects_to_workflow(page, gui_server):
+    page.goto(f'{gui_server["base_url"]}/queue', wait_until="domcontentloaded")
+    expect(page.locator(".ag-fixedbar-shell")).to_be_visible()
+    expect(page).to_have_url(re.compile(r"/workflow$"))
+    expect(page.get_by_text("后台队列", exact=True)).to_be_visible()
 
 
 def test_setup_page_can_save_temp_config(page, gui_server):
@@ -347,7 +359,7 @@ def test_workflow_validation_warnings(page, gui_server):
 def test_workflow_page_groups_actions_and_idle_progress_is_static(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/workflow')
 
-    for title in ["任务起点", "运行方式", "主流程操作", "第一次运行建议", "相关入口"]:
+    for title in ["任务起点", "运行方式", "主流程操作", "任务进度", "后台队列", "第一次运行建议", "相关入口"]:
         expect(page.get_by_text(title, exact=True)).to_be_visible()
 
     progress_card = _card(page, "任务进度")
@@ -356,8 +368,11 @@ def test_workflow_page_groups_actions_and_idle_progress_is_static(page, gui_serv
     _editable_field_input(page, "项目名").fill("Progress Smoke Test")
     _set_path_value(page, open_button_name="选择 PDF 文件夹", label_text="PDF 文件夹", value=str(gui_server["pdf_dir"]))
     page.get_by_role("button", name="仅分析文献").click()
-    expect(_notification(page)).to_contain_text("测试模式：已模拟执行")
+    expect(_notification(page)).to_contain_text("测试模式：已模拟提交")
     expect(progress_card.locator(".q-linear-progress--indeterminate")).to_have_count(0)
+    project_input = _editable_field_input(page, "项目名")
+    project_input.fill("Editable After Queue Submit")
+    expect(project_input).to_have_value("Editable After Queue Submit")
 
 
 def test_switching_between_workflow_and_logs_keeps_ui_responsive(page, gui_server):
@@ -394,6 +409,11 @@ def test_workflow_free_mode_layout_stays_readable(page, gui_server):
 
     planner_outputs = page.locator(".ag-planner-output")
     expect(planner_outputs).to_have_count(2)
+    expect(page.get_by_text("在这里继续对话", exact=True)).to_be_visible()
+    expect(_editable_field_input(page, "输入下一轮回复")).to_be_visible()
+    composer_box = page.locator(".ag-chat-composer").bounding_box()
+    assert composer_box is not None
+    assert composer_box["height"] >= 140
     for index in range(2):
         field = planner_outputs.nth(index)
         expect(field).to_be_visible()
@@ -412,7 +432,7 @@ def test_workflow_actions_and_links(page, gui_server):
     _set_path_value(page, open_button_name="选择 PDF 文件夹", label_text="PDF 文件夹", value=str(gui_server["pdf_dir"]))
     _editable_field_input(page, "项目名").fill("GUI Smoke Test")
     page.get_by_role("button", name="自由模式").click()
-    _editable_field_input(page, "继续告诉规划助手").fill("请围绕 research gap 和变量链路组织一个测试大纲。")
+    _editable_field_input(page, "输入下一轮回复").fill("请围绕 research gap 和变量链路组织一个测试大纲。")
 
     page.get_by_role("button", name="打开 PDF 文件夹").click()
     expect(_notification(page)).to_contain_text("测试模式：已模拟打开路径")
@@ -428,12 +448,12 @@ def test_workflow_actions_and_links(page, gui_server):
 
     for button_name in ["仅分析文献", "生成大纲", "生成全文", "一键运行"]:
         page.get_by_role("button", name=button_name).click()
-        expect(_notification(page)).to_contain_text("测试模式：已模拟执行")
+        expect(_notification(page)).to_contain_text("测试模式：已模拟提交")
 
     page.get_by_role("button", name="补跑、恢复与验证（按需展开）").click()
     for button_name in ["验证综述", "重试失败论文"]:
         page.get_by_role("button", name=button_name).click()
-        expect(_notification(page)).to_contain_text("测试模式：已模拟执行")
+        expect(_notification(page)).to_contain_text("测试模式：已模拟提交")
 
     _card(page, "相关入口").get_by_role("button", name="前往设置").click()
     expect(page).to_have_url(re.compile(r"/setup$"))
@@ -450,8 +470,9 @@ def test_logs_and_guide_pages_render(page, gui_server):
     expect(_notification(page)).to_contain_text("测试模式：已模拟打开路径")
 
     _open_page(page, f'{gui_server["base_url"]}/guide')
-    expect(page.locator(".ag-card")).to_have_count(4)
+    expect(page.locator(".ag-card")).to_have_count(5)
     expect(page.get_by_text("第一次运行，只看这一页也能开始", exact=True)).to_be_visible()
+    expect(page.get_by_text("后台队列怎么用", exact=True)).to_be_visible()
     expect(page.get_by_text("输入方式说明", exact=True)).to_be_visible()
     expect(page.get_by_text("运行方式说明", exact=True)).to_be_visible()
     expect(page.get_by_text("关于 OCR、MinerU、复用和工作区", exact=True)).to_be_visible()

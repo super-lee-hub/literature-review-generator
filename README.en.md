@@ -36,7 +36,7 @@ Around that core pipeline, the project now also includes:
 
 - a local GUI workbench
 - job workspaces / artifact registry / resume state
-- queueing and recovery
+- GUI-managed serial background queueing and recovery
 - PDF preprocessing cache, OCR fallback, and `normalized.md` intermediates
 - stage-1 summary reuse across runs
 - free-mode profile / idea flows
@@ -55,9 +55,9 @@ Around that core pipeline, the project now also includes:
 - Retry failed papers or failed review sections only
 - Reuse historical `summaries.json`
 - Merge multiple historical `summaries.json` files into one downstream run
-- Use either the GUI or the CLI
+- Use either the GUI or the direct-run CLI
 - Use the repo-local Codex / OMX skill entry surface for AI-native execution
-- Prepare and run queued jobs
+- Submit GUI workflow jobs into the built-in serial background queue
 - Run optional review validation
 
 ### 3.2 How the project currently works
@@ -120,7 +120,7 @@ python main.py --pdf-folder "D:\papers" --project-name "my_review" --run-all
 1. Run `python launch_gui.py`
 2. Fill in paths, APIs, and models on the Setup pages
 3. Go to Workflow, choose PDF or Zotero mode
-4. Run immediately, or add jobs to the queue first
+4. Submit from Workflow; the GUI automatically queues jobs serially in the background while the form stays editable
 
 ## 6. Common workflows
 
@@ -193,28 +193,11 @@ Meaning:
 - `--retry-review-failed`: retry only failed or missing review sections
 - `--validate-review`: run an extra validation pass; lower-level validation / repair artifacts are written into the active workspace
 
-### 6.5 Queue system
+### 6.5 GUI background queue
 
-```bash
-python main.py --queue-add --pdf-folder "D:\papers" --project-name "batch_a" --analyze-only
-python main.py --queue-run
-python main.py --queue-list
-python main.py --queue-cancel <job_id>
-python main.py --queue-retry <job_id>
-python main.py --queue-clear
-```
+Queueing is now a **GUI-first** interaction model. On the Workflow page, buttons such as "Analyze only", "Generate outline", "Generate review", and "Run all" submit jobs into the GUI's internal persistent serial queue. The queue drains in the background, and the form remains editable so you can configure the next job immediately.
 
-If you want a custom queue file:
-
-```bash
-python main.py --queue-file "custom_queue.json" --queue-list
-```
-
-If you want to load multiple queue files at once:
-
-```bash
-python main.py --queue-run --queue-files "queue1.json" "queue2.json"
-```
+The CLI no longer exposes public queue commands. Command-line usage is direct-run only, e.g. `--analyze-only`, `--generate-outline`, `--generate-review`, and `--run-all`. The AI-native Codex / OMX skill also runs directly and stays out of the GUI queue.
 
 ## 7. Advanced capabilities
 
@@ -339,7 +322,6 @@ Important config sections include:
 - `Preprocess`
 - `Retry_Settings`
 - `Stage2_Retry`
-- `Queue`
 - `Validation`
 - `Styling`
 - `GUI`
@@ -387,6 +369,6 @@ If you are here to work on the repository rather than just run it, start with:
 Think of this repository as:
 
 - a local AI literature-analysis / review-writing workbench with GUI, CLI, and a repo-local Codex skill entrypoint
-- a project that already has product-style capabilities such as workspaces, artifacts, queueing, reuse, and validation
+- a project that already has product-style capabilities such as workspaces, artifacts, GUI background queueing, reuse, and validation
 - a user surface documented mainly in this file and the Chinese README
 - a deeper runtime reality documented in `AGENTS.md` and `TRUTH_SOURCES.md`

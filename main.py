@@ -497,7 +497,7 @@ class LiteratureReviewGenerator:
         count = 0
         for job in self.queue_service.list_jobs():
             runtime = self.queue_service.get_job_runtime(job.job_id)
-            if runtime and runtime.state in (QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCELLED):
+            if runtime and runtime.state == QueueState.COMPLETED:
                 self.queue_service.remove_job(job.job_id)
                 count += 1
         return count
@@ -5707,36 +5707,6 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             handle_merge_mode(args)
             return
         
-        # 队列列表命令
-        if hasattr(args, 'queue_list') and args.queue_list:
-            handle_queue_list_mode(args)
-            return
-        
-        # 队列取消命令
-        if hasattr(args, 'queue_cancel') and args.queue_cancel:
-            handle_queue_cancel_mode(args, args.queue_cancel)
-            return
-        
-        # 队列重试命令
-        if hasattr(args, 'queue_retry') and args.queue_retry:
-            handle_queue_retry_mode(args, args.queue_retry)
-            return
-        
-        # 队列清空命令
-        if hasattr(args, 'queue_clear') and args.queue_clear:
-            handle_queue_clear_mode(args)
-            return
-        
-        # 队列添加命令
-        if hasattr(args, 'queue_add') and args.queue_add:
-            handle_queue_add_mode(args)
-            return
-        
-        # 队列运行命令
-        if hasattr(args, 'queue_run') and args.queue_run:
-            handle_queue_run_mode(args)
-            return
-        
         # 大纲采纳命令
         if hasattr(args, 'outline_adopt') and args.outline_adopt:
             handle_outline_adopt_mode(args)
@@ -6192,300 +6162,6 @@ def handle_merge_mode(args: argparse.Namespace):  # type: ignore
         generator.logger.error(f"合并过程中出错: {e}")
         traceback.print_exc()
 
-def handle_queue_list_mode(args: argparse.Namespace):  # type: ignore
-    """处理队列列表命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
-    generator.logger.info("*** 队列列表模式已启动 ***")
-    generator.logger.info("=" * 60)
-    
-    try:
-        if not generator.load_configuration():
-            generator.logger.error("配置加载失败")
-            sys.exit(1)
-        if not generator.setup_output_directory():
-            generator.logger.error("输出目录设置失败")
-            sys.exit(1)
-        
-        generator._init_queue_service()
-        if generator.queue_service is None:
-            generator.logger.error("队列服务未初始化")
-            return
-        
-        jobs = generator.queue_service.list_jobs()
-        if not jobs:
-            generator.logger.info("暂无队列任务")
-            return
-        
-        generator.logger.info(f"共 {len(jobs)} 个队列任务:")
-        for job in jobs:
-            runtime = generator.queue_service.get_job_runtime(job.job_id)
-            state_str = runtime.state.value if runtime else "unknown"
-            generator.logger.info(f"  - [{state_str}] {job.job_type} - {job.project_name} ({job.job_id})")
-            
-    except Exception as e:
-        generator.logger.error(f"队列列表查询失败: {e}")
-        traceback.print_exc()
-
-def handle_queue_cancel_mode(args: argparse.Namespace, job_id: str):  # type: ignore
-    """处理队列取消命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
-    generator.logger.info("*** 队列取消模式已启动 ***")
-    generator.logger.info("=" * 60)
-    
-    try:
-        if not generator.load_configuration():
-            generator.logger.error("配置加载失败")
-            sys.exit(1)
-        if not generator.setup_output_directory():
-            generator.logger.error("输出目录设置失败")
-            sys.exit(1)
-        
-        generator._init_queue_service()
-        if generator.queue_service is None:
-            generator.logger.error("队列服务未初始化")
-            return
-        
-        if generator.cancel_queue_job(job_id):
-            generator.logger.success(f"任务已取消: {job_id}")
-        else:
-            generator.logger.error(f"取消任务失败: {job_id}")
-            
-    except Exception as e:
-        generator.logger.error(f"队列取消操作失败: {e}")
-        traceback.print_exc()
-
-def handle_queue_retry_mode(args: argparse.Namespace, job_id: str):  # type: ignore
-    """处理队列重试命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
-    generator.logger.info("*** 队列重试模式已启动 ***")
-    generator.logger.info("=" * 60)
-    
-    try:
-        if not generator.load_configuration():
-            generator.logger.error("配置加载失败")
-            sys.exit(1)
-        if not generator.setup_output_directory():
-            generator.logger.error("输出目录设置失败")
-            sys.exit(1)
-        
-        generator._init_queue_service()
-        if generator.queue_service is None:
-            generator.logger.error("队列服务未初始化")
-            return
-        
-        if generator.retry_queue_job(job_id):
-            generator.logger.success(f"任务已重置并将重试: {job_id}")
-        else:
-            generator.logger.error(f"重试任务失败: {job_id}")
-            
-    except Exception as e:
-        generator.logger.error(f"队列重试操作失败: {e}")
-        traceback.print_exc()
-
-def handle_queue_clear_mode(args: argparse.Namespace):  # type: ignore
-    """处理队列清空命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"))
-    generator.logger.info("*** 队列清空模式已启动 ***")
-    generator.logger.info("=" * 60)
-    
-    try:
-        if not generator.load_configuration():
-            generator.logger.error("配置加载失败")
-            sys.exit(1)
-        if not generator.setup_output_directory():
-            generator.logger.error("输出目录设置失败")
-            sys.exit(1)
-        
-        generator._init_queue_service()
-        if generator.queue_service is None:
-            generator.logger.error("队列服务未初始化")
-            return
-        
-        count = generator.clear_completed_queue_jobs()
-        generator.logger.success(f"已清空 {count} 个已完成的任务")
-            
-    except Exception as e:
-        generator.logger.error(f"队列清空操作失败: {e}")
-        traceback.print_exc()
-
-
-def handle_queue_add_mode(args: argparse.Namespace):  # type: ignore
-    """处理队列添加命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"), getattr(args, "zotero_report", None), getattr(args, "library_path", None))
-    generator.logger.info("*** 队列添加模式已启动 ***")
-    generator.logger.info("=" * 60)
-    
-    try:
-        if not generator.load_configuration():
-            generator.logger.error("配置加载失败")
-            sys.exit(1)
-        if not generator.setup_output_directory():
-            generator.logger.error("输出目录设置失败")
-            sys.exit(1)
-        
-        generator._init_queue_service()
-        if generator.queue_service is None:
-            generator.logger.error("队列服务未初始化")
-            return
-        
-        # 构建任务参数
-        params = {
-            "config": args.config,
-            "project_name": args.project_name,
-            "pdf_folder": args.pdf_folder,
-            "action": "analyze",
-            "run_all": getattr(args, "run_all", False),
-            "analyze_only": getattr(args, "analyze_only", False),
-            "generate_outline": getattr(args, "generate_outline", False),
-            "generate_review": getattr(args, "generate_review", False),
-            "generate_section": getattr(args, "generate_section", None),
-            "validate_review": getattr(args, "validate_review", False),
-            "retry_review_failed": getattr(args, "retry_review_failed", False),
-            "concept": getattr(args, "concept", None),
-            "free_mode_profile": getattr(args, "free_mode_profile", None),
-            "free_mode_idea": getattr(args, "free_mode_idea", None),
-            "summary_file": getattr(args, "summary_file", None),
-            "summary_sources": getattr(args, "summary_sources", None),
-            "reuse_stage1": getattr(args, "reuse_stage1", False),
-            "reuse_summary_files": getattr(args, "reuse_summary_files", None),
-            "source_mode": "zotero" if args.zotero_report else "direct",
-            "zotero_report": args.zotero_report,
-            "library_path": args.library_path,
-        }
-        
-        # 确定任务类型
-        job_type = "analyze"
-        if getattr(args, "run_all", False):
-            job_type = "run_all"
-        elif getattr(args, "generate_outline", False):
-            job_type = "generate_outline"
-        elif getattr(args, "generate_section", None):
-            job_type = "generate_section"
-        elif getattr(args, "generate_review", False):
-            job_type = "generate_review"
-        elif getattr(args, "retry_review_failed", False):
-            job_type = "retry_review_failed"
-        elif getattr(args, "validate_review", False):
-            job_type = "validate_review"
-        
-        # 确定项目名称
-        project_name = args.project_name
-        if not project_name and args.pdf_folder:
-            # 如果未传 --project-name，使用 pdf_folder 的 basename 作为项目名
-            import os
-            project_name = os.path.basename(args.pdf_folder)
-            # 清理项目名称，移除特殊字符
-            import re
-            project_name = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5]', '_', project_name)
-            generator.logger.info(f"自动生成项目名称: {project_name}")
-        else:
-            project_name = project_name or "literature_review"
-        
-        # 计算配置指纹
-        import hashlib
-        config_content = str(generator.config) if generator.config else ""
-        config_fingerprint = hashlib.md5(config_content.encode('utf-8')).hexdigest()[:16]
-        
-        # 检查队列中是否已存在相同的任务
-        existing_job = None
-        for job in generator.queue_service.list_jobs():
-            job_params = job.parameters
-            job_action = job.job_type
-            job_pdf_folder = job_params.get('pdf_folder')
-            job_config_fingerprint = job.config_fingerprint
-            
-            # 检查任务状态是否为 pending 或 running
-            job_runtime = generator.queue_service.get_job_runtime(job.job_id)
-            if job_runtime and job_runtime.state in ['pending', 'running']:
-                # 检查 pdf_folder、action 和 config fingerprint 是否相同
-                if (job_pdf_folder == args.pdf_folder and 
-                    job_action == job_type and 
-                    job_config_fingerprint == config_fingerprint):
-                    existing_job = job
-                    break
-        
-        if existing_job:
-            # 已存在相同任务，返回已有 job
-            generator.logger.info(f"已存在相同的任务: {existing_job.job_id}")
-            job_runtime = generator.queue_service.get_job_runtime(existing_job.job_id)
-            job_state = job_runtime.state if job_runtime else "unknown"
-            generator.logger.info(f"任务状态: {job_state}")
-            generator.logger.success(f"返回已有任务: {existing_job.job_id}")
-            return
-        
-        # 创建任务规格
-        from services.queue_service import QueueJobSpec, create_queue_job_id
-        job_spec = QueueJobSpec(
-            job_id=create_queue_job_id(),
-            job_type=job_type,
-            project_name=project_name,
-            parameters=params,
-            config_fingerprint=config_fingerprint
-        )
-        
-        # 添加任务到队列
-        job_id = generator.queue_service.add_job(job_spec)
-        generator.logger.success(f"任务已添加到队列: {job_id}")
-        generator.logger.info(f"任务类型: {job_type}")
-        if args.project_name:
-            generator.logger.info(f"项目名称: {args.project_name}")
-        if args.pdf_folder:
-            generator.logger.info(f"PDF文件夹: {args.pdf_folder}")
-        if args.zotero_report:
-            generator.logger.info(f"Zotero报告: {args.zotero_report}")
-            
-    except Exception as e:
-        generator.logger.error(f"队列添加操作失败: {e}")
-        traceback.print_exc()
-
-
-def handle_queue_run_mode(args: argparse.Namespace):  # type: ignore
-    """处理队列运行命令"""
-    generator = LiteratureReviewGenerator(args.config, args.project_name, args.pdf_folder, getattr(args, "queue_file", "output/_queue/queue.json"), getattr(args, "zotero_report", None), getattr(args, "library_path", None))
-    generator.logger.info("*** 队列运行模式已启动 ***")
-    generator.logger.info("=" * 60)
-    
-    try:
-        if not generator.load_configuration():
-            generator.logger.error("配置加载失败")
-            sys.exit(1)
-        if not generator.setup_output_directory():
-            generator.logger.error("输出目录设置失败")
-            sys.exit(1)
-        
-        generator._init_queue_service()
-        if generator.queue_service is None:
-            generator.logger.error("队列服务未初始化")
-            return
-        
-        # 处理批量 queue 文件
-        if hasattr(args, 'queue_files') and args.queue_files:
-            for queue_file in args.queue_files:
-                if os.path.exists(queue_file):
-                    generator.logger.info(f"加载队列文件: {queue_file}")
-                    try:
-                        generator.queue_service.load_queue(queue_file)
-                        generator.logger.success(f"队列文件加载成功: {queue_file}")
-                    except Exception as e:
-                        generator.logger.error(f"加载队列文件失败: {queue_file} - {e}")
-                else:
-                    generator.logger.error(f"队列文件不存在: {queue_file}")
-        
-        # 创建JobRunner和QueueRunner
-        from services.job_runner import JobRunner
-        from services.queue_service import QueueRunner
-        job_runner = JobRunner()
-        queue_runner = QueueRunner(generator.queue_service, job_runner)
-        
-        # 运行队列
-        generator.logger.info("开始运行队列任务...")
-        queue_runner.run()
-        generator.logger.success("队列运行完成！")
-            
-    except Exception as e:
-        generator.logger.error(f"队列运行操作失败: {e}")
-        traceback.print_exc()
-
 def handle_run_all_mode(generator: 'LiteratureReviewGenerator'):  # type: ignore
     """处理一键执行模式"""
     generator.logger.info("*** '一键执行'模式已启动 ***")
@@ -6615,7 +6291,7 @@ def main() -> None:  # type: ignore
     
     parser = argparse.ArgumentParser(
         description="auto-generate - AI 文献分析与综述写作工作台\n"
-                   "支持本地 GUI 和 CLI 两种模式，提供文献分析、综述生成、队列管理等功能。",
+                   "支持本地 GUI 和 CLI 两种模式；CLI 直接运行，GUI 工作台自动管理后台队列。",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="示例:\n"
                "  # 运行交互式设置\n"
@@ -6626,9 +6302,6 @@ def main() -> None:  # type: ignore
                "\n"
                "  # 一键运行所有阶段\n"
                "  python main.py --project-name \"my_review\" --run-all\n"
-               "\n"
-               "  # 查看队列任务\n"
-               "  python main.py --project-name \"my_review\" --queue-list\n"
     )
     
     # 基础选项
@@ -6755,53 +6428,6 @@ def main() -> None:  # type: ignore
         '--reuse-summary-file',
         action='append',
         help='Add an extra summaries.json file to the stage-1 reuse pool (repeatable)'
-    )
-    
-    # 队列选项
-    queue_group = parser.add_argument_group('队列选项')
-    queue_group.add_argument(
-        '--queue-add',
-        action='store_true',
-        help='添加任务到队列'
-    )
-    queue_group.add_argument(
-        '--queue-run',
-        action='store_true',
-        help='运行队列任务'
-    )
-    queue_group.add_argument(
-        '--queue-file',
-        type=str,
-        default='output/_queue/queue.json',
-        help='队列文件路径（默认：output/_queue/queue.json）'
-    )
-    queue_group.add_argument(
-        '--queue-files',
-        type=str,
-        nargs='+',
-        help='批量队列文件路径（支持多个文件）'
-    )
-    queue_group.add_argument(
-        '--queue-list',
-        action='store_true',
-        help='列出所有队列任务'
-    )
-    queue_group.add_argument(
-        '--queue-cancel',
-        type=str,
-        metavar='JOB_ID',
-        help='取消指定任务（需要 job_id）'
-    )
-    queue_group.add_argument(
-        '--queue-retry',
-        type=str,
-        metavar='JOB_ID',
-        help='重试失败任务（需要 job_id）'
-    )
-    queue_group.add_argument(
-        '--queue-clear',
-        action='store_true',
-        help='清空已完成的任务'
     )
     
     # Zotero选项

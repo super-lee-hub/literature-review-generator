@@ -24,14 +24,14 @@ This matrix provides a comprehensive view of the current implementation status o
 | Stage1 Multimodal Input | implemented | Support for multimodal inputs in stage 1 | Fully functional |
 | Citation Object Main Chain | implemented | Citation object as primary truth source | Fully functional - structured citations are now the default truth source |
 | Validation/Repair | implemented | Validation and repair pipeline | Fully functional - includes preprocess evidence loader and semi-closed loop repair |
-| Queue System | implemented | Job queue management | Fully functional - includes complete task snapshots and dependency tracking |
+| GUI Queue System | implemented | Workflow-page serial background queue | Fully functional for GUI submissions with durable task snapshots and serial processing |
 | AI-native Skill Entrypoint | implemented | Repo-local Codex / OMX skill entry surface | Fully functional additive surface via `.codex/skills/auto-generate-orchestrator` + `runtime/*` |
 | Runtime Stage Trace | implemented | AI-native runtime source/trace artifacts | Fully functional - persists `source_bundle.json` and `runtime_stage_trace.json` into the job workspace |
 | Outline Review Compatibility | partial | Optional outline critique/arbitration/adopt surface | Present as an explicit/manual compatibility path; normal outline/review workflow does not require it |
 | Zotero Integration | implemented | Zotero report parsing and library integration | Fully functional |
 | PDF Extraction | implemented | PDF text extraction with multiple backends | Fully functional |
 | AI Integration | implemented | OpenAI-compatible API integration | Fully functional |
-| GUI Interface | implemented | Local GUI for workflow management | Fully functional - includes complete queue operations |
+| GUI Interface | implemented | Local GUI for workflow management | Fully functional - includes embedded workflow-page queue operations |
 | CLI Interface | implemented | Command-line interface | Fully functional |
 
 ## Feature Details
@@ -76,10 +76,10 @@ This matrix provides a comprehensive view of the current implementation status o
 - **Description**: Validation and repair pipeline
 - **Notes**: Fully functional - includes preprocess evidence loader and semi-closed loop repair
 
-### Queue System
+### GUI Queue System
 - **Status**: implemented
-- **Description**: Job queue management
-- **Notes**: Fully functional - includes complete task snapshots and dependency tracking
+- **Description**: Workflow-page serial background queue
+- **Notes**: Fully functional for GUI submissions; CLI and AI-native runtime remain direct-run and out-of-queue
 
 ### AI-native Skill Entrypoint
 - **Status**: implemented
@@ -114,7 +114,7 @@ This matrix provides a comprehensive view of the current implementation status o
 ### GUI Interface
 - **Status**: implemented
 - **Description**: Local GUI for workflow management
-- **Notes**: Fully functional - includes complete queue operations
+- **Notes**: Fully functional - includes embedded workflow-page queue operations
 
 ### CLI Interface
 - **Status**: implemented
@@ -127,7 +127,7 @@ This section records implementation direction/history. It should not be read as 
 
 ### P0: Stability and Truth Alignment
 - Fix Windows pymupdf4llm/onnxruntime access violation
-- Unify --zotero-report, --library-path, --queue-file execution chain
+- Unify --zotero-report and --library-path direct execution chain
 - Create feature reality matrix and update documentation
 
 ### P1: Citation Object Main Chain
@@ -142,8 +142,8 @@ This section records implementation direction/history. It should not be read as 
 
 ### P3: Queue Productization
 - Extend QueueJobSpec/QueueJobRuntime
-- Add complete queue operations to GUI
-- Update CLI to support batch queue files
+- Add embedded workflow-page queue operations to GUI
+- Remove public CLI queue commands and keep CLI direct-run
 
 ### P4: Outline review simplification
 - Keep markdown outline generation as the normal path
