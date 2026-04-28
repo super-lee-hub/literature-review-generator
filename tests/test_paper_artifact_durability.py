@@ -150,7 +150,18 @@ def _stub_stage1_success(monkeypatch, generator) -> None:
     monkeypatch.setattr(
         generator,
         "_prepare_stage1_input",
-        lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}),
+        lambda *_args, **_kwargs: (
+            "x" * 1200,
+            {
+                "analysis_input_kind": "plain_text",
+                "extractor_used": "mock",
+                "selected_text_source": "plain_text",
+                "stage1_quality_level": "FALLBACK",
+                "stage1_input_path": str(Path("cache") / "stage1_input.md"),
+                "stage1_input_manifest_path": str(Path("cache") / "stage1_input_manifest.json"),
+                "stage1_quality_report_path": str(Path("cache") / "stage1_text_quality_report.json"),
+            },
+        ),
     )
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
@@ -194,6 +205,11 @@ def test_successful_process_paper_creates_registered_paper_artifact(
     assert artifact_payload["analysis"]["status"] == "success"
     assert artifact_payload["analysis"]["text_length"] == 1200
     assert artifact_payload["analysis"]["ai_summary"]["routing"]["paper_type"] == "empirical"
+    assert artifact_payload["analysis"]["preprocess"]["selected_text_source"] == "plain_text"
+    assert artifact_payload["analysis"]["preprocess"]["stage1_quality_level"] == "FALLBACK"
+    assert artifact_payload["stage1_inputs"]["selected_text_source"] == "plain_text"
+    assert artifact_payload["stage1_inputs"]["stage1_quality_level"] == "FALLBACK"
+    assert artifact_payload["stage1_inputs"]["stage1_input_manifest_path"].endswith("stage1_input_manifest.json")
 
 
 def test_failed_process_paper_does_not_create_or_register_paper_artifact(tmp_path: Path, monkeypatch) -> None:

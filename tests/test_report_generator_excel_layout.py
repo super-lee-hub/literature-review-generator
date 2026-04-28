@@ -273,7 +273,15 @@ def test_generate_failure_report_includes_attempt_history_details(tmp_path: Path
                     {
                         "preprocess_strategy": "hybrid",
                         "preprocess_profile": "hybrid",
+                        "parser_mode": "hybrid",
                         "extractor_used": "pymupdf4llm",
+                        "selected_text_source": "plain_text",
+                        "stage1_quality_level": "FALLBACK",
+                        "mineru_remote_requested": True,
+                        "mineru_remote_enabled": False,
+                        "mineru_attempted": False,
+                        "mineru_succeeded": False,
+                        "mineru_route": "hybrid_local_baseline_met",
                         "model_used": "backup",
                         "quality_reason": "primary low quality; backup low quality",
                     }
@@ -291,6 +299,11 @@ def test_generate_failure_report_includes_attempt_history_details(tmp_path: Path
     assert "尝试明细" in content
     assert "策略=hybrid" in content
     assert "profile=hybrid" in content
+    assert "parser=hybrid" in content
     assert "提取器=pymupdf4llm" in content
+    assert "source=plain_text" in content
+    assert "quality=FALLBACK" in content
+    assert "MinerU requested=True, enabled=False, attempted=False" in content
+    assert "route=hybrid_local_baseline_met" in content
     assert "模型=backup" in content
     assert "原因=primary low quality; backup low quality" in content

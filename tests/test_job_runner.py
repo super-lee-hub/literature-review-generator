@@ -48,6 +48,18 @@ class _DummyGenerator:
         self.job_workspace = kwargs["workspace"]
         self.output_dir = kwargs["workspace"].root_dir
         self.summary_file = kwargs["workspace"].artifact_path(f"{kwargs['workspace'].project_name}_summaries.json")
+        log_path = self.job_workspace.log_path("job.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write("workspace job log\n")
+        self.bound_registry.register_file(
+            artifact_role="log",
+            artifact_type="job_log",
+            artifact_version="v1",
+            path=log_path,
+            producer="tests._DummyGenerator.bind_job_workspace",
+            artifact_id="job_log",
+        )
 
     def _get_concept_profile_file_path(self):
         return self.job_workspace.artifact_path(f"{self.project_name}_concept_profile.json")
@@ -90,6 +102,8 @@ def test_job_runner_creates_workspace_and_pointer(tmp_path, monkeypatch) -> None
     assert pointer_payload["status"] == "completed"
     assert pointer_payload["workspace_path"] == called["workspace"]
     assert pointer_payload["artifact_registry_path"].endswith("artifact_registry.json")
+    assert result.log_path.endswith(os.path.join("logs", "job.log"))
+    assert os.path.exists(result.log_path)
 
 
 def test_job_runner_aborts_immediately_when_cancelled_before_start(monkeypatch) -> None:

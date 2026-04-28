@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional
 import fitz  # type: ignore
 import requests  # type: ignore
 
+from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
+
 
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
@@ -60,8 +62,12 @@ class PreprocessResult:
     diagnostics_path: str
     structured_json_path: str
     manifest_path: str
+    stage1_input_path: str
+    stage1_input_manifest_path: str
+    stage1_quality_report_path: str
     markdown_text: str
     plain_text: str
+    stage1_input_text: str
     page_index: List[Dict[str, Any]]
     page_diagnostics: List[PageDiagnostics]
     low_quality: bool
@@ -80,6 +86,8 @@ class PreprocessResult:
     mineru_remote_requested: bool
     mineru_remote_enabled: bool
     mineru_base_url: str
+    selected_text_source: str
+    stage1_quality_level: str
 
 
 class PreprocessManager:
@@ -188,7 +196,16 @@ class PreprocessManager:
         if not page_index:
             page_index = self._build_page_index(page_blocks, page_diagnostics)
 
-        chunks = self._build_chunks(markdown_text, page_index)
+        stage1_selection = self._select_stage1_input(
+            markdown_text=markdown_text,
+            plain_text=plain_text,
+            page_index=page_index,
+        )
+        chunks = self._build_chunks(stage1_selection.selected_text, page_index)
+        stage1_manifest_payload, stage1_quality_report_payload = self._stage1_selection_payloads(
+            selection=stage1_selection,
+            artifact_paths=artifact_paths,
+        )
         low_quality = any(item.low_quality for item in page_diagnostics)
         scanned_like = any(item.scanned_candidate for item in page_diagnostics)
         used_ocr = any(item.used_ocr for item in page_diagnostics) or bool(extraction.get("used_ocr"))
@@ -232,6 +249,18 @@ class PreprocessManager:
                 "chunks": artifact_paths["chunks_path"],
                 "diagnostics": artifact_paths["diagnostics_path"],
                 "prepare_manifest": artifact_paths["manifest_path"],
+                "stage1_input": artifact_paths["stage1_input_path"],
+                "stage1_input_manifest": artifact_paths["stage1_input_manifest_path"],
+                "stage1_text_quality_report": artifact_paths["stage1_quality_report_path"],
+            },
+            "stage1_input": {
+                "selected_text_source": stage1_selection.selected_source,
+                "stage1_quality_level": stage1_selection.quality_level,
+                "fallback_reason": stage1_selection.fallback_reason,
+                "stage1_quality_reasons": stage1_selection.stage1_quality_reasons,
+                "stage1_input_path": artifact_paths["stage1_input_path"],
+                "stage1_input_manifest_path": artifact_paths["stage1_input_manifest_path"],
+                "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
             },
         }
         manifest_payload = {
@@ -254,6 +283,12 @@ class PreprocessManager:
             "mineru_remote_requested": mineru_remote_requested,
             "mineru_remote_enabled": mineru_remote_enabled,
             "mineru_base_url": self.mineru_base_url,
+            "selected_text_source": stage1_selection.selected_source,
+            "stage1_quality_level": stage1_selection.quality_level,
+            "stage1_quality_reasons": stage1_selection.stage1_quality_reasons,
+            "stage1_input_path": artifact_paths["stage1_input_path"],
+            "stage1_input_manifest_path": artifact_paths["stage1_input_manifest_path"],
+            "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
             "artifacts": diagnostics_payload["artifact_paths"],
         }
 
@@ -265,6 +300,12 @@ class PreprocessManager:
             json.dump(page_index, handle, ensure_ascii=False, indent=2)
         with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
             json.dump(chunks, handle, ensure_ascii=False, indent=2)
+        with open(artifact_paths["stage1_input_path"], "w", encoding="utf-8") as handle:
+            handle.write(stage1_selection.selected_text)
+        with open(artifact_paths["stage1_input_manifest_path"], "w", encoding="utf-8") as handle:
+            json.dump(stage1_manifest_payload, handle, ensure_ascii=False, indent=2)
+        with open(artifact_paths["stage1_quality_report_path"], "w", encoding="utf-8") as handle:
+            json.dump(stage1_quality_report_payload, handle, ensure_ascii=False, indent=2)
         with open(artifact_paths["diagnostics_path"], "w", encoding="utf-8") as handle:
             json.dump(diagnostics_payload, handle, ensure_ascii=False, indent=2)
         with open(artifact_paths["structured_json_path"], "w", encoding="utf-8") as handle:
@@ -274,6 +315,7 @@ class PreprocessManager:
                     "page_index": page_index,
                     "plain_text": plain_text,
                     "markdown_text": markdown_text,
+                    "stage1_input_text": stage1_selection.selected_text,
                     "source_payload": self._make_json_safe(structured_payload),
                 },
                 handle,
@@ -293,8 +335,12 @@ class PreprocessManager:
             diagnostics_path=artifact_paths["diagnostics_path"],
             structured_json_path=artifact_paths["structured_json_path"],
             manifest_path=artifact_paths["manifest_path"],
+            stage1_input_path=artifact_paths["stage1_input_path"],
+            stage1_input_manifest_path=artifact_paths["stage1_input_manifest_path"],
+            stage1_quality_report_path=artifact_paths["stage1_quality_report_path"],
             markdown_text=markdown_text,
             plain_text=plain_text,
+            stage1_input_text=stage1_selection.selected_text,
             page_index=page_index,
             page_diagnostics=page_diagnostics,
             low_quality=low_quality,
@@ -313,6 +359,8 @@ class PreprocessManager:
             mineru_remote_requested=mineru_remote_requested,
             mineru_remote_enabled=mineru_remote_enabled,
             mineru_base_url=self.mineru_base_url,
+            selected_text_source=stage1_selection.selected_source,
+            stage1_quality_level=stage1_selection.quality_level,
         )
 
     def _artifact_paths(self, cache_dir: str) -> Dict[str, str]:
@@ -324,6 +372,9 @@ class PreprocessManager:
             "diagnostics_path": os.path.join(cache_dir, "diagnostics.json"),
             "structured_json_path": os.path.join(cache_dir, "structured.json"),
             "manifest_path": os.path.join(cache_dir, "prepare_manifest.json"),
+            "stage1_input_path": os.path.join(cache_dir, "stage1_input.md"),
+            "stage1_input_manifest_path": os.path.join(cache_dir, "stage1_input_manifest.json"),
+            "stage1_quality_report_path": os.path.join(cache_dir, "stage1_text_quality_report.json"),
         }
 
     def _extract_preferred_content(self, pdf_path: str) -> Optional[Dict[str, Any]]:
@@ -1260,30 +1311,235 @@ class PreprocessManager:
             parts.append(f"## Page {page_marker}\n\n{content}")
         return "\n\n".join(parts)
 
-    def _build_chunks(self, markdown_text: str, page_index: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _select_stage1_input(
+        self,
+        *,
+        markdown_text: str,
+        plain_text: str,
+        page_index: List[Dict[str, Any]],
+        allow_reprocess: bool = True,
+    ) -> Stage1InputSelection:
+        return select_stage1_input(
+            markdown_text=markdown_text,
+            plain_text=plain_text,
+            page_index=page_index,
+            allow_reprocess=allow_reprocess,
+        )
+
+    def _write_stage1_selection_artifacts(
+        self,
+        *,
+        selection: Stage1InputSelection,
+        artifact_paths: Dict[str, str],
+        page_index: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        chunks = self._build_chunks(selection.selected_text, page_index)
+        stage1_manifest_payload, stage1_quality_report_payload = self._stage1_selection_payloads(
+            selection=selection,
+            artifact_paths=artifact_paths,
+        )
+        with open(artifact_paths["stage1_input_path"], "w", encoding="utf-8") as handle:
+            handle.write(selection.selected_text)
+        with open(artifact_paths["stage1_input_manifest_path"], "w", encoding="utf-8") as handle:
+            json.dump(stage1_manifest_payload, handle, ensure_ascii=False, indent=2)
+        with open(artifact_paths["stage1_quality_report_path"], "w", encoding="utf-8") as handle:
+            json.dump(stage1_quality_report_payload, handle, ensure_ascii=False, indent=2)
+        with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
+            json.dump(chunks, handle, ensure_ascii=False, indent=2)
+        return chunks
+
+    def _stage1_selection_payloads(
+        self,
+        *,
+        selection: Stage1InputSelection,
+        artifact_paths: Dict[str, str],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        artifacts = {
+            "stage1_input": artifact_paths["stage1_input_path"],
+            "stage1_input_manifest": artifact_paths["stage1_input_manifest_path"],
+            "stage1_text_quality_report": artifact_paths["stage1_quality_report_path"],
+            "chunks": artifact_paths["chunks_path"],
+        }
+        manifest_payload = dict(selection.manifest_payload)
+        manifest_payload["artifacts"] = artifacts
+        quality_report_payload = dict(selection.quality_report_payload)
+        quality_report_payload["artifacts"] = artifacts
+        return manifest_payload, quality_report_payload
+
+    def _load_or_rebuild_stage1_selection(
+        self,
+        *,
+        markdown_text: str,
+        plain_text: str,
+        page_index: List[Dict[str, Any]],
+        artifact_paths: Dict[str, str],
+        diagnostics: Dict[str, Any],
+        manifest: Dict[str, Any],
+    ) -> tuple[str, str, str, List[str], List[Dict[str, Any]]]:
+        stage1_paths = [
+            artifact_paths["stage1_input_path"],
+            artifact_paths["stage1_input_manifest_path"],
+            artifact_paths["stage1_quality_report_path"],
+        ]
+        if all(os.path.exists(path) for path in stage1_paths):
+            with open(artifact_paths["stage1_input_path"], "r", encoding="utf-8") as handle:
+                stage1_input_text = handle.read()
+            with open(artifact_paths["stage1_input_manifest_path"], "r", encoding="utf-8") as handle:
+                stage1_manifest = json.load(handle)
+            try:
+                with open(artifact_paths["chunks_path"], "r", encoding="utf-8") as handle:
+                    chunks = json.load(handle)
+            except Exception:
+                chunks = self._build_chunks(stage1_input_text, page_index)
+                with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
+                    json.dump(chunks, handle, ensure_ascii=False, indent=2)
+            if not self._chunks_use_selected_stage1(chunks):
+                chunks = self._build_chunks(stage1_input_text, page_index)
+                with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
+                    json.dump(chunks, handle, ensure_ascii=False, indent=2)
+            return (
+                stage1_input_text,
+                str(stage1_manifest.get("selected_text_source") or ""),
+                str(stage1_manifest.get("stage1_quality_level") or ""),
+                list(stage1_manifest.get("stage1_quality_reasons") or []),
+                chunks if isinstance(chunks, list) else [],
+            )
+
+        selection = self._select_stage1_input(
+            markdown_text=markdown_text,
+            plain_text=plain_text,
+            page_index=page_index,
+        )
+        chunks = self._write_stage1_selection_artifacts(
+            selection=selection,
+            artifact_paths=artifact_paths,
+            page_index=page_index,
+        )
+        artifact_map = manifest.setdefault("artifacts", {})
+        artifact_map.update(
+            {
+                "stage1_input": artifact_paths["stage1_input_path"],
+                "stage1_input_manifest": artifact_paths["stage1_input_manifest_path"],
+                "stage1_text_quality_report": artifact_paths["stage1_quality_report_path"],
+                "chunks": artifact_paths["chunks_path"],
+            }
+        )
+        manifest.update(
+            {
+                "chunk_count": len(chunks),
+                "selected_text_source": selection.selected_source,
+                "stage1_quality_level": selection.quality_level,
+                "stage1_quality_reasons": selection.stage1_quality_reasons,
+                "stage1_input_path": artifact_paths["stage1_input_path"],
+                "stage1_input_manifest_path": artifact_paths["stage1_input_manifest_path"],
+                "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
+            }
+        )
+        diagnostics.setdefault("artifact_paths", {}).update(artifact_map)
+        diagnostics["stage1_input"] = {
+            "selected_text_source": selection.selected_source,
+            "stage1_quality_level": selection.quality_level,
+            "fallback_reason": selection.fallback_reason,
+            "stage1_quality_reasons": selection.stage1_quality_reasons,
+            "stage1_input_path": artifact_paths["stage1_input_path"],
+            "stage1_input_manifest_path": artifact_paths["stage1_input_manifest_path"],
+            "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
+        }
+        with open(artifact_paths["manifest_path"], "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        with open(artifact_paths["diagnostics_path"], "w", encoding="utf-8") as handle:
+            json.dump(diagnostics, handle, ensure_ascii=False, indent=2)
+        return (
+            selection.selected_text,
+            selection.selected_source,
+            selection.quality_level,
+            selection.stage1_quality_reasons,
+            chunks,
+        )
+
+    def _build_chunks(self, stage1_text: str, page_index: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         chunks: List[Dict[str, Any]] = []
-        for page in page_index:
-            text = str(page.get("text", "") or "").strip()
+        selected_text = str(stage1_text or "").strip()
+        if not selected_text:
+            return chunks
+
+        page_lookup = {
+            int(page.get("page_number")): str(page.get("text") or "").strip()
+            for page in page_index
+            if str(page.get("page_number") or "").isdigit()
+        }
+        page_sections = self._split_stage1_text_pages(selected_text)
+        if page_sections:
+            for index, (page_number, text) in enumerate(page_sections, start=1):
+                chunk_text = text.strip() or page_lookup.get(page_number, "")
+                if not chunk_text:
+                    continue
+                chunks.append(
+                    {
+                        "chunk_id": f"stage1-page-{page_number or index}",
+                        "page_number": page_number,
+                        "page_range": [page_number] if page_number else [],
+                        "text": chunk_text[:8000],
+                        "source": "selected_stage1_input",
+                        "chunk_source": "selected_stage1_input",
+                    }
+                )
+            if chunks:
+                return chunks
+
+        chunk_size = 8000
+        for index in range(0, len(selected_text), chunk_size):
+            text = selected_text[index : index + chunk_size].strip()
             if not text:
                 continue
             chunks.append(
                 {
-                    "chunk_id": f"page-{page.get('page_number')}",
-                    "page_number": page.get("page_number"),
-                    "text": text[:8000],
-                    "source": "page_index",
-                }
-            )
-        if not chunks and markdown_text.strip():
-            chunks.append(
-                {
-                    "chunk_id": "markdown-1",
+                    "chunk_id": f"stage1-{len(chunks) + 1}",
                     "page_number": None,
-                    "text": markdown_text[:8000],
-                    "source": "markdown",
+                    "page_range": [],
+                    "text": text,
+                    "source": "selected_stage1_input",
+                    "chunk_source": "selected_stage1_input",
                 }
             )
         return chunks
+
+    def _chunks_use_selected_stage1(self, chunks: Any) -> bool:
+        if not isinstance(chunks, list) or not chunks:
+            return False
+        return all(
+            isinstance(chunk, dict)
+            and chunk.get("chunk_source") == "selected_stage1_input"
+            for chunk in chunks
+        )
+
+    def _split_stage1_text_pages(self, text: str) -> List[tuple[Optional[int], str]]:
+        sections: List[tuple[Optional[int], str]] = []
+        marker = "--- Page "
+        if marker in text:
+            for section in [block.strip() for block in text.split(marker) if block.strip()]:
+                lines = section.splitlines()
+                page_number = self._parse_page_number(lines[0] if lines else "")
+                content = "\n".join(lines[1:]).strip()
+                sections.append((page_number, content))
+            return sections
+        markdown_marker = "## Page "
+        if markdown_marker in text:
+            for section in [block.strip() for block in text.split(markdown_marker) if block.strip()]:
+                lines = section.splitlines()
+                page_number = self._parse_page_number(lines[0] if lines else "")
+                content = "\n".join(lines[1:]).strip()
+                sections.append((page_number, content))
+        return sections
+
+    def _parse_page_number(self, value: str) -> Optional[int]:
+        digits = "".join(char for char in str(value or "") if char.isdigit())
+        if not digits:
+            return None
+        try:
+            return int(digits)
+        except ValueError:
+            return None
 
     def _load_cached_result(
         self,
@@ -1298,6 +1554,7 @@ class PreprocessManager:
         manifest_path: str,
     ) -> Optional[PreprocessResult]:
         try:
+            artifact_paths = self._artifact_paths(cache_dir)
             with open(markdown_path, "r", encoding="utf-8") as handle:
                 markdown_text = handle.read()
             with open(plain_text_path, "r", encoding="utf-8") as handle:
@@ -1310,6 +1567,20 @@ class PreprocessManager:
                 manifest = json.load(handle)
 
             page_diagnostics = [PageDiagnostics(**item) for item in diagnostics.get("page_diagnostics", [])]
+            (
+                stage1_input_text,
+                selected_text_source,
+                stage1_quality_level,
+                stage1_quality_reasons,
+                chunks,
+            ) = self._load_or_rebuild_stage1_selection(
+                markdown_text=markdown_text,
+                plain_text=plain_text,
+                page_index=page_index,
+                artifact_paths=artifact_paths,
+                diagnostics=diagnostics,
+                manifest=manifest,
+            )
             return PreprocessResult(
                 pdf_path=pdf_path,
                 cache_dir=cache_dir,
@@ -1320,15 +1591,19 @@ class PreprocessManager:
                 diagnostics_path=diagnostics_path,
                 structured_json_path=structured_json_path,
                 manifest_path=manifest_path,
+                stage1_input_path=artifact_paths["stage1_input_path"],
+                stage1_input_manifest_path=artifact_paths["stage1_input_manifest_path"],
+                stage1_quality_report_path=artifact_paths["stage1_quality_report_path"],
                 markdown_text=markdown_text,
                 plain_text=plain_text,
+                stage1_input_text=stage1_input_text,
                 page_index=page_index,
                 page_diagnostics=page_diagnostics,
                 low_quality=bool(diagnostics.get("low_quality")),
                 scanned_like=bool(diagnostics.get("scanned_like")),
                 used_ocr=bool(diagnostics.get("used_ocr")),
                 extractor_used=str(manifest.get("extractor_used", "fitz")),
-                chunk_count=int(manifest.get("chunk_count", 0)),
+                chunk_count=int(manifest.get("chunk_count", len(chunks))),
                 local_rag_enabled=bool(manifest.get("local_rag_enabled")),
                 local_rag_built=bool(manifest.get("local_rag_built")),
                 local_rag_persist_dir=str(manifest.get("local_rag_persist_dir", self.rag_persist_dir)),
@@ -1340,6 +1615,8 @@ class PreprocessManager:
                 mineru_remote_requested=bool(manifest.get("mineru_remote_requested")),
                 mineru_remote_enabled=bool(manifest.get("mineru_remote_enabled")),
                 mineru_base_url=str(manifest.get("mineru_base_url", self.mineru_base_url)),
+                selected_text_source=selected_text_source,
+                stage1_quality_level=stage1_quality_level,
             )
         except Exception as exc:
             self._log(f"Failed to load preprocess cache for {pdf_path}: {exc}", level="warning")

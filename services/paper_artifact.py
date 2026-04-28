@@ -49,6 +49,7 @@ def build_paper_artifact_v1(
         if str(item).strip()
     ]
     stage1_input = dict(result.get("stage1_input") or {})
+    preprocess = dict(result.get("preprocess") or {})
     selected_visual_refs = [
         dict(item)
         for item in (stage1_input.get("selected_visual_refs") or [])
@@ -88,5 +89,10 @@ def build_paper_artifact_v1(
             "selected_visual_refs": selected_visual_refs,
             "visual_selection_policy_snapshot": dict(stage1_input.get("visual_selection_policy_snapshot") or {}),
             "multimodal_capability": dict(stage1_input.get("multimodal_capability") or {}),
+            "selected_text_source": str(preprocess.get("selected_text_source") or ""),
+            "stage1_quality_level": str(preprocess.get("stage1_quality_level") or ""),
+            "stage1_input_path": str(preprocess.get("stage1_input_path") or ""),
+            "stage1_input_manifest_path": str(preprocess.get("stage1_input_manifest_path") or ""),
+            "stage1_quality_report_path": str(preprocess.get("stage1_quality_report_path") or ""),
         },
     )

@@ -514,12 +514,23 @@ def test_process_paper_returns_failed_when_all_stage1_strategies_fail(tmp_path, 
     monkeypatch.setenv("MINERU_API_TOKEN", "token")
 
     def _prepare_stage1_input(_path, preprocess_strategy="hybrid"):
+        mineru_candidate = preprocess_strategy in {"hybrid", "mineru"}
+        mineru_enabled = preprocess_strategy == "mineru"
         return (
             "A" * 1600,
             {
                 "analysis_input_kind": "text",
                 "extractor_used": f"mock-{preprocess_strategy}",
                 "preprocess_profile": f"profile-{preprocess_strategy}",
+                "parser_mode": "hybrid" if preprocess_strategy == "hybrid" else preprocess_strategy,
+                "primary_parser": "mineru_remote" if mineru_candidate else "local",
+                "selected_text_source": "plain_text",
+                "stage1_quality_level": "FALLBACK" if preprocess_strategy == "hybrid" else "PASS",
+                "mineru_remote_requested": mineru_candidate,
+                "mineru_remote_enabled": mineru_enabled,
+                "mineru_attempted": mineru_enabled,
+                "mineru_succeeded": False,
+                "mineru_token_present": True,
             },
         )
 
@@ -571,6 +582,16 @@ def test_process_paper_returns_failed_when_all_stage1_strategies_fail(tmp_path, 
     assert "模型: backup" in result["failure_reason"]
     assert "attempt_history" in result
     assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling", "mineru", "legacy"]
+    first_attempt = result["attempt_history"][0]
+    assert first_attempt["parser_mode"] == "hybrid"
+    assert first_attempt["selected_text_source"] == "plain_text"
+    assert first_attempt["stage1_quality_level"] == "FALLBACK"
+    assert first_attempt["mineru_remote_requested"] is True
+    assert first_attempt["mineru_remote_enabled"] is False
+    assert first_attempt["mineru_attempted"] is False
+    assert first_attempt["mineru_route"] == "hybrid_local_baseline_met"
+    assert first_attempt["stage1_route"]["extractor_used"] == "mock-hybrid"
+    assert "MinerU: requested=True, enabled=False, attempted=False" in result["failure_reason"]
 
 
 def test_generate_review_outline_prefers_outline_api_config(tmp_path, monkeypatch) -> None:

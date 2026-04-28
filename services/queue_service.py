@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
@@ -91,6 +91,7 @@ class QueueJobRuntime:
     workspace_path: str = ""
     log_path: str = ""
     produced_artifacts: List[str] = field(default_factory=list)
+    progress_snapshot: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -105,6 +106,7 @@ class QueueJobRuntime:
             "workspace_path": self.workspace_path,
             "log_path": self.log_path,
             "produced_artifacts": self.produced_artifacts,
+            "progress_snapshot": self.progress_snapshot,
         }
 
     @classmethod
@@ -121,6 +123,7 @@ class QueueJobRuntime:
             workspace_path=data.get("workspace_path", ""),
             log_path=data.get("log_path", ""),
             produced_artifacts=data.get("produced_artifacts", []),
+            progress_snapshot=data.get("progress_snapshot", {}),
         )
 
 
@@ -133,6 +136,31 @@ class QueuedJobHandle(Generic[T]):
 
     def cancel(self) -> None:
         self.cancel_token.request_cancel()
+
+
+class QueueRuntimeProgressTracker:
+    """ProgressTracker adapter that mirrors workflow progress into queue runtime state."""
+
+    def __init__(self, on_update: Callable[[Dict[str, Any]], None]) -> None:
+        from services.progress_service import ProgressTracker
+
+        self._tracker = ProgressTracker()
+        self._on_update = on_update
+
+    def reset(self, **kwargs: Any) -> None:
+        self._tracker.reset(**kwargs)
+        self._on_update(self.snapshot())
+
+    def emit(self, **kwargs: Any) -> None:
+        self._tracker.emit(**kwargs)
+        self._on_update(self.snapshot())
+
+    def finish(self, **kwargs: Any) -> None:
+        self._tracker.finish(**kwargs)
+        self._on_update(self.snapshot())
+
+    def snapshot(self) -> Dict[str, Any]:
+        return self._tracker.snapshot()
 
 
 class InProcessQueueService:
@@ -409,6 +437,10 @@ class QueueRunner:
             # Build JobRunRequest from queued parameters
             from services.job_runner import build_job_request_from_mapping
             request = build_job_request_from_mapping(params)
+            progress_tracker = QueueRuntimeProgressTracker(
+                lambda snapshot, jid=job_spec.job_id: self._update_job_progress_snapshot(jid, snapshot)
+            )
+            request = replace(request, progress_tracker=progress_tracker)
             
             
             # 计算工作区路径（基于项目名称和任务ID）
@@ -434,6 +466,11 @@ class QueueRunner:
             
             # 更新当前阶段
             self._update_job_stage(job_spec.job_id, "completing")
+            self._update_job_runtime_info(job_spec.job_id, {
+                "workspace_path": result.workspace_path,
+                "log_path": result.log_path if hasattr(result, 'log_path') else job_spec.log_path,
+                "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
+            })
             
             if result.success:
                 # 更新任务状态为完成
@@ -448,13 +485,6 @@ class QueueRunner:
                     "resume_state": result.resume_state,
                 }
                 self.queue_service.set_job_result(job_spec.job_id, result_summary)
-                
-                # 更新运行时信息
-                self._update_job_runtime_info(job_spec.job_id, {
-                    "workspace_path": result.workspace_path,
-                    "log_path": result.log_path if hasattr(result, 'log_path') else job_spec.log_path,
-                    "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
-                })
             else:
                 # 检查是否因为取消而失败
                 if result.exit_code == 130:
@@ -494,6 +524,17 @@ class QueueRunner:
                     runtime.log_path = info['log_path']
                 if 'produced_artifacts' in info:
                     runtime.produced_artifacts = info['produced_artifacts']
+                self.queue_service._save()
+
+    def _update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> None:
+        """Persist the latest workflow progress snapshot for GUI queue inspection."""
+        with self._lock:
+            if job_id in self.queue_service._runtimes:
+                runtime = self.queue_service._runtimes[job_id]
+                runtime.progress_snapshot = dict(snapshot)
+                stage = str(snapshot.get("stage") or "").strip()
+                if stage:
+                    runtime.current_stage = stage
                 self.queue_service._save()
 
     def run(self) -> None:

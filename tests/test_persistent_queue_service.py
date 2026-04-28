@@ -240,6 +240,78 @@ def test_queue_runner_reconstructs_summary_source_and_reuse_fields(tmp_path: Pat
     assert captured["request"].reuse_summary_files == ("D:/reuse-a.json",)
 
 
+def test_queue_runner_persists_progress_snapshot_and_failure_log_path(tmp_path: Path) -> None:
+    queue_file = tmp_path / "test_queue.json"
+    service = PersistentQueueService(queue_file)
+    log_path = tmp_path / "workspace" / "logs" / "job.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("job log", encoding="utf-8")
+
+    class _Runner:
+        def run(self, request, cancel_token=None):
+            assert request.progress_tracker is not None
+            request.progress_tracker.reset(
+                task_type="文献分析",
+                stage="analyze",
+                message="开始分析",
+                indeterminate=False,
+            )
+            request.progress_tracker.emit(
+                total=3,
+                current=1,
+                success_count=1,
+                failure_count=0,
+                remaining_count=2,
+                item_label="Paper A",
+                message="Paper A 完成",
+            )
+            return type(
+                "_Result",
+                (),
+                {
+                    "success": False,
+                    "exit_code": 1,
+                    "message": "failed",
+                    "workspace_path": str(log_path.parent.parent),
+                    "job_id": "job123",
+                    "resume_state": "weak_resumable",
+                    "produced_artifacts": [str(log_path)],
+                    "log_path": str(log_path),
+                    "report_paths": [],
+                    "failure_summary": "failed",
+                },
+            )()
+
+    job_id = create_queue_job_id()
+    service.add_job(
+        QueueJobSpec(
+            job_id=job_id,
+            job_type="analyze",
+            project_name="demo",
+            parameters={
+                "config": "config.ini",
+                "project_name": "demo",
+                "pdf_folder": "D:/papers",
+                "action": "analyze",
+                "analyze_only": True,
+            },
+        )
+    )
+
+    queue_runner = QueueRunner(service, _Runner())
+    assert queue_runner.run_single_job(job_id) is True
+
+    runtime = service.get_job_runtime(job_id)
+    assert runtime is not None
+    assert runtime.state == QueueState.FAILED
+    assert runtime.log_path == str(log_path)
+    assert runtime.workspace_path == str(log_path.parent.parent)
+    assert runtime.progress_snapshot["stage"] == "analyze"
+    assert runtime.progress_snapshot["item_label"] == "Paper A"
+    assert runtime.progress_snapshot["success_count"] == 1
+    assert runtime.progress_snapshot["remaining_count"] == 2
+
+
 def test_queue_runner_respects_reordered_job_order(tmp_path: Path) -> None:
     queue_file = tmp_path / "test_queue.json"
     service = PersistentQueueService(queue_file)

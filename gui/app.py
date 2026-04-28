@@ -767,7 +767,18 @@ def _guess_provider(api_base: str) -> str:
     return "custom"
 
 
-def _latest_log_excerpt(language: str = "zh-CN") -> Tuple[str, str]:
+def _latest_log_excerpt(
+    language: str = "zh-CN",
+    *,
+    output_root: str | Path | None = None,
+    project_name: str = "",
+    queue_service: Any | None = None,
+) -> Tuple[str, str]:
+    for candidate in _candidate_job_logs(output_root=output_root, project_name=project_name, queue_service=queue_service):
+        path = Path(candidate)
+        if path.exists():
+            return _read_log_excerpt(path, language)
+
     logs_dir = REPO_ROOT / "logs"
     if not logs_dir.exists():
         return "", translate(language, "暂无日志文件。")
@@ -777,12 +788,61 @@ def _latest_log_excerpt(language: str = "zh-CN") -> Tuple[str, str]:
         return "", translate(language, "暂无日志文件。")
 
     latest = log_files[0]
+    return _read_log_excerpt(latest, language)
+
+
+def _read_log_excerpt(path: Path, language: str) -> Tuple[str, str]:
     try:
-        lines = latest.read_text(encoding="utf-8", errors="ignore").splitlines()
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
         excerpt = "\n".join(lines[-60:])
-        return str(latest), excerpt
+        return str(path), excerpt
     except Exception as exc:  # pragma: no cover - defensive.
-        return str(latest), translate(language, "无法读取日志：{exc}").format(exc=exc)
+        return str(path), translate(language, "无法读取日志：{exc}").format(exc=exc)
+
+
+def _candidate_job_logs(
+    *,
+    output_root: str | Path | None,
+    project_name: str,
+    queue_service: Any | None,
+) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def append(path_value: Any) -> None:
+        raw = str(path_value or "").strip()
+        if not raw:
+            return
+        path = Path(raw)
+        try:
+            key = path.resolve()
+        except Exception:
+            key = path.absolute()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(path)
+
+    root = Path(output_root or REPO_ROOT / "output")
+    if project_name:
+        pointer_path = root / project_name / "_latest_job.json"
+        payload = _read_json_payload(pointer_path)
+        workspace_path = str((payload or {}).get("workspace_path") or "")
+        if workspace_path:
+            append(Path(workspace_path) / "logs" / "job.log")
+
+    runtimes = getattr(queue_service, "_runtimes", {}) if queue_service is not None else {}
+    runtime_items = list(runtimes.values()) if isinstance(runtimes, dict) else []
+    runtime_items.sort(key=lambda item: str(getattr(item, "completed_at", None) or getattr(item, "started_at", None) or ""), reverse=True)
+    for runtime in runtime_items:
+        append(getattr(runtime, "log_path", ""))
+
+    if root.exists():
+        workspace_logs = sorted(root.glob("*__*/logs/job.log"), key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True)
+        for path in workspace_logs:
+            append(path)
+
+    return candidates
 
 
 def _read_json_payload(path: Path) -> Dict[str, Any] | None:
@@ -2077,8 +2137,27 @@ class WorkspaceController:
         self._safe_update_bound_list(self.bindings.progress_overall_bars, _update_bar)
         self._safe_update_bound_list(self.bindings.progress_stage_bars, _update_bar)
 
+    def _latest_queue_progress_snapshot(self) -> Dict[str, Any] | None:
+        if not self._queue_service:
+            return None
+        runtimes = getattr(self._queue_service, "_runtimes", {})
+        if not isinstance(runtimes, dict):
+            return None
+        running = [
+            runtime
+            for runtime in runtimes.values()
+            if getattr(runtime, "state", None) == QueueState.RUNNING and getattr(runtime, "progress_snapshot", None)
+        ]
+        running.sort(key=lambda item: str(getattr(item, "started_at", "") or ""), reverse=True)
+        if not running:
+            return None
+        return dict(getattr(running[0], "progress_snapshot", {}) or {})
+
     def refresh_progress(self) -> None:
-        if self.progress_tracker is not None:
+        queue_snapshot = self._latest_queue_progress_snapshot()
+        if queue_snapshot:
+            self.progress_snapshot = queue_snapshot
+        elif self.progress_tracker is not None:
             self.progress_snapshot = self.progress_tracker.snapshot()
             if self.progress_snapshot.get("status") in {"completed", "failed"}:
                 self.set_workflow_running(False)
@@ -2087,7 +2166,12 @@ class WorkspaceController:
             self.refresh_logs()
 
     def refresh_logs(self) -> None:
-        self.latest_log_path, self.latest_log_excerpt = _latest_log_excerpt(self.language)
+        self.latest_log_path, self.latest_log_excerpt = _latest_log_excerpt(
+            self.language,
+            output_root=self.state["paths"].get("output_path", "./output"),
+            project_name=str(self.state["workflow"].get("project_name") or "").strip(),
+            queue_service=self._queue_service,
+        )
         self._safe_update_bound_list(
             self.bindings.log_path_labels,
             lambda element: element.set_text(self.latest_log_path or self.t("暂无日志文件。")),
@@ -2446,12 +2530,26 @@ def _render_workflow_queue_card(controller: WorkspaceController) -> None:
 
             if active_job is not None:
                 runtime = runtimes.get(active_job.job_id)
+                progress_snapshot = dict(getattr(runtime, "progress_snapshot", {}) or {}) if runtime else {}
                 with ui.element("div").classes("ag-note-block q-mt-md"):
                     ui.label(t("当前后台任务")).classes("ag-subtle")
                     ui.label(f"{controller.action_label(active_job.job_type)} · {active_job.project_name}").classes("text-body1")
                     ui.label(f"ID: {active_job.job_id}").classes("ag-subtle")
                     if runtime and runtime.current_stage:
                         ui.label(f"{t('当前阶段')}: {runtime.current_stage}").classes("ag-subtle")
+                    if progress_snapshot:
+                        message = str(progress_snapshot.get("message") or "")
+                        item_label = str(progress_snapshot.get("item_label") or "")
+                        counts_text = (
+                            f"{int(progress_snapshot.get('success_count') or 0)} / "
+                            f"{int(progress_snapshot.get('failure_count') or 0)} / "
+                            f"{int(progress_snapshot.get('remaining_count') or 0)}"
+                        )
+                        if item_label:
+                            ui.label(f"{t('当前对象')}: {item_label}").classes("ag-subtle")
+                        ui.label(f"{t('成功 / 失败 / 剩余')}: {counts_text}").classes("ag-subtle")
+                        if message:
+                            ui.label(message).classes("ag-subtle")
 
             ui.label(t("队列任务列表")).classes("ag-section-title q-mt-lg")
             with ui.element("div").classes("ag-ledger-list"):
@@ -2467,6 +2565,20 @@ def _render_workflow_queue_card(controller: WorkspaceController) -> None:
                                 with ui.element("div").classes("ag-ledger-meta"):
                                     ui.label(f"{t('输入来源')}: {source_label}")
                                     ui.label(f"ID: {job.job_id}")
+                                    progress_snapshot = dict(getattr(runtime, "progress_snapshot", {}) or {}) if runtime else {}
+                                    if progress_snapshot:
+                                        message = str(progress_snapshot.get("message") or "")
+                                        item_label = str(progress_snapshot.get("item_label") or "")
+                                        counts_text = (
+                                            f"{int(progress_snapshot.get('success_count') or 0)} / "
+                                            f"{int(progress_snapshot.get('failure_count') or 0)} / "
+                                            f"{int(progress_snapshot.get('remaining_count') or 0)}"
+                                        )
+                                        if item_label:
+                                            ui.label(f"{t('当前对象')}: {item_label}")
+                                        ui.label(f"{t('成功 / 失败 / 剩余')}: {counts_text}")
+                                        if message:
+                                            ui.label(message[:140] + ("..." if len(message) > 140 else ""))
                                     if runtime and runtime.error_message:
                                         ui.label(f"{t('错误信息')}: {runtime.error_message[:100]}...")
                             ui.label(state_labels.get(state, state.value)).classes("ag-build-badge")

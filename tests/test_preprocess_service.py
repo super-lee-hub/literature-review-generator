@@ -54,18 +54,36 @@ def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monk
     assert Path(result.structured_json_path).name == "structured.json"
     assert Path(result.diagnostics_path).name == "diagnostics.json"
     assert Path(result.manifest_path).name == "prepare_manifest.json"
+    assert Path(result.stage1_input_path).name == "stage1_input.md"
+    assert Path(result.stage1_input_manifest_path).name == "stage1_input_manifest.json"
+    assert Path(result.stage1_quality_report_path).name == "stage1_text_quality_report.json"
     assert Path(result.markdown_path).exists()
     assert Path(result.plain_text_path).exists()
     assert Path(result.page_index_path).exists()
     assert Path(result.structured_json_path).exists()
     assert Path(result.diagnostics_path).exists()
     assert Path(result.manifest_path).exists()
+    assert Path(result.stage1_input_path).exists()
+    assert Path(result.stage1_input_manifest_path).exists()
+    assert Path(result.stage1_quality_report_path).exists()
+    assert result.stage1_input_text
+    assert result.selected_text_source in {"normalized_markdown", "plain_text", "markdown_from_plain_text"}
+    assert result.stage1_quality_level in {"PASS", "WARN", "FALLBACK"}
 
     diagnostics = json.loads(Path(result.diagnostics_path).read_text(encoding="utf-8"))
     manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    stage1_manifest = json.loads(Path(result.stage1_input_manifest_path).read_text(encoding="utf-8"))
+    quality_report = json.loads(Path(result.stage1_quality_report_path).read_text(encoding="utf-8"))
+    chunks = json.loads((Path(result.cache_dir) / "chunks.json").read_text(encoding="utf-8"))
     assert diagnostics["extractor_used"] in {"fitz", "pymupdf4llm", "legacy_pdf_extractor"}
     assert diagnostics["mineru_token_present"] is False
     assert manifest["artifacts"]["normalized_md"] == result.markdown_path
+    assert manifest["artifacts"]["stage1_input"] == result.stage1_input_path
+    assert stage1_manifest["selected_text_source"] == result.selected_text_source
+    assert stage1_manifest["artifacts"]["stage1_input"] == result.stage1_input_path
+    assert quality_report["candidate_reports"]
+    assert chunks
+    assert {chunk["chunk_source"] for chunk in chunks} == {"selected_stage1_input"}
 
 
 def test_preprocess_manager_defaults_to_local_even_with_ambient_mineru_token(tmp_path: Path, monkeypatch) -> None:
@@ -139,7 +157,7 @@ def test_preprocess_manager_records_hybrid_skip_reason_without_losing_token_stat
     assert manifest["mineru_remote_enabled"] is False
 
 
-def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path) -> None:
+def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "sample.pdf"
     cache_dir = tmp_path / "cache"
     _make_text_pdf(pdf_path)
@@ -156,13 +174,32 @@ def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path) -> None:
     }
     manager = PreprocessManager(config=config, logger=None)
     first = manager.prepare_pdf(str(pdf_path))
+    assert first is not None
+    for path in [
+        first.stage1_input_path,
+        first.stage1_input_manifest_path,
+        first.stage1_quality_report_path,
+    ]:
+        Path(path).unlink()
+
+    monkeypatch.setattr(
+        manager,
+        "_extract_preferred_content",
+        lambda _path: (_ for _ in ()).throw(AssertionError("fresh cache should not re-run parser")),
+    )
     second = manager.prepare_pdf(str(pdf_path))
 
-    assert first is not None
     assert second is not None
     assert first.cache_dir == second.cache_dir
     assert first.manifest_path == second.manifest_path
     assert first.page_index_path == second.page_index_path
+    assert Path(second.stage1_input_path).exists()
+    assert Path(second.stage1_input_manifest_path).exists()
+    assert Path(second.stage1_quality_report_path).exists()
+    assert second.stage1_input_text
+    chunks = json.loads((Path(second.cache_dir) / "chunks.json").read_text(encoding="utf-8"))
+    assert chunks
+    assert {chunk["chunk_source"] for chunk in chunks} == {"selected_stage1_input"}
 
 
 def test_preprocess_manager_sanitizes_bytes_before_writing_json(tmp_path: Path, monkeypatch) -> None:
@@ -179,6 +216,7 @@ def test_preprocess_manager_sanitizes_bytes_before_writing_json(tmp_path: Path, 
             "primary_parser": "mineru_remote",
             "ocr_mode": "off",
             "force_rebuild": "true",
+            "extractor_profile": "fitz",
         },
     }
     manager = PreprocessManager(config=config, logger=None)

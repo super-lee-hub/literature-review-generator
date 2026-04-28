@@ -320,7 +320,18 @@ class JobRunner:
     def _collect_artifact_tracking_info(self, registry: ArtifactRegistry, workspace: JobWorkspace, failure_summary: Optional[str]) -> tuple[List[str], str, List[str]]:
         """收集产物追踪信息"""
         produced_artifacts = [record.path for record in registry.list_records() if record.status == "ready"]
-        log_path = workspace.artifact_path("job.log")
+        registered_log_paths = [
+            record.path
+            for record in registry.list_records()
+            if record.status == "ready" and record.artifact_type == "job_log"
+        ]
+        workspace_log_path = workspace.log_path("job.log")
+        if registered_log_paths:
+            log_path = registered_log_paths[0]
+        elif os.path.exists(workspace_log_path):
+            log_path = workspace_log_path
+        else:
+            log_path = ""
         report_paths = []
         try:
             report_dir = workspace.paths.reports_dir

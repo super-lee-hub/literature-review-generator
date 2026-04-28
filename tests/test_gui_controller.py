@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import configparser
 import importlib
+import json
 import os
 import sys
 import types
@@ -104,7 +105,7 @@ def test_refresh_logs_prunes_deleted_widgets(gui_app_module, monkeypatch) -> Non
     controller.bindings.log_path_labels = [stale_label, live_label]
     controller.bindings.log_views = [stale_view, live_view]
 
-    monkeypatch.setattr(gui_app_module, "_latest_log_excerpt", lambda _language: ("D:/logs/demo.log", "latest lines"))
+    monkeypatch.setattr(gui_app_module, "_latest_log_excerpt", lambda _language, **_kwargs: ("D:/logs/demo.log", "latest lines"))
 
     controller.refresh_logs()
 
@@ -112,6 +113,30 @@ def test_refresh_logs_prunes_deleted_widgets(gui_app_module, monkeypatch) -> Non
     assert controller.bindings.log_views == [live_view]
     assert live_label.text == "D:/logs/demo.log"
     assert live_view.value == "latest lines"
+
+
+def test_latest_log_excerpt_prefers_latest_job_workspace_log(gui_app_module, tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    workspace = output_root / "demo__job123"
+    workspace_log = workspace / "logs" / "job.log"
+    workspace_log.parent.mkdir(parents=True)
+    workspace_log.write_text("workspace log line\n", encoding="utf-8")
+    pointer_dir = output_root / "demo"
+    pointer_dir.mkdir(parents=True)
+    (pointer_dir / "_latest_job.json").write_text(
+        json.dumps({"workspace_path": str(workspace)}),
+        encoding="utf-8",
+    )
+
+    log_path, excerpt = gui_app_module._latest_log_excerpt(
+        "zh-CN",
+        output_root=output_root,
+        project_name="demo",
+        queue_service=None,
+    )
+
+    assert Path(log_path) == workspace_log
+    assert excerpt == "workspace log line"
 
 
 def test_register_client_disconnect_prunes_stale_bindings_and_notify_is_safe(gui_app_module, monkeypatch) -> None:

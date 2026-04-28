@@ -392,6 +392,9 @@ class LiteratureReviewGenerator:
         self.queue_service: Optional[PersistentQueueService] = None
         self._stage1_reuse_report: Optional[Dict[str, Any]] = None
         self._stage1_reused_paper_keys: Set[str] = set()
+        self.root_log_path: str = ""
+        self.workspace_log_path: str = ""
+        self._workspace_log_handler: Optional[logging.Handler] = None
 
         # 身份基断点续传相关变量
         self._checkpoint_processed_papers: Set[str] = set()
@@ -434,6 +437,7 @@ class LiteratureReviewGenerator:
         self.project_name = workspace.project_name
         self.output_dir = workspace.root_dir
         self.summary_file = workspace.artifact_path(f"{workspace.project_name}_summaries.json")
+        self._attach_workspace_log_handler(workspace, artifact_registry)
         
         # 初始化队列服务
         if self.queue_file and os.path.exists(self.queue_file):
@@ -443,6 +447,48 @@ class LiteratureReviewGenerator:
             # 否则使用默认路径
             queue_file_path = Path(workspace.root_dir) / "_queue" / "queue.json"
         self.queue_service = PersistentQueueService(queue_file_path)
+
+    def _attach_workspace_log_handler(self, workspace: JobWorkspace, artifact_registry: ArtifactRegistry) -> None:
+        workspace_log_path = workspace.log_path("job.log")
+        os.makedirs(os.path.dirname(workspace_log_path), exist_ok=True)
+        logger_handlers = list(getattr(self.logger, "handlers", []) or [])
+
+        if self.workspace_log_path == workspace_log_path and self._workspace_log_handler in logger_handlers:
+            return
+
+        if self._workspace_log_handler is not None:
+            try:
+                if hasattr(self.logger, "removeHandler"):
+                    self.logger.removeHandler(self._workspace_log_handler)
+                self._workspace_log_handler.close()
+            except Exception:
+                pass
+
+        formatter = None
+        if logger_handlers:
+            formatter = logger_handlers[0].formatter
+        if formatter is None:
+            formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+
+        if hasattr(self.logger, "addHandler"):
+            handler = logging.FileHandler(workspace_log_path, encoding='utf-8')
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self._workspace_log_handler = handler
+        else:
+            Path(workspace_log_path).touch()
+            self._workspace_log_handler = None
+        self.workspace_log_path = workspace_log_path
+        artifact_registry.register_file(
+            artifact_role="log",
+            artifact_type="job_log",
+            artifact_version="v1",
+            path=workspace_log_path,
+            producer="main.LiteratureReviewGenerator._attach_workspace_log_handler",
+            artifact_id="job_log",
+        )
+        self.logger.info(f"工作区日志已创建: {workspace_log_path}")
 
     def _init_queue_service(self) -> None:
         """初始化队列服务（向后兼容：在没有 job_workspace 时使用）"""
@@ -1120,7 +1166,8 @@ class LiteratureReviewGenerator:
             # 生成日志文件名：使用时间戳确保唯一性
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             log_file = os.path.join(logs_dir, f'llm_reviewer_{timestamp}.log')
-            
+            self.root_log_path = log_file
+
             file_handler = logging.FileHandler(log_file, encoding='utf-8')
             file_handler.setLevel(logging.INFO)
             file_handler.setFormatter(formatter)
@@ -1676,6 +1723,135 @@ class LiteratureReviewGenerator:
             retry_total_rounds=retry_total_rounds,
         )
 
+    def _collect_preprocess_result_metadata(self, preprocess_result: Any, input_kind: str) -> Dict[str, Any]:
+        metadata = {
+            'analysis_input_kind': input_kind,
+            'extractor_used': getattr(preprocess_result, 'extractor_used', ''),
+            'layout_fidelity': getattr(preprocess_result, 'layout_fidelity', ''),
+            'conversion_used': getattr(preprocess_result, 'conversion_used', ''),
+            'used_ocr': bool(getattr(preprocess_result, 'used_ocr', False)),
+            'low_quality': bool(getattr(preprocess_result, 'low_quality', False)),
+            'scanned_like': bool(getattr(preprocess_result, 'scanned_like', False)),
+            'mineru_attempted': bool(getattr(preprocess_result, 'mineru_attempted', False)),
+            'mineru_succeeded': bool(getattr(preprocess_result, 'mineru_succeeded', False)),
+            'mineru_token_present': bool(getattr(preprocess_result, 'mineru_token_present', False)),
+            'mineru_remote_requested': bool(getattr(preprocess_result, 'mineru_remote_requested', False)),
+            'mineru_remote_enabled': bool(getattr(preprocess_result, 'mineru_remote_enabled', False)),
+            'mineru_base_url': getattr(preprocess_result, 'mineru_base_url', ''),
+            'markdown_path': getattr(preprocess_result, 'markdown_path', ''),
+            'plain_text_path': getattr(preprocess_result, 'plain_text_path', ''),
+            'page_index_path': getattr(preprocess_result, 'page_index_path', ''),
+            'structured_json_path': getattr(preprocess_result, 'structured_json_path', ''),
+            'diagnostics_path': getattr(preprocess_result, 'diagnostics_path', ''),
+            'manifest_path': getattr(preprocess_result, 'manifest_path', ''),
+            'stage1_input_path': getattr(preprocess_result, 'stage1_input_path', ''),
+            'stage1_input_manifest_path': getattr(preprocess_result, 'stage1_input_manifest_path', ''),
+            'stage1_quality_report_path': getattr(preprocess_result, 'stage1_quality_report_path', ''),
+            'selected_text_source': getattr(preprocess_result, 'selected_text_source', ''),
+            'stage1_quality_level': getattr(preprocess_result, 'stage1_quality_level', ''),
+            'chunk_count': getattr(preprocess_result, 'chunk_count', 0),
+            'cache_dir': getattr(preprocess_result, 'cache_dir', ''),
+        }
+        quality_report_path = str(metadata.get('stage1_quality_report_path') or '')
+        if quality_report_path:
+            try:
+                with open(quality_report_path, "r", encoding="utf-8") as handle:
+                    quality_report = json.load(handle)
+                metadata['stage1_quality_reasons'] = quality_report.get('stage1_quality_reasons', [])
+            except Exception:
+                metadata['stage1_quality_reasons'] = []
+        else:
+            metadata['stage1_quality_reasons'] = []
+        return metadata
+
+    @staticmethod
+    def _stage1_route_snapshot(strategy: str, metadata: Mapping[str, Any]) -> Dict[str, Any]:
+        def text(key: str, default: str = "") -> str:
+            value = metadata.get(key, default)
+            return str(value if value is not None else default)
+
+        parser_mode = text('parser_mode')
+        primary_parser = text('primary_parser')
+        remote_candidate = (
+            strategy == 'mineru'
+            or parser_mode in {'remote', 'remote_first'}
+            or (parser_mode == 'hybrid' and primary_parser == 'mineru_remote')
+        )
+        requested = bool(metadata.get('mineru_remote_requested')) if 'mineru_remote_requested' in metadata else remote_candidate
+        enabled = bool(metadata.get('mineru_remote_enabled')) if 'mineru_remote_enabled' in metadata else (
+            strategy == 'mineru' or parser_mode in {'remote', 'remote_first'}
+        )
+        attempted = bool(metadata.get('mineru_attempted'))
+        succeeded = bool(metadata.get('mineru_succeeded'))
+        token_present = bool(metadata.get('mineru_token_present'))
+
+        if succeeded:
+            mineru_route = 'mineru_remote_succeeded'
+        elif attempted:
+            mineru_route = 'mineru_remote_failed_local_fallback'
+        elif requested and not enabled:
+            mineru_route = 'hybrid_local_baseline_met'
+        elif requested and enabled and not token_present:
+            mineru_route = 'mineru_token_missing'
+        elif requested and enabled:
+            mineru_route = 'mineru_remote_not_attempted'
+        elif not requested:
+            mineru_route = 'mineru_not_requested'
+        else:
+            mineru_route = 'mineru_not_used'
+
+        return {
+            'strategy': strategy,
+            'preprocess_strategy': strategy,
+            'preprocess_profile': text('preprocess_profile', strategy),
+            'parser_mode': parser_mode,
+            'primary_parser': primary_parser,
+            'fallback_parser': text('fallback_parser'),
+            'allow_local_parse_fallback': bool(metadata.get('allow_local_parse_fallback')),
+            'extractor_used': text('extractor_used', 'unknown'),
+            'selected_text_source': text('selected_text_source') or text('analysis_input_kind'),
+            'stage1_quality_level': text('stage1_quality_level'),
+            'mineru_token_present': token_present,
+            'mineru_remote_requested': requested,
+            'mineru_remote_enabled': enabled,
+            'mineru_attempted': attempted,
+            'mineru_succeeded': succeeded,
+            'mineru_route': mineru_route,
+        }
+
+    @staticmethod
+    def _format_stage1_route_snapshot(snapshot: Mapping[str, Any]) -> str:
+        return (
+            "阶段一输入路由: "
+            f"strategy={snapshot.get('strategy')}, "
+            f"parser_mode={snapshot.get('parser_mode')}, "
+            f"extractor_used={snapshot.get('extractor_used')}, "
+            f"selected_text_source={snapshot.get('selected_text_source')}, "
+            f"stage1_quality_level={snapshot.get('stage1_quality_level')}, "
+            f"mineru_remote_requested={snapshot.get('mineru_remote_requested')}, "
+            f"mineru_remote_enabled={snapshot.get('mineru_remote_enabled')}, "
+            f"mineru_attempted={snapshot.get('mineru_attempted')}, "
+            f"mineru_succeeded={snapshot.get('mineru_succeeded')}, "
+            f"mineru_route={snapshot.get('mineru_route')}"
+        )
+
+    @staticmethod
+    def _stage1_route_human_message(snapshot: Mapping[str, Any]) -> str:
+        route = str(snapshot.get('mineru_route') or '')
+        if route == 'hybrid_local_baseline_met':
+            return "配置把 MinerU 作为候选，但本地基线达标，所以本篇未发起 MinerU 请求。"
+        if route == 'mineru_token_missing':
+            return "配置要求 MinerU 远程解析，但 MINERU_API_TOKEN 缺失，所以本篇未发起 MinerU 请求。"
+        if route == 'mineru_remote_failed_local_fallback':
+            return "MinerU 远程解析已尝试但未成功，本篇已按配置回退到本地解析结果。"
+        if route == 'mineru_remote_not_attempted':
+            return "配置要求 MinerU 远程解析，但远程请求未实际发起；请检查配置和预处理诊断。"
+        if route == 'mineru_not_requested':
+            return "本篇阶段一输入没有请求 MinerU 远程解析，使用当前本地/兼容解析路径。"
+        if route == 'mineru_remote_succeeded':
+            return "本篇阶段一输入已使用 MinerU 远程解析结果。"
+        return ""
+
     def _load_stage1_prompt_template(self) -> str:
         """加载阶段一结构化分析提示词模板。"""
         with open('prompts/optimized_prompt_analyze_router.txt', 'r', encoding='utf-8') as handle:
@@ -1720,6 +1896,13 @@ class LiteratureReviewGenerator:
                     self.preprocess_manager.force_rebuild = True
                     self.preprocess_manager.allow_local_parse_fallback = original_allow_local_parse_fallback
                     self.preprocess_manager.force_docling_strategy = False
+
+                preprocess_metadata.update({
+                    'parser_mode': self.preprocess_manager.parser_mode,
+                    'primary_parser': self.preprocess_manager.primary_parser,
+                    'fallback_parser': self.preprocess_manager.fallback_parser,
+                    'allow_local_parse_fallback': self.preprocess_manager.allow_local_parse_fallback,
+                })
                 
                 # 准备PDF
                 preprocess_result = self.preprocess_manager.prepare_pdf(
@@ -1727,41 +1910,21 @@ class LiteratureReviewGenerator:
                 )
 
                 if preprocess_result:
-                    stage1_text = (
-                        preprocess_result.markdown_text
-                        if self.preprocess_manager.use_markdown_as_stage1_input
-                        else preprocess_result.plain_text
-                    )
+                    stage1_text = preprocess_result.stage1_input_text
+                    input_kind = preprocess_result.selected_text_source or "stage1_input"
+                    preprocess_metadata.update(self._collect_preprocess_result_metadata(preprocess_result, input_kind))
                     if stage1_text and len(stage1_text.strip()) >= 500:
-                        input_kind = "normalized_markdown" if self.preprocess_manager.use_markdown_as_stage1_input else "plain_text"
-                        preprocess_metadata.update({
-                            'analysis_input_kind': input_kind,
-                            'extractor_used': preprocess_result.extractor_used,
-                            'layout_fidelity': preprocess_result.layout_fidelity,
-                            'conversion_used': preprocess_result.conversion_used,
-                            'used_ocr': preprocess_result.used_ocr,
-                            'low_quality': preprocess_result.low_quality,
-                            'scanned_like': preprocess_result.scanned_like,
-                            'mineru_attempted': preprocess_result.mineru_attempted,
-                            'mineru_succeeded': preprocess_result.mineru_succeeded,
-                            'mineru_token_present': preprocess_result.mineru_token_present,
-                            'mineru_remote_requested': preprocess_result.mineru_remote_requested,
-                            'mineru_remote_enabled': preprocess_result.mineru_remote_enabled,
-                            'mineru_base_url': preprocess_result.mineru_base_url,
-                            'markdown_path': preprocess_result.markdown_path,
-                            'plain_text_path': preprocess_result.plain_text_path,
-                            'page_index_path': preprocess_result.page_index_path,
-                            'structured_json_path': preprocess_result.structured_json_path,
-                            'diagnostics_path': preprocess_result.diagnostics_path,
-                            'manifest_path': preprocess_result.manifest_path,
-                            'chunk_count': preprocess_result.chunk_count,
-                            'cache_dir': preprocess_result.cache_dir,
-                        })
                         self.logger.info(
                             f"阶段一输入使用预处理结果: {os.path.basename(pdf_path)} -> "
                             f"{preprocess_result.extractor_used} / {input_kind} (策略: {preprocess_strategy})"
                         )
                         return stage1_text, preprocess_metadata
+                    if preprocess_result.stage1_quality_level in {"REPROCESS", "BLOCK"}:
+                        preprocess_metadata['analysis_input_kind'] = preprocess_result.selected_text_source or 'blocked_stage1_input'
+                        self.logger.warning(
+                            f"阶段一输入质量闸阻止当前预处理结果: {os.path.basename(pdf_path)} "
+                            f"({preprocess_result.stage1_quality_level})"
+                        )
 
                     self.logger.warning(
                         f"预处理结果文本过短，尝试其他策略: {os.path.basename(pdf_path)} "
@@ -1786,6 +1949,10 @@ class LiteratureReviewGenerator:
             preprocess_metadata.update({
                 'analysis_input_kind': 'legacy_text',
                 'extractor_used': 'legacy_pdf_extractor',
+                'parser_mode': 'legacy',
+                'primary_parser': 'legacy_pdf_extractor',
+                'fallback_parser': '',
+                'allow_local_parse_fallback': False,
                 'layout_fidelity': 'plain_text_only',
                 'conversion_used': 'native_pdf',
                 'used_ocr': False,
@@ -1794,7 +1961,10 @@ class LiteratureReviewGenerator:
                 'mineru_attempted': False,
                 'mineru_succeeded': False,
                 'mineru_token_present': bool(mineru_api_token),
+                'mineru_remote_requested': False,
+                'mineru_remote_enabled': False,
                 'mineru_base_url': mineru_base_url,
+                'selected_text_source': 'legacy_text',
             })
             return legacy_text, preprocess_metadata
 
@@ -2688,7 +2858,7 @@ class LiteratureReviewGenerator:
                     'failure_reason': failure_reason
                 }
             
-            # 四级尝试序列：hybrid → 本地强制 Docling → 强制 MinerU remote（已配置时）→ legacy extractor
+            # Keep the existing parser retry route: hybrid -> forced Docling -> MinerU remote if configured -> legacy.
             mineru_configured = bool(
                 (
                     getattr(self.preprocess_manager, 'mineru_api_token', '')
@@ -2718,10 +2888,20 @@ class LiteratureReviewGenerator:
                 quality_reason: str,
                 extractor_name: Optional[str] = None,
             ) -> None:
+                route_snapshot = self._stage1_route_snapshot(strategy_name, current_metadata)
                 attempt_history.append({
                     'preprocess_strategy': strategy_name,
-                    'preprocess_profile': str(current_metadata.get('preprocess_profile', strategy_name)),
-                    'extractor_used': extractor_name or str(current_metadata.get('extractor_used', 'unknown')),
+                    'preprocess_profile': str(route_snapshot.get('preprocess_profile') or strategy_name),
+                    'parser_mode': str(route_snapshot.get('parser_mode') or ''),
+                    'extractor_used': extractor_name or str(route_snapshot.get('extractor_used') or 'unknown'),
+                    'selected_text_source': str(route_snapshot.get('selected_text_source') or ''),
+                    'stage1_quality_level': str(route_snapshot.get('stage1_quality_level') or ''),
+                    'mineru_remote_requested': bool(route_snapshot.get('mineru_remote_requested')),
+                    'mineru_remote_enabled': bool(route_snapshot.get('mineru_remote_enabled')),
+                    'mineru_attempted': bool(route_snapshot.get('mineru_attempted')),
+                    'mineru_succeeded': bool(route_snapshot.get('mineru_succeeded')),
+                    'mineru_route': str(route_snapshot.get('mineru_route') or ''),
+                    'stage1_route': route_snapshot,
                     'model_used': model_name,
                     'quality_reason': quality_reason,
                     'success': False,
@@ -2736,6 +2916,12 @@ class LiteratureReviewGenerator:
                 self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在准备阶段一输入 (策略: {strategy}): {os.path.basename(pdf_path)}")
                 
                 pdf_text, preprocess_metadata = self._prepare_stage1_input(pdf_path, strategy)
+                stage1_route_snapshot = self._stage1_route_snapshot(strategy, preprocess_metadata)
+                preprocess_metadata['stage1_route'] = stage1_route_snapshot
+                self.logger.info(self._format_stage1_route_snapshot(stage1_route_snapshot))
+                route_human_message = self._stage1_route_human_message(stage1_route_snapshot)
+                if route_human_message:
+                    self.logger.info(route_human_message)
 
                 if not pdf_text or len(pdf_text.strip()) < 500:  # type: ignore
                     failure_reason = f"阶段一输入准备失败或内容过少({len(pdf_text) if pdf_text else 0}字符)"  # type: ignore
@@ -2754,20 +2940,6 @@ class LiteratureReviewGenerator:
                     f"阶段一输入准备成功 (策略: {strategy}): {len(pdf_text)}字符 "
                     f"({input_kind} / {extractor_used})"
                 )
-                
-                # 记录为什么没用 MinerU 的原因
-                if strategy == 'hybrid' and not preprocess_metadata.get('mineru_succeeded', False):
-                    if not preprocess_metadata.get('mineru_remote_requested', False):
-                        self.logger.info("未触发 MinerU: 当前预处理配置未请求远程解析")
-                    elif not preprocess_metadata.get('mineru_remote_enabled', False):
-                        self.logger.info("未触发 MinerU: hybrid 模式判定本地基线质量可接受，无需使用远程解析")
-                    elif not preprocess_metadata.get('mineru_token_present', False):
-                        self.logger.info("未触发 MinerU: 已请求远程解析，但 MINERU_API_TOKEN 不存在")
-                    elif not preprocess_metadata.get('mineru_attempted', False):
-                        self.logger.info("未触发 MinerU: 远程解析未实际发起")
-                    else:
-                        self.logger.info("未使用 MinerU: MinerU 尝试失败，使用本地解析作为回退")
-
                 self._check_cancelled()
 
                 try:
@@ -2985,7 +3157,15 @@ class LiteratureReviewGenerator:
                     detailed_reason += (
                         f"  尝试 {i+1} (策略: {attempt['preprocess_strategy']}, "
                         f"Profile: {attempt.get('preprocess_profile', '')}, "
+                        f"Parser: {attempt.get('parser_mode', '')}, "
                         f"提取器: {attempt['extractor_used']}, "
+                        f"Source: {attempt.get('selected_text_source', '')}, "
+                        f"Quality: {attempt.get('stage1_quality_level', '')}, "
+                        f"MinerU: requested={attempt.get('mineru_remote_requested')}, "
+                        f"enabled={attempt.get('mineru_remote_enabled')}, "
+                        f"attempted={attempt.get('mineru_attempted')}, "
+                        f"succeeded={attempt.get('mineru_succeeded')}, "
+                        f"route={attempt.get('mineru_route', '')}, "
                         f"模型: {attempt['model_used']}): {attempt['quality_reason']}\n"
                     )
                 
