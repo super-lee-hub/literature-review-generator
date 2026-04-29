@@ -58,7 +58,9 @@ def apply_validation_compat_sections(
 
     normalized.setdefault("Performance", {})
     settings = read_validation_settings(normalized)
-    normalized["Validation"] = settings.to_section()
+    validation_section = dict(normalized.get("Validation", {}))
+    validation_section.update(settings.to_section())
+    normalized["Validation"] = validation_section
     normalized["Performance"]["enable_stage1_validation"] = "true" if settings.stage1_enabled else "false"
     normalized["Performance"]["enable_stage2_validation"] = "true" if settings.stage2_enabled else "false"
     return normalized

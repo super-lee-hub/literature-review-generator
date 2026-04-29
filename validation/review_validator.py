@@ -1,10 +1,12 @@
 ﻿from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import hashlib
+import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from services.citation_manifest import normalize_citation_set_key
@@ -402,18 +404,44 @@ class ReviewValidator:
         self.preprocess_evidence = preprocess_evidence or {}
         self.paper_metadata = paper_metadata or {}
         self.evidence_loader = PreprocessEvidenceLoader()
+        self._resolver_context_cache: Dict[str, EvidenceResolverContext] = {}
+        self._resolver_context_cache_lock = threading.Lock()
 
     def validate(
         self,
         progress_callback: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
+        max_workers: int = 1,
     ) -> ReviewValidationReport:
         citation_sets = self._get_citation_sets_from_manifest()
-        citation_results: List[CitationValidationResult] = []
         total = len(citation_sets)
-        for index, bundle in enumerate(citation_sets, start=1):
-            if progress_callback is not None:
-                progress_callback(index, total, bundle)
-            citation_results.append(self._validate_citation_set(bundle))
+        try:
+            requested_workers = int(max_workers or 1)
+        except (TypeError, ValueError):
+            requested_workers = 1
+        worker_count = min(max(1, requested_workers), max(total, 1))
+        if worker_count <= 1 or total <= 1:
+            citation_results: List[CitationValidationResult] = []
+            for index, bundle in enumerate(citation_sets, start=1):
+                if progress_callback is not None:
+                    progress_callback(index, total, bundle)
+                citation_results.append(self._validate_citation_set(bundle))
+            return _build_review_validation_report(citation_results)
+
+        ordered_results: List[Optional[CitationValidationResult]] = [None] * total
+        completed = 0
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_bundle = {
+                executor.submit(self._validate_citation_set, bundle): (index, bundle)
+                for index, bundle in enumerate(citation_sets)
+            }
+            for future in as_completed(future_to_bundle):
+                index, bundle = future_to_bundle[future]
+                ordered_results[index] = future.result()
+                completed += 1
+                if progress_callback is not None:
+                    progress_callback(completed, total, bundle)
+
+        citation_results = [item for item in ordered_results if item is not None]
         return _build_review_validation_report(citation_results)
 
     def _get_block_from_review_draft(self, block_id: str) -> Optional[Dict[str, Any]]:
@@ -535,6 +563,11 @@ class ReviewValidator:
         return claim_units
 
     def _resolver_context_for_paper(self, paper_id: str, paper_artifact: Dict[str, Any]) -> EvidenceResolverContext:
+        with self._resolver_context_cache_lock:
+            cached_context = self._resolver_context_cache.get(paper_id)
+        if cached_context is not None:
+            return cached_context
+
         paper_preprocess_evidence = self.preprocess_evidence.get(paper_id, {}) or paper_artifact.get("analysis", {}).get("preprocess", {})
         paper_specific_metadata = self.paper_metadata.get(paper_id, {})
         evidence = self.evidence_loader.load_evidence(
@@ -547,7 +580,7 @@ class ReviewValidator:
             visual_artifacts_path=paper_preprocess_evidence.get("visual_artifacts_path"),
             diagnostics_path=paper_preprocess_evidence.get("diagnostics_path"),
         )
-        return EvidenceResolverContext(
+        context = EvidenceResolverContext(
             paper_key=paper_id,
             paper_identity=paper_artifact.get("paper_identity", {}),
             preprocess_artifacts={
@@ -564,6 +597,8 @@ class ReviewValidator:
             preprocess_evidence=paper_preprocess_evidence,
             paper_metadata=paper_specific_metadata,
         )
+        with self._resolver_context_cache_lock:
+            return self._resolver_context_cache.setdefault(paper_id, context)
 
     def _validate_citation_set(self, bundle: Dict[str, Any]) -> CitationValidationResult:
         citation_set_key = str(bundle.get("citation_set_key") or bundle.get("bundle_id") or "unknown")

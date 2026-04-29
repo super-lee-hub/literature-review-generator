@@ -107,6 +107,9 @@ enable_stage2_validation = true
 stage1_enabled = false
 stage2_enabled = true
 keep_checkpoints_after_completion = false
+# Optional override for review validation parallelism.
+# Leave commented to reuse [Performance].max_workers.
+# max_workers = 3
 
 [Retry_Settings]
 # 自动重试设置 - 当文献处理失败时的重试机制

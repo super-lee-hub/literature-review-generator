@@ -10,7 +10,8 @@ import json
 import traceback
 import hashlib
 import time
-from typing import Optional, Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Dict, Any, List, Mapping
 from datetime import datetime
 import configparser
 
@@ -52,6 +53,50 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _get_config_section(config_obj: Any, section_name: str) -> Dict[str, Any]:
+    if not config_obj:
+        return {}
+    has_section = getattr(config_obj, "has_section", None)
+    items = getattr(config_obj, "items", None)
+    if callable(has_section) and callable(items):
+        try:
+            if has_section(section_name):
+                return {str(key): value for key, value in items(section_name)}
+        except Exception:
+            return {}
+    if isinstance(config_obj, Mapping):
+        section = config_obj.get(section_name, {})
+        return dict(section) if isinstance(section, Mapping) else {}
+    getter = getattr(config_obj, "get", None)
+    if callable(getter):
+        try:
+            section = getter(section_name)
+        except TypeError:
+            return {}
+        except Exception:
+            return {}
+        return dict(section) if isinstance(section, Mapping) else {}
+    return {}
+
+
+def _get_validation_max_workers(generator_instance: Any) -> int:
+    config_obj = getattr(generator_instance, "config", None)
+    validation_config = _get_config_section(config_obj, "Validation")
+    performance_config = _get_config_section(config_obj, "Performance")
+    for configured_value in (
+        validation_config.get("max_workers"),
+        validation_config.get("parallel_workers"),
+        performance_config.get("validation_max_workers"),
+        performance_config.get("max_workers"),
+    ):
+        if configured_value in (None, ""):
+            continue
+        parsed = _coerce_positive_int(configured_value, 0)
+        if parsed > 0:
+            return parsed
+    return 1
 
 
 def _get_validator_context_max_tokens(generator_instance: Any) -> int:
@@ -467,12 +512,23 @@ def _bundle_progress_label(bundle: Dict[str, Any]) -> str:
     return f"{preview} (papers={paper_count}, blocks={block_count}, claim_units={claim_unit_count})"
 
 
-def _run_base_review_validation(validator: Any, progress_callback: Any = None) -> Any:
-    if progress_callback is None:
+def _run_base_review_validation(validator: Any, progress_callback: Any = None, max_workers: int = 1) -> Any:
+    worker_count = _coerce_positive_int(max_workers, 1)
+    validate_kwargs: Dict[str, Any] = {}
+    if progress_callback is not None:
+        validate_kwargs["progress_callback"] = progress_callback
+    if worker_count > 1:
+        validate_kwargs["max_workers"] = worker_count
+    if not validate_kwargs:
         return validator.validate()
     try:
-        return validator.validate(progress_callback=progress_callback)
+        return validator.validate(**validate_kwargs)
     except TypeError:
+        if progress_callback is not None:
+            try:
+                return validator.validate(progress_callback=progress_callback)
+            except TypeError:
+                pass
         return validator.validate()
 
 
@@ -848,13 +904,18 @@ def _run_stronger_ai_bundle_validation(generator_instance: Any, result: Any) -> 
     )
 
 
-def _run_adjudication_ladder(generator_instance: Any, citation_results: List[Any]) -> List[Any]:
-    adjudicated_results: List[Any] = []
+def _run_adjudication_ladder(generator_instance: Any, citation_results: List[Any], max_workers: int = 1) -> List[Any]:
     logger = getattr(generator_instance, "logger", None)
     total = len(citation_results)
+    try:
+        requested_workers = int(max_workers or 1)
+    except (TypeError, ValueError):
+        requested_workers = 1
+    worker_count = min(max(1, requested_workers), max(total, 1))
     if logger and total:
-        logger.info(f"Starting AI adjudication for {total} citation set(s).")
-    for index, result in enumerate(citation_results, start=1):
+        logger.info(f"Starting AI adjudication for {total} citation set(s) with max_workers={worker_count}.")
+
+    def _run_one(index: int, result: Any) -> tuple[int, Any]:
         citation_set_key = str(getattr(result, "citation_set_key", "") or getattr(result, "citation_id", "") or "unknown")
         preview = citation_set_key if len(citation_set_key) <= 80 else f"{citation_set_key[:77]}..."
         bundle_started_at = time.monotonic()
@@ -868,7 +929,26 @@ def _run_adjudication_ladder(generator_instance: Any, citation_results: List[Any
         if logger:
             elapsed = time.monotonic() - bundle_started_at
             logger.info(f"[adjudication {index}/{total}] done in {elapsed:.1f}s -> {preview}")
-        adjudicated_results.append(final)
+        return index - 1, final
+
+    if worker_count <= 1 or total <= 1:
+        adjudicated_results: List[Any] = []
+        for index, result in enumerate(citation_results, start=1):
+            _result_index, final = _run_one(index, result)
+            adjudicated_results.append(final)
+        return adjudicated_results
+
+    ordered_results: List[Optional[Any]] = [None] * total
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(_run_one, index, result)
+            for index, result in enumerate(citation_results, start=1)
+        ]
+        for future in as_completed(futures):
+            result_index, final = future.result()
+            ordered_results[result_index] = final
+
+    adjudicated_results = [item for item in ordered_results if item is not None]
     return adjudicated_results
 
 
@@ -1156,16 +1236,27 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
         from validation.review_validator import ReviewValidator
 
         validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
+        validation_max_workers = _get_validation_max_workers(generator_instance)
         def _progress_callback(index: int, total: int, bundle: Dict[str, Any]) -> None:
             generator_instance.logger.info(f"[base validation {index}/{total}] {_bundle_progress_label(bundle)}")
 
-        generator_instance.logger.info("Running base review validation across citation sets.")
+        generator_instance.logger.info(
+            f"Running base review validation across citation sets with max_workers={validation_max_workers}."
+        )
         base_started_at = time.monotonic()
-        base_report = _run_base_review_validation(validator, progress_callback=_progress_callback)
+        base_report = _run_base_review_validation(
+            validator,
+            progress_callback=_progress_callback,
+            max_workers=validation_max_workers,
+        )
         generator_instance.logger.info(
             f"Base review validation finished in {time.monotonic() - base_started_at:.1f}s."
         )
-        enriched_results = _run_adjudication_ladder(generator_instance, base_report.citation_results)
+        enriched_results = _run_adjudication_ladder(
+            generator_instance,
+            base_report.citation_results,
+            max_workers=validation_max_workers,
+        )
         final_report = _build_report_from_results(enriched_results)
 
         touched_summaries = _apply_summary_repairs(generator_instance, enriched_results, paper_artifacts)
@@ -1179,8 +1270,16 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             if review_draft is None or citation_manifest is None:
                 return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
             validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
-            revalidated = _run_base_review_validation(validator, progress_callback=_progress_callback)
-            rerun_results = _run_adjudication_ladder(generator_instance, revalidated.citation_results)
+            revalidated = _run_base_review_validation(
+                validator,
+                progress_callback=_progress_callback,
+                max_workers=validation_max_workers,
+            )
+            rerun_results = _run_adjudication_ladder(
+                generator_instance,
+                revalidated.citation_results,
+                max_workers=validation_max_workers,
+            )
             final_report = _build_report_from_results(rerun_results)
 
         manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]

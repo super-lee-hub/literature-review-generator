@@ -49,6 +49,24 @@ def test_apply_validation_compat_sections_reads_legacy_checkpoint_flag_from_perf
     assert normalized["Validation"]["keep_checkpoints_after_completion"] == "true"
 
 
+def test_apply_validation_compat_sections_preserves_validation_extensions() -> None:
+    normalized = apply_validation_compat_sections(
+        {
+            "Performance": {
+                "enable_stage2_validation": "true",
+            },
+            "Validation": {
+                "max_workers": "4",
+                "evidence_resolver_enabled": "true",
+            },
+        }
+    )
+
+    assert normalized["Validation"]["stage2_enabled"] == "true"
+    assert normalized["Validation"]["max_workers"] == "4"
+    assert normalized["Validation"]["evidence_resolver_enabled"] == "true"
+
+
 def test_compat_config_view_updates_raw_config_in_place() -> None:
     config = {
         "Performance": {

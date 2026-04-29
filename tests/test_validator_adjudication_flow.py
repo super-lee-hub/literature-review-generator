@@ -1,4 +1,6 @@
 import types
+import time
+import configparser
 
 from validation.review_validator import CitationValidationResult, ReviewValidationReport, RootCause, ValidationConclusion
 import validator
@@ -48,6 +50,16 @@ def _base_result() -> CitationValidationResult:
         evidence_status="evidence_gap",
         disposition="manual_review",
     )
+
+
+def _base_result_with_key(key: str) -> CitationValidationResult:
+    result = _base_result()
+    result.citation_id = key
+    result.citation_set_key = key
+    result.paper_id = key
+    result.paper_ids = [key]
+    result.details["per_paper_evidence_packets"] = {key: []}
+    return result
 
 
 def _dummy_generator():
@@ -203,3 +215,44 @@ def test_run_review_validation_reaches_manual_review_only_after_stronger_pass(mo
     assert final_result.details["adjudication_stage"] == "stronger"
     assert final_result.details["escalated"] is True
     assert final_result.conclusion == ValidationConclusion.NEEDS_REVIEW
+
+
+def test_run_adjudication_ladder_parallel_preserves_input_order(monkeypatch):
+    generator = _dummy_generator()
+    citation_results = [
+        _base_result_with_key("slow"),
+        _base_result_with_key("fast"),
+        _base_result_with_key("middle"),
+    ]
+
+    def _fake_primary(_generator, result):
+        delays = {"slow": 0.03, "fast": 0.0, "middle": 0.01}
+        time.sleep(delays[result.citation_set_key])
+        return result
+
+    monkeypatch.setattr(validator, "_run_ai_bundle_validation", _fake_primary)
+    monkeypatch.setattr(validator, "_needs_stronger_ai_adjudication", lambda _result: False)
+
+    adjudicated = validator._run_adjudication_ladder(generator, citation_results, max_workers=3)
+
+    assert [result.citation_set_key for result in adjudicated] == ["slow", "fast", "middle"]
+
+
+def test_get_validation_max_workers_reads_configparser_section():
+    parser = configparser.ConfigParser()
+    parser["Performance"] = {"max_workers": "2"}
+    parser["Validation"] = {"max_workers": "4"}
+    generator = types.SimpleNamespace(config=parser)
+
+    assert validator._get_validation_max_workers(generator) == 4
+
+
+def test_get_validation_max_workers_falls_back_to_performance_when_validation_is_invalid():
+    generator = types.SimpleNamespace(
+        config={
+            "Performance": {"max_workers": "3"},
+            "Validation": {"max_workers": "0"},
+        }
+    )
+
+    assert validator._get_validation_max_workers(generator) == 3

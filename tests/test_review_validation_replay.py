@@ -94,3 +94,24 @@ def test_review_validator_validate_emits_progress_callback_for_each_bundle() -> 
     assert seen[0][0] == 1
     assert seen[-1][0] == len(seen)
     assert all(total == len(seen) for _, total, _ in seen)
+
+
+def test_review_validator_parallel_validate_preserves_report_order() -> None:
+    review_draft, citation_manifest, paper_artifacts = _load_fixture_bundle()
+    sequential_report = ReviewValidator(review_draft, citation_manifest, paper_artifacts).validate()
+    seen: list[tuple[int, int, str]] = []
+
+    def _progress(index: int, total: int, bundle: dict) -> None:
+        seen.append((index, total, str(bundle.get("citation_set_key") or "")))
+
+    parallel_report = ReviewValidator(review_draft, citation_manifest, paper_artifacts).validate(
+        progress_callback=_progress,
+        max_workers=2,
+    )
+
+    sequential_keys = [result.citation_set_key for result in sequential_report.citation_results]
+    parallel_keys = [result.citation_set_key for result in parallel_report.citation_results]
+    assert parallel_keys == sequential_keys
+    assert parallel_report.total_citations == sequential_report.total_citations
+    assert len(seen) == sequential_report.total_citations
+    assert sorted(index for index, _, _ in seen) == list(range(1, sequential_report.total_citations + 1))
