@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from services.stage1_input_completeness import (
+    build_completeness_metrics,
+    has_blocking_stage1_reason,
+    is_blocked_stage1_quality,
+)
 from services.stage1_input_selector import select_stage1_input
 
 
@@ -105,20 +110,33 @@ def audit_paper_artifact(artifact_path: Path) -> Dict[str, Any]:
     selected_source = str(preprocess.get("selected_text_source") or "")
     reasons = list(preprocess.get("stage1_quality_reasons") or [])
     audit_origin = "native_stage1_quality" if existing_level else "legacy_rescore"
+    completeness_metrics = _stage1_completeness_metrics(payload, preprocess)
+    completeness_reasons = list(completeness_metrics.get("reasons") or [])
+    reasons = sorted({str(reason) for reason in reasons + completeness_reasons if str(reason).strip()})
 
     if not existing_level:
         selected_source, existing_level, reasons = _score_legacy_preprocess(preprocess)
+        completeness_metrics = _stage1_completeness_metrics(payload, preprocess)
+        completeness_reasons = list(completeness_metrics.get("reasons") or [])
+        reasons = sorted({str(reason) for reason in reasons + completeness_reasons if str(reason).strip()})
+
+    refreshed_after_summary = _stage1_artifact_newer_than_summary(artifact_path, payload, preprocess)
+    if refreshed_after_summary:
+        reasons = sorted({*reasons, "stage1_input_newer_than_summary"})
 
     is_fallback = existing_level == "FALLBACK"
     if audit_origin == "legacy_rescore":
-        is_bad = existing_level in LEGACY_STALE_LEVELS
+        is_bad = existing_level in LEGACY_STALE_LEVELS or has_blocking_stage1_reason(reasons)
     else:
-        is_bad = existing_level in STALE_LEVELS
+        is_bad = is_blocked_stage1_quality(existing_level, reasons)
+    if refreshed_after_summary:
+        is_bad = True
     summary_status = _summary_status(
         quality_level=existing_level,
         is_bad=is_bad,
         is_fallback=is_fallback,
         audit_origin=audit_origin,
+        reasons=reasons,
     )
     return {
         "paper_artifact_path": str(artifact_path),
@@ -129,6 +147,10 @@ def audit_paper_artifact(artifact_path: Path) -> Dict[str, Any]:
         "selected_text_source": selected_source,
         "stage1_quality_level": existing_level,
         "stage1_quality_reasons": reasons,
+        "completeness_metrics": completeness_metrics,
+        "selected_text_length": int(completeness_metrics.get("selected_text_length") or 0),
+        "page_count": int(completeness_metrics.get("page_count") or 0),
+        "stage1_input_newer_than_summary": refreshed_after_summary,
         "is_fallback_stage1_input": is_fallback,
         "is_bad_stage1_input": is_bad,
         "summary_status": summary_status,
@@ -164,6 +186,9 @@ def write_reports(
             "selected_text_source",
             "stage1_quality_level",
             "stage1_quality_reasons",
+            "selected_text_length",
+            "page_count",
+            "stage1_input_newer_than_summary",
             "is_fallback_stage1_input",
             "is_bad_stage1_input",
             "summary_status",
@@ -191,9 +216,94 @@ def _score_legacy_preprocess(preprocess: Dict[str, Any]) -> tuple[str, str, List
     return selection.selected_source, selection.quality_level, selection.stage1_quality_reasons
 
 
-def _summary_status(*, quality_level: str, is_bad: bool, is_fallback: bool, audit_origin: str) -> str:
+def _stage1_completeness_metrics(payload: Dict[str, Any], preprocess: Dict[str, Any]) -> Dict[str, Any]:
+    stage1_inputs = payload.get("stage1_inputs") if isinstance(payload.get("stage1_inputs"), dict) else {}
+    manifest = _load_json(_resolve_stage1_path(preprocess, stage1_inputs, "stage1_input_manifest_path"), default={})
+    quality_report = _load_json(_resolve_stage1_path(preprocess, stage1_inputs, "stage1_quality_report_path"), default={})
+    stage1_text = _read_text(_resolve_stage1_path(preprocess, stage1_inputs, "stage1_input_path"))
+
+    existing_metrics = manifest.get("completeness_metrics") if isinstance(manifest, dict) else {}
+    if not isinstance(existing_metrics, dict):
+        existing_metrics = {}
+    preprocess_metrics = preprocess.get("stage1_completeness_metrics") or preprocess.get("completeness_metrics") or {}
+    if isinstance(preprocess_metrics, dict):
+        existing_metrics = {**preprocess_metrics, **existing_metrics}
+    candidate_lengths: Dict[str, int] = {}
+    if isinstance(quality_report, dict):
+        for report in quality_report.get("candidate_reports") or []:
+            if isinstance(report, dict):
+                source = str(report.get("source") or "").strip()
+                if source:
+                    candidate_lengths[source] = int(report.get("text_length") or 0)
+    if not candidate_lengths and isinstance(existing_metrics.get("candidate_lengths"), dict):
+        candidate_lengths = {
+            str(source): int(length or 0)
+            for source, length in dict(existing_metrics.get("candidate_lengths") or {}).items()
+        }
+
+    selected_text_length = None
+    if not stage1_text:
+        selected_text_length = int(
+            manifest.get("selected_text_length")
+            or preprocess.get("selected_text_length")
+            or existing_metrics.get("selected_text_length")
+            or 0
+        )
+    page_count = int(
+        manifest.get("page_count")
+        or preprocess.get("stage1_page_count")
+        or preprocess.get("page_count")
+        or existing_metrics.get("page_count")
+        or 0
+    )
+    chunk_count = None
+    if isinstance(existing_metrics, dict) and existing_metrics.get("chunk_count") is not None:
+        chunk_count = int(existing_metrics.get("chunk_count") or 0)
+
+    return build_completeness_metrics(
+        text=stage1_text,
+        page_count=page_count,
+        candidate_lengths=candidate_lengths,
+        selected_text_length=selected_text_length,
+        chunk_count=chunk_count,
+    )
+
+
+def _resolve_stage1_path(preprocess: Dict[str, Any], stage1_inputs: Dict[str, Any], key: str) -> Path:
+    return _resolve_path(preprocess.get(key) or stage1_inputs.get(key) or "")
+
+
+def _stage1_artifact_newer_than_summary(
+    artifact_path: Path,
+    payload: Dict[str, Any],
+    preprocess: Dict[str, Any],
+) -> bool:
+    stage1_inputs = payload.get("stage1_inputs") if isinstance(payload.get("stage1_inputs"), dict) else {}
+    candidate_paths = [
+        _resolve_stage1_path(preprocess, stage1_inputs, "stage1_input_manifest_path"),
+        _resolve_stage1_path(preprocess, stage1_inputs, "stage1_quality_report_path"),
+        _resolve_stage1_path(preprocess, stage1_inputs, "stage1_input_path"),
+    ]
+    try:
+        summary_mtime = artifact_path.stat().st_mtime
+    except OSError:
+        return False
+    for path in candidate_paths:
+        try:
+            if path.exists() and path.stat().st_mtime > summary_mtime + 1:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _summary_status(*, quality_level: str, is_bad: bool, is_fallback: bool, audit_origin: str, reasons: List[str]) -> str:
+    if is_bad and "stage1_input_newer_than_summary" in reasons:
+        return "stale_due_to_refreshed_stage1_input"
     if is_bad and audit_origin == "legacy_rescore":
         return "stale_due_to_legacy_bad_stage1_input"
+    if is_bad and has_blocking_stage1_reason(reasons):
+        return "stale_due_to_incomplete_stage1_input"
     if is_bad:
         return "stale_due_to_blocked_stage1_input"
     if is_fallback:

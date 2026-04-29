@@ -165,6 +165,13 @@ class JobRunner:
         alias = "".join(alias_chars).strip(" .")
         return alias or "unknown"
 
+    @staticmethod
+    def _looks_like_lossy_project_name(project_name: str) -> bool:
+        sanitized = sanitize_path_component(project_name)
+        if not sanitized or any(not char.isascii() for char in sanitized):
+            return False
+        return "_" in sanitized
+
     def _workspace_support_score(self, workspace_path: str, project_name: str, action: str) -> tuple[int, float]:
         artifacts_dir = os.path.join(workspace_path, "artifacts")
         summary_path = os.path.join(artifacts_dir, f"{project_name}_summaries.json")
@@ -228,6 +235,8 @@ class JobRunner:
 
         base_output_dir = os.path.abspath(base_output_dir)
         if not os.path.isdir(base_output_dir):
+            return requested_project_name
+        if not self._looks_like_lossy_project_name(requested_project_name):
             return requested_project_name
 
         requested_alias = self._lossy_project_alias(requested_project_name)

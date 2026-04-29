@@ -4,7 +4,7 @@ from typing import cast
 
 import main
 from services.paper_identity import build_paper_key, normalize_doi
-from services.summary_reuse import collect_summary_sources
+from services.summary_reuse import SummarySource, collect_summary_sources, index_reusable_summaries
 
 
 class _DummyLogger:
@@ -307,6 +307,55 @@ def test_process_all_papers_only_processes_missing_papers_after_reuse(tmp_path: 
     assert generator._apply_stage1_cross_run_reuse() is True
     assert generator.process_all_papers() is True
     assert processed_titles == ["Needs Analysis"]
+
+
+def test_index_reusable_summaries_skips_incomplete_stage1_inputs(tmp_path: Path) -> None:
+    stage1_input_path = tmp_path / "short_stage1_input.md"
+    stage1_input_path.write_text("Short extracted paper text. " * 150, encoding="utf-8")
+    manifest_path = tmp_path / "stage1_input_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "selected_text_source": "normalized_markdown",
+                "stage1_quality_level": "PASS",
+                "stage1_quality_reasons": [],
+                "selected_text_length": len(stage1_input_path.read_text(encoding="utf-8")),
+                "page_count": 11,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    summary_path = tmp_path / "summaries.json"
+    summary = _make_summary(
+        title="Reusable But Incomplete",
+        authors=["Alice Example"],
+        year="2024",
+        doi="10.1000/incomplete",
+    )
+    summary["preprocess"] = {
+        "selected_text_source": "normalized_markdown",
+        "stage1_quality_level": "PASS",
+        "stage1_quality_reasons": [],
+        "stage1_input_path": str(stage1_input_path),
+        "stage1_input_manifest_path": str(manifest_path),
+    }
+    summary_path.write_text(json.dumps([summary], ensure_ascii=False), encoding="utf-8")
+
+    reusable, rejected = index_reusable_summaries(
+        [
+            SummarySource(
+                path=str(summary_path),
+                source_type="explicit",
+                priority=0,
+                label="explicit",
+            )
+        ]
+    )
+
+    assert reusable == {}
+    assert rejected[0]["reason"] == "stage1_input_incomplete_or_blocked"
 
 
 def test_load_existing_summaries_materializes_summary_file_override(tmp_path: Path) -> None:

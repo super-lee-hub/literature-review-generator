@@ -66,26 +66,31 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "api_key": "loaded_from_.env_file",
             "model": "",
             "api_base": PROVIDER_PRESETS["siliconflow"].default_api_base,
+            "proxy_mode": "environment",
         },
         "Backup_Reader_API": {
             "api_key": "loaded_from_.env_file",
             "model": "",
             "api_base": PROVIDER_PRESETS["videocaptioner"].default_api_base,
+            "proxy_mode": "environment",
         },
         "Writer_API": {
             "api_key": "loaded_from_.env_file",
             "model": "",
             "api_base": PROVIDER_PRESETS["videocaptioner"].default_api_base,
+            "proxy_mode": "environment",
         },
         "Outline_API": {
             "api_key": "loaded_from_.env_file",
             "model": "",
             "api_base": PROVIDER_PRESETS["videocaptioner"].default_api_base,
+            "proxy_mode": "environment",
         },
         "Free_Mode_API": {
             "api_key": "loaded_from_.env_file",
             "model": "",
             "api_base": "",
+            "proxy_mode": "environment",
         },
         "Performance": {
             "max_workers": "3",
@@ -150,6 +155,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "free_mode_temperature": "0.4",
             "validator_max_tokens": "4096",
             "validator_temperature": "0.3",
+            "validator_context_max_tokens": "1000000",
             "claims_max_tokens": "8192",
             "claims_temperature": "0.3",
         },
@@ -157,6 +163,9 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "api_key": "loaded_from_.env_file",
             "model": "",
             "api_base": PROVIDER_PRESETS["openai"].default_api_base,
+            "proxy_mode": "environment",
+            "thinking": "",
+            "reasoning_effort": "",
         },
         "Validation": {
             "stage1_enabled": "false",
@@ -336,8 +345,8 @@ def normalize_for_save(config_sections: MutableMapping[str, Dict[str, str]]) -> 
         section.pop("provider", None)
 
 
-def test_api_endpoint(api_key: str, api_base: str, model: str) -> tuple[bool, str]:
+def test_api_endpoint(api_key: str, api_base: str, model: str, proxy_mode: str = "environment") -> tuple[bool, str]:
     """Wrapper used by the GUI setup page."""
 
     normalized_base = normalize_api_base(api_base)
-    return test_api_connection(api_key=api_key, api_base=normalized_base, model=model)
+    return test_api_connection(api_key=api_key, api_base=normalized_base, model=model, proxy_mode=proxy_mode)

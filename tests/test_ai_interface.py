@@ -8,7 +8,8 @@ import pytest
 import time
 import threading
 from unittest.mock import Mock, patch, MagicMock
-from requests.exceptions import RequestException, Timeout, ConnectionError  # type: ignore
+from requests.exceptions import RequestException, Timeout, ConnectionError, HTTPError  # type: ignore
+import ai_interface
 from ai_interface import _normalize_type_specific_details
 
 
@@ -143,6 +144,38 @@ class TestAIIinterface:
         assert result is None
 
     @patch('ai_interface.requests.post')
+    def test_call_ai_api_quota_error_is_not_retried(self, mock_post):
+        """Quota and auth style HTTP errors should fail fast."""
+        mock_response = Mock()
+        mock_response.status_code = 403
+        mock_response.json.return_value = {
+            "error": {
+                "message": "Your account balance is insufficient.",
+                "code": "insufficient_user_quota",
+            }
+        }
+        mock_response.raise_for_status.side_effect = HTTPError("HTTP 403")
+        mock_post.return_value = mock_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="4")), patch('ai_interface.time.sleep', return_value=None) as mock_sleep:
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
+
+        assert result is None
+        assert mock_post.call_count == 1
+        mock_sleep.assert_not_called()
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="4")), patch('ai_interface.time.sleep', return_value=None):
+            detailed = self.ai_interface._call_ai_api_detailed(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
+        assert detailed["error_kind"] == "quota_exhausted"
+
+    @patch('ai_interface.requests.post')
     def test_call_ai_api_network_error(self, mock_post):
         """测试网络错误处理"""
         # 模拟网络错误
@@ -173,6 +206,39 @@ class TestAIIinterface:
             )
 
         assert result is None
+
+    @patch('ai_interface.requests.post')
+    def test_call_ai_api_detailed_classifies_transient_network(self, mock_post):
+        mock_post.side_effect = Timeout("Proxy disconnected with SSL EOF")
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api_detailed(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
+
+        assert result["status"] == "failed"
+        assert result["error_kind"] == "transient_network"
+
+    @patch('ai_interface.requests.post')
+    def test_call_ai_api_detailed_classifies_retryable_http(self, mock_post):
+        mock_response = Mock()
+        mock_response.status_code = 503
+        mock_response.json.return_value = {"error": {"message": "temporarily unavailable"}}
+        mock_response.raise_for_status.side_effect = HTTPError("HTTP 503")
+        mock_post.return_value = mock_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api_detailed(
+                "test prompt",
+                {"api_key": "test_key", "model": "test_model"},
+                "system prompt"
+            )
+
+        assert result["status"] == "failed"
+        assert result["error_kind"] == "retryable_http"
+        assert result["http_status"] == 503
 
     @patch('ai_interface.requests.post')
     def test_call_ai_api_invalid_json(self, mock_post):
@@ -223,6 +289,111 @@ class TestAIIinterface:
 
         assert result is None
         assert mock_post.call_count == 3
+
+    @patch('ai_interface.requests.post')
+    def test_call_ai_api_retries_without_deprecated_temperature(self, mock_post):
+        """Some providers reject temperature for selected models; retry once without it."""
+        error_response = Mock()
+        error_response.status_code = 400
+        error_response.json.return_value = {
+            "error": {
+                "message": "`temperature` is deprecated for this model.",
+            }
+        }
+        error_response.raise_for_status.side_effect = HTTPError("HTTP 400")
+
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "ok"}'}}]
+        }
+        mock_post.side_effect = [error_response, success_response]
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {"api_key": "test_key", "model": "claude-opus-4-7", "api_base": "https://aihubmix.com/v1"},
+                "system prompt",
+            )
+
+        assert result == {"summary": "ok"}
+        assert mock_post.call_count == 2
+        assert "temperature" in mock_post.call_args_list[0].kwargs["json"]
+        assert "temperature" not in mock_post.call_args_list[1].kwargs["json"]
+
+    @patch('ai_interface.requests.post')
+    def test_call_ai_api_passes_reasoning_payload_params(self, mock_post):
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "ok"}'}}]
+        }
+        mock_post.return_value = success_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "deepseek-v4-pro",
+                    "api_base": "https://api.deepseek.com",
+                    "thinking": "enabled",
+                    "reasoning_effort": "max",
+                },
+                "system prompt",
+            )
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert result == {"summary": "ok"}
+        assert payload["thinking"] == {"type": "enabled"}
+        assert payload["reasoning_effort"] == "max"
+
+    @patch('ai_interface.requests.post')
+    def test_call_ai_api_direct_proxy_mode_bypasses_environment_proxy(self, mock_post, monkeypatch):
+        """proxy_mode=direct should ignore HTTP(S)_PROXY environment settings."""
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "ok"}'}}]
+        }
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def post(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return success_response
+
+        session = FakeSession()
+        monkeypatch.setattr(ai_interface.requests, "Session", lambda: session)
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "test_model",
+                    "api_base": "https://api.siliconflow.cn/v1",
+                    "proxy_mode": "direct",
+                },
+                "system prompt",
+            )
+
+        assert result == {"summary": "ok"}
+        assert session.trust_env is False
+        assert len(session.calls) == 1
+        mock_post.assert_not_called()
 
 
 if __name__ == "__main__":
@@ -278,3 +449,85 @@ def test_normalize_type_specific_details_marks_uncertain_when_no_route_evidence(
     assert normalized["paper_type"] == "uncertain"
     assert normalized["paper_subtype"] == ""
     assert normalized["classification_rationale"] == "insufficient evidence to assign a stable primary type"
+
+
+def test_stage1_reader_scheduler_alternates_transient_failures(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_detailed(*_args, engine_type="primary", **_kwargs):
+        calls.append(engine_type)
+        if calls == ["primary", "backup", "primary"]:
+            return {
+                "status": "success",
+                "content": {"ok": True},
+                "engine_type": engine_type,
+                "error_kind": None,
+                "message": "",
+            }
+        return {
+            "status": "failed",
+            "content": None,
+            "engine_type": engine_type,
+            "error_kind": "transient_network",
+            "message": "timeout",
+        }
+
+    monkeypatch.setattr(ai_interface, "_load_api_runtime_settings", lambda: (600, 2))
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+
+    result = ai_interface.get_summary_from_ai_with_fallback(
+        "prompt",
+        {"api_key": "primary", "model": "m1"},
+        {"api_key": "backup", "model": "m2"},
+    )
+
+    assert result == {"ok": True}
+    assert calls == ["primary", "backup", "primary"]
+
+
+def test_stage1_reader_scheduler_disables_quota_engine_for_round(monkeypatch) -> None:
+    calls: list[str] = []
+    disabled: list[str] = []
+
+    def fake_detailed(*_args, engine_type="primary", **_kwargs):
+        calls.append(engine_type)
+        if engine_type == "backup":
+            return {
+                "status": "failed",
+                "content": None,
+                "engine_type": engine_type,
+                "error_kind": "quota_exhausted",
+                "message": "balance is insufficient",
+            }
+        if calls.count("primary") == 2:
+            return {
+                "status": "success",
+                "content": {"ok": True},
+                "engine_type": engine_type,
+                "error_kind": None,
+                "message": "",
+            }
+        return {
+            "status": "failed",
+            "content": None,
+            "engine_type": engine_type,
+            "error_kind": "transient_network",
+            "message": "timeout",
+        }
+
+    def disable(engine, _result):
+        disabled.append(engine)
+
+    monkeypatch.setattr(ai_interface, "_load_api_runtime_settings", lambda: (600, 2))
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+
+    result = ai_interface.get_summary_from_ai_with_fallback(
+        "prompt",
+        {"api_key": "primary", "model": "m1"},
+        {"api_key": "backup", "model": "m2"},
+        disable_engine_callback=disable,
+    )
+
+    assert result == {"ok": True}
+    assert calls == ["primary", "backup", "primary"]
+    assert disabled == ["backup"]

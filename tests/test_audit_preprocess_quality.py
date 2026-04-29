@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 from tools.audit_preprocess_quality import _encode_for_stdout, main as audit_main
 
@@ -75,6 +76,132 @@ def test_audit_reports_new_fallback_as_current_warning_without_rewriting(tmp_pat
     assert audit_report["record_count"] == 1
     assert audit_report["bad_stage1_input_count"] == 0
     assert summary_path.read_text(encoding="utf-8") == original_summary
+
+
+def test_audit_marks_native_pass_with_incomplete_stage1_input_as_stale(tmp_path: Path) -> None:
+    output_root, artifacts_dir, paper_artifact_dir = _make_project_workspace(tmp_path)
+    stage1_input_path = artifacts_dir / "short_stage1_input.md"
+    stage1_input_path.write_text("Short extracted paper text. " * 150, encoding="utf-8")
+    manifest_path = artifacts_dir / "stage1_input_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "selected_text_source": "normalized_markdown",
+                "stage1_quality_level": "PASS",
+                "stage1_quality_reasons": [],
+                "selected_text_length": len(stage1_input_path.read_text(encoding="utf-8")),
+                "page_count": 11,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    paper_artifact = {
+        "artifact_type": "paper_artifact",
+        "artifact_version": "v1",
+        "paper_identity": {"canonical_paper_key": "paper-native-short-pass"},
+        "paper_info": {"title": "Native Short Pass Paper"},
+        "analysis": {
+            "status": "success",
+            "preprocess": {
+                "selected_text_source": "normalized_markdown",
+                "stage1_quality_level": "PASS",
+                "stage1_quality_reasons": [],
+                "stage1_input_path": str(stage1_input_path),
+                "stage1_input_manifest_path": str(manifest_path),
+            },
+        },
+        "stage1_inputs": {},
+    }
+    (paper_artifact_dir / "paper-native-short-pass.json").write_text(
+        json.dumps(paper_artifact, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    exit_code = audit_main(
+        [
+            "--project",
+            "demo",
+            "--output-root",
+            str(output_root),
+            "--mode",
+            "all",
+            "--write-report",
+        ]
+    )
+
+    assert exit_code == 0
+    bad_inputs = json.loads((artifacts_dir / "bad_stage1_inputs.json").read_text(encoding="utf-8"))
+    stale_summaries = json.loads((artifacts_dir / "stale_summaries.json").read_text(encoding="utf-8"))
+    assert bad_inputs[0]["paper_key"] == "paper-native-short-pass"
+    assert bad_inputs[0]["summary_status"] == "stale_due_to_incomplete_stage1_input"
+    assert "incomplete_by_page_count" in bad_inputs[0]["stage1_quality_reasons"]
+    assert stale_summaries[0]["paper_key"] == "paper-native-short-pass"
+
+
+def test_audit_marks_summary_stale_when_stage1_input_was_refreshed_after_summary(tmp_path: Path) -> None:
+    output_root, artifacts_dir, paper_artifact_dir = _make_project_workspace(tmp_path)
+    stage1_input_path = artifacts_dir / "healthy_stage1_input.md"
+    stage1_input_path.write_text("Complete paper text with discussion, conclusions, and references. " * 200, encoding="utf-8")
+    manifest_path = artifacts_dir / "stage1_input_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "selected_text_source": "normalized_markdown",
+                "stage1_quality_level": "PASS",
+                "stage1_quality_reasons": [],
+                "selected_text_length": len(stage1_input_path.read_text(encoding="utf-8")),
+                "page_count": 6,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    paper_artifact_path = paper_artifact_dir / "paper-refreshed-stage1.json"
+    paper_artifact = {
+        "artifact_type": "paper_artifact",
+        "artifact_version": "v1",
+        "paper_identity": {"canonical_paper_key": "paper-refreshed-stage1"},
+        "paper_info": {"title": "Refreshed Stage One Paper"},
+        "analysis": {
+            "status": "success",
+            "preprocess": {
+                "selected_text_source": "normalized_markdown",
+                "stage1_quality_level": "PASS",
+                "stage1_quality_reasons": [],
+                "stage1_input_path": str(stage1_input_path),
+                "stage1_input_manifest_path": str(manifest_path),
+            },
+        },
+        "stage1_inputs": {},
+    }
+    paper_artifact_path.write_text(json.dumps(paper_artifact, ensure_ascii=False, indent=2), encoding="utf-8")
+    old_time = time.time() - 20
+    new_time = time.time()
+    os.utime(paper_artifact_path, (old_time, old_time))
+    os.utime(stage1_input_path, (new_time, new_time))
+    os.utime(manifest_path, (new_time, new_time))
+
+    exit_code = audit_main(
+        [
+            "--project",
+            "demo",
+            "--output-root",
+            str(output_root),
+            "--mode",
+            "all",
+            "--write-report",
+        ]
+    )
+
+    assert exit_code == 0
+    bad_inputs = json.loads((artifacts_dir / "bad_stage1_inputs.json").read_text(encoding="utf-8"))
+    assert bad_inputs[0]["paper_key"] == "paper-refreshed-stage1"
+    assert bad_inputs[0]["summary_status"] == "stale_due_to_refreshed_stage1_input"
+    assert bad_inputs[0]["stage1_input_newer_than_summary"] is True
+    assert "stage1_input_newer_than_summary" in bad_inputs[0]["stage1_quality_reasons"]
 
 
 def test_audit_treats_legacy_rescored_fallback_as_stale(tmp_path: Path) -> None:

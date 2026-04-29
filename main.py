@@ -39,7 +39,13 @@ from config_loader import load_config, ConfigDict
 from zotero_parser import parse_zotero_report
 from file_finder import create_file_index, FileIndex, find_pdf
 from pdf_extractor import extract_text_from_pdf  # type: ignore
-from ai_interface import get_summary_from_ai, get_summary_from_ai_with_fallback, get_concept_analysis, _call_ai_api  # type: ignore
+from ai_interface import (  # type: ignore
+    get_summary_from_ai,
+    get_summary_from_ai_with_fallback,
+    get_concept_analysis,
+    _call_ai_api,
+    _post_with_proxy_mode,
+)
 from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references_from_manifest
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from preprocess.service import PreprocessManager
@@ -64,6 +70,7 @@ from services.progress_state import (
 from services.queue_service import CancelToken, PersistentQueueService, QueueJobSpec, QueueState, create_queue_job_id
 from services.review_draft import build_review_draft_v1, build_review_draft_v2
 from services.stage1_input_builder import Stage1InputBuilder
+from services.stage1_input_completeness import is_blocked_stage1_quality
 from services.model_selection import get_outline_api_config
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
 from services.summary_reuse import (
@@ -395,6 +402,9 @@ class LiteratureReviewGenerator:
         self.root_log_path: str = ""
         self.workspace_log_path: str = ""
         self._workspace_log_handler: Optional[logging.Handler] = None
+        self._stage1_reader_engine_lock: threading.Lock = threading.Lock()
+        self._stage1_disabled_reader_engines: Set[str] = set()
+        self._stage1_reader_disable_reasons: Dict[str, str] = {}
 
         # 身份基断点续传相关变量
         self._checkpoint_processed_papers: Set[str] = set()
@@ -1641,6 +1651,22 @@ class LiteratureReviewGenerator:
         if not self.summaries:
             return False
 
+        processed_papers, failed_papers = self._stage1_progress_sets_from_loaded_summaries()
+        if not processed_papers and not failed_papers:
+            return False
+
+        self._checkpoint_processed_papers = processed_papers
+        self._checkpoint_failed_papers = failed_papers
+        self.processed_count.set(len(processed_papers))
+        self.failed_count.set(len(failed_papers))
+
+        self.logger.info(
+            f"[进度恢复] 已根据现有摘要重建处理进度: {len(processed_papers)}成功, {len(failed_papers)}失败"
+        )
+        return True
+
+    def _stage1_progress_sets_from_loaded_summaries(self) -> Tuple[Set[str], Set[str]]:
+        """从已加载 summaries 提取阶段一成功/失败身份集合。"""
         processed_papers: Set[str] = set()
         failed_papers: Set[str] = set()
 
@@ -1660,19 +1686,42 @@ class LiteratureReviewGenerator:
                 processed_papers.add(paper_key)
                 failed_papers.discard(paper_key)
             elif status == "failed":
-                failed_papers.add(paper_key)
+                if paper_key not in processed_papers:
+                    failed_papers.add(paper_key)
 
+        failed_papers.difference_update(processed_papers)
+        return processed_papers, failed_papers
+
+    def _merge_stage1_progress_from_loaded_summaries(self) -> bool:
+        """用 summaries 中的 durable 结果校正旧 checkpoint，避免重试已成功论文。"""
+        if not self.summaries:
+            return False
+
+        processed_papers, failed_papers = self._stage1_progress_sets_from_loaded_summaries()
         if not processed_papers and not failed_papers:
             return False
 
-        self._checkpoint_processed_papers = processed_papers
-        self._checkpoint_failed_papers = failed_papers
-        self.processed_count.set(len(processed_papers))
-        self.failed_count.set(len(failed_papers))
+        old_processed = set(self._checkpoint_processed_papers)
+        old_failed = set(self._checkpoint_failed_papers)
 
-        self.logger.info(
-            f"[进度恢复] 已根据现有摘要重建处理进度: {len(processed_papers)}成功, {len(failed_papers)}失败"
+        self._checkpoint_processed_papers.update(processed_papers)
+        self._checkpoint_failed_papers.difference_update(processed_papers)
+        self._checkpoint_failed_papers.update(
+            key for key in failed_papers if key not in self._checkpoint_processed_papers
         )
+        self.processed_count.set(len(self._checkpoint_processed_papers))
+        self.failed_count.set(len(self._checkpoint_failed_papers))
+
+        if (
+            old_processed != self._checkpoint_processed_papers
+            or old_failed != self._checkpoint_failed_papers
+        ):
+            self.logger.info(
+                "[进度恢复] 已用现有摘要校正 checkpoint: "
+                f"{len(self._checkpoint_processed_papers)}成功, "
+                f"{len(self._checkpoint_failed_papers)}失败"
+            )
+
         return True
     
     def reset_counters(self):
@@ -1723,6 +1772,70 @@ class LiteratureReviewGenerator:
             retry_total_rounds=retry_total_rounds,
         )
 
+    def reset_stage1_reader_engine_round_state(self) -> None:
+        with self._stage1_reader_engine_lock:
+            self._stage1_disabled_reader_engines.clear()
+            self._stage1_reader_disable_reasons.clear()
+
+    def _is_stage1_reader_engine_disabled(self, engine_type: str) -> bool:
+        with self._stage1_reader_engine_lock:
+            return engine_type in self._stage1_disabled_reader_engines
+
+    def _disable_stage1_reader_engine_for_round(self, engine_type: str, result: Mapping[str, Any]) -> None:
+        label = "主引擎" if engine_type == "primary" else "备用引擎"
+        message = f"{label}余额/额度不足，本轮自动跳过。"
+        reason = str(result.get("message") or result.get("provider_code") or result.get("error_kind") or "")
+        first_disable = False
+        with self._stage1_reader_engine_lock:
+            if engine_type not in self._stage1_disabled_reader_engines:
+                self._stage1_disabled_reader_engines.add(engine_type)
+                self._stage1_reader_disable_reasons[engine_type] = reason
+                first_disable = True
+        if first_disable:
+            detail = f" 原因: {reason}" if reason else ""
+            self.logger.warning(f"{message}{detail}")
+            self._emit_progress(stage="analyze", message=message)
+
+    def _call_stage1_reader_with_scheduler(
+        self,
+        analysis_prompt: str,
+        reader_api_config: APIConfig,
+        backup_api_config: APIConfig,
+        *,
+        user_content: Any = None,
+        skip_engines: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        result = get_summary_from_ai_with_fallback(
+            analysis_prompt,
+            reader_api_config,
+            backup_api_config,
+            logger=self.logger,
+            config=self.config,
+            user_content=user_content,
+            return_detailed=True,
+            disable_engine_callback=self._disable_stage1_reader_engine_for_round,
+            is_engine_disabled_callback=self._is_stage1_reader_engine_disabled,
+            skip_engines=skip_engines,
+        )
+        if isinstance(result, dict) and "status" in result and "content" in result:
+            return result
+        if result:
+            legacy_engine = "backup" if skip_engines and "primary" in skip_engines else "primary"
+            return {
+                "status": "success",
+                "error_kind": None,
+                "message": "",
+                "content": result,
+                "engine_type": legacy_engine,
+            }
+        return {
+            "status": "failed",
+            "error_kind": "invalid_response",
+            "message": "AI summary generation failed",
+            "content": None,
+            "engine_type": None,
+        }
+
     def _collect_preprocess_result_metadata(self, preprocess_result: Any, input_kind: str) -> Dict[str, Any]:
         metadata = {
             'analysis_input_kind': input_kind,
@@ -1758,10 +1871,25 @@ class LiteratureReviewGenerator:
                 with open(quality_report_path, "r", encoding="utf-8") as handle:
                     quality_report = json.load(handle)
                 metadata['stage1_quality_reasons'] = quality_report.get('stage1_quality_reasons', [])
+                metadata['stage1_completeness_metrics'] = quality_report.get('completeness_metrics', {})
             except Exception:
                 metadata['stage1_quality_reasons'] = []
+                metadata['stage1_completeness_metrics'] = {}
         else:
             metadata['stage1_quality_reasons'] = []
+            metadata['stage1_completeness_metrics'] = {}
+        manifest_path = str(metadata.get('stage1_input_manifest_path') or '')
+        if manifest_path:
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as handle:
+                    stage1_manifest = json.load(handle)
+                metadata['selected_text_length'] = int(stage1_manifest.get('selected_text_length') or 0)
+                metadata['stage1_page_count'] = int(stage1_manifest.get('page_count') or 0)
+                if not metadata.get('stage1_completeness_metrics'):
+                    metadata['stage1_completeness_metrics'] = stage1_manifest.get('completeness_metrics', {})
+            except Exception:
+                metadata.setdefault('selected_text_length', 0)
+                metadata.setdefault('stage1_page_count', 0)
         return metadata
 
     @staticmethod
@@ -1811,6 +1939,9 @@ class LiteratureReviewGenerator:
             'extractor_used': text('extractor_used', 'unknown'),
             'selected_text_source': text('selected_text_source') or text('analysis_input_kind'),
             'stage1_quality_level': text('stage1_quality_level'),
+            'stage1_quality_reasons': list(metadata.get('stage1_quality_reasons') or []),
+            'selected_text_length': int(metadata.get('selected_text_length') or 0),
+            'stage1_page_count': int(metadata.get('stage1_page_count') or 0),
             'mineru_token_present': token_present,
             'mineru_remote_requested': requested,
             'mineru_remote_enabled': enabled,
@@ -1913,6 +2044,17 @@ class LiteratureReviewGenerator:
                     stage1_text = preprocess_result.stage1_input_text
                     input_kind = preprocess_result.selected_text_source or "stage1_input"
                     preprocess_metadata.update(self._collect_preprocess_result_metadata(preprocess_result, input_kind))
+                    if is_blocked_stage1_quality(
+                        preprocess_result.stage1_quality_level,
+                        preprocess_metadata.get('stage1_quality_reasons'),
+                    ):
+                        preprocess_metadata['analysis_input_kind'] = preprocess_result.selected_text_source or 'blocked_stage1_input'
+                        self.logger.warning(
+                            f"阶段一输入质量闸阻止当前预处理结果: {os.path.basename(pdf_path)} "
+                            f"({preprocess_result.stage1_quality_level}: "
+                            f"{', '.join(preprocess_metadata.get('stage1_quality_reasons') or [])})"
+                        )
+                        return "", preprocess_metadata
                     if stage1_text and len(stage1_text.strip()) >= 500:
                         self.logger.info(
                             f"阶段一输入使用预处理结果: {os.path.basename(pdf_path)} -> "
@@ -2593,6 +2735,166 @@ class LiteratureReviewGenerator:
             for candidate in variants
         )
 
+    @staticmethod
+    def _quality_reason_parts(reason: str) -> List[str]:
+        return [part.strip() for part in re.split(r"[;；\n]+", str(reason or "")) if part.strip()]
+
+    @staticmethod
+    def _is_metadata_quality_issue(reason_part: str) -> bool:
+        lowered = str(reason_part or "").casefold()
+        metadata_markers = (
+            "author",
+            "authors",
+            "year",
+            "journal",
+            "metadata",
+            "paper_metadata",
+            "paper_info",
+            "作者",
+            "年份",
+            "期刊",
+            "元数据",
+        )
+        return any(marker.casefold() in lowered for marker in metadata_markers)
+
+    def _is_metadata_only_quality_failure(self, reason: str) -> bool:
+        parts = self._quality_reason_parts(reason)
+        return bool(parts) and all(self._is_metadata_quality_issue(part) for part in parts)
+
+    def _apply_filename_metadata_backfill(self, paper: PaperInfo) -> List[str]:
+        pdf_path = str(paper.get("pdf_path") or "")
+        if not pdf_path:
+            return []
+        stem = os.path.splitext(os.path.basename(pdf_path))[0].strip()
+        if not stem:
+            return []
+
+        updated_fields: List[str] = []
+        if not str(paper.get("title") or "").strip():
+            paper["title"] = stem
+            updated_fields.append("title")
+
+        if self._is_placeholder_metadata_value(paper.get("year")):
+            match = re.search(r"\b(?:19|20)\d{2}\b", stem)
+            if match:
+                paper["year"] = match.group(0)
+                updated_fields.append("year")
+        return updated_fields
+
+    def _apply_paper_metadata_to_ai_summary(self, paper: PaperInfo, ai_summary: Any) -> List[str]:
+        if not isinstance(ai_summary, dict):
+            return []
+        paper_metadata = ai_summary.setdefault("paper_metadata", {})
+        if not isinstance(paper_metadata, dict):
+            paper_metadata = {}
+            ai_summary["paper_metadata"] = paper_metadata
+
+        updated_fields: List[str] = []
+
+        def set_if_missing(field: str, value: Any) -> None:
+            current = paper_metadata.get(field)
+            current_missing = (
+                not current
+                or (field in {"year", "journal"} and self._is_placeholder_metadata_value(current))
+                or (field == "authors" and not current)
+            )
+            if value and current_missing:
+                paper_metadata[field] = value
+                updated_fields.append(f"paper_metadata.{field}")
+
+        title = str(paper.get("title") or "").strip()
+        authors = paper.get("authors") or []
+        year = str(paper.get("year") or "").strip()
+        journal = str(paper.get("journal") or "").strip()
+        doi = str(paper.get("doi") or "").strip()
+
+        set_if_missing("title", title)
+        if authors:
+            set_if_missing("authors", authors)
+        if year and not self._is_placeholder_metadata_value(year):
+            set_if_missing("year", year)
+        if journal and not self._is_placeholder_metadata_value(journal):
+            set_if_missing("journal", journal)
+        set_if_missing("doi", doi)
+
+        if updated_fields:
+            quality_audit = ai_summary.setdefault("quality_audit", {})
+            inferred_fields = quality_audit.setdefault("inferred_fields", [])
+            if isinstance(inferred_fields, list):
+                for field in updated_fields:
+                    note = f"{field} from paper_info"
+                    if note not in inferred_fields:
+                        inferred_fields.append(note)
+        return updated_fields
+
+    def _resolve_stage1_metadata_for_quality(self, paper: PaperInfo, ai_summary: Any, stage1_text: str) -> List[str]:
+        updated_fields: List[str] = []
+        try:
+            updated_fields.extend(self._apply_filename_metadata_backfill(paper))
+        except Exception as exc:
+            self.logger.warning(f"Filename metadata backfill failed: {exc}")
+        try:
+            updated_fields.extend(self._apply_ai_metadata_backfill(paper, ai_summary))
+        except Exception as exc:
+            self.logger.warning(f"AI metadata backfill failed: {exc}")
+        try:
+            updated_fields.extend(self._apply_stage1_text_metadata_backfill(paper, stage1_text))
+        except Exception as exc:
+            self.logger.warning(f"Stage-1 text metadata backfill failed: {exc}")
+        try:
+            updated_fields.extend(self._apply_paper_metadata_to_ai_summary(paper, ai_summary))
+        except Exception as exc:
+            self.logger.warning(f"Summary metadata sync failed: {exc}")
+        return updated_fields
+
+    def _missing_metadata_fields_for_summary(self, paper: PaperInfo, ai_summary: Any) -> List[str]:
+        metadata = sanitize_metadata_fields(get_paper_metadata(ai_summary or {}))
+        authors = paper.get("authors") or metadata.get("authors") or []
+        year = paper.get("year") or metadata.get("year") or ""
+        journal = paper.get("journal") or metadata.get("journal") or ""
+        missing: List[str] = []
+        if not authors:
+            missing.append("authors")
+        if self._is_placeholder_metadata_value(year):
+            missing.append("year")
+        if self._is_placeholder_metadata_value(journal):
+            missing.append("journal")
+        return missing
+
+    def _mark_summary_metadata_manual_review(self, paper: PaperInfo, ai_summary: Any, quality_reason: str) -> List[str]:
+        if not isinstance(ai_summary, dict):
+            return []
+        missing_fields = self._missing_metadata_fields_for_summary(paper, ai_summary)
+        quality_audit = ai_summary.setdefault("quality_audit", {})
+        if not isinstance(quality_audit, dict):
+            quality_audit = {}
+            ai_summary["quality_audit"] = quality_audit
+        quality_audit["needs_manual_review"] = True
+
+        missing_critical = quality_audit.setdefault("missing_critical_fields", [])
+        if isinstance(missing_critical, list):
+            for field in missing_fields:
+                marker = f"paper_metadata.{field}"
+                if marker not in missing_critical:
+                    missing_critical.append(marker)
+
+        inferred_fields = quality_audit.setdefault("inferred_fields", [])
+        if isinstance(inferred_fields, list):
+            warning = f"metadata unresolved after local resolution: {quality_reason}"
+            if warning not in inferred_fields:
+                inferred_fields.append(warning)
+
+        conflict_flags = quality_audit.setdefault("conflict_flags", [])
+        if isinstance(conflict_flags, list) and "metadata_needs_manual_review" not in conflict_flags:
+            conflict_flags.append("metadata_needs_manual_review")
+        return missing_fields
+
+    def _mark_metadata_manual_review_if_missing(self, paper: PaperInfo, ai_summary: Any, reason: str) -> List[str]:
+        missing_fields = self._missing_metadata_fields_for_summary(paper, ai_summary)
+        if not missing_fields:
+            return []
+        return self._mark_summary_metadata_manual_review(paper, ai_summary, reason)
+
     def _apply_ai_metadata_backfill(self, paper: PaperInfo, ai_summary: Any) -> List[str]:
         metadata = sanitize_metadata_fields(get_paper_metadata(ai_summary or {}))
         updated_fields: List[str] = []
@@ -2896,6 +3198,9 @@ class LiteratureReviewGenerator:
                     'extractor_used': extractor_name or str(route_snapshot.get('extractor_used') or 'unknown'),
                     'selected_text_source': str(route_snapshot.get('selected_text_source') or ''),
                     'stage1_quality_level': str(route_snapshot.get('stage1_quality_level') or ''),
+                    'stage1_quality_reasons': list(route_snapshot.get('stage1_quality_reasons') or []),
+                    'selected_text_length': int(route_snapshot.get('selected_text_length') or 0),
+                    'stage1_page_count': int(route_snapshot.get('stage1_page_count') or 0),
                     'mineru_remote_requested': bool(route_snapshot.get('mineru_remote_requested')),
                     'mineru_remote_enabled': bool(route_snapshot.get('mineru_remote_enabled')),
                     'mineru_attempted': bool(route_snapshot.get('mineru_attempted')),
@@ -2925,6 +3230,16 @@ class LiteratureReviewGenerator:
 
                 if not pdf_text or len(pdf_text.strip()) < 500:  # type: ignore
                     failure_reason = f"阶段一输入准备失败或内容过少({len(pdf_text) if pdf_text else 0}字符)"  # type: ignore
+                    stage1_reasons = [
+                        str(reason)
+                        for reason in (preprocess_metadata.get('stage1_quality_reasons') or [])
+                        if str(reason).strip()
+                    ]
+                    if stage1_reasons:
+                        failure_reason = (
+                            f"阶段一输入质量闸阻止: {', '.join(stage1_reasons)} "
+                            f"({len(pdf_text) if pdf_text else 0}字符)"
+                        )
                     self.logger.warning(f"策略 {strategy} 失败: {failure_reason}")
                     record_attempt_failure(
                         strategy,
@@ -2958,7 +3273,8 @@ class LiteratureReviewGenerator:
                 reader_api_config: APIConfig = {
                     'api_key': primary_reader_config.get('api_key', ''),
                     'model': primary_reader_config.get('model', ''),
-                    'api_base': primary_reader_config.get('api_base', 'https://api.openai.com/v1')
+                    'api_base': primary_reader_config.get('api_base', 'https://api.openai.com/v1'),
+                    'proxy_mode': primary_reader_config.get('proxy_mode', 'environment'),
                 }
                 
                 # 提取备用引擎API配置（用于超长论文）
@@ -2966,7 +3282,8 @@ class LiteratureReviewGenerator:
                 backup_api_config: APIConfig = {
                     'api_key': backup_reader_config.get('api_key', ''),
                     'model': backup_reader_config.get('model', ''),
-                    'api_base': backup_reader_config.get('api_base', 'https://api.openai.com/v1')
+                    'api_base': backup_reader_config.get('api_base', 'https://api.openai.com/v1'),
+                    'proxy_mode': backup_reader_config.get('proxy_mode', 'environment'),
                 }
                 
                 visual_bundle = self._build_stage1_visual_bundle(
@@ -3012,22 +3329,25 @@ class LiteratureReviewGenerator:
                 preprocess_metadata["stage1_input_fallback_reason"] = str(stage1_input.get("fallback_reason") or "")
 
                 # 调用AI接口生成摘要（自动处理引擎切换）
-                ai_result = get_summary_from_ai_with_fallback(
+                reader_result = self._call_stage1_reader_with_scheduler(
                     analysis_prompt,
                     reader_api_config,
                     backup_api_config,
-                    logger=self.logger,
-                    config=self.config,
                     user_content=stage1_user_content,
                 )
+                ai_result = reader_result.get("content")
+                model_used = str(reader_result.get("engine_type") or "primary")
                 
                 if not ai_result:
+                    api_message = str(reader_result.get("message") or reader_result.get("error_kind") or "")
                     failure_reason = "AI摘要生成失败"
+                    if api_message:
+                        failure_reason = f"{failure_reason}: {api_message}"
                     self.logger.warning(f"策略 {strategy} 失败: {failure_reason}")
                     record_attempt_failure(
                         strategy,
                         preprocess_metadata,
-                        model_name='primary',
+                        model_name=model_used,
                         quality_reason=failure_reason,
                         extractor_name=extractor_used,
                     )
@@ -3048,6 +3368,13 @@ class LiteratureReviewGenerator:
                 except Exception as e:
                     self.logger.warning(f"元数据回填失败: {e}")
 
+                try:
+                    synced_fields = self._apply_paper_metadata_to_ai_summary(paper, ai_result)
+                    if synced_fields:
+                        self.logger.info(f"Synced paper_info metadata into AI summary: {', '.join(synced_fields)}")
+                except Exception as e:
+                    self.logger.warning(f"AI summary metadata sync failed: {e}")
+
                 temp_result: Dict[str, Any] = {
                     'paper_info': paper,
                     'status': 'success',
@@ -3059,6 +3386,34 @@ class LiteratureReviewGenerator:
                 is_quality_ok, quality_reason = validate_summary_quality(temp_result)
                 
                 if not is_quality_ok:
+                    if self._is_metadata_only_quality_failure(quality_reason):
+                        resolved_fields = self._resolve_stage1_metadata_for_quality(paper, ai_result, pdf_text)
+                        if resolved_fields:
+                            self.logger.info(f"Metadata-only quality issue resolved fields: {', '.join(resolved_fields)}")
+                        temp_result = {
+                            'paper_info': paper,
+                            'status': 'success',
+                            'ai_summary': ai_result,
+                            'source_mode': self.mode,
+                        }
+                        is_quality_ok, quality_reason = validate_summary_quality(temp_result)
+                        if is_quality_ok:
+                            self._mark_metadata_manual_review_if_missing(
+                                paper,
+                                ai_result,
+                                "metadata unresolved after local resolution",
+                            )
+                            self.logger.info("Metadata resolution fixed Stage 1 quality check")
+                            strategy_succeeded = True
+                            break
+                        if self._is_metadata_only_quality_failure(quality_reason):
+                            missing_fields = self._mark_summary_metadata_manual_review(paper, ai_result, quality_reason)
+                            self.logger.warning(
+                                "Stage 1 summary body is usable but metadata remains incomplete; "
+                                f"saved with manual-review flag: {', '.join(missing_fields) or quality_reason}"
+                            )
+                            strategy_succeeded = True
+                            break
                     # 🚨 内容质量检查失败，尝试备用引擎
                     failure_reason = f"AI生成内容为空或不完整: {quality_reason}"
                     self.logger.warning(f"策略 {strategy} 主引擎质量检查失败: {failure_reason}")
@@ -3069,15 +3424,15 @@ class LiteratureReviewGenerator:
                         self.logger.info("主引擎内容质量检查失败，尝试备用引擎...")
                         
                         # 使用备用引擎直接调用（绕过主引擎）
-                        backup_result = get_summary_from_ai(
+                        backup_reader_result = self._call_stage1_reader_with_scheduler(
                             analysis_prompt,
                             reader_api_config,
                             backup_api_config,
-                            engine_type='backup',
-                            logger=self.logger,
-                            config=self.config,
                             user_content=stage1_user_content,
+                            skip_engines={model_used},
                         )
+                        backup_result = backup_reader_result.get("content")
+                        backup_model_used = str(backup_reader_result.get("engine_type") or "backup")
                         
                         if backup_result:
                             self.logger.success("备用引擎AI摘要生成成功")
@@ -3103,7 +3458,12 @@ class LiteratureReviewGenerator:
                                 self.logger.info("备用引擎内容质量检查通过")
                                 ai_result = backup_result  # 使用备用引擎的结果
                                 # 继续后续处理
-                                model_used = 'backup'
+                                model_used = backup_model_used
+                                self._mark_metadata_manual_review_if_missing(
+                                    paper,
+                                    ai_result,
+                                    "metadata unresolved after local resolution",
+                                )
                                 strategy_succeeded = True
                                 break
                             else:
@@ -3112,7 +3472,7 @@ class LiteratureReviewGenerator:
                                 record_attempt_failure(
                                     strategy,
                                     preprocess_metadata,
-                                    model_name='backup',
+                                    model_name=backup_model_used,
                                     quality_reason=f"主引擎: {quality_reason}; 备用引擎: {quality_reason_backup}",
                                     extractor_name=extractor_used,
                                 )
@@ -3123,7 +3483,7 @@ class LiteratureReviewGenerator:
                             record_attempt_failure(
                                 strategy,
                                 preprocess_metadata,
-                                model_name='backup',
+                                model_name=backup_model_used,
                                 quality_reason=f"主引擎: {quality_reason}; 备用引擎调用失败",
                                 extractor_name=extractor_used,
                             )
@@ -3141,7 +3501,16 @@ class LiteratureReviewGenerator:
                         continue
                 else:
                     # 质量检查通过
-                    model_used = 'primary'
+                    unresolved_metadata = self._mark_metadata_manual_review_if_missing(
+                        paper,
+                        ai_result,
+                        "metadata unresolved after local resolution",
+                    )
+                    if unresolved_metadata:
+                        self.logger.warning(
+                            "Stage 1 summary body passed but metadata remains incomplete; "
+                            f"saved with manual-review flag: {', '.join(unresolved_metadata)}"
+                        )
                     strategy_succeeded = True
                     break
             
@@ -3205,7 +3574,8 @@ class LiteratureReviewGenerator:
                 writer_api_config: APIConfig = {
                     'api_key': writer_config.get('api_key') or '',  # type: ignore
                     'model': writer_config.get('model') or '',  # type: ignore
-                    'api_base': writer_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
+                    'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
+                    'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
                 }
 
                 # 调用概念分析接口
@@ -3772,6 +4142,7 @@ class LiteratureReviewGenerator:
             
             # 重置计数器
             self.reset_counters()
+            self.reset_stage1_reader_engine_round_state()
             run_success_count = 0
             run_failure_count = 0
             tracked_total = len(papers_to_process)
@@ -3972,6 +4343,7 @@ class LiteratureReviewGenerator:
                 # 执行自动重试（使用配置中的参数）
                 for retry_round in range(1, max_retry_rounds + 1):
                     self._check_cancelled()
+                    self.reset_stage1_reader_engine_round_state()
                     self._emit_stage1_progress(
                         total=tracked_total,
                         current=run_success_count + run_failure_count,
@@ -4245,9 +4617,11 @@ class LiteratureReviewGenerator:
             self.load_existing_summaries()
             
             if checkpoint_loaded:
+                self._merge_stage1_progress_from_loaded_summaries()
                 self.logger.info("[断点恢复] 成功加载旧 checkpoint，将从上次中断处继续处理")
                 self.logger.info("[断点续传] 已加载处理进度，将跳过已处理的论文")
             elif progress_snapshot_path and self._restore_stage1_progress_from_snapshot(progress_snapshot_path):
+                self._merge_stage1_progress_from_loaded_summaries()
                 self.logger.info("[进度恢复] 找到新的 progress snapshot，将从上次中断处继续处理")
                 self.logger.info("[断点续传] 已加载处理进度，将跳过已处理的论文")
             elif self._rebuild_stage1_progress_from_loaded_summaries():
@@ -4412,7 +4786,8 @@ class LiteratureReviewGenerator:
             writer_api_config: APIConfig = {
                 'api_key': writer_config.get('api_key') or '',  # type: ignore
                 'model': writer_config.get('model') or '',  # type: ignore
-                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
+                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
+                'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
             }
 
             self.logger.info(f"正在调用写作引擎生成章节内容: {section_title}")
@@ -5441,7 +5816,8 @@ class LiteratureReviewGenerator:
             writer_api_config: APIConfig = {
                 'api_key': writer_config.get('api_key') or '',  # type: ignore
                 'model': writer_config.get('model') or '',  # type: ignore
-                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
+                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
+                'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
             }
 
             self.logger.info("正在调用写作引擎生成文献综述...")
@@ -5498,8 +5874,9 @@ class LiteratureReviewGenerator:
                 try:
                     self.logger.info(f"综述生成尝试 {attempt + 1}/{max_retries}")
 
-                    response = requests.post(
+                    response = _post_with_proxy_mode(
                         api_url,
+                        api_config=writer_api_config,
                         headers=headers,
                         json=payload,
                         timeout=300  # 5分钟超时
@@ -5631,13 +6008,15 @@ class LiteratureReviewGenerator:
                     reader_api_config: APIConfig = {
                         'api_key': primary_config.get('api_key', ''),  # type: ignore
                         'model': primary_config.get('model', ''),  # type: ignore
-                        'api_base': primary_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
+                        'api_base': primary_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
+                        'proxy_mode': primary_config.get('proxy_mode', 'environment'),  # type: ignore
                     }
                     
                     backup_api_config: APIConfig = {
                         'api_key': backup_config.get('api_key', ''),  # type: ignore
                         'model': backup_config.get('model', ''),  # type: ignore
-                        'api_base': backup_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
+                        'api_base': backup_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
+                        'proxy_mode': backup_config.get('proxy_mode', 'environment'),  # type: ignore
                     }
                     
                     # 构建完整的分析提示词
@@ -5755,7 +6134,8 @@ class LiteratureReviewGenerator:
             writer_api_config: APIConfig = {
                 'api_key': writer_config.get('api_key') or '',  # type: ignore
                 'model': writer_config.get('model') or '',  # type: ignore
-                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1')  # type: ignore
+                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
+                'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
             }
             
             # 设置系统提示词

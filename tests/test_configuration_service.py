@@ -24,6 +24,9 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert config['Validation']['keep_checkpoints_after_completion'] == 'false'
     assert config['Performance']['enable_stage1_validation'] == 'false'
     assert config['Performance']['enable_stage2_validation'] == 'true'
+    assert config['Primary_Reader_API']['proxy_mode'] == 'environment'
+    assert config['Outline_API']['proxy_mode'] == 'environment'
+    assert config['Validator_API']['proxy_mode'] == 'environment'
 
 
 def test_write_env_file_allows_clearing_existing_keys(tmp_path) -> None:

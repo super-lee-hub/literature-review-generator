@@ -33,6 +33,8 @@ output_path = ./output
 api_key = YOUR_PRIMARY_READER_API_KEY_HERE
 model = Pro/moonshotai/Kimi-K2-Instruct-0905
 api_base = https://api.siliconflow.cn/v1
+# environment = follow HTTP_PROXY/HTTPS_PROXY/NO_PROXY; direct = bypass local proxy for this provider
+proxy_mode = environment
 
 [Backup_Reader_API]
 # [建议] 备用阅读引擎 API 密钥 - 推荐通过 .env 文件设置
@@ -41,6 +43,7 @@ api_base = https://api.siliconflow.cn/v1
 api_key = YOUR_BACKUP_READER_API_KEY_HERE
 model = gemini-2.5-pro
 api_base = https://api.videocaptioner.cn/v1
+proxy_mode = environment
 
 [Writer_API]
 # [建议] 写作引擎 API 密钥 - 推荐通过 .env 文件设置
@@ -49,12 +52,14 @@ api_base = https://api.videocaptioner.cn/v1
 api_key = YOUR_WRITER_API_KEY_HERE
 model = gemini-2.5-pro
 api_base = https://api.videocaptioner.cn/v1
+proxy_mode = environment
 
 [Outline_API]
 # [可选] 用于大纲生成的独立 API
 api_key = YOUR_OUTLINE_API_KEY_HERE
 model = gemini-2.5-pro
 api_base = https://api.videocaptioner.cn/v1
+proxy_mode = environment
 
 [Free_Mode_API]
 # [可选] 用于自由模式前置对话规划的独立 API
@@ -62,6 +67,7 @@ api_base = https://api.videocaptioner.cn/v1
 api_key = YOUR_FREE_MODE_API_KEY_HERE
 model = gemini-2.5-pro
 api_base = https://api.videocaptioner.cn/v1
+proxy_mode = environment
 
 [Performance]
 # 并发处理的最大工作线程数
@@ -186,6 +192,10 @@ font_size_heading2 = 14
 api_key = YOUR_VALIDATOR_API_KEY_HERE
 model = gpt-4-turbo-preview
 api_base = https://api.openai.com/v1
+proxy_mode = environment
+# DeepSeek v4 / reasoning-compatible providers only. Leave blank for providers that do not support these.
+thinking =
+reasoning_effort =
 
 [API_Parameters]
 # API调用参数配置 - 可根据您的模型和需求调整这些参数
@@ -220,6 +230,7 @@ free_mode_temperature = 0.4
 # 验证引擎参数（用于交叉验证）
 validator_max_tokens = 4096
 validator_temperature = 0.3
+validator_context_max_tokens = 1000000
 
 # 观点验证引擎参数（用于批量验证引用）
 claims_max_tokens = 8192

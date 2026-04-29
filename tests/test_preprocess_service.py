@@ -1,4 +1,6 @@
+import io
 import json
+import zipfile
 from pathlib import Path
 
 import fitz  # type: ignore
@@ -202,6 +204,56 @@ def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path, monkeypatch) -> N
     assert {chunk["chunk_source"] for chunk in chunks} == {"selected_stage1_input"}
 
 
+def test_preprocess_manager_refreshes_stale_stage1_cache_with_completeness_gate(tmp_path: Path) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    short_text = ("This paper introduces constructive choice processes in consumer behavior.\n" * 55).strip()
+    artifact_paths = {
+        "stage1_input_path": str(tmp_path / "stage1_input.md"),
+        "stage1_input_manifest_path": str(tmp_path / "stage1_input_manifest.json"),
+        "stage1_quality_report_path": str(tmp_path / "stage1_text_quality_report.json"),
+        "chunks_path": str(tmp_path / "chunks.json"),
+        "manifest_path": str(tmp_path / "prepare_manifest.json"),
+        "diagnostics_path": str(tmp_path / "diagnostics.json"),
+    }
+    Path(artifact_paths["stage1_input_path"]).write_text(short_text, encoding="utf-8")
+    Path(artifact_paths["stage1_input_manifest_path"]).write_text(
+        json.dumps(
+            {
+                "selected_text_source": "normalized_markdown",
+                "stage1_quality_level": "PASS",
+                "stage1_quality_reasons": [],
+                "selected_text_length": len(short_text),
+                "page_count": 11,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    Path(artifact_paths["stage1_quality_report_path"]).write_text("{}", encoding="utf-8")
+    Path(artifact_paths["chunks_path"]).write_text(
+        json.dumps([{"chunk_source": "selected_stage1_input", "text": short_text}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    selected_text, selected_source, quality_level, reasons, chunks = manager._load_or_rebuild_stage1_selection(
+        markdown_text=short_text,
+        plain_text=short_text,
+        page_index=[{"page_number": index + 1, "text": "page text"} for index in range(11)],
+        artifact_paths=artifact_paths,
+        diagnostics={},
+        manifest={},
+    )
+
+    assert selected_text == ""
+    assert selected_source == ""
+    assert quality_level == "REPROCESS"
+    assert "incomplete_by_page_count" in reasons
+    assert chunks == []
+    refreshed_manifest = json.loads(Path(artifact_paths["stage1_input_manifest_path"]).read_text(encoding="utf-8"))
+    assert refreshed_manifest["completeness_metrics"]["page_count"] == 11
+    assert "incomplete_by_page_count" in refreshed_manifest["stage1_quality_reasons"]
+
+
 def test_preprocess_manager_sanitizes_bytes_before_writing_json(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "sample.pdf"
     cache_dir = tmp_path / "cache"
@@ -299,6 +351,84 @@ def test_preprocess_manager_prefers_remote_mineru_when_available(tmp_path: Path,
     diagnostics = json.loads(Path(result.diagnostics_path).read_text(encoding="utf-8"))
     assert diagnostics["mineru_attempted"] is True
     assert diagnostics["mineru_succeeded"] is True
+
+
+def test_mineru_normalizer_downloads_full_zip_url(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    markdown_text = "# Complete MinerU result\n\n" + (
+        "This complete extraction includes methods, results, discussion, conclusions, and references.\n" * 200
+    )
+    plain_text = markdown_text.replace("# Complete MinerU result\n\n", "")
+    raw_zip = io.BytesIO()
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("normalized.md", markdown_text)
+        archive.writestr("plain_text.txt", plain_text)
+        archive.writestr(
+            "page_index.json",
+            json.dumps([{"page_number": 1, "text": plain_text, "text_length": len(plain_text)}]),
+        )
+
+    monkeypatch.setattr(manager, "_request_binary", lambda _url: raw_zip.getvalue())
+
+    normalized = manager._normalize_mineru_payload(
+        payload={"data": {"extract_result": [{"state": "done", "full_zip_url": "https://cdn.example/result.zip"}]}},
+        baseline_page_diagnostics=[],
+        baseline_page_blocks=[],
+        baseline_page_index=[{"page_number": 1, "text": "baseline"}],
+    )
+
+    assert normalized is not None
+    assert normalized["markdown_text"] == markdown_text
+    assert normalized["plain_text"] == plain_text
+    assert len(normalized["plain_text"]) > 6000
+
+
+def test_mineru_normalizer_does_not_treat_baseline_as_success_when_zip_download_fails(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    monkeypatch.setattr(
+        manager,
+        "_request_binary",
+        lambda _url: (_ for _ in ()).throw(RuntimeError("cdn unavailable")),
+    )
+
+    normalized = manager._normalize_mineru_payload(
+        payload={"data": {"extract_result": [{"state": "done", "full_zip_url": "https://cdn.example/result.zip"}]}},
+        baseline_page_diagnostics=[],
+        baseline_page_blocks=[],
+        baseline_page_index=[{"page_number": 1, "text": "baseline watermark text"}],
+    )
+
+    assert normalized is None
+
+
+def test_mineru_binary_download_bypasses_environment_proxy(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_api_token = "token"
+    sessions: list[object] = []
+
+    class FakeResponse:
+        content = b"zip-bytes"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.trust_env = True
+            self.closed = False
+            sessions.append(self)
+
+        def get(self, _url: str, **_kwargs):
+            assert self.trust_env is False
+            return FakeResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr("preprocess.service.requests.Session", FakeSession)
+
+    assert manager._request_binary("https://cdn.example/result.zip") == b"zip-bytes"
+    assert sessions and getattr(sessions[0], "closed") is True
 
 
 def test_preprocess_manager_skips_docling_when_local_pipeline_is_healthy(monkeypatch) -> None:
@@ -521,3 +651,64 @@ def test_hybrid_skip_logs_baseline_quality_metrics(monkeypatch) -> None:
         "text_length=1600" in message and "low_quality_pages=0/1" in message and "scanned_candidate_pages=0/1" in message
         for _level, message in logger.records
     )
+
+
+def test_hybrid_tries_mineru_when_baseline_is_incomplete_by_page_count(monkeypatch) -> None:
+    logger = _ListLogger()
+    manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "enabled": "true",
+                "parser_mode": "hybrid",
+                "primary_parser": "mineru_remote",
+                "ocr_mode": "off",
+            },
+        },
+        logger=logger,
+    )
+    manager.mineru_api_token = "token"
+
+    diagnostics = [
+        PageDiagnostics(
+            page_number=index + 1,
+            text_length=349,
+            image_count=0,
+            scanned_candidate=False,
+            used_ocr=False,
+            low_quality=False,
+        )
+        for index in range(11)
+    ]
+    baseline_text = "A local baseline paragraph about consumer choice.\n" * 80
+    remote_result = {
+        "markdown_text": "# MinerU\n\n" + ("complete remote text\n" * 400),
+        "plain_text": "complete remote text\n" * 400,
+        "page_index": [{"page_number": index + 1, "text": "remote page text"} for index in range(11)],
+        "page_diagnostics": diagnostics,
+        "page_blocks": [],
+        "structured_payload": {"source": "mineru"},
+        "extractor_used": "mineru",
+        "layout_fidelity": "layout_aware",
+        "conversion_used": "native_pdf",
+        "used_ocr": False,
+    }
+
+    monkeypatch.setattr(
+        manager,
+        "_extract_local_page_data",
+        lambda _pdf_path, allow_ocr: (baseline_text, diagnostics, []),
+    )
+    monkeypatch.setattr(manager, "_extract_with_mineru_remote", lambda **_kwargs: remote_result)
+    monkeypatch.setattr(
+        manager,
+        "_extract_with_local_fallbacks",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("local fallback should not run before MinerU")),
+    )
+
+    result = manager._extract_preferred_content("sample.pdf")
+
+    assert result is remote_result
+    assert result["mineru_attempted"] is True
+    assert result["mineru_succeeded"] is True
+    assert result["mineru_remote_enabled"] is True
+    assert any("local baseline looks incomplete" in message for _level, message in logger.records)

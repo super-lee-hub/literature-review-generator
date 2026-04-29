@@ -177,6 +177,9 @@ class APIConfig(TypedDict):
     api_key: Optional[str]
     model: Optional[str]
     api_base: Optional[str]
+    proxy_mode: NotRequired[str]
+    thinking: NotRequired[Any]
+    reasoning_effort: NotRequired[str]
 
 
 SummariesList = List[ProcessingResult]

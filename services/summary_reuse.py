@@ -12,6 +12,7 @@ from services.paper_identity import (
     normalized_author_surnames,
     normalized_title_key,
 )
+from services.stage1_input_completeness import build_completeness_metrics, is_blocked_stage1_quality
 from services.text_io import load_json_file_with_fallbacks
 
 
@@ -182,6 +183,24 @@ def summary_success(summary: Mapping[str, Any]) -> bool:
     return str(summary.get("status") or "").strip().lower() == "success"
 
 
+def summary_stage1_reuse_block_reason(summary: Mapping[str, Any]) -> str:
+    preprocess = summary.get("preprocess")
+    if not isinstance(preprocess, Mapping):
+        return ""
+
+    quality_level = str(preprocess.get("stage1_quality_level") or "")
+    reasons = [
+        str(reason)
+        for reason in (preprocess.get("stage1_quality_reasons") or [])
+        if str(reason).strip()
+    ]
+    completeness = _summary_completeness_metrics(preprocess)
+    reasons = sorted({*reasons, *(str(reason) for reason in completeness.get("reasons") or [])})
+    if is_blocked_stage1_quality(quality_level, reasons):
+        return "stage1_input_incomplete_or_blocked"
+    return ""
+
+
 def summary_canonical_doi(summary: Mapping[str, Any]) -> str:
     paper_info = _summary_paper_info(summary)
     doi = normalize_doi(paper_info.get("doi"))
@@ -249,6 +268,91 @@ def describe_summary_candidate(summary: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _summary_completeness_metrics(preprocess: Mapping[str, Any]) -> Dict[str, Any]:
+    manifest = _load_optional_json(preprocess.get("stage1_input_manifest_path"))
+    quality_report = _load_optional_json(preprocess.get("stage1_quality_report_path"))
+    stage1_text = _read_optional_text(preprocess.get("stage1_input_path"))
+    existing_metrics = {}
+    if isinstance(preprocess.get("stage1_completeness_metrics"), Mapping):
+        existing_metrics = dict(preprocess.get("stage1_completeness_metrics") or {})
+    elif isinstance(preprocess.get("completeness_metrics"), Mapping):
+        existing_metrics = dict(preprocess.get("completeness_metrics") or {})
+
+    candidate_lengths: Dict[str, int] = {}
+    if isinstance(quality_report, Mapping):
+        for report in quality_report.get("candidate_reports") or []:
+            if isinstance(report, Mapping):
+                source = str(report.get("source") or "").strip()
+                if source:
+                    candidate_lengths[source] = int(report.get("text_length") or 0)
+    if not candidate_lengths and isinstance(existing_metrics.get("candidate_lengths"), Mapping):
+        candidate_lengths = {
+            str(source): int(length or 0)
+            for source, length in dict(existing_metrics.get("candidate_lengths") or {}).items()
+        }
+
+    selected_text_length: Optional[int] = None
+    if not stage1_text:
+        selected_text_length = int(
+            manifest.get("selected_text_length")
+            or preprocess.get("selected_text_length")
+            or existing_metrics.get("selected_text_length")
+            or 0
+        )
+    page_count = int(
+        manifest.get("page_count")
+        or preprocess.get("stage1_page_count")
+        or preprocess.get("page_count")
+        or existing_metrics.get("page_count")
+        or 0
+    )
+    chunk_count: Optional[int] = None
+    manifest_metrics = manifest.get("completeness_metrics")
+    if isinstance(manifest_metrics, Mapping):
+        existing_metrics = {**existing_metrics, **dict(manifest_metrics)}
+    if isinstance(existing_metrics, Mapping) and existing_metrics.get("chunk_count") is not None:
+        chunk_count = int(existing_metrics.get("chunk_count") or 0)
+
+    return build_completeness_metrics(
+        text=stage1_text,
+        page_count=page_count,
+        candidate_lengths=candidate_lengths,
+        selected_text_length=selected_text_length,
+        chunk_count=chunk_count,
+    )
+
+
+def _load_optional_json(value: Any) -> Dict[str, Any]:
+    path = _resolve_optional_path(value)
+    if not path:
+        return {}
+    try:
+        payload = load_json_file_with_fallbacks(path)
+    except Exception:
+        return {}
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _read_optional_text(value: Any) -> str:
+    path = _resolve_optional_path(value)
+    if not path:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _resolve_optional_path(value: Any) -> Optional[Path]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    return Path.cwd() / path
+
+
 class SummaryCatalog:
     def __init__(
         self,
@@ -305,6 +409,18 @@ class SummaryCatalog:
                             "source_type": source.source_type,
                             "record_index": index,
                             "reason": "summary_status_not_success",
+                        }
+                    )
+                    continue
+
+                stage1_block_reason = summary_stage1_reuse_block_reason(summary)
+                if stage1_block_reason:
+                    rejected.append(
+                        {
+                            "path": source.path,
+                            "source_type": source.source_type,
+                            "record_index": index,
+                            "reason": stage1_block_reason,
                         }
                     )
                     continue

@@ -1204,6 +1204,7 @@ class WorkspaceController:
                 "model": self.sections.get(section_name, {}).get("model", ""),
                 "api_base": api_base,
                 "api_key": self.env_values.get(API_ENV_MAPPING[section_name], ""),
+                "proxy_mode": self.sections.get(section_name, {}).get("proxy_mode", "environment") or "environment",
             }
         
         # 初始化队列服务
@@ -1958,6 +1959,7 @@ class WorkspaceController:
             updated_sections[section_name]["provider"] = card["provider"]
             updated_sections[section_name]["model"] = card["model"]
             updated_sections[section_name]["api_base"] = card["api_base"]
+            updated_sections[section_name]["proxy_mode"] = card.get("proxy_mode", "environment") or "environment"
             api_keys[section_name] = card["api_key"]
 
         extra_env_values = self._collect_extra_env_values()
@@ -2354,6 +2356,7 @@ class WorkspaceController:
             card["api_key"],
             api_base,
             card["model"],
+            card.get("proxy_mode", "environment"),
         )
         self.show_api_feedback(section_name, message, tone="positive" if ok else "negative")
         self.notify(f"{section_name}: {message}", color="positive" if ok else "negative", multi_line=True)
@@ -3013,6 +3016,12 @@ def _render_api_card(controller: WorkspaceController, section_name: str, title: 
             model_input = ui.input(controller.t("模型名"), value=card["model"]).bind_value(card, "model")
             api_base_input = ui.input("API Base", value=card["api_base"]).bind_value(card, "api_base")
             api_key_input = ui.input("API Key", value=card["api_key"], password=True, password_toggle_button=True).bind_value(card, "api_key")
+            proxy_select = ui.select(
+                {"environment": controller.t("跟随系统代理"), "direct": controller.t("直连")},
+                value=card.get("proxy_mode", "environment"),
+                label=controller.t("代理模式"),
+            )
+            proxy_select.bind_value(card, "proxy_mode")
 
         provider_select.on("update:model-value", lambda _: controller.preview_api_config(section_name))
         model_input.on("blur", lambda _: controller.preview_api_config(section_name))
@@ -3021,6 +3030,7 @@ def _render_api_card(controller: WorkspaceController, section_name: str, title: 
         api_base_input.on("update:model-value", lambda _: controller.preview_api_config(section_name))
         api_key_input.on("blur", lambda _: controller.preview_api_config(section_name))
         api_key_input.on("update:model-value", lambda _: controller.preview_api_config(section_name))
+        proxy_select.on("update:model-value", lambda _: controller.preview_api_config(section_name))
 
         def apply_preset() -> None:
             provider = provider_select.value or "custom"

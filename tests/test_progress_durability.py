@@ -167,3 +167,29 @@ def test_rebuild_stage1_progress_from_loaded_summaries_marks_processed_papers(tm
     assert generator._checkpoint_failed_papers == {"paper b_unknown_author"}
     assert generator.processed_count.value == 1
     assert generator.failed_count.value == 1
+
+
+def test_merge_stage1_progress_from_loaded_summaries_clears_stale_failures(tmp_path) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = _DummyLogger()  # type: ignore[assignment]
+    generator._checkpoint_processed_papers = {"paper a_unknown_author"}
+    generator._checkpoint_failed_papers = {
+        "paper b_unknown_author",
+        "paper c_unknown_author",
+    }
+    generator.summaries = [
+        {"status": "success", "paper_info": {"title": "Paper B"}},
+        {"status": "failed", "paper_info": {"title": "Paper D"}},
+    ]
+
+    assert generator._merge_stage1_progress_from_loaded_summaries() is True
+    assert generator._checkpoint_processed_papers == {
+        "paper a_unknown_author",
+        "paper b_unknown_author",
+    }
+    assert generator._checkpoint_failed_papers == {
+        "paper c_unknown_author",
+        "paper d_unknown_author",
+    }
+    assert generator.processed_count.value == 2
+    assert generator.failed_count.value == 2

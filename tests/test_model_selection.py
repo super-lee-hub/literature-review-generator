@@ -7,6 +7,7 @@ def test_get_outline_api_config_falls_back_to_writer_when_outline_key_is_placeho
             "api_key": "writer-key",
             "model": "writer-model",
             "api_base": "https://writer.example.com/v1",
+            "proxy_mode": "direct",
         },
         "Outline_API": {
             "api_key": "loaded_from_.env_file",
@@ -21,6 +22,7 @@ def test_get_outline_api_config_falls_back_to_writer_when_outline_key_is_placeho
         "api_key": "writer-key",
         "model": "writer-model",
         "api_base": "https://writer.example.com/v1",
+        "proxy_mode": "direct",
     }
 
 
@@ -30,6 +32,7 @@ def test_get_free_mode_api_config_falls_back_to_outline_when_free_mode_key_is_pl
             "api_key": "outline-key",
             "model": "outline-model",
             "api_base": "https://outline.example.com/v1",
+            "proxy_mode": "environment",
         },
         "Free_Mode_API": {
             "api_key": "YOUR_FREE_MODE_API_KEY_HERE",
@@ -44,4 +47,5 @@ def test_get_free_mode_api_config_falls_back_to_outline_when_free_mode_key_is_pl
         "api_key": "outline-key",
         "model": "outline-model",
         "api_base": "https://outline.example.com/v1",
+        "proxy_mode": "environment",
     }

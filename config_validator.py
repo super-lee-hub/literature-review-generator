@@ -11,6 +11,8 @@ import requests  # type: ignore
 import json
 from typing import Tuple, Dict, Any, List
 
+from services.proxy_policy import should_bypass_environment_proxy
+
 
 class ConfigValidationError(Exception):
     """配置验证异常类"""
@@ -505,7 +507,7 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
 
 
-def test_api_connection(api_key: str, api_base: str, model: str) -> Tuple[bool, str]:
+def test_api_connection(api_key: str, api_base: str, model: str, proxy_mode: str = "environment") -> Tuple[bool, str]:
 
 
     """
@@ -578,19 +580,20 @@ def test_api_connection(api_key: str, api_base: str, model: str) -> Tuple[bool, 
         # 发送请求到模型列表端点
 
 
-        response = requests.get(
-
-
-            models_endpoint,
-
-
-            headers=headers,
-
-
-            timeout=10  # 10秒超时
-
-
-        )
+        if should_bypass_environment_proxy({"proxy_mode": proxy_mode}):
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.get(
+                    models_endpoint,
+                    headers=headers,
+                    timeout=10,  # 10秒超时
+                )
+        else:
+            response = requests.get(
+                models_endpoint,
+                headers=headers,
+                timeout=10,  # 10秒超时
+            )
 
 
         

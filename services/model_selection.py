@@ -34,6 +34,7 @@ def _section_to_api_config(section: Dict[str, Any] | None) -> APIConfig:
         "api_key": api_key,
         "model": _normalize_text(section.get("model")),
         "api_base": _normalize_text(section.get("api_base")) or "https://api.openai.com/v1",
+        "proxy_mode": _normalize_text(section.get("proxy_mode")) or "environment",
     }
 
 

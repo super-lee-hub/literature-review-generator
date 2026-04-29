@@ -41,8 +41,42 @@ except ImportError:
 
 # 导入主程序中的AI接口调用函数
 from ai_interface import _call_ai_api  # type: ignore
+from context_manager import estimate_tokens
 from summary_schema import get_core_analysis
 from validation.llm_adjudicator import build_adjudication_packet, run_adjudication_stage
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _get_validator_context_max_tokens(generator_instance: Any) -> int:
+    api_params = {}
+    try:
+        api_params = generator_instance.config.get("API_Parameters") or {}
+    except Exception:
+        api_params = {}
+    return _coerce_positive_int(api_params.get("validator_context_max_tokens"), 1_000_000)
+
+
+def _truncate_text_to_token_budget(text: str, max_tokens: int) -> str:
+    if not text or max_tokens <= 0:
+        return text
+    current_tokens = estimate_tokens(text)
+    if current_tokens <= max_tokens:
+        return text
+
+    keep_chars = max(1, int(len(text) * (max_tokens / max(current_tokens, 1))))
+    truncated = text[:keep_chars]
+    while keep_chars > 1 and estimate_tokens(truncated) > max_tokens:
+        keep_chars = max(1, int(keep_chars * 0.95))
+        truncated = text[:keep_chars]
+    return truncated
+
 
 def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: Dict[str, Any],
                            use_cache: bool = True) -> Dict[str, Any]:
@@ -144,10 +178,8 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
         # 安全生成提示词
         try:
             summary_str: str = json.dumps(ai_result, ensure_ascii=False, indent=2)
-            max_text_len: int = 800000  # 限制文本长度，防止API调用超限
-
-            # 截断过长的文本
-            truncated_pdf_text = pdf_text[:max_text_len] if len(pdf_text) > max_text_len else pdf_text
+            context_max_tokens = _get_validator_context_max_tokens(generator_instance)
+            truncated_pdf_text = _truncate_text_to_token_budget(pdf_text, context_max_tokens)
 
             final_prompt = prompt_template.replace('{{PAPER_FULL_TEXT}}', truncated_pdf_text)
             final_prompt = final_prompt.replace('{{GENERATED_SUMMARY}}', summary_str)
@@ -519,11 +551,19 @@ def _get_validator_api_config(generator_instance: Any) -> Optional[APIConfig]:
     model = str(validator_config.get("model") or "").strip()
     if not api_key or not model:
         return None
-    return APIConfig(
+    api_config = APIConfig(
         api_key=api_key,
         model=model,
         api_base=str(validator_config.get("api_base") or "https://api.openai.com/v1").strip(),
+        proxy_mode=str(validator_config.get("proxy_mode") or "environment").strip(),
     )
+    thinking = str(validator_config.get("thinking") or "").strip()
+    reasoning_effort = str(validator_config.get("reasoning_effort") or "").strip()
+    if thinking:
+        api_config["thinking"] = thinking
+    if reasoning_effort:
+        api_config["reasoning_effort"] = reasoning_effort
+    return api_config
 
 
 def _load_source_text_for_artifact(paper_artifact: Dict[str, Any]) -> str:

@@ -501,6 +501,203 @@ def test_process_paper_backfills_inverted_citation_authors_from_stage1_text(tmp_
     assert paper["doi"] == "10.1234/example"
 
 
+def test_stage1_reader_disabled_engines_reset_each_round(tmp_path) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+
+    generator._disable_stage1_reader_engine_for_round("backup", {"message": "balance is insufficient"})
+    assert generator._is_stage1_reader_engine_disabled("backup") is True
+
+    generator.reset_stage1_reader_engine_round_state()
+
+    assert generator._is_stage1_reader_engine_disabled("backup") is False
+
+
+def test_process_paper_syncs_zotero_paper_info_metadata_before_quality_check(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.mode = "zotero"
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "", "model": "", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
+    monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
+
+    def _fake_validate(summary_data):
+        metadata = summary_data["ai_summary"]["paper_metadata"]
+        assert metadata["year"] == "2024"
+        assert metadata["journal"] == "Journal of Tests"
+        return True, "ok"
+
+    monkeypatch.setattr(main, "validate_summary_quality", _fake_validate)
+
+    result = generator.process_paper(
+        {
+            "title": "Zotero Paper",
+            "authors": ["Alice Example"],
+            "year": "2024",
+            "journal": "Journal of Tests",
+            "doi": "",
+            "pdf_path": str(pdf_path),
+        },
+        0,
+        None,
+        1,
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+
+
+def test_process_paper_persists_metadata_only_failure_with_manual_review(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.mode = "zotero"
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "backup", "model": "m2", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(generator, "_apply_stage1_text_metadata_backfill", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
+    monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (False, "年份信息缺失; 期刊信息缺失"))
+    monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
+
+    result = generator.process_paper(
+        {
+            "title": "Metadata Missing Paper",
+            "authors": ["Alice Example"],
+            "year": _legacy_mojibake_unknown_year(),
+            "journal": _legacy_mojibake_unknown_journal(),
+            "doi": "",
+            "pdf_path": str(pdf_path),
+        },
+        0,
+        None,
+        1,
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    audit = result["ai_summary"]["quality_audit"]
+    assert audit["needs_manual_review"] is True
+    assert "paper_metadata.year" in audit["missing_critical_fields"]
+    assert "paper_metadata.journal" in audit["missing_critical_fields"]
+    assert "metadata_needs_manual_review" in audit["conflict_flags"]
+
+
+def test_process_paper_direct_mode_marks_unresolved_metadata_manual_review(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "", "model": "", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(generator, "_apply_stage1_text_metadata_backfill", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
+    monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (True, "ok"))
+    monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
+
+    result = generator.process_paper(
+        {
+            "title": "Filename Only Paper",
+            "authors": ["Alice Example"],
+            "year": _legacy_mojibake_unknown_year(),
+            "journal": _legacy_mojibake_unknown_journal(),
+            "doi": "",
+            "pdf_path": str(pdf_path),
+        },
+        0,
+        None,
+        1,
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    audit = result["ai_summary"]["quality_audit"]
+    assert audit["needs_manual_review"] is True
+    assert "paper_metadata.year" in audit["missing_critical_fields"]
+    assert "paper_metadata.journal" in audit["missing_critical_fields"]
+
+
+def test_process_paper_body_quality_failure_tries_other_reader_engine(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "backup", "model": "m2", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+    calls: list[set[str] | None] = []
+
+    bad_summary = _quality_ready_ai_summary()
+    bad_summary["body_marker"] = "bad"
+    good_summary = _quality_ready_ai_summary()
+
+    def _fake_reader(*_args, skip_engines=None, **_kwargs):
+        calls.append(skip_engines)
+        if skip_engines:
+            return {"status": "success", "content": good_summary, "engine_type": "backup"}
+        return {"status": "success", "content": bad_summary, "engine_type": "primary"}
+
+    def _fake_validate(summary_data):
+        if summary_data["ai_summary"].get("body_marker") == "bad":
+            return False, "摘要为空"
+        return True, "ok"
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
+    monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(generator, "_call_stage1_reader_with_scheduler", _fake_reader)
+    monkeypatch.setattr(main, "validate_summary_quality", _fake_validate)
+    monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
+
+    result = generator.process_paper(
+        {
+            "title": "Body Bad Paper",
+            "authors": ["Alice Example"],
+            "year": "2024",
+            "journal": "Journal of Tests",
+            "doi": "",
+            "pdf_path": str(pdf_path),
+        },
+        0,
+        None,
+        1,
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert result["model_used"] == "backup"
+    assert calls == [None, {"primary"}]
+
+
 def test_process_paper_returns_failed_when_all_stage1_strategies_fail(tmp_path, monkeypatch) -> None:
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
     generator.logger = cast(main.CustomLogger, _DummyLogger())
@@ -592,6 +789,99 @@ def test_process_paper_returns_failed_when_all_stage1_strategies_fail(tmp_path, 
     assert first_attempt["mineru_route"] == "hybrid_local_baseline_met"
     assert first_attempt["stage1_route"]["extractor_used"] == "mock-hybrid"
     assert "MinerU: requested=True, enabled=False, attempted=False" in result["failure_reason"]
+
+
+def test_process_paper_skips_ai_for_blocked_stage1_attempts(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "", "model": "", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+
+    def _prepare_stage1_input(_path, preprocess_strategy="hybrid"):
+        if preprocess_strategy in {"hybrid", "docling"}:
+            return (
+                "",
+                {
+                    "analysis_input_kind": "blocked_stage1_input",
+                    "extractor_used": f"mock-{preprocess_strategy}",
+                    "preprocess_profile": preprocess_strategy,
+                    "parser_mode": preprocess_strategy,
+                    "selected_text_source": "",
+                    "stage1_quality_level": "REPROCESS",
+                    "stage1_quality_reasons": ["incomplete_by_page_count"],
+                    "selected_text_length": 0,
+                    "stage1_page_count": 11,
+                },
+            )
+        return (
+            "A" * 1600,
+            {
+                "analysis_input_kind": "text",
+                "extractor_used": "mock-legacy",
+                "preprocess_profile": "legacy",
+                "parser_mode": "legacy",
+                "selected_text_source": "legacy_text",
+                "stage1_quality_level": "PASS",
+                "stage1_quality_reasons": [],
+                "selected_text_length": 1600,
+                "stage1_page_count": 1,
+            },
+        )
+
+    ai_calls: list[str] = []
+
+    def _fake_summary(*_args, **_kwargs):
+        ai_calls.append("primary")
+        return _quality_ready_ai_summary()
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", _prepare_stage1_input)
+    monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_build_stage1_model_input",
+        lambda **_kwargs: {
+            "input_mode": "text_only",
+            "prompt_text": "prompt",
+            "user_message_content": None,
+            "selected_visual_refs": [],
+            "visual_manifest_path": "",
+            "visual_bundle_path": "",
+            "visual_selection_policy_snapshot": {},
+            "multimodal_capability": {},
+            "fallback_reason": "",
+        },
+    )
+    monkeypatch.setattr(generator, "_apply_stage1_text_metadata_backfill", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(generator, "_apply_ai_metadata_backfill", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", _fake_summary)
+    monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (True, "ok"))
+    monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
+
+    result = generator.process_paper(
+        {
+            "title": "Demo Paper",
+            "authors": ["Alice Example"],
+            "year": "2024",
+            "journal": "Journal of Tests",
+            "doi": "",
+            "pdf_path": str(pdf_path),
+        },
+        0,
+        None,
+        1,
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert ai_calls == ["primary"]
+    assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling"]
+    assert result["attempt_history"][0]["stage1_quality_reasons"] == ["incomplete_by_page_count"]
 
 
 def test_generate_review_outline_prefers_outline_api_config(tmp_path, monkeypatch) -> None:

@@ -5,10 +5,11 @@ import time
 import threading
 import re
 import requests  # type: ignore
-from typing import Union, Dict, Optional, Any, List, Tuple, Callable
+from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set
 
 from models import APIConfig
 from config_loader import load_config
+from services.proxy_policy import should_bypass_environment_proxy
 from summary_schema import (
     default_ai_summary,
     get_ai_summary,
@@ -18,6 +19,195 @@ from summary_schema import (
 
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
+_NON_RETRIABLE_HTTP_STATUSES = {400, 401, 402, 403, 404, 422}
+_QUOTA_ERROR_MARKERS = (
+    "insufficient_user_quota",
+    "insufficient quota",
+    "quota exceeded",
+    "balance is insufficient",
+    "insufficient balance",
+    "recharge",
+    "credit balance",
+    "billing quota",
+    "余额不足",
+    "额度不足",
+    "余额/额度",
+    "充值",
+    "欠费",
+)
+_TRANSIENT_NETWORK_MARKERS = (
+    "timeout",
+    "timed out",
+    "proxy",
+    "disconnect",
+    "connection reset",
+    "connection aborted",
+    "ssl eof",
+    "eof occurred",
+    "remote end closed connection",
+    "temporarily unavailable",
+)
+_PAYLOAD_PARAMETER_ERROR_MARKERS = (
+    "unsupported parameter",
+    "not support",
+    "not supported",
+    "deprecated",
+    "unknown parameter",
+    "unrecognized parameter",
+    "not allowed",
+)
+
+
+def _api_result(
+    *,
+    status: str,
+    content: Any = None,
+    error_kind: Optional[str] = None,
+    http_status: Optional[int] = None,
+    provider_code: Optional[str] = None,
+    message: str = "",
+    engine_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "error_kind": error_kind,
+        "http_status": http_status,
+        "provider_code": provider_code,
+        "message": message,
+        "content": content,
+        "engine_type": engine_type,
+    }
+
+
+def _extract_provider_error(response: Any) -> Dict[str, Any]:
+    status_code = getattr(response, "status_code", None)
+    provider_code = None
+    message = ""
+    raw_text = ""
+
+    if response is None:
+        return {
+            "http_status": None,
+            "provider_code": None,
+            "message": "",
+            "raw_text": "",
+        }
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        error_payload = payload.get("error", payload)
+        if isinstance(error_payload, dict):
+            provider_code = (
+                error_payload.get("code")
+                or error_payload.get("type")
+                or error_payload.get("error_code")
+            )
+            message = str(error_payload.get("message") or error_payload.get("error") or "")
+        elif error_payload is not None:
+            message = str(error_payload)
+        raw_text = str(payload)
+    else:
+        raw_text = str(getattr(response, "text", "") or "")
+        message = raw_text
+
+    return {
+        "http_status": status_code,
+        "provider_code": str(provider_code or ""),
+        "message": message,
+        "raw_text": raw_text,
+    }
+
+
+def _looks_like_quota_error(*parts: Any) -> bool:
+    text = " ".join(str(part or "") for part in parts).casefold()
+    return any(marker.casefold() in text for marker in _QUOTA_ERROR_MARKERS)
+
+
+def _classify_http_error(response: Any) -> Tuple[str, Optional[int], Optional[str], str]:
+    details = _extract_provider_error(response)
+    status_code = details.get("http_status")
+    provider_code = str(details.get("provider_code") or "")
+    message = str(details.get("message") or details.get("raw_text") or "")
+
+    if _looks_like_quota_error(provider_code, message, details.get("raw_text")):
+        return "quota_exhausted", status_code, provider_code or None, message
+    if status_code == 429 or (isinstance(status_code, int) and 500 <= status_code <= 599):
+        return "retryable_http", status_code, provider_code or None, message
+    if status_code in {400, 401, 402, 403, 404, 422}:
+        return "fatal_config_or_auth", status_code, provider_code or None, message
+    return "retryable_http", status_code, provider_code or None, message
+
+
+def _classify_exception(exc: BaseException) -> Tuple[str, str]:
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ProxyError,
+            requests.exceptions.SSLError,
+        ),
+    ):
+        return "transient_network", str(exc)
+
+    message = str(exc)
+    message_folded = message.casefold()
+    if any(marker in message_folded for marker in _TRANSIENT_NETWORK_MARKERS):
+        return "transient_network", message
+    return "invalid_response", message
+
+
+def _is_payload_parameter_error(parameter_name: str, *parts: Any) -> bool:
+    text = " ".join(str(part or "") for part in parts).casefold()
+    return parameter_name.casefold() in text and any(marker in text for marker in _PAYLOAD_PARAMETER_ERROR_MARKERS)
+
+
+def _normalize_thinking_payload(value: Any) -> Optional[Dict[str, str]]:
+    if isinstance(value, dict):
+        thinking_type = str(value.get("type") or "").strip().lower()
+        if thinking_type in {"enabled", "disabled"}:
+            return {"type": thinking_type}
+        return None
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    lowered = text.casefold()
+    if lowered.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        return _normalize_thinking_payload(parsed)
+    if lowered in {"enabled", "enable", "on", "true", "yes", "1"}:
+        return {"type": "enabled"}
+    if lowered in {"disabled", "disable", "off", "false", "no", "0"}:
+        return {"type": "disabled"}
+    return None
+
+
+def _apply_optional_api_payload_params(payload: Dict[str, Any], api_config: APIConfig, logger: Any = None) -> None:
+    reasoning_effort = str(api_config.get("reasoning_effort") or "").strip()
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+
+    thinking_payload = _normalize_thinking_payload(api_config.get("thinking"))
+    if thinking_payload:
+        payload["thinking"] = thinking_payload
+    elif api_config.get("thinking") not in (None, "") and logger:
+        logger.warning("Ignoring invalid API thinking config; expected enabled/disabled or {'type': ...}.")
+
+
+def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any) -> Any:
+    if should_bypass_environment_proxy(api_config):
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.post(api_url, **kwargs)
+    return requests.post(api_url, **kwargs)
 
 
 def _default_core_variables() -> Dict[str, List[str]]:
@@ -39,6 +229,25 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _response_error_details(response: Any, limit: int = 500) -> str:
+    if response is None:
+        return "HTTP错误 ?"
+
+    details = f"HTTP错误 {getattr(response, 'status_code', '?')}"
+    try:
+        error_response = response.json()
+        details += f"，响应: {str(error_response)[:limit]}"
+    except Exception:
+        response_text = getattr(response, "text", "") or "无响应内容"
+        details += f"，响应文本: {response_text[:limit]}"
+    return details
+
+
+def _is_non_retriable_http_response(response: Any) -> bool:
+    status_code = getattr(response, "status_code", None)
+    return status_code in _NON_RETRIABLE_HTTP_STATUSES
 
 
 def _load_api_runtime_settings() -> Tuple[int, int]:
@@ -120,175 +329,230 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
     return normalized
 
 
-def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
-                 temperature: float = 0.3, response_format: str = "json", logger: Any = None,
-                 user_content: Any = None) -> Optional[Dict[str, Any]]:
-    """
-    统一的AI API调用函数，完全独立处理JSON解析，包含自动纠错功能
-
-    Args:
-        prompt: 用户提示词
-        api_config: API配置字典
-        system_prompt: 系统提示词
-        max_tokens: 最大令牌数
-        temperature: 温度参数
-        response_format: 响应格式 ("json" 或 "text")
-        logger: 日志记录器实例
-
-    Returns:
-        解析后的Python字典（如果响应是JSON）或字符串，失败返回None
-    """
+def _call_ai_api_detailed(
+    prompt: str,
+    api_config: APIConfig,
+    system_prompt: str,
+    max_tokens: int = 4000,
+    temperature: float = 0.3,
+    response_format: str = "json",
+    logger: Any = None,
+    user_content: Any = None,
+    retry_attempts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Call a chat-completions compatible API and retain failure details."""
     try:
         api_key = api_config.get('api_key') or ''
         model_name = api_config.get('model') or ''
         api_base = api_config.get('api_base', 'https://api.openai.com/v1') or 'https://api.openai.com/v1'
-        
+
         if not api_key or not model_name:
+            message = "API config is missing api_key or model"
             if logger:
-                logger.error("API配置缺少必要的参数: api_key 或 model")
-            return None
-        
-        # 从配置文件加载超时设置
-        timeout_seconds, max_retries = _load_api_runtime_settings()
-        
+                logger.error(message)
+            return _api_result(status="failed", error_kind="fatal_config_or_auth", message=message)
+
+        timeout_seconds, configured_retries = _load_api_runtime_settings()
+        max_retries = (
+            _coerce_positive_int(retry_attempts, configured_retries)
+            if retry_attempts is not None
+            else configured_retries
+        )
         api_url = f"{api_base.rstrip('/')}/chat/completions"
-        
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
+            "Authorization": f"Bearer {api_key}",
         }
-        
         normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
-
         payload: Dict[str, Any] = {
             "model": model_name,
             "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": normalized_user_content
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": normalized_user_content},
             ],
             "temperature": temperature,
-            "max_tokens": max_tokens
+            "max_tokens": max_tokens,
         }
-        
-        # 如果需要JSON格式响应，添加response_format参数
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
-        
-        # 重试逻辑
+        _apply_optional_api_payload_params(payload, api_config, logger=logger)
+
         response = None
-        for attempt in range(max_retries):
+        last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
+        attempt = 0
+        removed_compat_params: Set[str] = set()
+        while attempt < max_retries:
+            attempt += 1
             try:
-                # 特殊处理AIHubMix API
                 final_payload = payload.copy()
-                is_aihubmix = 'aihubmix.com' in api_base.lower()
-                
-                if is_aihubmix:
-                    # AIHubMix支持Gemini模型，不需要映射
-                    if logger:
-                        logger.info(f"调用AIHubMix API，模型: {final_payload['model']}")
-                    # AIHubMix使用标准的json参数，与OpenAI兼容
-                    response = requests.post(
-                        api_url,
-                        headers=headers,
-                        json=final_payload,
-                        timeout=timeout_seconds
-                    )
-                else:
-                    # 标准OpenAI兼容API使用json参数
-                    response = requests.post(
-                        api_url,
-                        headers=headers,
-                        json=final_payload,
-                        timeout=timeout_seconds
-                    )
-                
+                if 'aihubmix.com' in api_base.lower() and logger:
+                    logger.info(f"调用AIHubMix API，模型: {final_payload['model']}")
+
+                response = _post_with_proxy_mode(
+                    api_url,
+                    api_config=api_config,
+                    headers=headers,
+                    json=final_payload,
+                    timeout=timeout_seconds,
+                )
                 response.raise_for_status()
-                response_data = response.json()
-                
-                # 提取AI回复内容
-                content = response_data['choices'][0]['message']['content']
-                
-                # 如果需要JSON格式响应，尝试解析JSON
+
+                try:
+                    response_data = response.json()
+                    content = response_data['choices'][0]['message']['content']
+                except Exception as exc:
+                    message = f"Malformed API response: {exc}"
+                    if logger:
+                        logger.error(message)
+                    return _api_result(
+                        status="failed",
+                        error_kind="invalid_response",
+                        http_status=getattr(response, "status_code", None),
+                        message=message,
+                    )
+
                 if response_format == "json":
-                    # 使用智能JSON解析器，包含自动纠错功能
                     parsed_content = _smart_json_parser(content)
                     if parsed_content is not None:
-                        return parsed_content
-                    else:
-                        # 如果智能解析失败，尝试自动纠错
-                        corrected_content = _auto_correct_json(content)
-                        if corrected_content is not None:
-                            if logger:
-                                logger.info("通过自动纠错成功修复JSON")
-                            return corrected_content
-                        else:
-                            if logger:
-                                logger.error("自动纠错也失败，无法解析JSON")
-                                logger.debug(f"AI返回内容: {str(content)[:500]}...")
-                            return None
-                else:
-                    # 文本格式响应，直接返回
-                    return content
-                
-            except requests.exceptions.HTTPError as e:
-                if attempt < max_retries - 1:
-                    wait_time = 2 * (2 ** attempt)
-                    # 记录详细的错误信息
-                    error_details = f"HTTP错误 {response.status_code if response is not None else '?'}"
-                    if response is not None:
-                        try:
-                            error_response = response.json()
-                            error_details += f"，响应: {str(error_response)[:200]}"
-                        except:
-                            error_details += f"，响应文本: {response.text[:200] if response.text else '无响应内容'}"
+                        return _api_result(
+                            status="success",
+                            content=parsed_content,
+                            http_status=getattr(response, "status_code", None),
+                        )
+
+                    corrected_content = _auto_correct_json(content)
+                    if corrected_content is not None:
+                        if logger:
+                            logger.info("通过自动纠错成功修复JSON")
+                        return _api_result(
+                            status="success",
+                            content=corrected_content,
+                            http_status=getattr(response, "status_code", None),
+                        )
+
+                    message = "200 response but JSON content is empty or malformed"
                     if logger:
-                        logger.warning(f"{error_details}，{wait_time:.1f}秒后重试...")
+                        logger.error(message)
+                        logger.debug(f"AI返回内容: {str(content)[:500]}...")
+                    return _api_result(
+                        status="failed",
+                        error_kind="invalid_response",
+                        http_status=getattr(response, "status_code", None),
+                        message=message,
+                    )
+
+                return _api_result(
+                    status="success",
+                    content=content,
+                    http_status=getattr(response, "status_code", None),
+                )
+
+            except requests.exceptions.HTTPError:
+                error_kind, http_status, provider_code, message = _classify_http_error(response)
+                last_failure = _api_result(
+                    status="failed",
+                    error_kind=error_kind,
+                    http_status=http_status,
+                    provider_code=provider_code,
+                    message=message or _response_error_details(response, limit=500),
+                )
+                for payload_key in ("temperature", "response_format", "reasoning_effort", "thinking"):
+                    if (
+                        payload_key in payload
+                        and payload_key not in removed_compat_params
+                        and _is_payload_parameter_error(payload_key, provider_code, message, last_failure["message"])
+                    ):
+                        removed_compat_params.add(payload_key)
+                        payload.pop(payload_key, None)
+                        attempt -= 1
+                        if logger:
+                            logger.warning(
+                                f"API rejected payload parameter '{payload_key}', retrying once without it."
+                            )
+                        break
+                else:
+                    payload_key = ""
+
+                if payload_key:
+                    continue
+
+                if error_kind in {"quota_exhausted", "fatal_config_or_auth"}:
+                    if logger:
+                        logger.error(f"API调用不可重试失败 ({error_kind}): {last_failure['message']}")
+                    return last_failure
+
+                if attempt < max_retries:
+                    wait_time = 2 * (2 ** (attempt - 1))
+                    if logger:
+                        logger.warning(f"{_response_error_details(response, limit=200)}，{wait_time:.1f}秒后重试...")
                     time.sleep(wait_time)
                     continue
-                else:
-                    # 最终失败时记录更详细的信息
-                    error_details = f"API调用最终失败: HTTP {response.status_code if response is not None else '?'}"
-                    if response is not None:
-                        try:
-                            error_response = response.json()
-                            error_details += f"，响应: {str(error_response)[:500]}"
-                        except:
-                            error_details += f"，响应文本: {response.text[:500] if response.text else '无响应内容'}"
-                    if logger:
-                        logger.error(error_details)
-                    return None
 
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = 2 * (2 ** attempt)
-                    # 处理网络连接错误
-                    error_msg = str(e)
-                    if "Connection" in error_msg or "timeout" in error_msg.lower() or "reset" in error_msg.lower():
-                        if logger:
-                            logger.warning(f"网络连接错误: {str(e)}，{wait_time:.1f}秒后重试...")
-                    else:
-                        if logger:
-                            logger.warning(f"错误: {str(e)}，{wait_time:.1f}秒后重试...")
+                if logger:
+                    logger.error(f"API调用最终失败: {last_failure['message']}")
+                return last_failure
+
+            except Exception as exc:
+                response_status = getattr(response, "status_code", None)
+                if isinstance(response_status, int) and response_status >= 400:
+                    error_kind, http_status, provider_code, message = _classify_http_error(response)
+                else:
+                    error_kind, message = _classify_exception(exc)
+                    http_status = response_status
+                    provider_code = None
+
+                last_failure = _api_result(
+                    status="failed",
+                    error_kind=error_kind,
+                    http_status=http_status,
+                    provider_code=provider_code,
+                    message=message,
+                )
+                if error_kind in {"quota_exhausted", "fatal_config_or_auth", "invalid_response"}:
+                    if logger:
+                        logger.error(f"API调用不可重试失败 ({error_kind}): {message}")
+                    return last_failure
+
+                if attempt < max_retries:
+                    wait_time = 2 * (2 ** (attempt - 1))
+                    if logger:
+                        logger.warning(f"API调用失败 ({error_kind}): {message}，{wait_time:.1f}秒后重试...")
                     time.sleep(wait_time)
                     continue
-                else:
-                    # 记录详细错误信息但不中断程序
-                    if logger:
-                        logger.error(f"API调用最终失败: {str(e)}")
-                    return None
-        
-        return None
 
-    except Exception as e:
+                if logger:
+                    logger.error(f"API调用最终失败 ({error_kind}): {message}")
+                return last_failure
+
+        return last_failure
+
+    except Exception as exc:
         if logger:
-            logger.error(f"调用API失败: {e}")
-        return None
+            logger.error(f"调用API失败: {exc}")
+        error_kind, message = _classify_exception(exc)
+        return _api_result(status="failed", error_kind=error_kind, message=message)
+
+
+def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
+                 temperature: float = 0.3, response_format: str = "json", logger: Any = None,
+                 user_content: Any = None) -> Optional[Dict[str, Any]]:
+    """
+    Backward-compatible wrapper: existing callers receive parsed content only.
+    Use _call_ai_api_detailed when transport failure kind is needed.
+    """
+    result = _call_ai_api_detailed(
+        prompt,
+        api_config,
+        system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        response_format=response_format,
+        logger=logger,
+        user_content=user_content,
+    )
+    if result.get("status") == "success":
+        return result.get("content")
+    return None
 
 
 def _smart_json_parser(content: str) -> Optional[Dict[str, Any]]:
@@ -1001,140 +1265,319 @@ except Exception as e:
     rate_limiter = RateLimiter(900000, 9000, 2000000, 9000)
 
 
+def get_summary_from_ai_detailed(
+    prompt_text: str,
+    primary_api_config: APIConfig,
+    backup_api_config: APIConfig,
+    engine_type: str = 'primary',
+    logger: Optional[Any] = None,
+    config: Optional[Dict[str, Any]] = None,
+    user_content: Any = None,
+    retry_attempts: Optional[int] = None,
+    allow_rate_limiter_switch: bool = True,
+) -> Dict[str, Any]:
+    """Stage-1 reader call that preserves API failure classification."""
+    if ('dummy' in (primary_api_config.get('api_key') or '') or
+        'dummy' in (backup_api_config.get('api_key') or '')):
+        return _api_result(
+            status="success",
+            engine_type=engine_type,
+            content=normalize_ai_summary(
+                {
+                    'routing': {
+                        'paper_type': None,
+                        'paper_subtype_raw': None,
+                        'paper_subtype_normalized': None,
+                        'classification_status': 'uncertain',
+                        'route_confidence': 'low',
+                        'classification_rationale': None,
+                        'secondary_candidates': [],
+                    },
+                    'core_analysis': {
+                        'summary': 'This is a dummy summary.',
+                        'key_points': ['Dummy key point 1', 'Dummy key point 2'],
+                        'methodology': 'Dummy methodology.',
+                        'findings': 'Dummy findings.',
+                        'conclusions': 'Dummy conclusions.',
+                        'relevance': 'Dummy relevance.',
+                        'limitations': 'Dummy limitations.',
+                        'theoretical_framework': None,
+                        'research_gap': None,
+                        'future_research_directions': [],
+                    },
+                    'specialized_details': {
+                        'empirical': None,
+                        'review': None,
+                        'conceptual': None,
+                    },
+                }
+            ),
+        )
+
+    if logger:
+        rate_limiter.set_logger(logger)
+
+    if not prompt_text or not prompt_text.strip():
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message="Prompt text is empty",
+            engine_type=engine_type,
+        )
+    if engine_type not in engine_map:
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message=f"Unknown reader engine type: {engine_type}",
+            engine_type=engine_type,
+        )
+
+    api_config = primary_api_config if engine_type == 'primary' else backup_api_config
+    engine_name = engine_map[engine_type]['name']
+    api_key = api_config.get('api_key') or ''
+    model_name = api_config.get('model') or ''
+    api_base = api_config.get('api_base') or 'https://api.openai.com/v1'
+
+    if not api_key.strip():
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message=f"{engine_name} api_key is empty",
+            engine_type=engine_type,
+        )
+    if not model_name.strip():
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message=f"{engine_name} model is empty",
+            engine_type=engine_type,
+        )
+    if len(prompt_text) > 10000000:
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message=f"Prompt text is too long: {len(prompt_text)} characters",
+            engine_type=engine_type,
+        )
+
+    runtime_config = config
+    if runtime_config is None:
+        try:
+            runtime_config = load_config('config.ini')
+        except Exception:
+            runtime_config = None
+
+    try:
+        if runtime_config:
+            api_params = runtime_config.get('API_Parameters', {}) or {}  # type: ignore[union-attr]
+            if engine_type == 'primary':
+                max_tokens = int(api_params.get('primary_max_tokens', 3000))
+                temperature = float(api_params.get('primary_temperature', 0.3))
+            else:
+                max_tokens = int(api_params.get('backup_max_tokens', 8192))
+                temperature = float(api_params.get('backup_temperature', 0.3))
+        else:
+            max_tokens = 3000
+            temperature = 0.3
+    except (ValueError, TypeError) as exc:
+        if logger:
+            logger.warning(f"Failed to read API parameters, using defaults: {exc}")
+        max_tokens = 3000
+        temperature = 0.3
+
+    try:
+        with open('prompts/prompt_system_analyze.txt', 'r', encoding='utf-8') as handle:
+            system_prompt = handle.read()
+    except Exception as exc:
+        if logger:
+            logger.warning(f"Unable to load system prompt, using default: {exc}")
+        system_prompt = (
+            "You are an academic literature analysis expert. Analyze the paper text "
+            "and return a structured JSON summary."
+        )
+
+    estimated_tokens = len(prompt_text) + 3000
+    rate_limit_result = rate_limiter.consume(
+        tokens_needed=estimated_tokens,
+        requests_needed=1,
+        engine_type=engine_type,
+    )
+
+    if rate_limit_result is True:
+        pass
+    elif isinstance(rate_limit_result, float):
+        wait_time = rate_limit_result
+        if logger:
+            logger.info(f"{engine_name} token bucket wait: {wait_time:.2f}s")
+        time.sleep(wait_time)
+        retry_result = rate_limiter.consume(
+            tokens_needed=estimated_tokens,
+            requests_needed=1,
+            engine_type=engine_type,
+        )
+        if retry_result is not True:
+            return _api_result(
+                status="failed",
+                error_kind="retryable_http",
+                message=f"{engine_name} local token bucket still unavailable",
+                engine_type=engine_type,
+            )
+    elif rate_limit_result == "SWITCH_TO_BACKUP":
+        if allow_rate_limiter_switch and engine_type == 'primary':
+            return get_summary_from_ai_detailed(
+                prompt_text,
+                primary_api_config,
+                backup_api_config,
+                engine_type='backup',
+                logger=logger,
+                config=config,
+                user_content=user_content,
+                retry_attempts=retry_attempts,
+                allow_rate_limiter_switch=allow_rate_limiter_switch,
+            )
+        return _api_result(
+            status="failed",
+            error_kind="retryable_http",
+            message=f"{engine_name} local token bucket suggests switching engine",
+            engine_type=engine_type,
+        )
+    elif rate_limit_result == "TOKEN_LIMIT_EXCEEDED":
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message=f"{engine_name} token limit exceeded",
+            engine_type=engine_type,
+        )
+    else:
+        return _api_result(
+            status="failed",
+            error_kind="retryable_http",
+            message=f"{engine_name} local token bucket returned {rate_limit_result}",
+            engine_type=engine_type,
+        )
+
+    request_api_config: APIConfig = {
+        **api_config,
+        'api_key': api_key,
+        'model': model_name,
+        'api_base': api_base,
+    }
+
+    detailed = _call_ai_api_detailed(
+        prompt_text,
+        request_api_config,
+        system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        response_format="json",
+        logger=logger,
+        user_content=user_content,
+        retry_attempts=retry_attempts,
+    )
+    detailed["engine_type"] = engine_type
+
+    if detailed.get("status") != "success":
+        return detailed
+
+    ai_response = detailed.get("content")
+    if isinstance(ai_response, dict):
+        detailed["content"] = normalize_ai_summary(ai_response)
+        if logger:
+            status = rate_limiter.get_status(engine_type)
+            logger.debug(f"令牌桶状态: {status}")
+        return detailed
+    if ai_response:
+        if logger:
+            logger.warning("AI returned non-dict content, trying manual extraction")
+        detailed["content"] = _extract_summary_manually(ai_response)
+        return detailed
+    return _api_result(
+        status="failed",
+        error_kind="invalid_response",
+        message="AI response was empty",
+        engine_type=engine_type,
+    )
+
+
 def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,
                                       logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None,
-                                      user_content: Any = None) -> Optional[Dict[str, Any]]:
+                                      user_content: Any = None, return_detailed: bool = False,
+                                      disable_engine_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+                                      is_engine_disabled_callback: Optional[Callable[[str], bool]] = None,
+                                      skip_engines: Optional[Set[str]] = None) -> Optional[Dict[str, Any]]:
     """
-    调用AI API并返回结构化摘要，支持主引擎失败时自动切换到备用引擎
-    采用与validate_summary_quality相同的严格占位符检测标准
-    
-    Args:
-        prompt_text: 完整的提示词文本
-        primary_api_config: 主引擎API配置字典
-        backup_api_config: 备用引擎API配置字典
-        logger: 日志记录器实例（可选）
-        config: 配置字典（可选）
-    
-    Returns:
-        Optional[Dict[str, Any]]: 结构化摘要，如果调用失败则返回None
+    Stage-1 reader scheduler. Transient failures alternate engines:
+    primary#1 -> backup#1 -> primary#2 -> backup#2. Quota/balance failures
+    disable that engine for the current caller-managed retry round.
     """
-    # 首先尝试主引擎
-    if logger:
-        logger.debug("尝试使用主引擎生成摘要...")
-    
-    result = get_summary_from_ai(
-        prompt_text,
-        primary_api_config,
-        backup_api_config,
-        engine_type='primary',
-        logger=logger,
-        config=config,
-        user_content=user_content,
-    )
-    
-    if result is not None:
-        # 使用与validate_summary_quality相同的严格内容检查
-        # 定义无效内容的关键词黑名单（与context_manager.py保持一致）
-        PLACEHOLDER_KEYWORDS = [
-            "未提供相关信息", "未提及", "未提供", "无相关信息", "未知", 
-            "Not provided", "N/A", "null", "None", "...", "无摘要", "无数据",
-            "暂无信息", "信息不完整", "未明确说明", "无具体说明"
-        ]
-        
-        def is_valid_content(content: Any) -> bool:
-            """检查内容是否有效（不是占位符或空内容）"""
-            if content is None:
-                return False
-            
-            if isinstance(content, str):
-                text = str(content).strip()
-                # 检查是否为空或过短
-                if not text or text == '' or text == '...':
-                    return False
-                # 检查是否包含占位符关键词
-                if any(keyword in text for keyword in PLACEHOLDER_KEYWORDS):
-                    # 如果内容很短且包含占位符关键词，强烈怀疑是占位符
-                    if len(text) < 30:
-                        return False
-                    # 如果内容较长但包含占位符，需要更严格的检查
-                    placeholder_count = sum(1 for keyword in PLACEHOLDER_KEYWORDS if keyword in text)
-                    if placeholder_count > 0 and len(text) < 100:
-                        return False
-                # 检查摘要是否过短（小于50字）
-                if len(text) < 50:
-                    return False
-                return True
-            
-            elif isinstance(content, list):
-                # 检查列表是否为空
-                if not content:
-                    return False
-                # 检查列表中是否包含有效内容
-                for item in content:
-                    if isinstance(item, str) and is_valid_content(item):
-                        return True
-                return False
-            
-            else:
-                # 其他类型（如数字）认为有效
-                return True
-        
-        # 检查结果是否有效（使用严格标准）
-        if 'common_core' in result:
-            common_core = result['common_core']
-            if isinstance(common_core, dict):
-                # 检查关键字段是否有实际内容
-                critical_fields = ['summary', 'methodology', 'findings', 'conclusions']
-                has_valid_content = any(
-                    is_valid_content(common_core.get(field))
-                    for field in critical_fields
-                )
-                
-                if has_valid_content:
-                    if logger:
-                        logger.debug("主引擎返回有效结果（通过严格内容检查）")
-                    return normalize_ai_summary(result)
-                else:
-                    if logger:
-                        logger.warning("主引擎返回结果未通过严格内容检查，尝试备用引擎")
-                    # 记录失败的具体原因
-                    failed_fields = []
-                    for field in critical_fields:
-                        content = common_core.get(field)
-                        if not is_valid_content(content):
-                            failed_fields.append(f"{field}: {str(content)[:50]}")
-                    if logger:
-                        logger.info(f"内容检查失败字段: {', '.join(failed_fields)}")
-            else:
-                if logger:
-                    logger.warning(f"common_core字段类型错误: {type(common_core)}，尝试备用引擎")
-        else:
+    _, attempt_budget = _load_api_runtime_settings()
+    attempt_budget = max(1, attempt_budget)
+    skip_engine_set = set(skip_engines or set())
+    engine_order = ["primary", "backup"]
+    remaining = {engine: attempt_budget for engine in engine_order}
+    last_result: Optional[Dict[str, Any]] = None
+
+    def configured(engine: str) -> bool:
+        cfg = primary_api_config if engine == "primary" else backup_api_config
+        return bool(str(cfg.get("api_key") or "").strip() and str(cfg.get("model") or "").strip())
+
+    while True:
+        made_attempt = False
+        for engine in engine_order:
+            if engine in skip_engine_set:
+                continue
+            if remaining.get(engine, 0) <= 0:
+                continue
+            if not configured(engine):
+                remaining[engine] = 0
+                continue
+            if is_engine_disabled_callback and is_engine_disabled_callback(engine):
+                remaining[engine] = 0
+                continue
+
+            made_attempt = True
+            remaining[engine] -= 1
             if logger:
-                logger.debug("主引擎返回结果（不含common_core，可能是旧格式）")
-            return result
-    
-    # 主引擎失败或返回无效结果，尝试备用引擎
-    if logger:
-        logger.info("主引擎失败，切换到备用引擎...")
-    
-    result = get_summary_from_ai(
-        prompt_text,
-        primary_api_config,
-        backup_api_config,
-        engine_type='backup',
-        logger=logger,
-        config=config,
-        user_content=user_content,
-    )
-    
-    if result is not None:
-        if logger:
-            logger.info("备用引擎成功返回结果")
-        return result
-    else:
-        if logger:
-            logger.error("主引擎和备用引擎都失败了")
-        return None
+                logger.info(f"Stage 1 reader attempt: {engine}#{attempt_budget - remaining[engine]}")
+
+            result = get_summary_from_ai_detailed(
+                prompt_text,
+                primary_api_config,
+                backup_api_config,
+                engine_type=engine,
+                logger=logger,
+                config=config,
+                user_content=user_content,
+                retry_attempts=1,
+                allow_rate_limiter_switch=False,
+            )
+            last_result = result
+            if result.get("status") == "success":
+                return result if return_detailed else result.get("content")
+
+            error_kind = str(result.get("error_kind") or "")
+            if error_kind == "quota_exhausted":
+                remaining[engine] = 0
+                if disable_engine_callback:
+                    disable_engine_callback(engine, result)
+                elif logger:
+                    label = "主引擎" if engine == "primary" else "备用引擎"
+                    logger.warning(f"{label}余额/额度不足，本轮自动跳过。")
+                continue
+            if error_kind in {"fatal_config_or_auth", "invalid_response"}:
+                remaining[engine] = 0
+                continue
+
+        if not made_attempt:
+            break
+
+    if last_result is None:
+        last_result = _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message="No configured reader engine was available",
+        )
+    return last_result if return_detailed else None
 
 
 def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,

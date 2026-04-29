@@ -328,3 +328,21 @@ def test_job_runner_validate_review_recovers_lossy_project_name_from_existing_wo
     assert called["project_name"] == recovered_project_name
     assert str(called["workspace"]).endswith(f"{recovered_project_name}__20260418_041739")
     assert pointer_payload["workspace_path"].endswith(f"{recovered_project_name}__20260418_041739")
+
+
+def test_job_runner_does_not_recover_real_chinese_project_name_by_ascii_alias(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    existing_project_name = "方法"
+    requested_project_name = "偏好"
+    workspace = output_dir / f"{existing_project_name}__20260406_064148"
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / f"{existing_project_name}_summaries.json").write_text("[]", encoding="utf-8")
+
+    resolved = JobRunner()._resolve_project_name_from_existing_workspaces(
+        base_output_dir=str(output_dir),
+        requested_project_name=requested_project_name,
+        action="generate_outline",
+    )
+
+    assert resolved == requested_project_name

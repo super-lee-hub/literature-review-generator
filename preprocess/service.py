@@ -17,6 +17,7 @@ import fitz  # type: ignore
 import requests  # type: ignore
 
 from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
+from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -205,6 +206,7 @@ class PreprocessManager:
         stage1_manifest_payload, stage1_quality_report_payload = self._stage1_selection_payloads(
             selection=stage1_selection,
             artifact_paths=artifact_paths,
+            chunk_count=len(chunks),
         )
         low_quality = any(item.low_quality for item in page_diagnostics)
         scanned_like = any(item.scanned_candidate for item in page_diagnostics)
@@ -479,6 +481,19 @@ class PreprocessManager:
         if not baseline_page_diagnostics:
             return False
 
+        completeness_metrics = build_completeness_metrics(
+            text=baseline_plain_text,
+            page_count=len(baseline_page_diagnostics),
+        )
+        if has_blocking_stage1_reason(completeness_metrics.get("blocking_reasons")):
+            self._log(
+                "Hybrid preprocess will try MinerU because the local baseline looks incomplete "
+                f"(text_length={stripped_length}, pages={len(baseline_page_diagnostics)}, "
+                f"reasons={','.join(completeness_metrics.get('blocking_reasons') or [])}).",
+                level="info",
+            )
+            return True
+
         total_pages = len(baseline_page_diagnostics)
         low_quality_pages = sum(1 for item in baseline_page_diagnostics if item.low_quality)
         scanned_candidate_pages = sum(1 for item in baseline_page_diagnostics if item.scanned_candidate)
@@ -625,16 +640,25 @@ class PreprocessManager:
 
     def _request_binary(self, url: str) -> bytes:
         last_exception: Optional[Exception] = None
-        for attempt in range(self.mineru_request_max_retries + 1):
-            try:
-                response = requests.get(url, headers=self._mineru_headers(), timeout=120)
-                response.raise_for_status()
-                return response.content
-            except Exception as exc:  # pragma: no cover - transport path.
-                last_exception = exc
-                if attempt >= self.mineru_request_max_retries:
-                    break
-                time.sleep(self.mineru_retry_backoff_seconds * (attempt + 1))
+        session = requests.Session()
+        # MinerU result assets are served from a CDN. In some Windows/proxy
+        # environments the HTTPS proxy breaks the CDN TLS handshake, while the
+        # direct connection succeeds. Keep API JSON calls unchanged, but bypass
+        # ambient proxies for binary artifact downloads.
+        session.trust_env = False
+        try:
+            for attempt in range(self.mineru_request_max_retries + 1):
+                try:
+                    response = session.get(url, headers=self._mineru_headers(), timeout=120)
+                    response.raise_for_status()
+                    return response.content
+                except Exception as exc:  # pragma: no cover - transport path.
+                    last_exception = exc
+                    if attempt >= self.mineru_request_max_retries:
+                        break
+                    time.sleep(self.mineru_retry_backoff_seconds * (attempt + 1))
+        finally:
+            session.close()
         if last_exception:
             raise last_exception
         return b""
@@ -693,7 +717,7 @@ class PreprocessManager:
             return True
         if self._find_first_value(payload, {"content_list", "contentList", "page_index"}):
             return True
-        if self._find_first_value(payload, {"result_zip_url", "zip_url", "artifact_zip_url"}):
+        if self._find_first_value(payload, {"result_zip_url", "zip_url", "artifact_zip_url", "full_zip_url"}):
             return True
         return False
 
@@ -742,13 +766,14 @@ class PreprocessManager:
 
         zip_url = self._find_first_value(
             normalized_payload,
-            {"result_zip_url", "zip_url", "artifact_zip_url"},
+            {"result_zip_url", "zip_url", "artifact_zip_url", "full_zip_url"},
         )
         zip_artifacts: Dict[str, Any] = {}
         if isinstance(zip_url, str) and zip_url.strip():
             try:
                 zip_artifacts = self._artifacts_from_zip_bytes(self._request_binary(self._join_base_url(zip_url)))
-            except Exception:  # pragma: no cover - transport path.
+            except Exception as exc:  # pragma: no cover - transport path.
+                self._log(f"MinerU result zip download failed: {exc}", level="warning")
                 zip_artifacts = {}
 
         if not markdown_text:
@@ -762,12 +787,17 @@ class PreprocessManager:
             content_list = zip_artifacts.get("content_list")
 
         page_index: List[Dict[str, Any]] = []
+        page_index_from_remote = False
         if isinstance(content_list, list):
             page_index = self._build_page_index_from_content_list(content_list, baseline_page_index)
+            page_index_from_remote = bool(page_index)
         if not page_index:
-            page_index = self._coerce_page_index(zip_artifacts.get("page_index")) or baseline_page_index
+            page_index = self._coerce_page_index(zip_artifacts.get("page_index"))
+            page_index_from_remote = bool(page_index)
+        if not page_index:
+            page_index = baseline_page_index
 
-        if not plain_text and page_index:
+        if not plain_text and page_index and page_index_from_remote:
             plain_text = "\n\n".join(
                 item["text"].strip()
                 for item in page_index
@@ -1337,6 +1367,7 @@ class PreprocessManager:
         stage1_manifest_payload, stage1_quality_report_payload = self._stage1_selection_payloads(
             selection=selection,
             artifact_paths=artifact_paths,
+            chunk_count=len(chunks),
         )
         with open(artifact_paths["stage1_input_path"], "w", encoding="utf-8") as handle:
             handle.write(selection.selected_text)
@@ -1353,6 +1384,7 @@ class PreprocessManager:
         *,
         selection: Stage1InputSelection,
         artifact_paths: Dict[str, str],
+        chunk_count: int = 0,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         artifacts = {
             "stage1_input": artifact_paths["stage1_input_path"],
@@ -1361,8 +1393,14 @@ class PreprocessManager:
             "chunks": artifact_paths["chunks_path"],
         }
         manifest_payload = dict(selection.manifest_payload)
+        manifest_completeness = dict(manifest_payload.get("completeness_metrics") or {})
+        manifest_completeness["chunk_count"] = int(chunk_count or 0)
+        manifest_payload["completeness_metrics"] = manifest_completeness
         manifest_payload["artifacts"] = artifacts
         quality_report_payload = dict(selection.quality_report_payload)
+        quality_completeness = dict(quality_report_payload.get("completeness_metrics") or {})
+        quality_completeness["chunk_count"] = int(chunk_count or 0)
+        quality_report_payload["completeness_metrics"] = quality_completeness
         quality_report_payload["artifacts"] = artifacts
         return manifest_payload, quality_report_payload
 
@@ -1386,6 +1424,31 @@ class PreprocessManager:
                 stage1_input_text = handle.read()
             with open(artifact_paths["stage1_input_manifest_path"], "r", encoding="utf-8") as handle:
                 stage1_manifest = json.load(handle)
+            current_selection = self._select_stage1_input(
+                markdown_text=markdown_text,
+                plain_text=plain_text,
+                page_index=page_index,
+            )
+            if self._stage1_cache_needs_refresh(stage1_manifest, stage1_input_text, current_selection):
+                chunks = self._write_stage1_selection_artifacts(
+                    selection=current_selection,
+                    artifact_paths=artifact_paths,
+                    page_index=page_index,
+                )
+                self._update_stage1_artifact_metadata(
+                    selection=current_selection,
+                    chunks=chunks,
+                    artifact_paths=artifact_paths,
+                    diagnostics=diagnostics,
+                    manifest=manifest,
+                )
+                return (
+                    current_selection.selected_text,
+                    current_selection.selected_source,
+                    current_selection.quality_level,
+                    current_selection.stage1_quality_reasons,
+                    chunks,
+                )
             try:
                 with open(artifact_paths["chunks_path"], "r", encoding="utf-8") as handle:
                     chunks = json.load(handle)
@@ -1415,6 +1478,50 @@ class PreprocessManager:
             artifact_paths=artifact_paths,
             page_index=page_index,
         )
+        self._update_stage1_artifact_metadata(
+            selection=selection,
+            chunks=chunks,
+            artifact_paths=artifact_paths,
+            diagnostics=diagnostics,
+            manifest=manifest,
+        )
+        return (
+            selection.selected_text,
+            selection.selected_source,
+            selection.quality_level,
+            selection.stage1_quality_reasons,
+            chunks,
+        )
+
+    def _stage1_cache_needs_refresh(
+        self,
+        stage1_manifest: Dict[str, Any],
+        stage1_input_text: str,
+        current_selection: Stage1InputSelection,
+    ) -> bool:
+        if not isinstance(stage1_manifest.get("completeness_metrics"), dict):
+            return True
+        cached_reasons = sorted(str(reason) for reason in (stage1_manifest.get("stage1_quality_reasons") or []))
+        current_reasons = sorted(str(reason) for reason in current_selection.stage1_quality_reasons)
+        return any(
+            [
+                str(stage1_manifest.get("selected_text_source") or "") != current_selection.selected_source,
+                str(stage1_manifest.get("stage1_quality_level") or "") != current_selection.quality_level,
+                cached_reasons != current_reasons,
+                int(stage1_manifest.get("selected_text_length") or 0) != len(current_selection.selected_text),
+                str(stage1_input_text or "") != current_selection.selected_text,
+            ]
+        )
+
+    def _update_stage1_artifact_metadata(
+        self,
+        *,
+        selection: Stage1InputSelection,
+        chunks: List[Dict[str, Any]],
+        artifact_paths: Dict[str, str],
+        diagnostics: Dict[str, Any],
+        manifest: Dict[str, Any],
+    ) -> None:
         artifact_map = manifest.setdefault("artifacts", {})
         artifact_map.update(
             {
@@ -1449,13 +1556,6 @@ class PreprocessManager:
             json.dump(manifest, handle, ensure_ascii=False, indent=2)
         with open(artifact_paths["diagnostics_path"], "w", encoding="utf-8") as handle:
             json.dump(diagnostics, handle, ensure_ascii=False, indent=2)
-        return (
-            selection.selected_text,
-            selection.selected_source,
-            selection.quality_level,
-            selection.stage1_quality_reasons,
-            chunks,
-        )
 
     def _build_chunks(self, stage1_text: str, page_index: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         chunks: List[Dict[str, Any]] = []
