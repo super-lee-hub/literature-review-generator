@@ -1,0 +1,135 @@
+{
+  "task": "Documentation Architecture Migration — migrate root-level developer/AI/runtime documentation into structured bilingual docs/ tree",
+  "plan": ".omc/plans/docs-migration.md",
+  "created": "2026-05-05",
+  "stories": [
+    {
+      "id": "US-001",
+      "name": "Phase 1: Create docs/ skeleton and index pages",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Directory tree created: docs/zh-CN/{developer,ai,runtime,reference}/ and docs/en/{developer,ai,runtime,reference}/",
+        "docs/zh-CN/index.md and docs/en/index.md exist as navigation hubs with audience statements and links back to root README",
+        "All 8 subdirectory index pages exist (developer, ai, runtime, reference in both CN and EN) with content scope statements",
+        "All 10 CN/EN index pages are full mirrors (same structure, section count, content depth)",
+        "No root files modified",
+        "docs/user/ directory is NOT created (user content stays at root)"
+      ]
+    },
+    {
+      "id": "US-002",
+      "name": "Phase 2a: Migrate Developer content to docs/",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "docs/zh-CN/developer/setup.md created with full CN content from DEVELOPMENT.md",
+        "docs/en/developer/setup.md created with full EN content from DEVELOPMENT.md",
+        "docs/zh-CN/developer/architecture.md created from AGENTS.md §4,§8,§11,§12 extracts (architecture, GUI/CLI, tech debt, module map)",
+        "docs/en/developer/architecture.md created as full EN mirror of architecture.md",
+        "docs/zh-CN/developer/architecture-baseline.md created from ARCHITECTURE_BASELINE.md",
+        "docs/en/developer/architecture-baseline.md created as full EN mirror",
+        "All developer index pages updated with real links to content pages",
+        "CN and EN pages are full mirrors (not summaries)",
+        "AGENTS.md and all other root files NOT yet modified (content extraction is copy, not move)"
+      ]
+    },
+    {
+      "id": "US-003",
+      "name": "Phase 2b: Migrate Reference content + create Phase 2 root stubs",
+      "priority": 3,
+      "passes": true,
+      "acceptanceCriteria": [
+        "docs/zh-CN/reference/feature-matrix.md created from FEATURE_MATRIX.md",
+        "docs/en/reference/feature-matrix.md created as full EN mirror",
+        "docs/zh-CN/reference/migration-history.md created from MIGRATION_NOTES.md",
+        "docs/en/reference/migration-history.md created as full EN mirror",
+        "DEVELOPMENT.md rewritten as thin stub (<500 bytes) linking to docs/en/developer/setup.md",
+        "ARCHITECTURE_BASELINE.md rewritten as thin stub (<500 bytes) linking to docs/en/developer/architecture-baseline.md",
+        "FEATURE_MATRIX.md rewritten as thin stub (<500 bytes) linking to docs/en/reference/feature-matrix.md",
+        "MIGRATION_NOTES.md rewritten as thin stub (<500 bytes) linking to docs/en/reference/migration-history.md",
+        "Reference index pages updated with real links",
+        "CN and EN pages are full mirrors"
+      ]
+    },
+    {
+      "id": "US-004",
+      "name": "Phase 3a: Create AI handoff content in docs/",
+      "priority": 4,
+      "passes": true,
+      "acceptanceCriteria": [
+        "docs/zh-CN/ai/handoff.md created from AGENTS.md §1-3,§9,§10,§14 (CN source, since AGENTS.md is Chinese-primary)",
+        "docs/en/ai/handoff.md created as EN translation mirror",
+        "docs/zh-CN/ai/skill.md created adapted from .codex/skills/auto-generate-orchestrator/SKILL.md",
+        "docs/en/ai/skill.md created as EN mirror",
+        "docs/zh-CN/ai/runtime-bridge.md created from AGENTS.md §5.5,§6.4,§7",
+        "docs/en/ai/runtime-bridge.md created as EN mirror",
+        "AI index pages updated with real links",
+        "SKILL.md at .codex/skills/auto-generate-orchestrator/ is NOT modified",
+        "CN and EN pages are full mirrors",
+        "AGENTS.md root file NOT yet rewritten (content extraction is copy, not move)"
+      ]
+    },
+    {
+      "id": "US-005",
+      "name": "Phase 3b: Create Runtime truth content in docs/",
+      "priority": 5,
+      "passes": true,
+      "acceptanceCriteria": [
+        "docs/zh-CN/runtime/truth-sources.md created from TRUTH_SOURCES.md + AGENTS.md §5-7",
+        "docs/en/runtime/truth-sources.md created as EN mirror",
+        "docs/zh-CN/runtime/compatibility.md created from TRUTH_SOURCES.md deprecated/removal sections",
+        "docs/en/runtime/compatibility.md created as EN mirror",
+        "docs/zh-CN/runtime/workspace-layout.md created from AGENTS.md §7 + TRUTH_SOURCES.md",
+        "docs/en/runtime/workspace-layout.md created as EN mirror",
+        "Runtime index pages updated with real links",
+        "CN and EN pages are full mirrors"
+      ]
+    },
+    {
+      "id": "US-006",
+      "name": "Phase 3c: Create AGENTS.md fat stub + TRUTH_SOURCES.md thin stub",
+      "priority": 6,
+      "passes": true,
+      "acceptanceCriteria": [
+        "AGENTS.md rewritten as fat stub (2-3KB) containing: project identity paragraph, full 18-item reading order with 1-2 sentence summaries per item, centralized 'where to find everything' directory linking to docs/",
+        "TRUTH_SOURCES.md rewritten as thin stub (<500 bytes) linking to docs/en/runtime/truth-sources.md",
+        "All content from original AGENTS.md fully accounted for in docs/ (no sections dropped)",
+        "All content from original TRUTH_SOURCES.md fully accounted for in docs/ (no sections dropped)",
+        "AGENTS.md fat stub readable by fresh AI agent: can answer 'what is this project and where do I start?' without following links",
+        "All links in both stubs resolve to existing docs/ pages"
+      ]
+    },
+    {
+      "id": "US-007",
+      "name": "Phase 4a: Finalize README.md and update README links",
+      "priority": 7,
+      "passes": true,
+      "acceptanceCriteria": [
+        "README.md polished to concise bilingual product homepage (<6KB)",
+        "README.md 'Pick Your Path' table links updated to point to docs/ paths (AGENTS.md, TRUTH_SOURCES.md, FEATURE_MATRIX.md)",
+        "README.md 'Documentation Boundaries' section rewritten to reflect new docs/ structure",
+        "README.md contains no developer-only, AI-only, or runtime-only content beyond nav links",
+        "README.zh-CN.md §16 (排障快捷表) and §17 (文档分工) links updated to reference docs/",
+        "README.en.md §1 (doc split) and §10 (troubleshooting) links updated to reference docs/",
+        "All user-facing content in README.zh-CN.md (sections 1-15) and README.en.md (sections 2-9, 11-12) unchanged"
+      ]
+    },
+    {
+      "id": "US-008",
+      "name": "Phase 4b: Full verification + CI parity script",
+      "priority": 8,
+      "passes": true,
+      "acceptanceCriteria": [
+        "scripts/check-docs-parity.sh created and executable — verifies CN/EN file count parity, section count parity per page, and stale translation markers",
+        "All internal links verified: grep for '](./' patterns across all files, every link resolves to an existing file",
+        "CN/EN mirror check: for each docs/zh-CN/*.md, a matching docs/en/*.md exists with equivalent section structure",
+        "Root stub size check: all stubs except AGENTS.md are under 1KB; AGENTS.md is 2-3KB",
+        "Content ownership check: no developer/AI/runtime content in root README files beyond nav links",
+        "AGENTS.md reading order cross-reference trace: all 18 items trace to existing content",
+        "E2E fresh-AI-agent simulation: start from AGENTS.md fat stub, reach architecture/truth/module maps within 3 clicks",
+        "All 8 acceptance criteria from the deep-interview spec are verified"
+      ]
+    }
+  ]
+}

@@ -1,146 +1,192 @@
-# auto-generate 中文指南
+# auto-generate 中文用户指南
 
-> 根 README (`README.md`) 现在只做路由页；这份文档负责中文用户说明。
+> 一个本地运行、语料可控、全文优先、可追踪产物链的 AI 文献分析与综述写作工作台。
 
-## 1. 文档怎么分工
+这份文档面向普通用户和研究者，重点回答三个问题：
 
-- `README.md`：项目首页 / 路由页 / 快速选入口
-- `README.zh-CN.md`：中文完整使用说明（就是这份）
-- `README.en.md`：英文完整使用说明
-- `AGENTS.md`：给 AI 和新维护者的接手文档
-- `TRUTH_SOURCES.md`：更底层的运行时事实来源、产物真相、兼容层说明
-- `FEATURE_MATRIX.md`：功能实现状态矩阵
+1. 这个项目为什么值得用？
+2. 第一次如何用 GUI 或 CLI 跑起来？
+3. 常用命令、接口、输入模式、输出产物分别是什么？
 
-## 2. 项目定位
+如果你是 AI agent、开发者或维护者，请从 [AGENTS.md](./AGENTS.md) 开始；如果你要核对底层产物真相，请看 [TRUTH_SOURCES.md](./TRUTH_SOURCES.md) 和 [FEATURE_MATRIX.md](./FEATURE_MATRIX.md)。
 
-`auto-generate` 是一个本地运行的 AI 文献分析与综述写作工作台，而不再只是早期的“单脚本综述生成器”。
+## 1. 为什么不是又一个“AI 生成综述”工具？
 
-它支持两种主输入模式：
+很多 AI 文献综述工具的默认逻辑是：你给它一个主题，它自己去搜索、筛选、阅读，然后生成一篇看起来完整的综述。这个流程很省事，但对真正写论文的人来说有几个硬伤：
 
-- **PDF folder 模式**：直接扫描一个 PDF 文件夹
-- **Zotero 模式**：读取 `Zotero report + Zotero library`
+- **文献池是黑盒**：你不知道它为什么选这些论文，也不知道遗漏了哪些关键文献。
+- **全文不可控**：人文社科论文、大量订阅数据库论文、你自己 Zotero 里的 PDF，很多时候并不在开放网络里。
+- **证据链断裂**：从原始 PDF 到摘要、提纲、正文、引用，很多工具不给你可检查的中间产物。
+- **模型和成本不可控**：订阅制工具通常限制上传篇数、批量规模、模型选择和调用方式；一次综述常常需要几十篇甚至上百篇文献，不适合被很小的上传额度卡住。
+- **质量控制不足**：生成后的内容是否真的被原文支持，引用是否错配，通常需要人工重查。
 
-它现在有三种主要入口面：
+`auto-generate` 的定位正好相反：它不替你黑盒决定“该读哪些论文”，而是让你把已经掌控的文献集交给 AI 做完整、可追踪的综述生产。
 
-- **CLI**：`python main.py ...`
-- **GUI**：`python launch_gui.py`
-- **Codex / OMX skill**：仓库内置的 `auto-generate-orchestrator`，适合在 Codex 会话里直接走 AI-native 执行链
+核心贡献可以概括为：
 
-主流程仍然是经典三阶段：
+- **你控制文献范围**：用 PDF 文件夹或 Zotero report + library 明确指定本次综述的论文池。
+- **尽量使用全文**：先做 PDF 预处理、OCR / MinerU / 本地解析，再把适合阶段一的全文材料交给 AI。
+- **你控制模型和接口**：阅读、提纲、写作、自由规划、验证可以接不同 API 和不同模型。
+- **本地工作区保存证据链**：每次任务都有 job workspace，保留 summaries、outline、review draft、citation manifest、DOCX、日志、验证和修复产物。
+- **大批量更自然**：主要受你自己的本地资源、API 额度和模型上下文限制，而不是被平台上传文件数卡住。
+- **用户和 AI 都能接入**：GUI 给小白用户，CLI 给重度用户，repo-local Codex / OMX skill 给 AI-native 自动执行。
 
-1. **阶段一：论文分析** -> 生成结构化 `summaries.json`
-2. **阶段二：综述大纲** -> 生成 `outline.md`
-3. **阶段三：综述正文** -> 生成 `docx`
+## 2. 适合谁？
 
-但现在项目外围已经扩展出：
+适合：
 
-- 本地 GUI 工作台
-- Job workspace / artifact registry / resume state
-- GUI 工作台内置串行后台队列与任务恢复
-- PDF 预处理缓存、OCR fallback、`normalized.md` 中间产物
-- 阶段一历史摘要复用
-- free mode profile / idea
-- review draft + citation manifest 持久化
-- 可选验证 / repair 管线
-- 可选本地 RAG
+- 正在写学位论文、论文引言、理论综述、系统综述或研究背景的人
+- 已经在 Zotero 中整理了文献库，并希望直接复用附件 PDF 的人
+- 手头有一批 PDF，希望让 AI 逐篇分析再生成综述的人
+- 想自己选择 API、模型和成本结构，而不是订阅黑盒平台的人
+- 需要检查中间产物、复用历史摘要、局部重跑、验证引用的人
 
-## 3. 当前能力一览
+不适合：
 
-### 3.1 你可以做什么
+- 只想输入一个主题，让平台全自动替你找文献、筛文献、写综述的人
+- 完全不关心文献来源、全文质量和引用证据链的人
+- 想要一个云端账号登录即可使用的在线 SaaS，而不是本地工具的人
 
-- 扫描一个 PDF 文件夹批量分析论文
-- 通过 Zotero report + library 解析文献和附件
-- 生成阶段一摘要、阶段二提纲、阶段三综述正文
-- 只重跑某一章 / 某一节
-- 只重试失败论文或失败综述章节
-- 复用历史 `summaries.json`
-- 把多个历史 `summaries.json` 合并为当前下游输入
-- 用 GUI 管理 setup、workflow（含后台队列）、logs、guide
-- 用 CLI 直接批量执行（CLI 不再暴露公共队列命令）
-- 在 Codex / OMX 中使用仓库内置 skill 走 AI-native 运行时
-- 对已生成综述做额外验证
+## 3. 一张图理解工作流
 
-### 3.2 当前工作方式
+```text
+你的论文来源
+├─ PDF 文件夹
+└─ Zotero report + Zotero library
 
-- **GUI 与 CLI 共用同一条底层执行链**，不是两套完全独立引擎。
-- **Codex skill 模式是第三条加法入口**：它不会替代 GUI / CLI，而是复用现有 workspace / artifact / validation 基座。
-- 当前真实输出以 **job workspace** 为主，而不是老式 `output/<project>/` 混合目录。
-- Word / Excel 是重要导出物，但不是唯一或最高优先级的真相来源；一些更底层的产物已经转移到结构化 JSON。
+        ↓
 
-## 4. 安装与初始化
+PDF 预处理
+├─ 本地解析 / OCR
+├─ MinerU 远程解析（可选）
+└─ normalized.md / page_index / diagnostics / cache
 
-### 4.1 安装依赖
+        ↓
+
+阶段一：论文分析
+└─ *_summaries.json + paper_artifacts
+
+        ↓
+
+阶段二：生成综述大纲
+└─ *_literature_review_outline.md
+
+        ↓
+
+阶段三：生成综述正文
+├─ review_draft_v2.json
+├─ citation_manifest_v3.json
+└─ *_literature_review.docx
+
+        ↓
+
+可选：验证 / 修复
+└─ validation_report / repair_plan / repair_apply_result
+```
+
+## 4. 三种入口：GUI、CLI、Codex skill
+
+| 入口 | 适合谁 | 特点 |
+| --- | --- | --- |
+| GUI：`python launch_gui.py` | 第一次使用、希望界面化配置的人 | Setup / Workflow / Logs / Guide，Workflow 页面内置串行后台队列 |
+| CLI：`python main.py ...` | 熟悉命令行、需要重复批处理的人 | 直接运行，不进入 GUI 队列，适合脚本化和精确控制 |
+| Codex / OMX skill：`auto-generate-orchestrator` | 在 Codex 中让仓库自主执行的人 | AI-native 加法入口，复用同一套 workspace / artifact / validation 基座 |
+
+这三条入口不是三套引擎。GUI 和 CLI 共享底层 job runner / workspace / artifact 逻辑；Codex skill 是第三条加法入口，不替代 GUI / CLI。
+
+## 5. 安装与初始化
+
+### 5.1 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4.2 运行 setup
+### 5.2 运行设置向导
 
 ```bash
 python main.py --setup
 ```
 
-### 4.3 启动 GUI
+### 5.3 启动 GUI
 
 ```bash
 python launch_gui.py
 ```
 
-开发时可用：
+开发调试时可用：
 
 ```bash
 python launch_gui.py --reload --no-show
 ```
 
-## 5. 快速开始
+## 6. GUI 快速开始
 
-### 5.1 最短 CLI 路径（PDF 文件夹）
+推荐第一次使用走 GUI：
 
-```bash
-python main.py --pdf-folder "D:\papers" --analyze-only
-python main.py --pdf-folder "D:\papers" --generate-outline
-python main.py --pdf-folder "D:\papers" --generate-review
-```
+1. 运行 `python launch_gui.py`。
+2. 在 Setup 页面配置输出目录、Zotero 路径、API、模型和预处理选项。
+3. 在 Workflow 页面选择输入模式：
+   - PDF folder：选择一个 PDF 文件夹。
+   - Zotero：使用 `zotero_report` 和 `library_path`。
+4. 点击主流程按钮：
+   - Analyze only：只做阶段一论文分析。
+   - Generate outline：生成大纲。
+   - Generate review：生成综述正文。
+   - Run all：一键跑完分析、大纲、正文。
+5. 到 Logs 页面观察日志；输出通常在 `output/<project_name>__<job_id>/`。
 
-或者一次跑完：
+GUI 的任务会进入 GUI 内部的持久化串行后台队列。提交一个任务后，表单仍可继续编辑，你可以准备下一项；CLI 和 Codex skill 不进入这个 GUI 队列。
 
-```bash
-python main.py --pdf-folder "D:\papers" --run-all
-```
+## 7. CLI 快速开始
 
-如果你希望输出更容易区分，建议显式指定项目名：
+### 7.1 PDF 文件夹一键跑完
 
 ```bash
 python main.py --pdf-folder "D:\papers" --project-name "my_review" --run-all
 ```
 
-### 5.2 最短 GUI 路径
+建议始终显式指定 `--project-name`，这样输出目录更稳定、后续重跑更好找。
 
-1. `python launch_gui.py`
-2. 先在 Setup 页面填路径、API 和模型
-3. 到 Workflow 页面选择 PDF / Zotero 模式
-4. 在 Workflow 页面点击主流程按钮提交任务；GUI 会自动加入串行后台队列，表单仍可继续配置下一项
-
-## 6. 常用工作流
-
-### 6.1 PDF 文件夹模式
+### 7.2 分阶段运行
 
 ```bash
-python main.py --pdf-folder "D:\papers" --analyze-only
-python main.py --pdf-folder "D:\papers" --generate-outline
-python main.py --pdf-folder "D:\papers" --generate-review
-python main.py --pdf-folder "D:\papers" --run-all
+python main.py --pdf-folder "D:\papers" --project-name "my_review" --analyze-only
+python main.py --project-name "my_review" --generate-outline
+python main.py --project-name "my_review" --generate-review
+python main.py --project-name "my_review" --validate-review
 ```
 
-### 6.2 Zotero 模式
+第一次调试建议先跑 `--analyze-only`，确认 PDF 能被正确解析、summary 能生成，再跑后续阶段。
 
-先在 `config.ini` 或 GUI 中设置：
+## 8. 输入模式
 
-- `Paths.zotero_report`
-- `Paths.library_path`
+### 8.1 PDF 文件夹模式
 
-也可以直接命令行传入：
+最直接的方式：把要纳入综述的 PDF 放在一个文件夹里。
+
+```bash
+python main.py --pdf-folder "D:\papers" --project-name "my_review" --analyze-only
+python main.py --project-name "my_review" --generate-outline
+python main.py --project-name "my_review" --generate-review
+```
+
+### 8.2 Zotero 模式
+
+Zotero 模式适合已经用 Zotero 管理文献的人。你需要：
+
+- `zotero_report`：Zotero 导出的报告文件
+- `library_path`：Zotero storage / library 路径
+
+可以写在 `config.ini`：
+
+```ini
+[Paths]
+zotero_report = D:\zotero_report\Zotero 报告.txt
+library_path = D:\zotero_library\Zotero\storage
+```
+
+也可以命令行直接传入：
 
 ```bash
 python main.py --project-name "my_review" --zotero-report "D:\zotero_report.txt" --library-path "D:\ZoteroLibrary" --analyze-only
@@ -148,92 +194,139 @@ python main.py --project-name "my_review" --generate-outline
 python main.py --project-name "my_review" --generate-review
 ```
 
-### 6.3 复用已有阶段一摘要
+## 9. 常用命令速查
 
-当前有两种复用方式：
+| 命令 | 用途 |
+| --- | --- |
+| `python main.py --setup` | 运行交互式设置向导 |
+| `python launch_gui.py` | 启动本地 GUI |
+| `--pdf-folder "D:\papers"` | 指定 PDF 文件夹 |
+| `--project-name "my_review"` | 指定项目名和输出工作区标识 |
+| `--run-all` / `-a` | 一键运行：分析 -> 大纲 -> 综述 |
+| `--analyze-only` / `-A` | 只运行阶段一：论文分析 |
+| `--generate-outline` / `-o` | 只运行阶段二：生成大纲 |
+| `--generate-review` / `-r` | 只运行阶段三：生成综述 |
+| `--validate-review` / `-v` | 验证已生成综述 |
+| `--retry-failed` | 重试阶段一失败论文 |
+| `--generate-section 3` | 只重做第 3 节综述 |
+| `--retry-review-failed` | 重试失败或缺失的综述章节 |
+| `--summary-file <path>` | 为大纲/正文/验证显式指定 summary 文件 |
+| `--summary-source <path>` | 追加一个下游 summary 来源，可重复 |
+| `--reuse-stage1` | 阶段一分析时复用历史 summary |
+| `--reuse-summary-file <path>` | 追加一个阶段一复用池来源，可重复 |
+| `--merge <path>` | 把另一个 summaries.json 合并进当前 summary |
+| `--prime-with-folder <path>` + `--concept <name>` | 概念预热 / concept priming |
+| `--free-mode-profile <json>` | 加载 free mode profile |
+| `--free-mode-idea <text>` | 直接传入 free mode idea |
+| `--outline-adopt` | 显式采纳大纲仲裁结果；兼容/手动路径，不是默认主链 |
+| `--cleanup` | 清理旧工作空间，只保留最新的 |
 
-1. **下游步骤显式加载历史 summary 文件**
-   - `--summary-file`
-   - 可重复追加 `--summary-source <path>`
-2. **阶段一自动扫描历史输出并增量复用**
-   - `--reuse-stage1`
-   - 可重复追加 `--reuse-summary-file <path>`
+完整参数可运行：
 
-当前自动复用会优先尝试：
+```bash
+python main.py --help
+```
 
-1. DOI 完全一致
-2. canonical paper key 完全一致
+## 10. 摘要复用、合并与局部重跑
+
+### 10.1 复用历史阶段一摘要
+
+当你新增少量论文、重跑类似主题，或不想重复花钱分析已经处理过的 PDF，可以启用：
+
+```bash
+python main.py --pdf-folder "D:\new_papers" --project-name "my_review_v2" --analyze-only --reuse-stage1
+```
+
+也可以显式指定复用池：
+
+```bash
+python main.py --pdf-folder "D:\new_papers" --project-name "my_review_v2" --analyze-only --reuse-stage1 --reuse-summary-file "D:\cache\curated_summaries.json"
+```
+
+当前复用逻辑会优先匹配：
+
+1. DOI
+2. canonical paper key
 3. `title + first author + year` 的唯一高置信命中
 
-示例：
+### 10.2 下游显式加载 summary
+
+如果你已经有一个 `summaries.json`，可以跳过阶段一，直接生成大纲或正文：
 
 ```bash
 python main.py --project-name "subset_outline" --summary-file "D:\subset\subset_summaries.json" --generate-outline
 
 python main.py --project-name "subset_review" --summary-file "D:\subset\subset_a_summaries.json" --summary-source "D:\subset\subset_b_summaries.json" --generate-review
-
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1
-
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1 --reuse-summary-file "D:\cache\curated_summaries.json"
 ```
 
-### 6.4 局部重跑与失败恢复
+### 10.3 局部重跑
 
 ```bash
-python main.py --pdf-folder "D:\papers" --generate-section 3
-python main.py --pdf-folder "D:\papers" --retry-failed
-python main.py --pdf-folder "D:\papers" --retry-review-failed
-python main.py --project-name "my_review" --validate-review
+python main.py --project-name "my_review" --generate-section 3
+python main.py --project-name "my_review" --retry-review-failed
+python main.py --project-name "my_review" --retry-failed
 ```
 
-说明：
+## 11. PDF 预处理、MinerU 与 OCR
 
-- `--generate-section <n>`：只重做指定章节
-- `--retry-failed`：只重试阶段一失败论文
-- `--retry-review-failed`：只重试失败或缺失的综述章节
-- `--validate-review`：对当前综述做额外验证；更底层的 validation / repair 产物会写入当前 workspace
+AI 直接读扫描件或复杂 PDF 往往会失败，因为它拿不到真正可用的文本。这个项目把 PDF 预处理放在阶段一前面：
 
-### 6.5 GUI 后台队列
+- 本地解析 PDF 文本
+- 必要时 OCR
+- 可选 MinerU 远程解析
+- 生成 `normalized.md`、`plain_text.txt`、`page_index.json`、`diagnostics.json`、`structured.json`
+- 将更适合 AI 阅读的阶段一输入送入 Reader API
 
-队列现在是 **GUI-first** 的交互模型：在 Workflow 页面点击“仅分析文献 / 生成大纲 / 生成全文 / 一键运行”等主流程按钮时，任务会进入 GUI 内部的持久化串行队列，并在后台按顺序处理。提交后表单保持可编辑，你可以继续配置并提交下一项。
+相关配置在 `config.ini` 的 `[Preprocess]`：
 
-CLI 不再暴露公共队列命令；命令行入口保持直接运行模式，例如 `--analyze-only`、`--generate-outline`、`--generate-review`、`--run-all`。AI-native Codex / OMX skill 也保持直接运行，不进入 GUI 队列。
+```ini
+[Preprocess]
+enabled = true
+cache_dir = ./output/_preprocess_cache
+parser_mode = hybrid
+primary_parser = mineru_remote
+fallback_parser = local
+ocr_mode = auto
+use_markdown_as_stage1_input = true
+retain_page_index = true
+retain_diagnostics = true
+enable_local_rag = false
+```
 
-## 7. 进阶能力
+如果没有 MinerU token 或远程解析失败，系统可以按配置回退到本地解析。不同论文是否真的调用了 MinerU，请看对应 workspace 里的 preprocess diagnostics / manifest，而不是只看全局配置。
 
-这些功能通常不是第一次使用时的必需项，但已经是当前产品的一部分：
+## 12. API 与模型配置
 
-- `auto-generate-orchestrator`：在 Codex / OMX 中直接调用仓库内置 skill，走 AI-native 入口
-- `--prime-with-folder` + `--concept`：概念预热 / concept priming
-- `--free-mode-profile`：加载 free mode profile JSON
-- `--free-mode-idea`：直接输入 free mode idea 文本
-- `--merge`：把多个 `summaries.json` 合并成一个
-- `--outline-adopt`：大纲采纳兼容路径（手动 / 显式流程，不是默认主链）
-- PDF 预处理缓存：`normalized.md` / `page_index.json` / `diagnostics.json` / `chunks.json`
-- 可选本地 RAG：在预处理阶段构建索引
+建议把敏感 API key 放在 `.env`，把非敏感运行参数放在 `config.ini`。
 
-### 7.1 Codex / skill AI-native 入口
+`.env` 示例：
 
-如果你是在 Codex / OMX 里直接操作这个仓库，而不是手动点 GUI 或敲 CLI，那么可以使用仓库内置的 `auto-generate-orchestrator` skill。
+```text
+LLM_PRIMARY_READER_API=your_primary_reader_key
+LLM_BACKUP_READER_API=your_backup_reader_key
+LLM_WRITER_API=your_writer_key
+LLM_OUTLINE_API=your_outline_key
+LLM_FREE_MODE_API=your_free_mode_key
+LLM_VALIDATOR_API=your_validator_key
+MINERU_API_TOKEN=your_mineru_token
+```
 
-它的定位是：
+主要 API 角色：
 
-- **第三入口面**，不是对 GUI / CLI 的替换
-- 仍然复用现有的 `job workspace`、`artifact registry`、`resume`、`validation / repair` 基座
-- 更适合让 Codex 在仓库里直接做“输入归一化 -> 阶段执行 -> 持久化产物 -> 验证”的 AI-native 编排
+| 配置段 | 角色 |
+| --- | --- |
+| `[Primary_Reader_API]` | 阶段一主阅读模型 |
+| `[Backup_Reader_API]` | 阶段一备用阅读模型，适合长文/失败回退 |
+| `[Outline_API]` | 阶段二大纲生成 |
+| `[Writer_API]` | 阶段三正文写作 |
+| `[Free_Mode_API]` | free mode / idea planning |
+| `[Validator_API]` | 综述验证 |
 
-当你走这条入口时，除了常规产物外，还可能看到：
+每个 API 段可设置 `model`、`api_base`、`proxy_mode` 等。`proxy_mode = environment` 表示跟随系统代理环境变量；`proxy_mode = direct` 表示该 provider 绕过本地代理。
 
-- `artifacts/source_bundle.json`
-- `artifacts/runtime_stage_trace.json`
+## 13. 输出目录与关键产物
 
-如果你是普通用户，优先理解 GUI / CLI 即可；如果你是在 Codex 里让仓库自主执行，再关注这个入口。
-
-## 8. 输出目录与关键产物
-
-### 8.1 当前主输出目录
-
-当前真实输出通常位于：
+当前真实输出通常在：
 
 ```text
 output/<project_name>__<job_id>/
@@ -251,124 +344,85 @@ output/<project_name>__<job_id>/
 │  ├─ paper_artifacts/
 │  ├─ review_drafts/
 │  ├─ citation_manifests/
-│  └─ validation / repair 相关 JSON（启用时）
+│  └─ validation / repair 相关 JSON
 ├─ checkpoints/
 ├─ logs/
 ├─ reports/
 └─ artifact_registry.json
 ```
 
-### 8.2 兼容目录
+常见导出物：
+
+- `reports/*_analyzed_papers.xlsx`
+- `reports/*_literature_review.docx`
+- `reports/*_failed_papers_report.txt`
+- `artifacts/review_drafts/*_review_draft_v2.json`
+- `artifacts/citation_manifests/*_citation_manifest_v3.json`
+
+兼容目录：
 
 ```text
 output/<project_name>/
 ```
 
-这个目录现在通常只保留指针，例如：
+这个目录现在通常只保留 `_latest_job.json` 之类的指针，不要优先把它当成真实产物主目录。
 
-- `_latest_job.json`
+## 14. 验证与修复
 
-不要优先把它当成真实产物主目录。
+生成综述后，可以运行：
 
-### 8.3 常见导出物
-
-- `reports/*_analyzed_papers.xlsx`
-- `reports/*_literature_review.docx`
-- `reports/*_failed_papers_report.txt`
-- `checkpoints/*_review_checkpoint.json`
-- `artifacts/review_drafts/*_review_draft_v2.json`
-- `artifacts/citation_manifests/*_citation_manifest_v3.json`
-
-### 8.4 预处理缓存
-
-```text
-output/_preprocess_cache/
+```bash
+python main.py --project-name "my_review" --validate-review
 ```
 
-常见缓存产物：
+验证/修复管线会围绕 review draft、citation manifest、preprocess evidence 和 paper metadata 检查引用准确性、证据支撑和潜在漂移。启用时可能产生：
 
-- `normalized.md`
-- `plain_text.txt`
-- `page_index.json`
-- `chunks.json`
-- `diagnostics.json`
-- `structured.json`
-- `prepare_manifest.json`
+- `validation_report.json`
+- `repair_plan.json`
+- `repair_apply_result.json`
+- `applied_patch_*.json`
 
-### 8.5 AI-native runtime 附加产物
+这不是“魔法保证 100% 正确”，但它比只拿一个 DOCX 结果要更适合追查问题。
 
-当你使用仓库内置的 Codex skill 入口时，当前工作区里还可能出现：
+## 15. Codex / OMX skill 入口
 
-- `artifacts/source_bundle.json`：这次 AI-native 运行归一化后的输入快照
-- `artifacts/runtime_stage_trace.json`：阶段执行轨迹，区分本地步骤与 subagent 生成步骤
+如果你在 Codex 或 OMX 中直接操作这个仓库，可以使用 repo-local skill：
 
-## 9. 配置建议
+```text
+auto-generate-orchestrator
+```
 
-当前推荐约定：
+它会把 AI-native 请求归一化成项目自己的 runtime job spec，并复用同一套 workspace / artifact / validation 基座。使用该入口时，工作区里还可能出现：
 
-- **敏感信息** 放 `.env`
-- **非敏感运行参数** 放 `config.ini`
+- `artifacts/source_bundle.json`
+- `artifacts/runtime_stage_trace.json`
 
-关键配置段包括：
+普通用户优先掌握 GUI 和 CLI；只有当你在 Codex 里让仓库自主执行时，才需要关心这个入口。
 
-- `Paths`
-- `Primary_Reader_API`
-- `Backup_Reader_API`
-- `Writer_API`
-- `Outline_API`
-- `Free_Mode_API`
-- `Validator_API`
-- `Performance`
-- `Preprocess`
-- `Retry_Settings`
-- `Stage2_Retry`
-- `Validation`
-- `Styling`
-- `GUI`
-- `API_Parameters`
+## 16. 排障快捷表
 
-关键环境变量包括：
+| 问题 | 优先检查 |
+| --- | --- |
+| 第一次不知道怎么跑 | 用 GUI，或 CLI 先跑 `--analyze-only` |
+| 找不到输出 | 看 `output/<project_name>__<job_id>/` |
+| PDF 似乎没读出来 | 看 preprocess cache / diagnostics |
+| 想确认 MinerU 是否实际调用 | 看单篇 preprocess manifest / diagnostics，不只看全局配置 |
+| 阶段一太慢或太贵 | 使用 `--reuse-stage1` 或 `--reuse-summary-file` |
+| 只想修某一节 | 用 `--generate-section <n>` |
+| 只想补失败章节 | 用 `--retry-review-failed` |
+| 想验证生成结果 | 用 `--validate-review` |
+| 想了解底层产物真相 | 看 [docs/zh-CN/runtime/](./docs/zh-CN/runtime/) |
+| 想接手开发 | 看 [docs/zh-CN/developer/](./docs/zh-CN/developer/) 和 [docs/zh-CN/reference/](./docs/zh-CN/reference/) |
 
-- `LLM_PRIMARY_READER_API`
-- `LLM_BACKUP_READER_API`
-- `LLM_WRITER_API`
-- `LLM_OUTLINE_API`
-- `LLM_FREE_MODE_API`
-- `LLM_VALIDATOR_API`
-- `MINERU_*`
+## 17. 文档分工
 
-## 10. 排障建议
+- [README.md](./README.md)：中英双语项目入口和导航
+- [README.zh-CN.md](./README.zh-CN.md)：中文用户指南，也就是本文
+- [README.en.md](./README.en.md)：英文用户指南
+- [AGENTS.md](./AGENTS.md)：AI / 开发者接手入口（fat stub → docs/）
+- [docs/zh-CN/](./docs/zh-CN/)：完整中文技术文档站（开发者、AI、运行时、参考）
+- [docs/en/](./docs/en/)：完整英文技术文档站
 
-- **第一次跑**：从 `--analyze-only` 开始
-- **想用界面**：`python launch_gui.py`
-- **想在 Codex 里直接让仓库自主执行**：使用 repo-local skill `auto-generate-orchestrator`
-- **找不到输出**：先看 `output/<project_name>__<job_id>/`
-- **只修一部分**：`--generate-section` 或 `--retry-review-failed`
-- **想增量复用历史阶段一结果**：`--reuse-stage1`
-- **需要更深入的运行时真相**：看 `TRUTH_SOURCES.md`
-- **需要 AI / 维护者接手文档**：看 `AGENTS.md`
+## 18. 一句话总结
 
-## 11. 给开发者 / 维护者的入口
-
-如果你不是普通用户，而是来接手仓库或排查实现，请优先看：
-
-1. `AGENTS.md`
-2. `TRUTH_SOURCES.md`
-3. `FEATURE_MATRIX.md`
-4. `summary_schema.py`
-5. `services/job_runner.py`
-6. `main.py`
-7. `gui/app.py`
-8. `.codex/skills/auto-generate-orchestrator/SKILL.md`
-9. `runtime/orchestrator.py`
-10. `preprocess/service.py`
-11. `validation/review_validator.py`
-
-## 12. 一句话总结
-
-把这个项目理解成：
-
-- 一个以本地 GUI + CLI + repo-local Codex skill 为入口的 AI 文献分析 / 综述写作工作台
-- 已经具备 job workspace、artifact、GUI 后台队列、reuse、validation 等产品化能力
-- 用户文档以本文件和英文 README 为主
-- 更底层的真相和兼容细节请看 `AGENTS.md` 与 `TRUTH_SOURCES.md`
+把 `auto-generate` 理解成一个“研究者自己掌控语料和模型的本地 AI 文献综述工作台”：它不是替你黑盒决定读什么，而是把你已经确定的 PDF / Zotero 全文集合，变成可检查、可复用、可验证的综述生产链。

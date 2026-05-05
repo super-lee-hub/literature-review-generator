@@ -1,0 +1,26 @@
+# Documentation Migration Progress
+## Session started: 2026-05-05
+## Plan: .omc/plans/docs-migration.md (V2, APPROVED by ralplan consensus)
+
+## Completed
+- US-001: docs/ skeleton + 10 index pages created
+- US-002: Developer content migrated (setup, architecture, architecture-baseline → CN/EN mirrors)
+- US-003: Reference content migrated (feature-matrix, migration-history → CN/EN mirrors) + 4 root stubs
+- US-004: AI handoff content created (handoff, skill, runtime-bridge → CN/EN mirrors)
+- US-005: Runtime truth content created (truth-sources, compatibility, workspace-layout → CN/EN mirrors)
+- US-006: AGENTS.md fat stub (5.3KB, 18-item reading order) + TRUTH_SOURCES.md thin stub
+- US-007: README.md finalized (5.6KB), README.zh-CN.md §16-17 updated, README.en.md §1,§10 updated
+- US-008: CI parity script (scripts/check-docs-parity.sh) created and passing; all 8 acceptance criteria verified
+
+## Key Metrics
+- 32 docs/ pages (16 CN + 16 EN)
+- 7 root stubs (AGENTS.md fat, 6 thin)
+- 9 root files modified (3 READMEs + 6 stubs)
+- scripts/check-docs-parity.sh: all checks PASS
+- CN/EN mirror parity: PASS
+- Root stubs all under 1KB (AGENTS.md exception at 5.3KB)
+
+## Learnings
+- Fat stub pattern works well for preserving one-file onboarding
+- CN-first extraction from AGENTS.md (Chinese source) with EN translation mirrors
+- Scripts/ directory needed creation for CI tooling

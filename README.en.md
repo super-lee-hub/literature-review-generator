@@ -4,12 +4,12 @@
 
 ## 1. Document split
 
-- `README.md`: landing page / router / choose-your-entry document
+- `README.md`: landing page / router
 - `README.zh-CN.md`: full Chinese user guide
 - `README.en.md`: full English user guide (this file)
-- `AGENTS.md`: AI + maintainer handoff document
-- `TRUTH_SOURCES.md`: deeper runtime truth, durable artifacts, and compatibility notes
-- `FEATURE_MATRIX.md`: implementation-status matrix
+- `AGENTS.md`: AI + maintainer handoff entry (fat stub → docs/)
+- [docs/en/](./docs/en/): full English technical docs site (developer, AI, runtime, reference)
+- [docs/zh-CN/](./docs/zh-CN/): full Chinese technical docs site
 
 ## 2. What this project is
 
@@ -345,8 +345,8 @@ Important environment variables include:
 - **Cannot find outputs**: check `output/<project_name>__<job_id>/` first
 - **Need partial repair**: use `--generate-section` or `--retry-review-failed`
 - **Want incremental stage-1 reuse**: use `--reuse-stage1`
-- **Need deeper runtime truth**: read `TRUTH_SOURCES.md`
-- **Need AI / maintainer handoff context**: read `AGENTS.md`
+- **Need deeper runtime truth**: see [docs/en/runtime/](./docs/en/runtime/)
+- **Need AI / maintainer handoff context**: read `AGENTS.md` or [docs/en/ai/handoff.md](./docs/en/ai/handoff.md)
 
 ## 11. For developers and maintainers
 
