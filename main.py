@@ -621,9 +621,74 @@ class LiteratureReviewGenerator:
             return self.compat_config.stage2_validation_enabled()
         return False
 
+    def _ensure_compat_config(self) -> CompatConfigView:
+        if not self.config:
+            raise RuntimeError("Configuration is not loaded")
+        if not self.compat_config:
+            self.compat_config = CompatConfigView.from_config(self.config)
+        return self.compat_config
+
+    def _outline_v2_enabled(self) -> bool:
+        if not self.config:
+            return False
+        return self._ensure_compat_config().outline_v2_enabled()
+
+    def _outline_v2_model_call(self, route_name: str, prompt: str, metadata: Dict[str, Any]) -> Any:
+        """Call the configured v2 model route and return provider JSON."""
+        config = self.config or {}
+        if route_name == "Outline_API":
+            api_config = get_outline_api_config(config)
+        elif route_name == "Writer_API":
+            from services.model_selection import get_writer_api_config
+
+            api_config = get_writer_api_config(config)
+        elif route_name == "Primary_Reader_API":
+            from services.model_selection import get_reader_api_config
+
+            api_config = get_reader_api_config(config)
+        else:
+            api_config = get_outline_api_config(config)
+
+        system_prompt = (
+            "You are an Outline Intelligence v2 structured JSON generator. "
+            "Use only the provided controlled-corpus evidence and return strict JSON."
+        )
+        return _call_ai_api(
+            prompt=prompt,
+            api_config=api_config,
+            system_prompt=system_prompt,
+            max_tokens=8192,
+            temperature=0.2,
+            response_format="json",
+            logger=self.logger,
+        )
+
+    def _load_paper_artifacts_for_outline_v2(self) -> List[Dict[str, Any]]:
+        if not self.job_workspace:
+            return []
+        artifacts_dir = os.path.join(self.job_workspace.paths.artifacts_dir, "paper_artifacts")
+        if not os.path.isdir(artifacts_dir):
+            return []
+        artifacts: List[Dict[str, Any]] = []
+        for filename in sorted(os.listdir(artifacts_dir)):
+            if not filename.endswith(".json"):
+                continue
+            path = os.path.join(artifacts_dir, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                if isinstance(payload, dict):
+                    artifacts.append(payload)
+            except Exception as exc:
+                self.logger.warning(f"读取论文工件失败，已跳过 {path}: {exc}")
+        return artifacts
+
     def adopt_outline(self) -> bool:
         """执行大纲采纳操作"""
         try:
+            if self._outline_v2_enabled():
+                self.logger.error("当前启用了 Outline Intelligence v2；请使用 --adopt-outline-v2。")
+                return False
             self.logger.info("开始执行大纲采纳操作...")
             
             # 加载大纲文件（使用 JSON 格式的 OutlineDocument）
@@ -693,11 +758,102 @@ class LiteratureReviewGenerator:
             reviewed_outline_path = self.job_workspace.artifact_path(f"{self.project_name}_reviewed_outline.json")
             from services.job_workspace import atomic_write_json
             atomic_write_json(reviewed_outline_path, reviewed_outline.to_dict())
-            
+
+            if self.artifact_registry:
+                depends_on = []
+                if os.path.exists(outline_doc_path):
+                    depends_on.append(
+                        ArtifactDependencyRef(artifact_type="outline_document", path=outline_doc_path)
+                    )
+                if os.path.exists(arbitration_path):
+                    depends_on.append(
+                        ArtifactDependencyRef(artifact_type="outline_arbitration", path=arbitration_path)
+                    )
+                self.artifact_registry.register_file(
+                    artifact_role="reviewed_outline",
+                    artifact_type="reviewed_outline_document",
+                    artifact_version="v1",
+                    path=reviewed_outline_path,
+                    producer="main.LiteratureReviewGenerator.adopt_outline",
+                    depends_on=depends_on,
+                    artifact_id=f"reviewed_outline:{self.project_name}",
+                )
+
             self.logger.success(f"大纲采纳成功，已保存到: {reviewed_outline_path}")
             return True
         except Exception as e:
             self.logger.error(f"执行大纲采纳操作时出错: {e}")
+            import traceback
+            self.logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return False
+
+    def adopt_outline_v2(self, adopted_by: str = "user") -> bool:
+        """Explicitly adopt v2 final_outline.json after a passing, current audit."""
+        try:
+            self.logger.info("开始执行 Outline Intelligence v2 显式采纳...")
+            if not self.job_workspace or not self.project_name:
+                self.logger.error("工作空间或项目名称未设置")
+                return False
+
+            from outline.v2_models import CoverageAudit, FinalOutline
+            from outline.adoption import adopt_final_outline, write_adopted_outline
+
+            final_path = self.job_workspace.artifact_path(f"{self.project_name}_final_outline.json")
+            audit_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_coverage_audit.json")
+            if not os.path.exists(final_path):
+                self.logger.error(f"final_outline.json 不存在: {final_path}")
+                return False
+            if not os.path.exists(audit_path):
+                self.logger.error(f"outline_coverage_audit.json 不存在: {audit_path}")
+                return False
+
+            with open(final_path, "r", encoding="utf-8") as handle:
+                final_outline = FinalOutline.from_dict(json.load(handle))
+            with open(audit_path, "r", encoding="utf-8") as handle:
+                audit = CoverageAudit.from_dict(json.load(handle))
+
+            adopted, message = adopt_final_outline(
+                final_outline=final_outline,
+                audit=audit,
+                job_id=self.job_workspace.job_id,
+                adopted_by=adopted_by,
+            )
+            if adopted is None:
+                self.logger.error(f"Outline v2 采纳失败: {message}")
+                return False
+
+            adopted_path = self.job_workspace.artifact_path(f"{self.project_name}_adopted_final_outline.json")
+            write_adopted_outline(adopted, adopted_path)
+
+            if self.artifact_registry:
+                from services.artifact_registry import file_sha256
+
+                depends_on = [
+                    ArtifactDependencyRef(
+                        artifact_type="final_outline",
+                        path=final_path,
+                        content_hash=file_sha256(final_path),
+                    ),
+                    ArtifactDependencyRef(
+                        artifact_type="outline_coverage_audit",
+                        path=audit_path,
+                        content_hash=file_sha256(audit_path),
+                    ),
+                ]
+                self.artifact_registry.register_file(
+                    artifact_role="adopted_final_outline",
+                    artifact_type="adopted_final_outline",
+                    artifact_version="v1",
+                    path=adopted_path,
+                    producer="main.LiteratureReviewGenerator.adopt_outline_v2",
+                    depends_on=depends_on,
+                    artifact_id="adopted_final_outline",
+                )
+
+            self.logger.success(f"Outline v2 采纳成功，已保存到: {adopted_path}")
+            return True
+        except Exception as e:
+            self.logger.error(f"执行 Outline v2 采纳操作时出错: {e}")
             import traceback
             self.logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
@@ -2641,6 +2797,26 @@ class LiteratureReviewGenerator:
 
     def _load_outline_artifact(self) -> Optional[Tuple[str, str]]:
         """Load the primary markdown outline artifact used by downstream review generation."""
+        if self._outline_v2_enabled():
+            from outline.runtime_resolver import OutlineRuntimeResolver
+
+            resolver = OutlineRuntimeResolver(
+                config=self.config or {},
+                artifact_registry=self.artifact_registry,
+                workspace_path=self.job_workspace.paths.root_dir if self.job_workspace else (self.output_dir or ""),
+                project_name=self.project_name or "",
+                legacy_outline_path=self._get_legacy_outline_file_path(),
+            )
+            resolved = resolver.resolve_for_review()
+            if resolved is None:
+                self.logger.error(
+                    "Outline Intelligence v2 已启用，但未找到有效 adopted_final_outline.json；"
+                    "请先运行 --adopt-outline-v2，且不会回退到 legacy Markdown。"
+                )
+                return None
+            self.logger.info(f"Using v2 adopted outline artifact: {resolved.source_path}")
+            return resolved.source_path, resolved.markdown
+
         outline_file = self._resolve_outline_file_path()
         if outline_file:
             try:
@@ -5481,9 +5657,71 @@ class LiteratureReviewGenerator:
             self.logger.error(f"阶段二运行失败: {e}")
             return False
 
+    def _create_literature_review_outline_v2(self) -> bool:
+        """Run Outline Intelligence v2 Stage 2 artifact chain."""
+        try:
+            compat = self._ensure_compat_config()
+            errors = compat.validate_outline_v2_config()
+            if errors:
+                for error in errors:
+                    self.logger.error(f"Outline v2 配置错误: {error}")
+                return False
+
+            from outline.pipeline import V2Pipeline
+
+            test_dev_mode = compat.outline_test_dev_fixture_mode()
+            pipeline = V2Pipeline(
+                job_id=self.job_workspace.job_id if self.job_workspace else "standalone",
+                summaries=self.summaries,
+                config_view=compat,
+                artifact_registry=self.artifact_registry,
+                workspace=self.job_workspace,
+                output_dir=self.output_dir or "",
+                project_name=self.project_name or "review",
+                model_caller=self._outline_v2_model_call,
+                logger=self.logger,
+            )
+            result = pipeline.run(
+                candidate_count=compat.outline_candidate_count(),
+                test_dev_mode=test_dev_mode,
+                generator_model=compat.outline_model(),
+                structure_critic=compat.structure_critic_model(),
+                coverage_critic=compat.coverage_critic_model(),
+                arbitrator_model=compat.arbitrator_model(),
+                paper_artifacts=self._load_paper_artifacts_for_outline_v2(),
+            )
+            if not result.ok:
+                for error in result.errors:
+                    self.logger.error(f"Outline v2 生成失败: {error}")
+                return False
+
+            paths = pipeline.persist_artifacts(result)
+            if result.coverage_audit and not result.coverage_audit.passed:
+                self.logger.warning(
+                    "Outline v2 覆盖审计未通过；已写入工件，但采纳会被阻止。"
+                )
+            self.logger.success(
+                "Outline Intelligence v2 工件链已生成: "
+                + ", ".join(f"{name}={path}" for name, path in paths.items())
+            )
+            if compat.outline_require_explicit_adopt():
+                self.logger.info(
+                    "v2 需要显式采纳。请检查 final_outline/audit 后运行 --adopt-outline-v2；"
+                    "generate-review 将只接受 adopted_final_outline.json。"
+                )
+            return True
+        except Exception as exc:
+            self.logger.error(f"创建 Outline Intelligence v2 大纲失败: {exc}")
+            import traceback
+            self.logger.debug(f"详细错误信息: {traceback.format_exc()}")
+            return False
+
     def create_literature_review_outline(self) -> bool:
         """创建文献综述大纲，适配新的纯文本输出格式"""
         try:
+            if self._outline_v2_enabled():
+                return self._create_literature_review_outline_v2()
+
             review_data = self.prepare_review_data()
             outline_content = self.generate_review_outline(review_data)
             if not outline_content:
@@ -6268,6 +6506,10 @@ def dispatch_command(args: argparse.Namespace):  # type: ignore
             return
         
         # 大纲采纳命令
+        if hasattr(args, 'adopt_outline_v2') and args.adopt_outline_v2:
+            handle_outline_adopt_v2_mode(args)
+            return
+
         if hasattr(args, 'outline_adopt') and args.outline_adopt:
             handle_outline_adopt_mode(args)
             return
@@ -6921,6 +7163,11 @@ def main() -> None:  # type: ignore
         help='显式采纳 Week5 大纲仲裁结果'
     )
     workflow_group.add_argument(
+        '--adopt-outline-v2',
+        action='store_true',
+        help='显式采纳 Outline Intelligence v2 final_outline.json（写入 adopted_final_outline.json）'
+    )
+    workflow_group.add_argument(
         '--cleanup',
         action='store_true',
         help='清理旧工作空间，只保留最新的'
@@ -7134,6 +7381,41 @@ def handle_outline_adopt_mode(args: argparse.Namespace):  # type: ignore
             generator.logger.success("大纲采纳成功！")
     except Exception as e:
         logging.error(f"处理大纲采纳模式时出错: {e}")
+        import traceback
+        logging.debug(f"详细错误信息: {traceback.format_exc()}")
+        sys.exit(1)
+
+
+def handle_outline_adopt_v2_mode(args: argparse.Namespace):  # type: ignore
+    """处理 Outline Intelligence v2 大纲采纳模式"""
+    try:
+        if not args.project_name and not args.pdf_folder:
+            logging.error("必须指定--project-name或--pdf-folder参数中的一个")
+            sys.exit(1)
+
+        generator = LiteratureReviewGenerator(
+            args.config,
+            args.project_name,
+            args.pdf_folder,
+            getattr(args, "queue_file", "output/_queue/queue.json"),
+        )
+        generator.logger.info("=== Outline Intelligence v2 采纳模式已启动 ===")
+        generator.logger.info("=" * 60)
+
+        if not generator.load_configuration():
+            generator.logger.error("配置加载失败")
+            sys.exit(1)
+
+        if not generator.setup_output_directory():
+            generator.logger.error("输出目录设置失败")
+            sys.exit(1)
+
+        if not generator.adopt_outline_v2():
+            generator.logger.error("Outline v2 大纲采纳失败")
+            sys.exit(1)
+        generator.logger.success("Outline v2 大纲采纳成功！")
+    except Exception as e:
+        logging.error(f"处理 Outline v2 大纲采纳模式时出错: {e}")
         import traceback
         logging.debug(f"详细错误信息: {traceback.format_exc()}")
         sys.exit(1)

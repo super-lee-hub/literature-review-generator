@@ -177,3 +177,50 @@ def test_generate_review_fails_when_no_outline_is_available(tmp_path: Path, monk
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     assert generator.generate_full_review_from_outline() is False
+
+
+
+def test_create_literature_review_outline_v2_runs_pipeline_and_registers_artifacts(tmp_path: Path, monkeypatch) -> None:
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-v2-outline")
+    generator.config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
+    generator.config["Outline"]["test_dev_fixture_mode"] = "true"
+    generator.compat_config = CompatConfigView.from_config(generator.config)
+    generator.summaries = [
+        {"paper_info": {"title": "Core Paper", "classification": "core", "must_use": True}, "themes": ["core"], "methods": ["m"]},
+        {"paper_info": {"title": "Support Paper", "classification": "support"}, "themes": ["support"], "methods": ["m2"]},
+        {"paper_info": {"title": "Background Paper", "classification": "background_only"}, "themes": ["background"]},
+    ]
+
+    assert generator.create_literature_review_outline() is True
+
+    expected = [
+        "demo_literature_map.json",
+        "demo_synthesis_flow.json",
+        "demo_outline_candidates.json",
+        "demo_outline_critiques.json",
+        "demo_outline_arbitration_report.json",
+        "demo_final_outline.json",
+        "demo_outline_coverage_audit.json",
+    ]
+    for filename in expected:
+        assert Path(workspace.artifact_path(filename)).exists(), filename
+
+    registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
+    artifact_ids = {item["artifact_id"] for item in registry_payload["artifacts"]}
+    assert "outline_arbitration_report" in artifact_ids
+    final_record = next(item for item in registry_payload["artifacts"] if item["artifact_id"] == "final_outline")
+    assert all(dep["content_hash"] for dep in final_record["depends_on"])
+
+
+
+def test_generate_review_v2_enabled_without_adoption_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    generator, _workspace, _registry = _make_bound_generator(tmp_path, job_id="job-v2-review-gate")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+    generator.config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
+    generator.compat_config = CompatConfigView.from_config(generator.config)
+
+    legacy = Path(generator._get_legacy_outline_file_path())
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("# Legacy\n\n## 1. Should Not Load", encoding="utf-8")
+
+    assert generator.generate_full_review_from_outline() is False

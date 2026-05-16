@@ -1,6 +1,8 @@
-"""Outline module for Week 5.
+"""Outline module — Week 5 + Outline Intelligence v2 Complete Vertical Slice.
 
 JSON-first outline representation with critique and arbitration.
+V2 adds full literature map -> synthesis flow -> multi-candidate ->
+critique -> arbitration -> audit -> adoption pipeline.
 """
 
 from outline.models import (
@@ -40,6 +42,16 @@ from outline.legacy_adapter import (
     reviewed_outline_to_markdown,
 )
 
+from outline.runtime_resolver import OutlineRuntimeResolver, ResolveResult
+
+
+def __getattr__(name):
+    if name in {"V2Pipeline", "V2PipelineResult"}:
+        from outline.pipeline import V2Pipeline, V2PipelineResult
+
+        return {"V2Pipeline": V2Pipeline, "V2PipelineResult": V2PipelineResult}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 __all__ = [
     # Models
     "ArbitrationDecision",
@@ -73,4 +85,9 @@ __all__ = [
     "is_reviewed_outline_adopted",
     "outline_document_to_markdown",
     "reviewed_outline_to_markdown",
+    # V2
+    "OutlineRuntimeResolver",
+    "ResolveResult",
+    "V2Pipeline",
+    "V2PipelineResult",
 ]

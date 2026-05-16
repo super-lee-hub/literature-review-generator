@@ -165,6 +165,9 @@ nul
 # iFlow CLI generated files
 IFLOW.md
 
+# Local agent/runtime state
+.omc/state/
+
 # Test temporary artifacts
 test-*.json
 test-*.md

@@ -66,6 +66,49 @@ def apply_validation_compat_sections(
     return normalized
 
 
+def _outline_bool(view: "CompatConfigView", key: str, default: bool = False) -> bool:
+    outline = view.raw_config.get("Outline", {})
+    return _as_bool(outline.get(key), default=default)
+
+
+def _outline_int(view: "CompatConfigView", key: str, default: int = 0) -> int:
+    outline = view.raw_config.get("Outline", {})
+    try:
+        return int(outline.get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def _outline_int_parse_error(view: "CompatConfigView", key: str) -> str:
+    """Return a validation message when an explicit integer value is malformed."""
+    outline = view.raw_config.get("Outline", {})
+    if key not in outline:
+        return ""
+    value = outline.get(key)
+    try:
+        int(value)
+    except (ValueError, TypeError):
+        return f"{key}={value!r} must be an integer"
+    return ""
+
+
+def _cost_int_parse_error(view: "CompatConfigView", key: str) -> str:
+    cost = view.raw_config.get("OutlineCostControl", {})
+    if key not in cost:
+        return ""
+    value = cost.get(key)
+    try:
+        int(value)
+    except (ValueError, TypeError):
+        return f"{key}={value!r} must be an integer"
+    return ""
+
+
+def _outline_model_str(view: "CompatConfigView", key: str, default: str = "") -> str:
+    models = view.raw_config.get("OutlineModels", {})
+    return str(models.get(key, default)).strip()
+
+
 @dataclass
 class CompatConfigView:
     raw_config: MutableMapping[str, Dict[str, str]]
@@ -78,6 +121,8 @@ class CompatConfigView:
         config.update(normalized)
         return cls(raw_config=config, validation=read_validation_settings(config))
 
+    # -- Validation compat --
+
     def stage1_validation_enabled(self) -> bool:
         return self.validation.stage1_enabled
 
@@ -86,4 +131,113 @@ class CompatConfigView:
 
     def keep_checkpoints_after_completion(self) -> bool:
         return self.validation.keep_checkpoints_after_completion
+
+    # -- Outline v2 config --
+
+    def outline_v2_enabled(self) -> bool:
+        return _outline_bool(self, "enable_outline_intelligence_v2", default=False)
+
+    def outline_literature_map_enabled(self) -> bool:
+        return _outline_bool(self, "enable_literature_map", default=True)
+
+    def outline_synthesis_flow_enabled(self) -> bool:
+        return _outline_bool(self, "enable_synthesis_flow", default=True)
+
+    def outline_candidate_count(self) -> int:
+        return _outline_int(self, "candidate_count", default=3)
+
+    def outline_max_candidate_count(self) -> int:
+        cost = self.raw_config.get("OutlineCostControl", {})
+        try:
+            return int(cost.get("max_candidate_count", 3))
+        except (ValueError, TypeError):
+            return 3
+
+    def outline_multi_model_critique_enabled(self) -> bool:
+        return _outline_bool(self, "enable_multi_model_critique", default=True)
+
+    def outline_coverage_audit_enabled(self) -> bool:
+        return _outline_bool(self, "enable_coverage_audit", default=True)
+
+    def outline_require_explicit_adopt(self) -> bool:
+        return _outline_bool(self, "require_explicit_adopt", default=True)
+
+    def outline_allow_bibliometric_provider(self) -> bool:
+        return _outline_bool(self, "allow_bibliometric_provider", default=False)
+
+    def outline_test_dev_fixture_mode(self) -> bool:
+        return _outline_bool(self, "test_dev_fixture_mode", default=False)
+
+    # -- Outline model routing --
+
+    def outline_model(self) -> str:
+        return _outline_model_str(self, "outline_model", default="Outline_API")
+
+    def structure_critic_model(self) -> str:
+        return _outline_model_str(self, "structure_critic_model", default="Writer_API")
+
+    def coverage_critic_model(self) -> str:
+        return _outline_model_str(self, "coverage_critic_model", default="Primary_Reader_API")
+
+    def arbitrator_model(self) -> str:
+        return _outline_model_str(self, "arbitrator_model", default="Outline_API")
+
+    # -- Cost control --
+
+    def outline_max_critique_models(self) -> int:
+        cost = self.raw_config.get("OutlineCostControl", {})
+        try:
+            return int(cost.get("max_critique_models", 2))
+        except (ValueError, TypeError):
+            return 2
+
+    def outline_max_summary_refs_per_prompt(self) -> int:
+        cost = self.raw_config.get("OutlineCostControl", {})
+        try:
+            return int(cost.get("max_summary_refs_per_prompt", 80))
+        except (ValueError, TypeError):
+            return 80
+
+    def outline_max_retry_count(self) -> int:
+        cost = self.raw_config.get("OutlineCostControl", {})
+        try:
+            return int(cost.get("max_outline_retry_count", 2))
+        except (ValueError, TypeError):
+            return 2
+
+    # -- V2 config validation --
+
+    def validate_outline_v2_config(self) -> list[str]:
+        """Validate v2 config. Returns list of error strings."""
+        errors: list[str] = []
+        if not self.outline_v2_enabled():
+            return errors  # No v2 validation when v2 is disabled
+
+        candidate_parse_error = _outline_int_parse_error(self, "candidate_count")
+        if candidate_parse_error:
+            errors.append(candidate_parse_error)
+
+        max_candidate_parse_error = _cost_int_parse_error(self, "max_candidate_count")
+        if max_candidate_parse_error:
+            errors.append(max_candidate_parse_error)
+
+        count = self.outline_candidate_count()
+        if not candidate_parse_error:
+            if count < 2:
+                errors.append(f"candidate_count={count} is below minimum of 2 for production v2")
+            if count > 3:
+                errors.append(f"candidate_count={count} exceeds maximum of 3 for production v2")
+
+        max_count = self.outline_max_candidate_count()
+        if not max_candidate_parse_error and max_count != 3:
+            errors.append(f"max_candidate_count={max_count} must be 3")
+
+        if not self.outline_model():
+            errors.append("outline_model is not configured")
+        if not self.structure_critic_model():
+            errors.append("structure_critic_model is not configured")
+        if not self.coverage_critic_model():
+            errors.append("coverage_critic_model is not configured")
+
+        return errors
 

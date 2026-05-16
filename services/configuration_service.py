@@ -176,6 +176,28 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "review_drift_threshold": "0.3",
             "summary_drift_threshold": "0.2",
         },
+        "Outline": {
+            "enable_outline_intelligence_v2": "false",
+            "enable_literature_map": "true",
+            "enable_synthesis_flow": "true",
+            "candidate_count": "3",
+            "enable_multi_model_critique": "true",
+            "enable_coverage_audit": "true",
+            "require_explicit_adopt": "true",
+            "allow_bibliometric_provider": "false",
+        },
+        "OutlineModels": {
+            "outline_model": "Outline_API",
+            "structure_critic_model": "Writer_API",
+            "coverage_critic_model": "Primary_Reader_API",
+            "arbitrator_model": "Outline_API",
+        },
+        "OutlineCostControl": {
+            "max_candidate_count": "3",
+            "max_critique_models": "2",
+            "max_summary_refs_per_prompt": "80",
+            "max_outline_retry_count": "2",
+        },
     }
 
 
