@@ -1093,10 +1093,14 @@ def test_validator_prefers_claim_units_over_full_block_text():
 
 
 def test_summary_recheck_source_grounded_path(tmp_path):
-    """Test that summary_recheck uses source-grounded path for whitelisted fields."""
+    """Test that summary_recheck uses anchor-based source-grounded check.
+
+    Paraphrase without anchor conflicts (years, numbers, acronyms,
+    direction words) should NOT produce a false-positive candidate.
+    """
     from validation.summary_recheck import SummaryRechecker
-    
-    # Create paper artifact with mismatched summary
+
+    # Create paper artifact with paraphrased (but not conflicting) summary
     paper_artifact = {
         "paper_identity": {"canonical_paper_key": "test_paper"},
         "analysis": {
@@ -1110,19 +1114,73 @@ def test_summary_recheck_source_grounded_path(tmp_path):
             },
         },
     }
-    
+
     rechecker = SummaryRechecker(paper_artifact)
     report = rechecker.recheck()
-    
-    # Check that we got a candidate for the source-grounded check
+
+    # Paraphrase without anchor conflict should produce NO candidate
+    # (the old first-50-char substring heuristic was removed)
+    assert "core_analysis.summary" not in report.fields_with_candidates
+
+
+def test_summary_recheck_anchor_year_conflict(tmp_path):
+    """Test that a year conflict produces a correction candidate."""
+    from validation.summary_recheck import SummaryRechecker
+
+    paper_artifact = {
+        "paper_identity": {"canonical_paper_key": "test_paper"},
+        "analysis": {
+            "ai_summary": {
+                "core_analysis": {
+                    "summary": "The study conducted in 2023 found significant results.",
+                }
+            },
+            "preprocess": {
+                "normalized_text": "The study conducted in 2021 found significant results.",
+            },
+        },
+    }
+
+    rechecker = SummaryRechecker(paper_artifact)
+    report = rechecker.recheck()
+
     assert "core_analysis.summary" in report.fields_with_candidates
-    # Find the candidate
-    abstract_candidate = next(
+    candidate = next(
         (c for c in report.correction_candidates if c.field_path == "core_analysis.summary"),
         None
     )
-    assert abstract_candidate is not None
-    assert abstract_candidate.evidence_source == "preprocess_artifacts.normalized_text"
+    assert candidate is not None
+    assert "2023" in candidate.reason
+
+
+def test_summary_recheck_direction_word_conflict(tmp_path):
+    """Test that a direction-word conflict produces a correction candidate."""
+    from validation.summary_recheck import SummaryRechecker
+
+    paper_artifact = {
+        "paper_identity": {"canonical_paper_key": "test_paper"},
+        "analysis": {
+            "ai_summary": {
+                "core_analysis": {
+                    "findings": "The treatment showed a significant increase in outcomes.",
+                }
+            },
+            "preprocess": {
+                "normalized_text": "The treatment showed a significant decrease in outcomes.",
+            },
+        },
+    }
+
+    rechecker = SummaryRechecker(paper_artifact)
+    report = rechecker.recheck()
+
+    assert "core_analysis.findings" in report.fields_with_candidates
+    candidate = next(
+        (c for c in report.correction_candidates if c.field_path == "core_analysis.findings"),
+        None
+    )
+    assert candidate is not None
+    assert "increase" in candidate.reason.lower() or "direction" in candidate.reason.lower()
 
 
 def test_review_validator_uses_markdown_path_for_normalized_text(tmp_path):

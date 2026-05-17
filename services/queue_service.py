@@ -397,27 +397,43 @@ class QueueRunner:
         cancel_token = CancelToken()
         with self._lock:
             self._cancel_tokens[job_spec.job_id] = cancel_token
-        
+
         try:
             # 检查任务是否已经被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and runtime.state == QueueState.CANCELLED:
                 return
-            
-            # 检查依赖任务状态
+
+            # 检查依赖任务状态 — 严格优先级: missing → failed → cancelled → not-completed → completed
             for dep_job_id in job_spec.depends_on_job_ids:
                 dep_runtime = self.queue_service.get_job_runtime(dep_job_id)
+                # Missing dependency
                 if not dep_runtime:
                     self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
                     self.queue_service.set_job_error(job_spec.job_id, f"Dependency job {dep_job_id} not found")
                     return
-                if dep_runtime.state not in (QueueState.COMPLETED, QueueState.CANCELLED):
-                    # 依赖任务未完成，跳过执行
-                    return
+                # Failed dependency → propagate failure
                 if dep_runtime.state == QueueState.FAILED:
-                    # 依赖任务失败，标记当前任务为失败
                     self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                    self.queue_service.set_job_error(job_spec.job_id, f"Dependency job {dep_job_id} failed")
+                    self.queue_service.set_job_error(
+                        job_spec.job_id,
+                        f"Dependency job {dep_job_id} failed: {dep_runtime.error_message or 'no error details'}",
+                    )
+                    return
+                # Cancelled dependency → propagate cancellation (no error_message)
+                if dep_runtime.state == QueueState.CANCELLED:
+                    self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+                    self.queue_service.set_job_result(
+                        job_spec.job_id,
+                        {
+                            "cancelled_by_dependency": dep_job_id,
+                            "reason": f"Cancelled because dependency job {dep_job_id} was cancelled",
+                            "dependency_result_summary": dep_runtime.result_summary,
+                        },
+                    )
+                    return
+                # Pending or running dependency → keep this job waiting
+                if dep_runtime.state not in (QueueState.COMPLETED,):
                     return
             
             # 更新任务状态为运行中
@@ -542,27 +558,48 @@ class QueueRunner:
             if self._running:
                 return
             self._running = True
-        
+
         try:
-            while True:
+            processed_ids: set = set()
+            max_passes = len(self.queue_service._jobs) * 2 + 10  # safety bound
+            passes = 0
+            while passes < max_passes:
+                passes += 1
                 with self._lock:
                     if not self._running:
                         break
-                
+
                 # 获取待处理的任务
                 pending_jobs = self.queue_service.list_jobs_by_state(QueueState.PENDING)
-                if not pending_jobs:
+                active_jobs = [j for j in pending_jobs if j.job_id not in processed_ids]
+
+                if not active_jobs:
                     break
 
-                for job in pending_jobs:
+                made_progress = False
+                for job in active_jobs:
                     with self._lock:
                         if not self._running:
                             break
-                    
+
                     # 检查任务状态，确保没有被其他进程处理
                     runtime = self.queue_service.get_job_runtime(job.job_id)
                     if runtime and runtime.state == QueueState.PENDING:
                         self._process_job(job)
+                        # Only exclude job from re-evaluation if its state
+                        # actually changed; jobs that stayed PENDING
+                        # (dependency not ready) must be retried later.
+                        runtime_after = self.queue_service.get_job_runtime(job.job_id)
+                        if runtime_after and runtime_after.state != QueueState.PENDING:
+                            processed_ids.add(job.job_id)
+                            made_progress = True
+                        # After each job, re-scan pending list so newly-failed
+                        # or cancelled dependents are picked up in this drain
+                        if job.depends_on_job_ids:
+                            break
+
+                if not made_progress and not active_jobs:
+                    break
         finally:
             with self._lock:
                 self._running = False

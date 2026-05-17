@@ -1,134 +1,112 @@
 {
-  "task": "Documentation Architecture Migration — migrate root-level developer/AI/runtime documentation into structured bilingual docs/ tree",
-  "plan": ".omc/plans/docs-migration.md",
-  "created": "2026-05-05",
+  "task": "Repair / Validator / Queue Hardening — make v2/v3 pipeline reliable",
+  "plan": ".omx/plans/prd-repair-validator-queue-hardening-20260517T151930Z.md",
+  "created": "2026-05-17",
   "stories": [
     {
       "id": "US-001",
-      "name": "Phase 1: Create docs/ skeleton and index pages",
+      "name": "Phase 1: Repair apply v2 guard and multi-paper dependency matching",
       "priority": 1,
       "passes": true,
       "acceptanceCriteria": [
-        "Directory tree created: docs/zh-CN/{developer,ai,runtime,reference}/ and docs/en/{developer,ai,runtime,reference}/",
-        "docs/zh-CN/index.md and docs/en/index.md exist as navigation hubs with audience statements and links back to root README",
-        "All 8 subdirectory index pages exist (developer, ai, runtime, reference in both CN and EN) with content scope statements",
-        "All 10 CN/EN index pages are full mirrors (same structure, section count, content depth)",
-        "No root files modified",
-        "docs/user/ directory is NOT created (user content stays at root)"
+        "check_apply_guards defaults expected_artifact_version to 'v2' instead of 'v1'",
+        "infer_expected_review_draft_version(review_draft) returns artifact_version or 'v2'",
+        "check_apply_guards, apply_patch, RepairApplier.apply_all and run_repair_apply dry-run all use inferred expected version path",
+        "_check_dependency_bundle matches against metadata.paper_ids (plural) in addition to legacy metadata.paper_id",
+        "Multi-paper proposal with metadata.paper_ids=[A,B] passes guard only when all paper artifacts/dependencies match",
+        "Multi-paper proposal fails guard if any required paper artifact is missing or stale",
+        "Existing repair tests continue to pass"
       ]
     },
     {
       "id": "US-002",
-      "name": "Phase 2a: Migrate Developer content to docs/",
+      "name": "Phase 2: Repair planner v3 field alignment",
       "priority": 2,
       "passes": true,
       "acceptanceCriteria": [
-        "docs/zh-CN/developer/setup.md created with full CN content from DEVELOPMENT.md",
-        "docs/en/developer/setup.md created with full EN content from DEVELOPMENT.md",
-        "docs/zh-CN/developer/architecture.md created from AGENTS.md §4,§8,§11,§12 extracts (architecture, GUI/CLI, tech debt, module map)",
-        "docs/en/developer/architecture.md created as full EN mirror of architecture.md",
-        "docs/zh-CN/developer/architecture-baseline.md created from ARCHITECTURE_BASELINE.md",
-        "docs/en/developer/architecture-baseline.md created as full EN mirror",
-        "All developer index pages updated with real links to content pages",
-        "CN and EN pages are full mirrors (not summaries)",
-        "AGENTS.md and all other root files NOT yet modified (content extraction is copy, not move)"
+        "Paper identity lookup prefers citation_result.paper_ids → details.paper_ids → details.bundle.paper_ids → legacy paper_id",
+        "Block target lookup prefers target_claim_unit.block_id → block_ids[0] → details.target_claim_unit.block_id → legacy details.block_id",
+        "Proposal metadata includes paper_ids, citation_set_key, validation_bundle_id, claim_unit_id fields",
+        "_build_dependency_bundle is called per paper_id when multiple paper IDs are present",
+        "Multi-paper proposals build a composite dependency bundle that fails if any required paper is missing/stale",
+        "_find_block_for_citation uses the new priority order for block_id resolution",
+        "Existing repair pipeline tests continue to pass"
       ]
     },
     {
       "id": "US-003",
-      "name": "Phase 2b: Migrate Reference content + create Phase 2 root stubs",
+      "name": "Phase 3: Validator/manifest claim-level granularity",
       "priority": 3,
       "passes": true,
       "acceptanceCriteria": [
-        "docs/zh-CN/reference/feature-matrix.md created from FEATURE_MATRIX.md",
-        "docs/en/reference/feature-matrix.md created as full EN mirror",
-        "docs/zh-CN/reference/migration-history.md created from MIGRATION_NOTES.md",
-        "docs/en/reference/migration-history.md created as full EN mirror",
-        "DEVELOPMENT.md rewritten as thin stub (<500 bytes) linking to docs/en/developer/setup.md",
-        "ARCHITECTURE_BASELINE.md rewritten as thin stub (<500 bytes) linking to docs/en/developer/architecture-baseline.md",
-        "FEATURE_MATRIX.md rewritten as thin stub (<500 bytes) linking to docs/en/reference/feature-matrix.md",
-        "MIGRATION_NOTES.md rewritten as thin stub (<500 bytes) linking to docs/en/reference/migration-history.md",
-        "Reference index pages updated with real links",
-        "CN and EN pages are full mirrors"
+        "Same paper set in two different block/sentence locations yields same citation_set_key but different validation_bundle_id",
+        "claim_unit_results include block_id, sentence_index, span_start, span_end per claim unit",
+        "Each claim unit in the report carries stable claim_unit_id, validation_bundle_id, and paper set reference",
+        "Validation report metadata includes per-claim-unit block/sentence location information",
+        "Aggregate citation result remains backward-compatible with legacy paper_id/block_id fields",
+        "Legacy tests for review_validator continue to pass"
       ]
     },
     {
       "id": "US-004",
-      "name": "Phase 3a: Create AI handoff content in docs/",
+      "name": "Phase 4: Queue dependency propagation",
       "priority": 4,
       "passes": true,
       "acceptanceCriteria": [
-        "docs/zh-CN/ai/handoff.md created from AGENTS.md §1-3,§9,§10,§14 (CN source, since AGENTS.md is Chinese-primary)",
-        "docs/en/ai/handoff.md created as EN translation mirror",
-        "docs/zh-CN/ai/skill.md created adapted from .codex/skills/auto-generate-orchestrator/SKILL.md",
-        "docs/en/ai/skill.md created as EN mirror",
-        "docs/zh-CN/ai/runtime-bridge.md created from AGENTS.md §5.5,§6.4,§7",
-        "docs/en/ai/runtime-bridge.md created as EN mirror",
-        "AI index pages updated with real links",
-        "SKILL.md at .codex/skills/auto-generate-orchestrator/ is NOT modified",
-        "CN and EN pages are full mirrors",
-        "AGENTS.md root file NOT yet rewritten (content extraction is copy, not move)"
+        "Dependency check order: missing→failed, failed→failed, cancelled→cancelled, pending/running→returns early",
+        "Failed dependency marks current job FAILED with error_message containing dependency job ID",
+        "Cancelled dependency marks current job CANCELLED with status/result summary and no error_message set",
+        "Missing dependency marks current job FAILED with error",
+        "Pending/running dependency keeps downstream job PENDING (no state change)",
+        "Queue drain re-evaluates dependents after parent state changes so propagation happens in one cycle",
+        "Existing queue service tests continue to pass"
       ]
     },
     {
       "id": "US-005",
-      "name": "Phase 3b: Create Runtime truth content in docs/",
+      "name": "Phase 5: Stage 3 continuation, citation retry, checkpoint preservation",
       "priority": 5,
       "passes": true,
       "acceptanceCriteria": [
-        "docs/zh-CN/runtime/truth-sources.md created from TRUTH_SOURCES.md + AGENTS.md §5-7",
-        "docs/en/runtime/truth-sources.md created as EN mirror",
-        "docs/zh-CN/runtime/compatibility.md created from TRUTH_SOURCES.md deprecated/removal sections",
-        "docs/en/runtime/compatibility.md created as EN mirror",
-        "docs/zh-CN/runtime/workspace-layout.md created from AGENTS.md §7 + TRUTH_SOURCES.md",
-        "docs/en/runtime/workspace-layout.md created as EN mirror",
-        "Runtime index pages updated with real links",
-        "CN and EN pages are full mirrors"
+        "_call_ai_api_text_detailed returns dict with content, finish_reason, raw/metadata while _call_ai_api legacy behavior is unchanged",
+        "_call_section_api_optimized uses real finish_reason from _call_ai_api_text_detailed instead of hardcoded 'stop'",
+        "Mock finish_reason=length triggers continuation and concatenated content is returned on final stop",
+        "One narrow citation-token insertion retry is invoked when section lacks [[cite:...]] tokens",
+        "If citation retry succeeds, the section is accepted; if retry fails, the section is recorded as failed and checkpoint preserved",
+        "Checkpoint deletion only runs when failed_sections is empty (not before)",
+        "On failed sections, review checkpoint file remains and last_completed_section stays at the last successful one",
+        "Existing stage tests continue to pass"
       ]
     },
     {
       "id": "US-006",
-      "name": "Phase 3c: Create AGENTS.md fat stub + TRUTH_SOURCES.md thin stub",
+      "name": "Phase 6: Summary recheck anchor conflicts",
       "priority": 6,
       "passes": true,
       "acceptanceCriteria": [
-        "AGENTS.md rewritten as fat stub (2-3KB) containing: project identity paragraph, full 18-item reading order with 1-2 sentence summaries per item, centralized 'where to find everything' directory linking to docs/",
-        "TRUTH_SOURCES.md rewritten as thin stub (<500 bytes) linking to docs/en/runtime/truth-sources.md",
-        "All content from original AGENTS.md fully accounted for in docs/ (no sections dropped)",
-        "All content from original TRUTH_SOURCES.md fully accounted for in docs/ (no sections dropped)",
-        "AGENTS.md fat stub readable by fresh AI agent: can answer 'what is this project and where do I start?' without following links",
-        "All links in both stubs resolve to existing docs/ pages"
+        "_check_field_source_grounded no longer uses first-50-character substring matching",
+        "Anchor extraction identifies years (YYYY), percentages, sample sizes, experiment counts, uppercase acronyms, direction words from summary and source",
+        "Paraphrase with no anchor conflict produces no correction candidate (previously false-positive on substring mismatch)",
+        "Year conflict between summary and source produces correction candidate",
+        "Percentage/sample-size/experiment-count conflict produces correction candidate",
+        "Direction-word conflict (increase vs decrease, high vs low) produces candidate",
+        "Uppercase acronym present in summary but absent in source produces candidate",
+        "Existing summary recheck tests continue to pass"
       ]
     },
     {
       "id": "US-007",
-      "name": "Phase 4a: Finalize README.md and update README links",
+      "name": "Phase 7: Stage 1 strict/partial-success semantics",
       "priority": 7,
       "passes": true,
       "acceptanceCriteria": [
-        "README.md polished to concise bilingual product homepage (<6KB)",
-        "README.md 'Pick Your Path' table links updated to point to docs/ paths (AGENTS.md, TRUTH_SOURCES.md, FEATURE_MATRIX.md)",
-        "README.md 'Documentation Boundaries' section rewritten to reflect new docs/ structure",
-        "README.md contains no developer-only, AI-only, or runtime-only content beyond nav links",
-        "README.zh-CN.md §16 (排障快捷表) and §17 (文档分工) links updated to reference docs/",
-        "README.en.md §1 (doc split) and §10 (troubleshooting) links updated to reference docs/",
-        "All user-facing content in README.zh-CN.md (sections 1-15) and README.en.md (sections 2-9, 11-12) unchanged"
-      ]
-    },
-    {
-      "id": "US-008",
-      "name": "Phase 4b: Full verification + CI parity script",
-      "priority": 8,
-      "passes": true,
-      "acceptanceCriteria": [
-        "scripts/check-docs-parity.sh created and executable — verifies CN/EN file count parity, section count parity per page, and stale translation markers",
-        "All internal links verified: grep for '](./' patterns across all files, every link resolves to an existing file",
-        "CN/EN mirror check: for each docs/zh-CN/*.md, a matching docs/en/*.md exists with equivalent section structure",
-        "Root stub size check: all stubs except AGENTS.md are under 1KB; AGENTS.md is 2-3KB",
-        "Content ownership check: no developer/AI/runtime content in root README files beyond nav links",
-        "AGENTS.md reading order cross-reference trace: all 18 items trace to existing content",
-        "E2E fresh-AI-agent simulation: start from AGENTS.md fat stub, reach architecture/truth/module maps within 3 clicks",
-        "All 8 acceptance criteria from the deep-interview spec are verified"
+        "Default config adds allow_partial_success=false and min_success_ratio=1.0",
+        "process_all_papers returns False when final failed_papers is non-empty and allow_partial_success is false",
+        "process_all_papers returns True when final failed_papers is non-empty AND allow_partial_success=true AND success_ratio >= min_success_ratio",
+        "process_all_papers returns False when allow_partial_success=true but success_ratio < min_success_ratio",
+        "process_all_papers returns True when no failures exist (all papers processed successfully)",
+        "Result summary metadata includes: partial_success, failed_count, success_ratio, allow_partial_success",
+        "Existing stage 1 tests continue to pass"
       ]
     }
   ]

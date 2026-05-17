@@ -280,10 +280,15 @@ def _build_claim_unit(
     citation_tokens: List[str],
     block_anchor_hash: str,
     claim_unit_id: str,
+    paper_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    citation_set_key = str(bundle.get("citation_set_key") or bundle.get("bundle_id") or "unknown")
+    resolved_paper_ids = list(paper_ids or bundle.get("paper_ids", []))
     return {
         "claim_unit_id": claim_unit_id,
-        "citation_set_key": str(bundle.get("citation_set_key") or bundle.get("bundle_id") or "unknown"),
+        "citation_set_key": citation_set_key,
+        "validation_bundle_id": f"{citation_set_key}:{claim_unit_id}",
+        "paper_ids": resolved_paper_ids,
         "block_id": block_id,
         "sentence_index": sentence_index,
         "span_start": span_start,
@@ -813,6 +818,13 @@ class ReviewValidator:
             claim_unit_results.append(
                 {
                     "claim_unit_id": claim_unit.get("claim_unit_id", citation_set_key),
+                    "validation_bundle_id": claim_unit.get("validation_bundle_id", citation_set_key),
+                    "citation_set_key": claim_unit.get("citation_set_key", citation_set_key),
+                    "paper_ids": list(claim_unit.get("paper_ids", paper_ids)),
+                    "block_id": claim_unit.get("block_id", block_ids[0] if block_ids else ""),
+                    "sentence_index": claim_unit.get("sentence_index", 1),
+                    "span_start": claim_unit.get("span_start"),
+                    "span_end": claim_unit.get("span_end"),
                     "claim_text": unit_claim_text,
                     "evidence_status": unit_evidence_status,
                     "disposition": unit_disposition,

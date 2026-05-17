@@ -67,6 +67,7 @@ def _api_result(
     provider_code: Optional[str] = None,
     message: str = "",
     engine_type: Optional[str] = None,
+    finish_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "status": status,
@@ -76,6 +77,7 @@ def _api_result(
         "message": message,
         "content": content,
         "engine_type": engine_type,
+        "finish_reason": finish_reason,
     }
 
 
@@ -400,6 +402,7 @@ def _call_ai_api_detailed(
                 try:
                     response_data = response.json()
                     content = response_data['choices'][0]['message']['content']
+                    finish_reason = response_data['choices'][0].get('finish_reason', 'stop')
                 except Exception as exc:
                     message = f"Malformed API response: {exc}"
                     if logger:
@@ -418,6 +421,7 @@ def _call_ai_api_detailed(
                             status="success",
                             content=parsed_content,
                             http_status=getattr(response, "status_code", None),
+                            finish_reason=finish_reason,
                         )
 
                     corrected_content = _auto_correct_json(content)
@@ -428,6 +432,7 @@ def _call_ai_api_detailed(
                             status="success",
                             content=corrected_content,
                             http_status=getattr(response, "status_code", None),
+                            finish_reason=finish_reason,
                         )
 
                     message = "200 response but JSON content is empty or malformed"
@@ -445,6 +450,7 @@ def _call_ai_api_detailed(
                     status="success",
                     content=content,
                     http_status=getattr(response, "status_code", None),
+                    finish_reason=finish_reason,
                 )
 
             except requests.exceptions.HTTPError:
@@ -553,6 +559,45 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
     if result.get("status") == "success":
         return result.get("content")
     return None
+
+
+def _call_ai_api_text_detailed(
+    prompt: str,
+    api_config: APIConfig,
+    system_prompt: str,
+    max_tokens: int = 4000,
+    temperature: float = 0.3,
+    logger: Any = None,
+    user_content: Any = None,
+) -> Dict[str, Any]:
+    """Call the chat-completions API for text content and return full metadata.
+
+    Returns a dict with content, finish_reason, and raw response metadata.
+    Does NOT change _call_ai_api legacy return shape.
+    """
+    result = _call_ai_api_detailed(
+        prompt,
+        api_config,
+        system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        response_format="text",
+        logger=logger,
+        user_content=user_content,
+    )
+    if result.get("status") == "success":
+        return {
+            "content": result.get("content", ""),
+            "finish_reason": result.get("finish_reason", "stop"),
+            "http_status": result.get("http_status"),
+        }
+    return {
+        "content": None,
+        "finish_reason": None,
+        "http_status": result.get("http_status"),
+        "error_kind": result.get("error_kind"),
+        "message": result.get("message", ""),
+    }
 
 
 def _smart_json_parser(content: str) -> Optional[Dict[str, Any]]:

@@ -49,6 +49,17 @@ def _compute_anchor_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
 
 
+def _resolve_paper_artifact(
+    paper_artifacts: Sequence[Dict[str, Any]],
+    paper_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Find a paper artifact by canonical_paper_key matching paper_id."""
+    for pa in paper_artifacts:
+        if pa.get("paper_identity", {}).get("canonical_paper_key") == paper_id:
+            return pa
+    return None
+
+
 def _check_dependency_bundle(
     proposal: PatchProposal,
     paper_artifacts: Sequence[Dict[str, Any]],
@@ -56,45 +67,74 @@ def _check_dependency_bundle(
     visual_manifest: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Check if dependencies are still valid.
-    
+
     Returns False if any dependency is missing or stale.
+    Supports multi-paper proposals via metadata.paper_ids (v3) with
+    fallback to metadata.paper_id (legacy).
     """
     bundle = proposal.dependency_bundle
-    
-    # Find the paper artifact
-    paper_artifact = None
-    for pa in paper_artifacts:
-        if pa.get("paper_identity", {}).get("canonical_paper_key") == proposal.metadata.get("paper_id"):
-            paper_artifact = pa
-            break
-    
-    if not paper_artifact:
+
+    # Resolve target paper IDs: prefer paper_ids (plural, v3), then legacy paper_id
+    target_paper_ids: List[str] = list(proposal.metadata.get("paper_ids", []))
+    if not target_paper_ids:
+        legacy_paper_id = proposal.metadata.get("paper_id", "")
+        if legacy_paper_id:
+            target_paper_ids = [legacy_paper_id]
+
+    if not target_paper_ids:
         return False
-    
-    # Check summary hash
-    summary_data = paper_artifact.get("analysis", {}).get("ai_summary", {})
-    current_summary_hash = _compute_hash(summary_data)
-    if current_summary_hash != bundle.summary_hash:
-        return False
-    
-    # Check paper artifact hash
-    current_artifact_hash = _compute_hash(paper_artifact)
-    if current_artifact_hash != bundle.paper_artifact_hash:
-        return False
-    
+
+    # All listed paper IDs must resolve to valid artifacts
+    resolved_artifacts: List[Dict[str, Any]] = []
+    for pid in target_paper_ids:
+        artifact = _resolve_paper_artifact(paper_artifacts, pid)
+        if not artifact:
+            return False
+        resolved_artifacts.append(artifact)
+
+    primary = resolved_artifacts[0]
+
+    # Check aggregate summary hash across all papers
+    if bundle.summary_hash:
+        aggregate_summary: Dict[str, Any] = {}
+        for artifact in resolved_artifacts:
+            summary_data = artifact.get("analysis", {}).get("ai_summary", {})
+            aggregate_summary.update(summary_data)
+        current_summary_hash = _compute_hash(aggregate_summary)
+        if current_summary_hash != bundle.summary_hash:
+            return False
+
+    # Check paper artifact hash — composite over all resolved artifacts
+    # so that any artifact change is detected for multi-paper proposals.
+    if bundle.paper_artifact_hash:
+        composite = resolved_artifacts if len(resolved_artifacts) > 1 else primary
+        current_artifact_hash = _compute_hash(composite)
+        if current_artifact_hash != bundle.paper_artifact_hash:
+            return False
+
     # Check visual manifest hash
     if bundle.visual_manifest_hash:
         current_visual_manifest_hash = _compute_hash(visual_manifest or {})
         if current_visual_manifest_hash != bundle.visual_manifest_hash:
             return False
-    
-    # Check visual refs hash
-    selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
-    current_visual_refs_hash = _compute_hash(selected_visual_refs)
-    if current_visual_refs_hash != bundle.selected_visual_refs_hash:
-        return False
-    
+
+    # Check visual refs hash (from primary artifact, matches plan-time)
+    if bundle.selected_visual_refs_hash:
+        selected_visual_refs = primary.get("stage1_inputs", {}).get("selected_visual_refs", [])
+        current_visual_refs_hash = _compute_hash(selected_visual_refs)
+        if current_visual_refs_hash != bundle.selected_visual_refs_hash:
+            return False
+
     return True
+
+
+def infer_expected_review_draft_version(review_draft: Dict[str, Any]) -> str:
+    """Return artifact_version from review_draft, defaulting to 'v2'.
+
+    The v2/v3 chain is now canonical; v1 is a compatibility fallback only.
+    """
+    version = str(review_draft.get("artifact_version", "") or "").strip()
+    return version if version else "v2"
 
 
 def check_apply_guards(
@@ -102,7 +142,7 @@ def check_apply_guards(
     review_draft: Dict[str, Any],
     paper_artifacts: Sequence[Dict[str, Any]],
     visual_manifest: Optional[Dict[str, Any]] = None,
-    expected_artifact_version: str = "v1",
+    expected_artifact_version: str = "v2",
 ) -> ApplyGuardResult:
     """Check all guards before applying a patch.
     
@@ -205,8 +245,11 @@ def apply_patch(
     
     Returns AppliedPatchRecord on success, None on failure.
     """
-    # Check guards first
-    guard_result = check_apply_guards(proposal, review_draft, paper_artifacts, visual_manifest)
+    # Check guards first (use inferred expected version from review_draft)
+    expected_version = infer_expected_review_draft_version(review_draft)
+    guard_result = check_apply_guards(
+        proposal, review_draft, paper_artifacts, visual_manifest, expected_artifact_version=expected_version
+    )
     if not guard_result.can_apply:
         return None
     
@@ -291,9 +334,11 @@ class RepairApplier:
             if "plan_id" not in proposal.metadata:
                 proposal.metadata["plan_id"] = self.repair_plan.plan_id
             
-            # Check guards
+            # Check guards (use inferred expected version)
+            expected_version = infer_expected_review_draft_version(self.review_draft)
             guard_result = check_apply_guards(
-                proposal, self.review_draft, self.paper_artifacts, self.visual_manifest
+                proposal, self.review_draft, self.paper_artifacts, self.visual_manifest,
+                expected_artifact_version=expected_version
             )
             
             if not guard_result.can_apply:
@@ -316,8 +361,10 @@ class RepairApplier:
                 
                 # Auto-trigger targeted recheck based on root cause
                 if proposal.root_cause == RepairRootCause.SUMMARY_DRIFT:
-                    # Trigger targeted summary recheck
-                    recheck_triggered.append(f"summary_recheck:{proposal.metadata.get('paper_id')}")
+                    # Trigger targeted summary recheck (use first paper_id from v3 list)
+                    paper_ids = proposal.metadata.get("paper_ids", [])
+                    primary_id = paper_ids[0] if paper_ids else proposal.metadata.get("paper_id", "unknown")
+                    recheck_triggered.append(f"summary_recheck:{primary_id}")
                 elif proposal.root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
                     # Trigger citation mapping recheck and manifest update
                     recheck_triggered.append(f"citation_mapping_recheck:{proposal.citation_id}")
@@ -376,10 +423,14 @@ def run_repair_apply(
     )
     
     if dry_run:
-        # Just check guards for all proposals
+        # Just check guards for all proposals (use inferred expected version)
+        expected_version = infer_expected_review_draft_version(review_draft)
         results = []
         for proposal in repair_plan.proposals:
-            guard_result = check_apply_guards(proposal, review_draft, paper_artifacts, visual_manifest)
+            guard_result = check_apply_guards(
+                proposal, review_draft, paper_artifacts, visual_manifest,
+                expected_artifact_version=expected_version
+            )
             results.append({
                 "proposal_id": proposal.proposal_id,
                 "can_apply": guard_result.can_apply,

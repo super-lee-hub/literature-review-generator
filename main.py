@@ -44,6 +44,7 @@ from ai_interface import (  # type: ignore
     get_summary_from_ai_with_fallback,
     get_concept_analysis,
     _call_ai_api,
+    _call_ai_api_text_detailed,
     _post_with_proxy_mode,
 )
 from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references_from_manifest
@@ -399,6 +400,7 @@ class LiteratureReviewGenerator:
         self.queue_service: Optional[PersistentQueueService] = None
         self._stage1_reuse_report: Optional[Dict[str, Any]] = None
         self._stage1_reused_paper_keys: Set[str] = set()
+        self.stage1_result_summary: Dict[str, Any] = {}
         self.root_log_path: str = ""
         self.workspace_log_path: str = ""
         self._workspace_log_handler: Optional[logging.Handler] = None
@@ -606,6 +608,24 @@ class LiteratureReviewGenerator:
         if self.compat_config:
             return self.compat_config.keep_checkpoints_after_completion()
         return False
+
+    def _get_stage1_config(self) -> Dict[str, Any]:
+        """Return Stage 1 strict/partial-success configuration.
+
+        Defaults: allow_partial_success=false, min_success_ratio=1.0.
+        """
+        stage1_raw = (self.config or {}).get("Stage1", {}) or {}
+        if isinstance(stage1_raw, dict):
+            allow_partial = bool(stage1_raw.get("allow_partial_success", False))
+            try:
+                min_ratio = float(stage1_raw.get("min_success_ratio", 1.0))
+            except (TypeError, ValueError):
+                min_ratio = 1.0
+            return {
+                "allow_partial_success": allow_partial,
+                "min_success_ratio": max(0.0, min(1.0, min_ratio)),
+            }
+        return {"allow_partial_success": False, "min_success_ratio": 1.0}
 
     def _stage1_validation_enabled(self) -> bool:
         if not self.compat_config and self.config is not None:
@@ -4735,9 +4755,41 @@ class LiteratureReviewGenerator:
             # 最终保存所有数据
             self.save_summaries()
             self.save_checkpoint()
-            
+
+            # Stage 1 strict success semantics
+            stage1_cfg = self._get_stage1_config()
+            failed_count = len(self.failed_papers)
+            total_papers = len(self.papers)
+            success_count = max(total_papers - failed_count, 0)
+            success_ratio = success_count / total_papers if total_papers > 0 else 1.0
+            allow_partial = stage1_cfg["allow_partial_success"]
+            min_ratio = stage1_cfg["min_success_ratio"]
+
+            partial_success = failed_count > 0
+            stage1_ok = not partial_success or (
+                allow_partial and success_ratio >= min_ratio
+            )
+
+            self.stage1_result_summary = {
+                "partial_success": partial_success,
+                "failed_count": failed_count,
+                "success_count": success_count,
+                "total": total_papers,
+                "success_ratio": round(success_ratio, 4),
+                "allow_partial_success": allow_partial,
+                "min_success_ratio": min_ratio,
+            }
+
+            if not stage1_ok:
+                self.logger.warning(
+                    f"Stage 1 success check failed: {failed_count} failed papers, "
+                    f"ratio={success_ratio:.2f}, allow_partial={allow_partial}, "
+                    f"min_ratio={min_ratio}"
+                )
+                return False
+
             return True
-            
+
         except KeyboardInterrupt:
             self.logger.error("\n\n用户中断处理")
             self.logger.info(f"已处理: {self.processed_count.value}篇文献，失败: {self.failed_count.value}篇")
@@ -5156,24 +5208,24 @@ class LiteratureReviewGenerator:
 
             self.logger.success(f"生成最终章节提示词: {len(final_prompt)}字符")
 
-            # Call unified AI API function
-            ai_response = _call_ai_api(
+            # Call detailed API to get real finish_reason for continuation logic
+            result = _call_ai_api_text_detailed(
                 prompt=final_prompt,
                 api_config=writer_api_config,
                 system_prompt=system_prompt,
                 max_tokens=6000,
                 temperature=0.7,
-                response_format="text" # Expecting plain text
+                logger=self.logger,
             )
 
-            if ai_response:
-                # _call_ai_api returns content directly for text format
+            content = result.get("content")
+            if content:
                 return {
-                    'content': ai_response,
-                    'finish_reason': 'stop' # _call_ai_api doesn't return finish_reason for text, assume stop
+                    'content': content,
+                    'finish_reason': result.get('finish_reason', 'stop'),
                 }
             else:
-                self.logger.error(f"章节内容生成失败: _call_ai_api 返回空值")
+                self.logger.error(f"章节内容生成失败: {result.get('message', 'unknown')}")
                 return None
 
         except Exception as e:
@@ -5441,18 +5493,45 @@ class LiteratureReviewGenerator:
                 
                 # 检查章节内容是否包含结构化citation token
                 if "[[cite:" not in section_content:
-                    self.logger.error(
-                        f"Section {section_num} is missing structured citation tokens; canonical review generation is blocked."
+                    self.logger.warning(
+                        f"Section {section_num} is missing structured citation tokens; attempting one narrow retry."
                     )
-                    failed_sections.append(
-                        {
-                            "section_number": int(section_num),
-                            "section_title": section_title,
-                            "failure_reason": "missing_structured_citation_tokens",
-                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        }
+                    # One narrow citation-token insertion retry.
+                    # Boundary markers prevent the embedded section content from
+                    # being interpreted as prompt instructions.
+                    retry_section_escaped = section_content.replace("'''", r"\'\'\'")
+                    retry_prompt = (
+                        "The following section content is missing [[cite:paper_key]] citation tokens. "
+                        "Please rewrite it inserting appropriate [[cite:...]] tokens for every factual claim "
+                        "referenced from the provided paper summaries. Preserve all other content and structure.\n\n"
+                        f"=== SECTION TO FIX ===\nSection: {section_title}\n\n"
+                        "'''CONTENT START'''\n"
+                        f"{retry_section_escaped[:4000]}\n"
+                        "'''CONTENT END'''\n\n"
+                        "Rewrite the above CONTENT section with citation tokens added."
                     )
-                    continue
+                    retry_result = self._call_section_api_optimized(
+                        retry_prompt,
+                        writer_api_config,
+                        is_continuation=False,
+                    )
+                    if retry_result and "[[cite:" in str(retry_result.get("content", "")):
+                        section_content = retry_result["content"]
+                        self.logger.success(f"Citation-token retry succeeded for section {section_num}")
+                    else:
+                        self.logger.error(
+                            f"Section {section_num} still lacks structured citation tokens after retry; "
+                            "canonical review generation is blocked."
+                        )
+                        failed_sections.append(
+                            {
+                                "section_number": int(section_num),
+                                "section_title": section_title,
+                                "failure_reason": "missing_structured_citation_tokens",
+                                "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            }
+                        )
+                        continue
 
                 review_sections_by_number[int(section_num)] = {
                     "section_number": int(section_num),
@@ -5490,13 +5569,18 @@ class LiteratureReviewGenerator:
                     indeterminate=False
                 )
 
-            if os.path.exists(review_checkpoint_file):
-                keep_checkpoints = self._keep_checkpoints_after_completion()
-                if not keep_checkpoints:
-                    os.remove(review_checkpoint_file)
-                    self.logger.info("Removed review checkpoint after section generation completed.")
-                else:
-                    self.logger.info("Keeping review checkpoint because configuration requires it.")
+            if not failed_sections:
+                if os.path.exists(review_checkpoint_file):
+                    keep_checkpoints = self._keep_checkpoints_after_completion()
+                    if not keep_checkpoints:
+                        os.remove(review_checkpoint_file)
+                        self.logger.info("Removed review checkpoint after section generation completed.")
+                    else:
+                        self.logger.info("Keeping review checkpoint because configuration requires it.")
+            else:
+                self.logger.info(
+                    f"Preserving review checkpoint because {len(failed_sections)} section(s) failed."
+                )
 
             if failed_sections:
                 self.logger.warning("Skipping review_draft_v1 registration because one or more review sections failed")

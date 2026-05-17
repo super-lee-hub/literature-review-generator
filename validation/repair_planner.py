@@ -13,7 +13,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from validation.repair_models import (
-    ApplyGuardResult,
     DependencyHashBundle,
     PatchGranularity,
     PatchProposal,
@@ -74,23 +73,99 @@ def _map_validation_root_cause(root_causes: List[RootCause]) -> Optional[RepairR
     return None
 
 
+def _resolve_candidate_paper_ids(citation: CitationValidationResult) -> List[str]:
+    """Resolve paper IDs for a citation result using v3 priority order.
+
+    Priority: citation_result.paper_ids (v3) → details.paper_ids →
+    details.bundle.paper_ids → legacy paper_id (only when not synthetic).
+    """
+    # v3: direct paper_ids on citation result
+    if citation.paper_ids:
+        return list(citation.paper_ids)
+
+    # v3: from details.paper_ids
+    details_pids = citation.details.get("paper_ids", [])
+    if details_pids:
+        return [str(p) for p in details_pids if str(p).strip()]
+
+    # v3: from details.bundle.paper_ids
+    bundle = citation.details.get("bundle", {})
+    if isinstance(bundle, dict):
+        bundle_pids = bundle.get("paper_ids", [])
+        if bundle_pids:
+            return [str(p) for p in bundle_pids if str(p).strip()]
+
+    # Legacy fallback: paper_id, but skip synthetic/multi-paper composite keys
+    legacy = str(citation.paper_id or "").strip()
+    if legacy and "+" not in legacy:
+        return [legacy]
+
+    return []
+
+
+def _resolve_target_block_id(citation: CitationValidationResult) -> str:
+    """Resolve target block ID using v3 priority order.
+
+    Priority: target_claim_unit.block_id → block_ids[0] →
+    details.target_claim_unit.block_id → legacy details.block_id →
+    empty string (text fallback in caller).
+    """
+    # v3: from target_claim_unit
+    tcu = citation.target_claim_unit if isinstance(citation.target_claim_unit, dict) else {}
+    tcu_block = str(tcu.get("block_id", "") or "").strip()
+    if tcu_block:
+        return tcu_block
+
+    # v3: first entry in block_ids
+    if citation.block_ids:
+        first = str(citation.block_ids[0] or "").strip()
+        if first:
+            return first
+
+    # v3: from details.target_claim_unit
+    details_tcu = citation.details.get("target_claim_unit", {})
+    if isinstance(details_tcu, dict):
+        dtcu_block = str(details_tcu.get("block_id", "") or "").strip()
+        if dtcu_block:
+            return dtcu_block
+
+    # Legacy: details.block_id
+    legacy_block = str(citation.details.get("block_id", "") or "").strip()
+    if legacy_block:
+        return legacy_block
+
+    return ""
+
+
 def _find_block_for_citation(
     review_draft: Dict[str, Any],
     citation: CitationValidationResult,
 ) -> Optional[Dict[str, Any]]:
-    """Find the block in review_draft that contains the citation."""
+    """Find the block in review_draft that contains the citation.
+
+    Uses v3 priority: target_claim_unit.block_id → block_ids[0] →
+    details.target_claim_unit.block_id → legacy details.block_id → text fallback.
+    """
     sections = review_draft.get("content", {}).get("sections", [])
-    
+
+    # Resolve target block ID via priority order
+    target_block_id = _resolve_target_block_id(citation)
+
+    if target_block_id:
+        for section in sections:
+            for block in section.get("blocks", []):
+                if block.get("block_id") == target_block_id:
+                    return block
+
+    # Text-based fallback
     for section in sections:
         for block in section.get("blocks", []):
-            # Match by block_id if available in citation details
             if citation.details.get("block_id") == block.get("block_id"):
                 return block
-            # Fallback: check if citation text appears in block text
             block_text = block.get("text", "")
             if citation.citation_id in block_text or citation.details.get("cited_text", "") in block_text:
                 return block
-    
+
     return None
 
 
@@ -101,33 +176,58 @@ def _create_patch_proposal(
     job_id: str,
 ) -> Optional[PatchProposal]:
     """Create a PatchProposal from a validation result.
-    
+
     Maps root cause to appropriate fix strategy:
     - citation_mapping_error -> manifest/mapping fix + rerender
     - visual_understanding_gap -> summary recheck with visual bundle first
+
+    v3: Resolves paper IDs and block IDs using priority order, and
+    includes paper_ids, citation_set_key, validation_bundle_id, claim_unit_id
+    in proposal metadata.
     """
     root_cause = _map_validation_root_cause(citation_result.root_causes)
     if not root_cause:
         return None
-    
-    # Find target block
+
+    # Find target block using v3 priority
     block = _find_block_for_citation(review_draft, citation_result)
     if not block:
         return None
-    
-    # Find paper artifact
-    paper_artifact = None
-    for pa in paper_artifacts:
-        if pa.get("paper_identity", {}).get("canonical_paper_key") == citation_result.paper_id:
-            paper_artifact = pa
-            break
-    
-    if not paper_artifact:
+
+    # Resolve candidate paper IDs using v3 priority
+    candidate_paper_ids = _resolve_candidate_paper_ids(citation_result)
+    if not candidate_paper_ids:
+        # Legacy fallback: single paper_id (reject synthetic composite keys)
+        legacy_pid = str(citation_result.paper_id or "").strip()
+        if legacy_pid and "+" not in legacy_pid:
+            candidate_paper_ids = [legacy_pid]
+
+    # Find all matching paper artifacts
+    resolved_artifacts: List[Dict[str, Any]] = []
+    paper_index = {pa.get("paper_identity", {}).get("canonical_paper_key", ""): pa for pa in paper_artifacts}
+    for pid in candidate_paper_ids:
+        artifact = paper_index.get(pid)
+        if artifact:
+            resolved_artifacts.append(artifact)
+
+    if not resolved_artifacts:
         return None
-    
-    # Build dependency bundle
-    summary_data = paper_artifact.get("analysis", {}).get("ai_summary", {})
-    dependency_bundle = _build_dependency_bundle(paper_artifact, summary_data)
+
+    # Use the first resolved artifact as the primary for legacy compat
+    paper_artifact = resolved_artifacts[0]
+
+    # Build composite dependency bundle from all resolved artifacts.
+    # Summary hash aggregates across all papers.
+    # Paper artifact hash is composite (all artifacts) for multi-paper,
+    # matching check-time computation in _check_dependency_bundle.
+    aggregate_summary: Dict[str, Any] = {}
+    for artifact in resolved_artifacts:
+        summary_data = artifact.get("analysis", {}).get("ai_summary", {})
+        aggregate_summary.update(summary_data)
+
+    # Composite artifact for hash: full list for multi-paper, single for single
+    artifact_for_hash: Any = resolved_artifacts if len(resolved_artifacts) > 1 else paper_artifact
+    dependency_bundle = _build_dependency_bundle(artifact_for_hash, aggregate_summary)
     
     # Determine fix strategy based on root cause
     if root_cause == RepairRootCause.CITATION_MAPPING_ERROR:
@@ -168,9 +268,27 @@ def _create_patch_proposal(
         # For other errors, mark for recheck
         proposed_text = block_text  # Keep original, mark for recheck
     
-    # 构建增强的 metadata，包含 repair hint
+    # Build v3-enhanced metadata with paper_ids, citation_set_key,
+    # validation_bundle_id, and claim_unit_id
+    citation_set_key = str(
+        citation_result.citation_set_key
+        or citation_result.details.get("citation_set_key", "")
+    ).strip()
+    validation_bundle_id = str(
+        citation_result.details.get("target_claim_unit", {}).get("claim_unit_id", "")
+        or citation_result.target_claim_unit.get("claim_unit_id", "")
+    ).strip()
+    claim_unit_id = str(
+        citation_result.target_claim_unit.get("claim_unit_id", "")
+        or citation_result.details.get("target_claim_unit", {}).get("claim_unit_id", "")
+    ).strip()
+
     metadata = {
-        "paper_id": citation_result.paper_id,
+        "paper_id": citation_result.paper_id,  # legacy
+        "paper_ids": candidate_paper_ids,  # v3
+        "citation_set_key": citation_set_key,
+        "validation_bundle_id": validation_bundle_id or citation_set_key,
+        "claim_unit_id": claim_unit_id or citation_set_key,
         "validation_conclusion": citation_result.conclusion.value,
         "evidence_candidates_count": len(citation_result.evidence_candidates),
         "claim_text": citation_result.claim_text,
