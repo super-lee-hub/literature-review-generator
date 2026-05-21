@@ -166,7 +166,8 @@ nul
 IFLOW.md
 
 # Local agent/runtime state
-.omc/state/
+.omc/
+.omx/
 
 # Test temporary artifacts
 test-*.json
