@@ -260,6 +260,47 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content. [[cite:paper_a|mode=parenthetical]]"
 
 
+def test_review_draft_checkpoint_without_docx_restarts_from_first_section(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-stale-checkpoint")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+
+    outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
+    checkpoint_path = Path(workspace.checkpoint_path("demo_review_checkpoint.json"))
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "last_completed_section": 1,
+                "last_section_title": "First Section",
+                "update_time": "2026-04-03 00:00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    generated_sections = []
+
+    def _section_content(section_title: str, _outline: str):
+        generated_sections.append(section_title)
+        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
+
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
+
+    assert generator.generate_full_review_from_outline() is True
+
+    assert generated_sections == ["First Section", "Second Section"]
+    registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
+    review_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "review_draft" and item["artifact_version"] == "v1"]
+    artifact_payload = json.loads(Path(review_records[0]["path"]).read_text(encoding="utf-8"))
+    assert [section["section_number"] for section in artifact_payload["content"]["sections"]] == [1, 2]
+
+
 def test_retry_failed_review_sections_still_reenters_full_review_generation(
     tmp_path: Path,
     monkeypatch,

@@ -5371,6 +5371,13 @@ class LiteratureReviewGenerator:
                     last_completed_section = 0
             else:
                 self.logger.info("[全新开始] 未发现断点文件，将从第1章开始生成")
+
+            if last_completed_section > 0 and not os.path.exists(word_file):
+                self.logger.warning(
+                    "[断点续传] 发现综述断点，但未找到可恢复的综述文档；"
+                    "将从第1章重新生成，避免跳过已丢失的章节正文。"
+                )
+                last_completed_section = 0
             
             # 洁净启动机制：全新任务时删除旧文件
             if last_completed_section == 0 and os.path.exists(word_file):
