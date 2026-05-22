@@ -18,10 +18,12 @@ from docx.oxml import OxmlElement  # type: ignore
 DOCX_AVAILABLE = True
 
 from services.citation_catalog import (
+    alias_lookup_keys,
     build_citation_catalog,
     build_citation_catalog_from_manifest,
+    extract_citation_key,
+    extract_doi_aliases,
     format_in_text_citation,
-    normalize_alias,
 )
 
 
@@ -43,7 +45,27 @@ def _build_citation_entry_lookup(
 ) -> Dict[str, Any]:
     manifest_data = citation_manifest or {}
     if manifest_data.get("paper_entries"):
-        return build_citation_catalog_from_manifest(manifest_data)
+        alias_map = build_citation_catalog_from_manifest(manifest_data)
+        for occurrence in manifest_data.get("occurrences", []):
+            if not isinstance(occurrence, Mapping):
+                continue
+            paper_id = str(occurrence.get("paper_id") or "").strip()
+            if not paper_id or paper_id == "unknown":
+                continue
+            entry = None
+            for lookup_value in (paper_id, occurrence.get("paper_key")):
+                for lookup_key in alias_lookup_keys(lookup_value):
+                    entry = alias_map.get(lookup_key)
+                    if entry is not None:
+                        break
+                if entry is not None:
+                    break
+            if entry is None:
+                continue
+            token_key = extract_citation_key(str(occurrence.get("citation_token") or ""))
+            for lookup_key in alias_lookup_keys(token_key):
+                alias_map[lookup_key] = entry
+        return alias_map
     if not allow_compat_fallback:
         return {}
     summaries = getattr(generator_instance, "summaries", []) or []
@@ -79,7 +101,19 @@ def render_structured_citations(
             if "=" in part:
                 key, value = part.split("=", 1)
                 params[key.strip()] = value.strip()
-        entry = alias_map.get(normalize_alias(raw_key))
+        entry = None
+        for lookup_key in alias_lookup_keys(raw_key):
+            entry = alias_map.get(lookup_key)
+            if entry is not None:
+                break
+        if entry is None:
+            for doi_alias in extract_doi_aliases(raw_key):
+                for lookup_key in alias_lookup_keys(doi_alias):
+                    entry = alias_map.get(lookup_key)
+                    if entry is not None:
+                        break
+                if entry is not None:
+                    break
         if entry is None:
             unresolved.append(raw_key or match.group(0))
             return match.group(0)
@@ -465,20 +499,31 @@ def rebuild_review_docx_from_structured_artifacts(
         os.remove(output_path)
     _initialize_review_document(generator_instance, output_path)
 
+    failed_sections: List[str] = []
     for section in review_draft.get("content", {}).get("sections", []):
         section_text = "\n\n".join(
             str(block.get("text") or "").strip()
             for block in section.get("blocks", [])
             if str(block.get("text") or "").strip()
         )
-        append_section_to_word_document(
+        section_number = int(section.get("section_number") or 0)
+        section_title = str(section.get("section_title") or "")
+        appended = append_section_to_word_document(
             generator_instance,
-            int(section.get("section_number") or 0),
-            str(section.get("section_title") or ""),
+            section_number,
+            section_title,
             section_text,
             output_path,
             citation_manifest=citation_manifest,
             allow_compat_fallback=allow_compat_fallback,
+        )
+        if not appended:
+            failed_sections.append(f"{section_number}. {section_title}".strip())
+
+    if failed_sections:
+        raise ValueError(
+            "DOCX render failed before references; section append failed for: "
+            + "; ".join(failed_sections[:5])
         )
 
     if DOCX_AVAILABLE and Document is not None:

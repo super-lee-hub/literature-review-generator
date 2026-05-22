@@ -6,7 +6,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from services.citation_catalog import (
+    augment_citation_catalog_from_literature_map,
+    alias_lookup_keys,
     build_citation_catalog,
+    extract_doi_aliases,
     extract_citation_key,
     format_reference_entry,
     normalize_alias,
@@ -481,9 +484,24 @@ def _resolve_entry(
     entries_by_paper_id: Dict[str, Any],
 ) -> tuple[Optional[Any], str]:
     raw_key = explicit_paper_key or extract_citation_key(citation_token)
-    candidate = alias_map.get(normalize_alias(raw_key))
-    if candidate is not None:
-        return candidate, raw_key
+    candidates = [
+        explicit_paper_key,
+        explicit_paper_id,
+        extract_citation_key(citation_token),
+        citation_token,
+    ]
+    for value in candidates:
+        if not value:
+            continue
+        for lookup_key in alias_lookup_keys(value):
+            candidate = alias_map.get(lookup_key)
+            if candidate is not None:
+                return candidate, raw_key
+        for doi_alias in extract_doi_aliases(value):
+            for lookup_key in alias_lookup_keys(doi_alias):
+                candidate = alias_map.get(lookup_key)
+                if candidate is not None:
+                    return candidate, raw_key
     if explicit_paper_id and explicit_paper_id in entries_by_paper_id:
         return entries_by_paper_id[explicit_paper_id], raw_key
 
@@ -701,6 +719,7 @@ def build_citation_manifest_v2_from_review_draft(
     review_draft_v2: Dict[str, Any],
     paper_summaries: List[Dict[str, Any]],
     allow_legacy_regex: bool = True,
+    literature_map: Optional[Dict[str, Any]] = None,
 ) -> CitationManifestV2:
     occurrences: List[CitationOccurrence] = []
     clusters: List[CitationCluster] = []
@@ -708,6 +727,7 @@ def build_citation_manifest_v2_from_review_draft(
     bibliography: List[BibliographyEntry] = []
 
     entries, alias_map = build_citation_catalog(paper_summaries)
+    entries, alias_map = augment_citation_catalog_from_literature_map(entries, alias_map, literature_map)
     entries_by_paper_id = {entry.paper_id: entry for entry in entries}
     paper_occurrence_map: Dict[str, List[str]] = {}
     sections = review_draft_v2.get("content", {}).get("sections", [])
@@ -848,6 +868,7 @@ def build_citation_manifest_v3_from_review_draft(
     review_word_path: str,
     review_draft_v2: Dict[str, Any],
     paper_summaries: List[Dict[str, Any]],
+    literature_map: Optional[Dict[str, Any]] = None,
     load_source: str = "v3",
 ) -> CitationManifestV3:
     legacy_manifest = build_citation_manifest_v2_from_review_draft(
@@ -859,9 +880,11 @@ def build_citation_manifest_v3_from_review_draft(
         review_draft_v2=review_draft_v2,
         paper_summaries=paper_summaries,
         allow_legacy_regex=False,
+        literature_map=literature_map,
     )
 
     entries, _alias_map = build_citation_catalog(paper_summaries)
+    entries, _alias_map = augment_citation_catalog_from_literature_map(entries, _alias_map, literature_map)
     cited_paper_ids = {cluster.paper_id for cluster in legacy_manifest.clusters}
     paper_entries: List[CitationPaperEntry] = []
     paper_statuses: List[Dict[str, Any]] = []

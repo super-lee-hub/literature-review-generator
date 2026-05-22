@@ -301,3 +301,63 @@ def test_bibliography_cited_only():
     # 验证 bibliography 只包含被引用的论文
     assert len(manifest.bibliography) == 1
     assert manifest.bibliography[0].paper_id == 'test_paper_1'
+
+
+def test_manifest_resolves_literature_map_source_alias():
+    review_draft_v2 = {
+        'content': {
+            'sections': [
+                {
+                    'section_number': 1,
+                    'section_title': 'Introduction',
+                    'blocks': [
+                        {
+                            'block_id': 's1_b1',
+                            'block_order': 1,
+                            'text': 'Fairness is central [[cite:source:hash:paper_artifact:21]].',
+                            'citations': [
+                                {
+                                    'citation_token': '[[cite:source:hash:paper_artifact:21]]',
+                                    'paper_key': 'source:hash:paper_artifact:21',
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    paper_summaries = [
+        {
+            'paper_info': {
+                'title': 'Fair Pricing and Its Impact',
+                'authors': ['Alice Smith'],
+                'year': '2024',
+                'doi': '10.1016/j.jbusres.2024.01.001',
+            }
+        }
+    ]
+    literature_map = {
+        'paper_nodes': [
+            {
+                'paper_key': 'source:hash:paper_artifact:21',
+                'title': 'Fair Pricing and Its Impact',
+                'aliases': ['source:hash:paper_artifact:21'],
+            }
+        ]
+    }
+
+    manifest = build_citation_manifest_v2_from_review_draft(
+        job_id='test_job',
+        project_name='test_project',
+        manifest_id='test_manifest',
+        review_draft_path='test_draft.json',
+        review_word_path='test_review.docx',
+        review_draft_v2=review_draft_v2,
+        paper_summaries=paper_summaries,
+        allow_legacy_regex=False,
+        literature_map=literature_map,
+    )
+
+    assert manifest.occurrences[0].paper_id != 'unknown'
+    assert manifest.occurrences[0].paper_id == manifest.clusters[0].paper_id

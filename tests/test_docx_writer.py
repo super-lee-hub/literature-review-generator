@@ -3,7 +3,7 @@
 
 import pytest
 
-from docx_writer import generate_apa_references_from_manifest
+from docx_writer import generate_apa_references_from_manifest, rebuild_review_docx_from_structured_artifacts
 
 
 class MockGenerator:
@@ -193,3 +193,30 @@ def test_manifest_not_available_raises_without_compat_flag():
     generator = MockGenerator()
     with pytest.raises(ValueError):
         generate_apa_references_from_manifest(None, generator)
+
+
+def test_rebuild_review_docx_raises_when_section_append_fails(tmp_path, monkeypatch):
+    generator = MockGenerator()
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Intro",
+                    "blocks": [{"text": "Claim [[cite:missing]]."}],
+                }
+            ]
+        }
+    }
+    manifest = {"paper_entries": [], "bibliography": []}
+
+    monkeypatch.setattr("docx_writer._initialize_review_document", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("docx_writer.append_section_to_word_document", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(ValueError, match="section append failed"):
+        rebuild_review_docx_from_structured_artifacts(
+            generator,
+            review_draft,
+            manifest,
+            str(tmp_path / "review.docx"),
+        )

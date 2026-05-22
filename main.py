@@ -756,6 +756,21 @@ class LiteratureReviewGenerator:
                 self.logger.warning(f"读取论文工件失败，已跳过 {path}: {exc}")
         return artifacts
 
+    def _load_literature_map_for_citation_resolution(self) -> Optional[Dict[str, Any]]:
+        """Load Outline v2 literature map as an alias source for citation tokens."""
+        if not self.job_workspace or not self.project_name:
+            return None
+        path = self.job_workspace.artifact_path(f"{self.project_name}_literature_map.json")
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else None
+        except Exception as exc:
+            self.logger.warning(f"读取 literature_map 以解析引用别名失败，已跳过 {path}: {exc}")
+            return None
+
     def adopt_outline(self) -> bool:
         """执行大纲采纳操作"""
         try:
@@ -1299,6 +1314,7 @@ class LiteratureReviewGenerator:
             review_word_path=review_word_path,
             review_draft_v2=review_draft_v2,
             paper_summaries=[dict(summary) for summary in self.summaries],
+            literature_map=self._load_literature_map_for_citation_resolution(),
         )
 
     def _persist_citation_manifest(
@@ -5240,25 +5256,44 @@ class LiteratureReviewGenerator:
 
             self.logger.success(f"生成最终章节提示词: {len(final_prompt)}字符")
 
-            # Call detailed API to get real finish_reason for continuation logic
-            result = _call_ai_api_text_detailed(
-                prompt=final_prompt,
-                api_config=writer_api_config,
-                system_prompt=system_prompt,
-                max_tokens=6000,
-                temperature=0.7,
-                logger=self.logger,
-            )
+            max_section_api_attempts = 3
+            last_message = "empty response"
+            for attempt in range(1, max_section_api_attempts + 1):
+                # Call detailed API to get real finish_reason for continuation logic
+                result = _call_ai_api_text_detailed(
+                    prompt=final_prompt,
+                    api_config=writer_api_config,
+                    system_prompt=system_prompt,
+                    max_tokens=6000,
+                    temperature=0.7,
+                    logger=self.logger,
+                )
 
-            content = result.get("content")
-            if content:
-                return {
-                    'content': content,
-                    'finish_reason': result.get('finish_reason', 'stop'),
-                }
-            else:
-                self.logger.error(f"章节内容生成失败: {result.get('message', 'unknown')}")
-                return None
+                content = result.get("content")
+                if isinstance(content, str) and content.strip():
+                    return {
+                        'content': content,
+                        'finish_reason': result.get('finish_reason', 'stop'),
+                    }
+
+                error_kind = str(result.get("error_kind") or "").strip()
+                last_message = (
+                    str(result.get("message") or "").strip()
+                    or error_kind
+                    or "empty response from Writer_API"
+                )
+                if error_kind in {"quota_exhausted", "fatal_config_or_auth"}:
+                    break
+                if attempt < max_section_api_attempts:
+                    wait_seconds = 2 * (2 ** (attempt - 1))
+                    self.logger.warning(
+                        f"章节内容生成返回空内容或失败: {last_message}；"
+                        f"{wait_seconds:.1f}秒后重试 ({attempt + 1}/{max_section_api_attempts})"
+                    )
+                    time.sleep(wait_seconds)
+
+            self.logger.error(f"章节内容生成失败: {last_message}")
+            return None
 
         except Exception as e:
             self.logger.error(f"调用优化章节API失败: {e}")
@@ -5356,16 +5391,13 @@ class LiteratureReviewGenerator:
             
             # 检查断点续传文件
             last_completed_section = 0
+            checkpoint_loaded = False
             if os.path.exists(review_checkpoint_file):
                 try:
                     with open(review_checkpoint_file, 'r', encoding='utf-8') as f:
                         checkpoint = json.load(f)
                         last_completed_section = checkpoint.get('last_completed_section', 0)
-                    
-                    if last_completed_section > 0:
-                        self.logger.info(f"[断点续传] 发现综述生成断点，将从第 {last_completed_section + 1} 章开始继续...")
-                    else:
-                        self.logger.info("[全新开始] 未发现有效断点，将从第1章开始生成")
+                        checkpoint_loaded = True
                 except Exception as e:
                     self.logger.warning(f"读取断点文件失败，将从头开始: {e}")
                     last_completed_section = 0
@@ -5374,10 +5406,17 @@ class LiteratureReviewGenerator:
 
             if last_completed_section > 0 and not os.path.exists(word_file):
                 self.logger.warning(
-                    "[断点续传] 发现综述断点，但未找到可恢复的综述文档；"
-                    "将从第1章重新生成，避免跳过已丢失的章节正文。"
+                    f"[断点续传] 发现综述断点 last_completed_section={last_completed_section}，"
+                    "但未找到可恢复的综述文档；本次实际起点为第1章，将重新生成，"
+                    "避免跳过已丢失的章节正文。"
                 )
                 last_completed_section = 0
+            elif last_completed_section > 0:
+                self.logger.info(
+                    f"[断点续传] 已确认可恢复综述文档，将从第 {last_completed_section + 1} 章继续。"
+                )
+            elif checkpoint_loaded:
+                self.logger.info("[全新开始] 未发现有效断点，将从第1章开始生成")
             
             # 洁净启动机制：全新任务时删除旧文件
             if last_completed_section == 0 and os.path.exists(word_file):
@@ -5520,7 +5559,7 @@ class LiteratureReviewGenerator:
                             "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         }
                     )
-                    continue
+                    break
                 
                 # 发送章节成功的进度
                 self._emit_progress(
@@ -5572,7 +5611,7 @@ class LiteratureReviewGenerator:
                                 "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             }
                         )
-                        continue
+                        break
 
                 review_sections_by_number[int(section_num)] = {
                     "section_number": int(section_num),

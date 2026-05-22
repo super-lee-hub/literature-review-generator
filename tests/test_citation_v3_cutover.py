@@ -96,6 +96,92 @@ def test_render_structured_citations_prefers_manifest_entries():
     assert "(Smith & Jones, 2024)" in rendered
 
 
+def test_render_structured_citations_resolves_decorated_doi_token():
+    generator = types.SimpleNamespace(summaries=[], logger=_DummyLogger(), config={})
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "10.1016/j.jbusres.2021.10.002",
+                "paper_key": "10.1016/j.jbusres.2021.10.002",
+                "title": "Price Fairness",
+                "authors": ["Alice Smith"],
+                "year": "2021",
+                "doi": "10.1016/j.jbusres.2021.10.002",
+                "aliases": ["10.1016/j.jbusres.2021.10.002"],
+            }
+        ]
+    }
+
+    rendered, unresolved = render_structured_citations(
+        "Evidence [[cite:10.1016/j.jbusres.2021.10.002 <http://doi.org/10.1016/j.jbusres.2021.10.002>|mode=parenthetical]].",
+        generator,
+        manifest,
+        allow_compat_fallback=False,
+    )
+
+    assert not unresolved
+    assert "(Smith, 2021)" in rendered
+
+
+def test_render_structured_citations_resolves_yearless_alias_from_year_token():
+    generator = types.SimpleNamespace(summaries=[], logger=_DummyLogger(), config={})
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "song-he-paper",
+                "paper_key": "song-he-paper",
+                "title": "AI Pricing",
+                "authors": ["Song Xiaobing", "He Xianan"],
+                "year": "",
+                "aliases": ["songhe"],
+            }
+        ]
+    }
+
+    rendered, unresolved = render_structured_citations(
+        "Evidence [[cite:songhe2023|mode=parenthetical]].",
+        generator,
+        manifest,
+        allow_compat_fallback=False,
+    )
+
+    assert not unresolved
+    assert "(Xiaobing & Xianan, n.d.)" in rendered
+
+
+def test_render_structured_citations_uses_resolved_occurrence_tokens():
+    generator = types.SimpleNamespace(summaries=[], logger=_DummyLogger(), config={})
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "paper-rikala",
+                "paper_key": "paper-rikala",
+                "title": "Existing customers reaction",
+                "authors": ["Veli-Matti Rikala"],
+                "year": "2025",
+                "aliases": ["paper-rikala", "Rikala_2025"],
+            }
+        ],
+        "occurrences": [
+            {
+                "citation_token": "[[cite:existing_customers_reaction_rikala_2025|mode=parenthetical]]",
+                "paper_id": "paper-rikala",
+                "paper_key": "paper-rikala",
+            }
+        ],
+    }
+
+    rendered, unresolved = render_structured_citations(
+        "Evidence [[cite:existing_customers_reaction_rikala_2025|mode=parenthetical]].",
+        generator,
+        manifest,
+        allow_compat_fallback=False,
+    )
+
+    assert not unresolved
+    assert "(Rikala, 2025)" in rendered
+
+
 def test_run_review_validation_report_only_does_not_apply_summary_repairs(monkeypatch):
     generator = types.SimpleNamespace(
         logger=_DummyLogger(),

@@ -13,20 +13,23 @@ from services.progress_state import ResumeStateReport
 
 
 class _DummyLogger:
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, str]] = []
+
     def info(self, *_args, **_kwargs):
-        pass
+        self.messages.append(("info", " ".join(str(arg) for arg in _args)))
 
     def warning(self, *_args, **_kwargs):
-        pass
+        self.messages.append(("warning", " ".join(str(arg) for arg in _args)))
 
     def error(self, *_args, **_kwargs):
-        pass
+        self.messages.append(("error", " ".join(str(arg) for arg in _args)))
 
     def success(self, *_args, **_kwargs):
-        pass
+        self.messages.append(("success", " ".join(str(arg) for arg in _args)))
 
     def debug(self, *_args, **_kwargs):
-        pass
+        self.messages.append(("debug", " ".join(str(arg) for arg in _args)))
 
 
 def _resume_report(workspace: JobWorkspace) -> ResumeStateReport:
@@ -167,6 +170,33 @@ def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Pa
         assert not any(item["artifact_type"] == "review_draft" for item in registry_payload["artifacts"])
 
 
+def test_stage2_stops_after_first_failed_section(tmp_path: Path, monkeypatch) -> None:
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-stop-on-failure")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+
+    outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section\n\n## 3. Third Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
+    generated_sections = []
+
+    def _section_content(section_title: str, _outline: str):
+        generated_sections.append(section_title)
+        if section_title == "Second Section":
+            return None
+        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
+
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
+
+    assert generator.generate_full_review_from_outline() is False
+
+    assert generated_sections == ["First Section", "Second Section"]
+    failed_sections_path = Path(workspace.report_path("demo_failed_review_sections.json"))
+    failed_payload = json.loads(failed_sections_path.read_text(encoding="utf-8"))
+    assert failed_payload["failed_sections"][0]["section_number"] == 2
+
+
 def test_stage2_retries_section_missing_structured_citations(tmp_path: Path, monkeypatch) -> None:
     generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-citation-retry")
     _stub_stage2_bootstrap(monkeypatch, generator)
@@ -207,6 +237,28 @@ def test_stage2_retries_section_missing_structured_citations(tmp_path: Path, mon
     assert draft_payload["content"]["sections"][0]["content"] == (
         "First Section generated content. [[cite:paper_a|mode=parenthetical]]"
     )
+
+
+def test_section_api_retries_empty_writer_response(tmp_path: Path, monkeypatch) -> None:
+    generator, _workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-empty-response-retry")
+    calls = []
+
+    def _fake_text_detailed(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {"content": "", "finish_reason": "stop", "message": ""}
+        return {"content": "Recovered section content.", "finish_reason": "stop", "message": ""}
+
+    monkeypatch.setattr(main, "_call_ai_api_text_detailed", _fake_text_detailed)
+    monkeypatch.setattr(main.time, "sleep", lambda _seconds: None)
+
+    result = generator._call_section_api_optimized(
+        "Section prompt",
+        {"api_key": "writer-key", "model": "writer-model", "api_base": "https://example.com/v1"},
+    )
+
+    assert result == {"content": "Recovered section content.", "finish_reason": "stop"}
+    assert len(calls) == 2
 
 
 def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_completion(
@@ -295,6 +347,10 @@ def test_review_draft_checkpoint_without_docx_restarts_from_first_section(
     assert generator.generate_full_review_from_outline() is True
 
     assert generated_sections == ["First Section", "Second Section"]
+    logger = cast(_DummyLogger, generator.logger)
+    log_text = "\n".join(message for _level, message in logger.messages)
+    assert "未找到可恢复的综述文档" in log_text
+    assert "将从第 2 章继续" not in log_text
     registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
     review_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "review_draft" and item["artifact_version"] == "v1"]
     artifact_payload = json.loads(Path(review_records[0]["path"]).read_text(encoding="utf-8"))
