@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 from outline.v2_config import OutlineV2Config
@@ -85,7 +86,17 @@ class OutlineRuntimeResolver:
             return None
 
         current_final_hash = compute_content_hash(adopted.outline.to_dict())
-        if not adopted.source_final_outline_hash or adopted.source_final_outline_hash != current_final_hash:
+        source_hash_ok = adopted.source_final_outline_hash == current_final_hash
+        if not source_hash_ok and adopted.outline.adoption_status == "adopted":
+            source_projection = replace(
+                adopted.outline,
+                adoption_status="pending_user_adoption",
+            )
+            source_hash_ok = (
+                adopted.source_final_outline_hash
+                == compute_content_hash(source_projection.to_dict())
+            )
+        if not adopted.source_final_outline_hash or not source_hash_ok:
             return None
 
         # Verify hash identity if registry is available

@@ -32,6 +32,7 @@ from validation.repair_apply import (
     _compute_anchor_hash,
     run_repair_apply,
 )
+from services.repair_policy import is_auto_safe_proposal
 from validation.review_validator import (
     CitationValidationResult,
     ReviewValidationReport,
@@ -249,6 +250,7 @@ class TestApplyGuardResult:
         )
         assert result.can_apply is True
         assert result.version_guard_passed is True
+        assert result.auto_safe_guard_passed is True
     
     def test_guard_result_blocked(self):
         result = ApplyGuardResult(
@@ -504,6 +506,116 @@ class TestApplyGuards:
         assert result.can_apply is False
         assert result.dependency_guard_passed is False
 
+    def test_base_guards_allow_text_mutating_review_proposal(self):
+        bundle = DependencyHashBundle(
+            summary_hash="",
+            paper_artifact_hash="",
+            visual_manifest_hash="",
+            selected_visual_refs_hash="",
+        )
+        target = PatchTargetSignature(
+            block_id="s1_b1",
+            anchor_text="Text...",
+            anchor_hash=_compute_anchor_hash("Original claim"),
+        )
+        proposal = PatchProposal(
+            proposal_id="prop-review",
+            citation_id="cite-001",
+            root_cause=RepairRootCause.REVIEW_DRIFT,
+            granularity=PatchGranularity.SPAN,
+            target=target,
+            original_text="Original claim",
+            proposed_text="Narrowed claim",
+            confidence=0.9,
+            fix_strategy="block_span_patch",
+            dependency_bundle=bundle,
+            metadata={"paper_id": "paper-1"},
+        )
+        review_draft = {
+            "artifact_type": "review_draft",
+            "artifact_version": "v2",
+            "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": "Original claim"}]}]},
+        }
+        paper_artifacts = [
+            {
+                "paper_identity": {"canonical_paper_key": "paper-1"},
+                "analysis": {"ai_summary": {}},
+                "stage1_inputs": {"selected_visual_refs": []},
+            }
+        ]
+
+        result = check_apply_guards(proposal, review_draft, paper_artifacts)
+
+        assert result.can_apply is True
+        assert result.auto_safe_guard_passed is True
+
+    def test_auto_safe_guard_blocks_text_mutating_review_proposal(self):
+        bundle = DependencyHashBundle(
+            summary_hash="",
+            paper_artifact_hash="",
+            visual_manifest_hash="",
+            selected_visual_refs_hash="",
+        )
+        target = PatchTargetSignature(
+            block_id="s1_b1",
+            anchor_text="Text...",
+            anchor_hash=_compute_anchor_hash("Original claim"),
+        )
+        proposal = PatchProposal(
+            proposal_id="prop-review",
+            citation_id="cite-001",
+            root_cause=RepairRootCause.REVIEW_DRIFT,
+            granularity=PatchGranularity.SPAN,
+            target=target,
+            original_text="Original claim",
+            proposed_text="Narrowed claim",
+            confidence=0.9,
+            fix_strategy="block_span_patch",
+            dependency_bundle=bundle,
+            metadata={"paper_id": "paper-1"},
+        )
+        review_draft = {
+            "artifact_type": "review_draft",
+            "artifact_version": "v2",
+            "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": "Original claim"}]}]},
+        }
+        paper_artifacts = [
+            {
+                "paper_identity": {"canonical_paper_key": "paper-1"},
+                "analysis": {"ai_summary": {}},
+                "stage1_inputs": {"selected_visual_refs": []},
+            }
+        ]
+
+        result = check_apply_guards(proposal, review_draft, paper_artifacts, require_auto_safe=True)
+
+        assert result.can_apply is False
+        assert result.auto_safe_guard_passed is False
+        assert "auto_safe structural apply" in " ".join(result.block_reasons)
+
+    def test_structural_only_mapping_proposal_is_auto_safe_eligible(self):
+        bundle = DependencyHashBundle(
+            summary_hash="",
+            paper_artifact_hash="",
+            visual_manifest_hash="",
+            selected_visual_refs_hash="",
+        )
+        proposal = PatchProposal(
+            proposal_id="prop-mapping",
+            citation_id="cite-001",
+            root_cause=RepairRootCause.CITATION_MAPPING_ERROR,
+            granularity=PatchGranularity.SPAN,
+            target=PatchTargetSignature(block_id="s1_b1", anchor_text="Text...", anchor_hash="hash"),
+            original_text="Original claim",
+            proposed_text="Original claim",
+            confidence=0.8,
+            fix_strategy="manifest_fix_rerender",
+            dependency_bundle=bundle,
+            metadata={"structural_only": True},
+        )
+
+        assert is_auto_safe_proposal(proposal) is True
+
 
 class TestBlockSpanOnlyBehavior:
     """Test that patches are block/span only (no whole-section rewrite)."""
@@ -618,6 +730,78 @@ class TestRunRepairPlanning:
 
 class TestRunRepairApply:
     """Test run_repair_apply entry point."""
+
+    def test_auto_safe_structural_apply_does_not_change_review_text(self):
+        block_text = "Original claim with citation."
+        proposal = PatchProposal(
+            proposal_id="prop-structural",
+            citation_id="bundle-1",
+            root_cause=RepairRootCause.CITATION_MAPPING_ERROR,
+            granularity=PatchGranularity.SPAN,
+            target=PatchTargetSignature(
+                block_id="s1_b1",
+                anchor_text="Original claim...",
+                anchor_hash=_compute_anchor_hash(block_text),
+            ),
+            original_text=block_text,
+            proposed_text=block_text,
+            confidence=0.8,
+            fix_strategy="manifest_fix_rerender",
+            dependency_bundle=DependencyHashBundle(
+                summary_hash="",
+                paper_artifact_hash="",
+                visual_manifest_hash="",
+                selected_visual_refs_hash="",
+            ),
+            metadata={"structural_only": True, "citation_set_key": "paper-1", "paper_ids": ["paper-1"]},
+        )
+        plan = RepairPlan(
+            plan_id="plan-structural",
+            created_at=datetime.now().isoformat(),
+            created_from_job_id="job-001",
+            validation_report_id="val-001",
+            proposals=[proposal],
+            policy=RepairPolicy.AUTO_APPLY_SAFE,
+        )
+        review_draft = {
+            "artifact_type": "review_draft",
+            "artifact_version": "v2",
+            "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": block_text}]}]},
+        }
+        citation_manifest = {
+            "citation_sets": [
+                {
+                    "bundle_id": "bundle-1",
+                    "citation_set_key": "paper-1",
+                    "paper_ids": ["paper-1"],
+                }
+            ]
+        }
+
+        result = run_repair_apply(
+            repair_plan=plan,
+            review_draft=review_draft,
+            citation_manifest=citation_manifest,
+            paper_artifacts=[
+                {
+                    "paper_identity": {"canonical_paper_key": "paper-1"},
+                    "analysis": {"ai_summary": {}},
+                    "stage1_inputs": {"selected_visual_refs": []},
+                }
+            ],
+            job_id="job-001",
+            require_auto_safe=True,
+        )
+
+        assert result["apply_result"]["applied_count"] == 1
+        assert result["patched_review_draft"]["content"]["sections"][0]["blocks"][0]["text"] == block_text
+        patched_annotations = result["patched_citation_manifest"]["citation_sets"][0]["repair_annotations"]
+        assert patched_annotations[0]["proposal_id"] == "prop-structural"
+        assert result["applied_records"][0]["original_text"] == block_text
+        assert result["applied_records"][0]["applied_text"] == block_text
+        annotations = citation_manifest["citation_sets"][0]["repair_annotations"]
+        assert annotations[0]["proposal_id"] == "prop-structural"
+        assert annotations[0]["structural_only"] is True
     
     def test_dry_run_checks_guards(self):
         """Test that dry run checks guards without applying."""
@@ -639,10 +823,11 @@ class TestRunRepairApply:
             granularity=PatchGranularity.SPAN,
             target=target,
             original_text="Original",
-            proposed_text="Proposed",
+            proposed_text="Original",
             confidence=0.8,
             fix_strategy="manifest_fix",
             dependency_bundle=bundle,
+            metadata={"structural_only": True},
         )
         plan = RepairPlan(
             plan_id="plan-001",

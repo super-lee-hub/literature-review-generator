@@ -82,6 +82,20 @@ def test_removed_queue_flags_are_unknown_arguments() -> None:
     assert "--queue-list" in result.stdout
 
 
+def test_outline_alias_routes_to_generate_outline() -> None:
+    result = subprocess.run(
+        [sys.executable, str(Path(main.__file__).resolve()), "--outline", "--help"],
+        cwd=Path(main.__file__).resolve().parent,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "--generate-outline, -o, --outline" in result.stdout
+
+
 def test_dispatch_command_has_no_public_queue_route() -> None:
     dispatch_source = inspect.getsource(main.dispatch_command)
 

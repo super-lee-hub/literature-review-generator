@@ -4,10 +4,12 @@ Tests repair integration with ArtifactRegistry, persistence, and workflow wiring
 """
 
 import json
+import hashlib
 import os
 import tempfile
 import pytest
 from datetime import datetime
+from pathlib import Path
 
 from services.job_workspace import JobWorkspace
 from services.artifact_registry import ArtifactRegistry
@@ -429,7 +431,7 @@ class TestRepairPipelineIntegration:
             assert "message" in result  # Should have report-only message
     
     def test_repair_pipeline_auto_apply(self):
-        """Test repair pipeline with auto_apply=True."""
+        """Test auto_safe does not apply text-mutating generated proposals."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
@@ -499,9 +501,179 @@ class TestRepairPipelineIntegration:
             
             assert result["repair_pipeline"] is True
             assert result["policy"] == "auto_apply_safe"
+            assert result["repair_policy"] == "auto_safe"
+            assert result["applied"] is False
+            assert result["auto_safe_eligible_count"] == 0
+            assert "apply_result_path" not in result
+
+    def test_repair_pipeline_manual_confirm_marks_candidates(self):
+        """manual_confirm is report-only with explicit confirmation metadata."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = JobWorkspace(tmpdir, "test_project", "job-001")
+            registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+
+            citation_result = CitationValidationResult(
+                citation_id="cite-001",
+                paper_id="paper-001",
+                conclusion=ValidationConclusion.WRONG_SOURCE,
+                root_causes=[RootCause.CITATION_MAPPING_ERROR],
+                evidence_candidates=[],
+                details={"block_id": "s1_b1"},
+                claim_text="Test claim",
+                claim_context="Test context",
+                evidence_excerpt_list=[],
+                reasoning_summary="Test reasoning",
+                repair_hint="Test repair hint",
+            )
+            validation_report = ReviewValidationReport(
+                report_id="val-001",
+                created_at=datetime.now().isoformat(),
+                total_citations=1,
+                supported_count=0,
+                partial_support_count=0,
+                unsupported_count=0,
+                wrong_source_count=1,
+                needs_review_count=0,
+                citation_results=[citation_result],
+            )
+            review_draft = {
+                "artifact_type": "review_draft",
+                "artifact_version": "v1",
+                "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": "Test paragraph."}]}]},
+            }
+            citation_manifest = {"citations": [{"citation_id": "cite-001", "paper_id": "paper-001"}]}
+            paper_artifact = {
+                "paper_identity": {"canonical_paper_key": "paper-001"},
+                "analysis": {"ai_summary": {}},
+                "stage1_inputs": {"selected_visual_refs": []},
+            }
+
+            result = run_repair_pipeline(
+                validation_report=validation_report,
+                review_draft=review_draft,
+                citation_manifest=citation_manifest,
+                paper_artifacts=[paper_artifact],
+                job_id="job-001",
+                workspace=workspace,
+                registry=registry,
+                repair_policy="manual_confirm",
+            )
+
+            assert result["repair_policy"] == "manual_confirm"
+            assert result["requires_manual_confirmation"] is True
+            assert result["eligible_for_manual_apply"] is True
+            assert result["applied"] is False
+
+    def test_auto_safe_persists_patched_manifest_annotations(self, monkeypatch):
+        """Auto-safe manifest-only repairs must survive downstream persistence."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = JobWorkspace(tmpdir, "test_project", "job-001")
+            registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            block_text = "Test paragraph with citation."
+            citation_manifest = {
+                "artifact_type": "citation_manifest",
+                "artifact_version": "v3",
+                "citation_sets": [
+                    {
+                        "bundle_id": "bundle-1",
+                        "citation_set_key": "paper-001",
+                        "paper_ids": ["paper-001"],
+                    }
+                ],
+            }
+            proposal = PatchProposal(
+                proposal_id="prop-structural",
+                citation_id="bundle-1",
+                root_cause=RepairRootCause.CITATION_MAPPING_ERROR,
+                granularity=PatchGranularity.SPAN,
+                target=PatchTargetSignature(
+                    block_id="s1_b1",
+                    anchor_text=block_text,
+                    anchor_hash=hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8],
+                ),
+                original_text=block_text,
+                proposed_text=block_text,
+                confidence=0.9,
+                fix_strategy="manifest_fix_rerender",
+                dependency_bundle=DependencyHashBundle("", "", "", ""),
+                metadata={
+                    "structural_only": True,
+                    "citation_set_key": "paper-001",
+                    "validation_bundle_id": "bundle-1",
+                    "paper_ids": ["paper-001"],
+                },
+            )
+            plan = RepairPlan(
+                plan_id="plan-structural",
+                created_at=datetime.now().isoformat(),
+                created_from_job_id="job-001",
+                validation_report_id="val-001",
+                proposals=[proposal],
+                policy=RepairPolicy.AUTO_APPLY_SAFE,
+            )
+            report = RepairReport(
+                report_id="report-structural",
+                created_at=datetime.now().isoformat(),
+                created_from_job_id="job-001",
+                plan_id=plan.plan_id,
+                apply_result_id=None,
+                summary={},
+                proposals_detail=[],
+            )
+
+            class StubPlanner:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def create_plan(self, policy):
+                    return plan
+
+                def create_report(self, repair_plan):
+                    return report
+
+            monkeypatch.setattr("validation.repair_planner.RepairPlanner", StubPlanner)
+            monkeypatch.setattr("docx_writer.create_word_document", lambda *a, **k: None)
+            monkeypatch.setattr("docx_writer.generate_apa_references_from_manifest", lambda *a, **k: [])
+            monkeypatch.setattr("validator.run_review_validation", lambda _generator: {"success": True})
+
+            validation_report = ReviewValidationReport(
+                report_id="val-001",
+                created_at=datetime.now().isoformat(),
+                total_citations=1,
+                supported_count=0,
+                partial_support_count=0,
+                unsupported_count=0,
+                wrong_source_count=1,
+                needs_review_count=0,
+                citation_results=[],
+            )
+            review_draft = {
+                "artifact_type": "review_draft",
+                "artifact_version": "v2",
+                "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": block_text}]}]},
+            }
+            paper_artifact = {
+                "paper_identity": {"canonical_paper_key": "paper-001"},
+                "analysis": {"ai_summary": {}},
+                "stage1_inputs": {"selected_visual_refs": []},
+            }
+
+            result = run_repair_pipeline(
+                validation_report=validation_report,
+                review_draft=review_draft,
+                citation_manifest=citation_manifest,
+                paper_artifacts=[paper_artifact],
+                job_id="job-001",
+                workspace=workspace,
+                registry=registry,
+                repair_policy="auto_safe",
+            )
+
             assert result["applied"] is True
-            assert "apply_result_path" in result
-            assert "patched_review_draft" in result
+            persisted = json.loads(Path(result["patched_citation_manifest_path"]).read_text(encoding="utf-8"))
+            annotations = persisted["citation_sets"][0]["repair_annotations"]
+            assert annotations[0]["proposal_id"] == "prop-structural"
+            assert result["patched_citation_manifest"]["citation_sets"][0]["repair_annotations"][0]["structural_only"] is True
 
 
 class TestRepairArtifactsDurability:

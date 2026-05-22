@@ -1189,7 +1189,7 @@ class WorkspaceController:
                 "pdf_folder": "",
                 "summary_file": "",
                 "summary_sources": "",
-                "reuse_stage1": False,
+                "reuse_stage1": True,
                 "reuse_summary_files": "",
                 "concept": "",
                 "free_mode_idea": "",
@@ -1397,11 +1397,13 @@ class WorkspaceController:
             if section_number_raw.isdigit() and int(section_number_raw) > 0:
                 generate_section = int(section_number_raw)
 
+        stage1_reuse_actions = {"analyze", "run_all"}
+        reuse_stage1_enabled = bool(workflow_state.get("reuse_stage1")) and action in stage1_reuse_actions
         reuse_summary_files = [
             item.strip()
             for item in str(workflow_state.get("reuse_summary_files") or "").splitlines()
             if item.strip()
-        ]
+        ] if reuse_stage1_enabled else []
         summary_sources = [
             item.strip()
             for item in str(workflow_state.get("summary_sources") or "").splitlines()
@@ -1428,7 +1430,7 @@ class WorkspaceController:
             "free_mode_idea": free_mode_idea,
             "summary_file": str(workflow_state.get("summary_file") or "").strip() or None,
             "summary_sources": summary_sources,
-            "reuse_stage1": bool(workflow_state.get("reuse_stage1")),
+            "reuse_stage1": reuse_stage1_enabled,
             "reuse_summary_files": reuse_summary_files,
             "queue_file": str(Path(self.state["paths"]["output_path"]) / "_queue" / "queue.json"),
             "source_mode": "zotero" if effective_zotero_report else "direct",
@@ -2793,13 +2795,13 @@ def _render_workflow_actions_card(controller: WorkspaceController) -> None:
 
 def _render_workflow_summary_reuse_card(controller: WorkspaceController) -> None:
     t = controller.t
-    with ui.expansion(t("高级：复用已有摘要（一般可跳过）"), icon="tune").classes("w-full"):
+    with ui.expansion(t("高级：外部摘要文件（一般可跳过）"), icon="tune").classes("w-full"):
         with ui.card().classes("ag-card p-5 w-full q-mt-sm"):
-            ui.label(t("当你要从已有 summaries.json 继续生成大纲/正文，或想给阶段一提供额外复用池时，再展开这里。")).classes("ag-subtle")
+            ui.label(t("历史阶段一摘要会自动扫描复用。这里只用于跳过阶段一、直接用已有 summaries.json 生成大纲/正文，或补充 output_path 之外的复用池。")).classes("ag-subtle")
             with ui.column().classes("gap-3 q-mt-md"):
                 _render_path_field(
                     controller,
-                    label=t("Summary file"),
+                    label=t("Use existing summaries.json for outline/review"),
                     section="workflow",
                     key="summary_file",
                     pick="file",
@@ -2807,11 +2809,11 @@ def _render_workflow_summary_reuse_card(controller: WorkspaceController) -> None
                     filetypes=[("Summary Files", "*.json"), ("All Files", "*.*")],
                 )
                 ui.textarea(
-                    t("Additional downstream summary sources (one path per line)"),
+                    t("Additional outline/review summary sources (one path per line)"),
                     value=controller.state["workflow"]["summary_sources"],
                 ).bind_value(controller.state["workflow"], "summary_sources").props("outlined autogrow").classes("w-full")
                 ui.textarea(
-                    t("Additional stage-1 reuse summary files outside output_path (one path per line)"),
+                    t("Extra stage-1 reuse pools outside output_path (one path per line)"),
                     value=controller.state["workflow"]["reuse_summary_files"],
                 ).bind_value(controller.state["workflow"], "reuse_summary_files").props("outlined autogrow").classes("w-full")
                 with ui.row().classes("gap-2 flex-wrap"):

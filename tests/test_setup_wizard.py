@@ -165,7 +165,7 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
 
     assert parser["Primary_Reader_API"]["model"] == "deepseek-r1"
     assert parser["Outline_API"]["model"] == "claude-writer"
-    assert parser["Outline_API"]["api_base"] == "https://api.videocaptioner.cn/v1"
+    assert parser["Outline_API"]["api_base"] == "https://aihubmix.com/v1"
     assert parser["Free_Mode_API"]["model"] == "planner-model"
     assert parser["Free_Mode_API"]["api_base"] == "http://localhost:11434"
     assert parser["Validator_API"]["model"] == "gpt-4o-mini"

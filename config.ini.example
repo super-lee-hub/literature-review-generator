@@ -31,10 +31,17 @@ output_path = ./output
 # 如需在配置文件中设置，请替换下面的占位符
 # 或者留空从 .env 文件读取
 api_key = YOUR_PRIMARY_READER_API_KEY_HERE
-model = Pro/moonshotai/Kimi-K2-Instruct-0905
-api_base = https://api.siliconflow.cn/v1
+model = deepseek-v4-pro
+api_base = https://api.deepseek.com
 # environment = follow HTTP_PROXY/HTTPS_PROXY/NO_PROXY; direct = bypass local proxy for this provider
 proxy_mode = environment
+endpoint_type = chat_completions
+provider_family = deepseek
+thinking = enabled
+reasoning_effort = max
+max_context_tokens = 1000000
+force_highest_reasoning = true
+omit_temperature_when_reasoning = true
 
 [Backup_Reader_API]
 # [建议] 备用阅读引擎 API 密钥 - 推荐通过 .env 文件设置
@@ -50,16 +57,28 @@ proxy_mode = environment
 # 如需在配置文件中设置，请替换下面的占位符
 # 或者留空从 .env 文件读取
 api_key = YOUR_WRITER_API_KEY_HERE
-model = gemini-2.5-pro
-api_base = https://api.videocaptioner.cn/v1
+model = gpt-5.5
+api_base = https://aihubmix.com/v1
 proxy_mode = environment
+endpoint_type = responses
+provider_family = aihubmix_openai
+reasoning_effort = high
+force_highest_reasoning = true
+text_verbosity = high
+max_output_tokens = 32000
+omit_temperature_when_reasoning = true
 
 [Outline_API]
 # [可选] 用于大纲生成的独立 API
 api_key = YOUR_OUTLINE_API_KEY_HERE
-model = gemini-2.5-pro
-api_base = https://api.videocaptioner.cn/v1
+model = claude-opus-4-7
+api_base = https://aihubmix.com/v1
 proxy_mode = environment
+endpoint_type = chat_completions
+provider_family = aihubmix_claude
+reasoning_effort = xhigh
+reasoning_display = summarized
+force_highest_reasoning = true
 
 [Free_Mode_API]
 # [可选] 用于自由模式前置对话规划的独立 API
@@ -107,9 +126,45 @@ enable_stage2_validation = true
 stage1_enabled = false
 stage2_enabled = true
 keep_checkpoints_after_completion = false
+# Repair defaults to report-only. Explicit unsafe AI rewrite is only enabled by
+# full_auto_experimental.
+# Options: report_only / manual_confirm / auto_safe / full_auto_experimental
+repair_policy = report_only
 # Optional override for review validation parallelism.
 # Leave commented to reuse [Performance].max_workers.
 # max_workers = 3
+
+[Outline]
+enable_outline_intelligence_v2 = false
+enable_literature_map = true
+enable_synthesis_flow = true
+candidate_count = 3
+enable_multi_model_critique = true
+enable_coverage_audit = true
+require_explicit_adopt = true
+allow_bibliometric_provider = false
+
+[OutlineModels]
+outline_model = Outline_API
+structure_critic_model = Writer_API
+coverage_critic_model = Primary_Reader_API
+arbitrator_model = Outline_API
+
+[OutlineCostControl]
+max_candidate_count = 3
+max_critique_models = 2
+max_summary_refs_per_prompt = 80
+max_outline_retry_count = 2
+
+[OutlineQualityGate]
+# full = require corpus-wide coverage; local = allow smaller local-scope runs.
+coverage_scope = full
+min_canonical_coverage_full = 0.50
+min_canonical_coverage_local = 0.25
+min_effective_sections = 3
+max_duplicate_assignments = 0
+block_placeholder_sections = true
+block_empty_research_streams = true
 
 [Retry_Settings]
 # 自动重试设置 - 当文献处理失败时的重试机制
@@ -193,12 +248,16 @@ font_size_heading2 = 14
 # 如需在配置文件中设置，请替换下面的占位符
 # 或者留空从 .env 文件读取
 api_key = YOUR_VALIDATOR_API_KEY_HERE
-model = gpt-4-turbo-preview
-api_base = https://api.openai.com/v1
+model = deepseek-v4-pro
+api_base = https://api.deepseek.com
 proxy_mode = environment
-# DeepSeek v4 / reasoning-compatible providers only. Leave blank for providers that do not support these.
-thinking =
-reasoning_effort =
+endpoint_type = chat_completions
+provider_family = deepseek
+thinking = enabled
+reasoning_effort = max
+max_context_tokens = 1000000
+force_highest_reasoning = true
+omit_temperature_when_reasoning = true
 
 [API_Parameters]
 # API调用参数配置 - 可根据您的模型和需求调整这些参数
@@ -219,11 +278,11 @@ concept_max_tokens = 4000
 concept_temperature = 0.3
 
 # 写作引擎参数（用于生成文献综述）
-writer_max_tokens = 8000
+writer_max_tokens = 32000
 writer_temperature = 0.5
 
 # 大纲引擎参数（用于大纲规划）
-outline_max_tokens = 6000
+outline_max_tokens = 16000
 outline_temperature = 0.4
 
 # 自由模式对话引擎参数（用于前置对话规划）

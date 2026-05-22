@@ -65,6 +65,18 @@ def test_default_allow_bibliometric_provider_is_false():
     assert view.outline_allow_bibliometric_provider() is False
 
 
+def test_default_outline_quality_gate_values():
+    cfg = _make_config()
+    view = CompatConfigView.from_config(cfg)
+    assert view.outline_quality_gate_coverage_scope() == "full"
+    assert view.outline_min_canonical_coverage_full() == 0.50
+    assert view.outline_min_canonical_coverage_local() == 0.25
+    assert view.outline_min_effective_sections() == 3
+    assert view.outline_max_duplicate_assignments() == 0
+    assert view.outline_block_placeholder_sections() is True
+    assert view.outline_block_empty_research_streams() is True
+
+
 def test_default_outline_models_are_correct():
     cfg = _make_config()
     view = CompatConfigView.from_config(cfg)

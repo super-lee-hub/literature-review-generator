@@ -167,6 +167,48 @@ def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Pa
         assert not any(item["artifact_type"] == "review_draft" for item in registry_payload["artifacts"])
 
 
+def test_stage2_retries_section_missing_structured_citations(tmp_path: Path, monkeypatch) -> None:
+    generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-citation-retry")
+    _stub_stage2_bootstrap(monkeypatch, generator)
+
+    outline_text = "# Demo Outline\n\n## 1. First Section"
+    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
+    outline_path.write_text(outline_text, encoding="utf-8")
+
+    retry_calls = []
+
+    def _retry_with_citation(section_prompt, writer_api_config, is_continuation=False, partial_content=""):
+        retry_calls.append(
+            {
+                "section_prompt": section_prompt,
+                "writer_api_config": writer_api_config,
+                "is_continuation": is_continuation,
+                "partial_content": partial_content,
+            }
+        )
+        return {"content": "First Section generated content. [[cite:paper_a|mode=parenthetical]]"}
+
+    monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
+    monkeypatch.setattr(
+        generator,
+        "generate_review_section_content",
+        lambda _section_title, _outline: "First Section generated content without structured citations.",
+    )
+    monkeypatch.setattr(generator, "_call_section_api_optimized", _retry_with_citation)
+    monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
+
+    assert generator.generate_full_review_from_outline() is True
+
+    assert len(retry_calls) == 1
+    assert retry_calls[0]["writer_api_config"]["model"] == "writer-model"
+    assert retry_calls[0]["is_continuation"] is False
+    draft_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v1.json"))
+    draft_payload = json.loads(draft_path.read_text(encoding="utf-8"))
+    assert draft_payload["content"]["sections"][0]["content"] == (
+        "First Section generated content. [[cite:paper_a|mode=parenthetical]]"
+    )
+
+
 def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_completion(
     tmp_path: Path,
     monkeypatch,

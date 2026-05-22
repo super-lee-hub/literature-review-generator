@@ -12,6 +12,15 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.artifact_registry import ArtifactRegistry
+from services.repair_policy import (
+    ValidationRepairPolicy,
+    auto_safe_apply_enabled,
+    is_auto_safe_proposal,
+    parse_repair_policy,
+    repair_policy_to_week4_policy,
+    requires_manual_confirmation,
+    unsafe_auto_rewrite_enabled,
+)
 from validation.repair_models import RepairPlan, RepairApplyResult, AppliedPatchRecord, RepairReport
 from validation.repair_apply import run_repair_apply
 from validation.review_validator import ReviewValidationReport
@@ -21,6 +30,7 @@ REPAIR_PLAN_ARTIFACT_TYPE = "repair_plan"
 REPAIR_REPORT_ARTIFACT_TYPE = "repair_report"
 REPAIR_APPLY_RESULT_ARTIFACT_TYPE = "repair_apply_result"
 APPLIED_PATCH_RECORD_ARTIFACT_TYPE = "applied_patch_record"
+CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
 
 
 def persist_repair_plan(
@@ -124,6 +134,36 @@ def persist_repair_apply_result(
     return result_path
 
 
+def persist_patched_citation_manifest(
+    citation_manifest: Dict[str, Any],
+    apply_result: RepairApplyResult,
+    workspace: JobWorkspace,
+    registry: ArtifactRegistry,
+    job_id: str,
+) -> str:
+    """Persist the manifest mutated by auto-safe structural repair."""
+    artifact_version = str(citation_manifest.get("artifact_version") or "v1")
+    manifest_path = workspace.artifact_path(f"citation_manifests/repaired_citation_manifest_{job_id}.json")
+
+    atomic_write_json(manifest_path, citation_manifest)
+
+    registry.register(
+        artifact_id=f"repaired_citation_manifest_{job_id}",
+        artifact_type=CITATION_MANIFEST_ARTIFACT_TYPE,
+        artifact_version=artifact_version,
+        path=manifest_path,
+        producer="services.repair_integration.persist_patched_citation_manifest",
+        job_id=job_id,
+        status="completed",
+        depends_on=[
+            {"artifact_id": f"repair_apply_result_{apply_result.plan_id}", "role": "repair_apply_result"},
+        ],
+        artifact_role="citation_manifest",
+    )
+
+    return manifest_path
+
+
 def run_repair_pipeline(
     validation_report: ReviewValidationReport,
     review_draft: Dict[str, Any],
@@ -134,6 +174,7 @@ def run_repair_pipeline(
     registry: ArtifactRegistry,
     visual_manifest: Optional[Dict[str, Any]] = None,
     auto_apply: bool = False,  # Default is report-first
+    repair_policy: str | ValidationRepairPolicy | None = None,
 ) -> Dict[str, Any]:
     """Run the full Week 4 repair pipeline.
     
@@ -147,9 +188,9 @@ def run_repair_pipeline(
     
     Default policy is report-first, not silent auto-apply.
     """
+    from dataclasses import replace
     from validation.repair_planner import RepairPlanner
-    from validation.repair_models import RepairPolicy
-    from services.citation_manifest import build_citation_manifest_v2_from_review_draft, unresolved_occurrences
+    from services.citation_manifest import unresolved_occurrences
     from docx_writer import create_word_document, generate_apa_references_from_manifest
     from validator import run_review_validation
     
@@ -173,7 +214,12 @@ def run_repair_pipeline(
         return result
     
     # Step 1: Create repair plan
-    policy = RepairPolicy.AUTO_APPLY_SAFE if auto_apply else RepairPolicy.REPORT_FIRST
+    external_policy = (
+        parse_repair_policy(repair_policy)
+        if repair_policy is not None
+        else (ValidationRepairPolicy.AUTO_SAFE if auto_apply else ValidationRepairPolicy.REPORT_ONLY)
+    )
+    policy = repair_policy_to_week4_policy(external_policy)
     planner = RepairPlanner(
         validation_report=validation_report,
         review_draft=review_draft,
@@ -182,34 +228,49 @@ def run_repair_pipeline(
         job_id=job_id,
     )
     repair_plan = planner.create_plan(policy=policy)
+    safe_proposals = [proposal for proposal in repair_plan.proposals if is_auto_safe_proposal(proposal)]
     
     # Step 2: Persist repair plan
     plan_path = persist_repair_plan(repair_plan, workspace, registry)
     
     # Create and persist repair report
     repair_report = planner.create_report(repair_plan)
+    repair_report.summary.update({
+        "external_repair_policy": external_policy.value,
+        "requires_manual_confirmation": requires_manual_confirmation(external_policy),
+        "eligible_for_manual_apply": requires_manual_confirmation(external_policy),
+        "unsafe_auto_rewrite_enabled": unsafe_auto_rewrite_enabled(external_policy),
+        "auto_safe_eligible_count": len(safe_proposals),
+    })
     report_path = persist_repair_report(repair_report, workspace, registry)
     
     result = {
         "repair_pipeline": True,
         "plan_id": repair_plan.plan_id,
         "policy": policy.value,
+        "repair_policy": external_policy.value,
+        "requires_manual_confirmation": requires_manual_confirmation(external_policy),
+        "eligible_for_manual_apply": requires_manual_confirmation(external_policy),
+        "unsafe_auto_rewrite_enabled": unsafe_auto_rewrite_enabled(external_policy),
         "plan_path": plan_path,
         "report_path": report_path,
         "proposals_count": len(repair_plan.proposals),
+        "auto_safe_eligible_count": len(safe_proposals),
         "applied": False,
     }
     
-    # Step 3: Apply repairs (only if auto_apply is True)
-    if auto_apply and repair_plan.proposals:
+    # Step 3: Apply repairs (only if explicitly allowed by policy)
+    if auto_safe_apply_enabled(external_policy) and safe_proposals:
+        apply_plan = replace(repair_plan, proposals=safe_proposals)
         apply_result = run_repair_apply(
-            repair_plan=repair_plan,
+            repair_plan=apply_plan,
             review_draft=review_draft,
             citation_manifest=citation_manifest,
             paper_artifacts=paper_artifacts,
             job_id=job_id,
             visual_manifest=visual_manifest,
             dry_run=False,
+            require_auto_safe=True,
         )
         
         # Step 4: Persist apply results
@@ -222,23 +283,22 @@ def run_repair_pipeline(
         result["applied"] = True
         result["apply_result_path"] = result_path
         result["patched_review_draft"] = apply_result.get("patched_review_draft")
+        result["patched_citation_manifest"] = apply_result.get("patched_citation_manifest")
         result["applied_count"] = apply_result_obj.applied_count
         result["rejected_count"] = apply_result_obj.rejected_count
         
-        # Step 5: Generate new review_draft, citation_manifest, and review docx
+        # Step 5: Persist repaired manifest and regenerate downstream artifacts.
         if apply_result.get("patched_review_draft"):
             patched_review_draft = apply_result["patched_review_draft"]
-            
-            # Generate new citation manifest from patched review draft
-            new_citation_manifest = build_citation_manifest_v2_from_review_draft(
-                job_id=job_id,
-                project_name="repair",
-                manifest_id=f"manifest_{job_id}",
-                review_draft_path="",
-                review_word_path="",
-                review_draft_v2=patched_review_draft,
-                paper_summaries=list(paper_artifacts)
+            patched_citation_manifest = apply_result.get("patched_citation_manifest") or citation_manifest
+            manifest_path = persist_patched_citation_manifest(
+                patched_citation_manifest,
+                apply_result_obj,
+                workspace,
+                registry,
+                job_id,
             )
+            result["patched_citation_manifest_path"] = manifest_path
             
             # Generate new review docx
             docx_path = workspace.artifact_path(f"review_{job_id}_repaired.docx")
@@ -313,7 +373,7 @@ def run_repair_pipeline(
             
             mock_generator = MockGenerator(workspace)
             generate_apa_references_from_manifest(
-                new_citation_manifest.to_dict(),
+                patched_citation_manifest,
                 mock_generator,
                 allow_compat_fallback=True,
             )
@@ -330,8 +390,10 @@ def run_repair_pipeline(
         # Report-only mode
         if not repair_plan.proposals:
             result["message"] = "No repair proposals generated (citation manifest is complete and validation passed)"
+        elif auto_safe_apply_enabled(external_policy):
+            result["message"] = "Repair plan created but no proposals were eligible for auto_safe structural apply."
         else:
-            result["message"] = "Repair plan created but not applied (report-first policy). Use auto_apply=True to apply repairs."
+            result["message"] = f"Repair plan created but not applied ({external_policy.value} policy)."
     
     return result
 

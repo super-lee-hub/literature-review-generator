@@ -296,6 +296,29 @@ def test_build_queue_job_spec_can_use_explicit_input_mode(gui_app_module) -> Non
     assert spec.parameters["free_mode_idea"] is None
 
 
+def test_stage1_reuse_defaults_to_analyze_only_actions(gui_app_module) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["workflow"]["reuse_summary_files"] = "D:/reuse/a.json"
+
+    analyze_spec = controller._build_queue_job_spec(
+        "demo",
+        "D:/papers",
+        "",
+        "analyze",
+    )
+    assert analyze_spec.parameters["reuse_stage1"] is True
+    assert analyze_spec.parameters["reuse_summary_files"] == ["D:/reuse/a.json"]
+
+    outline_spec = controller._build_queue_job_spec(
+        "demo",
+        "D:/papers",
+        "",
+        "outline",
+    )
+    assert outline_spec.parameters["reuse_stage1"] is False
+    assert outline_spec.parameters["reuse_summary_files"] == []
+
+
 def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module) -> None:
     controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
     controller.state["workflow"].update(
@@ -342,15 +365,15 @@ def test_build_queue_job_spec_captures_immutable_source_snapshot(gui_app_module)
         "library_path": None,
         "summary_file": "D:/summaries/a.json",
         "summary_sources": ["D:/summaries/b.json", "D:/summaries/c.json"],
-        "reuse_stage1": True,
-        "reuse_summary_files": ["D:/reuse/a.json"],
+        "reuse_stage1": False,
+        "reuse_summary_files": [],
         "concept": None,
         "free_mode_profile": "D:/profiles/original.json",
         "free_mode_idea": None,
         "generate_section": 3,
     }
     assert spec.parameters["summary_sources"] == ["D:/summaries/b.json", "D:/summaries/c.json"]
-    assert spec.parameters["reuse_summary_files"] == ["D:/reuse/a.json"]
+    assert spec.parameters["reuse_summary_files"] == []
 
 
 def test_schedule_queue_processor_keeps_single_background_task(gui_app_module, monkeypatch) -> None:

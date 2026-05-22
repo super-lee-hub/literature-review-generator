@@ -313,7 +313,12 @@ class TestAIIinterface:
         with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
             result = self.ai_interface._call_ai_api(
                 "test prompt",
-                {"api_key": "test_key", "model": "claude-opus-4-7", "api_base": "https://aihubmix.com/v1"},
+                {
+                    "api_key": "test_key",
+                    "model": "generic-model",
+                    "api_base": "https://example.com/v1",
+                    "provider_family": "generic",
+                },
                 "system prompt",
             )
 
@@ -321,6 +326,35 @@ class TestAIIinterface:
         assert mock_post.call_count == 2
         assert "temperature" in mock_post.call_args_list[0].kwargs["json"]
         assert "temperature" not in mock_post.call_args_list[1].kwargs["json"]
+
+    @patch('ai_interface.requests.post')
+    def test_claude_reasoning_omits_temperature_before_provider_retry(self, mock_post):
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "ok"}'}}]
+        }
+        mock_post.return_value = success_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "claude-opus-4-7",
+                    "api_base": "https://aihubmix.com/v1",
+                    "provider_family": "aihubmix_claude",
+                    "reasoning_effort": "max",
+                    "reasoning_display": "summarized",
+                },
+                "system prompt",
+            )
+
+        assert result == {"summary": "ok"}
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["reasoning"] == {"effort": "max", "display": "summarized"}
+        assert "temperature" not in payload
 
     @patch('ai_interface.requests.post')
     def test_call_ai_api_passes_reasoning_payload_params(self, mock_post):
@@ -349,6 +383,183 @@ class TestAIIinterface:
         assert result == {"summary": "ok"}
         assert payload["thinking"] == {"type": "enabled"}
         assert payload["reasoning_effort"] == "max"
+
+    @patch('ai_interface.requests.post')
+    def test_gpt_writer_uses_responses_reasoning_payload(self, mock_post):
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {"output_text": "plain review text", "status": "completed"}
+        mock_post.return_value = success_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "gpt-5.5",
+                    "api_base": "https://aihubmix.com/v1",
+                    "endpoint_type": "responses",
+                    "provider_family": "aihubmix_openai",
+                    "reasoning_effort": "high",
+                    "text_verbosity": "high",
+                    "max_output_tokens": "32000",
+                    "omit_temperature_when_reasoning": "true",
+                },
+                "system prompt",
+                response_format="text",
+            )
+
+        assert result == "plain review text"
+        assert mock_post.call_args.args[0] == "https://aihubmix.com/v1/responses"
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["reasoning"] == {"effort": "high"}
+        assert payload["text"] == {"verbosity": "high"}
+        assert payload["max_output_tokens"] == 32000
+        assert "temperature" not in payload
+        assert "top_p" not in payload
+
+    @patch('ai_interface.requests.post')
+    def test_responses_json_output_uses_existing_json_parser(self, mock_post):
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": '{"summary": "ok"}'}
+                    ],
+                }
+            ],
+            "status": "completed",
+        }
+        mock_post.return_value = success_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "gpt-5.5",
+                    "api_base": "https://aihubmix.com/v1",
+                    "endpoint_type": "responses",
+                    "provider_family": "aihubmix_openai",
+                    "reasoning_effort": "high",
+                    "text_verbosity": "high",
+                    "omit_temperature_when_reasoning": "true",
+                },
+                "system prompt",
+            )
+
+        assert result == {"summary": "ok"}
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["text"]["format"] == {"type": "json_object"}
+        assert payload["text"]["verbosity"] == "high"
+
+    @patch('ai_interface.requests.post')
+    def test_claude_outline_sends_top_level_reasoning_and_retries_without_display(self, mock_post):
+        error_response = Mock()
+        error_response.status_code = 400
+        error_response.json.return_value = {"error": {"message": "unsupported parameter: display"}}
+        error_response.raise_for_status.side_effect = HTTPError("HTTP 400")
+
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "ok"}'}, "finish_reason": "stop"}]
+        }
+        mock_post.side_effect = [error_response, success_response]
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "claude-opus-4-7",
+                    "api_base": "https://aihubmix.com/v1",
+                    "provider_family": "aihubmix_claude",
+                    "reasoning_effort": "xhigh",
+                    "reasoning_display": "summarized",
+                },
+                "system prompt",
+            )
+
+        assert result == {"summary": "ok"}
+        first_payload = mock_post.call_args_list[0].kwargs["json"]
+        second_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert first_payload["reasoning"] == {"effort": "xhigh", "display": "summarized"}
+        assert second_payload["reasoning"] == {"effort": "xhigh"}
+        assert "extra_body" not in first_payload
+
+    @patch('ai_interface.requests.post')
+    def test_claude_opus_47_can_send_max_reasoning_display(self, mock_post):
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "ok"}'}, "finish_reason": "stop"}]
+        }
+        mock_post.return_value = success_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "claude-opus-4-7",
+                    "api_base": "https://aihubmix.com/v1",
+                    "provider_family": "aihubmix_claude",
+                    "reasoning_effort": "max",
+                    "reasoning_display": "summarized",
+                    "max_tokens": "16000",
+                },
+                "system prompt",
+            )
+
+        assert result == {"summary": "ok"}
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["reasoning"] == {"effort": "max", "display": "summarized"}
+        assert payload["max_tokens"] == 16000
+        assert "thinking" not in payload
+        assert "output_config" not in payload
+
+    @patch('ai_interface.requests.post')
+    def test_deepseek_reasoning_effort_max_falls_back_to_high(self, mock_post):
+        error_response = Mock()
+        error_response.status_code = 400
+        error_response.json.return_value = {"error": {"message": "reasoning_effort max is not supported"}}
+        error_response.raise_for_status.side_effect = HTTPError("HTTP 400")
+
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "ok"}'}, "finish_reason": "stop"}]
+        }
+        mock_post.side_effect = [error_response, success_response]
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "deepseek-v4-pro",
+                    "api_base": "https://api.deepseek.com",
+                    "provider_family": "deepseek",
+                    "thinking": "enabled",
+                    "reasoning_effort": "max",
+                },
+                "system prompt",
+            )
+
+        assert result == {"summary": "ok"}
+        assert mock_post.call_args_list[0].kwargs["json"]["reasoning_effort"] == "max"
+        assert mock_post.call_args_list[1].kwargs["json"]["reasoning_effort"] == "high"
+        assert "temperature" not in mock_post.call_args_list[0].kwargs["json"]
+        assert "top_p" not in mock_post.call_args_list[0].kwargs["json"]
 
     @patch('ai_interface.requests.post')
     def test_call_ai_api_direct_proxy_mode_bypasses_environment_proxy(self, mock_post, monkeypatch):

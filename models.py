@@ -180,6 +180,16 @@ class APIConfig(TypedDict):
     proxy_mode: NotRequired[str]
     thinking: NotRequired[Any]
     reasoning_effort: NotRequired[str]
+    endpoint_type: NotRequired[str]
+    provider_family: NotRequired[str]
+    reasoning_display: NotRequired[str]
+    text_verbosity: NotRequired[str]
+    max_tokens: NotRequired[Any]
+    max_output_tokens: NotRequired[Any]
+    max_completion_tokens: NotRequired[Any]
+    max_context_tokens: NotRequired[Any]
+    force_highest_reasoning: NotRequired[Any]
+    omit_temperature_when_reasoning: NotRequired[Any]
 
 
 SummariesList = List[ProcessingResult]

@@ -1,4 +1,5 @@
-from services.model_selection import get_free_mode_api_config, get_outline_api_config
+from services.model_capabilities import resolve_model_capability
+from services.model_selection import get_free_mode_api_config, get_outline_api_config, get_writer_api_config
 
 
 def test_get_outline_api_config_falls_back_to_writer_when_outline_key_is_placeholder() -> None:
@@ -49,3 +50,50 @@ def test_get_free_mode_api_config_falls_back_to_outline_when_free_mode_key_is_pl
         "api_base": "https://outline.example.com/v1",
         "proxy_mode": "environment",
     }
+
+
+def test_api_config_preserves_reasoning_transport_fields() -> None:
+    config = {
+        "Writer_API": {
+            "api_key": "writer-key",
+            "model": "gpt-5.5",
+            "api_base": "https://aihubmix.com/v1",
+            "proxy_mode": "environment",
+            "endpoint_type": "responses",
+            "provider_family": "aihubmix_openai",
+            "reasoning_effort": "high",
+            "text_verbosity": "high",
+            "max_output_tokens": "32000",
+            "force_highest_reasoning": "true",
+            "omit_temperature_when_reasoning": "true",
+        },
+    }
+
+    api_config = get_writer_api_config(config)
+
+    assert api_config["endpoint_type"] == "responses"
+    assert api_config["provider_family"] == "aihubmix_openai"
+    assert api_config["reasoning_effort"] == "high"
+    assert api_config["text_verbosity"] == "high"
+    assert api_config["max_output_tokens"] == "32000"
+    assert api_config["force_highest_reasoning"] == "true"
+    assert api_config["omit_temperature_when_reasoning"] == "true"
+
+
+def test_legacy_config_without_endpoint_type_stays_on_chat_completions() -> None:
+    api_config = get_writer_api_config(
+        {
+            "Writer_API": {
+                "api_key": "writer-key",
+                "model": "gpt-5.5",
+                "api_base": "https://aihubmix.com/v1",
+            }
+        }
+    )
+
+    capability = resolve_model_capability(api_config)
+
+    assert "endpoint_type" not in api_config
+    assert capability.endpoint_type == "chat_completions"
+    assert capability.provider_family == "aihubmix_openai"
+    assert capability.reasoning_param_style == "none"

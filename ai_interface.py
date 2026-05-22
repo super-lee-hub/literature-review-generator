@@ -1,4 +1,5 @@
 import base64
+import copy
 import json
 import mimetypes
 import time
@@ -9,6 +10,12 @@ from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set
 
 from models import APIConfig
 from config_loader import load_config
+from services.model_capabilities import (
+    ModelCapability,
+    apply_reasoning_policy,
+    remove_payload_path,
+    resolve_model_capability,
+)
 from services.proxy_policy import should_bypass_environment_proxy
 from summary_schema import (
     default_ai_summary,
@@ -168,6 +175,15 @@ def _is_payload_parameter_error(parameter_name: str, *parts: Any) -> bool:
     return parameter_name.casefold() in text and any(marker in text for marker in _PAYLOAD_PARAMETER_ERROR_MARKERS)
 
 
+def _is_payload_value_error(parameter_name: str, parameter_value: str, *parts: Any) -> bool:
+    text = " ".join(str(part or "") for part in parts).casefold()
+    return (
+        parameter_name.casefold() in text
+        and parameter_value.casefold() in text
+        and any(marker in text for marker in _PAYLOAD_PARAMETER_ERROR_MARKERS)
+    )
+
+
 def _normalize_thinking_payload(value: Any) -> Optional[Dict[str, str]]:
     if isinstance(value, dict):
         thinking_type = str(value.get("type") or "").strip().lower()
@@ -202,6 +218,208 @@ def _apply_optional_api_payload_params(payload: Dict[str, Any], api_config: APIC
         payload["thinking"] = thinking_payload
     elif api_config.get("thinking") not in (None, "") and logger:
         logger.warning("Ignoring invalid API thinking config; expected enabled/disabled or {'type': ...}.")
+
+
+def _config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
+
+def _configured_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _extract_response_output_text(response_data: Dict[str, Any]) -> str:
+    output_text = response_data.get("output_text")
+    if isinstance(output_text, str):
+        return output_text
+
+    chunks: List[str] = []
+    output_items = response_data.get("output")
+    if isinstance(output_items, list):
+        for output_item in output_items:
+            if not isinstance(output_item, dict):
+                continue
+            content_items = output_item.get("content")
+            if not isinstance(content_items, list):
+                continue
+            for content_item in content_items:
+                if not isinstance(content_item, dict):
+                    continue
+                text = content_item.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+                    continue
+                output_text_part = content_item.get("output_text")
+                if isinstance(output_text_part, str):
+                    chunks.append(output_text_part)
+    return "".join(chunks)
+
+
+def _responses_finish_reason(response_data: Dict[str, Any]) -> str:
+    status = str(response_data.get("status") or "").strip()
+    if status == "completed":
+        return "stop"
+    if status:
+        return status
+    return "stop"
+
+
+def _convert_chat_content_to_responses_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if not isinstance(content, list):
+        return [{"type": "input_text", "text": str(content or "")}]
+
+    converted: List[Dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type == "text":
+            converted.append({"type": "input_text", "text": str(item.get("text") or "")})
+            continue
+        if item_type == "image_url":
+            image_url = item.get("image_url")
+            if isinstance(image_url, dict):
+                url = str(image_url.get("url") or "").strip()
+            else:
+                url = str(image_url or "").strip()
+            if url:
+                converted.append({"type": "input_image", "image_url": url})
+            continue
+        if item_type == "input_text":
+            converted.append({"type": "input_text", "text": str(item.get("text") or "")})
+            continue
+        if item_type == "input_image":
+            image_url = str(item.get("image_url") or item.get("url") or "").strip()
+            if image_url:
+                converted.append({"type": "input_image", "image_url": image_url})
+    return converted or [{"type": "input_text", "text": ""}]
+
+
+def build_chat_completions_payload(
+    prompt: str,
+    api_config: APIConfig,
+    system_prompt: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    response_format: str,
+    user_content: Any = None,
+    logger: Any = None,
+    capability: Optional[ModelCapability] = None,
+) -> Dict[str, Any]:
+    capability = capability or resolve_model_capability(api_config)
+    normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
+    token_limit = _configured_positive_int(api_config.get("max_completion_tokens"), max_tokens)
+    token_limit = _configured_positive_int(api_config.get("max_tokens"), token_limit)
+    payload: Dict[str, Any] = {
+        "model": api_config.get("model") or "",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": normalized_user_content},
+        ],
+        "temperature": temperature,
+        "max_tokens": token_limit,
+    }
+    if response_format == "json":
+        payload["response_format"] = {"type": "json_object"}
+    apply_reasoning_policy(payload, api_config, capability, logger=logger)
+    return payload
+
+
+def build_responses_payload(
+    prompt: str,
+    api_config: APIConfig,
+    system_prompt: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    response_format: str,
+    user_content: Any = None,
+    logger: Any = None,
+    capability: Optional[ModelCapability] = None,
+) -> Dict[str, Any]:
+    capability = capability or resolve_model_capability(api_config)
+    normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
+    max_output_tokens = _configured_positive_int(api_config.get("max_output_tokens"), max_tokens)
+    payload: Dict[str, Any] = {
+        "model": api_config.get("model") or "",
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": _convert_chat_content_to_responses_content(normalized_user_content),
+            },
+        ],
+        "max_output_tokens": max_output_tokens,
+    }
+    if not _config_bool(api_config.get("omit_temperature_when_reasoning")):
+        payload["temperature"] = temperature
+    if response_format == "json":
+        payload["text"] = {"format": {"type": "json_object"}}
+    apply_reasoning_policy(payload, api_config, capability, logger=logger)
+    return payload
+
+
+def parse_chat_completions_response(response_data: Dict[str, Any]) -> Tuple[str, str]:
+    content = response_data["choices"][0]["message"]["content"]
+    finish_reason = response_data["choices"][0].get("finish_reason", "stop")
+    return content, finish_reason
+
+
+def parse_responses_response(response_data: Dict[str, Any]) -> Tuple[str, str]:
+    return _extract_response_output_text(response_data), _responses_finish_reason(response_data)
+
+
+def _format_success_result(content: Any, response_format: str, response: Any, finish_reason: str, logger: Any = None) -> Dict[str, Any]:
+    if response_format == "json":
+        parsed_content = _smart_json_parser(str(content or ""))
+        if parsed_content is not None:
+            return _api_result(
+                status="success",
+                content=parsed_content,
+                http_status=getattr(response, "status_code", None),
+                finish_reason=finish_reason,
+            )
+
+        corrected_content = _auto_correct_json(str(content or ""))
+        if corrected_content is not None:
+            if logger:
+                logger.info("通过自动纠错成功修复JSON")
+            return _api_result(
+                status="success",
+                content=corrected_content,
+                http_status=getattr(response, "status_code", None),
+                finish_reason=finish_reason,
+            )
+
+        message = "200 response but JSON content is empty or malformed"
+        if logger:
+            logger.error(message)
+            logger.debug(f"AI返回内容: {str(content)[:500]}...")
+        return _api_result(
+            status="failed",
+            error_kind="invalid_response",
+            http_status=getattr(response, "status_code", None),
+            message=message,
+        )
+
+    return _api_result(
+        status="success",
+        content=content,
+        http_status=getattr(response, "status_code", None),
+        finish_reason=finish_reason,
+    )
 
 
 def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any) -> Any:
@@ -341,12 +559,14 @@ def _call_ai_api_detailed(
     logger: Any = None,
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Call a chat-completions compatible API and retain failure details."""
+    """Call a configured AI API transport and retain failure details."""
     try:
         api_key = api_config.get('api_key') or ''
         model_name = api_config.get('model') or ''
         api_base = api_config.get('api_base', 'https://api.openai.com/v1') or 'https://api.openai.com/v1'
+        capability = resolve_model_capability(api_config)
 
         if not api_key or not model_name:
             message = "API config is missing api_key or model"
@@ -354,39 +574,58 @@ def _call_ai_api_detailed(
                 logger.error(message)
             return _api_result(status="failed", error_kind="fatal_config_or_auth", message=message)
 
-        timeout_seconds, configured_retries = _load_api_runtime_settings()
+        configured_timeout_seconds, configured_retries = _load_api_runtime_settings()
+        request_timeout_seconds = (
+            _coerce_positive_int(timeout_seconds, configured_timeout_seconds)
+            if timeout_seconds is not None
+            else configured_timeout_seconds
+        )
         max_retries = (
             _coerce_positive_int(retry_attempts, configured_retries)
             if retry_attempts is not None
             else configured_retries
         )
-        api_url = f"{api_base.rstrip('/')}/chat/completions"
+        endpoint_suffix = "responses" if capability.endpoint_type == "responses" else "chat/completions"
+        api_url = f"{api_base.rstrip('/')}/{endpoint_suffix}"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
         }
-        normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
-        payload: Dict[str, Any] = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": normalized_user_content},
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if response_format == "json":
-            payload["response_format"] = {"type": "json_object"}
-        _apply_optional_api_payload_params(payload, api_config, logger=logger)
+        if capability.endpoint_type == "responses":
+            payload = build_responses_payload(
+                prompt,
+                api_config,
+                system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format=response_format,
+                user_content=user_content,
+                logger=logger,
+                capability=capability,
+            )
+            response_parser = parse_responses_response
+        else:
+            payload = build_chat_completions_payload(
+                prompt,
+                api_config,
+                system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format=response_format,
+                user_content=user_content,
+                logger=logger,
+                capability=capability,
+            )
+            response_parser = parse_chat_completions_response
 
         response = None
         last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
         attempt = 0
-        removed_compat_params: Set[str] = set()
+        removed_compat_params: Set[Any] = set()
         while attempt < max_retries:
             attempt += 1
             try:
-                final_payload = payload.copy()
+                final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
                     logger.info(f"调用AIHubMix API，模型: {final_payload['model']}")
 
@@ -395,14 +634,13 @@ def _call_ai_api_detailed(
                     api_config=api_config,
                     headers=headers,
                     json=final_payload,
-                    timeout=timeout_seconds,
+                    timeout=request_timeout_seconds,
                 )
                 response.raise_for_status()
 
                 try:
                     response_data = response.json()
-                    content = response_data['choices'][0]['message']['content']
-                    finish_reason = response_data['choices'][0].get('finish_reason', 'stop')
+                    content, finish_reason = response_parser(response_data)
                 except Exception as exc:
                     message = f"Malformed API response: {exc}"
                     if logger:
@@ -414,44 +652,23 @@ def _call_ai_api_detailed(
                         message=message,
                     )
 
-                if response_format == "json":
-                    parsed_content = _smart_json_parser(content)
-                    if parsed_content is not None:
-                        return _api_result(
-                            status="success",
-                            content=parsed_content,
-                            http_status=getattr(response, "status_code", None),
-                            finish_reason=finish_reason,
-                        )
-
-                    corrected_content = _auto_correct_json(content)
-                    if corrected_content is not None:
-                        if logger:
-                            logger.info("通过自动纠错成功修复JSON")
-                        return _api_result(
-                            status="success",
-                            content=corrected_content,
-                            http_status=getattr(response, "status_code", None),
-                            finish_reason=finish_reason,
-                        )
-
-                    message = "200 response but JSON content is empty or malformed"
+                formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
+                if (
+                    formatted.get("status") == "failed"
+                    and formatted.get("error_kind") == "invalid_response"
+                    and response_format == "json"
+                    and attempt < max_retries
+                ):
+                    wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
-                        logger.error(message)
-                        logger.debug(f"AI返回内容: {str(content)[:500]}...")
-                    return _api_result(
-                        status="failed",
-                        error_kind="invalid_response",
-                        http_status=getattr(response, "status_code", None),
-                        message=message,
-                    )
+                        logger.warning(
+                            f"API returned malformed JSON; retrying structured request in {wait_time:.1f}s..."
+                        )
+                    time.sleep(wait_time)
+                    last_failure = formatted
+                    continue
 
-                return _api_result(
-                    status="success",
-                    content=content,
-                    http_status=getattr(response, "status_code", None),
-                    finish_reason=finish_reason,
-                )
+                return formatted
 
             except requests.exceptions.HTTPError:
                 error_kind, http_status, provider_code, message = _classify_http_error(response)
@@ -462,7 +679,46 @@ def _call_ai_api_detailed(
                     provider_code=provider_code,
                     message=message or _response_error_details(response, limit=500),
                 )
-                for payload_key in ("temperature", "response_format", "reasoning_effort", "thinking"):
+                if (
+                    capability.reasoning_param_style == "chat_reasoning"
+                    and ("reasoning", "display") not in removed_compat_params
+                    and _is_payload_parameter_error("display", provider_code, message, last_failure["message"])
+                    and remove_payload_path(payload, ("reasoning", "display"))
+                ):
+                    removed_compat_params.add(("reasoning", "display"))
+                    attempt -= 1
+                    if logger:
+                        logger.warning("API rejected reasoning.display, retrying once without it.")
+                    continue
+
+                if (
+                    capability.reasoning_param_style == "deepseek_thinking"
+                    and "reasoning_effort:max_to_high" not in removed_compat_params
+                    and str(payload.get("reasoning_effort") or "").strip().casefold() == "max"
+                    and (
+                        _is_payload_parameter_error("reasoning_effort", provider_code, message, last_failure["message"])
+                        or _is_payload_value_error("reasoning_effort", "max", provider_code, message, last_failure["message"])
+                    )
+                ):
+                    removed_compat_params.add("reasoning_effort:max_to_high")
+                    payload["reasoning_effort"] = "high"
+                    attempt -= 1
+                    if logger:
+                        logger.warning("API rejected reasoning_effort=max, retrying once with high.")
+                    continue
+
+                compat_payload_keys = [
+                    "temperature",
+                    "top_p",
+                    "response_format",
+                    "reasoning_effort",
+                    "thinking",
+                    "reasoning",
+                ]
+                if capability.endpoint_type == "responses":
+                    compat_payload_keys = ["temperature", "top_p", "text", "reasoning"]
+
+                for payload_key in compat_payload_keys:
                     if (
                         payload_key in payload
                         and payload_key not in removed_compat_params
@@ -541,7 +797,8 @@ def _call_ai_api_detailed(
 
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
                  temperature: float = 0.3, response_format: str = "json", logger: Any = None,
-                 user_content: Any = None) -> Optional[Dict[str, Any]]:
+                 user_content: Any = None, retry_attempts: Optional[int] = None,
+                 timeout_seconds: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Backward-compatible wrapper: existing callers receive parsed content only.
     Use _call_ai_api_detailed when transport failure kind is needed.
@@ -555,6 +812,8 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
         response_format=response_format,
         logger=logger,
         user_content=user_content,
+        retry_attempts=retry_attempts,
+        timeout_seconds=timeout_seconds,
     )
     if result.get("status") == "success":
         return result.get("content")
@@ -569,6 +828,8 @@ def _call_ai_api_text_detailed(
     temperature: float = 0.3,
     logger: Any = None,
     user_content: Any = None,
+    retry_attempts: Optional[int] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call the chat-completions API for text content and return full metadata.
 
@@ -584,6 +845,8 @@ def _call_ai_api_text_detailed(
         response_format="text",
         logger=logger,
         user_content=user_content,
+        retry_attempts=retry_attempts,
+        timeout_seconds=timeout_seconds,
     )
     if result.get("status") == "success":
         return {

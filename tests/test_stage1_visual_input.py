@@ -316,6 +316,41 @@ def test_call_ai_api_serializes_local_image_path_content(tmp_path: Path) -> None
     assert user_content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_call_ai_api_converts_visual_content_for_responses(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(PNG_BYTES)
+
+    mock_response = Mock()
+    mock_response.json.return_value = {"output_text": '{"summary": "ok"}', "status": "completed"}
+    mock_response.raise_for_status.return_value = None
+
+    with patch("ai_interface.requests.post", return_value=mock_response) as mock_post:
+        result = _call_ai_api(
+            "fallback prompt",
+            {
+                "api_key": "key",
+                "model": "gpt-5.5",
+                "api_base": "https://aihubmix.com/v1",
+                "endpoint_type": "responses",
+                "provider_family": "aihubmix_openai",
+                "reasoning_effort": "high",
+                "omit_temperature_when_reasoning": "true",
+            },
+            "system",
+            user_content=[
+                {"type": "text", "text": "hello"},
+                {"type": "local_image_path", "path": str(image_path)},
+            ],
+        )
+
+    assert result == {"summary": "ok"}
+    payload = mock_post.call_args.kwargs["json"]
+    user_content = payload["input"][1]["content"]
+    assert user_content[0] == {"type": "input_text", "text": "hello"}
+    assert user_content[1]["type"] == "input_image"
+    assert user_content[1]["image_url"].startswith("data:image/png;base64,")
+
+
 def test_process_paper_links_visual_bundle_into_paper_artifact_with_text_only_fallback(
     tmp_path: Path,
     monkeypatch,

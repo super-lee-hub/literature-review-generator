@@ -62,8 +62,12 @@ def test_gui_copy_uses_current_reuse_and_queue_order_labels() -> None:
     i18n_content = Path("gui/i18n.py").read_text(encoding="utf-8")
 
     assert "Auto reuse historical stage-1 summaries" in app_content
+    assert "历史阶段一摘要会自动扫描复用" in app_content
+    assert "高级：外部摘要文件（一般可跳过）" in app_content
+    assert "Use existing summaries.json for outline/review" in app_content
     assert "When enabled, stage 1 scans all historical project outputs plus compatible legacy summaries" in app_content
     assert "Enable DOI-only stage-1 reuse" not in app_content
+    assert "高级：复用已有摘要（一般可跳过）" not in app_content
     assert "上移选中任务" not in app_content
     assert "下移选中任务" not in app_content
 
@@ -72,4 +76,5 @@ def test_gui_copy_uses_current_reuse_and_queue_order_labels() -> None:
     assert '"PDF folder": "PDF 文件夹"' in i18n_content
     assert '"Open PDF folder": "打开 PDF 文件夹"' in i18n_content
     assert '"Please enter a project name first.": "请先填写项目名。"' in i18n_content
+    assert '"Use existing summaries.json for outline/review"' in i18n_content
     assert '"Enable DOI-only stage-1 reuse"' not in i18n_content

@@ -11,12 +11,53 @@ import requests  # type: ignore
 import json
 from typing import Tuple, Dict, Any, List
 
+from services.model_capabilities import resolve_model_capability
+from services.repair_policy import parse_repair_policy
 from services.proxy_policy import should_bypass_environment_proxy
 
 
 class ConfigValidationError(Exception):
     """配置验证异常类"""
     pass
+
+
+def _normalize_config_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) -> List[str]:
+    """Validate provider/endpoint/reasoning fields that shape request payloads."""
+    warnings: List[str] = []
+    provider_family = _normalize_config_text(section.get("provider_family")).replace("-", "_").lower()
+    endpoint_type = _normalize_config_text(section.get("endpoint_type")).replace("-", "_").lower()
+    api_base = _normalize_config_text(section.get("api_base")).lower()
+    reasoning_effort = _normalize_config_text(section.get("reasoning_effort"))
+    reasoning_display = _normalize_config_text(section.get("reasoning_display"))
+    thinking = _normalize_config_text(section.get("thinking"))
+
+    if provider_family and provider_family not in {"aihubmix_openai", "aihubmix_claude", "deepseek", "generic"}:
+        warnings.append(f"[{section_name}] provider_family={provider_family!r} is not supported")
+    if endpoint_type and endpoint_type not in {"chat_completions", "responses", "response"}:
+        warnings.append(f"[{section_name}] endpoint_type={endpoint_type!r} is not supported")
+    if provider_family == "aihubmix_openai" and endpoint_type and endpoint_type not in {"responses", "response"}:
+        warnings.append(f"[{section_name}] aihubmix_openai reasoning config requires endpoint_type=responses")
+    if provider_family == "aihubmix_claude" and endpoint_type and endpoint_type not in {"chat_completions"}:
+        warnings.append(f"[{section_name}] aihubmix_claude requires endpoint_type=chat_completions")
+    if provider_family == "deepseek" and endpoint_type and endpoint_type not in {"chat_completions"}:
+        warnings.append(f"[{section_name}] deepseek requires endpoint_type=chat_completions")
+    if provider_family == "deepseek" and api_base and "deepseek" not in api_base:
+        warnings.append(f"[{section_name}] provider_family=deepseek should use a DeepSeek api_base")
+    if provider_family.startswith("aihubmix") and api_base and "aihubmix" not in api_base:
+        warnings.append(f"[{section_name}] provider_family={provider_family} should use an AIHubMix api_base")
+
+    capability = resolve_model_capability(section)  # type: ignore[arg-type]
+    if (reasoning_effort or reasoning_display or thinking) and not capability.supports_reasoning:
+        warnings.append(f"[{section_name}] reasoning fields are set but provider/model combination does not support reasoning")
+    if reasoning_display and capability.reasoning_param_style != "chat_reasoning":
+        warnings.append(f"[{section_name}] reasoning_display is only valid for chat reasoning providers")
+    if thinking and capability.reasoning_param_style != "deepseek_thinking":
+        warnings.append(f"[{section_name}] thinking is only valid for DeepSeek reasoning")
+    return warnings
 
 
 def validate_file_path(path: str, allow_empty: bool = False) -> Tuple[bool, str]:
@@ -384,6 +425,8 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
             warnings.append(f"[{section}] {error}")
 
+        warnings.extend(_validate_api_transport_combo(section, config_dict[section]))
+
 
         
 
@@ -482,6 +525,7 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_url(outline_api_base)
         if not valid:
             warnings.append(f"[Outline_API] {error}")
+        warnings.extend(_validate_api_transport_combo('Outline_API', config_dict['Outline_API']))
 
     if 'Free_Mode_API' in config_dict and any(str(v).strip() for v in config_dict['Free_Mode_API'].values()):
         valid, error = validate_config_section(config_dict, 'Free_Mode_API', ['api_key', 'model', 'api_base'])
@@ -491,6 +535,7 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_url(free_mode_api_base)
         if not valid:
             warnings.append(f"[Free_Mode_API] {error}")
+        warnings.extend(_validate_api_transport_combo('Free_Mode_API', config_dict['Free_Mode_API']))
 
     if 'Preprocess' in config_dict:
         ocr_mode = str(config_dict['Preprocess'].get('ocr_mode', 'auto')).lower()
@@ -500,6 +545,12 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
     
 
+
+    if 'Validation' in config_dict:
+        try:
+            parse_repair_policy(config_dict['Validation'].get('repair_policy'))
+        except ValueError as exc:
+            return False, [str(exc)]
 
     return True, warnings
 

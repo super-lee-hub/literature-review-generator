@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -35,6 +36,12 @@ def verify_adoption_prerequisites(
     if not audit.passed:
         return False, "Coverage audit did not pass; adoption is blocked"
 
+    if final_outline.review_status == "blocked":
+        return False, "Final outline review_status is blocked; adoption is blocked"
+
+    if final_outline.blocking_critique_ids:
+        return False, "Final outline has unresolved blocking critiques; adoption is blocked"
+
     current_final_hash = compute_content_hash(final_outline.to_dict())
     if audit.source_final_outline_hash != current_final_hash:
         return False, (
@@ -60,15 +67,18 @@ def adopt_final_outline(
     if not ok:
         return None, err
 
+    source_final_outline_hash = compute_content_hash(final_outline.to_dict())
+    adopted_outline = replace(final_outline, adoption_status="adopted")
+
     adopted = AdoptedFinalOutline(
         created_from_job_id=job_id,
-        source_final_outline_id=f"final_outline:{compute_content_hash(final_outline.to_dict())[:12]}",
-        source_final_outline_hash=compute_content_hash(final_outline.to_dict()),
+        source_final_outline_id=f"final_outline:{source_final_outline_hash[:12]}",
+        source_final_outline_hash=source_final_outline_hash,
         source_coverage_audit_id=f"coverage_audit:{compute_content_hash(audit.to_dict())[:12]}",
         source_coverage_audit_hash=compute_content_hash(audit.to_dict()),
         adopted_at=_utc_now_iso(),
         adopted_by=adopted_by,
-        outline=final_outline,
+        outline=adopted_outline,
     )
 
     return adopted, "Adoption successful"

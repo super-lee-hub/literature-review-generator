@@ -19,13 +19,23 @@ from outline.adoption import (
     verify_adoption_prerequisites,
     write_adopted_outline,
 )
-from outline.v2_models import AdoptedFinalOutline, compute_content_hash
+from outline.v2_models import AdoptedFinalOutline, CoverageAudit, FinalOutline, FinalSection, compute_content_hash
 
 
 def _sample_summaries():
     return [
-        {"paper_info": {"title": f"Paper {i}", "authors": [str(i)], "year": 2020 + i, "classification": "core" if i == 0 else "support"}, "themes": [f"theme_{i}"], "methods": [f"method_{i}"]}
-        for i in range(3)
+        {
+            "paper_info": {
+                "title": f"Paper {i}",
+                "authors": [str(i)],
+                "year": 2020 + i,
+                "classification": "support",
+            },
+            "themes": ["promotion fairness" if i < 3 else "consumer trust"],
+            "methods": ["survey"],
+            "limitations": ["single context"],
+        }
+        for i in range(6)
     ]
 
 
@@ -47,31 +57,39 @@ def _make_final_and_audit():
     return final, audit
 
 
+def _force_passing_audit(final):
+    return CoverageAudit(
+        passed=True,
+        source_final_outline_hash=compute_content_hash(final.to_dict()),
+    )
+
+
 class TestAdoptionGate:
 
     def test_adoption_succeeds_with_passing_audit(self):
         final, audit = _make_final_and_audit()
-        if audit.passed:
-            adopted, msg = adopt_final_outline(final, audit, "job-001", "test-user")
-            assert adopted is not None
-            assert "success" in msg.lower()
-            assert isinstance(adopted, AdoptedFinalOutline)
-            assert adopted.adopted_by == "test-user"
-        else:
-            # If audit didn't pass, that's also valid (blocking issues detected)
-            assert not audit.passed
-            adopted, msg = adopt_final_outline(final, audit, "job-001", "test-user")
-            assert adopted is None
+        audit = _force_passing_audit(final)
+        adopted, msg = adopt_final_outline(final, audit, "job-001", "test-user")
+        assert adopted is not None
+        assert "success" in msg.lower()
+        assert isinstance(adopted, AdoptedFinalOutline)
+        assert adopted.adopted_by == "test-user"
+        assert adopted.outline.adoption_status == "adopted"
+        assert "<!-- Adoption: adopted -->" in adopted.to_markdown()
 
     def test_failed_audit_blocks_adoption(self):
         final, audit = _make_final_and_audit()
-        if not audit.passed:
-            adopted, msg = adopt_final_outline(final, audit, "job-001", "test-user")
-            assert adopted is None
-            assert "pass" in msg.lower() or "blocked" in msg.lower()
+        failed = CoverageAudit(
+            passed=False,
+            source_final_outline_hash=compute_content_hash(final.to_dict()),
+        )
+        adopted, msg = adopt_final_outline(final, failed, "job-001", "test-user")
+        assert adopted is None
+        assert "pass" in msg.lower() or "blocked" in msg.lower()
 
     def test_stale_audit_blocks_adoption(self):
         final, audit = _make_final_and_audit()
+        audit = _force_passing_audit(final)
 
         # Modify the final outline to make audit stale
         from outline.v2_models import FinalOutline as FO
@@ -87,52 +105,69 @@ class TestAdoptionGate:
         )
 
         ok, err = verify_adoption_prerequisites(modified_final, audit)
-        if audit.passed:
-            assert not ok
-            assert "stale" in err.lower() or "hash" in err.lower()
+        assert audit.passed is True
+        assert not ok
+        assert "stale" in err.lower() or "hash" in err.lower()
 
     def test_verify_prerequisites_checks_audit_pass(self):
         final, audit = _make_final_and_audit()
+        audit = _force_passing_audit(final)
         ok, err = verify_adoption_prerequisites(final, audit)
-        if audit.passed:
-            assert ok
-        else:
-            assert not ok
+        assert ok
 
     def test_adopted_outline_has_required_fields(self):
         final, audit = _make_final_and_audit()
-        if audit.passed:
-            adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
-            assert adopted is not None
-            assert adopted.artifact_type == "adopted_final_outline"
-            assert adopted.artifact_version == "v1"
-            assert adopted.source_final_outline_hash != ""
-            assert adopted.source_coverage_audit_hash != ""
-            assert adopted.adopted_at != ""
-            assert adopted.adopted_by == "test-user"
+        audit = _force_passing_audit(final)
+        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
+        assert adopted is not None
+        assert adopted.artifact_type == "adopted_final_outline"
+        assert adopted.artifact_version == "v1"
+        assert adopted.source_final_outline_hash != ""
+        assert adopted.source_coverage_audit_hash != ""
+        assert adopted.adopted_at != ""
+        assert adopted.adopted_by == "test-user"
 
     def test_write_adopted_outline_to_disk(self, tmp_path: Path):
         final, audit = _make_final_and_audit()
-        if audit.passed:
-            adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
-            path = str(tmp_path / "adopted_final_outline.json")
-            written = write_adopted_outline(adopted, path)
-            assert os.path.exists(written)
+        audit = _force_passing_audit(final)
+        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
+        path = str(tmp_path / "adopted_final_outline.json")
+        written = write_adopted_outline(adopted, path)
+        assert os.path.exists(written)
 
-            import json
-            with open(written, "r") as f:
-                data = json.load(f)
-            assert data["artifact_type"] == "adopted_final_outline"
-            assert data["adopted_by"] == "test-user"
+        import json
+        with open(written, "r") as f:
+            data = json.load(f)
+        assert data["artifact_type"] == "adopted_final_outline"
+        assert data["adopted_by"] == "test-user"
 
     def test_adoption_does_not_overwrite_reviewed_outline(self):
         """V2 adoption writes adopted_final_outline, NOT reviewed_outline."""
         final, audit = _make_final_and_audit()
-        if audit.passed:
-            adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
-            assert adopted is not None
-            # adopted_final_outline artifact type is NOT reviewed_outline_document
-            assert adopted.artifact_type == "adopted_final_outline"
+        audit = _force_passing_audit(final)
+        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
+        assert adopted is not None
+        # adopted_final_outline artifact type is NOT reviewed_outline_document
+        assert adopted.artifact_type == "adopted_final_outline"
+
+    def test_blocked_final_outline_blocks_adoption_even_with_passed_audit_hash(self):
+        final, _audit = _make_final_and_audit()
+        blocked = FinalOutline(
+            created_from_job_id=final.created_from_job_id,
+            outline_id=final.outline_id,
+            review_status="blocked",
+            sections=final.sections,
+            blocking_critique_ids=["crit-block"],
+        )
+        audit = CoverageAudit(
+            passed=True,
+            source_final_outline_hash=compute_content_hash(blocked.to_dict()),
+        )
+
+        adopted, msg = adopt_final_outline(blocked, audit, "job-001", "test-user")
+
+        assert adopted is None
+        assert "blocked" in msg.lower()
 
 
 
@@ -179,8 +214,7 @@ def test_generator_adopt_outline_v2_writes_registered_adopted_artifact(tmp_path:
     )
 
     final, audit = _make_final_and_audit()
-    if not audit.passed:
-        pytest.skip("fixture audit intentionally blocks adoption")
+    audit = _force_passing_audit(final)
     Path(workspace.artifact_path("demo_final_outline.json")).write_text(json.dumps(final.to_dict()), encoding="utf-8")
     Path(workspace.artifact_path("demo_outline_coverage_audit.json")).write_text(json.dumps(audit.to_dict()), encoding="utf-8")
 
@@ -191,3 +225,107 @@ def test_generator_adopt_outline_v2_writes_registered_adopted_artifact(tmp_path:
     assert record is not None
     assert record.artifact_type == "adopted_final_outline"
     assert all(dep.content_hash for dep in record.depends_on)
+
+
+def test_generator_adopt_outline_v2_failed_audit_does_not_write_adopted_artifact(tmp_path: Path):
+    import main
+    from config_loader import ConfigDict
+    from services.artifact_registry import ArtifactRegistry
+    from services.config_compat import CompatConfigView
+    from services.job_workspace import JobWorkspace
+    from services.progress_state import ResumeStateReport
+
+    class DummyLogger:
+        def info(self, *_args, **_kwargs): pass
+        def warning(self, *_args, **_kwargs): pass
+        def error(self, *_args, **_kwargs): pass
+        def success(self, *_args, **_kwargs): pass
+        def debug(self, *_args, **_kwargs): pass
+
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo", job_id="job-adopt-v2-fail")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    cfg = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Outline": {"enable_outline_intelligence_v2": "true"}})
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
+    generator.logger = DummyLogger()
+    generator.config = cfg
+    generator.bind_job_workspace(
+        workspace=workspace,
+        artifact_registry=registry,
+        compat_config=CompatConfigView.from_config(cfg),
+        fingerprint_bundle={},
+        resume_state_report=ResumeStateReport(
+            artifact_type="resume_state_report",
+            artifact_version="v1",
+            created_from_job_id=workspace.job_id,
+            created_at="2026-05-16T00:00:00Z",
+            project_name="demo",
+            job_id=workspace.job_id,
+            state="non_resumable",
+            reason="test",
+            summary_file=workspace.artifact_path("demo_summaries.json"),
+            progress_snapshot_file=None,
+            checkpoint_file=workspace.checkpoint_path("demo_checkpoint.json"),
+            fingerprint_bundle={},
+        ),
+    )
+
+    final = FinalOutline(
+        created_from_job_id="job-adopt-v2-fail",
+        sections=[FinalSection(section_id="s1", title="Research problem framing")],
+    )
+    audit = CoverageAudit(
+        passed=False,
+        source_final_outline_hash=compute_content_hash(final.to_dict()),
+    )
+    Path(workspace.artifact_path("demo_final_outline.json")).write_text(json.dumps(final.to_dict()), encoding="utf-8")
+    Path(workspace.artifact_path("demo_outline_coverage_audit.json")).write_text(json.dumps(audit.to_dict()), encoding="utf-8")
+
+    assert generator.adopt_outline_v2() is False
+    assert not Path(workspace.artifact_path("demo_adopted_final_outline.json")).exists()
+
+
+def test_setup_output_directory_restores_registry_for_latest_workspace(tmp_path: Path):
+    import main
+    from config_loader import ConfigDict
+    from services.artifact_registry import ArtifactRegistry
+    from services.config_compat import CompatConfigView
+    from services.job_workspace import JobWorkspace
+
+    class DummyLogger:
+        def info(self, *_args, **_kwargs): pass
+        def warning(self, *_args, **_kwargs): pass
+        def error(self, *_args, **_kwargs): pass
+        def success(self, *_args, **_kwargs): pass
+        def debug(self, *_args, **_kwargs): pass
+
+    output_dir = tmp_path / "output"
+    workspace = JobWorkspace.create(str(output_dir), "demo", job_id="job-existing")
+    workspace.write_latest_pointer(
+        resume_state="resumable",
+        fingerprint_bundle={},
+        status="ready",
+    )
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    registry.register_file(
+        artifact_role="marker",
+        artifact_type="marker",
+        artifact_version="v1",
+        path=workspace.artifact_path("marker.txt"),
+        producer="test",
+        artifact_id="marker",
+    )
+
+    cfg = ConfigDict({
+        "Paths": {"output_path": str(output_dir)},
+        "Outline": {"enable_outline_intelligence_v2": "true"},
+    })
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
+    generator.logger = DummyLogger()
+    generator.config = cfg
+    generator.compat_config = CompatConfigView.from_config(cfg)
+
+    assert generator.setup_output_directory() is True
+    assert generator.job_workspace is not None
+    assert generator.job_workspace.root_dir == workspace.root_dir
+    assert generator.artifact_registry is not None
+    assert generator.artifact_registry.get("marker") is not None

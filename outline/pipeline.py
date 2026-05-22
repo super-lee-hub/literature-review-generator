@@ -28,8 +28,10 @@ from outline.v2_models import (
 from outline.literature_map import build_literature_map
 from outline.synthesis_flow import build_synthesis_flow
 from outline.candidates import (
+    CandidateGenerationError,
+    deterministic_candidate_generation_report,
     generate_candidates_deterministic,
-    generate_candidates_production,
+    generate_candidates_production_with_report,
     validate_candidate_count,
 )
 from outline.critique_v2 import (
@@ -42,9 +44,11 @@ from outline.arbitration_v2 import (
     arbitrate_deterministic,
     arbitrate_production,
     build_final_outline,
+    complete_final_outline_coverage,
 )
 from outline.coverage_audit import run_coverage_audit
 from outline.adoption import adopt_final_outline, write_adopted_outline
+from outline.v2_config import OutlineQualityGateConfig
 
 
 ModelCaller = Callable[[str, str, Dict[str, Any]], Any]
@@ -61,6 +65,7 @@ class V2PipelineResult:
         self.literature_map: Optional[LiteratureMap] = None
         self.synthesis_flow: Optional[SynthesisFlow] = None
         self.candidates: Optional[OutlineCandidates] = None
+        self.candidate_generation_report: Optional[Dict[str, Any]] = None
         self.critiques: Optional[OutlineCritiquesV2] = None
         self.arbitration_report: Optional[ArbitrationReport] = None
         self.final_outline: Optional[FinalOutline] = None
@@ -132,14 +137,32 @@ class V2Pipeline:
 
         # Phase 3: Multi-candidate generation
         active_model_caller = model_caller or self.model_caller
-        if test_dev_mode:
-            candidates = generate_candidates_deterministic(
-                lit_map, synth_flow, candidate_count, generator_model, self.job_id
-            )
-        else:
-            candidates = generate_candidates_production(
-                lit_map, synth_flow, candidate_count, generator_model, active_model_caller
-            )
+        raw_config = getattr(self.config_view, "raw_config", None)
+        quality_gate = OutlineQualityGateConfig.from_config(raw_config or {})
+        try:
+            if test_dev_mode:
+                candidates = generate_candidates_deterministic(
+                    lit_map, synth_flow, candidate_count, generator_model, self.job_id
+                )
+                result.candidate_generation_report = deterministic_candidate_generation_report(
+                    candidates, candidate_count, generator_model, lit_map, synth_flow, quality_gate
+                )
+            else:
+                candidates, report = generate_candidates_production_with_report(
+                    lit_map,
+                    synth_flow,
+                    candidate_count,
+                    generator_model,
+                    active_model_caller,
+                    quality_gate,
+                    source_summaries=self.summaries,
+                )
+                result.candidate_generation_report = report
+        except CandidateGenerationError as exc:
+            result.candidate_generation_report = exc.report
+            result.errors.append(str(exc))
+            self.persist_candidate_generation_report(result)
+            return result
         result.candidates = candidates
 
         # Phase 4: Role-specific critique
@@ -174,13 +197,53 @@ class V2Pipeline:
         final_outline = build_final_outline(
             candidates, arbitration_report, lit_map_hash, synth_flow_hash, self.job_id
         )
+        final_outline = complete_final_outline_coverage(
+            final_outline,
+            lit_map,
+            synth_flow,
+            min_canonical_coverage=quality_gate.min_canonical_coverage,
+        )
         result.final_outline = final_outline
 
         # Phase 7: Coverage audit
-        audit = run_coverage_audit(final_outline, lit_map, synth_flow)
+        audit = run_coverage_audit(final_outline, lit_map, synth_flow, quality_gate)
         result.coverage_audit = audit
 
         return result
+
+    def persist_candidate_generation_report(self, result: V2PipelineResult) -> Dict[str, str]:
+        """Best-effort write/register for the optional candidate diagnostics sidecar."""
+        if not result.candidate_generation_report:
+            return {}
+        artifacts_dir = self._artifacts_dir()
+        report_path = os.path.join(
+            artifacts_dir,
+            f"{self.project_name}_outline_candidate_generation_report.json",
+        )
+        try:
+            self._write_json(report_path, result.candidate_generation_report)
+            dependency_refs: List[ArtifactDependencyRef] = []
+            lit_path = os.path.join(artifacts_dir, f"{self.project_name}_literature_map.json")
+            synth_path = os.path.join(artifacts_dir, f"{self.project_name}_synthesis_flow.json")
+            for artifact_type, dep_path in (
+                ("literature_map", lit_path),
+                ("synthesis_flow", synth_path),
+            ):
+                if os.path.exists(dep_path):
+                    dependency_refs.append(self._dependency_ref(artifact_type, dep_path))
+            self._register(
+                "candidate_generation_report",
+                "candidate_generation_report",
+                "v1",
+                report_path,
+                "v2_pipeline",
+                depends_on=dependency_refs,
+            )
+            return {"candidate_generation_report": report_path}
+        except Exception as exc:
+            if self.logger:
+                self.logger.warning(f"Failed to persist candidate generation report: {exc}")
+            return {}
 
     def persist_artifacts(self, result: V2PipelineResult) -> Dict[str, str]:
         """Write all v2 artifacts to disk and register them.
@@ -227,6 +290,10 @@ class V2Pipeline:
                 dependency_records["synthesis_flow"],
             ],
         )
+
+        # Candidate generation diagnostics sidecar (not an arbitration/adoption/runtime input)
+        report_paths = self.persist_candidate_generation_report(result)
+        paths.update(report_paths)
 
         # Critiques
         crit_path = os.path.join(artifacts_dir, f"{self.project_name}_outline_critiques.json")

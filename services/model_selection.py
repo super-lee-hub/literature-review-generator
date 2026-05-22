@@ -9,6 +9,20 @@ from models import APIConfig
 
 
 _API_KEY_PLACEHOLDER_RE = re.compile(r"^(?:your_.+_api_key_here|loaded_from_\.env_file)$", re.IGNORECASE)
+_API_CONFIG_OPTIONAL_FIELDS = (
+    "endpoint_type",
+    "provider_family",
+    "thinking",
+    "reasoning_effort",
+    "reasoning_display",
+    "text_verbosity",
+    "max_tokens",
+    "max_output_tokens",
+    "max_completion_tokens",
+    "max_context_tokens",
+    "force_highest_reasoning",
+    "omit_temperature_when_reasoning",
+)
 
 
 def _normalize_text(value: Any) -> str:
@@ -30,12 +44,16 @@ def _section_to_api_config(section: Dict[str, Any] | None) -> APIConfig:
     api_key = _normalize_text(section.get("api_key"))
     if not _has_meaningful_api_key(api_key):
         api_key = ""
-    return {
+    api_config: APIConfig = {
         "api_key": api_key,
         "model": _normalize_text(section.get("model")),
         "api_base": _normalize_text(section.get("api_base")) or "https://api.openai.com/v1",
         "proxy_mode": _normalize_text(section.get("proxy_mode")) or "environment",
     }
+    for field in _API_CONFIG_OPTIONAL_FIELDS:
+        if field in section and _normalize_text(section.get(field)):
+            api_config[field] = section.get(field)
+    return api_config
 
 
 def get_reader_api_config(config: Dict[str, Any] | None) -> APIConfig:
@@ -62,3 +80,7 @@ def get_free_mode_api_config(config: Dict[str, Any] | None) -> APIConfig:
     if _section_has_effective_route(free_mode_section):
         return _section_to_api_config(free_mode_section)
     return get_outline_api_config(config)
+
+
+def get_validator_api_config(config: Dict[str, Any] | None) -> APIConfig:
+    return _section_to_api_config((config or {}).get("Validator_API"))

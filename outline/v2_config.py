@@ -6,7 +6,7 @@ fixture mode detection so main.py and v2 modules don't duplicate logic.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Mapping, Optional
 
 
@@ -39,6 +39,16 @@ OUTLINE_COST_CONTROL_DEFAULTS: Dict[str, str] = {
     "max_outline_retry_count": "2",
 }
 
+OUTLINE_QUALITY_GATE_DEFAULTS: Dict[str, str] = {
+    "coverage_scope": "full",
+    "min_canonical_coverage_full": "0.50",
+    "min_canonical_coverage_local": "0.25",
+    "min_effective_sections": "3",
+    "max_duplicate_assignments": "0",
+    "block_placeholder_sections": "true",
+    "block_empty_research_streams": "true",
+}
+
 PRODUCTION_MIN_CANDIDATE_COUNT = 2
 PRODUCTION_MAX_CANDIDATE_COUNT = 3
 
@@ -58,6 +68,75 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (ValueError, TypeError):
         return default
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+@dataclass(frozen=True)
+class OutlineQualityGateConfig:
+    """Parsed quality-gate policy for v2 coverage/adoption."""
+
+    coverage_scope: str = "full"
+    min_canonical_coverage_full: float = 0.50
+    min_canonical_coverage_local: float = 0.25
+    min_effective_sections: int = 3
+    max_duplicate_assignments: int = 0
+    block_placeholder_sections: bool = True
+    block_empty_research_streams: bool = True
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any] | None) -> "OutlineQualityGateConfig":
+        section = dict(config.get("OutlineQualityGate", {})) if config else {}
+        scope = str(
+            section.get("coverage_scope", OUTLINE_QUALITY_GATE_DEFAULTS["coverage_scope"])
+        ).strip().lower()
+        if scope not in {"full", "local"}:
+            scope = "full"
+        return cls(
+            coverage_scope=scope,
+            min_canonical_coverage_full=_as_float(
+                section.get("min_canonical_coverage_full"),
+                _as_float(OUTLINE_QUALITY_GATE_DEFAULTS["min_canonical_coverage_full"]),
+            ),
+            min_canonical_coverage_local=_as_float(
+                section.get("min_canonical_coverage_local"),
+                _as_float(OUTLINE_QUALITY_GATE_DEFAULTS["min_canonical_coverage_local"]),
+            ),
+            min_effective_sections=_as_int(
+                section.get("min_effective_sections"),
+                _as_int(OUTLINE_QUALITY_GATE_DEFAULTS["min_effective_sections"]),
+            ),
+            max_duplicate_assignments=_as_int(
+                section.get("max_duplicate_assignments"),
+                _as_int(OUTLINE_QUALITY_GATE_DEFAULTS["max_duplicate_assignments"]),
+            ),
+            block_placeholder_sections=_as_bool(
+                section.get("block_placeholder_sections"),
+                _as_bool(OUTLINE_QUALITY_GATE_DEFAULTS["block_placeholder_sections"]),
+            ),
+            block_empty_research_streams=_as_bool(
+                section.get("block_empty_research_streams"),
+                _as_bool(OUTLINE_QUALITY_GATE_DEFAULTS["block_empty_research_streams"]),
+            ),
+        )
+
+    @property
+    def min_canonical_coverage(self) -> float:
+        if self.coverage_scope == "local":
+            return self.min_canonical_coverage_local
+        return self.min_canonical_coverage_full
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["min_canonical_coverage"] = self.min_canonical_coverage
+        return payload
 
 
 @dataclass(frozen=True)

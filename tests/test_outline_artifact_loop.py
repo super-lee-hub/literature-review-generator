@@ -196,6 +196,7 @@ def test_create_literature_review_outline_v2_runs_pipeline_and_registers_artifac
     expected = [
         "demo_literature_map.json",
         "demo_synthesis_flow.json",
+        "demo_outline_candidate_generation_report.json",
         "demo_outline_candidates.json",
         "demo_outline_critiques.json",
         "demo_outline_arbitration_report.json",
@@ -205,10 +206,25 @@ def test_create_literature_review_outline_v2_runs_pipeline_and_registers_artifac
     for filename in expected:
         assert Path(workspace.artifact_path(filename)).exists(), filename
 
+    audit_payload = json.loads(Path(workspace.artifact_path("demo_outline_coverage_audit.json")).read_text(encoding="utf-8"))
+    final_payload = json.loads(Path(workspace.artifact_path("demo_final_outline.json")).read_text(encoding="utf-8"))
+    assert "quality_gate_policy_snapshot" in audit_payload
+    assert "canonical_paper_coverage_ratio" in audit_payload
+    assert "duplicate_assignment_count" in audit_payload
+    assert "effective_section_count" in audit_payload
+    assert "placeholder_section_count" in audit_payload
+    assert "blocking_critique_ids" in final_payload
+    assert "unresolved_critique_ids" in final_payload
+    assert "applied_critique_ids" in final_payload
+
     registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
     artifact_ids = {item["artifact_id"] for item in registry_payload["artifacts"]}
+    artifact_types = {item["artifact_type"] for item in registry_payload["artifacts"]}
+    assert "candidate_generation_report" in artifact_ids
+    assert "candidate_generation_report" in artifact_types
     assert "outline_arbitration_report" in artifact_ids
     final_record = next(item for item in registry_payload["artifacts"] if item["artifact_id"] == "final_outline")
+    assert all(dep["artifact_type"] != "candidate_generation_report" for dep in final_record["depends_on"])
     assert all(dep["content_hash"] for dep in final_record["depends_on"])
 
 
@@ -224,3 +240,43 @@ def test_generate_review_v2_enabled_without_adoption_fails_closed(tmp_path: Path
     legacy.write_text("# Legacy\n\n## 1. Should Not Load", encoding="utf-8")
 
     assert generator.generate_full_review_from_outline() is False
+
+
+def test_candidate_generation_report_persisted_on_v2_candidate_failure(tmp_path: Path) -> None:
+    from outline.pipeline import V2Pipeline
+
+    generator, workspace, registry = _make_bound_generator(tmp_path, job_id="job-v2-candidate-failure")
+    generator.summaries = [
+        {"paper_info": {"title": "Lone Paper", "authors": ["A"], "year": 2020}, "themes": ["solo"]}
+    ]
+
+    def bad_candidate_caller(_route, _prompt, _metadata):
+        return {"candidates": [{"candidate_id": "bad", "sections": []}]}
+
+    pipeline = V2Pipeline(
+        job_id=workspace.job_id,
+        summaries=generator.summaries,
+        config_view=generator.compat_config,
+        artifact_registry=registry,
+        workspace=workspace,
+        output_dir=str(tmp_path / "output"),
+        project_name="demo",
+        model_caller=bad_candidate_caller,
+        logger=generator.logger,
+    )
+
+    result = pipeline.run(candidate_count=3, test_dev_mode=False, generator_model="Outline_API")
+
+    assert result.ok is False
+    report_path = Path(workspace.artifact_path("demo_outline_candidate_generation_report.json"))
+    assert report_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["artifact_type"] == "candidate_generation_report"
+    assert report["pipeline_continued"] is False
+    assert report["final_valid_count"] == 0
+    assert any("has no sections" in "; ".join(item["reasons"]) for item in report["rejected_reasons"])
+
+    registry_payload = json.loads(Path(workspace.paths.registry_path).read_text(encoding="utf-8"))
+    artifact_ids = {item["artifact_id"] for item in registry_payload["artifacts"]}
+    assert "candidate_generation_report" in artifact_ids
+    assert "outline_candidates" not in artifact_ids

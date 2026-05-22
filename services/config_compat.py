@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, MutableMapping
 
+from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
+
 
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
@@ -17,12 +19,14 @@ class ValidationCompatSettings:
     stage1_enabled: bool = False
     stage2_enabled: bool = False
     keep_checkpoints_after_completion: bool = False
+    repair_policy: str = DEFAULT_REPAIR_POLICY.value
 
     def to_section(self) -> Dict[str, str]:
         return {
             "stage1_enabled": "true" if self.stage1_enabled else "false",
             "stage2_enabled": "true" if self.stage2_enabled else "false",
             "keep_checkpoints_after_completion": "true" if self.keep_checkpoints_after_completion else "false",
+            "repair_policy": self.repair_policy,
         }
 
 
@@ -46,6 +50,7 @@ def read_validation_settings(config: Mapping[str, Any] | None) -> ValidationComp
                 default=_as_bool(config.get("keep_checkpoints_after_completion"), default=False) if config else False,
             ),
         ),
+        repair_policy=parse_repair_policy(validation_section.get("repair_policy")).value,
     )
 
 
@@ -104,6 +109,28 @@ def _cost_int_parse_error(view: "CompatConfigView", key: str) -> str:
     return ""
 
 
+def _quality_gate_section(view: "CompatConfigView") -> Dict[str, Any]:
+    return dict(view.raw_config.get("OutlineQualityGate", {}))
+
+
+def _quality_gate_bool(view: "CompatConfigView", key: str, default: bool = False) -> bool:
+    return _as_bool(_quality_gate_section(view).get(key), default=default)
+
+
+def _quality_gate_int(view: "CompatConfigView", key: str, default: int = 0) -> int:
+    try:
+        return int(_quality_gate_section(view).get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
+def _quality_gate_float(view: "CompatConfigView", key: str, default: float = 0.0) -> float:
+    try:
+        return float(_quality_gate_section(view).get(key, default))
+    except (ValueError, TypeError):
+        return default
+
+
 def _outline_model_str(view: "CompatConfigView", key: str, default: str = "") -> str:
     models = view.raw_config.get("OutlineModels", {})
     return str(models.get(key, default)).strip()
@@ -131,6 +158,9 @@ class CompatConfigView:
 
     def keep_checkpoints_after_completion(self) -> bool:
         return self.validation.keep_checkpoints_after_completion
+
+    def repair_policy(self) -> str:
+        return self.validation.repair_policy
 
     # -- Outline v2 config --
 
@@ -167,6 +197,30 @@ class CompatConfigView:
 
     def outline_test_dev_fixture_mode(self) -> bool:
         return _outline_bool(self, "test_dev_fixture_mode", default=False)
+
+    # -- Outline quality gate --
+
+    def outline_quality_gate_coverage_scope(self) -> str:
+        scope = str(_quality_gate_section(self).get("coverage_scope", "full")).strip().lower()
+        return scope if scope in {"full", "local"} else "full"
+
+    def outline_min_canonical_coverage_full(self) -> float:
+        return _quality_gate_float(self, "min_canonical_coverage_full", default=0.50)
+
+    def outline_min_canonical_coverage_local(self) -> float:
+        return _quality_gate_float(self, "min_canonical_coverage_local", default=0.25)
+
+    def outline_min_effective_sections(self) -> int:
+        return _quality_gate_int(self, "min_effective_sections", default=3)
+
+    def outline_max_duplicate_assignments(self) -> int:
+        return _quality_gate_int(self, "max_duplicate_assignments", default=0)
+
+    def outline_block_placeholder_sections(self) -> bool:
+        return _quality_gate_bool(self, "block_placeholder_sections", default=True)
+
+    def outline_block_empty_research_streams(self) -> bool:
+        return _quality_gate_bool(self, "block_empty_research_streams", default=True)
 
     # -- Outline model routing --
 

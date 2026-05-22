@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Mapping, MutableMapping
 
+from outline.v2_config import OUTLINE_QUALITY_GATE_DEFAULTS
 from config_validator import test_api_connection
 from services.config_compat import apply_validation_compat_sections
 
@@ -25,6 +26,8 @@ PROVIDER_PRESETS: Dict[str, ProviderPreset] = {
     "custom": ProviderPreset("Custom", "", append_v1=False),
     "openai": ProviderPreset("OpenAI", "https://api.openai.com/v1"),
     "openai_compatible": ProviderPreset("OpenAI Compatible", "https://api.openai.com/v1"),
+    "aihubmix": ProviderPreset("AIHubMix", "https://aihubmix.com/v1"),
+    "deepseek": ProviderPreset("DeepSeek", "https://api.deepseek.com", append_v1=False),
     "siliconflow": ProviderPreset("SiliconFlow", "https://api.siliconflow.cn/v1"),
     "videocaptioner": ProviderPreset("VideoCaptioner", "https://api.videocaptioner.cn/v1"),
     "ollama": ProviderPreset("Ollama", "http://localhost:11434", append_v1=False),
@@ -64,9 +67,16 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Primary_Reader_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "",
-            "api_base": PROVIDER_PRESETS["siliconflow"].default_api_base,
+            "model": "deepseek-v4-pro",
+            "api_base": PROVIDER_PRESETS["deepseek"].default_api_base,
             "proxy_mode": "environment",
+            "endpoint_type": "chat_completions",
+            "provider_family": "deepseek",
+            "thinking": "enabled",
+            "reasoning_effort": "max",
+            "max_context_tokens": "1000000",
+            "force_highest_reasoning": "true",
+            "omit_temperature_when_reasoning": "true",
         },
         "Backup_Reader_API": {
             "api_key": "loaded_from_.env_file",
@@ -76,15 +86,27 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Writer_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "",
-            "api_base": PROVIDER_PRESETS["videocaptioner"].default_api_base,
+            "model": "gpt-5.5",
+            "api_base": PROVIDER_PRESETS["aihubmix"].default_api_base,
             "proxy_mode": "environment",
+            "endpoint_type": "responses",
+            "provider_family": "aihubmix_openai",
+            "reasoning_effort": "high",
+            "force_highest_reasoning": "true",
+            "text_verbosity": "high",
+            "max_output_tokens": "32000",
+            "omit_temperature_when_reasoning": "true",
         },
         "Outline_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "",
-            "api_base": PROVIDER_PRESETS["videocaptioner"].default_api_base,
+            "model": "claude-opus-4-7",
+            "api_base": PROVIDER_PRESETS["aihubmix"].default_api_base,
             "proxy_mode": "environment",
+            "endpoint_type": "chat_completions",
+            "provider_family": "aihubmix_claude",
+            "reasoning_effort": "xhigh",
+            "reasoning_display": "summarized",
+            "force_highest_reasoning": "true",
         },
         "Free_Mode_API": {
             "api_key": "loaded_from_.env_file",
@@ -147,9 +169,9 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "backup_temperature": "0.3",
             "concept_max_tokens": "4000",
             "concept_temperature": "0.3",
-            "writer_max_tokens": "8000",
+            "writer_max_tokens": "32000",
             "writer_temperature": "0.5",
-            "outline_max_tokens": "6000",
+            "outline_max_tokens": "16000",
             "outline_temperature": "0.4",
             "free_mode_max_tokens": "6000",
             "free_mode_temperature": "0.4",
@@ -161,16 +183,22 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Validator_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "",
-            "api_base": PROVIDER_PRESETS["openai"].default_api_base,
+            "model": "deepseek-v4-pro",
+            "api_base": PROVIDER_PRESETS["deepseek"].default_api_base,
             "proxy_mode": "environment",
-            "thinking": "",
-            "reasoning_effort": "",
+            "endpoint_type": "chat_completions",
+            "provider_family": "deepseek",
+            "thinking": "enabled",
+            "reasoning_effort": "max",
+            "max_context_tokens": "1000000",
+            "force_highest_reasoning": "true",
+            "omit_temperature_when_reasoning": "true",
         },
         "Validation": {
             "stage1_enabled": "false",
             "stage2_enabled": "true",
             "keep_checkpoints_after_completion": "false",
+            "repair_policy": "report_only",
             "evidence_resolver_enabled": "true",
             "visual_refs_enabled": "true",
             "review_drift_threshold": "0.3",
@@ -198,6 +226,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "max_summary_refs_per_prompt": "80",
             "max_outline_retry_count": "2",
         },
+        "OutlineQualityGate": dict(OUTLINE_QUALITY_GATE_DEFAULTS),
     }
 
 
@@ -331,6 +360,17 @@ def save_config_and_env(
                 normalized[section_name].get("api_base")
                 or normalized["Writer_API"].get("api_base", "")
             )
+            for inherited_key in (
+                "endpoint_type",
+                "provider_family",
+                "reasoning_effort",
+                "reasoning_display",
+                "force_highest_reasoning",
+            ):
+                normalized[section_name][inherited_key] = normalized[section_name].get(
+                    inherited_key,
+                    "",
+                )
         if section_name == "Free_Mode_API":
             normalized[section_name]["model"] = (
                 normalized[section_name].get("model")
@@ -340,6 +380,18 @@ def save_config_and_env(
                 normalized[section_name].get("api_base")
                 or normalized["Outline_API"].get("api_base", "")
             )
+            for inherited_key in (
+                "endpoint_type",
+                "provider_family",
+                "reasoning_effort",
+                "reasoning_display",
+                "text_verbosity",
+                "max_output_tokens",
+                "force_highest_reasoning",
+                "omit_temperature_when_reasoning",
+            ):
+                if not normalized[section_name].get(inherited_key):
+                    normalized[section_name][inherited_key] = normalized["Outline_API"].get(inherited_key, "")
 
     write_config_file(normalized, config_path=config_path)
     env_payload = {

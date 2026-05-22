@@ -157,6 +157,7 @@ class ApplyGuardResult:
     anchor_hash_guard_passed: bool
     dependency_guard_passed: bool
     block_reasons: List[str] = field(default_factory=list)
+    auto_safe_guard_passed: bool = True
     
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

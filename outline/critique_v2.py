@@ -23,6 +23,15 @@ from outline.v2_models import (
 )
 
 
+BLOCKING_CRITIQUE_CATEGORIES = {
+    "scope_mismatch",
+    "weak_support_from_summaries",
+    "missing_paper_coverage",
+    "redundant_section",
+    "paper_misplacement",
+}
+
+
 ModelCaller = Callable[[str, str, Dict[str, Any]], Any]
 
 
@@ -200,7 +209,7 @@ def run_structure_critique_deterministic(
                 critiques.append(CritiqueItem(
                     critique_id=str(uuid.uuid4()),
                     category="redundant_section",
-                    severity="low",
+                    severity="high",
                     description=f"Section '{candidate.sections[i].title}' appears redundant",
                     target_candidate_id=candidate.candidate_id,
                     target_section_id=candidate.sections[i].section_id,
@@ -276,7 +285,9 @@ def _critique_prompt(candidates: OutlineCandidates, critic_role: str) -> str:
         f"Run an Outline Intelligence v2 {critic_role} critique. Return strict JSON "
         "with a top-level critiques list. Each critique must include category, "
         "severity, description, target_candidate_id/target_section_id when relevant, "
-        "evidence_refs, and suggested_fix.\n\n"
+        "evidence_refs, and suggested_fix. Write description and suggested_fix in "
+        "Simplified Chinese when possible; keep category, severity, ids, and evidence_refs "
+        "as controlled machine fields.\n\n"
         + json.dumps(
             {
                 "critic_role": critic_role,

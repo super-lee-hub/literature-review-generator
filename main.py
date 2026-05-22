@@ -45,7 +45,8 @@ from ai_interface import (  # type: ignore
     get_concept_analysis,
     _call_ai_api,
     _call_ai_api_text_detailed,
-    _post_with_proxy_mode,
+    _smart_json_parser,
+    _auto_correct_json,
 )
 from docx_writer import create_word_document, append_section_to_word_document, generate_word_table_of_contents, generate_apa_references_from_manifest
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
@@ -72,7 +73,12 @@ from services.queue_service import CancelToken, PersistentQueueService, QueueJob
 from services.review_draft import build_review_draft_v1, build_review_draft_v2
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import is_blocked_stage1_quality
-from services.model_selection import get_outline_api_config
+from services.model_selection import (
+    get_backup_reader_api_config,
+    get_outline_api_config,
+    get_reader_api_config,
+    get_writer_api_config,
+)
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
 from services.summary_reuse import (
     ResolvedSummarySet,
@@ -656,32 +662,79 @@ class LiteratureReviewGenerator:
     def _outline_v2_model_call(self, route_name: str, prompt: str, metadata: Dict[str, Any]) -> Any:
         """Call the configured v2 model route and return provider JSON."""
         config = self.config or {}
+        api_params = config.get("API_Parameters", {}) if isinstance(config.get("API_Parameters", {}), dict) else {}
         if route_name == "Outline_API":
             api_config = get_outline_api_config(config)
+            max_token_key = "outline_max_tokens"
+            default_max_tokens = 16000
+            default_temperature = 0.4
         elif route_name == "Writer_API":
-            from services.model_selection import get_writer_api_config
-
             api_config = get_writer_api_config(config)
+            max_token_key = "writer_max_tokens"
+            default_max_tokens = 32000
+            default_temperature = 0.7
         elif route_name == "Primary_Reader_API":
-            from services.model_selection import get_reader_api_config
-
             api_config = get_reader_api_config(config)
+            max_token_key = "primary_max_tokens"
+            default_max_tokens = 5000
+            default_temperature = 0.3
         else:
             api_config = get_outline_api_config(config)
+            max_token_key = "outline_max_tokens"
+            default_max_tokens = 16000
+            default_temperature = 0.4
+
+        try:
+            max_tokens = int(api_config.get("max_tokens") or api_params.get(max_token_key) or default_max_tokens)
+        except (TypeError, ValueError):
+            max_tokens = default_max_tokens
+        try:
+            temperature = float(api_params.get(max_token_key.replace("max_tokens", "temperature"), default_temperature))
+        except (TypeError, ValueError):
+            temperature = default_temperature
+        stage = str(metadata.get("stage") or "outline_v2")
+        default_timeout_seconds = 600 if stage == "outline_candidates" else 180
+        timeout_key = f"outline_v2_{stage}_timeout_seconds"
+        retries_key = f"outline_v2_{stage}_retry_attempts"
+        try:
+            timeout_seconds = int(api_params.get(timeout_key) or api_params.get("outline_v2_timeout_seconds") or default_timeout_seconds)
+        except (TypeError, ValueError):
+            timeout_seconds = default_timeout_seconds
+        try:
+            retry_attempts = int(api_params.get(retries_key) or api_params.get("outline_v2_retry_attempts") or (2 if stage == "outline_candidates" else 1))
+        except (TypeError, ValueError):
+            retry_attempts = 2 if stage == "outline_candidates" else 1
 
         system_prompt = (
             "You are an Outline Intelligence v2 structured JSON generator. "
             "Use only the provided controlled-corpus evidence and return strict JSON."
         )
-        return _call_ai_api(
+        candidate_index = metadata.get("candidate_index")
+        self.logger.info(
+            f"Outline v2 model call start: stage={stage}, candidate_index={candidate_index}, "
+            f"prompt_chars={len(prompt)}, max_tokens={max_tokens}, timeout_seconds={timeout_seconds}, "
+            f"retry_attempts={retry_attempts}, route={route_name}"
+        )
+        response = _call_ai_api_text_detailed(
             prompt=prompt,
             api_config=api_config,
             system_prompt=system_prompt,
-            max_tokens=8192,
-            temperature=0.2,
-            response_format="json",
+            max_tokens=max_tokens,
+            temperature=temperature,
             logger=self.logger,
+            retry_attempts=retry_attempts,
+            timeout_seconds=timeout_seconds,
         )
+        content = str(response.get("content") or "")
+        parsed = _smart_json_parser(content) or _auto_correct_json(content)
+        if parsed is not None:
+            self.logger.info(f"Outline v2 model call parsed JSON: stage={stage}, candidate_index={candidate_index}")
+            return parsed
+        self.logger.error(
+            f"Outline v2 model call returned unparseable JSON: stage={stage}, "
+            f"candidate_index={candidate_index}, message={response.get('message', '')}"
+        )
+        return None
 
     def _load_paper_artifacts_for_outline_v2(self) -> List[Dict[str, Any]]:
         if not self.job_workspace:
@@ -1431,6 +1484,11 @@ class LiteratureReviewGenerator:
                     )
 
             self.job_workspace.ensure_exists()
+            if self.artifact_registry is None:
+                self.artifact_registry = ArtifactRegistry(
+                    self.job_workspace.paths.registry_path,
+                    self.job_workspace.job_id,
+                )
             self.output_dir = self.job_workspace.root_dir
             self.summary_file = self._get_summary_file_path()
             
@@ -3465,22 +3523,8 @@ class LiteratureReviewGenerator:
                 
                 # 提取分析引擎API配置
                 self._emit_progress(stage="analyze", item_label=paper_label, message=f"正在调用AI生成摘要: {paper_label}")
-                primary_reader_config: Dict[str, str] = self.config.get('Primary_Reader_API', {}) if self.config else {}
-                reader_api_config: APIConfig = {
-                    'api_key': primary_reader_config.get('api_key', ''),
-                    'model': primary_reader_config.get('model', ''),
-                    'api_base': primary_reader_config.get('api_base', 'https://api.openai.com/v1'),
-                    'proxy_mode': primary_reader_config.get('proxy_mode', 'environment'),
-                }
-                
-                # 提取备用引擎API配置（用于超长论文）
-                backup_reader_config: Dict[str, str] = self.config.get('Backup_Reader_API', {}) if self.config else {}
-                backup_api_config: APIConfig = {
-                    'api_key': backup_reader_config.get('api_key', ''),
-                    'model': backup_reader_config.get('model', ''),
-                    'api_base': backup_reader_config.get('api_base', 'https://api.openai.com/v1'),
-                    'proxy_mode': backup_reader_config.get('proxy_mode', 'environment'),
-                }
+                reader_api_config: APIConfig = get_reader_api_config(self.config)
+                backup_api_config: APIConfig = get_backup_reader_api_config(self.config)
                 
                 visual_bundle = self._build_stage1_visual_bundle(
                     paper=paper,
@@ -3766,13 +3810,7 @@ class LiteratureReviewGenerator:
                 )
                 
                 # 获取写作引擎的 API 配置
-                writer_config: Dict[str, str] = self.config.get('Writer_API', {}) if self.config else {}
-                writer_api_config: APIConfig = {
-                    'api_key': writer_config.get('api_key') or '',  # type: ignore
-                    'model': writer_config.get('model') or '',  # type: ignore
-                    'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
-                    'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
-                }
+                writer_api_config: APIConfig = get_writer_api_config(self.config)
 
                 # 调用概念分析接口
                 concept_analysis_result = get_concept_analysis(concept_prompt, writer_api_config, logger=self.logger, config=self.config)
@@ -5010,13 +5048,7 @@ class LiteratureReviewGenerator:
             self.logger.info(f"生成综述提示词: {len(section_prompt)}字符")
 
             # 提取写作引擎API配置
-            writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
-            writer_api_config: APIConfig = {
-                'api_key': writer_config.get('api_key') or '',  # type: ignore
-                'model': writer_config.get('model') or '',  # type: ignore
-                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
-                'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
-            }
+            writer_api_config: APIConfig = get_writer_api_config(self.config)
 
             self.logger.info(f"正在调用写作引擎生成章节内容: {section_title}")
 
@@ -5279,6 +5311,8 @@ class LiteratureReviewGenerator:
                     return False
                 self.logger.success(f"Dummy review saved to {word_file}")
                 return True
+
+            writer_api_config: APIConfig = get_writer_api_config(self.config)
             
             # 加载大纲文件
             if not self.output_dir:
@@ -6133,113 +6167,52 @@ class LiteratureReviewGenerator:
             final_prompt = self._inject_free_mode_context(final_prompt)
             self.logger.success(f"生成最终综述提示词: {len(final_prompt)}字符")
 
-            # 提取写作引擎API配置
-            writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
-            writer_api_config: APIConfig = {
-                'api_key': writer_config.get('api_key') or '',  # type: ignore
-                'model': writer_config.get('model') or '',  # type: ignore
-                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
-                'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
-            }
+            writer_api_config: APIConfig = get_writer_api_config(self.config)
 
-            self.logger.info("正在调用写作引擎生成文献综述...")
+            self.logger.info("Calling Writer_API to generate literature review...")
 
-            # ===== 专门为综述调用设计的API接口（不强制JSON格式）=====
-            import requests  # type: ignore
-
-            api_key = writer_api_config.get('api_key') or ''
-            api_base = writer_api_config.get('api_base', 'https://api.openai.com/v1')
-            model_name = writer_api_config.get('model') or ''
-
-            api_url = f"{api_base.rstrip('/')}/chat/completions"  # type: ignore
-
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
-            }
-
-            # 专门为综述设计的系统提示词（返回纯文本）
             try:
                 with open('prompts/prompt_system_synthesize.txt', 'r', encoding='utf-8') as f:
                     system_prompt = f.read()
-                self.logger.success(f"加载综述系统提示词模板: {len(system_prompt)}字符")
+                self.logger.success(f"Loaded review system prompt template: {len(system_prompt)} characters")
             except Exception as e:
-                self.logger.warning(f"无法加载综述系统提示词模板，使用默认提示词: {e}")
-                system_prompt = """你是一个学术文献综述专家。请基于提供的文献分析结果生成一份完整的中文学术综述报告。
+                self.logger.warning(f"Unable to load review system prompt template, using default prompt: {e}")
+                system_prompt = """You are an academic literature review expert. Generate a complete Chinese academic literature review from the provided paper analysis results.
 
-要求：
-1. 直接输出纯文本格式的综述内容，不要使用JSON格式
-2. 使用markdown格式组织结构（标题用#, ##等）
-3. 内容需要专业、客观、全面
-4. 适当引用具体文献以支持论点
-5. 总字数控制在3000-5000字"""
+Requirements:
+1. Output plain review text, not JSON.
+2. Use Markdown headings.
+3. Keep the content professional, objective, and comprehensive.
+4. Cite specific papers where appropriate.
+5. Target 3000-5000 Chinese characters."""
 
-            payload: Dict[str, Any] = {  # type: ignore
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": final_prompt
-                    }
-                ],
-                "temperature": 0.7,
-                "max_tokens": 8000  # 综述需要更长的响应
-            }
+            api_params = (self.config or {}).get("API_Parameters", {}) if self.config else {}
+            try:
+                max_tokens = int(api_params.get("writer_max_tokens", 8000))
+            except (TypeError, ValueError):
+                max_tokens = 8000
+            try:
+                temperature = float(api_params.get("writer_temperature", 0.7))
+            except (TypeError, ValueError):
+                temperature = 0.7
 
-            # 重试逻辑
-            max_retries = 5
-            for attempt in range(max_retries):
-                try:
-                    self.logger.info(f"综述生成尝试 {attempt + 1}/{max_retries}")
-
-                    response = _post_with_proxy_mode(
-                        api_url,
-                        api_config=writer_api_config,
-                        headers=headers,
-                        json=payload,
-                        timeout=300  # 5分钟超时
-                    )
-
-                    response.raise_for_status()
-                    response_data = response.json()
-
-                    # 提取AI回复内容
-                    review_content = response_data['choices'][0]['message']['content']
-
-                    if review_content and len(review_content) > 100:
-                        self.logger.success("写作引擎返回综述文本")
-                        return review_content
-                    else:
-                        self.logger.warning(f"综述内容过短({len(review_content)}字符)，重试...")
-
-                except requests.exceptions.HTTPError as e:
-                    if attempt < max_retries - 1:
-                        wait_time = 2 * (2 ** attempt)
-                        self.logger.warning(f"HTTP错误 {response.status_code if 'response' in locals() else '?'}，{wait_time:.1f}秒后重试...")  # type: ignore
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        self.logger.error(f"综述生成失败: {str(e)}")
-                        return None
-
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        wait_time = 2 * (2 ** attempt)
-                        self.logger.warning(f"错误: {str(e)}，{wait_time:.1f}秒后重试...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        self.logger.error(f"综述生成最终失败: {str(e)}")
-                        return None
-
+            result = _call_ai_api_text_detailed(
+                prompt=final_prompt,
+                api_config=writer_api_config,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                logger=self.logger,
+            )
+            review_content = result.get("content")
+            if review_content and len(str(review_content)) > 100:
+                self.logger.success("Writer_API returned review text")
+                return str(review_content)
+            self.logger.error(f"Review generation failed: {result.get('message', 'empty response')}")
             return None
 
         except Exception as e:
-            self.logger.error(f"生成综述内容失败: {e}")
+            self.logger.error(f"Failed to generate review content: {e}")
             return None
 
     @staticmethod
@@ -6324,22 +6297,8 @@ class LiteratureReviewGenerator:
                     }
                     
                     # 获取API配置
-                    primary_config: Dict[str, str] = self.config.get('Primary_Reader_API', {}) if self.config else {}  # type: ignore
-                    backup_config: Dict[str, str] = self.config.get('Backup_Reader_API', {}) if self.config else {}  # type: ignore
-                    
-                    reader_api_config: APIConfig = {
-                        'api_key': primary_config.get('api_key', ''),  # type: ignore
-                        'model': primary_config.get('model', ''),  # type: ignore
-                        'api_base': primary_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
-                        'proxy_mode': primary_config.get('proxy_mode', 'environment'),  # type: ignore
-                    }
-                    
-                    backup_api_config: APIConfig = {
-                        'api_key': backup_config.get('api_key', ''),  # type: ignore
-                        'model': backup_config.get('model', ''),  # type: ignore
-                        'api_base': backup_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
-                        'proxy_mode': backup_config.get('proxy_mode', 'environment'),  # type: ignore
-                    }
+                    reader_api_config: APIConfig = get_reader_api_config(self.config)
+                    backup_api_config: APIConfig = get_backup_reader_api_config(self.config)
                     
                     # 构建完整的分析提示词
                     try:
@@ -6452,13 +6411,7 @@ class LiteratureReviewGenerator:
             final_prompt = prompt_template.replace('{{CONCEPT_NAME}}', concept_name).replace('{{SEED_PAPERS}}', papers_json)
             
             # 调用AI生成概念学习笔记
-            writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
-            writer_api_config: APIConfig = {
-                'api_key': writer_config.get('api_key') or '',  # type: ignore
-                'model': writer_config.get('model') or '',  # type: ignore
-                'api_base': writer_config.get('api_base', 'https://api.openai.com/v1'),  # type: ignore
-                'proxy_mode': writer_config.get('proxy_mode', 'environment'),  # type: ignore
-            }
+            writer_api_config: APIConfig = get_writer_api_config(self.config)
             
             # 设置系统提示词
             system_prompt = """你是一位学术研究专家，专门研究概念的历史发展和理论演化。请基于提供的种子论文，生成一个关于指定概念的全面学习笔记，并以JSON格式返回。"""
@@ -7227,7 +7180,7 @@ def main() -> None:  # type: ignore
         help='仅运行阶段一：文献分析'
     )
     workflow_group.add_argument(
-        '--generate-outline', '-o',
+        '--generate-outline', '-o', '--outline',
         action='store_true', 
         help='仅运行阶段二：生成大纲'
     )

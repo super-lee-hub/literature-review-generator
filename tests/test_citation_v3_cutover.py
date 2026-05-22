@@ -21,8 +21,16 @@ class _DummyLogger:
 
 
 class _DummyConfig:
+    def __init__(self, repair_policy="report_only"):
+        self.repair_policy = repair_policy
+
     def getboolean(self, _section, _option, fallback=False):
         return True
+
+    def get(self, section, fallback=None):
+        if section == "Validation":
+            return {"repair_policy": self.repair_policy}
+        return fallback if fallback is not None else {}
 
 
 def _target_claim_unit() -> dict:
@@ -88,7 +96,7 @@ def test_render_structured_citations_prefers_manifest_entries():
     assert "(Smith & Jones, 2024)" in rendered
 
 
-def test_run_review_validation_rebuilds_after_summary_only_repairs(monkeypatch):
+def test_run_review_validation_report_only_does_not_apply_summary_repairs(monkeypatch):
     generator = types.SimpleNamespace(
         logger=_DummyLogger(),
         config=_DummyConfig(),
@@ -146,10 +154,177 @@ def test_run_review_validation_rebuilds_after_summary_only_repairs(monkeypatch):
         return {"artifact_version": "v3", "citation_sets": [], "paper_entries": []}
 
     monkeypatch.setattr(validator, "_persist_repaired_review_artifacts", _fake_persist)
+    monkeypatch.setattr(validator, "_get_validation_workspace", lambda _g: types.SimpleNamespace(job_id="job-1", paths=types.SimpleNamespace(registry_path="registry.json")))
+
+    def _fake_pipeline(**kwargs):
+        return {
+            "repair_pipeline": True,
+            "repair_policy": kwargs["repair_policy"].value,
+            "applied": False,
+        }
+
+    monkeypatch.setattr("services.repair_integration.run_repair_pipeline", _fake_pipeline)
 
     result = validator.run_review_validation(generator)
 
     assert result["success"] is True
+    assert persisted.get("called") is None
+    assert result["repair_policy"] == "report_only"
+    assert result["repair_pipeline"]["repair_policy"] == "report_only"
+
+
+def test_run_review_validation_reports_repair_pipeline_failure_in_report_only(monkeypatch):
+    generator = types.SimpleNamespace(
+        logger=_DummyLogger(),
+        config=_DummyConfig(),
+        summaries=[],
+    )
+
+    report = ReviewValidationReport(
+        report_id="report-1",
+        created_at="2026-04-18T00:00:00Z",
+        total_citations=0,
+        supported_count=0,
+        partial_support_count=0,
+        unsupported_count=0,
+        wrong_source_count=0,
+        needs_review_count=0,
+        citation_results=[],
+    )
+
+    class _DummyReviewValidator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def validate(self):
+            return report
+
+    monkeypatch.setattr("validation.review_validator.ReviewValidator", _DummyReviewValidator)
+    monkeypatch.setattr(validator, "_load_validation_inputs", lambda _g: ({"content": {"sections": []}}, {"artifact_version": "v3", "citation_sets": [], "paper_entries": []}, [], {}, {}))
+    monkeypatch.setattr(validator, "_build_report_from_results", lambda results: report)
+    monkeypatch.setattr(validator, "_write_validation_reports", lambda *_args, **_kwargs: {"report_file": "report.txt", "manual_report_file": "manual.json"})
+    monkeypatch.setattr(validator, "_get_validation_workspace", lambda _g: types.SimpleNamespace(job_id="job-1", paths=types.SimpleNamespace(registry_path="registry.json")))
+    monkeypatch.setattr("services.repair_integration.run_repair_pipeline", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("planner exploded")))
+
+    result = validator.run_review_validation(generator)
+
+    assert result["success"] is True
+    assert result["status"] == "success"
+    assert result["repair_pipeline"] == {
+        "repair_pipeline": True,
+        "status": "failed",
+        "repair_policy": "report_only",
+        "error": "planner exploded",
+    }
+
+
+def test_run_review_validation_non_report_repair_pipeline_failure_is_partial(monkeypatch):
+    generator = types.SimpleNamespace(
+        logger=_DummyLogger(),
+        config=_DummyConfig(repair_policy="auto_safe"),
+        summaries=[],
+    )
+
+    report = ReviewValidationReport(
+        report_id="report-1",
+        created_at="2026-04-18T00:00:00Z",
+        total_citations=0,
+        supported_count=0,
+        partial_support_count=0,
+        unsupported_count=0,
+        wrong_source_count=0,
+        needs_review_count=0,
+        citation_results=[],
+    )
+
+    class _DummyReviewValidator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def validate(self):
+            return report
+
+    monkeypatch.setattr("validation.review_validator.ReviewValidator", _DummyReviewValidator)
+    monkeypatch.setattr(validator, "_load_validation_inputs", lambda _g: ({"content": {"sections": []}}, {"artifact_version": "v3", "citation_sets": [], "paper_entries": []}, [], {}, {}))
+    monkeypatch.setattr(validator, "_build_report_from_results", lambda results: report)
+    monkeypatch.setattr(validator, "_write_validation_reports", lambda *_args, **_kwargs: {"report_file": "report.txt", "manual_report_file": "manual.json"})
+    monkeypatch.setattr(validator, "_get_validation_workspace", lambda _g: types.SimpleNamespace(job_id="job-1", paths=types.SimpleNamespace(registry_path="registry.json")))
+    monkeypatch.setattr("services.repair_integration.run_repair_pipeline", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("planner exploded")))
+
+    result = validator.run_review_validation(generator)
+
+    assert result["success"] is False
+    assert result["status"] == "partial"
+    assert result["repair_pipeline"]["status"] == "failed"
+    assert result["repair_pipeline"]["repair_policy"] == "auto_safe"
+
+
+def test_run_review_validation_full_auto_experimental_allows_legacy_repairs(monkeypatch):
+    generator = types.SimpleNamespace(
+        logger=_DummyLogger(),
+        config=_DummyConfig(repair_policy="full_auto_experimental"),
+        summaries=[],
+    )
+
+    citation_result = CitationValidationResult(
+        citation_id="cite-1",
+        paper_id="paper-1",
+        conclusion=ValidationConclusion.PARTIAL_SUPPORT,
+        root_causes=[RootCause.SUMMARY_DRIFT],
+        evidence_candidates=[],
+        details={"repair_scope": "summary", "summary_paper_ids": ["paper-1"]},
+        claim_text="Claim text",
+        claim_context="Section 1",
+        evidence_excerpt_list=[],
+        reasoning_summary="Needs summary repair",
+        repair_hint="Refresh the summary",
+        citation_set_key="paper-1",
+        paper_ids=["paper-1"],
+        block_ids=[],
+        low_confidence=False,
+    )
+    report = ReviewValidationReport(
+        report_id="report-1",
+        created_at="2026-04-18T00:00:00Z",
+        total_citations=1,
+        supported_count=0,
+        partial_support_count=1,
+        unsupported_count=0,
+        wrong_source_count=0,
+        needs_review_count=0,
+        citation_results=[citation_result],
+    )
+
+    class _DummyReviewValidator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def validate(self):
+            return report
+
+    monkeypatch.setattr("validation.review_validator.ReviewValidator", _DummyReviewValidator)
+    monkeypatch.setattr(validator, "_load_validation_inputs", lambda _g: ({"content": {"sections": []}}, {"artifact_version": "v3", "citation_sets": [], "paper_entries": []}, [], {}, {}))
+    monkeypatch.setattr(validator, "_run_ai_bundle_validation", lambda _g, result: result)
+    monkeypatch.setattr(validator, "_apply_summary_repairs", lambda *_args, **_kwargs: ["paper-1"])
+    monkeypatch.setattr(validator, "_apply_review_repairs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(validator, "_build_report_from_results", lambda results: report)
+    monkeypatch.setattr(validator, "_write_validation_reports", lambda *_args, **_kwargs: {"report_file": "report.txt", "manual_report_file": "manual.json"})
+    monkeypatch.setattr(validator, "_get_validation_workspace", lambda _g: types.SimpleNamespace(job_id="job-1", paths=types.SimpleNamespace(registry_path="registry.json")))
+    monkeypatch.setattr("services.repair_integration.run_repair_pipeline", lambda **kwargs: {"repair_pipeline": True, "repair_policy": kwargs["repair_policy"].value})
+
+    persisted = {}
+
+    def _fake_persist(*_args, **_kwargs):
+        persisted["called"] = True
+        return {"artifact_version": "v3", "citation_sets": [], "paper_entries": []}
+
+    monkeypatch.setattr(validator, "_persist_repaired_review_artifacts", _fake_persist)
+
+    result = validator.run_review_validation(generator)
+
+    assert result["success"] is True
+    assert result["repair_policy"] == "full_auto_experimental"
+    assert result["unsafe_auto_rewrite_enabled"] is True
     assert persisted["called"] is True
 
 

@@ -45,6 +45,13 @@ from ai_interface import _call_ai_api  # type: ignore
 from context_manager import estimate_tokens
 from summary_schema import get_core_analysis
 from validation.llm_adjudicator import build_adjudication_packet, run_adjudication_stage
+from services.model_selection import get_validator_api_config
+from services.repair_policy import (
+    ValidationRepairPolicy,
+    parse_repair_policy,
+    requires_manual_confirmation,
+    unsafe_auto_rewrite_enabled,
+)
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:
@@ -97,6 +104,16 @@ def _get_validation_max_workers(generator_instance: Any) -> int:
         if parsed > 0:
             return parsed
     return 1
+
+
+def _get_validation_repair_policy(generator_instance: Any) -> ValidationRepairPolicy:
+    compat_config = getattr(generator_instance, "compat_config", None)
+    repair_policy_getter = getattr(compat_config, "repair_policy", None)
+    if callable(repair_policy_getter):
+        return parse_repair_policy(repair_policy_getter())
+    config_obj = getattr(generator_instance, "config", None)
+    validation_config = _get_config_section(config_obj, "Validation")
+    return parse_repair_policy(validation_config.get("repair_policy"))
 
 
 def _get_validator_context_max_tokens(generator_instance: Any) -> int:
@@ -602,23 +619,9 @@ def _get_validator_api_config(generator_instance: Any) -> Optional[APIConfig]:
                 validator_section = getter("Validator_API") or {}
             except TypeError:
                 validator_section = {}
-    validator_config: Dict[str, Any] = validator_section
-    api_key = str(validator_config.get("api_key") or "").strip()
-    model = str(validator_config.get("model") or "").strip()
-    if not api_key or not model:
+    api_config = get_validator_api_config({"Validator_API": validator_section})
+    if not str(api_config.get("api_key") or "").strip() or not str(api_config.get("model") or "").strip():
         return None
-    api_config = APIConfig(
-        api_key=api_key,
-        model=model,
-        api_base=str(validator_config.get("api_base") or "https://api.openai.com/v1").strip(),
-        proxy_mode=str(validator_config.get("proxy_mode") or "environment").strip(),
-    )
-    thinking = str(validator_config.get("thinking") or "").strip()
-    reasoning_effort = str(validator_config.get("reasoning_effort") or "").strip()
-    if thinking:
-        api_config["thinking"] = thinking
-    if reasoning_effort:
-        api_config["reasoning_effort"] = reasoning_effort
     return api_config
 
 
@@ -1150,7 +1153,12 @@ def _persist_repaired_review_artifacts(generator_instance: Any, review_draft: Di
     return citation_manifest
 
 
-def _write_validation_reports(generator_instance: Any, report: Any, manual_review_items: List[Any]) -> Dict[str, str]:
+def _write_validation_reports(
+    generator_instance: Any,
+    report: Any,
+    manual_review_items: List[Any],
+    repair_policy: ValidationRepairPolicy,
+) -> Dict[str, str]:
     workspace = _get_validation_workspace(generator_instance)
     project_name = workspace.project_name
     os.makedirs(workspace.paths.reports_dir, exist_ok=True)
@@ -1158,6 +1166,8 @@ def _write_validation_reports(generator_instance: Any, report: Any, manual_revie
     manual_report_file = os.path.join(workspace.paths.reports_dir, f"{project_name}_manual_review_report.json")
 
     lines = ["auto-generate validation report", f"generated_at: {datetime.now().isoformat()}", "=" * 40]
+    lines.append(f"repair_policy: {repair_policy.value}")
+    lines.append(f"unsafe_auto_rewrite_enabled: {unsafe_auto_rewrite_enabled(repair_policy)}")
     lines.append("summary")
     lines.append(f"total_citation_sets: {report.total_citations}")
     lines.append(f"supported: {report.supported_count}")
@@ -1187,6 +1197,10 @@ def _write_validation_reports(generator_instance: Any, report: Any, manual_revie
 
     manual_payload = {
         "generated_at": datetime.now().isoformat(),
+        "repair_policy": repair_policy.value,
+        "requires_manual_confirmation": requires_manual_confirmation(repair_policy),
+        "eligible_for_manual_apply": requires_manual_confirmation(repair_policy),
+        "unsafe_auto_rewrite_enabled": unsafe_auto_rewrite_enabled(repair_policy),
         "total_items": len(manual_review_items),
         "items": [
             {
@@ -1219,6 +1233,9 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
         if not stage2_enabled:  # type: ignore
             generator_instance.logger.warning("Stage-2 validation is disabled; skipping review validation.")  # type: ignore
             return {"success": True, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+
+        repair_policy = _get_validation_repair_policy(generator_instance)
+        generator_instance.logger.info(f"Validation repair policy: {repair_policy.value}")
 
         review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata = _load_validation_inputs(generator_instance)
         if review_draft is None or citation_manifest is None:
@@ -1258,11 +1275,47 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             max_workers=validation_max_workers,
         )
         final_report = _build_report_from_results(enriched_results)
+        manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
+        report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items, repair_policy)
+        generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
+        generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
 
-        touched_summaries = _apply_summary_repairs(generator_instance, enriched_results, paper_artifacts)
-        touched_blocks = _apply_review_repairs(generator_instance, review_draft, enriched_results)
-        if touched_summaries or touched_blocks:
-            citation_manifest = _persist_repaired_review_artifacts(generator_instance, review_draft)
+        repair_pipeline_result = None
+        try:
+            from services.repair_integration import run_repair_pipeline
+            from services.artifact_registry import ArtifactRegistry
+
+            workspace = _get_validation_workspace(generator_instance)
+            registry = getattr(generator_instance, "artifact_registry", None) or ArtifactRegistry(
+                workspace.paths.registry_path,
+                workspace.job_id,
+            )
+            repair_pipeline_result = run_repair_pipeline(
+                validation_report=final_report,
+                review_draft=review_draft,
+                citation_manifest=citation_manifest,
+                paper_artifacts=paper_artifacts,
+                job_id=workspace.job_id,
+                workspace=workspace,
+                registry=registry,
+                repair_policy=repair_policy,
+            )
+        except Exception as exc:
+            generator_instance.logger.warning(f"Repair plan generation failed: {exc}")
+            repair_pipeline_result = {
+                "repair_pipeline": True,
+                "status": "failed",
+                "repair_policy": repair_policy.value,
+                "error": str(exc),
+            }
+
+        touched_summaries: List[str] = []
+        touched_blocks: List[str] = []
+        if unsafe_auto_rewrite_enabled(repair_policy):
+            touched_summaries = _apply_summary_repairs(generator_instance, enriched_results, paper_artifacts)
+            touched_blocks = _apply_review_repairs(generator_instance, review_draft, enriched_results)
+            if touched_summaries or touched_blocks:
+                citation_manifest = _persist_repaired_review_artifacts(generator_instance, review_draft)
 
         if touched_summaries or touched_blocks:
             generator_instance.logger.info("Repairs applied; re-running review validation.")
@@ -1281,19 +1334,31 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
                 max_workers=validation_max_workers,
             )
             final_report = _build_report_from_results(rerun_results)
+            manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
+            report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items, repair_policy)
+            generator_instance.logger.success(f"Validation recheck report written: {report_paths['report_file']}")
+            generator_instance.logger.info(f"Manual review recheck report written: {report_paths['manual_report_file']}")
 
-        manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
-        report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items)
-        generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
-        generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
+        repair_pipeline_failed = (
+            isinstance(repair_pipeline_result, dict)
+            and repair_pipeline_result.get("status") == "failed"
+        )
+        repair_pipeline_blocks_success = (
+            repair_pipeline_failed
+            and repair_policy != ValidationRepairPolicy.REPORT_ONLY
+        )
 
         return {
-            "success": True,
+            "success": not repair_pipeline_blocks_success,
+            "status": "partial" if repair_pipeline_blocks_success else "success",
             "report": final_report,
             "review_draft": review_draft,
             "citation_manifest": citation_manifest,
             "paper_artifacts": paper_artifacts,
             "manual_review_items": manual_review_items,
+            "repair_policy": repair_policy.value,
+            "unsafe_auto_rewrite_enabled": unsafe_auto_rewrite_enabled(repair_policy),
+            "repair_pipeline": repair_pipeline_result,
             **report_paths,
         }
 
