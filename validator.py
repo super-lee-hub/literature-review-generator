@@ -734,7 +734,41 @@ def _attach_adjudication_metadata(
 def _map_ai_bundle_result(result: Any, ai_report: Dict[str, Any]) -> Any:
     from validation.review_validator import CitationValidationResult, RootCause, ValidationConclusion
 
+    if any(
+        str(item.get("reason") or "") == "ambiguous_claim_paper_alignment"
+        for item in result.details.get("claim_unit_results", []) or []
+        if isinstance(item, dict)
+    ):
+        return _attach_adjudication_metadata(
+            result,
+            adjudication_stage=str(ai_report.get("adjudication_stage") or getattr(result, "adjudication_stage", "") or "primary"),
+            adjudication_status="ambiguous_claim_paper_alignment",
+            escalated=bool(result.details.get("escalated") or getattr(result, "escalated", False)),
+        )
+
+    claim_unit_results = [
+        item
+        for item in result.details.get("claim_unit_results", []) or []
+        if isinstance(item, dict)
+    ]
+    has_source_grounded_claim_evidence = any(
+        bool(item.get("evidence_excerpts"))
+        for item in claim_unit_results
+    )
     status = str(ai_report.get("status") or "").strip().lower()
+    raw_disposition = str(ai_report.get("disposition") or "").strip().lower()
+    clean_support_requested = status == "supported" and raw_disposition != "narrowed_and_kept"
+    if clean_support_requested and claim_unit_results and not has_source_grounded_claim_evidence:
+        ai_report = dict(ai_report)
+        ai_report["status"] = "evidence_gap"
+        ai_report["disposition"] = "manual_review"
+        ai_report["repair_scope"] = "manual_review"
+        ai_report["low_confidence"] = True
+        ai_report["manual_review_reason"] = (
+            str(ai_report.get("manual_review_reason") or "").strip()
+            or "AI adjudication found no source-grounded evidence excerpts; ai_summary hints cannot establish clean support."
+        )
+        status = "evidence_gap"
     confidence = _normalize_ai_confidence(ai_report.get("confidence"))
     repair_scope = str(ai_report.get("repair_scope") or "none").strip().lower()
     disposition = str(ai_report.get("disposition") or "").strip().lower()
@@ -1219,7 +1253,15 @@ def _write_validation_reports(
     with open(manual_report_file, "w", encoding="utf-8") as handle:
         json.dump(manual_payload, handle, ensure_ascii=False, indent=2)
 
-    return {"report_file": report_file, "manual_report_file": manual_report_file}
+    audit_paths: Dict[str, str] = {}
+    try:
+        from validation.claim_alignment_audit import write_claim_alignment_audit
+
+        audit_paths = write_claim_alignment_audit(report, workspace.paths.reports_dir)
+    except Exception:
+        audit_paths = {}
+
+    return {"report_file": report_file, "manual_report_file": manual_report_file, **audit_paths}
 
 
 def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
@@ -1279,6 +1321,8 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
         report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items, repair_policy)
         generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
         generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
+        if report_paths.get("claim_alignment_audit_json"):
+            generator_instance.logger.info(f"Claim alignment audit written: {report_paths['claim_alignment_audit_json']}")
 
         repair_pipeline_result = None
         try:
@@ -1338,6 +1382,8 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items, repair_policy)
             generator_instance.logger.success(f"Validation recheck report written: {report_paths['report_file']}")
             generator_instance.logger.info(f"Manual review recheck report written: {report_paths['manual_report_file']}")
+            if report_paths.get("claim_alignment_audit_json"):
+                generator_instance.logger.info(f"Claim alignment recheck audit written: {report_paths['claim_alignment_audit_json']}")
 
         repair_pipeline_failed = (
             isinstance(repair_pipeline_result, dict)

@@ -130,6 +130,7 @@ Thumbs.db
 
 # Project specific
 config.ini
+config.ini.backup_before_*
 config.local.ini
 config.*.local.ini
 output/

@@ -107,10 +107,16 @@ def build_adjudication_packet(result: Any, *, stage: str = "primary") -> Adjudic
     claim_type_confidence = float(result.details.get("claim_type_confidence") or getattr(result, "claim_type_confidence", 0.0) or 0.0)
     claim_type_rationale = str(result.details.get("claim_type_rationale") or "").strip()
     raw_packets = dict(result.details.get("per_paper_evidence_packets") or {})
+    checked_paper_ids = [
+        str(item).strip()
+        for item in result.details.get("checked_paper_ids", [])
+        if str(item).strip()
+    ]
+    packet_paper_ids = list(dict.fromkeys(checked_paper_ids or getattr(result, "paper_ids", []) or list(raw_packets.keys())))
     trimmed_candidate_counts: Dict[str, int] = {}
     per_paper_packets: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     target_claim_unit_id = str((getattr(result, "target_claim_unit", {}) or {}).get("claim_unit_id") or "")
-    for paper_id in list(dict.fromkeys(getattr(result, "paper_ids", []) or list(raw_packets.keys()))):
+    for paper_id in packet_paper_ids:
         paper_packets = raw_packets.get(paper_id, {})
         if isinstance(paper_packets, list):
             normalized_packets = {target_claim_unit_id or "claim_unit": [dict(item) for item in paper_packets]}
@@ -149,7 +155,7 @@ def build_adjudication_packet(result: Any, *, stage: str = "primary") -> Adjudic
         claim_type=claim_type,
         claim_type_confidence=claim_type_confidence,
         claim_type_rationale=claim_type_rationale,
-        paper_ids=list(getattr(result, "paper_ids", []) or []),
+        paper_ids=packet_paper_ids,
         claim_units=[dict(item) for item in getattr(result, "claim_units", []) or []],
         target_claim_unit=dict(getattr(result, "target_claim_unit", {}) or {}),
         claim_unit_results=[dict(item) for item in result.details.get("claim_unit_results", []) or []],
@@ -172,9 +178,12 @@ def _build_prompts(packet: AdjudicationPacket) -> tuple[str, str]:
         "- The validator judges cited claims only, not uncited bridge prose.\n"
         "- Multiple cited papers may jointly support different sub-claims inside the same sentence.\n"
         "- Do not require every paper to support the full sentence if the set jointly supports it.\n"
+        "- Respect checked_paper_ids and expected_supporting_paper_ids on each claim_unit_result; do not infer claim-paper mappings from pooled citations.\n"
+        "- If a claim_unit_result reason is ambiguous_claim_paper_alignment, keep it as evidence_gap or low_confidence/manual_review unless source identity is truly missing or wrong.\n"
         "- Distinguish result, synthesis, future-direction, and limitation/method critique claims.\n"
         "- If the evidence is still not strong enough, use an uncertainty/manual-review outcome instead of forcing unsupported.\n"
-        "- Prefer source-grounded evidence packets over summary-only hints when both are available.\n\n"
+        "- Prefer source-grounded evidence packets over summary-only hints when both are available.\n"
+        "- ai_summary packets are hints/context only and cannot by themselves justify clean source-grounded support.\n\n"
         f"Bundle packet:\n{packet_json}"
     )
     if packet.stage == "stronger":

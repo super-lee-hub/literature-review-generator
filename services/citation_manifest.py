@@ -530,6 +530,10 @@ def _strip_citation_tokens(text: str) -> str:
     return cleaned
 
 
+def _unique_non_empty(values: Sequence[Any]) -> List[str]:
+    return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+
 def _sentence_spans(block_text: str) -> List[tuple[int, int, str]]:
     text = block_text or ""
     spans: List[tuple[int, int, str]] = []
@@ -549,6 +553,80 @@ def _sentence_spans(block_text: str) -> List[tuple[int, int, str]]:
     return spans
 
 
+def _occurrence_bounds(occurrence: CitationOccurrence) -> tuple[Optional[int], Optional[int]]:
+    starts = [span.start_offset for span in occurrence.spans if isinstance(span.start_offset, int)]
+    ends = [span.end_offset for span in occurrence.spans if isinstance(span.end_offset, int)]
+    if not starts or not ends:
+        return None, None
+    return min(starts), max(ends)
+
+
+def _citation_tail_remainder(
+    sentence_text: str,
+    sentence_occurrences: Sequence[CitationOccurrence],
+    *,
+    sentence_start: int,
+) -> str:
+    starts: List[int] = []
+    for occurrence in sentence_occurrences:
+        start, _end = _occurrence_bounds(occurrence)
+        if start is not None:
+            starts.append(max(start - sentence_start, 0))
+    if not starts:
+        return sentence_text
+
+    tail = sentence_text[min(starts):]
+    for occurrence in sentence_occurrences:
+        if occurrence.citation_token:
+            tail = tail.replace(occurrence.citation_token, "")
+    tail = re.sub(r"\[\[cite:[^\]]+\]\]", "", tail)
+    tail = re.sub(r"[\s,，;；:：.。!?！？、()\[\]（）]+", "", tail)
+    return tail
+
+
+def _semantic_claim_count(cleaned_sentence: str) -> int:
+    text = re.sub(r"\s+", " ", cleaned_sentence or "").strip()
+    if not text:
+        return 0
+    parts = [part.strip() for part in re.split(r"[;；]+", text) if part.strip()]
+    return len(parts) if len(parts) > 1 else 1
+
+
+def _semantic_block_claim_count(text: str) -> int:
+    cleaned = _strip_citation_tokens(text)
+    parts = [part.strip() for part in re.split(r"[.!?;；。！？]+", cleaned) if part.strip()]
+    return len(parts) if parts else 0
+
+
+def _alignment_for_sentence(
+    *,
+    sentence_text: str,
+    sentence_start: int,
+    block_text_before_sentence: str,
+    sentence_occurrences: Sequence[CitationOccurrence],
+) -> tuple[str, float]:
+    if not sentence_occurrences:
+        return "legacy_fallback", 0.0
+    if any(_occurrence_bounds(occurrence)[0] is None for occurrence in sentence_occurrences):
+        return "legacy_fallback", 0.0
+
+    citation_tail_empty = _citation_tail_remainder(
+        sentence_text,
+        sentence_occurrences,
+        sentence_start=sentence_start,
+    ) == ""
+    semantic_claim_count = _semantic_claim_count(_strip_citation_tokens(sentence_text))
+    block_claim_count = _semantic_block_claim_count(block_text_before_sentence) + semantic_claim_count
+
+    if len(sentence_occurrences) > 1 and citation_tail_empty and block_claim_count > 1:
+        return "ambiguous", 0.35
+    if len(sentence_occurrences) == 1 and citation_tail_empty:
+        return "inferred", 0.86
+    if len(sentence_occurrences) > 1 and citation_tail_empty:
+        return "inferred", 0.74
+    return "explicit", 0.92
+
+
 def _build_claim_unit(
     *,
     claim_marker: str,
@@ -561,7 +639,16 @@ def _build_claim_unit(
     sentence_occurrences: Sequence[CitationOccurrence],
     block_text: str,
 ) -> Dict[str, Any]:
-    return {
+    alignment_status, alignment_confidence = _alignment_for_sentence(
+        sentence_text=block_text[span_start:span_end],
+        sentence_start=span_start,
+        block_text_before_sentence=block_text[:span_start],
+        sentence_occurrences=sentence_occurrences,
+    )
+    supporting_paper_ids = _unique_non_empty(occ.paper_id for occ in sentence_occurrences if occ.paper_id != "unknown")
+    supporting_paper_keys = _unique_non_empty(occ.paper_key for occ in sentence_occurrences if occ.paper_key != "unknown")
+    supporting_occurrence_ids = _unique_non_empty(occ.occurrence_id for occ in sentence_occurrences)
+    claim_unit = {
         "claim_unit_id": hashlib.sha256(claim_marker.encode("utf-8")).hexdigest()[:16],
         "citation_set_key": citation_set_key,
         "block_id": block_id,
@@ -573,7 +660,16 @@ def _build_claim_unit(
             dict.fromkeys(occ.citation_token for occ in sentence_occurrences if occ.citation_token)
         ),
         "block_anchor_hash": hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8],
+        "supporting_paper_ids": supporting_paper_ids if alignment_status in {"explicit", "inferred"} else [],
+        "supporting_paper_keys": supporting_paper_keys if alignment_status in {"explicit", "inferred"} else [],
+        "supporting_occurrence_ids": supporting_occurrence_ids if alignment_status in {"explicit", "inferred"} else [],
+        "alignment_status": alignment_status,
+        "alignment_confidence": alignment_confidence,
     }
+    if alignment_status == "ambiguous":
+        claim_unit["pooled_paper_ids"] = supporting_paper_ids
+        claim_unit["pooled_occurrence_ids"] = supporting_occurrence_ids
+    return claim_unit
 
 
 def _build_citation_set_bundles(
