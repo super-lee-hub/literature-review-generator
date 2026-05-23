@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Literal, Mapping
 
-from services.job_runner import JobRunRequest
+from services.job_runner import JobRunRequest, resolve_stage1_reuse
 
 
 SourceMode = Literal["direct", "zotero"]
@@ -52,7 +52,7 @@ class RuntimeJobSpec:
     action: str = "run_all"
     summary_file: str = ""
     summary_sources: tuple[str, ...] = ()
-    reuse_stage1: bool = False
+    reuse_stage1: bool | None = None
     reuse_summary_files: tuple[str, ...] = ()
     generate_section: int | None = None
     queue_file: str = "output/_queue/queue.json"
@@ -96,7 +96,7 @@ class RuntimeJobSpec:
             action=self.action,
             summary_file=self.summary_file or None,
             summary_sources=tuple(item for item in self.summary_sources if str(item).strip()),
-            reuse_stage1=self.reuse_stage1,
+            reuse_stage1=resolve_stage1_reuse(self.action, self.reuse_stage1),
             reuse_summary_files=tuple(item for item in self.reuse_summary_files if str(item).strip()),
             run_all=self.action == "run_all",
             analyze_only=self.action == "analyze",
@@ -134,7 +134,11 @@ class RuntimeJobSpec:
                 for item in payload.get("summary_sources", [])
                 if str(item).strip()
             ),
-            reuse_stage1=bool(payload.get("reuse_stage1", False)),
+            reuse_stage1=(
+                bool(payload["reuse_stage1"])
+                if payload.get("reuse_stage1") is not None
+                else None
+            ),
             reuse_summary_files=tuple(
                 str(item).strip()
                 for item in payload.get("reuse_summary_files", [])
@@ -169,7 +173,11 @@ class RuntimeJobSpec:
                 for item in payload.get("summary_sources", [])
                 if str(item).strip()
             ),
-            reuse_stage1=bool(payload.get("reuse_stage1", False)),
+            reuse_stage1=(
+                bool(payload["reuse_stage1"])
+                if payload.get("reuse_stage1") is not None
+                else None
+            ),
             reuse_summary_files=tuple(
                 str(item).strip()
                 for item in payload.get("reuse_summary_files", [])

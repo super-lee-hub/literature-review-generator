@@ -7493,7 +7493,7 @@ def handle_stage_one_mode(generator: 'LiteratureReviewGenerator', args: argparse
         sys.exit(1)
 
 
-def main() -> None:  # type: ignore
+def build_parser() -> argparse.ArgumentParser:
     """主函数，处理命令行参数和执行相应操作"""
     
     parser = argparse.ArgumentParser(
@@ -7634,7 +7634,14 @@ def main() -> None:  # type: ignore
     advanced_group.add_argument(
         '--reuse-stage1',
         action='store_true',
+        default=None,
         help='Enable DOI-only reuse of earlier stage-1 summaries during stage-1 analysis'
+    )
+    advanced_group.add_argument(
+        '--no-reuse-stage1',
+        dest='reuse_stage1',
+        action='store_false',
+        help='Disable automatic stage-1 reuse for analyze/run-all'
     )
     advanced_group.add_argument(
         '--reuse-summary-file',
@@ -7655,6 +7662,13 @@ def main() -> None:  # type: ignore
         help='Zotero库路径'
     )
 
+    return parser
+
+
+def main() -> None:  # type: ignore
+    """Handle command line arguments and execute the selected workflow."""
+
+    parser = build_parser()
     args = parser.parse_args()
     dispatch_command(args)
 

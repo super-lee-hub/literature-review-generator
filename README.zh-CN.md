@@ -212,7 +212,8 @@ python main.py --project-name "my_review" --generate-review
 | `--retry-review-failed` | 重试失败或缺失的综述章节 |
 | `--summary-file <path>` | 为大纲/正文/验证显式指定 summary 文件 |
 | `--summary-source <path>` | 追加一个下游 summary 来源，可重复 |
-| `--reuse-stage1` | 阶段一分析时复用历史 summary |
+| `--reuse-stage1` | 兼容保留；阶段一/一键执行默认已自动复用历史 summary |
+| `--no-reuse-stage1` | 强制关闭阶段一历史 summary 自动复用 |
 | `--reuse-summary-file <path>` | 追加一个阶段一复用池来源，可重复 |
 | `--merge <path>` | 把另一个 summaries.json 合并进当前 summary |
 | `--prime-with-folder <path>` + `--concept <name>` | 概念预热 / concept priming |
@@ -231,16 +232,22 @@ python main.py --help
 
 ### 10.1 复用历史阶段一摘要
 
-当你新增少量论文、重跑类似主题，或不想重复花钱分析已经处理过的 PDF，可以启用：
+当你新增少量论文、重跑类似主题，或不想重复花钱分析已经处理过的 PDF，阶段一和一键执行会默认扫描历史输出并自动复用：
 
 ```bash
-python main.py --pdf-folder "D:\new_papers" --project-name "my_review_v2" --analyze-only --reuse-stage1
+python main.py --pdf-folder "D:\new_papers" --project-name "my_review_v2" --analyze-only
 ```
 
 也可以显式指定复用池：
 
 ```bash
-python main.py --pdf-folder "D:\new_papers" --project-name "my_review_v2" --analyze-only --reuse-stage1 --reuse-summary-file "D:\cache\curated_summaries.json"
+python main.py --pdf-folder "D:\new_papers" --project-name "my_review_v2" --analyze-only --reuse-summary-file "D:\cache\curated_summaries.json"
+```
+
+如需强制全新重跑阶段一：
+
+```bash
+python main.py --pdf-folder "D:\new_papers" --project-name "my_review_v2" --analyze-only --no-reuse-stage1
 ```
 
 当前复用逻辑会优先匹配：
@@ -407,7 +414,7 @@ auto-generate-orchestrator
 | 找不到输出 | 看 `output/<project_name>__<job_id>/` |
 | PDF 似乎没读出来 | 看 preprocess cache / diagnostics |
 | 想确认 MinerU 是否实际调用 | 看单篇 preprocess manifest / diagnostics，不只看全局配置 |
-| 阶段一太慢或太贵 | 使用 `--reuse-stage1` 或 `--reuse-summary-file` |
+| 阶段一太慢或太贵 | 默认会自动复用历史 summary；额外复用池用 `--reuse-summary-file` |
 | 只想修某一节 | 用 `--generate-section <n>` |
 | 只想补失败章节 | 用 `--retry-review-failed` |
 | 想验证生成结果 | 用 `--validate-review` |

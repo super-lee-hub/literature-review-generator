@@ -47,6 +47,31 @@ def test_runtime_job_spec_compiles_zotero_source_into_canonical_job_request() ->
     assert request.validate_review is True
 
 
+def test_runtime_job_spec_defaults_stage1_reuse_for_stage1_actions() -> None:
+    spec = RuntimeJobSpec(
+        project_name="demo",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        action="run_all",
+    )
+
+    request = spec.to_job_request()
+
+    assert request.reuse_stage1 is True
+
+
+def test_runtime_job_spec_preserves_stage1_reuse_opt_out() -> None:
+    spec = RuntimeJobSpec(
+        project_name="demo",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        action="run_all",
+        reuse_stage1=False,
+    )
+
+    request = spec.to_job_request()
+
+    assert request.reuse_stage1 is False
+
+
 def test_runtime_job_spec_rejects_unknown_requested_stages() -> None:
     spec = RuntimeJobSpec(
         project_name="demo",
@@ -102,6 +127,7 @@ def test_runtime_job_spec_round_trip(tmp_path: Path) -> None:
     spec = RuntimeJobSpec(
         project_name="demo",
         source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        reuse_stage1=True,
         metadata={"requested_stages": ["source_intake", "analyze"]},
     )
 

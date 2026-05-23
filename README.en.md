@@ -156,7 +156,8 @@ There are now two reuse patterns:
    - `--summary-file`
    - repeatable `--summary-source <path>`
 2. **Automatic incremental stage-1 reuse across historical runs**
-   - `--reuse-stage1`
+   - enabled by default for `--analyze-only` and `--run-all`
+   - `--no-reuse-stage1` disables automatic reuse for a forced fresh stage-1 run
    - repeatable `--reuse-summary-file <path>`
 
 Automatic reuse currently tries matches in this order:
@@ -172,9 +173,11 @@ python main.py --project-name "subset_outline" --summary-file "D:\subset\subset_
 
 python main.py --project-name "subset_review" --summary-file "D:\subset\subset_a_summaries.json" --summary-source "D:\subset\subset_b_summaries.json" --generate-review
 
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1
+python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only
 
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-stage1 --reuse-summary-file "D:\cache\curated_summaries.json"
+python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-summary-file "D:\cache\curated_summaries.json"
+
+python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --no-reuse-stage1
 ```
 
 ### 6.4 Partial reruns and failure recovery
@@ -344,7 +347,7 @@ Important environment variables include:
 - **Want the repo to run itself from Codex**: use the repo-local `auto-generate-orchestrator` skill
 - **Cannot find outputs**: check `output/<project_name>__<job_id>/` first
 - **Need partial repair**: use `--generate-section` or `--retry-review-failed`
-- **Want incremental stage-1 reuse**: use `--reuse-stage1`
+- **Want incremental stage-1 reuse**: it is automatic for stage-1 runs; add `--reuse-summary-file` for extra pools or `--no-reuse-stage1` for a forced fresh run
 - **Need deeper runtime truth**: see [docs/en/runtime/](./docs/en/runtime/)
 - **Need AI / maintainer handoff context**: read `AGENTS.md` or [docs/en/ai/handoff.md](./docs/en/ai/handoff.md)
 

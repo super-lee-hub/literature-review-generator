@@ -3,7 +3,13 @@ import os
 import threading
 
 import main
-from services.job_runner import JobRunRequest, JobRunResult, JobRunner, build_job_request_from_mapping
+from services.job_runner import (
+    JobRunRequest,
+    JobRunResult,
+    JobRunner,
+    build_job_request_from_mapping,
+    validate_job_request_options,
+)
 from services.queue_service import CancelToken
 
 
@@ -245,6 +251,74 @@ def test_build_job_request_from_mapping_supports_summary_source_and_reuse_fields
     assert request.summary_sources == ("D:/subset.json", "D:/subset-b.json")
     assert request.reuse_stage1 is True
     assert request.reuse_summary_files == ("D:/reuse-a.json", "D:/reuse-b.json")
+
+
+def test_stage1_reuse_defaults_on_for_stage1_actions() -> None:
+    analyze_request = build_job_request_from_mapping(
+        {
+            "config": "config.ini",
+            "project_name": "demo",
+            "pdf_folder": "D:/papers",
+            "analyze_only": True,
+        }
+    )
+    run_all_request = build_job_request_from_mapping(
+        {
+            "config": "config.ini",
+            "project_name": "demo",
+            "pdf_folder": "D:/papers",
+            "run_all": True,
+        }
+    )
+
+    assert analyze_request.action == "analyze"
+    assert analyze_request.reuse_stage1 is True
+    assert run_all_request.action == "run_all"
+    assert run_all_request.reuse_stage1 is True
+
+
+def test_stage1_reuse_can_be_explicitly_disabled() -> None:
+    request = build_job_request_from_mapping(
+        {
+            "config": "config.ini",
+            "project_name": "demo",
+            "pdf_folder": "D:/papers",
+            "run_all": True,
+            "reuse_stage1": False,
+        }
+    )
+
+    assert request.reuse_stage1 is False
+
+
+def test_reuse_summary_file_uses_default_stage1_reuse() -> None:
+    request = build_job_request_from_mapping(
+        {
+            "config": "config.ini",
+            "project_name": "demo",
+            "pdf_folder": "D:/papers",
+            "run_all": True,
+            "reuse_summary_files": ["D:/reuse-a.json"],
+        }
+    )
+
+    assert request.reuse_stage1 is True
+    assert request.reuse_summary_files == ("D:/reuse-a.json",)
+    assert validate_job_request_options(request) is None
+
+
+def test_stage1_reuse_is_off_for_downstream_actions_by_default() -> None:
+    request = build_job_request_from_mapping(
+        {
+            "config": "config.ini",
+            "project_name": "demo",
+            "pdf_folder": "D:/papers",
+            "generate_outline": True,
+        }
+    )
+
+    assert request.action == "generate_outline"
+    assert request.reuse_stage1 is False
 
 
 def test_job_runner_validate_review_uses_validator_module_directly(tmp_path, monkeypatch) -> None:

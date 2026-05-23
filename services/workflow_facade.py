@@ -23,7 +23,7 @@ def build_args(
     pdf_folder: Optional[str] = None,
     summary_file: Optional[str] = None,
     summary_sources: Optional[list[str]] = None,
-    reuse_stage1: bool = False,
+    reuse_stage1: Optional[bool] = None,
     reuse_summary_files: Optional[list[str]] = None,
     run_all: bool = False,
     analyze_only: bool = False,

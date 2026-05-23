@@ -15,6 +15,41 @@ from services.queue_service import CancelToken, JobCancelledError
 from utils import sanitize_path_component
 
 
+STAGE1_REUSE_ACTIONS = {"analyze", "run_all"}
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"", "auto", "default"}:
+            return None
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
+
+
+def resolve_stage1_reuse(action: str, raw_value: Any) -> bool:
+    """Resolve the effective stage-1 reuse policy.
+
+    Historical stage-1 reuse is automatic for stage-1 actions unless the caller
+    explicitly disables it. Downstream actions only preserve explicit opt-in so
+    validation can reject unsupported reuse flags with the existing error path.
+    """
+    normalized_action = str(action or "analyze")
+    requested_value = _coerce_optional_bool(raw_value)
+    if normalized_action not in STAGE1_REUSE_ACTIONS:
+        return bool(requested_value)
+    if requested_value is None:
+        return True
+    return requested_value
+
+
 @dataclass(frozen=True)
 class JobRunRequest:
     config: str
@@ -101,6 +136,8 @@ def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
 
     normalized_reuse_files = _normalize_string_list(params.get("reuse_summary_files", ()))
 
+    reuse_stage1 = resolve_stage1_reuse(action, params.get("reuse_stage1", None))
+
     return JobRunRequest(
         config=str(params.get("config", "config.ini")),
         project_name=cast(Optional[str], params.get("project_name", None)),
@@ -108,7 +145,7 @@ def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
         action=action,
         summary_file=summary_file,
         summary_sources=tuple(summary_source_items),
-        reuse_stage1=bool(params.get("reuse_stage1", False)),
+        reuse_stage1=reuse_stage1,
         reuse_summary_files=normalized_reuse_files,
         run_all=bool(params.get("run_all", False)),
         analyze_only=bool(params.get("analyze_only", False)),
@@ -145,7 +182,7 @@ def validate_job_request_options(request: Any) -> Optional[str]:
         return "--summary-file can only be used with generate-outline, generate-review, generate-section, or validate-review"
     if summary_sources and action not in {"generate_outline", "generate_review", "generate_section", "validate_review"}:
         return "--summary-source can only be used with generate-outline, generate-review, generate-section, or validate-review"
-    if reuse_stage1 and action not in {"analyze", "run_all"}:
+    if reuse_stage1 and action not in STAGE1_REUSE_ACTIONS:
         return "--reuse-stage1 can only be used with stage1 analysis or --run-all"
     if reuse_summary_files and not reuse_stage1:
         return "--reuse-summary-file requires --reuse-stage1"

@@ -43,7 +43,7 @@ def _make_args(**overrides):
         "retry_review_failed": False,
         "merge": None,
         "summary_file": None,
-        "reuse_stage1": False,
+        "reuse_stage1": None,
         "reuse_summary_files": None,
         "free_mode_profile": None,
         "free_mode_idea": None,
@@ -1018,6 +1018,39 @@ def test_dispatch_command_injects_progress_tracker(monkeypatch) -> None:
 
     assert captured["handled"] is True
     assert captured["tracker"] is tracker
+
+
+def test_cli_stage1_reuse_defaults_to_auto_for_run_all() -> None:
+    parser = main.build_parser()
+
+    args = parser.parse_args(
+        [
+            "--project-name",
+            "demo",
+            "--pdf-folder",
+            "D:/papers",
+            "--run-all",
+        ]
+    )
+
+    assert args.reuse_stage1 is None
+
+
+def test_cli_stage1_reuse_can_be_disabled() -> None:
+    parser = main.build_parser()
+
+    args = parser.parse_args(
+        [
+            "--project-name",
+            "demo",
+            "--pdf-folder",
+            "D:/papers",
+            "--run-all",
+            "--no-reuse-stage1",
+        ]
+    )
+
+    assert args.reuse_stage1 is False
 
 
 def test_dispatch_command_rejects_summary_file_for_stage1_actions(monkeypatch) -> None:
