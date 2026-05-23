@@ -80,6 +80,88 @@ def test_save_summaries_writes_progress_snapshot_and_registry_record(tmp_path) -
     assert any(item["artifact_type"] == "stage1_progress_snapshot" for item in registry_payload["artifacts"])
 
 
+def test_save_summaries_dedupes_records_by_stable_paper_key(tmp_path) -> None:
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    config = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Validation": {"stage1_enabled": "false", "stage2_enabled": "false"}})
+    compat_view = CompatConfigView.from_config(config)
+
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = _DummyLogger()  # type: ignore[assignment]
+    generator.config = config
+    generator.bind_job_workspace(
+        workspace=workspace,
+        artifact_registry=registry,
+        compat_config=compat_view,
+        fingerprint_bundle={"request": "demo"},
+        resume_state_report=_resume_report(workspace),
+    )
+    generator.summaries = [
+        {
+            "status": "success",
+            "paper_info": {
+                "title": "Short Source Title",
+                "authors": ["Alice Smith"],
+                "year": "2025",
+                "canonical_paper_key": "short source title_smith",
+            },
+        },
+        {
+            "status": "success",
+            "paper_info": {
+                "title": "Short Source Title: Full Subtitle Filled By AI",
+                "authors": ["Alice Smith"],
+                "year": "2025",
+                "canonical_paper_key": "short source title_smith",
+            },
+            "ai_summary": {"paper_metadata": {"title": "Short Source Title: Full Subtitle Filled By AI"}},
+        },
+    ]
+    generator._checkpoint_processed_papers.add("short source title_smith")
+
+    assert generator.save_summaries() is True
+
+    saved = json.loads(open(workspace.artifact_path("demo_summaries.json"), "r", encoding="utf-8").read())
+    assert len(saved) == 1
+    assert saved[0]["paper_info"]["title"] == "Short Source Title: Full Subtitle Filled By AI"
+
+
+def test_save_summaries_prunes_stale_progress_snapshot_keys(tmp_path) -> None:
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    config = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Validation": {"stage1_enabled": "false", "stage2_enabled": "false"}})
+    compat_view = CompatConfigView.from_config(config)
+
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = _DummyLogger()  # type: ignore[assignment]
+    generator.config = config
+    generator.bind_job_workspace(
+        workspace=workspace,
+        artifact_registry=registry,
+        compat_config=compat_view,
+        fingerprint_bundle={"request": "demo"},
+        resume_state_report=_resume_report(workspace),
+    )
+    generator.summaries = [
+        {
+            "status": "success",
+            "paper_info": {
+                "title": "Paper A",
+                "authors": ["Alice Smith"],
+                "year": "2025",
+                "canonical_paper_key": "paper-a",
+            },
+        }
+    ]
+    generator._checkpoint_processed_papers.update({"paper-a", "stale-paper"})
+
+    assert generator.save_summaries() is True
+
+    progress_payload = json.loads(open(workspace.artifact_path("stage1_progress_snapshot.json"), "r", encoding="utf-8").read())
+    assert progress_payload["summary_count"] == 1
+    assert progress_payload["processed_papers"] == ["paper-a"]
+
+
 def test_summaries_without_progress_snapshot_are_weak_resumable(tmp_path) -> None:
     workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
     summary_path = workspace.artifact_path("demo_summaries.json")

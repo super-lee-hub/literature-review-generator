@@ -3,17 +3,17 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from enum import Enum
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from services.citation_catalog import (
     augment_citation_catalog_from_literature_map,
-    alias_lookup_keys,
     build_citation_catalog,
     extract_doi_aliases,
     extract_citation_key,
     format_reference_entry,
-    normalize_alias,
 )
+from services.citation_ref_catalog import extract_ref_ids_from_token, resolve_ref_id
 from services.job_workspace import utc_now_iso
 
 
@@ -43,6 +43,9 @@ class CitationOccurrence:
     section_title: str
     block_id: str
     block_order: int
+    ref_id: str = ""
+    canonical_paper_key: str = ""
+    source_type: str = "structured_ref"
     spans: List[CitationSpan] = field(default_factory=list)
     context_before: str = ""
     context_after: str = ""
@@ -57,6 +60,9 @@ class CitationOccurrence:
             "section_title": self.section_title,
             "block_id": self.block_id,
             "block_order": self.block_order,
+            "ref_id": self.ref_id,
+            "canonical_paper_key": self.canonical_paper_key,
+            "source_type": self.source_type,
             "spans": [span.to_dict() for span in self.spans],
             "context_before": self.context_before,
             "context_after": self.context_after,
@@ -73,6 +79,9 @@ class CitationOccurrence:
             section_title=data["section_title"],
             block_id=data["block_id"],
             block_order=data["block_order"],
+            ref_id=str(data.get("ref_id") or ""),
+            canonical_paper_key=str(data.get("canonical_paper_key") or data.get("paper_key") or ""),
+            source_type=str(data.get("source_type") or "structured_ref"),
             spans=[CitationSpan.from_dict(s) for s in data.get("spans", [])],
             context_before=data.get("context_before", ""),
             context_after=data.get("context_after", ""),
@@ -163,6 +172,8 @@ class CitationMigrationReport:
     load_source: str
     fallback_counters: Dict[str, int] = field(default_factory=dict)
     paper_statuses: List[Dict[str, Any]] = field(default_factory=list)
+    legacy_citation_policy: str = "report_only"
+    legacy_warnings: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -195,6 +206,9 @@ class CitationManifestV2:
     citation_sets: List[CitationSetBundle] = field(default_factory=list)
     bibliography: List[BibliographyEntry] = field(default_factory=list)
     review_draft_version: str = "v2"
+    legacy_citation_policy: str = "report_only"
+    legacy_warnings: List[Dict[str, Any]] = field(default_factory=list)
+    fallback_counters: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -209,6 +223,9 @@ class CitationManifestV2:
             "citation_sets": [bundle.to_dict() for bundle in self.citation_sets],
             "bibliography": [entry.to_dict() for entry in self.bibliography],
             "review_draft_version": self.review_draft_version,
+            "legacy_citation_policy": self.legacy_citation_policy,
+            "legacy_warnings": list(self.legacy_warnings),
+            "fallback_counters": dict(self.fallback_counters),
         }
 
     @classmethod
@@ -225,6 +242,9 @@ class CitationManifestV2:
             citation_sets=[CitationSetBundle.from_dict(c) for c in data.get("citation_sets", [])],
             bibliography=[BibliographyEntry.from_dict(b) for b in data.get("bibliography", [])],
             review_draft_version=data.get("review_draft_version", "v2"),
+            legacy_citation_policy=str(data.get("legacy_citation_policy") or "report_only"),
+            legacy_warnings=list(data.get("legacy_warnings") or []),
+            fallback_counters=dict(data.get("fallback_counters") or {}),
         )
 
     def get_cited_bibliography(self) -> List[BibliographyEntry]:
@@ -262,6 +282,7 @@ class CitationManifestV3:
         default_factory=lambda: CitationMigrationReport(contract_version="v3", load_source="v3")
     )
     review_draft_version: str = "v2"
+    dependencies: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -278,7 +299,23 @@ class CitationManifestV3:
             "bibliography": [entry.to_dict() for entry in self.bibliography],
             "migration_report": self.migration_report.to_dict(),
             "review_draft_version": self.review_draft_version,
+            "dependencies": self.dependencies,
         }
+
+
+class LegacyCitationPolicy(str, Enum):
+    REPORT_ONLY = "report_only"
+    WARN_AND_RESOLVE = "warn_and_resolve"
+    FATAL = "fatal"
+
+
+def parse_legacy_citation_policy(value: Any = None) -> LegacyCitationPolicy:
+    normalized = str(value or LegacyCitationPolicy.REPORT_ONLY.value).strip().lower()
+    try:
+        return LegacyCitationPolicy(normalized)
+    except ValueError as exc:
+        allowed = ", ".join(policy.value for policy in LegacyCitationPolicy)
+        raise ValueError(f"Invalid [Validation].legacy_citation_policy={value!r}; expected one of: {allowed}") from exc
 
 
 def build_citation_manifest_v1(
@@ -438,6 +475,9 @@ def _build_occurrence(
     citation_token: str,
     paper_id: Optional[str],
     paper_key: Optional[str],
+    ref_id: str = "",
+    canonical_paper_key: Optional[str] = None,
+    source_type: str = "structured_ref",
     section_number: int,
     section_title: str,
     block_id: str,
@@ -448,6 +488,7 @@ def _build_occurrence(
 ) -> CitationOccurrence:
     safe_paper_id = str(paper_id or "unknown").strip() or "unknown"
     safe_paper_key = str(paper_key or safe_paper_id).strip() or "unknown"
+    safe_canonical_key = str(canonical_paper_key or safe_paper_key).strip() or safe_paper_key
     spans: List[CitationSpan] = []
     if isinstance(span_start, int) and isinstance(span_end, int) and 0 <= span_start < span_end <= len(block_text):
         spans.append(
@@ -469,51 +510,13 @@ def _build_occurrence(
         section_title=section_title,
         block_id=block_id,
         block_order=block_order,
+        ref_id=str(ref_id or ""),
+        canonical_paper_key=safe_canonical_key,
+        source_type=str(source_type or "structured_ref"),
         spans=spans,
         context_before=context_before,
         context_after=context_after,
     )
-
-
-def _resolve_entry(
-    *,
-    citation_token: str,
-    explicit_paper_key: Optional[str],
-    explicit_paper_id: Optional[str],
-    alias_map: Dict[str, Any],
-    entries_by_paper_id: Dict[str, Any],
-) -> tuple[Optional[Any], str]:
-    raw_key = explicit_paper_key or extract_citation_key(citation_token)
-    candidates = [
-        explicit_paper_key,
-        explicit_paper_id,
-        extract_citation_key(citation_token),
-        citation_token,
-    ]
-    for value in candidates:
-        if not value:
-            continue
-        for lookup_key in alias_lookup_keys(value):
-            candidate = alias_map.get(lookup_key)
-            if candidate is not None:
-                return candidate, raw_key
-        for doi_alias in extract_doi_aliases(value):
-            for lookup_key in alias_lookup_keys(doi_alias):
-                candidate = alias_map.get(lookup_key)
-                if candidate is not None:
-                    return candidate, raw_key
-    if explicit_paper_id and explicit_paper_id in entries_by_paper_id:
-        return entries_by_paper_id[explicit_paper_id], raw_key
-
-    citation_lower = citation_token.lower()
-    for entry in entries_by_paper_id.values():
-        if entry.title and entry.title.lower() in citation_lower:
-            return entry, raw_key
-        surnames = [author.split()[-1].lower() for author in entry.authors if str(author).strip()]
-        if surnames and any(surname in citation_lower for surname in surnames):
-            if entry.year and entry.year in citation_token:
-                return entry, raw_key
-    return None, raw_key
 
 
 def normalize_citation_set_key(paper_ids: Sequence[str], paper_keys: Sequence[str] | None = None) -> str:
@@ -525,7 +528,8 @@ def normalize_citation_set_key(paper_ids: Sequence[str], paper_keys: Sequence[st
 
 
 def _strip_citation_tokens(text: str) -> str:
-    cleaned = re.sub(r"\[\[cite:[^\]]+\]\]", "", text or "")
+    cleaned = re.sub(r"\[\[cite_ref:[^\]]+\]\]", "", text or "")
+    cleaned = re.sub(r"\[\[cite:[^\]]+\]\]", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
 
@@ -579,6 +583,7 @@ def _citation_tail_remainder(
     for occurrence in sentence_occurrences:
         if occurrence.citation_token:
             tail = tail.replace(occurrence.citation_token, "")
+    tail = re.sub(r"\[\[cite_ref:[^\]]+\]\]", "", tail)
     tail = re.sub(r"\[\[cite:[^\]]+\]\]", "", tail)
     tail = re.sub(r"[\s,，;；:：.。!?！？、()\[\]（）]+", "", tail)
     return tail
@@ -770,39 +775,77 @@ def _build_citation_set_bundles(
     return bundles
 
 
-def _resolve_bibliography_source_entry(
-    *,
-    paper_id: str,
-    occurrences: Sequence[CitationOccurrence],
+def _build_exact_entry_lookup(
     entries: Sequence[Any],
-    alias_map: Dict[str, Any],
-) -> Optional[Any]:
-    for entry in entries:
-        if entry.paper_id == paper_id:
-            return entry
+    paper_summaries: Sequence[Mapping[str, Any]],
+) -> Dict[str, List[Any]]:
+    exact: Dict[str, List[Any]] = {}
 
-    direct_match = alias_map.get(normalize_alias(paper_id))
-    if direct_match is not None:
-        return direct_match
+    def _add(value: Any, entry: Any) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        keys = {text.casefold()}
+        normalized_doi = extract_doi_aliases(text)
+        keys.update(item.casefold() for item in normalized_doi)
+        for key in keys:
+            exact.setdefault(key, [])
+            if entry not in exact[key]:
+                exact[key].append(entry)
 
-    related_occurrences = [occ for occ in occurrences if occ.paper_id == paper_id]
-    for occurrence in related_occurrences:
-        for candidate in (
-            occurrence.paper_key,
-            extract_citation_key(occurrence.citation_token),
-            occurrence.citation_token,
+    for index, entry in enumerate(entries):
+        summary = paper_summaries[index] if index < len(paper_summaries) else {}
+        paper_info_raw = summary.get("paper_info", {}) if isinstance(summary, Mapping) else {}
+        paper_info = paper_info_raw if isinstance(paper_info_raw, Mapping) else {}
+        for value in (
+            getattr(entry, "paper_id", ""),
+            getattr(entry, "paper_key", ""),
+            getattr(entry, "doi", ""),
+            paper_info.get("canonical_paper_key"),
+            paper_info.get("source_paper_id"),
+            paper_info.get("doi"),
         ):
-            matched = alias_map.get(normalize_alias(candidate))
-            if matched is not None:
-                return matched
+            _add(value, entry)
+    return exact
 
-    suffix_match = re.search(r"(\d+)$", paper_id)
-    if suffix_match:
-        index = int(suffix_match.group(1)) - 1
-        if 0 <= index < len(entries):
-            return entries[index]
 
-    return None
+def _lookup_exact_unique(value: Any, exact_lookup: Mapping[str, List[Any]]) -> tuple[Optional[Any], str]:
+    candidates: List[str] = []
+    raw = str(value or "").strip()
+    if raw:
+        candidates.append(raw.casefold())
+    for doi in extract_doi_aliases(raw):
+        candidates.append(doi.casefold())
+    for key in dict.fromkeys(candidates):
+        matches = exact_lookup.get(key, [])
+        if len(matches) == 1:
+            return matches[0], "resolved"
+        if len(matches) > 1:
+            return None, "ambiguous"
+    return None, "missing"
+
+
+def _warning(
+    *,
+    policy: LegacyCitationPolicy,
+    token: str,
+    source_type: str,
+    disposition: str,
+    reason: str,
+    section_number: int,
+    section_title: str,
+    block_id: str,
+) -> Dict[str, Any]:
+    return {
+        "policy": policy.value,
+        "citation_token": token,
+        "source_type": source_type,
+        "disposition": disposition,
+        "reason": reason,
+        "section_number": section_number,
+        "section_title": section_title,
+        "block_id": block_id,
+    }
 
 
 def build_citation_manifest_v2_from_review_draft(
@@ -816,6 +859,8 @@ def build_citation_manifest_v2_from_review_draft(
     paper_summaries: List[Dict[str, Any]],
     allow_legacy_regex: bool = True,
     literature_map: Optional[Dict[str, Any]] = None,
+    citation_ref_catalog: Optional[Mapping[str, Any]] = None,
+    legacy_citation_policy: str | LegacyCitationPolicy = LegacyCitationPolicy.REPORT_ONLY,
 ) -> CitationManifestV2:
     occurrences: List[CitationOccurrence] = []
     clusters: List[CitationCluster] = []
@@ -824,11 +869,13 @@ def build_citation_manifest_v2_from_review_draft(
 
     entries, alias_map = build_citation_catalog(paper_summaries)
     entries, alias_map = augment_citation_catalog_from_literature_map(entries, alias_map, literature_map)
-    entries_by_paper_id = {entry.paper_id: entry for entry in entries}
+    exact_lookup = _build_exact_entry_lookup(entries, paper_summaries)
     paper_occurrence_map: Dict[str, List[str]] = {}
     sections = review_draft_v2.get("content", {}).get("sections", [])
 
     occurrence_counter = 0
+    policy = legacy_citation_policy if isinstance(legacy_citation_policy, LegacyCitationPolicy) else parse_legacy_citation_policy(legacy_citation_policy)
+    legacy_warnings: List[Dict[str, Any]] = []
     fallback_cite_pattern = re.compile(r"\[\[cite:[^|\]]+(?:\|[^\]]+)*\]\]")
     fallback_apa_pattern = re.compile(r"\([^)]+,\s*\d{4}[^)]*\)")
 
@@ -850,6 +897,7 @@ def build_citation_manifest_v2_from_review_draft(
                             "paper_key": extract_citation_key(match.group(0)),
                             "span_start": match.start(),
                             "span_end": match.end(),
+                            "source_type": "legacy_token",
                         }
                     )
                 for match in fallback_apa_pattern.finditer(block_text):
@@ -858,31 +906,260 @@ def build_citation_manifest_v2_from_review_draft(
                             "citation_token": match.group(0),
                             "span_start": match.start(),
                             "span_end": match.end(),
+                            "source_type": "legacy_apa",
                         }
                     )
 
             for citation in extracted_citations:
-                occurrence_counter += 1
                 citation_token = str(
                     citation.get("citation_token")
                     or citation.get("raw_text")
                     or citation.get("text")
                     or ""
                 ).strip()
+                source_type = str(citation.get("source_type") or "").strip()
+                ref_id = str(citation.get("ref_id") or "").strip()
                 explicit_paper_key = str(citation.get("paper_key") or "").strip() or None
                 explicit_paper_id = str(citation.get("paper_id") or "").strip() or None
-                entry, raw_key = _resolve_entry(
-                    citation_token=citation_token,
-                    explicit_paper_key=explicit_paper_key,
-                    explicit_paper_id=explicit_paper_id,
-                    alias_map=alias_map,
-                    entries_by_paper_id=entries_by_paper_id,
-                )
+                canonical_paper_key = str(citation.get("canonical_paper_key") or explicit_paper_key or "").strip() or None
+                if not source_type and (explicit_paper_id or explicit_paper_key or canonical_paper_key):
+                    source_type = "structured_token"
+                entry = None
+                resolved_paper_id: Optional[str] = None
+                resolved_paper_key: Optional[str] = None
+                resolved_canonical_key: Optional[str] = None
+                truth_source_type = source_type
+
+                structured_ref_ids = [ref_id] if ref_id else []
+                if source_type == "structured_ref":
+                    structured_ref_ids = [str(item).strip() for item in structured_ref_ids if str(item).strip()]
+                    if not structured_ref_ids:
+                        structured_ref_ids = extract_ref_ids_from_token(citation_token)
+                    if not structured_ref_ids:
+                        legacy_warnings.append(
+                            _warning(
+                                policy=policy,
+                                token=citation_token,
+                                source_type="structured_ref",
+                                disposition="NEEDS_REVIEW",
+                                reason="malformed structured citation ref token",
+                                section_number=section_number,
+                                section_title=section_title,
+                                block_id=block_id,
+                            )
+                        )
+                        continue
+
+                    for structured_ref_id in structured_ref_ids:
+                        catalog_entry = resolve_ref_id(citation_ref_catalog, structured_ref_id)
+                        if catalog_entry:
+                            resolved_paper_id = str(catalog_entry.get("paper_id") or "").strip() or None
+                            resolved_canonical_key = str(catalog_entry.get("canonical_paper_key") or resolved_paper_id or "").strip() or None
+                            resolved_paper_key = resolved_canonical_key
+                            entry, _status = _lookup_exact_unique(
+                                resolved_canonical_key or resolved_paper_id,
+                                exact_lookup,
+                            )
+                        else:
+                            legacy_warnings.append(
+                                _warning(
+                                    policy=policy,
+                                    token=citation_token,
+                                    source_type="structured_ref",
+                                    disposition="NEEDS_REVIEW",
+                                    reason=f"unresolved citation ref id: {structured_ref_id}",
+                                    section_number=section_number,
+                                    section_title=section_title,
+                                    block_id=block_id,
+                                )
+                            )
+                            continue
+
+                        occurrence_counter += 1
+                        occurrence = _build_occurrence(
+                            occurrence_id=f"occ_{occurrence_counter}",
+                            citation_token=citation_token or structured_ref_id or "(Unknown, n.d.)",
+                            paper_id=resolved_paper_id or (entry.paper_id if entry else explicit_paper_id),
+                            paper_key=resolved_paper_key or (entry.paper_key if entry else canonical_paper_key),
+                            ref_id=structured_ref_id,
+                            canonical_paper_key=resolved_canonical_key or (entry.paper_key if entry else canonical_paper_key),
+                            source_type=truth_source_type,
+                            section_number=section_number,
+                            section_title=section_title,
+                            block_id=block_id,
+                            block_order=block_order,
+                            block_text=block_text,
+                            span_start=citation.get("span_start"),
+                            span_end=citation.get("span_end"),
+                        )
+                        occurrences.append(occurrence)
+                        if occurrence.paper_id != "unknown":
+                            paper_occurrence_map.setdefault(occurrence.paper_id, []).append(occurrence.occurrence_id)
+                    continue
+                elif source_type == "exact_id":
+                    for candidate in (explicit_paper_id, canonical_paper_key, explicit_paper_key):
+                        entry, status = _lookup_exact_unique(candidate, exact_lookup)
+                        if entry:
+                            break
+                        if status == "ambiguous":
+                            legacy_warnings.append(
+                                _warning(
+                                    policy=policy,
+                                    token=citation_token,
+                                    source_type="exact_id",
+                                    disposition="NEEDS_REVIEW",
+                                    reason=f"ambiguous exact citation id: {candidate}",
+                                    section_number=section_number,
+                                    section_title=section_title,
+                                    block_id=block_id,
+                                )
+                            )
+                            break
+                    if not entry:
+                        continue
+                    resolved_paper_id = entry.paper_id
+                    resolved_paper_key = entry.paper_key
+                    resolved_canonical_key = entry.paper_key
+                elif source_type == "structured_token":
+                    for candidate in (explicit_paper_id, canonical_paper_key, explicit_paper_key, extract_citation_key(citation_token)):
+                        entry, status = _lookup_exact_unique(candidate, exact_lookup)
+                        if entry:
+                            break
+                        if status == "ambiguous":
+                            legacy_warnings.append(
+                                _warning(
+                                    policy=policy,
+                                    token=citation_token,
+                                    source_type="structured_token",
+                                    disposition="NEEDS_REVIEW",
+                                    reason=f"ambiguous legacy structured citation id: {candidate}",
+                                    section_number=section_number,
+                                    section_title=section_title,
+                                    block_id=block_id,
+                                )
+                            )
+                            break
+                    if not entry:
+                        legacy_warnings.append(
+                            _warning(
+                                policy=policy,
+                                token=citation_token,
+                                source_type="structured_token",
+                                disposition="NEEDS_REVIEW",
+                                reason="legacy structured citation is unresolved",
+                                section_number=section_number,
+                                section_title=section_title,
+                                block_id=block_id,
+                            )
+                        )
+                        continue
+                    resolved_paper_id = entry.paper_id
+                    resolved_paper_key = entry.paper_key
+                    resolved_canonical_key = entry.paper_key
+                    truth_source_type = "exact_id"
+                    legacy_warnings.append(
+                        _warning(
+                            policy=policy,
+                            token=citation_token,
+                            source_type="structured_token",
+                            disposition="migrated_exact_id",
+                            reason="legacy structured citation resolved by explicit exact id",
+                            section_number=section_number,
+                            section_title=section_title,
+                            block_id=block_id,
+                        )
+                    )
+                elif source_type == "legacy_token" or citation_token.startswith("[[cite:"):
+                    legacy_key = extract_citation_key(citation_token)
+                    if policy == LegacyCitationPolicy.FATAL:
+                        raise ValueError(f"Legacy citation token is forbidden by legacy_citation_policy=fatal: {citation_token}")
+                    if policy == LegacyCitationPolicy.WARN_AND_RESOLVE:
+                        entry, status = _lookup_exact_unique(legacy_key, exact_lookup)
+                        if entry:
+                            resolved_paper_id = entry.paper_id
+                            resolved_paper_key = entry.paper_key
+                            resolved_canonical_key = entry.paper_key
+                            truth_source_type = "exact_id"
+                            legacy_warnings.append(
+                                _warning(
+                                    policy=policy,
+                                    token=citation_token,
+                                    source_type="legacy_token",
+                                    disposition="warn_and_resolved",
+                                    reason="legacy [[cite:...]] resolved by exact unique id",
+                                    section_number=section_number,
+                                    section_title=section_title,
+                                    block_id=block_id,
+                                )
+                            )
+                        else:
+                            legacy_warnings.append(
+                                _warning(
+                                    policy=policy,
+                                    token=citation_token,
+                                    source_type="legacy_token",
+                                    disposition="NEEDS_REVIEW",
+                                    reason="ambiguous legacy citation id" if status == "ambiguous" else "legacy citation is unresolved",
+                                    section_number=section_number,
+                                    section_title=section_title,
+                                    block_id=block_id,
+                                )
+                            )
+                            continue
+                    else:
+                        legacy_warnings.append(
+                            _warning(
+                                policy=policy,
+                                token=citation_token,
+                                source_type="legacy_token",
+                                disposition="report_only",
+                                reason="legacy [[cite:...]] token is excluded from citation truth",
+                                section_number=section_number,
+                                section_title=section_title,
+                                block_id=block_id,
+                            )
+                        )
+                        continue
+                elif source_type == "legacy_apa" or re.fullmatch(r"\([^)]+,\s*\d{4}[^)]*\)", citation_token):
+                    if policy == LegacyCitationPolicy.FATAL:
+                        raise ValueError(f"APA-style citation text is forbidden by legacy_citation_policy=fatal: {citation_token}")
+                    legacy_warnings.append(
+                        _warning(
+                            policy=policy,
+                            token=citation_token,
+                            source_type="legacy_apa",
+                            disposition="report_only",
+                            reason="APA-style citation text is excluded from citation truth and never auto-resolved",
+                            section_number=section_number,
+                            section_title=section_title,
+                            block_id=block_id,
+                        )
+                    )
+                    continue
+                else:
+                    legacy_warnings.append(
+                        _warning(
+                            policy=policy,
+                            token=citation_token,
+                            source_type=source_type or "unknown",
+                            disposition="NEEDS_REVIEW",
+                            reason="citation source_type is not a citation truth source",
+                            section_number=section_number,
+                            section_title=section_title,
+                            block_id=block_id,
+                        )
+                    )
+                    continue
+
+                occurrence_counter += 1
                 occurrence = _build_occurrence(
                     occurrence_id=f"occ_{occurrence_counter}",
-                    citation_token=citation_token or raw_key or "(Unknown, n.d.)",
-                    paper_id=entry.paper_id if entry else explicit_paper_id,
-                    paper_key=entry.paper_key if entry else (explicit_paper_key or raw_key or "unknown"),
+                    citation_token=citation_token or ref_id or "(Unknown, n.d.)",
+                    paper_id=resolved_paper_id or (entry.paper_id if entry else explicit_paper_id),
+                    paper_key=resolved_paper_key or (entry.paper_key if entry else canonical_paper_key),
+                    ref_id=ref_id,
+                    canonical_paper_key=resolved_canonical_key or (entry.paper_key if entry else canonical_paper_key),
+                    source_type=truth_source_type,
                     section_number=section_number,
                     section_title=section_title,
                     block_id=block_id,
@@ -908,13 +1185,14 @@ def build_citation_manifest_v2_from_review_draft(
             )
         )
 
+    entries_by_exact_paper_id = {entry.paper_id: entry for entry in entries}
+    entries_by_exact_paper_key = {entry.paper_key: entry for entry in entries}
     for paper_id in paper_occurrence_map:
-        entry = _resolve_bibliography_source_entry(
-            paper_id=paper_id,
-            occurrences=occurrences,
-            entries=entries,
-            alias_map=alias_map,
-        )
+        entry = entries_by_exact_paper_id.get(paper_id) or entries_by_exact_paper_key.get(paper_id)
+        if entry is None:
+            related_occurrence = next((occ for occ in occurrences if occ.paper_id == paper_id), None)
+            if related_occurrence is not None:
+                entry = entries_by_exact_paper_key.get(related_occurrence.canonical_paper_key)
         if entry is None:
             continue
         bibliography.append(
@@ -932,6 +1210,10 @@ def build_citation_manifest_v2_from_review_draft(
         occurrences=occurrences,
         review_draft_v2=review_draft_v2,
     )
+    warning_source_counts: Dict[str, int] = {}
+    for warning in legacy_warnings:
+        source = str(warning.get("source_type") or "unknown")
+        warning_source_counts[source] = warning_source_counts.get(source, 0) + 1
 
     return CitationManifestV2(
         artifact_type="citation_manifest",
@@ -952,6 +1234,15 @@ def build_citation_manifest_v2_from_review_draft(
         citation_sets=citation_sets,
         bibliography=bibliography,
         review_draft_version="v2",
+        legacy_citation_policy=policy.value,
+        legacy_warnings=legacy_warnings,
+        fallback_counters={
+            "legacy_warnings": len(legacy_warnings),
+            "legacy_tokens": warning_source_counts.get("legacy_token", 0),
+            "legacy_apa": warning_source_counts.get("legacy_apa", 0),
+            "structured_ref_unresolved": warning_source_counts.get("structured_ref", 0),
+            "unresolved_occurrences": len(unresolved_occurrences({"occurrences": [occ.to_dict() for occ in occurrences]})),
+        },
     )
 
 
@@ -966,6 +1257,10 @@ def build_citation_manifest_v3_from_review_draft(
     paper_summaries: List[Dict[str, Any]],
     literature_map: Optional[Dict[str, Any]] = None,
     load_source: str = "v3",
+    citation_ref_catalog: Optional[Mapping[str, Any]] = None,
+    citation_ref_catalog_path: str = "",
+    citation_ref_catalog_hash: str = "",
+    legacy_citation_policy: str | LegacyCitationPolicy = LegacyCitationPolicy.REPORT_ONLY,
 ) -> CitationManifestV3:
     legacy_manifest = build_citation_manifest_v2_from_review_draft(
         job_id=job_id,
@@ -977,6 +1272,8 @@ def build_citation_manifest_v3_from_review_draft(
         paper_summaries=paper_summaries,
         allow_legacy_regex=False,
         literature_map=literature_map,
+        citation_ref_catalog=citation_ref_catalog,
+        legacy_citation_policy=legacy_citation_policy,
     )
 
     entries, _alias_map = build_citation_catalog(paper_summaries)
@@ -1031,7 +1328,11 @@ def build_citation_manifest_v3_from_review_draft(
             "scope": "review_citations_truth_source",
             "contract_version": "v3",
         },
-        review_reference=legacy_manifest.review_reference,
+        review_reference={
+            **legacy_manifest.review_reference,
+            "citation_ref_catalog_path": citation_ref_catalog_path,
+            "citation_ref_catalog_hash": citation_ref_catalog_hash,
+        },
         paper_entries=paper_entries,
         occurrences=legacy_manifest.occurrences,
         clusters=legacy_manifest.clusters,
@@ -1047,8 +1348,15 @@ def build_citation_manifest_v3_from_review_draft(
                 "synthetic_citation_sets": 0,
                 "summary_generated_reference": 0,
                 "unresolved_occurrences": len(unresolved_occurrences(legacy_manifest.to_dict())),
+                **dict(legacy_manifest.fallback_counters),
             },
             paper_statuses=paper_statuses,
+            legacy_citation_policy=legacy_manifest.legacy_citation_policy,
+            legacy_warnings=list(legacy_manifest.legacy_warnings),
         ),
         review_draft_version=legacy_manifest.review_draft_version,
+        dependencies={
+            "citation_ref_catalog_path": citation_ref_catalog_path,
+            "citation_ref_catalog_hash": citation_ref_catalog_hash,
+        },
     )

@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from typing import cast
 
+from docx import Document
+
 import main
 from config_loader import ConfigDict
 from services.artifact_registry import ArtifactRegistry
@@ -98,7 +100,7 @@ def test_successful_stage2_generation_creates_registered_citation_manifest(tmp_p
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
         generator, "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite_ref:R001]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -119,11 +121,26 @@ def test_successful_stage2_generation_creates_registered_citation_manifest(tmp_p
     assert artifact_payload["created_from_job_id"] == workspace.job_id
     assert artifact_payload["manifest_identity"]["manifest_id"] == "citation_manifest:v3"
     assert artifact_payload["review_reference"]["review_word_path"] == str(word_path)
+    assert artifact_payload["review_reference"]["citation_ref_catalog_path"].endswith("demo_citation_ref_catalog.json")
+    assert artifact_payload["review_reference"]["citation_ref_catalog_hash"]
+    assert artifact_payload["dependencies"]["citation_ref_catalog_hash"] == artifact_payload["review_reference"]["citation_ref_catalog_hash"]
     # V2 uses occurrences/clusters/bibliography instead of flat citations
     assert "occurrences" in artifact_payload
     assert "clusters" in artifact_payload
     assert "bibliography" in artifact_payload
     assert any(dep["artifact_type"] == "review_draft" for dep in citation_records[0]["depends_on"])
+    assert any(dep["artifact_type"] == "citation_ref_catalog" for dep in citation_records[0]["depends_on"])
+
+    catalog_path = Path(workspace.artifact_path("citation_catalogs/demo_citation_ref_catalog.json"))
+    catalog_payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+    assert catalog_payload["artifact_type"] == "citation_ref_catalog"
+    assert catalog_payload["artifact_version"] == "v1"
+    assert catalog_payload["catalog_id"] == "citation_ref_catalog:demo"
+    assert catalog_payload["entries"][0]["ref_id"] == "R001"
+
+    catalog_records = [item for item in registry_payload["artifacts"] if item["artifact_type"] == "citation_ref_catalog"]
+    assert len(catalog_records) == 1
+    assert catalog_records[0]["artifact_id"] == "citation_ref_catalog:v1"
 
 
 def test_stage2_with_failed_sections_does_not_register_citation_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -137,7 +154,7 @@ def test_stage2_with_failed_sections_does_not_register_citation_manifest(tmp_pat
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
             return None
-        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
+        return f"{section_title} generated content. [[cite_ref:R001]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
@@ -150,7 +167,9 @@ def test_stage2_with_failed_sections_does_not_register_citation_manifest(tmp_pat
     failed_sections_path = Path(workspace.report_path("demo_failed_review_sections.json"))
     registry_path = Path(workspace.paths.registry_path)
 
-    assert word_path.exists() is False
+    assert word_path.exists() is True
+    document_text = "\n".join(paragraph.text for paragraph in Document(str(word_path)).paragraphs)
+    assert "First Section generated content." in document_text
     assert citation_path.exists() is False
     assert failed_sections_path.exists() is True
     if registry_path.exists():

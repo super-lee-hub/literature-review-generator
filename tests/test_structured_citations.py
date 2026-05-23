@@ -1,324 +1,247 @@
-"""Tests for structured citation handling."""
+"""Tests for document-stable structured citation refs."""
 
+import pytest
 
-
-from services.review_draft import build_review_draft_v2
 from services.citation_manifest import build_citation_manifest_v2_from_review_draft
+from services.citation_ref_catalog import build_document_ref_catalog, validate_citation_refs
+from services.review_draft import build_review_draft_v2
 
 
-def test_review_draft_v2_with_structured_citations():
-    """测试 review_draft_v2 对结构化 block citations 的保留与标准化"""
-    # 模拟论文摘要数据
-    paper_summaries = [
+def _summaries():
+    return [
         {
-            'paper_info': {
-                'title': 'Test Paper 1',
-                'authors': ['Author A', 'Author B'],
-                'year': '2023'
-            }
+            "paper_info": {
+                "title": "Test Paper 1",
+                "authors": ["Author A", "Author B"],
+                "year": "2023",
+                "canonical_paper_key": "test_paper_1",
+            },
+            "ai_summary": {"core_analysis": {"summary": "Evidence about test paper one."}},
         },
         {
-            'paper_info': {
-                'title': 'Test Paper 2',
-                'authors': ['Author C'],
-                'year': '2024'
-            }
-        }
+            "paper_info": {
+                "title": "Test Paper 2",
+                "authors": ["Author C"],
+                "year": "2024",
+                "canonical_paper_key": "test_paper_2",
+            },
+            "ai_summary": {"core_analysis": {"summary": "Evidence about test paper two."}},
+        },
     ]
-    
-    # 模拟带有结构化 citations 的 sections
-    sections = [
-        {
-            'section_number': 1,
-            'section_title': 'Introduction',
-            'blocks': [
-                {
-                    'block_id': 's1_b1',
-                    'block_kind': 'paragraph',
-                    'block_order': 1,
-                    'text': 'This is a test paragraph with citations.',
-                    'citations': [
-                        {
-                            'local_ref_id': 'cit1',
-                            'citation_token': '[[cite:test_paper_1|mode=parenthetical]]',
-                            'paper_id': 'test_paper_1',
-                            'paper_key': 'test_paper_1',
-                            'mode': 'parenthetical',
-                            'span_start': 10,
-                            'span_end': 40
-                        }
-                    ]
-                }
-            ]
-        }
-    ]
-    
-    # 构建 review_draft_v2
+
+
+def _catalog():
+    return build_document_ref_catalog(_summaries(), project_name="test_project", job_id="test_job")
+
+
+def test_review_draft_v2_resolves_cite_ref_via_catalog():
+    catalog = _catalog()
     draft = build_review_draft_v2(
-        job_id='test_job',
-        project_name='test_project',
-        draft_id='test_draft',
-        outline_artifact_id='test_outline',
-        outline_source_path='test_outline.md',
-        summary_file='test_summaries.json',
-        review_word_path='test_review.docx',
-        sections=sections,
-        references=['Test reference 1', 'Test reference 2'],
-        generation_mode='full_review',
-        paper_summaries=paper_summaries
+        job_id="test_job",
+        project_name="test_project",
+        draft_id="test_draft",
+        outline_artifact_id="test_outline",
+        outline_source_path="test_outline.md",
+        summary_file="test_summaries.json",
+        review_word_path="test_review.docx",
+        sections=[
+            {
+                "section_number": 1,
+                "section_title": "Introduction",
+                "content": "This is a catalog-backed claim [[cite_ref:R001]].",
+            }
+        ],
+        references=[],
+        generation_mode="full_review",
+        paper_summaries=_summaries(),
+        citation_ref_catalog=catalog,
+        citation_ref_catalog_path="catalog.json",
+        citation_ref_catalog_hash=catalog["catalog_hash"],
     )
-    
-    # 验证结果
-    assert draft.artifact_version == 'v2'
-    assert len(draft.content['sections']) == 1
-    assert len(draft.content['sections'][0].blocks) == 1
-    
-    block = draft.content['sections'][0].blocks[0]
-    assert len(block.citations) == 1
+
+    block = draft.content["sections"][0].blocks[0]
     citation = block.citations[0]
-    
-    # 验证标准化后的字段
-    assert citation['local_ref_id'] == 'cit1'
-    assert citation['citation_token'] == '[[cite:test_paper_1|mode=parenthetical]]'
-    assert citation['paper_id'] == 'test_paper_1'
-    assert citation['paper_key'] == 'test_paper_1'
-    assert citation['raw_text'] == '[[cite:test_paper_1|mode=parenthetical]]'
-    assert citation['mode'] == 'parenthetical'
-    assert citation['source_type'] == 'structured_block'
-    assert citation['span_start'] == 10
-    assert citation['span_end'] == 40
+    assert citation["ref_id"] == "R001"
+    assert citation["paper_id"] == "test_paper_1"
+    assert citation["canonical_paper_key"] == "test_paper_1"
+    assert citation["source_type"] == "structured_ref"
+    assert draft.generation_context["citation_ref_catalog_path"] == "catalog.json"
+    assert draft.generation_context["citation_ref_catalog_hash"] == catalog["catalog_hash"]
 
 
-def test_review_draft_v2_with_mixed_blocks():
-    """测试 mixed block 时 structured citations 优先于 regex"""
-    # 模拟论文摘要数据
-    paper_summaries = [
-        {
-            'paper_info': {
-                'title': 'Test Paper 1',
-                'authors': ['Author A', 'Author B'],
-                'year': '2023'
-            }
-        }
-    ]
-    
-    # 模拟混合 blocks：一个带结构化 citations，一个不带
-    sections = [
-        {
-            'section_number': 1,
-            'section_title': 'Introduction',
-            'blocks': [
-                # 带结构化 citations 的 block
-                {
-                    'block_id': 's1_b1',
-                    'block_kind': 'paragraph',
-                    'block_order': 1,
-                    'text': 'This is a test paragraph with (Author A, 2023) citation.',
-                    'citations': [
-                        {
-                            'local_ref_id': 'cit1',
-                            'citation_token': '[[cite:test_paper_1]]',
-                            'paper_id': 'test_paper_1',
-                            'paper_key': 'test_paper_1'
-                        }
-                    ]
-                },
-                # 不带结构化 citations 的 block（应该触发 regex fallback）
-                {
-                    'block_id': 's1_b2',
-                    'block_kind': 'paragraph',
-                    'block_order': 2,
-                    'text': 'This is another paragraph with (Author A, 2023) citation.'
-                }
-            ]
-        }
-    ]
-    
-    # 构建 review_draft_v2
+def test_review_draft_v2_expands_combined_cite_ref_token():
+    catalog = _catalog()
     draft = build_review_draft_v2(
-        job_id='test_job',
-        project_name='test_project',
-        draft_id='test_draft',
-        outline_artifact_id='test_outline',
-        outline_source_path='test_outline.md',
-        summary_file='test_summaries.json',
-        review_word_path='test_review.docx',
-        sections=sections,
-        references=['Test reference 1'],
-        generation_mode='full_review',
-        paper_summaries=paper_summaries,
-        allow_legacy_regex_citations=True,
-    )
-    
-    # 验证结果
-    assert len(draft.content['sections'][0].blocks) == 2
-    
-    # 第一个 block 应该保留结构化 citations
-    block1 = draft.content['sections'][0].blocks[0]
-    assert len(block1.citations) == 1
-    assert block1.citations[0]['source_type'] == 'structured_block'
-    
-    # 第二个 block 应该有 regex 提取的 citations
-    block2 = draft.content['sections'][0].blocks[1]
-    assert len(block2.citations) > 0
-    assert block2.citations[0]['source_type'] == 'legacy_regex'
-
-
-def test_citation_manifest_v2_priority_logic():
-    """测试 citation_manifest_v2 的严格优先级逻辑"""
-    # 模拟 review_draft_v2 数据
-    review_draft_v2 = {
-        'content': {
-            'sections': [
-                {
-                    'section_number': 1,
-                    'section_title': 'Introduction',
-                    'blocks': [
-                        {
-                            'block_id': 's1_b1',
-                            'block_order': 1,
-                            'text': 'This is a test paragraph with (Author A, 2023) citation.',
-                            'citations': [
-                                {
-                                    'local_ref_id': 'cit1',
-                                    'citation_token': '[[cite:test_paper_1]]',
-                                    'paper_id': 'test_paper_1',
-                                    'paper_key': 'test_paper_1',
-                                    'mode': 'parenthetical',
-                                    'span_start': 10,
-                                    'span_end': 40
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ],
-            'references': ['Author A, B. (2023). Test Paper 1. Journal of Testing.']
-        }
-    }
-    
-    # 模拟论文摘要数据
-    paper_summaries = [
-        {
-            'paper_info': {
-                'title': 'Test Paper 1',
-                'authors': ['Author A', 'Author B'],
-                'year': '2023'
+        job_id="test_job",
+        project_name="test_project",
+        draft_id="test_draft",
+        outline_artifact_id="test_outline",
+        outline_source_path="test_outline.md",
+        summary_file="test_summaries.json",
+        review_word_path="test_review.docx",
+        sections=[
+            {
+                "section_number": 1,
+                "section_title": "Introduction",
+                "content": "This is a catalog-backed claim [[cite_ref:R001, R002]].",
             }
-        }
-    ]
-    
-    # 构建 citation_manifest_v2
-    manifest = build_citation_manifest_v2_from_review_draft(
-        job_id='test_job',
-        project_name='test_project',
-        manifest_id='test_manifest',
-        review_draft_path='test_draft.json',
-        review_word_path='test_review.docx',
-        review_draft_v2=review_draft_v2,
-        paper_summaries=paper_summaries
+        ],
+        references=[],
+        generation_mode="full_review",
+        paper_summaries=_summaries(),
+        citation_ref_catalog=catalog,
     )
-    
-    # 验证结果
-    assert manifest.artifact_version == 'v2'
-    assert len(manifest.occurrences) == 1
-    assert len(manifest.bibliography) == 1
-    
-    # 验证 occurrence 包含正确的字段
-    occurrence = manifest.occurrences[0]
-    assert occurrence.citation_token == '[[cite:test_paper_1]]'
-    assert occurrence.paper_id == 'test_paper_1'
-    assert len(occurrence.spans) == 1
-    
-    # 验证 bibliography 只包含被引用的条目
-    bibliography_entry = manifest.bibliography[0]
-    assert bibliography_entry.is_cited
-    assert 'Test Paper 1' in bibliography_entry.citation_text
+
+    citations = draft.content["sections"][0].blocks[0].citations
+    assert [citation["ref_id"] for citation in citations] == ["R001", "R002"]
+    assert [citation["paper_id"] for citation in citations] == ["test_paper_1", "test_paper_2"]
+    assert all(citation["citation_token"] == "[[cite_ref:R001, R002]]" for citation in citations)
 
 
-def test_bibliography_cited_only():
-    """测试 bibliography 只包含 cited entries"""
-    # 模拟 review_draft_v2 数据（只引用了一篇论文）
+def test_review_draft_v2_records_legacy_warnings_without_truth_fields():
+    draft = build_review_draft_v2(
+        job_id="test_job",
+        project_name="test_project",
+        draft_id="test_draft",
+        outline_artifact_id="test_outline",
+        outline_source_path="test_outline.md",
+        summary_file="test_summaries.json",
+        review_word_path="test_review.docx",
+        sections=[
+            {
+                "section_number": 1,
+                "section_title": "Introduction",
+                "content": "Legacy [[cite:test_paper_1]] and APA (Author A, 2023).",
+            }
+        ],
+        references=[],
+        generation_mode="full_review",
+        paper_summaries=_summaries(),
+        citation_ref_catalog=_catalog(),
+    )
+
+    citations = draft.content["sections"][0].blocks[0].citations
+    assert {citation["source_type"] for citation in citations} == {"legacy_token", "legacy_apa"}
+    assert all(citation["paper_id"] is None for citation in citations)
+    assert all(citation["canonical_paper_key"] is None for citation in citations)
+
+
+def test_citation_manifest_truth_only_from_structured_ref():
+    catalog = _catalog()
     review_draft_v2 = {
-        'content': {
-            'sections': [
+        "content": {
+            "sections": [
                 {
-                    'section_number': 1,
-                    'section_title': 'Introduction',
-                    'blocks': [
+                    "section_number": 1,
+                    "section_title": "Introduction",
+                    "blocks": [
                         {
-                            'block_id': 's1_b1',
-                            'block_order': 1,
-                            'text': 'This is a test paragraph with citation.',
-                            'citations': [
+                            "block_id": "s1_b1",
+                            "block_order": 1,
+                            "text": "Claim one [[cite_ref:R001]]. Legacy [[cite:test_paper_2]].",
+                            "citations": [
                                 {
-                                    'local_ref_id': 'cit1',
-                                    'citation_token': '[[cite:test_paper_1]]',
-                                    'paper_id': 'test_paper_1',
-                                    'paper_key': 'test_paper_1'
-                                }
-                            ]
+                                    "citation_token": "[[cite_ref:R001]]",
+                                    "ref_id": "R001",
+                                    "source_type": "structured_ref",
+                                    "span_start": 10,
+                                    "span_end": 27,
+                                },
+                                {
+                                    "citation_token": "[[cite:test_paper_2]]",
+                                    "source_type": "legacy_token",
+                                    "span_start": 36,
+                                    "span_end": 57,
+                                },
+                            ],
                         }
-                    ]
+                    ],
                 }
-            ],
-            'references': [
-                'Author A, B. (2023). Test Paper 1. Journal of Testing.',
-                'Author C. (2024). Test Paper 2. Journal of Testing.'  # 未被引用
             ]
         }
     }
-    
-    # 模拟论文摘要数据（两篇论文）
-    paper_summaries = [
-        {
-            'paper_info': {
-                'title': 'Test Paper 1',
-                'authors': ['Author A', 'Author B'],
-                'year': '2023'
-            }
-        },
-        {
-            'paper_info': {
-                'title': 'Test Paper 2',
-                'authors': ['Author C'],
-                'year': '2024'
-            }
-        }
-    ]
-    
-    # 构建 citation_manifest_v2
+
     manifest = build_citation_manifest_v2_from_review_draft(
-        job_id='test_job',
-        project_name='test_project',
-        manifest_id='test_manifest',
-        review_draft_path='test_draft.json',
-        review_word_path='test_review.docx',
+        job_id="test_job",
+        project_name="test_project",
+        manifest_id="test_manifest",
+        review_draft_path="test_draft.json",
+        review_word_path="test_review.docx",
         review_draft_v2=review_draft_v2,
-        paper_summaries=paper_summaries
+        paper_summaries=_summaries(),
+        citation_ref_catalog=catalog,
     )
-    
-    # 验证 bibliography 只包含被引用的论文
+
+    assert len(manifest.occurrences) == 1
+    assert manifest.occurrences[0].ref_id == "R001"
+    assert manifest.occurrences[0].paper_id == "test_paper_1"
     assert len(manifest.bibliography) == 1
-    assert manifest.bibliography[0].paper_id == 'test_paper_1'
+    assert manifest.bibliography[0].paper_id == "test_paper_1"
+    assert manifest.fallback_counters["legacy_tokens"] == 1
 
 
-def test_manifest_resolves_literature_map_source_alias():
+def test_citation_manifest_expands_combined_cite_ref_token():
+    catalog = _catalog()
     review_draft_v2 = {
-        'content': {
-            'sections': [
+        "content": {
+            "sections": [
                 {
-                    'section_number': 1,
-                    'section_title': 'Introduction',
-                    'blocks': [
+                    "section_number": 1,
+                    "section_title": "Introduction",
+                    "blocks": [
                         {
-                            'block_id': 's1_b1',
-                            'block_order': 1,
-                            'text': 'Fairness is central [[cite:source:hash:paper_artifact:21]].',
-                            'citations': [
+                            "block_id": "s1_b1",
+                            "block_order": 1,
+                            "text": "Claim one [[cite_ref:R001, R002]].",
+                            "citations": [
                                 {
-                                    'citation_token': '[[cite:source:hash:paper_artifact:21]]',
-                                    'paper_key': 'source:hash:paper_artifact:21',
+                                    "citation_token": "[[cite_ref:R001, R002]]",
+                                    "source_type": "structured_ref",
+                                    "span_start": 10,
+                                    "span_end": 33,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    manifest = build_citation_manifest_v2_from_review_draft(
+        job_id="test_job",
+        project_name="test_project",
+        manifest_id="test_manifest",
+        review_draft_path="test_draft.json",
+        review_word_path="test_review.docx",
+        review_draft_v2=review_draft_v2,
+        paper_summaries=_summaries(),
+        citation_ref_catalog=catalog,
+    )
+
+    assert [occurrence.ref_id for occurrence in manifest.occurrences] == ["R001", "R002"]
+    assert [occurrence.paper_id for occurrence in manifest.occurrences] == ["test_paper_1", "test_paper_2"]
+    assert len(manifest.bibliography) == 2
+
+
+def test_warn_and_resolve_exact_unique_legacy_only():
+    review_draft_v2 = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Introduction",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_order": 1,
+                            "text": "Legacy [[cite:test_paper_1]].",
+                            "citations": [
+                                {
+                                    "citation_token": "[[cite:test_paper_1]]",
+                                    "source_type": "legacy_token",
+                                    "span_start": 7,
+                                    "span_end": 28,
                                 }
                             ],
                         }
@@ -327,37 +250,204 @@ def test_manifest_resolves_literature_map_source_alias():
             ]
         }
     }
-    paper_summaries = [
-        {
-            'paper_info': {
-                'title': 'Fair Pricing and Its Impact',
-                'authors': ['Alice Smith'],
-                'year': '2024',
-                'doi': '10.1016/j.jbusres.2024.01.001',
-            }
-        }
+
+    manifest = build_citation_manifest_v2_from_review_draft(
+        job_id="test_job",
+        project_name="test_project",
+        manifest_id="test_manifest",
+        review_draft_path="test_draft.json",
+        review_word_path="test_review.docx",
+        review_draft_v2=review_draft_v2,
+        paper_summaries=_summaries(),
+        legacy_citation_policy="warn_and_resolve",
+    )
+
+    assert len(manifest.occurrences) == 1
+    assert manifest.occurrences[0].paper_id == "test_paper_1"
+    assert manifest.occurrences[0].source_type == "exact_id"
+    assert manifest.legacy_warnings[0]["disposition"] == "warn_and_resolved"
+
+
+def test_ambiguous_legacy_is_unresolved_needs_review():
+    summaries = [
+        {"paper_info": {"title": "A", "authors": ["A"], "year": "2024", "canonical_paper_key": "dup"}},
+        {"paper_info": {"title": "B", "authors": ["B"], "year": "2024", "canonical_paper_key": "dup"}},
     ]
-    literature_map = {
-        'paper_nodes': [
-            {
-                'paper_key': 'source:hash:paper_artifact:21',
-                'title': 'Fair Pricing and Its Impact',
-                'aliases': ['source:hash:paper_artifact:21'],
-            }
-        ]
+    review_draft_v2 = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Intro",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_order": 1,
+                            "text": "Legacy [[cite:dup]].",
+                            "citations": [{"citation_token": "[[cite:dup]]", "source_type": "legacy_token"}],
+                        }
+                    ],
+                }
+            ]
+        }
     }
 
     manifest = build_citation_manifest_v2_from_review_draft(
-        job_id='test_job',
-        project_name='test_project',
-        manifest_id='test_manifest',
-        review_draft_path='test_draft.json',
-        review_word_path='test_review.docx',
+        job_id="job",
+        project_name="demo",
+        manifest_id="manifest",
+        review_draft_path="draft.json",
+        review_word_path="review.docx",
         review_draft_v2=review_draft_v2,
-        paper_summaries=paper_summaries,
-        allow_legacy_regex=False,
-        literature_map=literature_map,
+        paper_summaries=summaries,
+        legacy_citation_policy="warn_and_resolve",
     )
 
-    assert manifest.occurrences[0].paper_id != 'unknown'
-    assert manifest.occurrences[0].paper_id == manifest.clusters[0].paper_id
+    assert manifest.occurrences == []
+    assert manifest.legacy_warnings[0]["disposition"] == "NEEDS_REVIEW"
+
+
+def test_fatal_policy_fails_on_legacy():
+    with pytest.raises(ValueError, match="Legacy citation token"):
+        build_citation_manifest_v2_from_review_draft(
+            job_id="job",
+            project_name="demo",
+            manifest_id="manifest",
+            review_draft_path="draft.json",
+            review_word_path="review.docx",
+            review_draft_v2={
+                "content": {
+                    "sections": [
+                        {
+                            "section_number": 1,
+                            "section_title": "Intro",
+                            "blocks": [
+                                {
+                                    "block_id": "s1_b1",
+                                    "block_order": 1,
+                                    "text": "Legacy [[cite:test_paper_1]].",
+                                    "citations": [{"citation_token": "[[cite:test_paper_1]]", "source_type": "legacy_token"}],
+                                }
+                            ],
+                        }
+                    ]
+                }
+            },
+            paper_summaries=_summaries(),
+            legacy_citation_policy="fatal",
+        )
+
+
+def test_apa_author_year_title_and_pinyin_never_resolve():
+    review_draft_v2 = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Intro",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_order": 1,
+                            "text": "APA (Author A, 2023). Same surname (Author A, 2023). Title Test Paper 1. Pinyin qiu2023.",
+                            "citations": [
+                                {"citation_token": "(Author A, 2023)", "source_type": "legacy_apa"},
+                                {"citation_token": "(Author A, 2023)", "source_type": "legacy_apa"},
+                                {"citation_token": "Test Paper 1", "source_type": "legacy_apa"},
+                                {"citation_token": "qiu2023", "source_type": "legacy_apa"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    manifest = build_citation_manifest_v2_from_review_draft(
+        job_id="job",
+        project_name="demo",
+        manifest_id="manifest",
+        review_draft_path="draft.json",
+        review_word_path="review.docx",
+        review_draft_v2=review_draft_v2,
+        paper_summaries=_summaries(),
+        legacy_citation_policy="warn_and_resolve",
+    )
+
+    assert manifest.occurrences == []
+    assert manifest.bibliography == []
+    assert len(manifest.legacy_warnings) == 4
+
+
+
+def test_validate_citation_refs_expands_combined_tokens_and_flags_missing_refs():
+    catalog = _catalog()
+
+    result = validate_citation_refs(catalog, "Claim [[cite_ref:R001, R999]].")
+
+    assert result["valid"] is False
+    assert result["resolved"] == ["R001"]
+    assert result["unresolved"] == ["R999"]
+    assert result["tombstoned"] == []
+
+
+
+def test_validate_citation_refs_flags_tombstoned_refs_in_combined_tokens():
+    catalog = _catalog()
+    catalog["entries"][1]["status"] = "tombstoned"
+
+    result = validate_citation_refs(catalog, "Claim [[cite_ref:R001, R002]].")
+
+    assert result["valid"] is False
+    assert result["resolved"] == ["R001"]
+    assert result["unresolved"] == []
+    assert result["tombstoned"] == ["R002"]
+
+
+def test_catalog_rerun_id_stability_new_append_and_tombstones():
+    summaries = _summaries()
+    first = build_document_ref_catalog(summaries, project_name="demo", job_id="job-1")
+
+    assert [entry["ref_id"] for entry in first["entries"]] == ["R001", "R002"]
+
+    second = build_document_ref_catalog(
+        [
+            summaries[0],
+            {
+                "paper_info": {
+                    "title": "Test Paper 3",
+                    "authors": ["Author D"],
+                    "year": "2025",
+                    "canonical_paper_key": "test_paper_3",
+                }
+            },
+        ],
+        project_name="demo",
+        job_id="job-2",
+        existing_catalog=first,
+    )
+
+    active = [entry for entry in second["entries"] if entry["status"] == "active"]
+    tombstoned = [entry for entry in second["entries"] if entry["status"] == "tombstoned"]
+    assert [(entry["ref_id"], entry["canonical_paper_key"]) for entry in active] == [
+        ("R001", "test_paper_1"),
+        ("R003", "test_paper_3"),
+    ]
+    assert [(entry["ref_id"], entry["canonical_paper_key"]) for entry in tombstoned] == [
+        ("R002", "test_paper_2")
+    ]
+
+    third = build_document_ref_catalog(
+        summaries,
+        project_name="demo",
+        job_id="job-3",
+        existing_catalog=second,
+    )
+
+    active_third = [entry for entry in third["entries"] if entry["status"] == "active"]
+    tombstoned_third = [entry for entry in third["entries"] if entry["status"] == "tombstoned"]
+    assert [(entry["ref_id"], entry["canonical_paper_key"]) for entry in active_third] == [
+        ("R001", "test_paper_1"),
+        ("R004", "test_paper_2"),
+    ]
+    assert {entry["ref_id"] for entry in tombstoned_third} == {"R002", "R003"}

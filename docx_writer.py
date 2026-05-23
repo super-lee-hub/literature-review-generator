@@ -18,13 +18,11 @@ from docx.oxml import OxmlElement  # type: ignore
 DOCX_AVAILABLE = True
 
 from services.citation_catalog import (
-    alias_lookup_keys,
     build_citation_catalog,
-    build_citation_catalog_from_manifest,
     extract_citation_key,
-    extract_doi_aliases,
     format_in_text_citation,
 )
+from services.citation_ref_catalog import extract_ref_ids_from_token
 
 
 def _log(logger: Any, level: str, message: str) -> None:
@@ -45,27 +43,49 @@ def _build_citation_entry_lookup(
 ) -> Dict[str, Any]:
     manifest_data = citation_manifest or {}
     if manifest_data.get("paper_entries"):
-        alias_map = build_citation_catalog_from_manifest(manifest_data)
+        entries_by_paper_id: Dict[str, Any] = {}
+        for entry_data in manifest_data.get("paper_entries", []):
+            if not isinstance(entry_data, Mapping):
+                continue
+            from services.citation_catalog import CitationCatalogEntry
+
+            entry = CitationCatalogEntry(
+                index=len(entries_by_paper_id) + 1,
+                paper_id=str(entry_data.get("paper_id") or entry_data.get("paper_key") or ""),
+                paper_key=str(entry_data.get("paper_key") or entry_data.get("paper_id") or ""),
+                title=str(entry_data.get("title") or ""),
+                authors=[str(item).strip() for item in (entry_data.get("authors") or []) if str(item).strip()],
+                year=str(entry_data.get("year") or ""),
+                journal=str(entry_data.get("journal") or ""),
+                doi=str(entry_data.get("doi") or ""),
+                aliases=[],
+                migration_status=str(entry_data.get("status") or "clean_canonical"),
+                migration_reasons=list(entry_data.get("reasons") or []),
+                confidence_score=float(entry_data.get("confidence_score") or 1.0),
+                decision_threshold=float(entry_data.get("decision_threshold") or 0.85),
+                decision_source=str(entry_data.get("decision_source") or "rule"),
+                source_fields=dict(entry_data.get("source_fields") or {}),
+            )
+            if entry.paper_id:
+                entries_by_paper_id[entry.paper_id] = entry
+            if entry.paper_key:
+                entries_by_paper_id[entry.paper_key] = entry
+
+        lookup: Dict[str, Any] = {}
         for occurrence in manifest_data.get("occurrences", []):
             if not isinstance(occurrence, Mapping):
                 continue
             paper_id = str(occurrence.get("paper_id") or "").strip()
             if not paper_id or paper_id == "unknown":
                 continue
-            entry = None
-            for lookup_value in (paper_id, occurrence.get("paper_key")):
-                for lookup_key in alias_lookup_keys(lookup_value):
-                    entry = alias_map.get(lookup_key)
-                    if entry is not None:
-                        break
-                if entry is not None:
-                    break
+            entry = entries_by_paper_id.get(paper_id) or entries_by_paper_id.get(str(occurrence.get("paper_key") or ""))
             if entry is None:
                 continue
-            token_key = extract_citation_key(str(occurrence.get("citation_token") or ""))
-            for lookup_key in alias_lookup_keys(token_key):
-                alias_map[lookup_key] = entry
-        return alias_map
+            ref_id = str(occurrence.get("ref_id") or "").strip()
+            if ref_id:
+                lookup[ref_id] = entry
+            lookup[paper_id] = entry
+        return lookup
     if not allow_compat_fallback:
         return {}
     summaries = getattr(generator_instance, "summaries", []) or []
@@ -94,38 +114,36 @@ def render_structured_citations(
     unresolved: List[str] = []
 
     def _replace(match: re.Match[str]) -> str:
-        raw_key = str(match.group(1) or "").strip()
-        params_text = str(match.group(2) or "")
-        params: Dict[str, str] = {}
-        for part in params_text.split("|"):
-            if "=" in part:
-                key, value = part.split("=", 1)
-                params[key.strip()] = value.strip()
-        entry = None
-        for lookup_key in alias_lookup_keys(raw_key):
-            entry = alias_map.get(lookup_key)
-            if entry is not None:
-                break
-        if entry is None:
-            for doi_alias in extract_doi_aliases(raw_key):
-                for lookup_key in alias_lookup_keys(doi_alias):
-                    entry = alias_map.get(lookup_key)
-                    if entry is not None:
-                        break
-                if entry is not None:
-                    break
-        if entry is None:
-            unresolved.append(raw_key or match.group(0))
+        citation_token = match.group(0)
+        ref_ids = extract_ref_ids_from_token(citation_token)
+        if not ref_ids:
+            unresolved.append(citation_token)
             return match.group(0)
-        citation = format_in_text_citation(
-            entry,
-            mode=params.get("mode", "parenthetical"),
-            locator=params.get("locator"),
-        )
-        # Remove any backticks from the citation
-        return citation.replace("`", "")
 
-    rendered = re.sub(r"\[\[cite:([^|\]]+)(?:\|([^\]]*))?\]\]", _replace, str(text or ""))
+        citation_parts: List[str] = []
+        missing_ref_ids: List[str] = []
+        for ref_id in ref_ids:
+            entry = alias_map.get(ref_id)
+            if entry is None:
+                missing_ref_ids.append(ref_id)
+                continue
+            citation = format_in_text_citation(
+                entry,
+                mode="parenthetical",
+            ).replace("`", "")
+            if citation.startswith("(") and citation.endswith(")"):
+                citation = citation[1:-1]
+            citation_parts.append(citation)
+
+        if missing_ref_ids or not citation_parts:
+            unresolved.extend(missing_ref_ids or [citation_token])
+            return match.group(0)
+        return f"({'; '.join(citation_parts)})"
+
+    rendered = re.sub(r"\[\[cite_ref:[^\]]+\]\]", _replace, str(text or ""))
+    legacy_tokens = re.findall(r"\[\[cite:[^\]]+\]\]", rendered)
+    if legacy_tokens and not allow_compat_fallback:
+        unresolved.extend(legacy_tokens)
     # Also clean any remaining backticks in the text
     rendered = rendered.replace("`", "")
     return rendered, unresolved

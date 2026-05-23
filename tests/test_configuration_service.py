@@ -23,6 +23,7 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert config['Validation']['stage2_enabled'] == 'true'
     assert config['Validation']['keep_checkpoints_after_completion'] == 'false'
     assert config['Validation']['repair_policy'] == 'report_only'
+    assert config['Validation']['legacy_citation_policy'] == 'report_only'
     assert config['Performance']['enable_stage1_validation'] == 'false'
     assert config['Performance']['enable_stage2_validation'] == 'true'
     assert config['Primary_Reader_API']['proxy_mode'] == 'environment'

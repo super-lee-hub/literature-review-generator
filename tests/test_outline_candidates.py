@@ -808,6 +808,43 @@ class TestProductionCandidateGeneration:
         assert report["final_valid_count"] == 0
         assert report["pipeline_continued"] is False
 
+    def test_production_two_valid_candidates_can_continue_without_fallback(self):
+        lit_map = build_literature_map(_sample_summaries(), "job-partial-continue")
+        flow = build_synthesis_flow(lit_map, "job-partial-continue")
+        flow_steps = [step.flow_step_id for step in flow.flow_steps if not step.placeholder_flow]
+        paper_keys = [node.paper_key for node in lit_map.paper_nodes]
+        valid_sections = _valid_provider_sections(flow_steps, paper_keys)
+        valid_first = {
+            "candidate_id": "valid_first",
+            "sections": valid_sections,
+        }
+        valid_second = {
+            "candidate_id": "valid_second",
+            "sections": valid_sections,
+        }
+        invalid_third = {
+            "candidate_id": "invalid_third",
+            "sections": valid_sections[:2],
+        }
+
+        candidates, report = normalize_candidate_output_with_report(
+            {"candidates": [valid_first, valid_second, invalid_third]},
+            lit_map,
+            flow,
+            3,
+            "Outline_API",
+        )
+
+        assert report["minimum_viable_count"] == 2
+        assert report["provider_valid"] == 2
+        assert report["final_valid_count"] == 2
+        assert report["pipeline_continued"] is True
+        assert candidates.candidate_count == 2
+        assert [candidate.candidate_id for candidate in candidates.candidates] == [
+            "valid_first",
+            "valid_second",
+        ]
+
     def test_fixture_mode_provider_and_fallback_failure_summarizes_rejections(self):
         lit_map = build_literature_map(
             [{"paper_info": {"title": "Only Paper", "authors": ["A"], "year": 2020}, "themes": ["solo"]}],
@@ -872,6 +909,7 @@ class TestProductionCandidateGeneration:
             )
 
         report = excinfo.value.report
+        assert report["minimum_viable_count"] == 2
         assert report["provider_valid"] == 1
         assert report["final_valid_count"] == 1
         assert report["pipeline_continued"] is False

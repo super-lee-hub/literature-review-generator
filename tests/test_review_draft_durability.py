@@ -104,7 +104,7 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite_ref:R001]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -129,7 +129,7 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
     assert artifact_payload["generation_context"]["outline_source_path"] == str(outline_path)
     assert len(artifact_payload["content"]["sections"]) == 2
     assert artifact_payload["content"]["sections"][0]["section_title"] == "First Section"
-    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content. [[cite:paper_a|mode=parenthetical]]"
+    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content. [[cite_ref:R001]]"
     assert artifact_payload["content"]["references"] == [
         "Alice Smith (2024). Paper A *Journal of Tests* https://doi.org/10.1000/test.paper"
     ]
@@ -149,7 +149,7 @@ def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Pa
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
             return None
-        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
+        return f"{section_title} generated content. [[cite_ref:R001]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
@@ -162,7 +162,9 @@ def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Pa
     failed_sections_path = Path(workspace.report_path("demo_failed_review_sections.json"))
     registry_path = Path(workspace.paths.registry_path)
 
-    assert word_path.exists() is False
+    assert word_path.exists() is True
+    document_text = "\n".join(paragraph.text for paragraph in Document(str(word_path)).paragraphs)
+    assert "First Section generated content." in document_text
     assert draft_path.exists() is False
     assert failed_sections_path.exists() is True
     if registry_path.exists():
@@ -183,7 +185,7 @@ def test_stage2_stops_after_first_failed_section(tmp_path: Path, monkeypatch) ->
         generated_sections.append(section_title)
         if section_title == "Second Section":
             return None
-        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
+        return f"{section_title} generated content. [[cite_ref:R001]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
@@ -216,7 +218,7 @@ def test_stage2_retries_section_missing_structured_citations(tmp_path: Path, mon
                 "partial_content": partial_content,
             }
         )
-        return {"content": "First Section generated content. [[cite:paper_a|mode=parenthetical]]"}
+        return {"content": "First Section generated content. [[cite_ref:R001]]"}
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
@@ -235,7 +237,7 @@ def test_stage2_retries_section_missing_structured_citations(tmp_path: Path, mon
     draft_path = Path(workspace.artifact_path("review_drafts/demo_review_draft_v1.json"))
     draft_payload = json.loads(draft_path.read_text(encoding="utf-8"))
     assert draft_payload["content"]["sections"][0]["content"] == (
-        "First Section generated content. [[cite:paper_a|mode=parenthetical]]"
+        "First Section generated content. [[cite_ref:R001]]"
     )
 
 
@@ -259,6 +261,7 @@ def test_section_api_retries_empty_writer_response(tmp_path: Path, monkeypatch) 
 
     assert result == {"content": "Recovered section content.", "finish_reason": "stop"}
     assert len(calls) == 2
+    assert [call["retry_attempts"] for call in calls] == [1, 1]
 
 
 def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_completion(
@@ -295,7 +298,7 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite_ref:R001]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -309,7 +312,7 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     assert len(review_records) == 1
     assert [section["section_number"] for section in artifact_payload["content"]["sections"]] == [1, 2]
     assert artifact_payload["content"]["sections"][0]["content"] == "Existing section content."
-    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content. [[cite:paper_a|mode=parenthetical]]"
+    assert artifact_payload["content"]["sections"][1]["content"] == "Second Section generated content. [[cite_ref:R001]]"
 
 
 def test_review_draft_checkpoint_without_docx_restarts_from_first_section(
@@ -338,7 +341,7 @@ def test_review_draft_checkpoint_without_docx_restarts_from_first_section(
 
     def _section_content(section_title: str, _outline: str):
         generated_sections.append(section_title)
-        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
+        return f"{section_title} generated content. [[cite_ref:R001]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
@@ -414,7 +417,7 @@ def test_successful_stage2_generation_creates_registered_review_draft_v2(tmp_pat
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]\n\nSecond paragraph for {section_title}. [[cite:paper_a|mode=narrative]]",
+        lambda section_title, _outline: f"{section_title} generated content. [[cite_ref:R001]]\n\nSecond paragraph for {section_title}. [[cite_ref:R001]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: ["Author, A. (2024). Demo reference."])
 
@@ -457,7 +460,7 @@ def test_stage2_with_failed_sections_does_not_register_review_draft_v2(tmp_path:
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
             return None
-        return f"{section_title} generated content. [[cite:paper_a|mode=parenthetical]]"
+        return f"{section_title} generated content. [[cite_ref:R001]]"
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(generator, "generate_review_section_content", _section_content)
@@ -487,7 +490,7 @@ def test_review_draft_v2_written_to_job_workspace_not_project_root(tmp_path: Pat
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} content. [[cite:paper_a|mode=parenthetical]]",
+        lambda section_title, _outline: f"{section_title} content. [[cite_ref:R001]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
 
@@ -516,7 +519,7 @@ def test_review_draft_v1_and_v2_coexist_in_registry(tmp_path: Path, monkeypatch)
     monkeypatch.setattr(
         generator,
         "generate_review_section_content",
-        lambda section_title, _outline: f"{section_title} content. [[cite:paper_a|mode=parenthetical]]",
+        lambda section_title, _outline: f"{section_title} content. [[cite_ref:R001]]",
     )
     monkeypatch.setattr(generator, "generate_apa_references", lambda: [])
 

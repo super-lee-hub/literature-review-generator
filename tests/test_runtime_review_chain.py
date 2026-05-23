@@ -27,12 +27,12 @@ def test_runtime_review_chain_persists_outline_draft_manifest_and_docx(tmp_path:
             {
                 "section_number": 1,
                 "section_title": "Findings",
-                "content": "Paper A demonstrates a stable result. [[cite:paper_a|mode=parenthetical]]",
+                "content": "Paper A demonstrates a stable result. [[cite_ref:R001]]",
             },
             {
                 "section_number": 2,
                 "section_title": "Discussion",
-                "content": "The discussion revisits the same source. [[cite:paper_a|mode=parenthetical]]",
+                "content": "The discussion revisits the same source. [[cite_ref:R001]]",
             },
         ],
     )
@@ -56,3 +56,35 @@ def test_runtime_review_chain_persists_outline_draft_manifest_and_docx(tmp_path:
     citation_manifest = json.loads(citation_manifest_path.read_text(encoding="utf-8"))
     assert review_draft["artifact_version"] == "v2"
     assert citation_manifest["artifact_version"] == "v3"
+
+
+
+def test_runtime_review_chain_rejects_legacy_tokens_when_policy_is_fatal(tmp_path: Path) -> None:
+    bridge, session, _pdf_dir, pdf_path = make_bridge_session(tmp_path, action="generate_review")
+    session.generator.config.setdefault("Validation", {})["legacy_citation_policy"] = "fatal"
+    session.generator.compat_config = None
+
+    bridge.persist_stage1_results(
+        session,
+        [build_success_summary(pdf_path)],
+    )
+    outline_result = bridge.persist_outline(
+        session,
+        "# Demo Outline\n\n## 1. Findings",
+    )
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="citation manifest persistence failed"):
+        bridge.persist_review_chain(
+            session,
+            outline_file=outline_result.artifacts[0].path,
+            review_sections=[
+                {
+                    "section_number": 1,
+                    "section_title": "Findings",
+                    "content": "Paper A demonstrates a stable result. [[cite:paper_a|mode=parenthetical]]",
+                }
+            ],
+            rebuild_docx=False,
+        )

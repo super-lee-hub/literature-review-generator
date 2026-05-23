@@ -1,4 +1,5 @@
 from services.config_compat import CompatConfigView, apply_validation_compat_sections, read_validation_settings
+from services.repair_policy import ValidationRepairPolicy, parse_repair_policy
 
 
 def test_read_validation_settings_prefers_validation_section() -> None:
@@ -20,12 +21,17 @@ def test_read_validation_settings_prefers_validation_section() -> None:
     assert settings.stage2_enabled is False
     assert settings.keep_checkpoints_after_completion is True
     assert settings.repair_policy == "report_only"
+    assert settings.legacy_citation_policy == "report_only"
 
 
 def test_read_validation_settings_reads_repair_policy() -> None:
     settings = read_validation_settings({"Validation": {"repair_policy": "auto_safe"}})
 
     assert settings.repair_policy == "auto_safe"
+
+
+def test_parse_repair_policy_accepts_policy_enum() -> None:
+    assert parse_repair_policy(ValidationRepairPolicy.REPORT_ONLY) is ValidationRepairPolicy.REPORT_ONLY
 
 
 def test_read_validation_settings_rejects_invalid_repair_policy() -> None:
@@ -50,6 +56,7 @@ def test_apply_validation_compat_sections_mirrors_legacy_performance_flags() -> 
     assert normalized["Validation"]["stage1_enabled"] == "true"
     assert normalized["Validation"]["stage2_enabled"] == "false"
     assert normalized["Validation"]["repair_policy"] == "report_only"
+    assert normalized["Validation"]["legacy_citation_policy"] == "report_only"
     assert normalized["Performance"]["enable_stage1_validation"] == "true"
     assert normalized["Performance"]["enable_stage2_validation"] == "false"
 
@@ -102,5 +109,21 @@ def test_compat_config_view_updates_raw_config_in_place() -> None:
     assert view.stage1_validation_enabled() is True
     assert view.stage2_validation_enabled() is True
     assert view.repair_policy() == "report_only"
+    assert view.legacy_citation_policy() == "report_only"
     assert config["Validation"]["stage1_enabled"] == "true"
     assert config["Performance"]["enable_stage1_validation"] == "true"
+
+
+def test_read_validation_settings_reads_legacy_citation_policy() -> None:
+    settings = read_validation_settings({"Validation": {"legacy_citation_policy": "warn_and_resolve"}})
+
+    assert settings.legacy_citation_policy == "warn_and_resolve"
+
+
+def test_read_validation_settings_rejects_invalid_legacy_citation_policy() -> None:
+    try:
+        read_validation_settings({"Validation": {"legacy_citation_policy": "resolve_everything"}})
+    except ValueError as exc:
+        assert "Invalid [Validation].legacy_citation_policy" in str(exc)
+    else:
+        raise AssertionError("invalid legacy_citation_policy should fail loudly")

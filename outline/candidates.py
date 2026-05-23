@@ -1009,6 +1009,11 @@ class CandidateGenerationError(ValueError):
         self.report = report
 
 
+def _minimum_viable_candidate_count(candidate_count: int) -> int:
+    """Return the minimum strict-valid candidates needed to continue arbitration."""
+    return max(1, min(int(candidate_count or 0), 2))
+
+
 def _report_rejection(
     report: Dict[str, Any],
     *,
@@ -1039,6 +1044,7 @@ def _base_generation_report(
         "created_at": _utc_now_iso(),
         "generator_model": generator_model,
         "requested_candidate_count": candidate_count,
+        "minimum_viable_count": _minimum_viable_candidate_count(candidate_count),
         "provider_top_level_keys": top_keys,
         "provider_total": 0,
         "provider_valid": 0,
@@ -1276,7 +1282,7 @@ def normalize_candidate_output_with_report(
                 report,
                 quality_gate,
             )
-        if len(candidates) >= candidate_count:
+        if len(candidates) >= _minimum_viable_candidate_count(candidate_count):
             outline_candidates = OutlineCandidates(
                 source_literature_map_id=f"literature_map:{compute_content_hash(literature_map.to_dict())[:12]}",
                 source_synthesis_flow_id=f"synthesis_flow:{compute_content_hash(synthesis_flow.to_dict())[:12]}",
@@ -1391,11 +1397,13 @@ def normalize_candidate_output_with_report(
             report,
         )
 
-    if len(candidates) < candidate_count:
+    minimum_viable_count = _minimum_viable_candidate_count(candidate_count)
+    if len(candidates) < minimum_viable_count:
         _finalize_generation_report(report, candidates, pipeline_continued=False)
         reason_parts = [
             f"Candidate output contained {len(candidates)} valid candidates",
             f"expected {candidate_count}",
+            f"minimum viable {minimum_viable_count}",
             f"top-level keys: {top_keys}",
         ]
         rejection_summary = [

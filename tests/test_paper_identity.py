@@ -1,3 +1,5 @@
+import main
+
 from services.paper_identity import normalize_doi, normalize_paper_identity
 
 
@@ -45,3 +47,21 @@ def test_polluted_explicit_canonical_doi_does_not_override_valid_title_identity(
     assert identity["canonical_key"] == "fallback identity|smith|2025"
     assert identity["canonical_key_source"] == "normalized_title_first_author_year"
     assert identity["rejected_identity_values"][0]["field"] == "canonical_paper_key"
+
+
+def test_runtime_paper_key_prefers_stable_source_identity():
+    paper = {
+        "canonical_paper_key": "short source title_smith_lee",
+        "source_paper_id": "source-id",
+        "title": "Short source title",
+        "authors": ["Alice Smith", "Bob Lee"],
+        "year": "2025",
+    }
+
+    mutated_after_ai_backfill = {
+        **paper,
+        "title": "Short source title with subtitle that was filled by AI",
+    }
+
+    assert main.LiteratureReviewGenerator.get_paper_key(paper) == "short source title_smith_lee"
+    assert main.LiteratureReviewGenerator.get_paper_key(mutated_after_ai_backfill) == "short source title_smith_lee"

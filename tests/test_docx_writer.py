@@ -20,6 +20,8 @@ class MockGenerator:
                 pass
             def error(self, msg):
                 pass
+            def success(self, msg):
+                pass
         
         self.logger = MockLogger()
 
@@ -82,6 +84,141 @@ def test_v2_bibliography_cited_only():
     assert len(references) == 1
     assert 'Author A, B. (2023). Test Paper 1. Journal of Testing.' in references
     assert 'Author C. (2024). Test Paper 2. Journal of Testing.' not in references
+
+
+def test_rendered_docx_uses_manifest_ref_id_and_exact_bibliography(tmp_path):
+    generator = MockGenerator()
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Intro",
+                    "blocks": [{"text": "Structured claim [[cite_ref:R001]]. Legacy mention [[cite:paper_2]]."}],
+                }
+            ]
+        }
+    }
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "paper_1",
+                "paper_key": "paper_1",
+                "title": "Structured Paper",
+                "authors": ["Alice Smith"],
+                "year": "2024",
+            },
+            {
+                "paper_id": "paper_2",
+                "paper_key": "paper_2",
+                "title": "Uncited Paper",
+                "authors": ["Bob Jones"],
+                "year": "2025",
+            },
+        ],
+        "occurrences": [{"ref_id": "R001", "paper_id": "paper_1", "paper_key": "paper_1"}],
+        "bibliography": [
+            {
+                "entry_id": "bib_001",
+                "paper_id": "paper_1",
+                "paper_key": "paper_1",
+                "citation_text": "Alice Smith (2024). Structured Paper.",
+                "is_cited": True,
+            }
+        ],
+    }
+
+    output = tmp_path / "review.docx"
+
+    with pytest.raises(ValueError):
+        rebuild_review_docx_from_structured_artifacts(
+            generator,
+            review_draft,
+            manifest,
+            str(output),
+        )
+
+    review_draft["content"]["sections"][0]["blocks"][0]["text"] = "Structured claim [[cite_ref:R001]]."
+    rebuild_review_docx_from_structured_artifacts(
+        generator,
+        review_draft,
+        manifest,
+        str(output),
+    )
+
+    from docx import Document
+
+    text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
+    assert "(Smith, 2024)" in text
+    assert "Alice Smith (2024). Structured Paper." in text
+    assert "Uncited Paper" not in text
+
+
+def test_rendered_docx_resolves_combined_cite_ref_token(tmp_path):
+    generator = MockGenerator()
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Intro",
+                    "blocks": [{"text": "Combined support [[cite_ref:R001, R002]]."}],
+                }
+            ]
+        }
+    }
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "paper_1",
+                "paper_key": "paper_1",
+                "title": "Structured Paper One",
+                "authors": ["Alice Smith"],
+                "year": "2024",
+            },
+            {
+                "paper_id": "paper_2",
+                "paper_key": "paper_2",
+                "title": "Structured Paper Two",
+                "authors": ["Bob Jones"],
+                "year": "2025",
+            },
+        ],
+        "occurrences": [
+            {"ref_id": "R001", "paper_id": "paper_1", "paper_key": "paper_1"},
+            {"ref_id": "R002", "paper_id": "paper_2", "paper_key": "paper_2"},
+        ],
+        "bibliography": [
+            {
+                "entry_id": "bib_001",
+                "paper_id": "paper_1",
+                "paper_key": "paper_1",
+                "citation_text": "Alice Smith (2024). Structured Paper One.",
+                "is_cited": True,
+            },
+            {
+                "entry_id": "bib_002",
+                "paper_id": "paper_2",
+                "paper_key": "paper_2",
+                "citation_text": "Bob Jones (2025). Structured Paper Two.",
+                "is_cited": True,
+            },
+        ],
+    }
+
+    output = tmp_path / "review.docx"
+    rebuild_review_docx_from_structured_artifacts(
+        generator,
+        review_draft,
+        manifest,
+        str(output),
+    )
+
+    from docx import Document
+
+    text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
+    assert "[[cite_ref:" not in text
+    assert "(Smith, 2024; Jones, 2025)" in text
 
 
 def test_manifest_not_available_fallback():

@@ -6,6 +6,10 @@ from typing import Any, Dict, Mapping, MutableMapping
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 
+LEGACY_CITATION_POLICIES = {"report_only", "warn_and_resolve", "fatal"}
+DEFAULT_LEGACY_CITATION_POLICY = "report_only"
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -20,6 +24,7 @@ class ValidationCompatSettings:
     stage2_enabled: bool = False
     keep_checkpoints_after_completion: bool = False
     repair_policy: str = DEFAULT_REPAIR_POLICY.value
+    legacy_citation_policy: str = DEFAULT_LEGACY_CITATION_POLICY
 
     def to_section(self) -> Dict[str, str]:
         return {
@@ -27,12 +32,22 @@ class ValidationCompatSettings:
             "stage2_enabled": "true" if self.stage2_enabled else "false",
             "keep_checkpoints_after_completion": "true" if self.keep_checkpoints_after_completion else "false",
             "repair_policy": self.repair_policy,
+            "legacy_citation_policy": self.legacy_citation_policy,
         }
 
 
 def read_validation_settings(config: Mapping[str, Any] | None) -> ValidationCompatSettings:
     validation_section = dict(config.get("Validation", {})) if config else {}
     performance_section = dict(config.get("Performance", {})) if config else {}
+
+    legacy_citation_policy = str(
+        validation_section.get("legacy_citation_policy") or DEFAULT_LEGACY_CITATION_POLICY
+    ).strip().lower()
+    if legacy_citation_policy not in LEGACY_CITATION_POLICIES:
+        allowed = ", ".join(sorted(LEGACY_CITATION_POLICIES))
+        raise ValueError(
+            f"Invalid [Validation].legacy_citation_policy={legacy_citation_policy!r}; expected one of: {allowed}"
+        )
 
     return ValidationCompatSettings(
         stage1_enabled=_as_bool(
@@ -51,6 +66,7 @@ def read_validation_settings(config: Mapping[str, Any] | None) -> ValidationComp
             ),
         ),
         repair_policy=parse_repair_policy(validation_section.get("repair_policy")).value,
+        legacy_citation_policy=legacy_citation_policy,
     )
 
 
@@ -161,6 +177,9 @@ class CompatConfigView:
 
     def repair_policy(self) -> str:
         return self.validation.repair_policy
+
+    def legacy_citation_policy(self) -> str:
+        return self.validation.legacy_citation_policy
 
     # -- Outline v2 config --
 

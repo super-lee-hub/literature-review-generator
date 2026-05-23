@@ -1128,3 +1128,109 @@ def test_process_all_papers_emits_stage1_progress_and_retry_updates(tmp_path, mo
         and event.get("remaining_count") == 0
         for event in events
     )
+
+
+def test_run_all_auto_adopts_v2_outline_before_review() -> None:
+    events: list[str] = []
+
+    class _RunAllGenerator:
+        logger = _DummyLogger()
+
+        def run_stage_one(self):
+            events.append("stage1")
+            return True
+
+        def generate_literature_review_outline(self):
+            events.append("outline")
+            return True
+
+        def _outline_v2_enabled(self):
+            return True
+
+        def _load_outline_artifact(self):
+            events.append("load_outline:none")
+            return None
+
+        def adopt_outline_v2(self, adopted_by="user"):
+            events.append(f"adopt:{adopted_by}")
+            return True
+
+        def generate_full_review_from_outline(self):
+            events.append("review")
+            return True
+
+    main.handle_run_all_mode(cast(main.LiteratureReviewGenerator, _RunAllGenerator()))
+
+    assert events == ["stage1", "load_outline:none", "outline", "adopt:run_all", "review"]
+
+
+def test_run_all_reuses_existing_v2_adopted_outline_before_review() -> None:
+    events: list[str] = []
+
+    class _RunAllGenerator:
+        logger = _DummyLogger()
+
+        def run_stage_one(self):
+            events.append("stage1")
+            return True
+
+        def generate_literature_review_outline(self):
+            events.append("outline")
+            return True
+
+        def _outline_v2_enabled(self):
+            return True
+
+        def _load_outline_artifact(self):
+            events.append("load_outline:hit")
+            return ("adopted.json", "# Outline\n\n## 1. Existing")
+
+        def adopt_outline_v2(self, adopted_by="user"):
+            events.append(f"adopt:{adopted_by}")
+            return True
+
+        def generate_full_review_from_outline(self):
+            events.append("review")
+            return True
+
+    main.handle_run_all_mode(cast(main.LiteratureReviewGenerator, _RunAllGenerator()))
+
+    assert events == ["stage1", "load_outline:hit", "review"]
+
+
+def test_run_all_blocks_review_when_v2_auto_adoption_fails() -> None:
+    events: list[str] = []
+
+    class _RunAllGenerator:
+        logger = _DummyLogger()
+
+        def run_stage_one(self):
+            events.append("stage1")
+            return True
+
+        def generate_literature_review_outline(self):
+            events.append("outline")
+            return True
+
+        def _outline_v2_enabled(self):
+            return True
+
+        def _load_outline_artifact(self):
+            events.append("load_outline:none")
+            return None
+
+        def adopt_outline_v2(self, adopted_by="user"):
+            events.append(f"adopt:{adopted_by}")
+            return False
+
+        def generate_full_review_from_outline(self):
+            events.append("review")
+            return True
+
+    try:
+        main.handle_run_all_mode(cast(main.LiteratureReviewGenerator, _RunAllGenerator()))
+        raise AssertionError("handle_run_all_mode should exit when v2 adoption fails")
+    except SystemExit as exc:
+        assert exc.code == 1
+
+    assert events == ["stage1", "load_outline:none", "outline", "adopt:run_all"]

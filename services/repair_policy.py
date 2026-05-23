@@ -32,6 +32,8 @@ def parse_repair_policy(value: Any) -> ValidationRepairPolicy:
 
     if value is None:
         return DEFAULT_REPAIR_POLICY
+    if isinstance(value, ValidationRepairPolicy):
+        return value
     normalized = str(value).strip().lower()
     if not normalized:
         return DEFAULT_REPAIR_POLICY

@@ -199,6 +199,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "stage2_enabled": "true",
             "keep_checkpoints_after_completion": "false",
             "repair_policy": "report_only",
+            "legacy_citation_policy": "report_only",
             "evidence_resolver_enabled": "true",
             "visual_refs_enabled": "true",
             "review_drift_threshold": "0.3",

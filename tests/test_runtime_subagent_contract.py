@@ -26,7 +26,7 @@ def test_generation_stages_emit_runtime_stage_trace_records(tmp_path: Path) -> N
             {
                 "section_number": 1,
                 "section_title": "Findings",
-                "content": "Stable result. [[cite:paper_a|mode=parenthetical]]",
+                "content": "Stable result. [[cite_ref:R001]]",
             }
         ],
         subagent_run_id="stage3-subagent-001",
@@ -63,7 +63,7 @@ def test_generation_stages_without_subagent_ids_emit_local_trace_only(tmp_path: 
             {
                 "section_number": 1,
                 "section_title": "Findings",
-                "content": "Stable result. [[cite:paper_a|mode=parenthetical]]",
+                "content": "Stable result. [[cite_ref:R001]]",
             }
         ],
     )

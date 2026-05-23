@@ -348,7 +348,8 @@ class AgentRuntimeBridge:
         generator = session.generator
         review_word_path = word_file or generator._get_review_word_file_path()
         initial_references = list(references or [])
-
+        if not generator._persist_citation_ref_catalog():
+            raise RuntimeError("citation ref catalog persistence failed")
         if not generator._persist_review_draft_v2(
             outline_file=outline_file,
             review_sections=review_sections,

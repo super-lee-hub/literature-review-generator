@@ -394,6 +394,18 @@ def _format_success_result(content: Any, response_format: str, response: Any, fi
 
         corrected_content = _auto_correct_json(str(content or ""))
         if corrected_content is not None:
+            if corrected_content.get("error") == "无法修复JSON格式":
+                message = "200 response but JSON auto-correction could not recover a valid object"
+                if logger:
+                    logger.error(message)
+                    logger.debug(f"AI返回内容: {str(content)[:500]}...")
+                return _api_result(
+                    status="failed",
+                    error_kind="invalid_response",
+                    http_status=getattr(response, "status_code", None),
+                    message=message,
+                    finish_reason=finish_reason,
+                )
             if logger:
                 logger.info("通过自动纠错成功修复JSON")
             return _api_result(

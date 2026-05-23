@@ -459,6 +459,31 @@ class TestAIIinterface:
         assert payload["text"]["verbosity"] == "high"
 
     @patch('ai_interface.requests.post')
+    def test_json_auto_correction_failure_is_not_treated_as_success(self, mock_post):
+        success_response = Mock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {
+            "choices": [{"message": {"content": "not valid json"}, "finish_reason": "stop"}]
+        }
+        mock_post.return_value = success_response
+
+        with patch('ai_interface.load_config', return_value=_runtime_config(retries="1")):
+            result = self.ai_interface._call_ai_api_detailed(
+                "test prompt",
+                {
+                    "api_key": "test_key",
+                    "model": "gpt-4o",
+                    "api_base": "https://api.openai.com/v1",
+                },
+                "system prompt",
+            )
+
+        assert result["status"] == "failed"
+        assert result["error_kind"] == "invalid_response"
+        assert result["content"] is None
+
+    @patch('ai_interface.requests.post')
     def test_claude_outline_sends_top_level_reasoning_and_retries_without_display(self, mock_post):
         error_response = Mock()
         error_response.status_code = 400

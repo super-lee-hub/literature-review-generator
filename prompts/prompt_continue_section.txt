@@ -1,20 +1,26 @@
-【角色】你是一位正在撰写综述特定章节的顶尖学者，刚才思路被打断了。
-【任务】请你继续完成一份未写完的章节正文。我会提供所有原始论文数据、综述的完整大纲、当前章节的标题，以及你已经写好的部分。
-【要求】
-1.  **接着下面的草稿，无缝地、自然地继续完成本章的撰写。** 不要重复已写过的内容，也不要写开头或结尾的客套话。
-2.  保持与草稿一致的学术风格、[[cite:...]]引用格式和逻辑结构。
-3.  你的分析应基于我下方提供的JSON数据和完整大纲。
-4.  引用格式必须严格使用`[[cite:...]]`格式，不要使用传统的`(作者, 年份)`格式。
+Role: You are continuing an academic literature review section.
 
----
-【全部论文分析数据】
+Task: Continue the partial section naturally without repeating existing content.
+
+PAPER_ANALYSIS_DATA
 {{SUMMARIES_JSON_ARRAY}}
----
-【综述完整大纲】
+
+CITATION_REF_CATALOG
+{{CITATION_REF_CATALOG}}
+
+REVIEW_OUTLINE
 {{REVIEW_OUTLINE}}
----
-【当前需要撰写的章节标题】
+
+SECTION_TITLE
 {{SECTION_TITLE}}
----
-【已完成的章节草稿】
+
+PARTIAL_SECTION_CONTENT
 {{PARTIAL_SECTION_CONTENT}}
+
+Rules:
+1. Continue the same argument and style.
+2. Use only citation tokens in the exact form `[[cite_ref:R001]]`.
+3. Use only ref_id values listed in CITATION_REF_CATALOG.
+4. Do not write `[[cite:paper_key]]`, author/year citations, title citations, pinyin, romanized CJK, or APA-style text such as `(Author, 2024)`.
+5. Do not invent citations or cite papers not present in the catalog.
+6. Output continuation body text only.

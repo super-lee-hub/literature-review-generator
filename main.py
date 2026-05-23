@@ -54,6 +54,7 @@ from preprocess.service import PreprocessManager
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
 from services.citation_metadata import sanitize_metadata_fields
+from services.citation_ref_catalog import build_document_ref_catalog
 from services.config_compat import CompatConfigView
 from services.environment_service import (
     detect_runtime_environment,
@@ -62,7 +63,7 @@ from services.environment_service import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
-from services.paper_identity import build_paper_key as build_canonical_paper_key, normalize_doi
+from services.paper_identity import build_paper_key as build_legacy_paper_key, normalize_doi
 from services.progress_state import (
     ResumeStateReport,
     Stage1ProgressSnapshot,
@@ -100,7 +101,14 @@ from free_mode.profile_manager import build_profile_context, load_profile
 
 
 def get_paper_key(paper: 'Dict[str, Any] | PaperInfo') -> str:
-    return build_canonical_paper_key(paper)
+    explicit_key = str(
+        paper.get("canonical_paper_key")
+        or paper.get("source_paper_id")
+        or ""
+    ).strip()
+    if explicit_key:
+        return normalize_doi(explicit_key) or explicit_key
+    return build_legacy_paper_key(paper)
 
 def normalize_checkpoint_paper_key(paper_key: str) -> str:
     normalized = normalize_doi(paper_key)
@@ -370,6 +378,10 @@ class LiteratureReviewGenerator:
     CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
     CITATION_MANIFEST_ARTIFACT_ROLE = "citation_manifest"
     CITATION_MANIFEST_ARTIFACT_VERSION = "v3"
+    CITATION_REF_CATALOG_ARTIFACT_ID = "citation_ref_catalog:v1"
+    CITATION_REF_CATALOG_ARTIFACT_TYPE = "citation_ref_catalog"
+    CITATION_REF_CATALOG_ARTIFACT_ROLE = "citation_ref_catalog"
+    CITATION_REF_CATALOG_ARTIFACT_VERSION = "v1"
     
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None, queue_file: str = 'output/_queue/queue.json', zotero_report: Optional[str] = None, library_path: Optional[str] = None):
         self.config_file: str = config_file
@@ -647,12 +659,89 @@ class LiteratureReviewGenerator:
             return self.compat_config.stage2_validation_enabled()
         return False
 
+    def _legacy_citation_policy(self) -> str:
+        if self.compat_config:
+            legacy_policy_getter = getattr(self.compat_config, "legacy_citation_policy", None)
+            if callable(legacy_policy_getter):
+                return str(legacy_policy_getter() or "report_only").strip() or "report_only"
+        if self.config is not None:
+            self.compat_config = CompatConfigView.from_config(self.config)
+            return self.compat_config.legacy_citation_policy()
+        validation = (self.config or {}).get("Validation", {}) if self.config else {}
+        if isinstance(validation, Mapping):
+            return str(validation.get("legacy_citation_policy") or "report_only").strip() or "report_only"
+        return "report_only"
+
     def _ensure_compat_config(self) -> CompatConfigView:
         if not self.config:
             raise RuntimeError("Configuration is not loaded")
         if not self.compat_config:
             self.compat_config = CompatConfigView.from_config(self.config)
         return self.compat_config
+
+    def _format_citation_ref_catalog_for_prompt(
+        self,
+        citation_ref_catalog: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        catalog = citation_ref_catalog or self._load_citation_ref_catalog()
+        if not catalog:
+            return "ref_id | authors | year | title | evidence summary\n"
+        rows = ["ref_id | authors | year | title | evidence summary"]
+        summaries_by_key: Dict[str, Mapping[str, Any]] = {}
+        for summary in self.summaries:
+            paper_info_raw = summary.get("paper_info", {}) if isinstance(summary, Mapping) else {}
+            paper_info = paper_info_raw if isinstance(paper_info_raw, Mapping) else {}
+            for key in (
+                paper_info.get("canonical_paper_key"),
+                paper_info.get("source_paper_id"),
+                paper_info.get("doi"),
+            ):
+                text = str(key or "").strip()
+                if text:
+                    summaries_by_key[text] = summary
+        for entry in catalog.get("entries", []):
+            if not isinstance(entry, Mapping) or entry.get("status") != "active":
+                continue
+            evidence_summary = ""
+            summary = summaries_by_key.get(str(entry.get("canonical_paper_key") or "").strip()) or summaries_by_key.get(
+                str(entry.get("paper_id") or "").strip()
+            )
+            if isinstance(summary, Mapping):
+                core = get_core_analysis(summary.get("ai_summary", {}))
+                if isinstance(core, Mapping):
+                    evidence_summary = str(
+                        core.get("summary")
+                        or core.get("findings")
+                        or core.get("key_points")
+                        or ""
+                    ).strip()
+            evidence_summary = re.sub(r"\s+", " ", evidence_summary)[:240]
+            authors = ", ".join(str(author) for author in (entry.get("authors") or []) if str(author).strip())
+            rows.append(
+                " | ".join(
+                    [
+                        str(entry.get("ref_id") or ""),
+                        authors,
+                        str(entry.get("year") or ""),
+                        re.sub(r"\s+", " ", str(entry.get("title") or "")).strip(),
+                        evidence_summary,
+                    ]
+                )
+            )
+        return "\n".join(rows)
+
+    def _inject_citation_ref_catalog_context(self, prompt: str) -> str:
+        table = self._format_citation_ref_catalog_for_prompt()
+        rules = (
+            "\n\nCITATION_REF_CATALOG\n"
+            f"{table}\n\n"
+            "Citation rules: use only tokens exactly like [[cite_ref:R001]] from CITATION_REF_CATALOG. "
+            "Do not invent R IDs. Do not write [[cite:paper_key]], author/year citations, title citations, pinyin, romanized CJK, or APA-style text citations."
+        )
+        result = prompt.replace("{{CITATION_REF_CATALOG}}", table)
+        if "CITATION_REF_CATALOG" not in result:
+            result = f"{result}{rules}"
+        return result
 
     def _outline_v2_enabled(self) -> bool:
         if not self.config:
@@ -975,6 +1064,8 @@ class LiteratureReviewGenerator:
         if not self.job_workspace or not self.project_name or not self.summary_file:
             return False
 
+        self._sync_stage1_checkpoint_sets_from_summaries()
+
         snapshot_path = self.job_workspace.artifact_path("stage1_progress_snapshot.json")
         snapshot = Stage1ProgressSnapshot(
             artifact_type="stage1_progress_snapshot",
@@ -1099,6 +1190,12 @@ class LiteratureReviewGenerator:
         project_name = self.project_name or "review"
         return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_manifest_v3.json")
 
+    def _citation_ref_catalog_path(self) -> str:
+        if not self.job_workspace:
+            raise ValueError("job workspace is not configured")
+        project_name = self.project_name or "review"
+        return self.job_workspace.artifact_path(f"citation_catalogs/{project_name}_citation_ref_catalog.json")
+
     def _citation_manifest_v2_path(self) -> str:
         if not self.job_workspace:
             raise ValueError("job workspace is not configured")
@@ -1117,6 +1214,58 @@ class LiteratureReviewGenerator:
             raise ValueError("job workspace is not configured")
         project_name = self.project_name or "review"
         return self.job_workspace.artifact_path(f"citation_manifests/{project_name}_citation_migration_report.json")
+
+    def _load_citation_ref_catalog(self) -> Optional[Dict[str, Any]]:
+        try:
+            path = self._citation_ref_catalog_path()
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    return json.load(handle)
+        except Exception as exc:
+            self.logger.warning(f"Failed to load citation_ref_catalog: {exc}")
+        return None
+
+    def _persist_citation_ref_catalog(
+        self,
+        *,
+        paper_summaries: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        if not self.job_workspace or not self.artifact_registry:
+            return True
+        try:
+            summaries = paper_summaries if paper_summaries is not None else [dict(summary) for summary in self.summaries]
+            existing_catalog = self._load_citation_ref_catalog()
+            catalog = build_document_ref_catalog(
+                summaries,
+                project_name=self.project_name or "review",
+                job_id=self.job_workspace.job_id,
+                existing_catalog=existing_catalog,
+            )
+            artifact_path = self._citation_ref_catalog_path()
+            atomic_write_json(artifact_path, catalog)
+
+            depends_on: List[ArtifactDependencyRef] = []
+            if self.summary_file:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type="summary_file",
+                        path=self.summary_file,
+                    )
+                )
+
+            self.artifact_registry.register_file(
+                artifact_role=self.CITATION_REF_CATALOG_ARTIFACT_ROLE,
+                artifact_type=self.CITATION_REF_CATALOG_ARTIFACT_TYPE,
+                artifact_version=self.CITATION_REF_CATALOG_ARTIFACT_VERSION,
+                path=artifact_path,
+                producer="main.LiteratureReviewGenerator.generate_full_review_from_outline",
+                depends_on=depends_on,
+                artifact_id=self.CITATION_REF_CATALOG_ARTIFACT_ID,
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to persist citation_ref_catalog: {exc}")
+            return False
 
     def _extract_review_sections_from_word_document(
         self,
@@ -1242,6 +1391,9 @@ class LiteratureReviewGenerator:
             # Use self.summaries if paper_summaries is not explicitly provided
             if paper_summaries is None:
                 paper_summaries = [dict(summary) for summary in self.summaries]
+            citation_ref_catalog = self._load_citation_ref_catalog()
+            citation_ref_catalog_path = self._citation_ref_catalog_path()
+            citation_ref_catalog_hash = str((citation_ref_catalog or {}).get("catalog_hash") or "")
             
             review_draft = build_review_draft_v2(
                 job_id=self.job_workspace.job_id,
@@ -1256,6 +1408,9 @@ class LiteratureReviewGenerator:
                 generation_mode=generation_mode,
                 paper_summaries=paper_summaries,
                 allow_legacy_regex_citations=False,
+                citation_ref_catalog=citation_ref_catalog,
+                citation_ref_catalog_path=citation_ref_catalog_path,
+                citation_ref_catalog_hash=citation_ref_catalog_hash,
             )
             artifact_path = self._review_draft_v2_path()
             atomic_write_json(artifact_path, review_draft.to_dict())
@@ -1273,6 +1428,14 @@ class LiteratureReviewGenerator:
                     ArtifactDependencyRef(
                         artifact_type="summary_file",
                         path=self.summary_file,
+                    )
+                )
+            if citation_ref_catalog_path:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type=self.CITATION_REF_CATALOG_ARTIFACT_TYPE,
+                        path=citation_ref_catalog_path,
+                        content_hash=citation_ref_catalog_hash,
                     )
                 )
 
@@ -1305,6 +1468,9 @@ class LiteratureReviewGenerator:
         except Exception as e:
             self.logger.error(f"Failed to load review_draft_v2: {e}")
             raise
+        citation_ref_catalog = self._load_citation_ref_catalog()
+        citation_ref_catalog_path = self._citation_ref_catalog_path()
+        citation_ref_catalog_hash = str((citation_ref_catalog or {}).get("catalog_hash") or "")
         
         return build_citation_manifest_v3_from_review_draft(
             job_id=self.job_workspace.job_id if self.job_workspace else "unknown",
@@ -1315,6 +1481,10 @@ class LiteratureReviewGenerator:
             review_draft_v2=review_draft_v2,
             paper_summaries=[dict(summary) for summary in self.summaries],
             literature_map=self._load_literature_map_for_citation_resolution(),
+            citation_ref_catalog=citation_ref_catalog,
+            citation_ref_catalog_path=citation_ref_catalog_path,
+            citation_ref_catalog_hash=citation_ref_catalog_hash,
+            legacy_citation_policy=self._legacy_citation_policy(),
         )
 
     def _persist_citation_manifest(
@@ -1343,6 +1513,17 @@ class LiteratureReviewGenerator:
                     ArtifactDependencyRef(
                         artifact_type=self.REVIEW_DRAFT_V2_ARTIFACT_TYPE,
                         path=review_draft_path,
+                    )
+                )
+            citation_ref_catalog = self._load_citation_ref_catalog()
+            citation_ref_catalog_path = self._citation_ref_catalog_path()
+            citation_ref_catalog_hash = str((citation_ref_catalog or {}).get("catalog_hash") or "")
+            if citation_ref_catalog_path:
+                depends_on.append(
+                    ArtifactDependencyRef(
+                        artifact_type=self.CITATION_REF_CATALOG_ARTIFACT_TYPE,
+                        path=citation_ref_catalog_path,
+                        content_hash=citation_ref_catalog_hash,
                     )
                 )
 
@@ -1786,6 +1967,7 @@ class LiteratureReviewGenerator:
     ) -> bool:
         loaded_summaries = self._load_summary_records_from_path(path)
         self.summaries = [dict(item) for item in loaded_summaries]
+        self._dedupe_summaries_by_paper_key()
 
         success_count = len([s for s in self.summaries if s.get("status") == "success"])
         failed_count = len([s for s in self.summaries if s.get("status") == "failed"])
@@ -1941,6 +2123,76 @@ class LiteratureReviewGenerator:
 
         failed_papers.difference_update(processed_papers)
         return processed_papers, failed_papers
+
+    def _dedupe_summaries_by_paper_key(self) -> bool:
+        """Keep one durable Stage 1 record per stable paper identity."""
+        if not self.summaries:
+            return False
+
+        deduped: List[Dict[str, Any]] = []
+        key_to_index: Dict[str, int] = {}
+        removed_count = 0
+
+        for summary in self.summaries:
+            if not isinstance(summary, Mapping):
+                deduped.append(summary)  # type: ignore[arg-type]
+                continue
+
+            paper_info = summary.get("paper_info")
+            if not isinstance(paper_info, Mapping):
+                deduped.append(dict(summary))
+                continue
+
+            paper_key = LiteratureReviewGenerator.get_paper_key(dict(paper_info))
+            if not paper_key:
+                deduped.append(dict(summary))
+                continue
+
+            existing_index = key_to_index.get(paper_key)
+            if existing_index is None:
+                key_to_index[paper_key] = len(deduped)
+                deduped.append(dict(summary))
+                continue
+
+            removed_count += 1
+            if str(summary.get("status") or "").strip().lower() == "success":
+                deduped[existing_index] = dict(summary)
+
+        if removed_count:
+            self.summaries = deduped  # type: ignore[assignment]
+            self.logger.warning(
+                f"[Stage 1] Removed {removed_count} duplicate summary record(s) by stable paper key"
+            )
+            return True
+        return False
+
+    def _sync_stage1_checkpoint_sets_from_summaries(self) -> bool:
+        """Align progress/checkpoint sets with the durable summary records."""
+        if not self.summaries:
+            old_processed = set(self._checkpoint_processed_papers)
+            old_failed = set(self._checkpoint_failed_papers)
+            self._checkpoint_processed_papers = set()
+            self._checkpoint_failed_papers = set()
+            self.processed_count.set(0)
+            self.failed_count.set(0)
+            return bool(old_processed or old_failed)
+
+        processed_papers, failed_papers = self._stage1_progress_sets_from_loaded_summaries()
+        if not processed_papers and not failed_papers:
+            return False
+
+        old_processed = set(self._checkpoint_processed_papers)
+        old_failed = set(self._checkpoint_failed_papers)
+
+        self._checkpoint_processed_papers = processed_papers
+        self._checkpoint_failed_papers = failed_papers
+        self.processed_count.set(len(self._checkpoint_processed_papers))
+        self.failed_count.set(len(self._checkpoint_failed_papers))
+
+        return (
+            old_processed != self._checkpoint_processed_papers
+            or old_failed != self._checkpoint_failed_papers
+        )
 
     def _merge_stage1_progress_from_loaded_summaries(self) -> bool:
         """用 summaries 中的 durable 结果校正旧 checkpoint，避免重试已成功论文。"""
@@ -3963,6 +4215,8 @@ class LiteratureReviewGenerator:
                 return False
             
             # 创建备份文件（如果原文件存在）
+            self._dedupe_summaries_by_paper_key()
+
             if os.path.exists(self.summary_file):
                 backup_file = f"{self.summary_file}.backup"
                 try:
@@ -4388,6 +4642,8 @@ class LiteratureReviewGenerator:
                     failure_count=0,
                     message="所有论文都已处理完成",
                 )
+                self.save_summaries()
+                self.save_checkpoint()
                 return True
             
             # 重置计数器
@@ -4411,7 +4667,7 @@ class LiteratureReviewGenerator:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # 提交所有任务
                 future_to_paper: Dict[concurrent.futures.Future['ProcessingResult | None'], Tuple[int, 'PaperInfo']] = {
-                    executor.submit(self.process_paper, paper, i, file_index, total_papers): (i, paper)
+                    executor.submit(self.process_paper, dict(paper), i, file_index, total_papers): (i, paper)
                     for i, paper in papers_to_process
                 }
                 
@@ -4669,7 +4925,7 @@ class LiteratureReviewGenerator:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as retry_executor:
                         retry_futures: Dict[concurrent.futures.Future['ProcessingResult | None'], Tuple[Dict[str, Any], int]] = {}
                         for original_index, paper in retry_papers:
-                            future = retry_executor.submit(self.process_paper, paper, original_index, file_index, total_papers)  # type: ignore
+                            future = retry_executor.submit(self.process_paper, dict(paper), original_index, file_index, total_papers)  # type: ignore
                             retry_futures[future] = (paper, original_index)
                         
                         # 处理重试结果
@@ -5059,6 +5315,7 @@ class LiteratureReviewGenerator:
             section_prompt: str = prompt_template.replace('{{SUMMARIES_JSON_ARRAY}}', optimized_context)
             section_prompt = section_prompt.replace('{{SECTION_TITLE}}', section_title)
             section_prompt = section_prompt.replace('{{REVIEW_OUTLINE}}', outline_content)
+            section_prompt = self._inject_citation_ref_catalog_context(section_prompt)
             section_prompt = self._inject_free_mode_context(section_prompt)
 
             self.logger.info(f"生成综述提示词: {len(section_prompt)}字符")
@@ -5161,10 +5418,10 @@ class LiteratureReviewGenerator:
 1. 直接输出纯文本格式的章节正文内容
 2. 不要包含章节标题
 3. 内容需要专业、客观、全面
-4. 适当引用具体文献以支持论点，使用结构化的 citation refs 或 token，格式为 [cite:paper_key]，其中 paper_key 是论文的唯一标识符
+4. 适当引用具体文献以支持论点，只能使用 CITATION_REF_CATALOG 中的 `[[cite_ref:R001]]` 格式
 5. 语言风格需专业、学术
 6. 只撰写指定章节的内容，不要包含其他章节
-7. 不要使用传统的 (作者, 年份) 格式，只使用 [cite:paper_key] 格式的引用标记"""
+7. 不要使用传统的 (作者, 年份)、作者/年份、标题、拼音/罗马化中文或 [[cite:paper_key]] 引用"""
 
             # Determine final prompt
             if is_continuation:
@@ -5194,6 +5451,8 @@ class LiteratureReviewGenerator:
                 final_prompt = final_prompt.replace('{{SECTION_TITLE}}', section_title)
 
             self.logger.success(f"生成最终章节提示词: {len(final_prompt)}字符")
+
+            final_prompt = self._inject_citation_ref_catalog_context(final_prompt)
 
             # Call unified AI API function
             ai_response = _call_ai_api(
@@ -5234,10 +5493,10 @@ class LiteratureReviewGenerator:
 
 要求：
 1. 深度综合不同学者的观点，对比异同
-2. 每个论点必须引用至少1-2篇文献，使用结构化的 citation refs 或 token，格式为 [cite:paper_key]，其中 paper_key 是论文的唯一标识符
+2. 每个论点必须引用至少1-2篇文献，只能使用 CITATION_REF_CATALOG 中的 `[[cite_ref:R001]]` 格式
 3. 逻辑连贯，段落间有过渡
 4. 避免流水账式写法，按主题组织内容
-5. 不要使用传统的 (作者, 年份) 格式，只使用 [cite:paper_key] 格式的引用标记"""
+5. 不要使用传统的 (作者, 年份)、作者/年份、标题、拼音/罗马化中文或 [[cite:paper_key]] 引用"""
 
             # 对于续写调用，添加续写标记
             if is_continuation and partial_content:
@@ -5256,6 +5515,8 @@ class LiteratureReviewGenerator:
 
             self.logger.success(f"生成最终章节提示词: {len(final_prompt)}字符")
 
+            final_prompt = self._inject_citation_ref_catalog_context(final_prompt)
+
             max_section_api_attempts = 3
             last_message = "empty response"
             for attempt in range(1, max_section_api_attempts + 1):
@@ -5267,6 +5528,7 @@ class LiteratureReviewGenerator:
                     max_tokens=6000,
                     temperature=0.7,
                     logger=self.logger,
+                    retry_attempts=1,
                 )
 
                 content = result.get("content")
@@ -5303,6 +5565,34 @@ class LiteratureReviewGenerator:
         """将章节内容追加到Word文档（带样式配置）"""
         return append_section_to_word_document(self, section_number, section_title, section_text, word_file)
 
+    def _save_recoverable_review_document(
+        self,
+        *,
+        word_file: str,
+        review_sections_by_number: Mapping[int, Mapping[str, Any]],
+    ) -> bool:
+        """Persist generated sections to DOCX so the review checkpoint is recoverable."""
+        try:
+            from docx_writer import _initialize_review_document
+
+            _initialize_review_document(self, word_file)
+            for section_number in sorted(review_sections_by_number):
+                section = review_sections_by_number[section_number]
+                appended = append_section_to_word_document(
+                    self,
+                    int(section.get("section_number") or section_number),
+                    str(section.get("section_title") or ""),
+                    str(section.get("content") or ""),
+                    word_file,
+                    allow_compat_fallback=True,
+                )
+                if not appended:
+                    return False
+            return True
+        except Exception as exc:
+            self.logger.error(f"Failed to save recoverable review document: {exc}")
+            return False
+
     def generate_full_review_from_outline(self) -> bool:
         """从大纲生成完整文献综述"""
         self.logger.info("=" * 60 + "\n文献综述自动生成器 - 阶段二：综述生成\n" + "=" * 60)
@@ -5319,6 +5609,9 @@ class LiteratureReviewGenerator:
                 self.logger.error("没有找到任何摘要，请先运行阶段一")
                 return False
             
+            if not self._persist_citation_ref_catalog():
+                return False
+
             writer_config: Dict[str, Any] = (self.config or {}).get('Writer_API', {})  # type: ignore
             if 'dummy' in (writer_config.get('api_key') or ''):  # type: ignore
                 if not self.output_dir:
@@ -5345,6 +5638,8 @@ class LiteratureReviewGenerator:
                 ):
                     return False
                 self.logger.success(f"Dummy review saved to {word_file}")
+                self.save_summaries()
+                self.save_checkpoint()
                 return True
 
             writer_api_config: APIConfig = get_writer_api_config(self.config)
@@ -5572,7 +5867,7 @@ class LiteratureReviewGenerator:
                 )
                 
                 # 检查章节内容是否包含结构化citation token
-                if "[[cite:" not in section_content:
+                if "[[cite_ref:" not in section_content:
                     self.logger.warning(
                         f"Section {section_num} is missing structured citation tokens; attempting one narrow retry."
                     )
@@ -5581,9 +5876,11 @@ class LiteratureReviewGenerator:
                     # being interpreted as prompt instructions.
                     retry_section_escaped = section_content.replace("'''", r"\'\'\'")
                     retry_prompt = (
-                        "The following section content is missing [[cite:paper_key]] citation tokens. "
-                        "Please rewrite it inserting appropriate [[cite:...]] tokens for every factual claim "
-                        "referenced from the provided paper summaries. Preserve all other content and structure.\n\n"
+                        "The following section content is missing [[cite_ref:R001]] citation tokens. "
+                        "Please rewrite it inserting appropriate [[cite_ref:R###]] tokens for every factual claim "
+                        "referenced from CITATION_REF_CATALOG. Preserve all other content and structure. "
+                        "Use only existing catalog IDs; do not write [[cite:paper_key]] or APA citations.\n\n"
+                        f"CITATION_REF_CATALOG\n{self._format_citation_ref_catalog_for_prompt()}\n\n"
                         f"=== SECTION TO FIX ===\nSection: {section_title}\n\n"
                         "'''CONTENT START'''\n"
                         f"{retry_section_escaped[:4000]}\n"
@@ -5595,7 +5892,7 @@ class LiteratureReviewGenerator:
                         writer_api_config,
                         is_continuation=False,
                     )
-                    if retry_result and "[[cite:" in str(retry_result.get("content", "")):
+                    if retry_result and "[[cite_ref:" in str(retry_result.get("content", "")):
                         section_content = retry_result["content"]
                         self.logger.success(f"Citation-token retry succeeded for section {section_num}")
                     else:
@@ -5618,6 +5915,20 @@ class LiteratureReviewGenerator:
                     "section_title": section_title,
                     "content": section_content,
                 }
+
+                if not self._save_recoverable_review_document(
+                    word_file=word_file,
+                    review_sections_by_number=review_sections_by_number,
+                ):
+                    failed_sections.append(
+                        {
+                            "section_number": int(section_num),
+                            "section_title": section_title,
+                            "failure_reason": "recoverable_docx_save_failed",
+                            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                    )
+                    break
                 
                 checkpoint_data: Dict[str, Any] = {
                     'last_completed_section': i,
@@ -7061,13 +7372,24 @@ def handle_run_all_mode(generator: 'LiteratureReviewGenerator'):  # type: ignore
         generator.logger.info("开始执行阶段二：文献综述生成...")
         
         # 执行阶段二：先生成大纲，再生成全文
-        generator.logger.info("开始执行阶段二第一步：生成大纲...")
-        outline_success = generator.generate_literature_review_outline()
+        needs_v2_adoption = False
+        existing_v2_outline = generator._load_outline_artifact() if generator._outline_v2_enabled() else None
+        if existing_v2_outline is not None:
+            generator.logger.info("检测到有效的 v2 adopted outline，将跳过大纲重建并继续生成全文")
+            outline_success = True
+        else:
+            generator.logger.info("开始执行阶段二第一步：生成大纲...")
+            outline_success = generator.generate_literature_review_outline()
+            needs_v2_adoption = generator._outline_v2_enabled()
         
         if outline_success:
             generator.logger.success("大纲生成成功！")
-            generator.logger.info("开始执行阶段二第二步：从大纲生成全文...")
-            stage2_success = generator.generate_full_review_from_outline()
+            if needs_v2_adoption and not generator.adopt_outline_v2(adopted_by="run_all"):
+                generator.logger.error("Outline v2 大纲自动采纳失败，已阻止全文生成")
+                stage2_success = False
+            else:
+                generator.logger.info("开始执行阶段二第二步：从大纲生成全文...")
+                stage2_success = generator.generate_full_review_from_outline()
         else:
             stage2_success = False
         

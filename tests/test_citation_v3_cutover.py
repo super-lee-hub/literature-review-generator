@@ -67,10 +67,12 @@ def test_review_draft_v2_disables_legacy_regex_by_default():
     )
 
     block = draft.content["sections"][0].blocks[0]
-    assert block.citations == []
+    assert len(block.citations) == 1
+    assert block.citations[0]["source_type"] == "legacy_apa"
+    assert block.citations[0]["paper_id"] is None
 
 
-def test_render_structured_citations_prefers_manifest_entries():
+def test_render_structured_citations_uses_manifest_ref_id_occurrences():
     generator = types.SimpleNamespace(summaries=[], logger=_DummyLogger(), config={})
     manifest = {
         "paper_entries": [
@@ -82,11 +84,14 @@ def test_render_structured_citations_prefers_manifest_entries():
                 "year": "2024",
                 "aliases": ["paper-1", "Canonical Paper"],
             }
-        ]
+        ],
+        "occurrences": [
+            {"ref_id": "R001", "paper_id": "paper-1", "paper_key": "paper-1", "source_type": "structured_ref"}
+        ],
     }
 
     rendered, unresolved = render_structured_citations(
-        "Evidence [[cite:paper-1|mode=parenthetical]] supports the claim.",
+        "Evidence [[cite_ref:R001]] supports the claim.",
         generator,
         manifest,
         allow_compat_fallback=False,
@@ -96,60 +101,7 @@ def test_render_structured_citations_prefers_manifest_entries():
     assert "(Smith & Jones, 2024)" in rendered
 
 
-def test_render_structured_citations_resolves_decorated_doi_token():
-    generator = types.SimpleNamespace(summaries=[], logger=_DummyLogger(), config={})
-    manifest = {
-        "paper_entries": [
-            {
-                "paper_id": "10.1016/j.jbusres.2021.10.002",
-                "paper_key": "10.1016/j.jbusres.2021.10.002",
-                "title": "Price Fairness",
-                "authors": ["Alice Smith"],
-                "year": "2021",
-                "doi": "10.1016/j.jbusres.2021.10.002",
-                "aliases": ["10.1016/j.jbusres.2021.10.002"],
-            }
-        ]
-    }
-
-    rendered, unresolved = render_structured_citations(
-        "Evidence [[cite:10.1016/j.jbusres.2021.10.002 <http://doi.org/10.1016/j.jbusres.2021.10.002>|mode=parenthetical]].",
-        generator,
-        manifest,
-        allow_compat_fallback=False,
-    )
-
-    assert not unresolved
-    assert "(Smith, 2021)" in rendered
-
-
-def test_render_structured_citations_resolves_yearless_alias_from_year_token():
-    generator = types.SimpleNamespace(summaries=[], logger=_DummyLogger(), config={})
-    manifest = {
-        "paper_entries": [
-            {
-                "paper_id": "song-he-paper",
-                "paper_key": "song-he-paper",
-                "title": "AI Pricing",
-                "authors": ["Song Xiaobing", "He Xianan"],
-                "year": "",
-                "aliases": ["songhe"],
-            }
-        ]
-    }
-
-    rendered, unresolved = render_structured_citations(
-        "Evidence [[cite:songhe2023|mode=parenthetical]].",
-        generator,
-        manifest,
-        allow_compat_fallback=False,
-    )
-
-    assert not unresolved
-    assert "(Xiaobing & Xianan, n.d.)" in rendered
-
-
-def test_render_structured_citations_uses_resolved_occurrence_tokens():
+def test_render_structured_citations_rejects_legacy_tokens_by_default():
     generator = types.SimpleNamespace(summaries=[], logger=_DummyLogger(), config={})
     manifest = {
         "paper_entries": [
@@ -162,13 +114,7 @@ def test_render_structured_citations_uses_resolved_occurrence_tokens():
                 "aliases": ["paper-rikala", "Rikala_2025"],
             }
         ],
-        "occurrences": [
-            {
-                "citation_token": "[[cite:existing_customers_reaction_rikala_2025|mode=parenthetical]]",
-                "paper_id": "paper-rikala",
-                "paper_key": "paper-rikala",
-            }
-        ],
+        "occurrences": [{"ref_id": "R001", "paper_id": "paper-rikala", "paper_key": "paper-rikala"}],
     }
 
     rendered, unresolved = render_structured_citations(
@@ -178,8 +124,8 @@ def test_render_structured_citations_uses_resolved_occurrence_tokens():
         allow_compat_fallback=False,
     )
 
-    assert not unresolved
-    assert "(Rikala, 2025)" in rendered
+    assert unresolved == ["[[cite:existing_customers_reaction_rikala_2025|mode=parenthetical]]"]
+    assert "[[cite:" in rendered
 
 
 def test_run_review_validation_report_only_does_not_apply_summary_repairs(monkeypatch):
