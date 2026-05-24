@@ -21,6 +21,7 @@ import json
 import hashlib
 import logging
 import re
+import copy
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, Sequence
 from datetime import datetime
@@ -54,7 +55,7 @@ from preprocess.service import PreprocessManager
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
 from services.citation_metadata import sanitize_metadata_fields
-from services.citation_ref_catalog import build_document_ref_catalog
+from services.citation_ref_catalog import build_document_ref_catalog, validate_raw_citation_text
 from services.config_compat import CompatConfigView
 from services.environment_service import (
     detect_runtime_environment,
@@ -733,14 +734,16 @@ class LiteratureReviewGenerator:
     def _inject_citation_ref_catalog_context(self, prompt: str) -> str:
         table = self._format_citation_ref_catalog_for_prompt()
         rules = (
-            "\n\nCITATION_REF_CATALOG\n"
+            "CITATION RULES\n"
+            "Use only raw citation tokens with this exact grammar: [[cite_ref:R001]], [[cite_ref:R001,R002]], or [[cite_ref:R001, R002]].\n"
+            "Every R id must appear in the CITATION_REF_CATALOG below. Do not invent R ids.\n"
+            "Forbidden in raw drafts: [[cite:...]], semicolon-separated ref tokens, bare R001/(R001), author-year citations, title citations, pinyin, romanized CJK, or APA-style text citations.\n\n"
+            "CITATION_REF_CATALOG\n"
             f"{table}\n\n"
-            "Citation rules: use only tokens exactly like [[cite_ref:R001]] from CITATION_REF_CATALOG. "
-            "Do not invent R IDs. Do not write [[cite:paper_key]], author/year citations, title citations, pinyin, romanized CJK, or APA-style text citations."
         )
         result = prompt.replace("{{CITATION_REF_CATALOG}}", table)
-        if "CITATION_REF_CATALOG" not in result:
-            result = f"{result}{rules}"
+        if not result.startswith("CITATION RULES"):
+            result = f"{rules}{result}"
         return result
 
     def _outline_v2_enabled(self) -> bool:
@@ -2338,6 +2341,45 @@ class LiteratureReviewGenerator:
             "engine_type": None,
         }
 
+    def _stage1_strategy_policy(self) -> str:
+        preprocess_section = (self.config or {}).get("Preprocess", {}) if self.config else {}
+        policy = str(preprocess_section.get("strategy_policy") or "auto").strip().lower()
+        allowed = {"auto", "formal_precision", "mineru_first", "mineru_only", "local_first"}
+        return policy if policy in allowed else "auto"
+
+    def _stage1_preprocess_strategies(self) -> List[str]:
+        policy = self._stage1_strategy_policy()
+        if policy in {"formal_precision", "mineru_first"}:
+            return ["mineru", "docling", "legacy"]
+        if policy == "mineru_only":
+            return ["mineru"]
+        return ["hybrid", "docling", "mineru", "legacy"]
+
+    def _stage1_input_settings(self) -> Dict[str, Any]:
+        defaults: Dict[str, Any] = {
+            "send_extracted_text": "true",
+            "send_selected_visuals": "true",
+            "send_original_pdf": "never",
+            "pdf_required_for_formal_precision": "false",
+            "max_pdf_file_mb": "50",
+            "formal_precision_text_only_policy": "rich_mineru_evidence",
+            "force_pdf_file_input_for_provider": "false",
+            "pdf_verifier_api": "disabled",
+        }
+        configured = (self.config or {}).get("Stage1_Input", {}) if self.config else {}
+        merged = dict(defaults)
+        if isinstance(configured, Mapping):
+            merged.update({str(key): value for key, value in configured.items()})
+        return merged
+
+    @staticmethod
+    def _truthy_config(value: Any, *, default: bool = False) -> bool:
+        if value in (None, ""):
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().casefold() in {"1", "true", "yes", "y", "on", "enabled", "enable"}
+
     def _collect_preprocess_result_metadata(self, preprocess_result: Any, input_kind: str) -> Dict[str, Any]:
         metadata = {
             'analysis_input_kind': input_kind,
@@ -2394,6 +2436,57 @@ class LiteratureReviewGenerator:
                 metadata.setdefault('stage1_page_count', 0)
         return metadata
 
+    def _fresh_preprocess_manager_for_strategy(self, preprocess_strategy: str) -> PreprocessManager:
+        config_copy: Dict[str, Any] = copy.deepcopy(dict(self.config or {}))
+        preprocess_section = dict(config_copy.get("Preprocess", {}) or {})
+        preprocess_section["force_rebuild"] = "true"
+
+        if preprocess_strategy == "mineru":
+            preprocess_section.update(
+                {
+                    "parser_mode": "remote",
+                    "primary_parser": "mineru_remote",
+                    "fallback_parser": "none",
+                }
+            )
+        elif preprocess_strategy == "docling":
+            preprocess_section.update(
+                {
+                    "parser_mode": "local",
+                    "primary_parser": "docling",
+                    "fallback_parser": "none",
+                }
+            )
+        elif preprocess_strategy == "legacy":
+            preprocess_section.update(
+                {
+                    "parser_mode": "legacy",
+                    "primary_parser": "legacy_pdf_extractor",
+                    "fallback_parser": "none",
+                }
+            )
+        config_copy["Preprocess"] = preprocess_section
+
+        manager = PreprocessManager(config=config_copy, logger=self.logger)
+        if preprocess_strategy == "mineru":
+            manager.parser_mode = "remote"
+            manager.primary_parser = "mineru_remote"
+            manager.fallback_parser = "none"
+            manager.force_rebuild = True
+            manager.allow_local_parse_fallback = False
+            manager.force_docling_strategy = False
+        elif preprocess_strategy == "docling":
+            manager.parser_mode = "local"
+            manager.primary_parser = "docling"
+            manager.fallback_parser = "none"
+            manager.force_rebuild = True
+            manager.allow_local_parse_fallback = False
+            manager.force_docling_strategy = True
+        else:
+            manager.force_rebuild = True
+            manager.force_docling_strategy = False
+        return manager
+
     @staticmethod
     def _stage1_route_snapshot(strategy: str, metadata: Mapping[str, Any]) -> Dict[str, Any]:
         def text(key: str, default: str = "") -> str:
@@ -2444,6 +2537,19 @@ class LiteratureReviewGenerator:
             'stage1_quality_reasons': list(metadata.get('stage1_quality_reasons') or []),
             'selected_text_length': int(metadata.get('selected_text_length') or 0),
             'stage1_page_count': int(metadata.get('stage1_page_count') or 0),
+            'strategy_policy': text('strategy_policy', 'auto'),
+            'selected_strategy': text('selected_strategy', strategy),
+            'input_mode': text('input_mode') or text('stage1_input_mode'),
+            'formal_input_path': text('formal_input_path'),
+            'primary_text_source': text('primary_text_source') or text('selected_text_source') or text('analysis_input_kind'),
+            'pdf_file_input_supported': bool(metadata.get('pdf_file_input_supported')),
+            'pdf_attachment_status': text('pdf_attachment_status'),
+            'original_pdf_attached': bool(metadata.get('original_pdf_attached')),
+            'pdf_attachment_reason': text('pdf_attachment_reason'),
+            'pdf_attachment_size_mb': float(metadata.get('pdf_attachment_size_mb') or 0),
+            'text_only_evidence_used': text('text_only_evidence_used'),
+            'fallback_reason': text('fallback_reason') or text('stage1_input_fallback_reason'),
+            'quality_report_path': text('quality_report_path') or text('stage1_quality_report_path'),
             'mineru_token_present': token_present,
             'mineru_remote_requested': requested,
             'mineru_remote_enabled': enabled,
@@ -2456,10 +2562,14 @@ class LiteratureReviewGenerator:
     def _format_stage1_route_snapshot(snapshot: Mapping[str, Any]) -> str:
         return (
             "阶段一输入路由: "
+            f"strategy_policy={snapshot.get('strategy_policy')}, "
             f"strategy={snapshot.get('strategy')}, "
             f"parser_mode={snapshot.get('parser_mode')}, "
             f"extractor_used={snapshot.get('extractor_used')}, "
             f"selected_text_source={snapshot.get('selected_text_source')}, "
+            f"input_mode={snapshot.get('input_mode')}, "
+            f"formal_input_path={snapshot.get('formal_input_path')}, "
+            f"pdf_attachment_status={snapshot.get('pdf_attachment_status')}, "
             f"stage1_quality_level={snapshot.get('stage1_quality_level')}, "
             f"mineru_remote_requested={snapshot.get('mineru_remote_requested')}, "
             f"mineru_remote_enabled={snapshot.get('mineru_remote_enabled')}, "
@@ -2493,59 +2603,64 @@ class LiteratureReviewGenerator:
     def _prepare_stage1_input(self, pdf_path: str, preprocess_strategy: str = 'hybrid') -> Tuple[str, Dict[str, Any]]:
         """优先使用预处理工件，必要时回退到旧版文本提取。"""
 
-        preprocess_metadata: Dict[str, Any] = {}
-        preprocess_metadata['preprocess_strategy'] = preprocess_strategy
-        preprocess_metadata['preprocess_profile'] = {
-            'hybrid': 'hybrid',
-            'docling': 'forced_docling',
-            'mineru': 'forced_mineru_remote',
-            'legacy': 'legacy_extractor',
-        }.get(preprocess_strategy, preprocess_strategy)
+        if preprocess_strategy == 'mineru_only':
+            preprocess_strategy = 'mineru'
+        strategy_policy = self._stage1_strategy_policy()
+        preprocess_metadata: Dict[str, Any] = {
+            'preprocess_strategy': preprocess_strategy,
+            'strategy_policy': strategy_policy,
+            'selected_strategy': preprocess_strategy,
+            'preprocess_profile': {
+                'hybrid': 'hybrid',
+                'docling': 'forced_docling',
+                'mineru': 'forced_mineru_remote',
+                'legacy': 'legacy_extractor',
+            }.get(preprocess_strategy, preprocess_strategy),
+        }
 
-        if self.preprocess_manager:
-            original_parser_mode = self.preprocess_manager.parser_mode
-            original_primary_parser = self.preprocess_manager.primary_parser
-            original_force_rebuild = self.preprocess_manager.force_rebuild
-            original_allow_local_parse_fallback = self.preprocess_manager.allow_local_parse_fallback
-            original_force_docling_strategy = self.preprocess_manager.force_docling_strategy
+        mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
+        if preprocess_strategy == 'mineru' and not mineru_api_token:
+            preprocess_metadata.update({
+                'analysis_input_kind': 'blocked_stage1_input',
+                'extractor_used': 'mineru',
+                'parser_mode': 'remote',
+                'primary_parser': 'mineru_remote',
+                'fallback_parser': 'none',
+                'allow_local_parse_fallback': False,
+                'mineru_attempted': False,
+                'mineru_succeeded': False,
+                'mineru_token_present': False,
+                'mineru_remote_requested': True,
+                'mineru_remote_enabled': True,
+                'selected_text_source': '',
+                'stage1_quality_level': 'BLOCK',
+                'stage1_quality_reasons': ['MINERU_API_TOKEN is required for mineru strategy'],
+            })
+            return "", preprocess_metadata
+
+        if self.preprocess_manager and preprocess_strategy != 'legacy':
+            strategy_manager = self._fresh_preprocess_manager_for_strategy(preprocess_strategy)
             try:
-                # 根据策略调整配置
                 if preprocess_strategy == 'mineru':
-                    # 强制使用 MinerU 远程解析
-                    self.preprocess_manager.parser_mode = 'remote'
-                    self.preprocess_manager.force_rebuild = True
-                    self.preprocess_manager.allow_local_parse_fallback = False
-                    self.preprocess_manager.force_docling_strategy = False
                     self.logger.info(f"强制使用 MinerU 远程解析策略: {os.path.basename(pdf_path)}")
                 elif preprocess_strategy == 'docling':
-                    # 强制使用 Docling 解析
-                    self.preprocess_manager.parser_mode = 'local'
-                    self.preprocess_manager.force_rebuild = True
-                    self.preprocess_manager.allow_local_parse_fallback = False
-                    self.preprocess_manager.force_docling_strategy = True
                     self.logger.info(f"强制使用 Docling 解析策略: {os.path.basename(pdf_path)}")
-                else:
-                    # 其他策略保持默认配置
-                    self.preprocess_manager.force_rebuild = True
-                    self.preprocess_manager.allow_local_parse_fallback = original_allow_local_parse_fallback
-                    self.preprocess_manager.force_docling_strategy = False
 
                 preprocess_metadata.update({
-                    'parser_mode': self.preprocess_manager.parser_mode,
-                    'primary_parser': self.preprocess_manager.primary_parser,
-                    'fallback_parser': self.preprocess_manager.fallback_parser,
-                    'allow_local_parse_fallback': self.preprocess_manager.allow_local_parse_fallback,
+                    'parser_mode': strategy_manager.parser_mode,
+                    'primary_parser': strategy_manager.primary_parser,
+                    'fallback_parser': strategy_manager.fallback_parser,
+                    'allow_local_parse_fallback': strategy_manager.allow_local_parse_fallback,
                 })
-                
-                # 准备PDF
-                preprocess_result = self.preprocess_manager.prepare_pdf(
-                    pdf_path
-                )
+
+                preprocess_result = strategy_manager.prepare_pdf(pdf_path)
 
                 if preprocess_result:
                     stage1_text = preprocess_result.stage1_input_text
                     input_kind = preprocess_result.selected_text_source or "stage1_input"
                     preprocess_metadata.update(self._collect_preprocess_result_metadata(preprocess_result, input_kind))
+                    preprocess_metadata['strategy_policy'] = strategy_policy
+                    preprocess_metadata['selected_strategy'] = preprocess_strategy
                     if is_blocked_stage1_quality(
                         preprocess_result.stage1_quality_level,
                         preprocess_metadata.get('stage1_quality_reasons'),
@@ -2576,19 +2691,10 @@ class LiteratureReviewGenerator:
                     )
             except Exception as exc:
                 self.logger.warning(f"预处理阶段失败，尝试其他策略: {exc}")
-            finally:
-                self.preprocess_manager.parser_mode = original_parser_mode
-                self.preprocess_manager.primary_parser = original_primary_parser
-                self.preprocess_manager.force_rebuild = original_force_rebuild
-                self.preprocess_manager.allow_local_parse_fallback = original_allow_local_parse_fallback
-                self.preprocess_manager.force_docling_strategy = original_force_docling_strategy
 
-        # 如果是legacy策略或其他策略失败，使用旧版文本提取
         if preprocess_strategy == 'legacy':
             self.logger.info(f"阶段一输入使用旧版 PDF 文本提取: {os.path.basename(pdf_path)}")
             legacy_text = str(extract_text_from_pdf(pdf_path) or "")  # type: ignore
-            # 直接从环境变量读取 MinerU 配置
-            mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
             mineru_base_url = str(os.getenv("MINERU_BASE_URL", "https://mineru.net/api/v4")).strip().rstrip("/")
             preprocess_metadata.update({
                 'analysis_input_kind': 'legacy_text',
@@ -2609,13 +2715,12 @@ class LiteratureReviewGenerator:
                 'mineru_remote_enabled': False,
                 'mineru_base_url': mineru_base_url,
                 'selected_text_source': 'legacy_text',
+                'strategy_policy': strategy_policy,
+                'selected_strategy': 'legacy',
             })
             return legacy_text, preprocess_metadata
 
-        # 策略失败，返回空文本和元数据
-        # 确保即使在策略失败的情况下，也能正确设置 mineru_token_present
         if not preprocess_metadata.get('mineru_token_present'):
-            mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
             preprocess_metadata['mineru_token_present'] = bool(mineru_api_token)
         return "", preprocess_metadata
 
@@ -3027,6 +3132,8 @@ class LiteratureReviewGenerator:
         pdf_text: str,
         reader_api_config: Mapping[str, Any],
         visual_bundle: Optional[Mapping[str, Any]] = None,
+        pdf_path: str = "",
+        preprocess_metadata: Optional[Mapping[str, Any]] = None,
         paper: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         self.stage1_input_builder.logger = self.logger
@@ -3061,6 +3168,9 @@ class LiteratureReviewGenerator:
             paper_text=pdf_text,
             reader_api_config=reader_api_config,
             visual_bundle=resolved_visual_bundle,
+            pdf_path=pdf_path,
+            stage1_input_settings=self._stage1_input_settings(),
+            preprocess_metadata=preprocess_metadata,
         )
         return built_input.to_metadata_dict()
 
@@ -3682,19 +3792,8 @@ class LiteratureReviewGenerator:
                     'failure_reason': failure_reason
                 }
             
-            # Keep the existing parser retry route: hybrid -> forced Docling -> MinerU remote if configured -> legacy.
-            mineru_configured = bool(
-                (
-                    getattr(self.preprocess_manager, 'mineru_api_token', '')
-                    if self.preprocess_manager is not None
-                    else os.getenv('MINERU_API_TOKEN', '')
-                )
-                or ''
-            )
-            preprocess_strategies = ['hybrid', 'docling']
-            if mineru_configured:
-                preprocess_strategies.append('mineru')
-            preprocess_strategies.append('legacy')
+            strategy_policy = self._stage1_strategy_policy()
+            preprocess_strategies = self._stage1_preprocess_strategies()
             attempt_history = []
             
             # 初始化变量，确保在所有路径中都有定义
@@ -3723,6 +3822,19 @@ class LiteratureReviewGenerator:
                     'stage1_quality_reasons': list(route_snapshot.get('stage1_quality_reasons') or []),
                     'selected_text_length': int(route_snapshot.get('selected_text_length') or 0),
                     'stage1_page_count': int(route_snapshot.get('stage1_page_count') or 0),
+                    'strategy_policy': str(route_snapshot.get('strategy_policy') or strategy_policy),
+                    'selected_strategy': str(route_snapshot.get('selected_strategy') or strategy_name),
+                    'input_mode': str(route_snapshot.get('input_mode') or ''),
+                    'formal_input_path': str(route_snapshot.get('formal_input_path') or ''),
+                    'primary_text_source': str(route_snapshot.get('primary_text_source') or ''),
+                    'pdf_file_input_supported': bool(route_snapshot.get('pdf_file_input_supported')),
+                    'pdf_attachment_status': str(route_snapshot.get('pdf_attachment_status') or ''),
+                    'original_pdf_attached': bool(route_snapshot.get('original_pdf_attached')),
+                    'pdf_attachment_reason': str(route_snapshot.get('pdf_attachment_reason') or ''),
+                    'pdf_attachment_size_mb': float(route_snapshot.get('pdf_attachment_size_mb') or 0),
+                    'text_only_evidence_used': str(route_snapshot.get('text_only_evidence_used') or ''),
+                    'fallback_reason': str(route_snapshot.get('fallback_reason') or ''),
+                    'quality_report_path': str(route_snapshot.get('quality_report_path') or ''),
                     'mineru_remote_requested': bool(route_snapshot.get('mineru_remote_requested')),
                     'mineru_remote_enabled': bool(route_snapshot.get('mineru_remote_enabled')),
                     'mineru_attempted': bool(route_snapshot.get('mineru_attempted')),
@@ -3806,6 +3918,8 @@ class LiteratureReviewGenerator:
                         pdf_text=pdf_text,
                         reader_api_config=reader_api_config,
                         visual_bundle=visual_bundle,
+                        pdf_path=pdf_path,
+                        preprocess_metadata=preprocess_metadata,
                         paper=paper,
                     )
                     analysis_prompt = str(stage1_input.get("prompt_text") or pdf_text)
@@ -3835,6 +3949,43 @@ class LiteratureReviewGenerator:
                 preprocess_metadata["selected_visual_count"] = len(stage1_input.get("selected_visual_refs") or [])
                 preprocess_metadata["stage1_input_mode"] = str(stage1_input.get("input_mode") or "text_only")
                 preprocess_metadata["stage1_input_fallback_reason"] = str(stage1_input.get("fallback_reason") or "")
+                for snapshot_key in (
+                    "pdf_file_input_supported",
+                    "pdf_attachment_status",
+                    "original_pdf_attached",
+                    "pdf_attachment_reason",
+                    "pdf_attachment_size_mb",
+                    "formal_input_path",
+                    "text_only_evidence_used",
+                ):
+                    preprocess_metadata[snapshot_key] = stage1_input.get(snapshot_key)
+                preprocess_metadata["input_mode"] = str(stage1_input.get("input_mode") or "text_only")
+                preprocess_metadata["fallback_reason"] = str(stage1_input.get("fallback_reason") or "")
+                preprocess_metadata["primary_text_source"] = str(preprocess_metadata.get("selected_text_source") or input_kind)
+                pdf_required = (
+                    strategy_policy in {"formal_precision", "mineru_first", "mineru_only"}
+                    and self._truthy_config(
+                        self._stage1_input_settings().get("pdf_required_for_formal_precision"),
+                        default=False,
+                    )
+                )
+                if pdf_required and not bool(stage1_input.get("original_pdf_attached")):
+                    failure_reason = (
+                        "formal_precision requires original PDF attachment, but attachment status is "
+                        f"{stage1_input.get('pdf_attachment_status')}: {stage1_input.get('pdf_attachment_reason')}"
+                    )
+                    self.logger.warning(f"策略 {strategy} 失败: {failure_reason}")
+                    record_attempt_failure(
+                        strategy,
+                        preprocess_metadata,
+                        model_name='N/A',
+                        quality_reason=failure_reason,
+                        extractor_name=extractor_used,
+                    )
+                    continue
+                stage1_route_snapshot = self._stage1_route_snapshot(strategy, preprocess_metadata)
+                preprocess_metadata['stage1_route'] = stage1_route_snapshot
+                self.logger.info(self._format_stage1_route_snapshot(stage1_route_snapshot))
 
                 # 调用AI接口生成摘要（自动处理引擎切换）
                 reader_result = self._call_stage1_reader_with_scheduler(
@@ -4055,6 +4206,43 @@ class LiteratureReviewGenerator:
                 return failed_result
             
             self.logger.info("内容质量检查通过")
+            final_stage1_route_snapshot = self._stage1_route_snapshot(
+                str(preprocess_metadata.get('selected_strategy') or strategy),
+                preprocess_metadata,
+            )
+            attempt_history.append({
+                'preprocess_strategy': str(final_stage1_route_snapshot.get('strategy') or strategy),
+                'preprocess_profile': str(final_stage1_route_snapshot.get('preprocess_profile') or strategy),
+                'parser_mode': str(final_stage1_route_snapshot.get('parser_mode') or ''),
+                'extractor_used': str(final_stage1_route_snapshot.get('extractor_used') or 'unknown'),
+                'selected_text_source': str(final_stage1_route_snapshot.get('selected_text_source') or ''),
+                'stage1_quality_level': str(final_stage1_route_snapshot.get('stage1_quality_level') or ''),
+                'stage1_quality_reasons': list(final_stage1_route_snapshot.get('stage1_quality_reasons') or []),
+                'selected_text_length': int(final_stage1_route_snapshot.get('selected_text_length') or len(pdf_text or "")),
+                'stage1_page_count': int(final_stage1_route_snapshot.get('stage1_page_count') or 0),
+                'strategy_policy': str(final_stage1_route_snapshot.get('strategy_policy') or strategy_policy),
+                'selected_strategy': str(final_stage1_route_snapshot.get('selected_strategy') or strategy),
+                'input_mode': str(final_stage1_route_snapshot.get('input_mode') or ''),
+                'formal_input_path': str(final_stage1_route_snapshot.get('formal_input_path') or ''),
+                'primary_text_source': str(final_stage1_route_snapshot.get('primary_text_source') or ''),
+                'pdf_file_input_supported': bool(final_stage1_route_snapshot.get('pdf_file_input_supported')),
+                'pdf_attachment_status': str(final_stage1_route_snapshot.get('pdf_attachment_status') or ''),
+                'original_pdf_attached': bool(final_stage1_route_snapshot.get('original_pdf_attached')),
+                'pdf_attachment_reason': str(final_stage1_route_snapshot.get('pdf_attachment_reason') or ''),
+                'pdf_attachment_size_mb': float(final_stage1_route_snapshot.get('pdf_attachment_size_mb') or 0),
+                'text_only_evidence_used': str(final_stage1_route_snapshot.get('text_only_evidence_used') or ''),
+                'fallback_reason': str(final_stage1_route_snapshot.get('fallback_reason') or ''),
+                'quality_report_path': str(final_stage1_route_snapshot.get('quality_report_path') or ''),
+                'mineru_remote_requested': bool(final_stage1_route_snapshot.get('mineru_remote_requested')),
+                'mineru_remote_enabled': bool(final_stage1_route_snapshot.get('mineru_remote_enabled')),
+                'mineru_attempted': bool(final_stage1_route_snapshot.get('mineru_attempted')),
+                'mineru_succeeded': bool(final_stage1_route_snapshot.get('mineru_succeeded')),
+                'mineru_route': str(final_stage1_route_snapshot.get('mineru_route') or ''),
+                'stage1_route': final_stage1_route_snapshot,
+                'model_used': model_used,
+                'quality_reason': 'success',
+                'success': True,
+            })
             # ================================================================
             
             # 概念增强分析（如果启用）
@@ -5867,19 +6055,24 @@ class LiteratureReviewGenerator:
                 )
                 
                 # 检查章节内容是否包含结构化citation token
-                if "[[cite_ref:" not in section_content:
+                section_citation_validation = validate_raw_citation_text(
+                    self._load_citation_ref_catalog() or {},
+                    section_content,
+                )
+                if not section_citation_validation.get("valid"):
                     self.logger.warning(
-                        f"Section {section_num} is missing structured citation tokens; attempting one narrow retry."
+                        f"Section {section_num} citation validation failed "
+                        f"({', '.join(section_citation_validation.get('errors') or [])}); attempting one narrow retry."
                     )
                     # One narrow citation-token insertion retry.
                     # Boundary markers prevent the embedded section content from
                     # being interpreted as prompt instructions.
                     retry_section_escaped = section_content.replace("'''", r"\'\'\'")
                     retry_prompt = (
-                        "The following section content is missing [[cite_ref:R001]] citation tokens. "
-                        "Please rewrite it inserting appropriate [[cite_ref:R###]] tokens for every factual claim "
-                        "referenced from CITATION_REF_CATALOG. Preserve all other content and structure. "
-                        "Use only existing catalog IDs; do not write [[cite:paper_key]] or APA citations.\n\n"
+                        "The following section content failed raw citation validation. "
+                        "Please rewrite it so every factual claim has legal [[cite_ref:R###]] tokens. "
+                        "Legal forms are [[cite_ref:R001]], [[cite_ref:R001,R002]], and [[cite_ref:R001, R002]]. "
+                        "Use only existing catalog IDs; do not write [[cite:paper_key]], bare R001, semicolon refs, or APA citations.\n\n"
                         f"CITATION_REF_CATALOG\n{self._format_citation_ref_catalog_for_prompt()}\n\n"
                         f"=== SECTION TO FIX ===\nSection: {section_title}\n\n"
                         "'''CONTENT START'''\n"
@@ -5892,19 +6085,26 @@ class LiteratureReviewGenerator:
                         writer_api_config,
                         is_continuation=False,
                     )
-                    if retry_result and "[[cite_ref:" in str(retry_result.get("content", "")):
-                        section_content = retry_result["content"]
-                        self.logger.success(f"Citation-token retry succeeded for section {section_num}")
+                    retry_content = str((retry_result or {}).get("content") or "")
+                    retry_validation = validate_raw_citation_text(
+                        self._load_citation_ref_catalog() or {},
+                        retry_content,
+                    )
+                    if retry_result and retry_validation.get("valid"):
+                        section_content = retry_content
+                        self.logger.success(f"TOKEN_RETRY_SUCCESS section={section_num}")
                     else:
                         self.logger.error(
-                            f"Section {section_num} still lacks structured citation tokens after retry; "
+                            f"TOKEN_RETRY_FAILED section={section_num}: "
+                            f"{', '.join(retry_validation.get('errors') or section_citation_validation.get('errors') or [])}; "
                             "canonical review generation is blocked."
                         )
                         failed_sections.append(
                             {
                                 "section_number": int(section_num),
                                 "section_title": section_title,
-                                "failure_reason": "missing_structured_citation_tokens",
+                                "failure_reason": "invalid_structured_citation_tokens",
+                                "citation_validation": retry_validation or section_citation_validation,
                                 "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             }
                         )
@@ -6005,7 +6205,7 @@ class LiteratureReviewGenerator:
                     self.logger.error("Canonical citation_manifest_v3 was not persisted.")
                     return False
 
-                from docx_writer import generate_apa_references_from_manifest, rebuild_review_docx_from_structured_artifacts
+                from docx_writer import generate_apa_references_from_manifest, rebuild_final_docx_from_manifest
 
                 references = generate_apa_references_from_manifest(
                     citation_manifest,
@@ -6032,12 +6232,24 @@ class LiteratureReviewGenerator:
 
                 with open(review_draft_path, "r", encoding="utf-8") as handle:
                     review_draft = json.load(handle)
-                rebuild_review_docx_from_structured_artifacts(
+                final_docx_scan_path = ""
+                if self.job_workspace and self.project_name:
+                    final_docx_scan_path = self.job_workspace.artifact_path(
+                        f"citation_manifests/{self.project_name}_final_docx_citation_scan.json"
+                    )
+                final_docx_scan = rebuild_final_docx_from_manifest(
                     self,
                     review_draft,
                     citation_manifest,
                     word_file,
-                    allow_compat_fallback=False,
+                    scan_report_path=final_docx_scan_path,
+                )
+                if final_docx_scan_path:
+                    self.logger.info(f"Final DOCX citation scan saved: {final_docx_scan_path}")
+                self.logger.info(
+                    "Final DOCX citation scan passed: "
+                    f"unresolved_tokens={len(final_docx_scan.get('unresolved_tokens') or [])}, "
+                    f"bare_ref_ids={len(final_docx_scan.get('bare_ref_ids') or [])}"
                 )
 
             self.logger.success(f"完整文献综述已生成: {word_file}")

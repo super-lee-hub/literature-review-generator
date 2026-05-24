@@ -77,6 +77,13 @@ class TestDependencyHashBundle:
         bundle = DependencyHashBundle.from_dict(data)
         assert bundle.summary_hash == "abc123"
 
+    def test_build_dependency_bundle_allows_empty_artifact_list(self):
+        bundle = _build_dependency_bundle([], {})
+
+        assert bundle.summary_hash == _compute_hash({})
+        assert bundle.paper_artifact_hash == _compute_hash([])
+        assert bundle.selected_visual_refs_hash == _compute_hash([])
+
 
 class TestPatchTargetSignature:
     """Test PatchTargetSignature structure."""
@@ -364,6 +371,70 @@ class TestRepairPlanner:
         assert len(plan.proposals) == 1
         assert plan.proposals[0].root_cause == RepairRootCause.CITATION_MAPPING_ERROR
 
+    def test_create_plan_with_multi_paper_artifacts_uses_composite_dependency_hash(self):
+        """Test multi-paper citation sets produce a composite dependency bundle."""
+        block_text = "Test paragraph with multi-paper citation."
+        citation_result = CitationValidationResult(
+            citation_id="cite-multi",
+            paper_id="paper-001+paper-002",
+            conclusion=ValidationConclusion.WRONG_SOURCE,
+            root_causes=[RootCause.CITATION_MAPPING_ERROR],
+            evidence_candidates=[],
+            details={},
+            claim_text="Test claim",
+            claim_context="Test context",
+            evidence_excerpt_list=[],
+            reasoning_summary="Test reasoning",
+            repair_hint="Test repair hint",
+            citation_set_key="paper-001+paper-002",
+            paper_ids=["paper-001", "paper-002"],
+            block_ids=["s1_b1"],
+        )
+        report = ReviewValidationReport(
+            report_id="val-001",
+            created_at=datetime.now().isoformat(),
+            total_citations=1,
+            supported_count=0,
+            partial_support_count=0,
+            unsupported_count=0,
+            wrong_source_count=1,
+            needs_review_count=0,
+            citation_results=[citation_result],
+        )
+        review_draft = {
+            "artifact_type": "review_draft",
+            "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": block_text}]}]},
+        }
+        paper_artifact_1 = {
+            "paper_identity": {"canonical_paper_key": "paper-001"},
+            "analysis": {"ai_summary": {"finding_1": "alpha"}},
+            "stage1_inputs": {"selected_visual_refs": [{"path": "fig1.png"}]},
+        }
+        paper_artifact_2 = {
+            "paper_identity": {"canonical_paper_key": "paper-002"},
+            "analysis": {"ai_summary": {"finding_2": "beta"}},
+            "stage1_inputs": {"selected_visual_refs": [{"path": "fig2.png"}]},
+        }
+        paper_artifacts = [paper_artifact_1, paper_artifact_2]
+
+        planner = RepairPlanner(
+            validation_report=report,
+            review_draft=review_draft,
+            citation_manifest={"citations": []},
+            paper_artifacts=paper_artifacts,
+            job_id="job-001",
+        )
+
+        plan = planner.create_plan()
+
+        assert len(plan.proposals) == 1
+        proposal = plan.proposals[0]
+        assert proposal.metadata["paper_ids"] == ["paper-001", "paper-002"]
+        assert proposal.dependency_bundle.paper_artifact_hash == _compute_hash(paper_artifacts)
+        assert proposal.dependency_bundle.selected_visual_refs_hash == _compute_hash(
+            paper_artifact_1["stage1_inputs"]["selected_visual_refs"]
+        )
+
 
 class TestApplyGuards:
     """Test guard enforcement in repair apply."""
@@ -505,6 +576,62 @@ class TestApplyGuards:
         result = check_apply_guards(proposal, review_draft, [paper_artifact])
         assert result.can_apply is False
         assert result.dependency_guard_passed is False
+
+    def test_multi_paper_dependency_guard_checks_all_artifacts(self):
+        """Test multi-paper dependency guard fails if any referenced artifact changes."""
+        block_text = "Test paragraph with multi-paper citation."
+        paper_artifact_1 = {
+            "paper_identity": {"canonical_paper_key": "paper-001"},
+            "analysis": {"ai_summary": {"finding_1": "alpha"}},
+            "stage1_inputs": {"selected_visual_refs": [{"path": "fig1.png"}]},
+        }
+        paper_artifact_2 = {
+            "paper_identity": {"canonical_paper_key": "paper-002"},
+            "analysis": {"ai_summary": {"finding_2": "beta"}},
+            "stage1_inputs": {"selected_visual_refs": [{"path": "fig2.png"}]},
+        }
+        paper_artifacts = [paper_artifact_1, paper_artifact_2]
+        bundle = _build_dependency_bundle(
+            paper_artifacts,
+            {"finding_1": "alpha", "finding_2": "beta"},
+        )
+        proposal = PatchProposal(
+            proposal_id="prop-multi",
+            citation_id="cite-multi",
+            root_cause=RepairRootCause.CITATION_MAPPING_ERROR,
+            granularity=PatchGranularity.SPAN,
+            target=PatchTargetSignature(
+                block_id="s1_b1",
+                anchor_text="Test paragraph...",
+                anchor_hash=_compute_anchor_hash(block_text),
+            ),
+            original_text=block_text,
+            proposed_text="[CITATION_MAPPING_ERROR: cite-multi - needs manual review]",
+            confidence=0.8,
+            fix_strategy="manifest_fix_rerender",
+            dependency_bundle=bundle,
+            metadata={"paper_ids": ["paper-001", "paper-002"]},
+        )
+        review_draft = {
+            "artifact_type": "review_draft",
+            "artifact_version": "v2",
+            "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": block_text}]}]},
+        }
+
+        result = check_apply_guards(proposal, review_draft, paper_artifacts)
+
+        assert result.can_apply is True
+        changed_second_artifact = {
+            **paper_artifact_2,
+            "analysis": {"ai_summary": {"finding_2": "changed"}},
+        }
+        stale_result = check_apply_guards(
+            proposal,
+            review_draft,
+            [paper_artifact_1, changed_second_artifact],
+        )
+        assert stale_result.can_apply is False
+        assert stale_result.dependency_guard_passed is False
 
     def test_base_guards_allow_text_mutating_review_proposal(self):
         bundle = DependencyHashBundle(

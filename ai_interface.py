@@ -300,6 +300,14 @@ def _convert_chat_content_to_responses_content(content: Any) -> Any:
             image_url = str(item.get("image_url") or item.get("url") or "").strip()
             if image_url:
                 converted.append({"type": "input_image", "image_url": image_url})
+            continue
+        if item_type == "input_file":
+            file_item: Dict[str, Any] = {"type": "input_file"}
+            for key in ("file_id", "file_url", "file_data", "filename"):
+                if item.get(key):
+                    file_item[key] = str(item.get(key))
+            if len(file_item) > 1:
+                converted.append(file_item)
     return converted or [{"type": "input_text", "text": ""}]
 
 
@@ -521,6 +529,18 @@ def _encode_local_image_as_data_url(path: str) -> Optional[str]:
     return f"data:{mime_type};base64,{encoded}"
 
 
+def _encode_local_pdf_as_data_url(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as handle:
+            pdf_bytes = handle.read()
+    except Exception:
+        return None
+    if not pdf_bytes:
+        return None
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    return f"data:application/pdf;base64,{encoded}"
+
+
 def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any = None) -> Any:
     if not isinstance(user_content, list):
         return prompt
@@ -550,6 +570,29 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
                 normalized.append({"type": "image_url", "image_url": {"url": str(image_url.get("url"))}})
             elif isinstance(image_url, str) and image_url.strip():
                 normalized.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+            continue
+        if item_type == "local_pdf_path":
+            path = str(item.get("path") or "").strip()
+            data_url = _encode_local_pdf_as_data_url(path)
+            if not data_url:
+                if logger:
+                    logger.warning(f"Skipping missing or unreadable local PDF input: {path}")
+                continue
+            normalized.append(
+                {
+                    "type": "input_file",
+                    "filename": os.path.basename(path) or "document.pdf",
+                    "file_data": data_url,
+                }
+            )
+            continue
+        if item_type == "input_file":
+            file_item: Dict[str, Any] = {"type": "input_file"}
+            for key in ("file_id", "file_url", "file_data", "filename"):
+                if item.get(key):
+                    file_item[key] = str(item.get(key))
+            if len(file_item) > 1:
+                normalized.append(file_item)
             continue
 
     if not normalized:

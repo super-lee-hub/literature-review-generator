@@ -22,7 +22,7 @@ from services.citation_catalog import (
     extract_citation_key,
     format_in_text_citation,
 )
-from services.citation_ref_catalog import extract_ref_ids_from_token
+from services.citation_ref_catalog import LEGAL_CITE_REF_TOKEN_PATTERN, extract_ref_ids_from_token
 
 
 def _log(logger: Any, level: str, message: str) -> None:
@@ -336,8 +336,9 @@ def append_section_to_word_document(
                 raise ValueError(
                     f"Unresolved citation tokens in canonical DOCX render: {', '.join(sorted(set(unresolved_tokens))[:5])}"
                 )
-            generator_instance.logger.warning(
-                f"Word 导出时发现未解析 citation token: {', '.join(sorted(set(unresolved_tokens))[:5])}"
+            generator_instance.logger.info(
+                "DRAFT_DOCX_RAW_TOKEN_PRESENT: "
+                f"{', '.join(sorted(set(unresolved_tokens))[:5])}"
             )
         paragraphs = rendered_section_text.split('\n\n')
         for para in paragraphs:
@@ -431,29 +432,65 @@ def generate_apa_references_from_manifest(
     """
     try:
         if citation_manifest is not None:
-            # 尝试从 v2 manifest 中获取 bibliography（优先路径）
-            if 'bibliography' in citation_manifest:
-                references: List[str] = []
+            references: List[str] = []
+            cited_paper_ids = {
+                str(occurrence.get("paper_id") or "").strip()
+                for occurrence in citation_manifest.get("occurrences", [])
+                if isinstance(occurrence, dict) and str(occurrence.get("paper_id") or "").strip()
+            }
+            cited_cluster_paper_ids = {
+                str(cluster.get("paper_id") or "").strip()
+                for cluster in citation_manifest.get("clusters", [])
+                if isinstance(cluster, dict) and str(cluster.get("paper_id") or "").strip()
+            }
+            cited_paper_ids.update(cited_cluster_paper_ids)
+            if cited_paper_ids and citation_manifest.get("paper_entries"):
+                from services.citation_catalog import CitationCatalogEntry, format_reference_entry
+
+                for entry_data in citation_manifest.get("paper_entries", []):
+                    if not isinstance(entry_data, dict):
+                        continue
+                    paper_id = str(entry_data.get("paper_id") or "").strip()
+                    if paper_id not in cited_paper_ids:
+                        continue
+                    entry = CitationCatalogEntry(
+                        index=len(references) + 1,
+                        paper_id=paper_id,
+                        paper_key=str(entry_data.get("paper_key") or paper_id),
+                        title=str(entry_data.get("title") or ""),
+                        authors=[str(author).strip() for author in (entry_data.get("authors") or []) if str(author).strip()],
+                        year=str(entry_data.get("year") or ""),
+                        journal=str(entry_data.get("journal") or ""),
+                        doi=str(entry_data.get("doi") or ""),
+                        aliases=[],
+                    )
+                    formatted = format_reference_entry(entry)
+                    if formatted:
+                        references.append(formatted)
+
+            if not references and 'bibliography' in citation_manifest:
+                cited_keys = cited_paper_ids or {
+                    str(cluster.get("paper_key") or "").strip()
+                    for cluster in citation_manifest.get("clusters", [])
+                    if isinstance(cluster, dict) and str(cluster.get("paper_key") or "").strip()
+                }
                 for entry in citation_manifest['bibliography']:
-                    # v2 manifest 格式
                     if isinstance(entry, dict) and 'citation_text' in entry:
-                        # 只包含被引用的文献
-                        if entry.get('is_cited', True):
+                        entry_paper_id = str(entry.get("paper_id") or entry.get("paper_key") or "").strip()
+                        if entry.get('is_cited', True) and (not cited_keys or entry_paper_id in cited_keys):
                             references.append(entry['citation_text'])
-                    elif isinstance(entry, str):
-                        # 向后兼容：直接使用字符串
+                    elif isinstance(entry, str) and allow_compat_fallback:
                         references.append(entry)
-                
-                if references:
-                    # 按第一作者姓氏排序
-                    references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
-                    generator_instance.logger.info("使用 v2 manifest 中的 bibliography 生成参考文献")
-                    return references
-                elif allow_compat_fallback:
-                    # v2 manifest 存在但 bibliography 为空，继续检查 v1 citations
-                    generator_instance.logger.warning("v2 manifest 存在但 bibliography 为空，检查 v1 citations")
-                else:
-                    raise ValueError("Canonical citation manifest bibliography is empty")
+
+            if references:
+                references = list(dict.fromkeys(references))
+                references.sort(key=lambda x: x.split(',')[0] if ',' in x else x)
+                generator_instance.logger.info("使用 canonical citation manifest 的实际 resolved occurrences 生成参考文献")
+                return references
+            if allow_compat_fallback:
+                generator_instance.logger.warning("canonical manifest 没有可渲染 bibliography，检查 v1 citations")
+            else:
+                raise ValueError("Canonical citation manifest bibliography is empty")
             
             # 尝试从 v1 manifest 中获取 citations
             if 'citations' in citation_manifest and allow_compat_fallback:
@@ -503,6 +540,63 @@ def _initialize_review_document(generator_instance: Any, output_path: str) -> No
         run.font.size = Pt(font_size_body)
 
     doc.save(output_path)
+
+
+def scan_docx_for_unresolved_citation_tokens(
+    docx_path: str,
+    citation_manifest: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    doc = Document(docx_path)
+    texts: List[str] = []
+
+    def add_paragraphs(paragraphs: Any) -> None:
+        for paragraph in paragraphs:
+            texts.append(str(getattr(paragraph, "text", "") or ""))
+
+    add_paragraphs(doc.paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                add_paragraphs(cell.paragraphs)
+                for nested_table in cell.tables:
+                    for nested_row in nested_table.rows:
+                        for nested_cell in nested_row.cells:
+                            add_paragraphs(nested_cell.paragraphs)
+    for section in doc.sections:
+        for part in (section.header, section.footer):
+            add_paragraphs(part.paragraphs)
+            for table in part.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        add_paragraphs(cell.paragraphs)
+
+    full_text = "\n".join(texts)
+    legal_tokens = LEGAL_CITE_REF_TOKEN_PATTERN.findall(full_text)
+    legacy_tokens = re.findall(r"\[\[cite:[^\]]+\]\]", full_text)
+    raw_cite_ref_tokens = re.findall(r"\[\[cite_ref:[^\]]+\]\]", full_text)
+    unresolved_tokens = sorted(set(raw_cite_ref_tokens + legacy_tokens))
+    catalog_ref_ids = {
+        str(occurrence.get("ref_id") or "").strip()
+        for occurrence in (citation_manifest or {}).get("occurrences", [])
+        if isinstance(occurrence, Mapping) and str(occurrence.get("ref_id") or "").strip()
+    }
+    text_without_tokens = LEGAL_CITE_REF_TOKEN_PATTERN.sub("", full_text)
+    bare_ref_ids = sorted(
+        ref_id
+        for ref_id in catalog_ref_ids
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(ref_id)}(?![A-Za-z0-9_])", text_without_tokens)
+    )
+    references_seen = "References" in full_text or "参考文献" in full_text
+    return {
+        "docx_path": docx_path,
+        "paragraph_count": len(doc.paragraphs),
+        "table_count": len(doc.tables),
+        "legal_tokens": legal_tokens,
+        "unresolved_tokens": unresolved_tokens,
+        "bare_ref_ids": bare_ref_ids,
+        "references_seen": references_seen,
+        "passed": not unresolved_tokens and not bare_ref_ids,
+    }
 
 
 def rebuild_review_docx_from_structured_artifacts(
@@ -555,6 +649,42 @@ def rebuild_review_docx_from_structured_artifacts(
             doc.add_paragraph(reference)
         generate_word_table_of_contents(doc)
         doc.save(output_path)
+
+    scan_report = scan_docx_for_unresolved_citation_tokens(output_path, citation_manifest)
+    if not scan_report.get("passed"):
+        raise ValueError(
+            "FINAL_DOCX_UNRESOLVED_TOKEN_FATAL: "
+            + ", ".join(scan_report.get("unresolved_tokens") or scan_report.get("bare_ref_ids") or [])
+        )
+
+
+def rebuild_final_docx_from_manifest(
+    generator_instance: Any,
+    review_draft: Mapping[str, Any],
+    citation_manifest: Mapping[str, Any],
+    output_path: str,
+    *,
+    scan_report_path: str = "",
+) -> Dict[str, Any]:
+    rebuild_review_docx_from_structured_artifacts(
+        generator_instance,
+        review_draft,
+        citation_manifest,
+        output_path,
+        allow_compat_fallback=False,
+    )
+    scan_report = scan_docx_for_unresolved_citation_tokens(output_path, citation_manifest)
+    if scan_report_path:
+        import json
+
+        Path(scan_report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(scan_report_path).write_text(json.dumps(scan_report, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not scan_report.get("passed"):
+        raise ValueError(
+            "FINAL_DOCX_UNRESOLVED_TOKEN_FATAL: "
+            + ", ".join(scan_report.get("unresolved_tokens") or scan_report.get("bare_ref_ids") or [])
+        )
+    return scan_report
 
 
 def generate_apa_references(generator_instance: Any) -> List[str]:

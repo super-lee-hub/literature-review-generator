@@ -898,6 +898,90 @@ def test_process_paper_skips_ai_for_blocked_stage1_attempts(tmp_path, monkeypatc
     assert result["attempt_history"][0]["stage1_quality_reasons"] == ["incomplete_by_page_count"]
 
 
+def test_stage1_strategy_policy_formal_precision_order() -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo")
+    generator.config = ConfigDict({"Preprocess": {"strategy_policy": "formal_precision"}})
+
+    assert generator._stage1_preprocess_strategies() == ["mineru", "docling", "legacy"]
+
+
+def test_prepare_stage1_input_uses_fresh_manager_without_mutating_shared(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({"Preprocess": {"enabled": "true", "parser_mode": "hybrid", "primary_parser": "mineru_remote"}})
+    shared = main.PreprocessManager(config=generator.config, logger=generator.logger)
+    shared.parser_mode = "hybrid"
+    shared.primary_parser = "mineru_remote"
+    shared.force_rebuild = False
+    shared.allow_local_parse_fallback = True
+    shared.force_docling_strategy = False
+    generator.preprocess_manager = shared
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+
+    class _Result:
+        stage1_input_text = "A" * 800
+        selected_text_source = "stage1_input"
+        extractor_used = "docling"
+        layout_fidelity = "layout_aware"
+        conversion_used = "native_pdf"
+        used_ocr = False
+        low_quality = False
+        scanned_like = False
+        mineru_attempted = False
+        mineru_succeeded = False
+        mineru_token_present = False
+        mineru_remote_requested = False
+        mineru_remote_enabled = False
+        mineru_base_url = ""
+        markdown_path = ""
+        plain_text_path = ""
+        page_index_path = ""
+        structured_json_path = ""
+        diagnostics_path = ""
+        manifest_path = ""
+        stage1_input_path = ""
+        stage1_input_manifest_path = ""
+        stage1_quality_report_path = ""
+        stage1_quality_level = "PASS"
+        chunk_count = 0
+        cache_dir = ""
+
+    seen_modes: list[tuple[str, bool, bool]] = []
+
+    def fake_prepare(self, _pdf_path):
+        seen_modes.append((self.parser_mode, self.force_docling_strategy, self.allow_local_parse_fallback))
+        return _Result()
+
+    monkeypatch.setattr(main.PreprocessManager, "prepare_pdf", fake_prepare)
+
+    text, metadata = generator._prepare_stage1_input(str(pdf_path), "docling")
+
+    assert text == "A" * 800
+    assert metadata["parser_mode"] == "local"
+    assert seen_modes == [("local", True, False)]
+    assert shared.parser_mode == "hybrid"
+    assert shared.primary_parser == "mineru_remote"
+    assert shared.force_rebuild is False
+    assert shared.allow_local_parse_fallback is True
+    assert shared.force_docling_strategy is False
+
+
+def test_mineru_only_missing_token_fails_clearly(monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo")
+    generator.config = ConfigDict({"Preprocess": {"strategy_policy": "mineru_only"}})
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+
+    text, metadata = generator._prepare_stage1_input("missing.pdf", "mineru")
+
+    assert text == ""
+    assert metadata["stage1_quality_level"] == "BLOCK"
+    assert metadata["mineru_remote_requested"] is True
+    assert metadata["mineru_remote_enabled"] is True
+    assert metadata["mineru_attempted"] is False
+    assert "MINERU_API_TOKEN" in metadata["stage1_quality_reasons"][0]
+
+
 def test_generate_review_outline_prefers_outline_api_config(tmp_path, monkeypatch) -> None:
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
     generator.logger = cast(main.CustomLogger, _DummyLogger())

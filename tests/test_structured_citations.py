@@ -3,7 +3,7 @@
 import pytest
 
 from services.citation_manifest import build_citation_manifest_v2_from_review_draft
-from services.citation_ref_catalog import build_document_ref_catalog, validate_citation_refs
+from services.citation_ref_catalog import build_document_ref_catalog, validate_citation_refs, validate_raw_citation_text
 from services.review_draft import build_review_draft_v2
 
 
@@ -402,6 +402,24 @@ def test_validate_citation_refs_flags_tombstoned_refs_in_combined_tokens():
     assert result["resolved"] == ["R001"]
     assert result["unresolved"] == []
     assert result["tombstoned"] == ["R002"]
+
+
+def test_validate_raw_citation_text_rejects_illegal_tokens_and_bare_refs():
+    catalog = _catalog()
+
+    bad = validate_raw_citation_text(
+        catalog,
+        "Claim (Author A, 2023) cites bare R001 and bad [[cite:R001]] plus [[cite_ref:R001; R002]].",
+    )
+
+    assert bad["valid"] is False
+    assert "ILLEGAL_CITATION_TOKEN" in bad["errors"]
+    assert "BARE_CATALOG_REF_ID" in bad["errors"]
+    assert "RAW_APA_CITATION" in bad["errors"]
+
+    good = validate_raw_citation_text(catalog, "Claim [[cite_ref:R001, R002]].")
+    assert good["valid"] is True
+    assert good["resolved"] == ["R001", "R002"]
 
 
 def test_catalog_rerun_id_stability_new_append_and_tombstones():

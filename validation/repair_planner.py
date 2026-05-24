@@ -31,13 +31,24 @@ def _compute_hash(data: Any) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
 
 
+def _resolve_primary_artifact(paper_artifact_or_artifacts: Any) -> Dict[str, Any]:
+    """Return the primary paper artifact for single- and multi-paper inputs."""
+    if isinstance(paper_artifact_or_artifacts, list):
+        first = paper_artifact_or_artifacts[0] if paper_artifact_or_artifacts else {}
+        return first if isinstance(first, dict) else {}
+    if isinstance(paper_artifact_or_artifacts, dict):
+        return paper_artifact_or_artifacts
+    return {}
+
+
 def _build_dependency_bundle(
-    paper_artifact: Dict[str, Any],
+    paper_artifact: Any,
     summary_data: Dict[str, Any],
     visual_manifest: Optional[Dict[str, Any]] = None,
 ) -> DependencyHashBundle:
     """Build dependency hash bundle from artifacts."""
-    selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
+    primary_artifact = _resolve_primary_artifact(paper_artifact)
+    selected_visual_refs = primary_artifact.get("stage1_inputs", {}).get("selected_visual_refs", [])
     
     return DependencyHashBundle(
         summary_hash=_compute_hash(summary_data),

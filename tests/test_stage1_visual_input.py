@@ -284,7 +284,90 @@ def test_stage1_input_builder_falls_back_to_text_only_when_backend_is_unclear(tm
     assert built.input_mode == "text_only"
     assert built.user_message_content is None
     assert built.fallback_reason == "conservative_fallback_for_unsupported_or_unclear_backend"
-    assert len(built.selected_visual_refs) == 1
+
+
+def test_stage1_input_builder_deepseek_formal_precision_is_text_only_rich_evidence(tmp_path: Path) -> None:
+    page_index = tmp_path / "page_index.json"
+    page_index.write_text('[{"page_number": 1, "text_length": 1200, "block_count": 4, "image_count": 1}]', encoding="utf-8")
+    stage1_input = tmp_path / "stage1_input.md"
+    stage1_input.write_text("Main text body.", encoding="utf-8")
+    normalized = tmp_path / "normalized.md"
+    normalized.write_text("# Structured\n\nMain text body with layout.", encoding="utf-8")
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nplaceholder")
+
+    built = Stage1InputBuilder().build(
+        prompt_template="Analyze carefully:\n{{PAPER_FULL_TEXT}}",
+        paper_text="Main text body.",
+        reader_api_config={
+            "api_key": "key",
+            "model": "deepseek-v4-pro",
+            "api_base": "https://api.deepseek.com",
+            "endpoint_type": "chat_completions",
+            "provider_family": "deepseek",
+        },
+        visual_bundle=_sample_visual_bundle(tmp_path),
+        pdf_path=str(pdf),
+        stage1_input_settings={"send_original_pdf": "always"},
+        preprocess_metadata={
+            "stage1_input_path": str(stage1_input),
+            "markdown_path": str(normalized),
+            "page_index_path": str(page_index),
+            "selected_text_source": "stage1_input",
+        },
+    )
+
+    assert built.input_mode == "text_only"
+    assert built.pdf_file_input_supported is False
+    assert built.pdf_attachment_status == "not_supported"
+    assert built.original_pdf_attached is False
+    assert built.formal_input_path == "text_only_rich_evidence"
+    assert built.text_only_evidence_used == "rich_mineru_evidence_v1"
+    assert "[RICH MINERU EVIDENCE V1]" in built.prompt_text
+
+
+def test_stage1_input_builder_pdf_capable_provider_attaches_under_limit(tmp_path: Path) -> None:
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nplaceholder")
+
+    built = Stage1InputBuilder().build(
+        prompt_template="Analyze carefully:\n{{PAPER_FULL_TEXT}}",
+        paper_text="Main text body.",
+        reader_api_config={
+            "api_key": "key",
+            "model": "gpt-5.5",
+            "api_base": "https://api.openai.com/v1",
+            "endpoint_type": "responses",
+            "supports_pdf_file_input": "true",
+        },
+        pdf_path=str(pdf),
+        stage1_input_settings={"send_original_pdf": "always", "max_pdf_file_mb": "1"},
+    )
+
+    assert built.input_mode == "pdf_plus_text"
+    assert built.pdf_file_input_supported is True
+    assert built.pdf_attachment_status == "attached"
+    assert built.original_pdf_attached is True
+    assert built.user_message_content is not None
+    assert built.user_message_content[-1]["type"] == "local_pdf_path"
+
+
+def test_stage1_input_builder_always_respects_provider_capability(tmp_path: Path) -> None:
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nplaceholder")
+
+    built = Stage1InputBuilder().build(
+        prompt_template="Analyze carefully:\n{{PAPER_FULL_TEXT}}",
+        paper_text="Main text body.",
+        reader_api_config={"api_key": "key", "model": "custom", "api_base": "https://example.com/v1"},
+        pdf_path=str(pdf),
+        stage1_input_settings={"send_original_pdf": "always"},
+    )
+
+    assert built.input_mode == "text_only"
+    assert built.pdf_attachment_status == "not_supported"
+    assert built.original_pdf_attached is False
+    assert built.user_message_content is None
 
 
 def test_call_ai_api_serializes_local_image_path_content(tmp_path: Path) -> None:

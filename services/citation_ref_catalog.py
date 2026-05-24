@@ -114,9 +114,14 @@ def _next_ref_id(number: int) -> str:
     return f"R{number:03d}"
 
 
+LEGAL_CITE_REF_TOKEN_PATTERN = re.compile(r"\[\[cite_ref:R\d{3,}(?:,\s*R\d{3,})*\]\]")
+
+
 def extract_ref_ids_from_token(citation_token: Any) -> List[str]:
     match = re.fullmatch(r"\s*\[\[cite_ref:([^\]]+)\]\]\s*", str(citation_token or ""))
     if not match:
+        return []
+    if not LEGAL_CITE_REF_TOKEN_PATTERN.fullmatch(str(citation_token or "").strip()):
         return []
     return list(dict.fromkeys(re.findall(r"\bR\d{3,}\b", match.group(1))))
 
@@ -322,4 +327,67 @@ def validate_citation_refs(
         "resolved": [ref_id for ref_id in ref_ids if ref_id in active_ids],
         "unresolved": unresolved,
         "tombstoned": tombstoned,
+    }
+
+
+def validate_raw_citation_text(catalog: Mapping[str, Any], text: str) -> Dict[str, Any]:
+    """Validate raw Stage 2 text before it becomes canonical review_draft_v2."""
+
+    raw_text = str(text or "")
+    active_ids = {
+        str(entry.get("ref_id") or "")
+        for entry in catalog.get("entries", [])
+        if isinstance(entry, Mapping) and entry.get("status") == ACTIVE_STATUS
+    }
+    legal_tokens = LEGAL_CITE_REF_TOKEN_PATTERN.findall(raw_text)
+    illegal_tokens = [
+        match.group(0)
+        for match in re.finditer(r"\[\[cite(?:_ref)?:[^\]]+\]\]", raw_text)
+        if not LEGAL_CITE_REF_TOKEN_PATTERN.fullmatch(match.group(0))
+    ]
+    resolved: List[str] = []
+    unresolved: List[str] = []
+    for token in legal_tokens:
+        for ref_id in extract_ref_ids_from_token(token):
+            if ref_id in active_ids:
+                resolved.append(ref_id)
+            else:
+                unresolved.append(ref_id)
+
+    text_without_legal_tokens = LEGAL_CITE_REF_TOKEN_PATTERN.sub("", raw_text)
+    bare_catalog_refs: List[str] = []
+    for ref_id in sorted(active_ids):
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(ref_id)}(?![A-Za-z0-9_])", text_without_legal_tokens):
+            bare_catalog_refs.append(ref_id)
+
+    raw_apa_citations = [
+        match.group(0)
+        for match in re.finditer(
+            r"\((?:[A-Z][A-Za-z'’.-]+(?:\s+[A-Z]\.?)?(?:\s+(?:&|and)\s+[A-Z][A-Za-z'’.-]+(?:\s+[A-Z]\.?)?)?|[A-Z][A-Za-z'’.-]+\s+et\s+al\.)"
+            r",?\s+(?:19|20)\d{2}[a-z]?(?:[;,]\s*(?:[A-Z][A-Za-z'’.-]+|[A-Z][A-Za-z'’.-]+\s+et\s+al\.),?\s+(?:19|20)\d{2}[a-z]?)*\)",
+            text_without_legal_tokens,
+        )
+    ]
+
+    errors: List[str] = []
+    if not legal_tokens:
+        errors.append("INITIAL_NO_CITATION_TOKEN")
+    if illegal_tokens:
+        errors.append("ILLEGAL_CITATION_TOKEN")
+    if unresolved:
+        errors.append("UNKNOWN_CITATION_REF_ID")
+    if bare_catalog_refs:
+        errors.append("BARE_CATALOG_REF_ID")
+    if raw_apa_citations:
+        errors.append("RAW_APA_CITATION")
+
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "legal_tokens": legal_tokens,
+        "resolved": list(dict.fromkeys(resolved)),
+        "unresolved": list(dict.fromkeys(unresolved)),
+        "illegal_tokens": list(dict.fromkeys(illegal_tokens)),
+        "bare_catalog_refs": list(dict.fromkeys(bare_catalog_refs)),
+        "raw_apa_citations": list(dict.fromkeys(raw_apa_citations)),
     }

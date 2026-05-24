@@ -3,7 +3,13 @@
 
 import pytest
 
-from docx_writer import generate_apa_references_from_manifest, rebuild_review_docx_from_structured_artifacts
+from docx_writer import (
+    append_section_to_word_document,
+    generate_apa_references_from_manifest,
+    rebuild_final_docx_from_manifest,
+    rebuild_review_docx_from_structured_artifacts,
+    scan_docx_for_unresolved_citation_tokens,
+)
 
 
 class MockGenerator:
@@ -11,17 +17,19 @@ class MockGenerator:
     def __init__(self, summaries=None):
         self.summaries = summaries or []
         self.config = {}
+        self.log_messages = []
         
         # 模拟 logger
+        log_messages = self.log_messages
         class MockLogger:
             def info(self, msg):
-                pass
+                log_messages.append(("info", msg))
             def warning(self, msg):
-                pass
+                log_messages.append(("warning", msg))
             def error(self, msg):
-                pass
+                log_messages.append(("error", msg))
             def success(self, msg):
-                pass
+                log_messages.append(("success", msg))
         
         self.logger = MockLogger()
 
@@ -150,7 +158,7 @@ def test_rendered_docx_uses_manifest_ref_id_and_exact_bibliography(tmp_path):
 
     text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
     assert "(Smith, 2024)" in text
-    assert "Alice Smith (2024). Structured Paper." in text
+    assert "Alice Smith (2024). Structured Paper" in text
     assert "Uncited Paper" not in text
 
 
@@ -219,6 +227,84 @@ def test_rendered_docx_resolves_combined_cite_ref_token(tmp_path):
     text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
     assert "[[cite_ref:" not in text
     assert "(Smith, 2024; Jones, 2025)" in text
+
+
+def test_final_docx_rebuild_scan_and_manifest_only_references(tmp_path):
+    generator = MockGenerator()
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Intro",
+                    "blocks": [{"text": "Claim one [[cite_ref:R001]]. Claim two [[cite_ref:R001, R002]]."}],
+                },
+                {
+                    "section_number": 2,
+                    "section_title": "Second",
+                    "blocks": [{"text": "Claim three [[cite_ref:R002]]."}],
+                },
+            ]
+        }
+    }
+    manifest = {
+        "paper_entries": [
+            {"paper_id": "paper_1", "paper_key": "paper_1", "title": "Paper One", "authors": ["Alice Smith"], "year": "2024"},
+            {"paper_id": "paper_2", "paper_key": "paper_2", "title": "Paper Two", "authors": ["Bob Jones"], "year": "2025"},
+            {"paper_id": "paper_3", "paper_key": "paper_3", "title": "Never Cited", "authors": ["Casey Roe"], "year": "2026"},
+        ],
+        "occurrences": [
+            {"ref_id": "R001", "paper_id": "paper_1", "paper_key": "paper_1"},
+            {"ref_id": "R002", "paper_id": "paper_2", "paper_key": "paper_2"},
+        ],
+        "clusters": [
+            {"paper_id": "paper_1", "paper_key": "paper_1"},
+            {"paper_id": "paper_2", "paper_key": "paper_2"},
+        ],
+        "bibliography": [
+            {"paper_id": "paper_1", "paper_key": "paper_1", "citation_text": "Alice Smith (2024). Paper One.", "is_cited": True},
+            {"paper_id": "paper_2", "paper_key": "paper_2", "citation_text": "Bob Jones (2025). Paper Two.", "is_cited": True},
+            {"paper_id": "paper_3", "paper_key": "paper_3", "citation_text": "Casey Roe (2026). Never Cited.", "is_cited": False},
+        ],
+    }
+    output = tmp_path / "final.docx"
+    scan_path = tmp_path / "scan.json"
+
+    scan = rebuild_final_docx_from_manifest(generator, review_draft, manifest, str(output), scan_report_path=str(scan_path))
+
+    assert scan["passed"] is True
+    assert scan_path.exists()
+    rescanned = scan_docx_for_unresolved_citation_tokens(str(output), manifest)
+    assert rescanned["unresolved_tokens"] == []
+    assert rescanned["bare_ref_ids"] == []
+
+    from docx import Document
+
+    text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
+    assert "[[cite_ref:" not in text
+    assert "[[cite:" not in text
+    assert "Paper One" in text
+    assert "Paper Two" in text
+    assert "Never Cited" not in text
+
+
+def test_recoverable_docx_logs_raw_tokens_as_info(tmp_path):
+    generator = MockGenerator()
+    output = tmp_path / "recoverable.docx"
+
+    appended = append_section_to_word_document(
+        generator,
+        1,
+        "Recoverable",
+        "Draft claim [[cite_ref:R001]].",
+        str(output),
+        citation_manifest={"paper_entries": [], "occurrences": []},
+        allow_compat_fallback=True,
+    )
+
+    assert appended is True
+    assert any(level == "info" and "DRAFT_DOCX_RAW_TOKEN_PRESENT" in message for level, message in generator.log_messages)
+    assert not any(level == "warning" and "citation token" in message for level, message in generator.log_messages)
 
 
 def test_manifest_not_available_fallback():

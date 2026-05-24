@@ -204,6 +204,8 @@ max_retry_delay = 120
 [Preprocess]
 # 启用 PDF 预处理
 enabled = true
+# auto / formal_precision / mineru_first / mineru_only / local_first
+strategy_policy = auto
 # 预处理缓存目录
 cache_dir = ./output/_preprocess_cache
 # hybrid / remote / local
@@ -229,6 +231,16 @@ retain_diagnostics = true
 # 本地 RAG（可选）
 enable_local_rag = false
 rag_backend = chroma
+
+[Stage1_Input]
+send_extracted_text = true
+send_selected_visuals = true
+send_original_pdf = never
+pdf_required_for_formal_precision = false
+max_pdf_file_mb = 50
+formal_precision_text_only_policy = rich_mineru_evidence
+force_pdf_file_input_for_provider = false
+pdf_verifier_api = disabled
 
 [Styling]
 # [可选] 文档样式配置

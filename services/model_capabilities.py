@@ -17,6 +17,7 @@ class ModelCapability:
     endpoint_type: EndpointType = "chat_completions"
     provider_family: ProviderFamily = "generic"
     supports_reasoning: bool = False
+    supports_pdf_file_input: bool = False
     reasoning_param_style: ReasoningParamStyle = "none"
     highest_reasoning_effort: str = ""
     max_token_param: str = "max_tokens"
@@ -68,12 +69,15 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
     provider_family = _infer_provider_family(api_config)
     endpoint_type = _normalize_endpoint(api_config.get("endpoint_type"))
     model = _lower(api_config.get("model"))
+    explicit_pdf_input = _truthy(api_config.get("supports_pdf_file_input")) or _truthy(api_config.get("pdf_file_input"))
+    official_openai_host = "api.openai.com" in _lower(api_config.get("api_base"))
 
     if provider_family == "aihubmix_openai" and endpoint_type == "responses":
         return ModelCapability(
             endpoint_type="responses",
             provider_family=provider_family,
             supports_reasoning=True,
+            supports_pdf_file_input=explicit_pdf_input,
             reasoning_param_style="responses_reasoning",
             highest_reasoning_effort="high",
             max_token_param="max_output_tokens",
@@ -86,6 +90,7 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
             endpoint_type="chat_completions",
             provider_family=provider_family,
             supports_reasoning=True,
+            supports_pdf_file_input=explicit_pdf_input,
             reasoning_param_style="chat_reasoning",
             highest_reasoning_effort="xhigh",
             max_token_param="max_tokens",
@@ -97,13 +102,18 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
             endpoint_type="chat_completions",
             provider_family=provider_family,
             supports_reasoning=True,
+            supports_pdf_file_input=False,
             reasoning_param_style="deepseek_thinking",
             highest_reasoning_effort="max",
             max_token_param="max_tokens",
             disallowed_when_reasoning={"temperature", "top_p", "presence_penalty", "frequency_penalty"},
         )
 
-    return ModelCapability(endpoint_type=endpoint_type, provider_family=provider_family)
+    return ModelCapability(
+        endpoint_type=endpoint_type,
+        provider_family=provider_family,
+        supports_pdf_file_input=bool(explicit_pdf_input and endpoint_type == "responses" and official_openai_host),
+    )
 
 
 def _configured_reasoning_effort(api_config: APIConfig, capability: ModelCapability) -> str:
