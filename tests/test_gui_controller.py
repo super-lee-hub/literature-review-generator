@@ -47,9 +47,11 @@ class _FakeElement:
 
     def props(self, *args, **kwargs) -> None:
         self.props_calls.append((args, kwargs))
+        return self
 
     def classes(self, *args, **kwargs) -> None:
         self.class_calls.append((args, kwargs))
+        return self
 
 
 class _FakeClient:
@@ -83,6 +85,65 @@ class _FakeBackgroundTask:
 
     def done(self) -> bool:
         return self._done
+
+
+class _FakeUiContext(_FakeElement):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _FakeSelect(_FakeElement):
+    def __init__(self, options, *, value=None, label=None, **_kwargs) -> None:
+        super().__init__()
+        self.options = options
+        self.value = value
+        self.label = label
+        self.bound: tuple[dict, str] | None = None
+        if not self._value_in_options(value, options):
+            raise ValueError(f"Invalid value: {value}")
+
+    @staticmethod
+    def _value_in_options(value, options) -> bool:
+        if isinstance(options, dict):
+            return value in options
+        return value in list(options)
+
+    def bind_value(self, target: dict, key: str):
+        self.bound = (target, key)
+        target[key] = self.value
+        return self
+
+    def on(self, *_args, **_kwargs):
+        return self
+
+
+class _FakeNiceGuiUi:
+    def __init__(self) -> None:
+        self.selects: list[_FakeSelect] = []
+
+    def card(self):
+        return _FakeUiContext()
+
+    def grid(self, **_kwargs):
+        return _FakeUiContext()
+
+    def element(self, *_args, **_kwargs):
+        return _FakeUiContext()
+
+    def label(self, *_args, **_kwargs):
+        return _FakeElement()
+
+    def switch(self, *_args, value=False, **_kwargs):
+        element = _FakeSelect([True, False], value=value)
+        return element
+
+    def select(self, options, *, value=None, label=None, **kwargs):
+        element = _FakeSelect(options, value=value, label=label, **kwargs)
+        self.selects.append(element)
+        return element
 
 
 @pytest.fixture()
@@ -436,6 +497,22 @@ def test_run_workflow_enqueues_while_processor_running_without_block(gui_app_mod
     assert any("排队位置：2" in message for message in notifications)
 
 
+def test_persist_config_keeps_active_queue_service(gui_app_module, monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text((REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"), encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    original_service = controller._queue_service
+    controller.queue_processor_running = True
+
+    controller.persist_config(notify_user=False)
+
+    assert controller._queue_service is original_service
+
+
 def test_clear_completed_jobs_keeps_failed_and_cancelled(gui_app_module, tmp_path) -> None:
     service = gui_app_module.PersistentQueueService(tmp_path / "queue.json")
     states = {
@@ -455,6 +532,109 @@ def test_clear_completed_jobs_keeps_failed_and_cancelled(gui_app_module, tmp_pat
     assert service.get_job("done") is None
     assert service.get_job("failed") is not None
     assert service.get_job("cancelled") is not None
+
+
+def test_processing_mineru_card_accepts_none_fallback_only(gui_app_module, monkeypatch) -> None:
+    fake_ui = _FakeNiceGuiUi()
+    monkeypatch.setattr(gui_app_module, "ui", fake_ui)
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["preprocess"]["parser_mode"] = "remote"
+    controller.state["preprocess"]["primary_parser"] = "mineru_remote"
+    controller.state["preprocess"]["fallback_parser"] = "none"
+
+    gui_app_module._render_processing_mineru_card(controller)
+
+    assert len(fake_ui.selects) >= 3
+    parser_mode_select, primary_select, fallback_select = fake_ui.selects[:3]
+    assert parser_mode_select.value == "remote"
+    assert primary_select.value == "mineru_remote"
+    assert fallback_select.value == "none"
+    assert "none" not in primary_select.options
+    assert "none" in fallback_select.options
+
+
+def test_processing_mineru_card_normalizes_parser_drift_without_rewriting_config(gui_app_module, monkeypatch) -> None:
+    fake_ui = _FakeNiceGuiUi()
+    monkeypatch.setattr(gui_app_module, "ui", fake_ui)
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["preprocess"]["parser_mode"] = "remote"
+    controller.state["preprocess"]["primary_parser"] = "none"
+    controller.state["preprocess"]["fallback_parser"] = "unknown_value"
+
+    gui_app_module._render_processing_mineru_card(controller)
+
+    _parser_mode_select, primary_select, fallback_select = fake_ui.selects[:3]
+    assert primary_select.value == "mineru_remote"
+    assert fallback_select.value == "none"
+    assert controller.state["preprocess"]["primary_parser"] == "mineru_remote"
+    assert controller.state["preprocess"]["fallback_parser"] == "none"
+
+
+def test_processing_mineru_card_local_primary_drift_falls_back_to_local(gui_app_module, monkeypatch) -> None:
+    fake_ui = _FakeNiceGuiUi()
+    monkeypatch.setattr(gui_app_module, "ui", fake_ui)
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["preprocess"]["parser_mode"] = "local"
+    controller.state["preprocess"]["primary_parser"] = "none"
+    controller.state["preprocess"]["fallback_parser"] = "local"
+
+    gui_app_module._render_processing_mineru_card(controller)
+
+    _parser_mode_select, primary_select, fallback_select = fake_ui.selects[:3]
+    assert primary_select.value == "local"
+    assert fallback_select.value == "local"
+
+
+def test_processing_mineru_card_unknown_mode_primary_drift_falls_back_to_local(gui_app_module, monkeypatch) -> None:
+    fake_ui = _FakeNiceGuiUi()
+    monkeypatch.setattr(gui_app_module, "ui", fake_ui)
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["preprocess"]["parser_mode"] = "unknown_mode"
+    controller.state["preprocess"]["primary_parser"] = "none"
+    controller.state["preprocess"]["fallback_parser"] = ""
+
+    gui_app_module._render_processing_mineru_card(controller)
+
+    parser_mode_select, primary_select, fallback_select = fake_ui.selects[:3]
+    assert parser_mode_select.value == "local"
+    assert primary_select.value == "local"
+    assert fallback_select.value == "none"
+
+
+def test_processing_mineru_card_remote_first_primary_drift_falls_back_to_mineru(gui_app_module, monkeypatch) -> None:
+    fake_ui = _FakeNiceGuiUi()
+    monkeypatch.setattr(gui_app_module, "ui", fake_ui)
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["preprocess"]["parser_mode"] = "remote_first"
+    controller.state["preprocess"]["primary_parser"] = "none"
+    controller.state["preprocess"]["fallback_parser"] = "none"
+
+    gui_app_module._render_processing_mineru_card(controller)
+
+    _parser_mode_select, primary_select, fallback_select = fake_ui.selects[:3]
+    assert primary_select.value == "mineru_remote"
+    assert fallback_select.value == "none"
+
+
+def test_processing_mineru_card_render_does_not_rewrite_config_file(gui_app_module, monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text((REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"), encoding="utf-8")
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    parser["Preprocess"]["parser_mode"] = "remote"
+    parser["Preprocess"]["primary_parser"] = "none"
+    parser["Preprocess"]["fallback_parser"] = "unknown_value"
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    before = config_path.read_text(encoding="utf-8")
+
+    fake_ui = _FakeNiceGuiUi()
+    monkeypatch.setattr(gui_app_module, "ui", fake_ui)
+    controller = gui_app_module.WorkspaceController(str(config_path))
+
+    gui_app_module._render_processing_mineru_card(controller)
+
+    assert config_path.read_text(encoding="utf-8") == before
 
 
 def test_persist_config_writes_and_applies_mineru_settings(gui_app_module, monkeypatch, tmp_path) -> None:
@@ -493,3 +673,22 @@ def test_persist_config_writes_and_applies_mineru_settings(gui_app_module, monke
 
     assert controller.env_values["MINERU_API_TOKEN"] == "token-123"
     assert os.environ["MINERU_API_TOKEN"] == "token-123"
+
+
+def test_persist_config_writes_none_fallback(gui_app_module, monkeypatch, tmp_path) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text((REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"), encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    controller.state["preprocess"]["parser_mode"] = "remote"
+    controller.state["preprocess"]["primary_parser"] = "mineru_remote"
+    controller.state["preprocess"]["fallback_parser"] = "none"
+
+    controller.persist_config(notify_user=False)
+
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    assert parser["Preprocess"]["fallback_parser"] == "none"

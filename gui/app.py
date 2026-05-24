@@ -106,6 +106,12 @@ SEARCH_ITEMS = [
 
 DEFAULT_MINERU_BASE_URL = "https://mineru.net/api/v4"
 
+
+def safe_select_value(value: Any, options: Dict[str, Any], default: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in options else default
+
+
 STYLE_BLOCK = """
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
@@ -1222,6 +1228,21 @@ class WorkspaceController:
         except Exception:
             self._queue_service = None
 
+    def _queue_file_path(self) -> Path:
+        return Path(self.state["paths"]["output_path"]) / "_queue" / "queue.json"
+
+    def _queue_processor_is_active(self) -> bool:
+        if self.queue_processor_running:
+            return True
+        if self._queue_processor_task is not None and not self._queue_processor_task.done():
+            return True
+        if self._queue_runner is not None:
+            try:
+                return bool(self._queue_runner.is_running())
+            except Exception:
+                return True
+        return False
+
     def refresh_queue(self, *, notify_user: bool = True) -> None:
         """刷新队列状态"""
         if self._queue_service is None:
@@ -2194,7 +2215,10 @@ class WorkspaceController:
         )
         self.sections = ensure_config_sections(updated_sections)
         self._sync_env_values_from_disk()
-        self._init_queue_service()
+        current_queue_path = Path(getattr(self._queue_service, "queue_file_path", "")) if self._queue_service else None
+        next_queue_path = self._queue_file_path()
+        if self._queue_service is None or (current_queue_path != next_queue_path and not self._queue_processor_is_active()):
+            self._init_queue_service()
         self.set_status(self.tf("配置已保存到 {config_path} 和 {env_path}", config_path=self.config_path, env_path=self.env_path))
         if notify_user:
             self.notify(self.t("配置已保存。"), color="positive")
@@ -3101,27 +3125,35 @@ def _render_processing_mineru_card(controller: WorkspaceController) -> None:
         "remote_first": t("remote_first · 先尝试 MinerU"),
         "remote": t("remote · 只走 MinerU"),
     }
-    parser_options = {
+    primary_parser_options = {
         "local": t("local · 本地解析链"),
         "mineru_remote": t("mineru_remote · MinerU 远程"),
     }
+    fallback_parser_options = {
+        "none": t("none · 不使用回退解析器"),
+        **primary_parser_options,
+    }
+    parser_mode_value = safe_select_value(preprocess["parser_mode"], parser_mode_options, "local")
+    primary_default = "mineru_remote" if parser_mode_value in {"hybrid", "remote_first", "remote"} else "local"
+    primary_parser_value = safe_select_value(preprocess["primary_parser"], primary_parser_options, primary_default)
+    fallback_parser_value = safe_select_value(preprocess["fallback_parser"], fallback_parser_options, "none")
     with ui.card().classes("ag-card ag-card-strong p-6"):
         ui.label(t("解析策略与 MinerU")).classes("ag-section-title")
         ui.label(t("MinerU 会不会真正用上，取决于这里的 parser mode、主解析器和回退策略，而不只是有没有填 token。")).classes("ag-subtle")
         with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
             parser_mode_select = ui.select(
                 parser_mode_options,
-                value=preprocess["parser_mode"],
+                value=parser_mode_value,
                 label=t("Parser mode"),
             ).bind_value(preprocess, "parser_mode")
             primary_parser_select = ui.select(
-                parser_options,
-                value=preprocess["primary_parser"],
+                primary_parser_options,
+                value=primary_parser_value,
                 label=t("主解析器"),
             ).bind_value(preprocess, "primary_parser")
             fallback_parser_select = ui.select(
-                parser_options,
-                value=preprocess["fallback_parser"],
+                fallback_parser_options,
+                value=fallback_parser_value,
                 label=t("回退解析器"),
             ).bind_value(preprocess, "fallback_parser")
             fallback_switch = ui.switch(
