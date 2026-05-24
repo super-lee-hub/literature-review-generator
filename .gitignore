@@ -133,6 +133,9 @@ config.ini
 config.ini.backup_before_*
 config.local.ini
 config.*.local.ini
+tmp_*.config.ini
+tmp_*.ini
+*_e2e.config.ini
 output/
 logs/
 *.log
