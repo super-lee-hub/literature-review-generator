@@ -12,6 +12,7 @@ import time
 import zipfile
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urljoin, urlparse
 
 import fitz  # type: ignore
 import requests  # type: ignore
@@ -142,6 +143,11 @@ class PreprocessManager:
         self.mineru_poll_timeout_seconds = _as_float(os.getenv("MINERU_POLL_TIMEOUT_SECONDS", "900"), 900.0)
         self.mineru_request_max_retries = _as_int(os.getenv("MINERU_REQUEST_MAX_RETRIES", "2"), 2)
         self.mineru_retry_backoff_seconds = _as_float(os.getenv("MINERU_RETRY_BACKOFF_SECONDS", "1.5"), 1.5)
+        self.mineru_allowed_url_hosts = {
+            item.strip().lower()
+            for item in str(os.getenv("MINERU_ALLOWED_URL_HOSTS", "")).split(",")
+            if item.strip()
+        }
         self.allow_local_parse_fallback = _as_bool(os.getenv("ALLOW_LOCAL_PARSE_FALLBACK", "true"), default=True)
 
     def prepare_pdf(self, pdf_path: str) -> Optional[PreprocessResult]:
@@ -594,7 +600,12 @@ class PreprocessManager:
             pdf_bytes = handle.read()
 
         for target in upload_targets:
-            response = requests.put(target, data=pdf_bytes, timeout=120)
+            response = requests.put(
+                self._validate_mineru_url(target, purpose="upload URL"),
+                data=pdf_bytes,
+                timeout=120,
+                allow_redirects=False,
+            )
             response.raise_for_status()
 
         poll_payload = self._poll_mineru_result(batch_id=batch_id, seed_payload=upload_response)
@@ -617,14 +628,16 @@ class PreprocessManager:
         return normalized
 
     def _request_json(self, method: str, url: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        safe_url = self._validate_mineru_url(url, purpose="JSON request URL", require_mineru_origin=True)
         last_exception: Optional[Exception] = None
         for attempt in range(self.mineru_request_max_retries + 1):
             try:
                 response = requests.request(
                     method=method.upper(),
-                    url=url,
+                    url=safe_url,
                     headers=self._mineru_headers(),
                     timeout=60,
+                    allow_redirects=False,
                     **kwargs,
                 )
                 response.raise_for_status()
@@ -639,6 +652,7 @@ class PreprocessManager:
         return None
 
     def _request_binary(self, url: str) -> bytes:
+        safe_url = self._validate_mineru_url(url, purpose="binary artifact URL")
         last_exception: Optional[Exception] = None
         session = requests.Session()
         # MinerU result assets are served from a CDN. In some Windows/proxy
@@ -649,7 +663,8 @@ class PreprocessManager:
         try:
             for attempt in range(self.mineru_request_max_retries + 1):
                 try:
-                    response = session.get(url, headers=self._mineru_headers(), timeout=120)
+                    headers = self._mineru_headers() if self._is_mineru_origin_url(safe_url) else {}
+                    response = session.get(safe_url, headers=headers, timeout=120, allow_redirects=False)
                     response.raise_for_status()
                     return response.content
                 except Exception as exc:  # pragma: no cover - transport path.
@@ -1193,9 +1208,41 @@ class PreprocessManager:
         return True
 
     def _join_base_url(self, value: str) -> str:
-        if value.startswith("http://") or value.startswith("https://"):
-            return value
-        return f"{self.mineru_base_url}/{value.lstrip('/')}"
+        stripped = value.strip()
+        if stripped.startswith("http://") or stripped.startswith("https://"):
+            return stripped
+        return urljoin(f"{self.mineru_base_url}/", stripped.lstrip("/"))
+
+    def _validate_mineru_url(
+        self,
+        value: str,
+        *,
+        purpose: str,
+        require_mineru_origin: bool = False,
+    ) -> str:
+        url = self._join_base_url(value)
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError(f"MinerU {purpose} must be an absolute HTTP(S) URL.")
+        if require_mineru_origin:
+            if not self._is_mineru_origin_url(url):
+                raise RuntimeError(f"MinerU {purpose} must use the configured MinerU service origin.")
+            return url
+        if not (self._is_mineru_origin_url(url) or self._is_allowed_mineru_host(url)):
+            raise RuntimeError(
+                f"MinerU {purpose} host is not trusted. Set MINERU_ALLOWED_URL_HOSTS to allow expected storage hosts."
+            )
+        return url
+
+    def _is_mineru_origin_url(self, value: str) -> bool:
+        parsed = urlparse(value)
+        base = urlparse(self.mineru_base_url)
+        return parsed.scheme == base.scheme and parsed.netloc.lower() == base.netloc.lower()
+
+    def _is_allowed_mineru_host(self, value: str) -> bool:
+        parsed = urlparse(value)
+        hostname = (parsed.hostname or "").lower()
+        return bool(parsed.scheme == "https" and hostname and hostname in self.mineru_allowed_url_hosts)
 
     def _mineru_headers(self) -> Dict[str, str]:
         return {

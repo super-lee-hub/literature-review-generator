@@ -4,6 +4,7 @@ import zipfile
 from pathlib import Path
 
 import fitz  # type: ignore
+import pytest
 
 from preprocess.service import PageDiagnostics, PreprocessManager
 
@@ -404,7 +405,9 @@ def test_mineru_normalizer_does_not_treat_baseline_as_success_when_zip_download_
 def test_mineru_binary_download_bypasses_environment_proxy(monkeypatch) -> None:
     manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
     manager.mineru_api_token = "token"
+    manager.mineru_allowed_url_hosts = {"cdn.example"}
     sessions: list[object] = []
+    observed_kwargs: list[dict] = []
 
     class FakeResponse:
         content = b"zip-bytes"
@@ -420,6 +423,7 @@ def test_mineru_binary_download_bypasses_environment_proxy(monkeypatch) -> None:
 
         def get(self, _url: str, **_kwargs):
             assert self.trust_env is False
+            observed_kwargs.append(_kwargs)
             return FakeResponse()
 
         def close(self) -> None:
@@ -429,6 +433,62 @@ def test_mineru_binary_download_bypasses_environment_proxy(monkeypatch) -> None:
 
     assert manager._request_binary("https://cdn.example/result.zip") == b"zip-bytes"
     assert sessions and getattr(sessions[0], "closed") is True
+    assert observed_kwargs[0]["headers"] == {}
+    assert observed_kwargs[0]["allow_redirects"] is False
+
+
+def test_mineru_json_request_rejects_cross_origin_urls(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_base_url = "https://mineru.example/api/v4"
+    manager.mineru_api_token = "token"
+
+    def fail_request(*_args, **_kwargs):
+        raise AssertionError("cross-origin request should not be sent")
+
+    monkeypatch.setattr("preprocess.service.requests.request", fail_request)
+
+    with pytest.raises(RuntimeError, match="configured MinerU service origin"):
+        manager._request_json("get", "https://attacker.example/status")
+
+
+def test_mineru_binary_request_rejects_untrusted_hosts(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_base_url = "https://mineru.example/api/v4"
+
+    def fail_session():
+        raise AssertionError("untrusted binary request should not create a session")
+
+    monkeypatch.setattr("preprocess.service.requests.Session", fail_session)
+
+    with pytest.raises(RuntimeError, match="host is not trusted"):
+        manager._request_binary("https://attacker.example/result.zip")
+
+
+def test_mineru_upload_rejects_untrusted_presigned_url(monkeypatch, tmp_path: Path) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_base_url = "https://mineru.example/api/v4"
+    manager.mineru_api_token = "token"
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF fake")
+
+    monkeypatch.setattr(
+        manager,
+        "_request_json",
+        lambda *_args, **_kwargs: {"batch_id": "batch-1", "upload_urls": ["https://attacker.example/upload"]},
+    )
+
+    def fail_put(*_args, **_kwargs):
+        raise AssertionError("PDF upload should not be sent to an untrusted host")
+
+    monkeypatch.setattr("preprocess.service.requests.put", fail_put)
+
+    with pytest.raises(RuntimeError, match="host is not trusted"):
+        manager._extract_with_mineru_remote(
+            pdf_path=str(pdf_path),
+            baseline_page_diagnostics=[],
+            baseline_page_blocks=[],
+            baseline_page_index=[],
+        )
 
 
 def test_preprocess_manager_skips_docling_when_local_pipeline_is_healthy(monkeypatch) -> None:
