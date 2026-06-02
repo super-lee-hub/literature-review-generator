@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import asdict, dataclass
@@ -47,6 +48,11 @@ _DEFAULT_SELECTION_POLICY: Dict[str, Any] = {
         "figure_crop_max": 6,
         "total_visuals_max": 10,
         "figure_crop_max_per_page": 2,
+    },
+    "rendering_safety": {
+        "max_rendered_pixels": 16000000,
+        "max_rendered_dimension_px": 8000,
+        "max_visual_artifact_bytes": 20971520,
     },
     "selection_signals": [
         "image_rich_pages",
@@ -582,6 +588,58 @@ class Stage1VisualArtifactBuilder:
             digest_source = f"{page_no}:{bbox}"
         return hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:12]
 
+    def _render_pixmap_if_safe(
+        self,
+        *,
+        page: Any,
+        matrix: Any,
+        image_path: str,
+        policy: Mapping[str, Any],
+        clip: Optional[Any] = None,
+    ) -> bool:
+        safety = policy.get("rendering_safety", {}) if isinstance(policy, Mapping) else {}
+        max_pixels = int(safety.get("max_rendered_pixels", 16_000_000) or 16_000_000)
+        max_dimension = int(safety.get("max_rendered_dimension_px", 8_000) or 8_000)
+        max_bytes = int(safety.get("max_visual_artifact_bytes", 20 * 1024 * 1024) or (20 * 1024 * 1024))
+
+        rect = fitz.Rect(clip) if clip is not None else fitz.Rect(page.rect)
+        page_rect = fitz.Rect(page.rect)
+        rect.x0 = max(rect.x0, page_rect.x0)
+        rect.y0 = max(rect.y0, page_rect.y0)
+        rect.x1 = min(rect.x1, page_rect.x1)
+        rect.y1 = min(rect.y1, page_rect.y1)
+        if rect.is_empty or rect.width <= 0 or rect.height <= 0:
+            return False
+
+        rendered_width = int(math.ceil(float(rect.width) * abs(float(matrix.a))))
+        rendered_height = int(math.ceil(float(rect.height) * abs(float(matrix.d))))
+        rendered_pixels = rendered_width * rendered_height
+        if (
+            rendered_width <= 0
+            or rendered_height <= 0
+            or rendered_width > max_dimension
+            or rendered_height > max_dimension
+            or rendered_pixels > max_pixels
+        ):
+            if self.logger:
+                self.logger.warning(
+                    "Skipping visual artifact render that exceeds safety bounds: "
+                    f"{rendered_width}x{rendered_height} pixels"
+                )
+            return False
+
+        pixmap = page.get_pixmap(matrix=matrix, clip=rect if clip is not None else None, alpha=False)
+        pixmap.save(image_path)
+        try:
+            if os.path.getsize(image_path) > max_bytes:
+                os.remove(image_path)
+                if self.logger:
+                    self.logger.warning(f"Skipping oversized visual artifact image: {image_path}")
+                return False
+        except OSError:
+            return False
+        return True
+
     def _materialize_visuals(
         self,
         *,
@@ -610,7 +668,13 @@ class Stage1VisualArtifactBuilder:
                 page = doc.load_page(page_no - 1)
                 bbox = [0.0, 0.0, round(float(page.rect.width), 2), round(float(page.rect.height), 2)]
                 image_path = os.path.join(bundle_dir, f"page_snapshot_p{page_no:03d}.png")
-                page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False).save(image_path)
+                if not self._render_pixmap_if_safe(
+                    page=page,
+                    matrix=fitz.Matrix(1.4, 1.4),
+                    image_path=image_path,
+                    policy=policy,
+                ):
+                    continue
                 artifact_id = f"page_snapshot:{artifact_hash}:p{page_no:03d}"
                 visuals.append(
                     VisualArtifactRecord(
@@ -638,7 +702,14 @@ class Stage1VisualArtifactBuilder:
                     continue
                 page = doc.load_page(page_no - 1)
                 image_path = os.path.join(bundle_dir, f"figure_crop_p{page_no:03d}_{index:02d}.png")
-                page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8), clip=fitz.Rect(bbox), alpha=False).save(image_path)
+                if not self._render_pixmap_if_safe(
+                    page=page,
+                    matrix=fitz.Matrix(1.8, 1.8),
+                    clip=fitz.Rect(bbox),
+                    image_path=image_path,
+                    policy=policy,
+                ):
+                    continue
                 artifact_id = f"figure_crop:{artifact_hash}:p{page_no:03d}:c{index:02d}"
                 visuals.append(
                     VisualArtifactRecord(

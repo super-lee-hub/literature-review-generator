@@ -257,6 +257,57 @@ def test_visual_bundle_writes_manifest_and_registers_artifacts(tmp_path: Path) -
     assert "table_crop" not in artifact_types
 
 
+def test_visual_bundle_skips_oversized_page_render(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "huge-page.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=10000, height=10000)
+    page.insert_text((72, 72), "Figure 1. Oversized page should not be rendered.")
+    doc.save(str(pdf_path))
+    doc.close()
+
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo", job_id="job-huge-visual")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+
+    bundle = Stage1VisualArtifactBuilder(logger=_DummyLogger()).build_bundle(
+        job_id=workspace.job_id,
+        paper_key="huge-paper",
+        paper_info={"title": "Huge Paper"},
+        source_pdf=str(pdf_path),
+        output_dir=workspace.artifact_path("stage1_visuals/huge"),
+        artifact_registry=registry,
+    )
+
+    assert bundle is not None
+    assert bundle.selected_visual_refs == []
+    assert not list(Path(bundle.visual_manifest_path).parent.glob("*.png"))
+
+
+def test_call_ai_api_skips_oversized_local_image_path_content(tmp_path: Path) -> None:
+    image_path = tmp_path / "too-large.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + (b"0" * (20 * 1024 * 1024 + 1)))
+
+    mock_response = Mock()
+    mock_response.json.return_value = {
+        "choices": [{"message": {"content": '{"summary": "ok"}'}}],
+    }
+    mock_response.raise_for_status.return_value = None
+
+    with patch("ai_interface.requests.post", return_value=mock_response) as mock_post:
+        result = _call_ai_api(
+            "fallback prompt",
+            {"api_key": "key", "model": "gpt-4o", "api_base": "https://api.openai.com/v1"},
+            "system",
+            user_content=[
+                {"type": "text", "text": "hello"},
+                {"type": "local_image_path", "path": str(image_path)},
+            ],
+        )
+
+    assert result == {"summary": "ok"}
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["messages"][1]["content"] == [{"type": "text", "text": "hello"}]
+
+
 def test_stage1_input_builder_returns_multimodal_payload_when_supported(tmp_path: Path) -> None:
     built = Stage1InputBuilder().build(
         prompt_template="Analyze carefully:\n{{PAPER_FULL_TEXT}}",
