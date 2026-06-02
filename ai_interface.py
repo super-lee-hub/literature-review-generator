@@ -2,6 +2,7 @@ import base64
 import copy
 import json
 import mimetypes
+import os
 import time
 import threading
 import re
@@ -26,6 +27,7 @@ from summary_schema import (
 
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
+_MAX_LOCAL_IMAGE_INPUT_BYTES = 20 * 1024 * 1024
 _NON_RETRIABLE_HTTP_STATUSES = {400, 401, 402, 403, 404, 422}
 _QUOTA_ERROR_MARKERS = (
     "insufficient_user_quota",
@@ -516,12 +518,19 @@ def _encode_local_image_as_data_url(path: str) -> Optional[str]:
     if not path:
         return None
     try:
+        image_size = os.path.getsize(path)
+    except OSError:
+        return None
+    if image_size <= 0 or image_size > _MAX_LOCAL_IMAGE_INPUT_BYTES:
+        return None
+
+    try:
         with open(path, "rb") as handle:
-            image_bytes = handle.read()
+            image_bytes = handle.read(_MAX_LOCAL_IMAGE_INPUT_BYTES + 1)
     except OSError:
         return None
 
-    if not image_bytes:
+    if not image_bytes or len(image_bytes) > _MAX_LOCAL_IMAGE_INPUT_BYTES:
         return None
 
     mime_type = mimetypes.guess_type(path)[0] or "image/png"
