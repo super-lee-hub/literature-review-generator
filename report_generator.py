@@ -460,6 +460,12 @@ def generate_failure_report(generator_instance: Any) -> bool:  # type: ignore
                 handle.write(f"   期刊: {paper.get('journal', '未知期刊')}\n")
                 handle.write(f"   DOI: {paper.get('doi', '')}\n")
                 handle.write(f"   失败原因: {failed_item.get('failure_reason', '未知原因')}\n")
+                if failed_item.get("pdf_match"):
+                    handle.write(
+                        "   PDF match: "
+                        + json.dumps(failed_item["pdf_match"], ensure_ascii=False, sort_keys=True)
+                        + "\n"
+                    )
                 _write_attempt_history(handle, failed_item.get("attempt_history", []))
                 handle.write("-" * 60 + "\n")
 

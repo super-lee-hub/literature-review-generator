@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from runtime.source_intake import (
     build_direct_source_bundle,
@@ -35,18 +38,41 @@ def test_build_zotero_source_bundle_uses_parser_and_file_matching(monkeypatch, t
     matched_pdf.write_bytes(b"%PDF-1.4\n%matched\n")
 
     monkeypatch.setattr(
-        "runtime.source_intake.parse_zotero_report",
-        lambda _report: [
-            {
-                "title": "A Zotero Paper",
-                "authors": ["Smith, John"],
-                "year": "2024",
-                "attachments": ["matched.pdf"],
-            }
-        ],
+        "runtime.source_intake.parse_zotero_report_result",
+        lambda _report: SimpleNamespace(
+            papers=[
+                {
+                    "title": "A Zotero Paper",
+                    "authors": ["Smith, John"],
+                    "year": "2024",
+                    "attachments": ["matched.pdf"],
+                }
+            ],
+            status="ok",
+            parser_route="standard",
+            parser_version="zotero-parser-v1",
+            report_hash="report-hash",
+            parse_confidence=1.0,
+            stats=SimpleNamespace(to_dict=lambda: {"parsed_entries": 1}),
+            diagnostics=(),
+        ),
     )
     monkeypatch.setattr("runtime.source_intake.create_file_index", lambda _library: object())
-    monkeypatch.setattr("runtime.source_intake.find_pdf", lambda *_args, **_kwargs: str(matched_pdf))
+    monkeypatch.setattr(
+        "runtime.source_intake.resolve_pdf_match",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="matched",
+            selected_path=str(matched_pdf),
+            candidates=(),
+            diagnostics=(),
+            to_dict=lambda: {
+                "status": "matched",
+                "selected_path": str(matched_pdf),
+                "candidates": [],
+                "diagnostics": [],
+            },
+        ),
+    )
 
     bundle = build_zotero_source_bundle(
         project_name="demo-zotero",
@@ -58,6 +84,7 @@ def test_build_zotero_source_bundle_uses_parser_and_file_matching(monkeypatch, t
     assert len(bundle.paper_work_items) == 1
     assert bundle.paper_work_items[0].source_pdf == str(matched_pdf.resolve())
     assert bundle.source_snapshot["zotero_report"] == str(report_path.resolve())
+    assert bundle.source_snapshot["zotero_parse"]["report_hash"] == "report-hash"
 
 
 def test_build_source_bundle_for_request_dispatches_by_source_mode(tmp_path: Path) -> None:
@@ -78,3 +105,86 @@ def test_build_source_bundle_for_request_dispatches_by_source_mode(tmp_path: Pat
     assert bundle.project_name == "demo"
     assert bundle.source_mode == "direct"
     assert bundle.paper_work_items[0].source_pdf == str(pdf_path.resolve())
+
+
+def test_zotero_source_intake_surfaces_ambiguous_pdf_candidates(tmp_path: Path) -> None:
+    library = tmp_path / "storage"
+    unique_pdf = library / "UNIQUE" / "unique.pdf"
+    duplicate_a = library / "AAAA" / "paper.pdf"
+    duplicate_b = library / "BBBB" / "paper.pdf"
+    for path, marker in (
+        (unique_pdf, b"u"),
+        (duplicate_a, b"a"),
+        (duplicate_b, b"b"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"%PDF-1.4\n" + marker * 2048)
+
+    report = tmp_path / "report.txt"
+    report.write_text(
+        "\n".join(
+            [
+                "*",
+                "Unique Paper",
+                "附件\tUNIQUE/unique.pdf",
+                "*",
+                "Ambiguous Paper",
+                "附件\tpaper.pdf",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    bundle = build_zotero_source_bundle(
+        project_name="real-intake",
+        zotero_report=str(report),
+        library_path=str(library),
+    )
+
+    assert [item.paper_info["title"] for item in bundle.paper_work_items] == ["Unique Paper"]
+    assert bundle.paper_work_items[0].source_pdf == str(unique_pdf.resolve())
+    assert bundle.source_snapshot["missing_titles"] == []
+    assert bundle.source_snapshot["ambiguous_matches"][0]["title"] == "Ambiguous Paper"
+    assert [
+        candidate["path"]
+        for candidate in bundle.source_snapshot["ambiguous_matches"][0]["candidates"]
+    ] == [
+        str(duplicate_a.resolve()),
+        str(duplicate_b.resolve()),
+    ]
+    assert bundle.source_snapshot["zotero_parse"]["status"] == "ok"
+
+
+def test_zotero_source_intake_failed_parse_does_not_scan_library(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    report = tmp_path / "report.txt"
+    report.write_text("invalid", encoding="utf-8")
+    library = tmp_path / "storage"
+    library.mkdir()
+    scanned = False
+
+    monkeypatch.setattr(
+        "runtime.source_intake.parse_zotero_report_result",
+        lambda _path: SimpleNamespace(
+            status="failed",
+            diagnostics=(SimpleNamespace(code="unknown_format"),),
+        ),
+    )
+
+    def fail_if_scanned(_path: str):
+        nonlocal scanned
+        scanned = True
+        raise AssertionError("FileIndex must not be built after parse failure")
+
+    monkeypatch.setattr("runtime.source_intake.create_file_index", fail_if_scanned)
+
+    with pytest.raises(ValueError, match="zotero_parse_failed:unknown_format"):
+        build_zotero_source_bundle(
+            project_name="failed-parse",
+            zotero_report=str(report),
+            library_path=str(library),
+        )
+
+    assert scanned is False

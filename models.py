@@ -166,11 +166,13 @@ class ProcessingResult(TypedDict):
     failure_reason: NotRequired[Optional[str]]
     attempt_history: NotRequired[List[Dict[str, Any]]]
     model_used: NotRequired[str]
+    pdf_match: NotRequired[Dict[str, Any]]
 
 
 class FailedPaper(TypedDict):
     paper_info: PaperInfo
     failure_reason: str
+    pdf_match: NotRequired[Dict[str, Any]]
 
 
 class APIConfig(TypedDict):

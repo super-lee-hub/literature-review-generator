@@ -23,7 +23,7 @@ import logging
 import re
 import copy
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, Sequence
+from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, Sequence, cast
 from datetime import datetime
 
 ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
@@ -37,8 +37,8 @@ from models import (
     APIConfig, AISummary
 )
 from config_loader import load_config, ConfigDict
-from zotero_parser import parse_zotero_report
-from file_finder import create_file_index, FileIndex, find_pdf
+from zotero_parser import parse_zotero_report, parse_zotero_report_result
+from file_finder import create_file_index, FileIndex, resolve_pdf_match
 from pdf_extractor import extract_text_from_pdf  # type: ignore
 from ai_interface import (  # type: ignore
     get_summary_from_ai,
@@ -401,6 +401,7 @@ class LiteratureReviewGenerator:
         self.reuse_summary_files: List[str] = []
         self.papers: List[PaperInfo] = []
         self.source_descriptors: List[Dict[str, Any]] = []
+        self.zotero_parse_result: Dict[str, Any] = {}
         self.summaries: SummariesList = []
         self.failed_papers: List[FailedPaper] = []
         self.preprocess_manager: Optional[PreprocessManager] = None
@@ -1808,14 +1809,21 @@ class LiteratureReviewGenerator:
                 paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
                 zotero_report_path: str = paths_config.get('zotero_report', '')
             
-            if not zotero_report_path or not os.path.exists(zotero_report_path):
-                self.logger.error(f"Zotero报告文件不存在: {zotero_report_path}")
+            if not zotero_report_path:
+                self.logger.error("Zotero report path is empty")
                 return False
             
             self.logger.info(f"正在解析Zotero报告: {zotero_report_path}")
             
             # 解析报告
-            self.papers = parse_zotero_report(zotero_report_path)
+            parse_result = parse_zotero_report_result(zotero_report_path)
+            self.papers = parse_result.papers
+            self.zotero_parse_result = parse_result.to_dict()
+            for diagnostic in parse_result.diagnostics:
+                if diagnostic.severity == "error":
+                    self.logger.error(f"Zotero parser [{diagnostic.code}]: {diagnostic.message}")
+                elif diagnostic.severity == "warning":
+                    self.logger.warning(f"Zotero parser [{diagnostic.code}]: {diagnostic.message}")
             
             if not self.papers:
                 self.logger.error("Zotero报告解析失败或报告为空")
@@ -3762,22 +3770,36 @@ class LiteratureReviewGenerator:
                     }
                 
                 # 创建文件索引（如果还没有）
-                if not file_index:
+                if file_index is None:
                     file_index = create_file_index(library_path)
                 
-                # 使用 file_finder.py 中强大的 find_pdf 函数
-                find_result = find_pdf(dict(paper), library_path, file_index)
+                match_result = resolve_pdf_match(dict(paper), library_path, file_index)
+                find_result = match_result.selected_path
                 
                 if find_result:
                     pdf_path = find_result
+                    paper['pdf_path'] = pdf_path
+                    paper['source_pdf'] = pdf_path
+                    refreshed_descriptor = normalize_source_papers("zotero", [paper])[0]
+                    paper.update(
+                        project_descriptors_to_legacy_papers(
+                            [paper],
+                            [refreshed_descriptor],
+                        )[0]
+                    )
                     self.logger.info(f"智能查找到PDF: {os.path.basename(pdf_path)}")
                 else:
-                    failure_reason = "未找到PDF文件"
+                    failure_reason = (
+                        "ambiguous_pdf_match"
+                        if match_result.status == "ambiguous"
+                        else "pdf_not_found"
+                    )
                     self.logger.error(f"未找到PDF文件: {file_title} - 原因: {failure_reason}")
                     return {
                         'paper_info': paper,
                         'status': 'failed',
-                        'failure_reason': failure_reason
+                        'failure_reason': failure_reason,
+                        'pdf_match': match_result.to_dict(),
                     }
             elif not pdf_path and self.mode == "direct":
                 # 直接模式下PDF路径应该已经存在
@@ -4787,6 +4809,7 @@ class LiteratureReviewGenerator:
                     "title": str(paper_info.get('title') or ''),
                     "doi": normalize_doi(paper_info.get('doi')),
                     "failure_reason": str(failed.get('failure_reason') or ''),
+                    "pdf_match": dict(failed.get('pdf_match') or {}),
                 }
             )
 
@@ -4932,12 +4955,16 @@ class LiteratureReviewGenerator:
                             failure_reason = result.get('failure_reason') or '未知错误' if result else '处理返回空结果'
                             if not isinstance(failure_reason, str):  # type: ignore
                                 failure_reason = '未知错误'
-                            failed_paper = result.get('paper_info', paper) if result else paper
+                            failed_paper = cast(PaperInfo, result.get('paper_info', paper) if result else paper)
                             
-                            self.failed_papers.append({  # type: ignore
-                                    'paper_info': failed_paper,
-                                    'failure_reason': failure_reason
-                                })
+                            failed_entry: FailedPaper = {
+                                'paper_info': failed_paper,
+                                'failure_reason': failure_reason,
+                            }
+                            pdf_match_payload = result.get('pdf_match') if result else None
+                            if isinstance(pdf_match_payload, Mapping):
+                                failed_entry['pdf_match'] = dict(pdf_match_payload)
+                            self.failed_papers.append(failed_entry)
                                 # 更新身份基断点跟踪
                             self._checkpoint_failed_papers.add(paper_key)
                             
@@ -5142,7 +5169,7 @@ class LiteratureReviewGenerator:
                         break
                     
                     # 重置当前轮次的失败列表
-                    current_round_failures: List[Dict[str, Any]] = []
+                    current_round_failures: List[FailedPaper] = []
                     
                     # 创建线程池进行重试处理
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as retry_executor:
@@ -5194,10 +5221,14 @@ class LiteratureReviewGenerator:
                                 else:
                                     # 重试仍然失败
                                     failure_reason = result.get('failure_reason', '重试失败') if result else '重试返回空结果'
-                                    current_round_failures.append({
-                                        'paper_info': paper,
-                                        'failure_reason': failure_reason
-                                    })
+                                    retry_failure: FailedPaper = {
+                                        'paper_info': cast(PaperInfo, paper),
+                                        'failure_reason': str(failure_reason),
+                                    }
+                                    retry_pdf_match = result.get('pdf_match') if result else None
+                                    if isinstance(retry_pdf_match, Mapping):
+                                        retry_failure['pdf_match'] = dict(retry_pdf_match)
+                                    current_round_failures.append(retry_failure)
                                     failed_label = self._paper_progress_label(paper)
                                     self._emit_stage1_progress(
                                         total=tracked_total,
@@ -5228,7 +5259,7 @@ class LiteratureReviewGenerator:
                                 # 重试异常
                                 failure_reason = f"重试过程发生异常: {str(e)}"
                                 current_round_failures.append({
-                                    'paper_info': paper,
+                                    'paper_info': cast(PaperInfo, paper),
                                     'failure_reason': failure_reason
                                 })
                                 failed_label = self._paper_progress_label(paper)
