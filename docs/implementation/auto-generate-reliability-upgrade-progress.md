@@ -316,3 +316,62 @@ code commit itself.
   option documentation is completed with the Phase 8 compatibility/docs pass.
 - Job-outcome invalidation is applied when a canonical outcome already exists;
   Phase 5 makes outcome creation universal for runner-managed children.
+
+## Phase 5 - AI-native runner, append-only recovery, and strict reconcile
+
+### Scope and provenance
+
+- Pre-phase commit: `f348716`
+- Code checkpoint: `2597c5d`
+- Added the single high-level `AgentRuntimeRunner` on top of
+  `AgentRuntimeBridge`, plus public `run`, `resume`, `status`, and `reconcile`
+  commands. Generation remains an explicit host/subagent callback; lifecycle,
+  persistence, validation, and recovery stay local.
+- Persisted immutable attempt snapshots and terminal stage records. A stale
+  running attempt is appended as `interrupted` before a new pending/running
+  attempt is created; prior snapshots are never rewritten.
+- Added provider-free strict reconciliation requiring a ready Registry record,
+  matching file hash, schema validation, resolvable recursive dependencies,
+  and a registered terminal stage record before a stage is considered complete.
+- Added latest-pointer claim locking and finalize ownership checks, Queue
+  lifecycle mapping from `job_status`, CWD-independent spec/config/summary path
+  origins, and fail-closed Outline Registry resolution.
+- Integrated verified ReviewBatch derivation into Runner with zero Stage 1
+  provider calls, and repaired the review/citation dependency graph so resume
+  can prove durable completion without regenerating content.
+
+### Changed files
+
+- Runner and recovery: `runtime/runner.py`, `runtime/cli.py`,
+  `runtime/attempt_store.py`, `runtime/stage_terminal.py`,
+  `runtime/reconcile.py`, `runtime/lifecycle.py`.
+- Bridge and durable dependencies: `runtime/orchestrator.py`, `main.py`,
+  `services/job_runner.py`, `services/job_workspace.py`,
+  `services/queue_service.py`.
+- Path and outline contracts: `runtime/job_spec.py`, `config_loader.py`,
+  `services/summary_reuse.py`, `outline/runtime_resolver.py`.
+- Runner, fault-injection, reconcile, Queue, path-origin, pointer, and batch
+  integration tests under `tests/`.
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q tests/test_runtime_runner.py tests/test_runtime_attempt_store.py tests/test_runtime_reconcile.py tests/test_review_batch.py tests/test_runtime_lifecycle_parity.py tests/test_job_workspace.py tests/test_runtime_job_spec_bridge.py tests/test_persistent_queue_service.py tests/test_summary_reuse.py tests/test_outline_runtime_alignment.py tests/test_runtime_validation_bridge.py tests/test_runtime_review_chain.py tests/test_job_runner.py` | 0 | `82 passed in 21.33s` |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | Milestone B: `816 passed, 22 deselected in 63.43s`; zero skips |
+| `python -m pyright runtime/runner.py runtime/cli.py runtime/attempt_store.py runtime/stage_terminal.py runtime/reconcile.py runtime/lifecycle.py runtime/job_spec.py runtime/orchestrator.py services/job_runner.py services/job_workspace.py services/queue_service.py services/summary_reuse.py outline/runtime_resolver.py config_loader.py` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+
+### Artifact hashes
+
+- Full strict-offline pytest log: `87159c4678b59ab550ef2be62e25f15764f22311652ff6c1f26298fd5c5b5a44`
+
+### Remaining risks
+
+- Outline provider/schema health and prompt-budget enforcement are Phase 6.
+- Evidence preprocessing dependencies and claim-unit by paper checkpoints are
+  Phase 7.
+- Platform preflight/circuit breakers, migration/documentation closure, and
+  public synthetic E2E remain Phase 8.
+- Repository-wide pyright debt remains a final-gate obligation; every changed
+  Phase 5 runtime/service module is type-clean.
