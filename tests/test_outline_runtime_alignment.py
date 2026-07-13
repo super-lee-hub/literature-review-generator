@@ -180,6 +180,17 @@ def test_runtime_resolver_v2_with_valid_adopted_outline(tmp_path: Path) -> None:
 
     adopted_path = artifacts_dir / "test_adopted_final_outline.json"
     adopted_path.write_text(json.dumps(adopted.to_dict()), encoding="utf-8")
+    from outline.stage_health import OutlineStageHealthV1, make_test_double_entry
+    health = OutlineStageHealthV1(
+        job_id="job-001",
+        execution_mode="test_dev",
+        stages=(make_test_double_entry("outline_candidates", "test", {}, {}),),
+        source_final_outline_hash=adopted.source_final_outline_hash,
+        source_coverage_audit_hash=adopted.source_coverage_audit_hash,
+    )
+    (artifacts_dir / "test_outline_stage_health_v1.json").write_text(
+        json.dumps(health.to_dict()), encoding="utf-8"
+    )
 
     config = {"Outline": {"enable_outline_intelligence_v2": "true"}}
     resolver = OutlineRuntimeResolver(

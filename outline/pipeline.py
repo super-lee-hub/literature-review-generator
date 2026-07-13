@@ -48,7 +48,14 @@ from outline.arbitration_v2 import (
 )
 from outline.coverage_audit import run_coverage_audit
 from outline.adoption import adopt_final_outline, write_adopted_outline
-from outline.v2_config import OutlineQualityGateConfig
+from outline.prompt_budget import PromptBudgetV1
+from outline.stage_health import (
+    OutlineStageHealthV1,
+    StageHealthCollector,
+    StageHealthEntryV1,
+    make_test_double_entry,
+)
+from outline.v2_config import OutlineQualityGateConfig, OutlineV2Config
 
 
 ModelCaller = Callable[[str, str, Dict[str, Any]], Any]
@@ -70,6 +77,7 @@ class V2PipelineResult:
         self.arbitration_report: Optional[ArbitrationReport] = None
         self.final_outline: Optional[FinalOutline] = None
         self.coverage_audit: Optional[CoverageAudit] = None
+        self.stage_health: Optional[OutlineStageHealthV1] = None
         self.adopted_outline: Optional[AdoptedFinalOutline] = None
         self.errors: List[str] = []
         self.warnings: List[str] = []
@@ -139,6 +147,49 @@ class V2Pipeline:
         active_model_caller = model_caller or self.model_caller
         raw_config = getattr(self.config_view, "raw_config", None)
         quality_gate = OutlineQualityGateConfig.from_config(raw_config or {})
+        outline_config = OutlineV2Config.from_config(
+            raw_config or {}, is_test_fixture_mode=test_dev_mode
+        )
+        route_defaults = {
+            "Outline_API": ("outline_max_tokens", 16000),
+            "Writer_API": ("writer_max_tokens", 32000),
+            "Primary_Reader_API": ("primary_max_tokens", 5000),
+        }
+
+        def route_budget(route: str) -> PromptBudgetV1:
+            config = raw_config or {}
+            api_section = dict(config.get(route, {}))
+            api_parameters = dict(config.get("API_Parameters", {}))
+            max_token_key, default_output = route_defaults.get(
+                route, ("outline_max_tokens", outline_config.max_output_tokens)
+            )
+            try:
+                context_limit = int(
+                    api_section.get("max_context_tokens") or outline_config.model_context_limit
+                )
+                max_output = int(
+                    api_section.get("max_tokens")
+                    or api_parameters.get(max_token_key)
+                    or default_output
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid Outline prompt budget for {route}: {exc}") from exc
+            return PromptBudgetV1(
+                model_context_limit=context_limit,
+                max_output_tokens=max_output,
+            )
+
+        candidate_prompt_budget = route_budget(generator_model)
+        health_collector = StageHealthCollector(active_model_caller)
+
+        def guarded_model_caller(route: str, prompt: str, metadata: Dict[str, Any]) -> Any:
+            prompt_budget = route_budget(route)
+            prompt_budget.assert_fits(prompt, stage=str(metadata.get("stage") or "outline_v2"))
+            enriched = dict(metadata)
+            enriched["prompt_budget"] = prompt_budget.metadata(prompt)
+            return health_collector.call(route, prompt, enriched)
+
+        health_entries: List[StageHealthEntryV1] = []
         try:
             if test_dev_mode:
                 candidates = generate_candidates_deterministic(
@@ -153,9 +204,10 @@ class V2Pipeline:
                     synth_flow,
                     candidate_count,
                     generator_model,
-                    active_model_caller,
+                    guarded_model_caller,
                     quality_gate,
                     source_summaries=self.summaries,
+                    prompt_budget=candidate_prompt_budget,
                 )
                 result.candidate_generation_report = report
         except CandidateGenerationError as exc:
@@ -164,6 +216,37 @@ class V2Pipeline:
             self.persist_candidate_generation_report(result)
             return result
         result.candidates = candidates
+        if test_dev_mode:
+            health_entries.append(
+                make_test_double_entry("outline_candidates", generator_model, lit_map.to_dict(), candidates.to_dict())
+            )
+        else:
+            for supporting_stage in ("outline_stream_synthesis", "outline_synthesis_merge"):
+                if health_collector.has_calls(supporting_stage):
+                    health_entries.append(
+                        health_collector.entry(supporting_stage, generator_model, schema_valid=True)
+                    )
+            candidate_fallback = next(
+                (
+                    candidate.provenance
+                    for candidate in candidates.candidates
+                    if candidate.provenance in {"deterministic_fallback", "deterministic_topup"}
+                ),
+                "provider",
+            )
+            health_entries.append(
+                health_collector.entry(
+                    "outline_candidates",
+                    generator_model,
+                    schema_valid=True,
+                    fallback_provenance=candidate_fallback,
+                    degraded_reason=(
+                        "production candidate generation used deterministic fallback"
+                        if candidate_fallback != "provider"
+                        else ""
+                    ),
+                )
+            )
 
         # Phase 4: Role-specific critique
         if test_dev_mode:
@@ -171,25 +254,64 @@ class V2Pipeline:
             coverage_run = run_coverage_critique_deterministic(candidates, coverage_critic)
         else:
             structure_run = run_critique_production(
-                candidates, structure_critic, "structure", active_model_caller
+                candidates, structure_critic, "structure", guarded_model_caller
             )
             coverage_run = run_critique_production(
-                candidates, coverage_critic, "coverage", active_model_caller
+                candidates, coverage_critic, "coverage", guarded_model_caller
             )
         critiques_v2 = build_critiques_v2(
             structure_run, coverage_run,
             [c.candidate_id for c in candidates.candidates],
         )
         result.critiques = critiques_v2
+        if test_dev_mode:
+            health_entries.extend(
+                [
+                    make_test_double_entry("structure_critique", structure_critic, candidates.to_dict(), structure_run.to_dict()),
+                    make_test_double_entry("coverage_critique", coverage_critic, candidates.to_dict(), coverage_run.to_dict()),
+                ]
+            )
+        else:
+            health_entries.extend(
+                [
+                    health_collector.entry("structure_critique", structure_critic, schema_valid=True),
+                    health_collector.entry("coverage_critique", coverage_critic, schema_valid=True),
+                ]
+            )
 
         # Phase 5: Arbitration
         if test_dev_mode:
             arbitration_report = arbitrate_deterministic(candidates, critiques_v2, arbitrator_model)
         else:
             arbitration_report = arbitrate_production(
-                candidates, critiques_v2, arbitrator_model, active_model_caller
+                candidates, critiques_v2, arbitrator_model, guarded_model_caller
             )
         result.arbitration_report = arbitration_report
+        if test_dev_mode:
+            health_entries.append(
+                make_test_double_entry(
+                    "outline_arbitration", arbitrator_model, critiques_v2.to_dict(), arbitration_report.to_dict()
+                )
+            )
+        else:
+            arbitration_payload = arbitration_report.to_dict()
+            fallback_reason = str(
+                (arbitration_payload.get("final_decision") or {}).get("fallback_reason") or ""
+            )
+            fallback = (
+                "deterministic_fallback"
+                if fallback_reason or "fallback" in arbitration_report.merged_strategy.lower()
+                else "provider"
+            )
+            health_entries.append(
+                health_collector.entry(
+                    "outline_arbitration",
+                    arbitrator_model,
+                    schema_valid=True,
+                    fallback_provenance=fallback,
+                    degraded_reason=fallback_reason,
+                )
+            )
 
         # Phase 6: Final outline
         lit_map_hash = compute_content_hash(lit_map.to_dict())
@@ -208,6 +330,14 @@ class V2Pipeline:
         # Phase 7: Coverage audit
         audit = run_coverage_audit(final_outline, lit_map, synth_flow, quality_gate)
         result.coverage_audit = audit
+
+        result.stage_health = OutlineStageHealthV1(
+            job_id=self.job_id,
+            execution_mode="test_dev" if test_dev_mode else "production",
+            stages=tuple(health_entries),
+            source_final_outline_hash=compute_content_hash(final_outline.to_dict()),
+            source_coverage_audit_hash=compute_content_hash(audit.to_dict()),
+        )
 
         return result
 
@@ -259,6 +389,8 @@ class V2Pipeline:
             raise ValueError("Cannot persist incomplete v2 pipeline result")
         if not result.coverage_audit:
             raise ValueError("Cannot persist incomplete v2 pipeline result")
+        if not result.stage_health:
+            raise ValueError("Cannot persist v2 pipeline result without stage health")
 
         dependency_records: Dict[str, ArtifactDependencyRef] = {}
 
@@ -341,37 +473,138 @@ class V2Pipeline:
             depends_on=[dependency_records["final_outline"]],
         )
 
+        # Independent health sidecar. Existing Outline artifacts remain at their
+        # original schema versions; adoption consumes this registered dependency.
+        health_path = os.path.join(
+            artifacts_dir, f"{self.project_name}_outline_stage_health_v1.json"
+        )
+        self._write_json(health_path, result.stage_health.to_dict())
+        paths["outline_stage_health"] = health_path
+        dependency_records["outline_stage_health"] = self._register(
+            "outline_stage_health",
+            "outline_stage_health",
+            "v1",
+            health_path,
+            "v2_pipeline",
+            depends_on=[
+                dependency_records["literature_map"],
+                dependency_records["synthesis_flow"],
+                dependency_records["outline_candidates"],
+                dependency_records["outline_critiques"],
+                dependency_records["outline_arbitration_report"],
+                dependency_records["final_outline"],
+                dependency_records["outline_coverage_audit"],
+            ],
+        )
+
         return paths
 
     def adopt(self, result: V2PipelineResult, adopted_by: str) -> Tuple[Optional[AdoptedFinalOutline], str, str]:
         """Attempt to adopt the final outline."""
-        if not result.final_outline or not result.coverage_audit:
-            return None, "", "Missing final outline or coverage audit"
+        if not self.registry:
+            return None, "", "Adoption requires an Artifact Registry for immutable audit"
+        if not result.final_outline or not result.coverage_audit or not result.stage_health:
+            return None, "", "Missing final outline, coverage audit, or stage health"
 
         adopted, msg = adopt_final_outline(
             result.final_outline, result.coverage_audit,
-            self.job_id, adopted_by,
+            self.job_id, adopted_by, result.stage_health,
         )
 
         if adopted is None:
             return None, "", msg
 
         artifacts_dir = self._artifacts_dir()
-        adopted_path = os.path.join(artifacts_dir, f"{self.project_name}_adopted_final_outline.json")
-        write_adopted_outline(adopted, adopted_path)
-
         dependencies = []
         final_path = os.path.join(artifacts_dir, f"{self.project_name}_final_outline.json")
         audit_path = os.path.join(artifacts_dir, f"{self.project_name}_outline_coverage_audit.json")
-        for artifact_type, dep_path in (
-            ("final_outline", final_path),
-            ("outline_coverage_audit", audit_path),
+        health_path = os.path.join(artifacts_dir, f"{self.project_name}_outline_stage_health_v1.json")
+        for artifact_id, artifact_type, dep_path in (
+            ("final_outline", "final_outline", final_path),
+            ("outline_coverage_audit", "outline_coverage_audit", audit_path),
+            ("outline_stage_health", "outline_stage_health", health_path),
         ):
-            if os.path.exists(dep_path):
-                dependencies.append(self._dependency_ref(artifact_type, dep_path))
-        self._register(
+            record = self.registry.get(artifact_id)
+            if (
+                record is None
+                or record.status != "ready"
+                or not os.path.isfile(dep_path)
+                or os.path.abspath(record.path) != os.path.abspath(dep_path)
+                or record.content_hash != self._dependency_ref(artifact_type, dep_path).content_hash
+            ):
+                return None, "", f"Missing or stale registered adoption dependency: {artifact_id}"
+            dependencies.append(
+                ArtifactDependencyRef(
+                    artifact_type=artifact_type,
+                    path=record.path,
+                    content_hash=record.content_hash,
+                    dependency_kind="local_job",
+                    job_id=record.job_id,
+                    artifact_id=record.artifact_id,
+                )
+            )
+        adopted_path = os.path.join(artifacts_dir, f"{self.project_name}_adopted_final_outline.json")
+        write_adopted_outline(adopted, adopted_path)
+        adopted_ref = self._register(
             "adopted_final_outline", "adopted_final_outline", "v1", adopted_path, "v2_adoption",
             depends_on=dependencies,
+        )
+
+        from services.audit_record import AuditArtifactRefV1, AuditRecordV1
+        from services.job_workspace import atomic_write_json
+
+        input_refs = [
+            AuditArtifactRefV1(
+                artifact_id=dependency.artifact_id,
+                artifact_type=dependency.artifact_type,
+                job_id=dependency.job_id or self.job_id,
+                content_hash=dependency.content_hash,
+            )
+            for dependency in dependencies
+        ]
+        adoption_audit = AuditRecordV1.create(
+            audit_type="outline_manual_adoption",
+            job_id=self.job_id,
+            attempt_id=f"outline-adoption:{self.job_id}",
+            producer="outline.pipeline.V2Pipeline.adopt",
+            actor=adopted_by,
+            reason="explicit Outline v2 pipeline adoption",
+            scope={
+                "operation": "explicit_adoption",
+                "execution_mode": result.stage_health.execution_mode,
+            },
+            target_artifacts=input_refs,
+            input_artifact_refs=input_refs,
+            output_artifact_refs=[
+                AuditArtifactRefV1(
+                    artifact_id="adopted_final_outline",
+                    artifact_type="adopted_final_outline",
+                    job_id=self.job_id,
+                    content_hash=adopted_ref.content_hash,
+                )
+            ],
+            input_hashes={
+                "final_outline": dependencies[0].content_hash,
+                "coverage_audit": dependencies[1].content_hash,
+                "stage_health": dependencies[2].content_hash,
+            },
+            policy_snapshot={
+                "require_stage_health": True,
+                "production_fallback_adoptable": False,
+            },
+            disposition="adopted",
+        )
+        audit_record_path = os.path.join(
+            artifacts_dir, f"outline_manual_adoption_{adoption_audit.audit_id}.json"
+        )
+        atomic_write_json(audit_record_path, adoption_audit.to_dict())
+        self._register(
+            adoption_audit.audit_id,
+            "audit_record",
+            "v1",
+            audit_record_path,
+            "v2_adoption",
+            depends_on=[*dependencies, adopted_ref],
         )
 
         return adopted, adopted_path, msg
@@ -414,6 +647,9 @@ class V2Pipeline:
                 artifact_type=record.artifact_type,
                 path=record.path,
                 content_hash=record.content_hash,
+                dependency_kind="local_job",
+                job_id=record.job_id,
+                artifact_id=record.artifact_id,
             )
         except Exception as exc:
             if self.logger:

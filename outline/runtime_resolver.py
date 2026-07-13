@@ -17,6 +17,7 @@ from outline.v2_models import (
     AdoptedFinalOutline,
     compute_content_hash,
 )
+from outline.stage_health import OutlineStageHealthV1
 from services.artifact_registry import file_sha256
 
 
@@ -99,6 +100,16 @@ class OutlineRuntimeResolver:
         if not adopted.source_final_outline_hash or not source_hash_ok:
             return None
 
+        health = self._load_current_health(adopted_path)
+        if health is None or not health.adoptable:
+            return None
+        if health.job_id != adopted.created_from_job_id:
+            return None
+        if health.source_final_outline_hash != adopted.source_final_outline_hash:
+            return None
+        if health.source_coverage_audit_hash != adopted.source_coverage_audit_hash:
+            return None
+
         # Verify hash identity if registry is available
         if self._registry:
             record = self._registry.get("adopted_final_outline")
@@ -123,8 +134,41 @@ class OutlineRuntimeResolver:
                 "source_coverage_audit_hash": adopted.source_coverage_audit_hash,
                 "adopted_by": adopted.adopted_by,
                 "adopted_at": adopted.adopted_at,
+                "outline_stage_health_hash": file_sha256(self._health_path(adopted_path)),
             },
         )
+
+    def _health_path(self, adopted_path: str) -> str:
+        if self._registry:
+            record = self._registry.get("outline_stage_health")
+            return record.path if record else ""
+        return os.path.join(
+            os.path.dirname(adopted_path),
+            f"{self._project_name}_outline_stage_health_v1.json",
+        )
+
+    def _load_current_health(self, adopted_path: str) -> Optional[OutlineStageHealthV1]:
+        health_path = self._health_path(adopted_path)
+        if not health_path or not os.path.isfile(health_path):
+            return None
+        if self._registry:
+            health_record = self._registry.get("outline_stage_health")
+            adopted_record = self._registry.get("adopted_final_outline")
+            if health_record is None or health_record.status != "ready":
+                return None
+            if health_record.content_hash != file_sha256(health_path):
+                return None
+            if adopted_record is None or not any(
+                dependency.artifact_type == "outline_stage_health"
+                and dependency.content_hash == health_record.content_hash
+                for dependency in adopted_record.depends_on
+            ):
+                return None
+        try:
+            with open(health_path, "r", encoding="utf-8") as handle:
+                return OutlineStageHealthV1.from_dict(json.load(handle))
+        except Exception:
+            return None
 
     def _resolve_legacy(self) -> Optional[ResolveResult]:
         """Legacy mode: load registered Markdown outline through existing behavior."""

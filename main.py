@@ -969,7 +969,11 @@ class LiteratureReviewGenerator:
             self.logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
 
-    def adopt_outline_v2(self, adopted_by: str = "user") -> bool:
+    def adopt_outline_v2(
+        self,
+        adopted_by: str = "user",
+        reason: str = "explicit Outline v2 adoption",
+    ) -> bool:
         """Explicitly adopt v2 final_outline.json after a passing, current audit."""
         try:
             self.logger.info("开始执行 Outline Intelligence v2 显式采纳...")
@@ -979,9 +983,14 @@ class LiteratureReviewGenerator:
 
             from outline.v2_models import CoverageAudit, FinalOutline
             from outline.adoption import adopt_final_outline, write_adopted_outline
+            from outline.stage_health import OutlineStageHealthV1
+            from services.artifact_registry import file_sha256
 
             final_path = self.job_workspace.artifact_path(f"{self.project_name}_final_outline.json")
             audit_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_coverage_audit.json")
+            health_path = self.job_workspace.artifact_path(
+                f"{self.project_name}_outline_stage_health_v1.json"
+            )
             if not os.path.exists(final_path):
                 self.logger.error(f"final_outline.json 不存在: {final_path}")
                 return False
@@ -989,16 +998,32 @@ class LiteratureReviewGenerator:
                 self.logger.error(f"outline_coverage_audit.json 不存在: {audit_path}")
                 return False
 
+            if not self.artifact_registry:
+                self.logger.error("Outline v2 adoption requires an Artifact Registry")
+                return False
+            health_record = self.artifact_registry.get("outline_stage_health")
+            if (
+                health_record is None
+                or not os.path.isfile(health_path)
+                or os.path.abspath(health_record.path) != os.path.abspath(health_path)
+                or health_record.content_hash != file_sha256(health_path)
+            ):
+                self.logger.error("Registered outline_stage_health evidence is missing or stale")
+                return False
+
             with open(final_path, "r", encoding="utf-8") as handle:
                 final_outline = FinalOutline.from_dict(json.load(handle))
             with open(audit_path, "r", encoding="utf-8") as handle:
                 audit = CoverageAudit.from_dict(json.load(handle))
+            with open(health_path, "r", encoding="utf-8") as handle:
+                stage_health = OutlineStageHealthV1.from_dict(json.load(handle))
 
             adopted, message = adopt_final_outline(
                 final_outline=final_outline,
                 audit=audit,
                 job_id=self.job_workspace.job_id,
                 adopted_by=adopted_by,
+                stage_health=stage_health,
             )
             if adopted is None:
                 self.logger.error(f"Outline v2 采纳失败: {message}")
@@ -1012,15 +1037,18 @@ class LiteratureReviewGenerator:
 
                 depends_on = [
                     ArtifactDependencyRef(
-                        artifact_type="final_outline",
-                        path=final_path,
-                        content_hash=file_sha256(final_path),
-                    ),
-                    ArtifactDependencyRef(
-                        artifact_type="outline_coverage_audit",
-                        path=audit_path,
-                        content_hash=file_sha256(audit_path),
-                    ),
+                        artifact_type=artifact_type,
+                        path=path,
+                        content_hash=file_sha256(path),
+                        dependency_kind="local_job",
+                        job_id=self.job_workspace.job_id,
+                        artifact_id=artifact_id,
+                    )
+                    for artifact_id, artifact_type, path in (
+                        ("final_outline", "final_outline", final_path),
+                        ("outline_coverage_audit", "outline_coverage_audit", audit_path),
+                        ("outline_stage_health", "outline_stage_health", health_path),
+                    )
                 ]
                 self.artifact_registry.register_file(
                     artifact_role="adopted_final_outline",
@@ -1030,6 +1058,79 @@ class LiteratureReviewGenerator:
                     producer="main.LiteratureReviewGenerator.adopt_outline_v2",
                     depends_on=depends_on,
                     artifact_id="adopted_final_outline",
+                )
+
+                from services.audit_record import AuditArtifactRefV1, AuditRecordV1
+                from services.job_workspace import atomic_write_json
+
+                input_refs = [
+                    AuditArtifactRefV1(
+                        artifact_id=artifact_id,
+                        artifact_type=artifact_type,
+                        job_id=self.job_workspace.job_id,
+                        content_hash=file_sha256(path),
+                    )
+                    for artifact_id, artifact_type, path in (
+                        ("final_outline", "final_outline", final_path),
+                        ("outline_coverage_audit", "outline_coverage_audit", audit_path),
+                        ("outline_stage_health", "outline_stage_health", health_path),
+                    )
+                ]
+                adopted_hash = file_sha256(adopted_path)
+                audit_record = AuditRecordV1.create(
+                    audit_type="outline_manual_adoption",
+                    job_id=self.job_workspace.job_id,
+                    attempt_id=f"outline-adoption:{self.job_workspace.job_id}",
+                    producer="main.LiteratureReviewGenerator.adopt_outline_v2",
+                    actor=adopted_by,
+                    reason=reason,
+                    scope={
+                        "operation": "explicit_adoption",
+                        "execution_mode": stage_health.execution_mode,
+                    },
+                    target_artifacts=input_refs,
+                    input_artifact_refs=input_refs,
+                    output_artifact_refs=[
+                        AuditArtifactRefV1(
+                            artifact_id="adopted_final_outline",
+                            artifact_type="adopted_final_outline",
+                            job_id=self.job_workspace.job_id,
+                            content_hash=adopted_hash,
+                        )
+                    ],
+                    input_hashes={
+                        "final_outline": file_sha256(final_path),
+                        "coverage_audit": file_sha256(audit_path),
+                        "stage_health": file_sha256(health_path),
+                    },
+                    policy_snapshot={
+                        "require_stage_health": True,
+                        "production_fallback_adoptable": False,
+                    },
+                    disposition="adopted",
+                )
+                audit_record_path = self.job_workspace.artifact_path(
+                    f"outline_manual_adoption_{audit_record.audit_id}.json"
+                )
+                atomic_write_json(audit_record_path, audit_record.to_dict())
+                self.artifact_registry.register_file(
+                    artifact_role="audit_record",
+                    artifact_type="audit_record",
+                    artifact_version="v1",
+                    path=audit_record_path,
+                    producer="main.LiteratureReviewGenerator.adopt_outline_v2",
+                    artifact_id=audit_record.audit_id,
+                    depends_on=[
+                        *depends_on,
+                        ArtifactDependencyRef(
+                            artifact_type="adopted_final_outline",
+                            path=adopted_path,
+                            content_hash=adopted_hash,
+                            dependency_kind="local_job",
+                            job_id=self.job_workspace.job_id,
+                            artifact_id="adopted_final_outline",
+                        ),
+                    ],
                 )
 
             self.logger.success(f"Outline v2 采纳成功，已保存到: {adopted_path}")

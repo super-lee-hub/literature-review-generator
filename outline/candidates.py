@@ -22,6 +22,7 @@ from outline.quality_rules import (
     non_blocking_flow_roles,
 )
 from outline.v2_config import OutlineQualityGateConfig
+from outline.prompt_budget import OutlinePromptBudgetExceeded, PromptBudgetV1, packet_hash
 from outline.v2_models import (
     CandidateSection,
     FlowStep,
@@ -587,7 +588,7 @@ def _controlled_literature_index(literature_map: LiteratureMap) -> Dict[str, Any
             "aliases": list(node.aliases)[:6],
         })
     streams: List[Dict[str, Any]] = []
-    for stream in literature_map.research_streams[:80]:
+    for stream in literature_map.research_streams:
         streams.append({
             "stream_name": stream.get("stream_name"),
             "paper_keys": list(stream.get("paper_keys") or []),
@@ -612,6 +613,7 @@ def _candidate_prompt(
     candidate_count: int,
     source_summaries: Sequence[Dict[str, Any]] | None = None,
     strategy_offset: int = 0,
+    evidence_context: Dict[str, Any] | None = None,
 ) -> str:
     strategy_examples = [
         ("mechanism_driven", "Organized by causal mechanisms and processes"),
@@ -660,7 +662,10 @@ def _candidate_prompt(
         },
         "controlled_literature_index": _controlled_literature_index(literature_map),
         "synthesis_flow": synthesis_flow.to_dict(),
-        "stage1_summaries_full": _source_summary_packet(source_summaries),
+        "stage1_summaries_full": (
+            _source_summary_packet(source_summaries) if evidence_context is None else []
+        ),
+        "research_stream_syntheses": evidence_context or {},
         "output_schema": {
             "candidates": schema_candidates
         },
@@ -681,11 +686,193 @@ def _candidate_prompt(
         f"forbidden={sorted(forbidden_provider_flow_roles())}. Every candidate "
         "must contain a sections array, and every section must cite source flow steps and assigned "
         "controlled-corpus paper keys from controlled_literature_index.controlled_paper_keys. "
-        "The stage1_summaries_full array contains the complete substantive Stage 1 evidence "
-        "without runtime diagnostics; use it for judgment, not as a replacement for controlled "
+        "Use stage1_summaries_full when present; otherwise use research_stream_syntheses, "
+        "which is a lossless paper-key-indexed hierarchy derived from the complete Stage 1 evidence. "
+        "Use this evidence for judgment, not as a replacement for controlled "
         "paper_key values.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
+
+
+def _stream_synthesis_prompt(
+    stream_name: str,
+    paper_keys: Sequence[str],
+    packets: Sequence[Dict[str, Any]],
+) -> str:
+    payload = {
+        "stream_name": stream_name,
+        "paper_keys": list(paper_keys),
+        "packet_hashes": [packet_hash(packet) for packet in packets],
+        "stage1_summary_packets": list(packets),
+        "output_schema": {
+            "stream_name": stream_name,
+            "paper_keys": list(paper_keys),
+            "themes": [],
+            "tensions": [],
+            "mechanisms": [],
+            "methods": [],
+            "gaps": [],
+            "evidence_claims": [{"claim": "", "paper_keys": []}],
+        },
+    }
+    return (
+        "Synthesize this complete research-stream shard without dropping any paper. "
+        "Return strict JSON matching output_schema and ground every evidence claim in paper_keys.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
+def _merge_synthesis_prompt(records: Sequence[Dict[str, Any]]) -> str:
+    paper_keys = sorted({key for record in records for key in record.get("paper_keys", [])})
+    return (
+        "Merge these controlled-corpus research syntheses. Preserve every paper key and return "
+        "strict JSON with paper_keys and synthesis.\n\n"
+        + json.dumps(
+            {
+                "paper_keys": paper_keys,
+                "syntheses": list(records),
+                "output_schema": {"paper_keys": paper_keys, "synthesis": {}},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def _partition_for_budget(
+    items: Sequence[Dict[str, Any]],
+    prompt_builder: Callable[[Sequence[Dict[str, Any]]], str],
+    budget: PromptBudgetV1,
+    *,
+    stage: str,
+) -> List[List[Dict[str, Any]]]:
+    groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for item in items:
+        candidate = [*current, item]
+        if budget.fits(prompt_builder(candidate)):
+            current = candidate
+            continue
+        if not current:
+            budget.assert_fits(prompt_builder([item]), stage=stage)
+        groups.append(current)
+        current = [item]
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _budgeted_evidence_context(
+    literature_map: LiteratureMap,
+    synthesis_flow: SynthesisFlow,
+    source_summaries: Sequence[Dict[str, Any]] | None,
+    generator_model: str,
+    model_caller: ModelCaller,
+    budget: PromptBudgetV1,
+    *,
+    candidate_count: int,
+    strategy_offset: int,
+) -> Dict[str, Any] | None:
+    full_prompt = _candidate_prompt(
+        literature_map,
+        synthesis_flow,
+        candidate_count,
+        source_summaries,
+        strategy_offset,
+    )
+    if budget.fits(full_prompt):
+        return None
+
+    packets = _source_summary_packet(source_summaries)
+    nodes = list(literature_map.paper_nodes)
+    keyed_packets: List[Dict[str, Any]] = []
+    for index, packet in enumerate(packets):
+        paper_key = nodes[index].paper_key if index < len(nodes) else f"unmapped:{index + 1}"
+        keyed_packets.append({"paper_key": paper_key, "packet": packet})
+
+    stream_by_key: Dict[str, str] = {}
+    for index, stream in enumerate(literature_map.research_streams):
+        name = str(stream.get("stream_name") or f"stream_{index + 1}")
+        for key in stream.get("paper_keys") or ():
+            stream_by_key.setdefault(str(key), name)
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in keyed_packets:
+        grouped.setdefault(stream_by_key.get(item["paper_key"], "unassigned"), []).append(item)
+
+    syntheses: List[Dict[str, Any]] = []
+    for stream_name, stream_items in grouped.items():
+        def build_prompt(items: Sequence[Dict[str, Any]]) -> str:
+            return _stream_synthesis_prompt(
+                stream_name,
+                [str(item["paper_key"]) for item in items],
+                [dict(item["packet"]) for item in items],
+            )
+
+        for shard in _partition_for_budget(
+            stream_items, build_prompt, budget, stage="outline_stream_synthesis"
+        ):
+            prompt = build_prompt(shard)
+            raw = model_caller(
+                generator_model,
+                prompt,
+                {
+                    "stage": "outline_stream_synthesis",
+                    "prompt_budget": budget.metadata(prompt),
+                },
+            )
+            syntheses.append(
+                {
+                    "stream_name": stream_name,
+                    "paper_keys": [str(item["paper_key"]) for item in shard],
+                    "packet_hashes": [packet_hash(item["packet"]) for item in shard],
+                    "synthesis": raw,
+                }
+            )
+
+    context: Dict[str, Any] = {"level": 0, "syntheses": syntheses}
+    merge_level = 0
+    while not budget.fits(
+        _candidate_prompt(
+            literature_map,
+            synthesis_flow,
+            candidate_count,
+            None,
+            strategy_offset,
+            context,
+        )
+    ):
+        merge_level += 1
+        if merge_level > 20:
+            raise OutlinePromptBudgetExceeded("research-stream synthesis did not converge")
+        groups = _partition_for_budget(
+            syntheses, _merge_synthesis_prompt, budget, stage="outline_synthesis_merge"
+        )
+        if len(groups) == len(syntheses) and all(len(group) == 1 for group in groups):
+            raise OutlinePromptBudgetExceeded(
+                "indivisible research-stream synthesis exceeds final candidate budget"
+            )
+        merged: List[Dict[str, Any]] = []
+        for group in groups:
+            prompt = _merge_synthesis_prompt(group)
+            raw = model_caller(
+                generator_model,
+                prompt,
+                {
+                    "stage": "outline_synthesis_merge",
+                    "prompt_budget": budget.metadata(prompt),
+                },
+            )
+            merged.append(
+                {
+                    "paper_keys": sorted(
+                        {key for item in group for key in item.get("paper_keys", [])}
+                    ),
+                    "synthesis": raw,
+                }
+            )
+        syntheses = merged
+        context = {"level": merge_level, "syntheses": syntheses}
+    return context
 
 
 def _first_present(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
@@ -1565,6 +1752,7 @@ def generate_candidates_production_with_report(
     model_caller: ModelCaller | None,
     quality_gate: OutlineQualityGateConfig | None = None,
     source_summaries: Sequence[Dict[str, Any]] | None = None,
+    prompt_budget: PromptBudgetV1 | None = None,
 ) -> tuple[OutlineCandidates, Dict[str, Any]]:
     """Generate candidates through Outline_API and return diagnostics sidecar."""
     if model_caller is None:
@@ -1574,6 +1762,20 @@ def generate_candidates_production_with_report(
     if candidate_count > 1:
         raw_candidates: List[Any] = []
         per_strategy_errors: List[Dict[str, Any]] = []
+        shared_evidence_context = (
+            _budgeted_evidence_context(
+                literature_map,
+                synthesis_flow,
+                source_summaries,
+                generator_model,
+                model_caller,
+                prompt_budget,
+                candidate_count=1,
+                strategy_offset=0,
+            )
+            if prompt_budget is not None
+            else None
+        )
         for idx in range(candidate_count):
             prompt = _candidate_prompt(
                 literature_map,
@@ -1581,11 +1783,18 @@ def generate_candidates_production_with_report(
                 1,
                 source_summaries,
                 strategy_offset=idx,
+                evidence_context=shared_evidence_context,
             )
+            if prompt_budget is not None:
+                prompt_budget.assert_fits(prompt, stage="outline_candidates")
             raw_output = model_caller(
                 generator_model,
                 prompt,
-                {"stage": "outline_candidates", "candidate_index": idx + 1},
+                {
+                    "stage": "outline_candidates",
+                    "candidate_index": idx + 1,
+                    "prompt_budget": prompt_budget.metadata(prompt) if prompt_budget else {},
+                },
             )
             try:
                 one_raw, _top_keys = _extract_raw_candidate_list(raw_output)
@@ -1609,8 +1818,37 @@ def generate_candidates_production_with_report(
         if per_strategy_errors:
             raw_output["provider_strategy_errors"] = per_strategy_errors
     else:
-        prompt = _candidate_prompt(literature_map, synthesis_flow, candidate_count, source_summaries)
-        raw_output = model_caller(generator_model, prompt, {"stage": "outline_candidates"})
+        evidence_context = (
+            _budgeted_evidence_context(
+                literature_map,
+                synthesis_flow,
+                source_summaries,
+                generator_model,
+                model_caller,
+                prompt_budget,
+                candidate_count=candidate_count,
+                strategy_offset=0,
+            )
+            if prompt_budget is not None
+            else None
+        )
+        prompt = _candidate_prompt(
+            literature_map,
+            synthesis_flow,
+            candidate_count,
+            source_summaries,
+            evidence_context=evidence_context,
+        )
+        if prompt_budget is not None:
+            prompt_budget.assert_fits(prompt, stage="outline_candidates")
+        raw_output = model_caller(
+            generator_model,
+            prompt,
+            {
+                "stage": "outline_candidates",
+                "prompt_budget": prompt_budget.metadata(prompt) if prompt_budget else {},
+            },
+        )
     return normalize_candidate_output_with_report(
         raw_output,
         literature_map,

@@ -20,6 +20,7 @@ from outline.adoption import (
     write_adopted_outline,
 )
 from outline.v2_models import AdoptedFinalOutline, CoverageAudit, FinalOutline, FinalSection, compute_content_hash
+from outline.stage_health import OutlineStageHealthV1, make_test_double_entry
 
 
 def _sample_summaries():
@@ -64,12 +65,22 @@ def _force_passing_audit(final):
     )
 
 
+def _make_health(final, audit, job_id="job-001"):
+    return OutlineStageHealthV1(
+        job_id=job_id,
+        execution_mode="test_dev",
+        stages=(make_test_double_entry("outline_candidates", "test", {}, {}),),
+        source_final_outline_hash=compute_content_hash(final.to_dict()),
+        source_coverage_audit_hash=compute_content_hash(audit.to_dict()),
+    )
+
+
 class TestAdoptionGate:
 
     def test_adoption_succeeds_with_passing_audit(self):
         final, audit = _make_final_and_audit()
         audit = _force_passing_audit(final)
-        adopted, msg = adopt_final_outline(final, audit, "job-001", "test-user")
+        adopted, msg = adopt_final_outline(final, audit, "job-001", "test-user", _make_health(final, audit))
         assert adopted is not None
         assert "success" in msg.lower()
         assert isinstance(adopted, AdoptedFinalOutline)
@@ -83,7 +94,7 @@ class TestAdoptionGate:
             passed=False,
             source_final_outline_hash=compute_content_hash(final.to_dict()),
         )
-        adopted, msg = adopt_final_outline(final, failed, "job-001", "test-user")
+        adopted, msg = adopt_final_outline(final, failed, "job-001", "test-user", _make_health(final, failed))
         assert adopted is None
         assert "pass" in msg.lower() or "blocked" in msg.lower()
 
@@ -104,7 +115,7 @@ class TestAdoptionGate:
             source_synthesis_flow_hash=final.source_synthesis_flow_hash,
         )
 
-        ok, err = verify_adoption_prerequisites(modified_final, audit)
+        ok, err = verify_adoption_prerequisites(modified_final, audit, _make_health(final, audit))
         assert audit.passed is True
         assert not ok
         assert "stale" in err.lower() or "hash" in err.lower()
@@ -112,13 +123,13 @@ class TestAdoptionGate:
     def test_verify_prerequisites_checks_audit_pass(self):
         final, audit = _make_final_and_audit()
         audit = _force_passing_audit(final)
-        ok, err = verify_adoption_prerequisites(final, audit)
+        ok, err = verify_adoption_prerequisites(final, audit, _make_health(final, audit))
         assert ok
 
     def test_adopted_outline_has_required_fields(self):
         final, audit = _make_final_and_audit()
         audit = _force_passing_audit(final)
-        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
+        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user", _make_health(final, audit))
         assert adopted is not None
         assert adopted.artifact_type == "adopted_final_outline"
         assert adopted.artifact_version == "v1"
@@ -130,7 +141,7 @@ class TestAdoptionGate:
     def test_write_adopted_outline_to_disk(self, tmp_path: Path):
         final, audit = _make_final_and_audit()
         audit = _force_passing_audit(final)
-        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
+        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user", _make_health(final, audit))
         path = str(tmp_path / "adopted_final_outline.json")
         written = write_adopted_outline(adopted, path)
         assert os.path.exists(written)
@@ -145,7 +156,7 @@ class TestAdoptionGate:
         """V2 adoption writes adopted_final_outline, NOT reviewed_outline."""
         final, audit = _make_final_and_audit()
         audit = _force_passing_audit(final)
-        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user")
+        adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user", _make_health(final, audit))
         assert adopted is not None
         # adopted_final_outline artifact type is NOT reviewed_outline_document
         assert adopted.artifact_type == "adopted_final_outline"
@@ -164,7 +175,7 @@ class TestAdoptionGate:
             source_final_outline_hash=compute_content_hash(blocked.to_dict()),
         )
 
-        adopted, msg = adopt_final_outline(blocked, audit, "job-001", "test-user")
+        adopted, msg = adopt_final_outline(blocked, audit, "job-001", "test-user", _make_health(blocked, audit))
 
         assert adopted is None
         assert "blocked" in msg.lower()
@@ -217,6 +228,17 @@ def test_generator_adopt_outline_v2_writes_registered_adopted_artifact(tmp_path:
     audit = _force_passing_audit(final)
     Path(workspace.artifact_path("demo_final_outline.json")).write_text(json.dumps(final.to_dict()), encoding="utf-8")
     Path(workspace.artifact_path("demo_outline_coverage_audit.json")).write_text(json.dumps(audit.to_dict()), encoding="utf-8")
+    health = _make_health(final, audit, job_id=final.created_from_job_id)
+    health_path = Path(workspace.artifact_path("demo_outline_stage_health_v1.json"))
+    health_path.write_text(json.dumps(health.to_dict()), encoding="utf-8")
+    registry.register_file(
+        artifact_role="outline_stage_health",
+        artifact_type="outline_stage_health",
+        artifact_version="v1",
+        path=health_path,
+        producer="test",
+        artifact_id="outline_stage_health",
+    )
 
     assert generator.adopt_outline_v2() is True
     adopted_path = Path(workspace.artifact_path("demo_adopted_final_outline.json"))
@@ -225,6 +247,7 @@ def test_generator_adopt_outline_v2_writes_registered_adopted_artifact(tmp_path:
     assert record is not None
     assert record.artifact_type == "adopted_final_outline"
     assert all(dep.content_hash for dep in record.depends_on)
+    assert any(item.artifact_type == "audit_record" for item in registry.list_records())
 
 
 def test_generator_adopt_outline_v2_failed_audit_does_not_write_adopted_artifact(tmp_path: Path):
