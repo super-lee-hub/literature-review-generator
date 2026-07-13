@@ -434,3 +434,62 @@ code commit itself.
   Windows UTF-8 progress, compatibility documentation, and public synthetic E2E.
 - Repository-wide pyright debt remains a final-gate obligation; every changed
   Phase 6 Outline module is type-clean.
+
+## Phase 7 - Evidence dependency graph and durable Validation edges
+
+### Scope and provenance
+
+- Pre-phase commit: `bcdc9a6`
+- Code checkpoint: `49e2275`
+- Added `EvidenceManifestV1` and registered normalized text, chunks, page index,
+  and the manifest as direct hash-bearing paper-artifact dependencies.
+- Projected selected parent paper artifacts and their evidence dependencies into
+  derived child ReviewBatch jobs as `external_job` references; children still
+  perform zero Stage 1 provider calls.
+- Added Stage 1 English concept/keyword queries for bilingual source-grounded
+  recall. The original claim is preserved and AI summary hints are not promoted
+  to source evidence.
+- Added immutable claim-unit by canonical-paper edge checkpoints whose key
+  covers claim, evidence, segmenter, retrieval configuration, model route,
+  prompt, and adjudication schema versions.
+- Added a separate immutable adjudication checkpoint so recovery does not
+  repeat primary or stronger provider calls after edge retrieval is durable.
+- Reconcile now validates the new evidence artifact types recursively.
+
+### Changed files
+
+- Evidence contracts and persistence: `services/evidence_manifest.py`,
+  `main.py`, `runtime/reconcile.py`.
+- Child dependency projection: `services/review_batch.py`.
+- Retrieval and recovery: `validation/evidence_resolver.py`,
+  `validation/edge_checkpoint.py`, `validation/adjudication_checkpoint.py`,
+  `validation/review_validator.py`, `validator.py`.
+- Evidence, 43-edge interruption/resume, adjudication replay, paper durability,
+  ReviewBatch, runtime, and visual-input tests under `tests/`.
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q tests/test_validation_edge_checkpoint.py tests/test_validation_adjudication_checkpoint.py tests/test_evidence_manifest.py tests/test_paper_artifact_durability.py tests/test_review_batch.py tests/test_week3_validation.py tests/test_claim_paper_alignment_validation.py tests/test_runtime_validation_bridge.py tests/test_runtime_bridge_helpers.py --disable-warnings --maxfail=1` | 0 | `67 passed in 7.96s` |
+| `python -m pytest -q tests/test_runtime_runner.py tests/test_runtime_reconcile.py --disable-warnings --maxfail=1` | 0 | `10 passed in 12.27s` |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr" --disable-warnings --maxfail=1` | 0 | Milestone C preflight: `830 passed, 22 deselected in 68.25s`; zero skips |
+| `python -m pyright validator.py services/evidence_manifest.py services/review_batch.py validation/adjudication_checkpoint.py validation/edge_checkpoint.py validation/evidence_resolver.py validation/review_validator.py` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py validator.py services validation` | 0 | no diagnostics |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+
+### Artifact hashes
+
+- `services/evidence_manifest.py`: `6c1bafafdcd584d6c3b4511f5d1eed8db515fc5644c528d15bc7b4f653efb8c6`
+- `validation/edge_checkpoint.py`: `51079950597330a25042e45547f2558c80621d45bc524b75c0f414e7fdc4804b`
+- `validation/adjudication_checkpoint.py`: `29b84edc0b83752dbd2a84f6aadd94b9f6409679d3c48afb722ab600c2cbfb26`
+- `validation/evidence_resolver.py`: `4f3477aed50ab27101cfaa74c0c4a56551b98f5825392761dc8e773a74d61f77`
+
+### Remaining risks
+
+- Phase 8 must complete provider preflight/circuit breakers, subprocess
+  isolation, Windows UTF-8/ASCII-safe progress, compatibility documentation,
+  old-workspace migration coverage, and the public synthetic E2E.
+- Repository-wide pyright debt remains a final-gate obligation; every changed
+  Phase 7 service/validation/runtime module is type-clean apart from existing
+  `main.py` diagnostics that predate this phase.
