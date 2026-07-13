@@ -12,14 +12,14 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: `63aeba8` (Phase 0)
+- Last-known-good checkpoint: `24f318d` (Phase 1)
 
 ## Phase status
 
 | Phase | Status | Code checkpoint | Evidence checkpoint |
 | --- | --- | --- | --- |
 | 0 - hotfix and offline baseline | completed | `63aeba8` | current ledger commit |
-| 1 - Zotero and FileIndex | pending | - | - |
+| 1 - Zotero and FileIndex | completed | `24f318d` | current ledger commit |
 | 2 - identity, registry, audit, fingerprint | pending | - | - |
 | 3 - sentence and validation truth | pending | - | - |
 | 4 - ReviewBatch derivation | pending | - | - |
@@ -78,3 +78,59 @@ code commit itself.
 - Native non-Python executables cannot inherit Python socket monkeypatches.
   Strict-offline CI therefore excludes explicitly marked Playwright/heavy OCR
   tests and blocks common shell network clients at the subprocess boundary.
+
+## Phase 1 - Zotero parsing and root-scoped FileIndex
+
+### Scope and provenance
+
+- Pre-phase commit: `3ebd8b2`
+- Code checkpoint: `24f318d`
+- Replaced the lossy flat Zotero report parser with the versioned
+  `ZoteroParseResultV1` contract while retaining the old `List[PaperInfo]`
+  projection for compatibility.
+- Replaced the process-global PDF index with immutable, root-scoped instances;
+  duplicate basenames remain explicit candidates and indexing performs no
+  writes to the Zotero library.
+- Migrated first-party source-intake and Stage 1 preparation paths to the
+  structured parser and `PdfMatchResultV1`, so ambiguous candidates fail closed
+  before provider execution.
+
+### Changed files
+
+- `zotero_parser.py`
+- `file_finder.py`
+- `runtime/source_intake.py`
+- `main.py`
+- `models.py`
+- `report_generator.py`
+- `tests/test_zotero_parser.py`
+- `tests/test_file_finder.py`
+- `tests/test_runtime_source_intake.py`
+- `tests/test_zotero_stage1_pdf_resolution.py`
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest tests/test_zotero_parser.py tests/test_retry_report_roundtrip.py tests/test_file_finder.py tests/test_runtime_source_intake.py tests/test_zotero_stage1_pdf_resolution.py tests/test_main_flow.py -q --strict-markers` | 0 | `33 passed` |
+| `python -m pytest tests/test_zotero_parser.py tests/test_retry_report_roundtrip.py tests/test_file_finder.py tests/test_runtime_source_intake.py tests/test_zotero_stage1_pdf_resolution.py tests/test_main_flow.py tests/test_main_dispatch_and_free_mode.py tests/test_outline_candidates.py tests/test_paper_identity.py tests/test_runtime_validation_bridge.py -q --strict-markers` | 0 | `114 passed in 35.84s` |
+| `python -m pyright zotero_parser.py file_finder.py runtime/source_intake.py models.py` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py runtime/source_intake.py zotero_parser.py file_finder.py models.py report_generator.py` | 0 | no diagnostics |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+
+### Artifact hashes
+
+- `zotero_parser.py`: `e12171093da70a14c94d456caaf5ac3575481c04a3fe1713f03bf734089e027b`
+- `file_finder.py`: `4c78fc75569e8796ba4f274fdc7c7d35fb1261bd9d62e51ec0780ff31e5a17d8`
+- `runtime/source_intake.py`: `f25b773b928664ab006d816d74081d57e097f69e5a17b7432356ea76c1b33948`
+
+### Remaining risks
+
+- Legacy parser and `find_pdf()` wrappers remain intentionally available for
+  compatibility, but all first-party ingestion paths now use structured,
+  fail-closed results.
+- A failed Zotero parse currently terminates source intake with a typed
+  diagnostic encoded in the exception. Phase 2 will persist the same failure
+  as inventory, quarantine, audit, and job-outcome artifacts.
+- Repository-wide pyright debt remains part of the final delivery gate; the
+  four Phase 1 contract modules themselves are type-clean.
