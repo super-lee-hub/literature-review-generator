@@ -4,7 +4,7 @@ import hashlib
 import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from services.citation_catalog import (
     augment_citation_catalog_from_literature_map,
@@ -15,6 +15,7 @@ from services.citation_catalog import (
 )
 from services.citation_ref_catalog import extract_ref_ids_from_token, resolve_ref_id
 from services.job_workspace import utc_now_iso
+from services.sentence_segmenter import segment_sentences
 
 
 @dataclass(frozen=True)
@@ -534,27 +535,8 @@ def _strip_citation_tokens(text: str) -> str:
     return cleaned
 
 
-def _unique_non_empty(values: Sequence[Any]) -> List[str]:
+def _unique_non_empty(values: Iterable[Any]) -> List[str]:
     return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
-
-
-def _sentence_spans(block_text: str) -> List[tuple[int, int, str]]:
-    text = block_text or ""
-    spans: List[tuple[int, int, str]] = []
-    start = 0
-    for match in re.finditer(r"[。！？!?\.]+(?:\s+|$)", text):
-        end = match.end()
-        chunk = text[start:end].strip()
-        if chunk:
-            spans.append((start, end, chunk))
-        start = end
-    if start < len(text):
-        chunk = text[start:].strip()
-        if chunk:
-            spans.append((start, len(text), chunk))
-    if not spans and text.strip():
-        spans.append((0, len(text), text.strip()))
-    return spans
 
 
 def _occurrence_bounds(occurrence: CitationOccurrence) -> tuple[Optional[int], Optional[int]]:
@@ -644,8 +626,9 @@ def _build_claim_unit(
     sentence_occurrences: Sequence[CitationOccurrence],
     block_text: str,
 ) -> Dict[str, Any]:
+    raw_sentence = block_text[span_start:span_end]
     alignment_status, alignment_confidence = _alignment_for_sentence(
-        sentence_text=block_text[span_start:span_end],
+        sentence_text=raw_sentence,
         sentence_start=span_start,
         block_text_before_sentence=block_text[:span_start],
         sentence_occurrences=sentence_occurrences,
@@ -660,6 +643,8 @@ def _build_claim_unit(
         "sentence_index": sentence_index,
         "span_start": span_start,
         "span_end": span_end,
+        "raw_text": raw_sentence,
+        "display_text": raw_sentence.strip(),
         "claim_text": claim_text,
         "citation_tokens": sorted(
             dict.fromkeys(occ.citation_token for occ in sentence_occurrences if occ.citation_token)
@@ -698,8 +683,11 @@ def _build_citation_set_bundles(
             if not block_occurrences:
                 continue
 
-            sentence_spans = _sentence_spans(block_text)
-            for sentence_index, (sent_start, sent_end, sentence_text) in enumerate(sentence_spans, start=1):
+            sentence_spans = segment_sentences(block_text)
+            for sentence_index, sentence_span in enumerate(sentence_spans, start=1):
+                sent_start = sentence_span.span_start
+                sent_end = sentence_span.span_end
+                sentence_text = sentence_span.raw_text
                 sentence_occurrences = [
                     occurrence
                     for occurrence in block_occurrences

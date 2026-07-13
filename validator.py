@@ -11,7 +11,7 @@ import traceback
 import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Dict, Any, List, Mapping
+from typing import Optional, Dict, Any, List, Mapping, cast
 from datetime import datetime
 import configparser
 
@@ -52,6 +52,11 @@ from services.repair_policy import (
     requires_manual_confirmation,
     unsafe_auto_rewrite_enabled,
 )
+from validation.run_result import (
+    ClaimVerdict,
+    ValidationExecutionStatus,
+    ValidationRunResultV1,
+)
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:
@@ -70,7 +75,10 @@ def _get_config_section(config_obj: Any, section_name: str) -> Dict[str, Any]:
     if callable(has_section) and callable(items):
         try:
             if has_section(section_name):
-                return {str(key): value for key, value in items(section_name)}
+                section_items = items(section_name)
+                if isinstance(section_items, Mapping):
+                    return {str(key): value for key, value in section_items.items()}
+                return {str(key): value for key, value in cast(Any, section_items)}
         except Exception:
             return {}
     if isinstance(config_obj, Mapping):
@@ -447,9 +455,10 @@ def _get_validation_workspace(generator_instance: Any) -> Any:
 
     from services.job_workspace import JobWorkspace
 
-    project_name = generator_instance.project_name or "unknown_project"
+    project_name = str(getattr(generator_instance, "project_name", "") or "unknown_project")
     job_id = datetime.now().strftime("%Y%m%dT%H%M%S")
-    return JobWorkspace(generator_instance.output_dir, project_name, job_id)
+    output_dir = str(getattr(generator_instance, "output_dir", "") or os.path.abspath("output"))
+    return JobWorkspace(output_dir, project_name, job_id)
 
 
 def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
@@ -564,6 +573,7 @@ def _build_report_from_results(citation_results: List[Any]) -> Any:
         ),
         partial_support_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.PARTIAL_SUPPORT),
         unsupported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.UNSUPPORTED),
+        contradicted_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.CONTRADICTED),
         wrong_source_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.WRONG_SOURCE),
         needs_review_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.NEEDS_REVIEW),
         citation_results=citation_results,
@@ -616,7 +626,8 @@ def _get_validator_api_config(generator_instance: Any) -> Optional[APIConfig]:
         getter = getattr(config_obj, "get", None)
         if callable(getter):
             try:
-                validator_section = getter("Validator_API") or {}
+                raw_section = getter("Validator_API") or {}
+                validator_section = dict(raw_section) if isinstance(raw_section, Mapping) else {}
             except TypeError:
                 validator_section = {}
     api_config = get_validator_api_config({"Validator_API": validator_section})
@@ -792,7 +803,35 @@ def _map_ai_bundle_result(result: Any, ai_report: Dict[str, Any]) -> Any:
         else:
             disposition = existing_disposition or "keep_as_is"
 
-    if status == "supported":
+    known_statuses = {
+        "supported",
+        "clean_supported",
+        "partial_support",
+        "partial",
+        "evidence_gap",
+        "unsupported",
+        "contradicted",
+        "wrong_source",
+        "mapping_error",
+        "low_confidence",
+        "needs_review",
+    }
+    if status not in known_statuses:
+        status = "needs_review"
+        low_confidence = True
+        disposition = "manual_review"
+        repair_scope = "manual_review"
+        ai_report = dict(ai_report)
+        ai_report["status"] = status
+        ai_report["disposition"] = disposition
+        ai_report["repair_scope"] = repair_scope
+        ai_report["low_confidence"] = True
+        ai_report["manual_review_reason"] = (
+            str(ai_report.get("manual_review_reason") or "").strip()
+            or "Validator returned an unknown status; manual review is required."
+        )
+
+    if status in {"supported", "clean_supported"}:
         conclusion = ValidationConclusion.SUPPORTED if disposition != "narrowed_and_kept" else ValidationConclusion.PARTIAL_SUPPORT
         root_causes: List[RootCause] = []
     elif status in {"partial_support", "partial", "evidence_gap"}:
@@ -801,12 +840,18 @@ def _map_ai_bundle_result(result: Any, ai_report: Dict[str, Any]) -> Any:
     elif status in {"wrong_source", "mapping_error"}:
         conclusion = ValidationConclusion.WRONG_SOURCE
         root_causes = [RootCause.CITATION_MAPPING_ERROR]
-    elif low_confidence:
+    elif status == "contradicted":
+        conclusion = ValidationConclusion.CONTRADICTED
+        root_causes = [RootCause.REVIEW_DRIFT]
+    elif status == "unsupported":
+        conclusion = ValidationConclusion.UNSUPPORTED
+        root_causes = [RootCause.INSUFFICIENT_CONTEXT]
+    elif status in {"low_confidence", "needs_review"} or low_confidence:
         conclusion = ValidationConclusion.NEEDS_REVIEW
         root_causes = [RootCause.LOW_CONFIDENCE]
     else:
-        conclusion = ValidationConclusion.UNSUPPORTED
-        root_causes = []
+        conclusion = ValidationConclusion.NEEDS_REVIEW
+        root_causes = [RootCause.LOW_CONFIDENCE]
 
     if repair_scope == "summary":
         root_causes.append(RootCause.SUMMARY_DRIFT)
@@ -1193,33 +1238,57 @@ def _write_validation_reports(
     manual_review_items: List[Any],
     repair_policy: ValidationRepairPolicy,
 ) -> Dict[str, str]:
+    del manual_review_items  # compatibility input; projections use only the canonical run result
     workspace = _get_validation_workspace(generator_instance)
     project_name = workspace.project_name
     os.makedirs(workspace.paths.reports_dir, exist_ok=True)
+    validation_run_result = (
+        report
+        if isinstance(report, ValidationRunResultV1)
+        else ValidationRunResultV1.from_report(
+            report,
+            job_id=str(getattr(workspace, "job_id", "") or "legacy-workspace"),
+            repair_policy=repair_policy.value,
+        )
+    )
+    validation_run_result_file = os.path.join(
+        workspace.paths.reports_dir,
+        f"{project_name}_validation_run_result_v1.json",
+    )
     report_file = os.path.join(workspace.paths.reports_dir, f"{project_name}_validation_report.txt")
     manual_report_file = os.path.join(workspace.paths.reports_dir, f"{project_name}_manual_review_report.json")
+    completion_report_file = os.path.join(
+        workspace.paths.reports_dir,
+        f"{project_name}_validation_completion.json",
+    )
 
-    lines = ["auto-generate validation report", f"generated_at: {datetime.now().isoformat()}", "=" * 40]
-    lines.append(f"repair_policy: {repair_policy.value}")
+    from services.job_workspace import atomic_write_json
+
+    atomic_write_json(validation_run_result_file, validation_run_result.to_dict())
+
+    lines = [
+        "auto-generate validation report",
+        f"generated_at: {validation_run_result.updated_at}",
+        "=" * 40,
+    ]
+    lines.append(f"validation_run_id: {validation_run_result.validation_run_id}")
+    lines.append(f"execution_status: {validation_run_result.execution_status.value}")
+    lines.append(f"validation_disposition: {validation_run_result.validation_disposition.value}")
+    lines.append(f"repair_policy: {validation_run_result.repair_policy}")
     lines.append(f"unsafe_auto_rewrite_enabled: {unsafe_auto_rewrite_enabled(repair_policy)}")
     lines.append("summary")
-    lines.append(f"total_citation_sets: {report.total_citations}")
-    lines.append(f"supported: {report.supported_count}")
-    lines.append(f"narrowed_and_kept: {getattr(report, 'narrowed_and_kept_count', 0)}")
-    lines.append(f"evidence_gap: {getattr(report, 'evidence_gap_count', 0)}")
-    lines.append(f"partial_support: {report.partial_support_count}")
-    lines.append(f"unsupported: {report.unsupported_count}")
-    lines.append(f"wrong_source: {report.wrong_source_count}")
-    lines.append(f"needs_review: {report.needs_review_count}")
+    lines.append(f"total_claims: {validation_run_result.total_claims}")
+    for verdict in ClaimVerdict:
+        lines.append(
+            f"{verdict.value}: {validation_run_result.claim_verdict_counts[verdict.value]}"
+        )
     lines.append("")
     lines.append("details")
-    for index, result in enumerate(report.citation_results, start=1):
-        lines.append(f"{index}. citation_set: {result.citation_set_key or result.citation_id}")
-        lines.append(f"   papers: {', '.join(result.paper_ids) if result.paper_ids else result.paper_id}")
-        lines.append(f"   conclusion: {result.conclusion.value}")
-        lines.append(f"   evidence_status: {_result_evidence_status(result) or '?'}")
-        lines.append(f"   disposition: {_result_disposition(result) or '?'}")
-        lines.append(f"   root_causes: {', '.join(root.value for root in result.root_causes) or '?'}")
+    for index, result in enumerate(validation_run_result.claim_results, start=1):
+        lines.append(f"{index}. citation_set: {result.citation_set_key or result.claim_result_id}")
+        lines.append(f"   papers: {', '.join(result.paper_ids) or '?'}")
+        lines.append(f"   claim_verdict: {result.verdict.value}")
+        lines.append(f"   root_causes: {', '.join(result.root_causes) or '?'}")
         lines.append(f"   claim: {result.claim_text[:300]}")
         lines.append(f"   reasoning: {result.reasoning_summary}")
         if result.repair_hint:
@@ -1230,38 +1299,119 @@ def _write_validation_reports(
         handle.write("\n".join(lines))
 
     manual_payload = {
-        "generated_at": datetime.now().isoformat(),
-        "repair_policy": repair_policy.value,
+        "generated_at": validation_run_result.updated_at,
+        "validation_run_id": validation_run_result.validation_run_id,
+        "repair_policy": validation_run_result.repair_policy,
         "requires_manual_confirmation": requires_manual_confirmation(repair_policy),
         "eligible_for_manual_apply": requires_manual_confirmation(repair_policy),
         "unsafe_auto_rewrite_enabled": unsafe_auto_rewrite_enabled(repair_policy),
-        "total_items": len(manual_review_items),
+        "total_items": sum(
+            1
+            for item in validation_run_result.claim_results
+            if item.verdict
+            in {ClaimVerdict.NEEDS_REVIEW, ClaimVerdict.WRONG_SOURCE, ClaimVerdict.CONTRADICTED}
+        ),
         "items": [
             {
                 "citation_set_key": item.citation_set_key,
-                "paper_ids": item.paper_ids,
+                "paper_ids": list(item.paper_ids),
                 "claim_text": item.claim_text,
                 "reasoning_summary": item.reasoning_summary,
                 "repair_hint": item.repair_hint,
-                "manual_review_reason": item.details.get("manual_review_reason", ""),
-                "evidence_status": _result_evidence_status(item),
-                "disposition": _result_disposition(item),
+                "claim_verdict": item.verdict.value,
+                "manual_review_reason": str(item.details.get("manual_review_reason", "")),
             }
-            for item in manual_review_items
+            for item in validation_run_result.claim_results
+            if item.verdict
+            in {ClaimVerdict.NEEDS_REVIEW, ClaimVerdict.WRONG_SOURCE, ClaimVerdict.CONTRADICTED}
         ],
     }
-    with open(manual_report_file, "w", encoding="utf-8") as handle:
-        json.dump(manual_payload, handle, ensure_ascii=False, indent=2)
+    atomic_write_json(manual_report_file, manual_payload)
+
+    completion_payload = {
+        "artifact_type": "validation_completion_projection",
+        "artifact_version": "v1",
+        "validation_run_id": validation_run_result.validation_run_id,
+        "execution_status": validation_run_result.execution_status.value,
+        "validation_disposition": validation_run_result.validation_disposition.value,
+        "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
+        "contradicted_count": validation_run_result.contradicted_count,
+        "total_claims": validation_run_result.total_claims,
+        "canonical_result_path": validation_run_result_file,
+        "canonical_result_hash": validation_run_result.stable_hash(),
+    }
+    atomic_write_json(completion_report_file, completion_payload)
 
     audit_paths: Dict[str, str] = {}
     try:
         from validation.claim_alignment_audit import write_claim_alignment_audit
 
-        audit_paths = write_claim_alignment_audit(report, workspace.paths.reports_dir)
+        audit_paths = write_claim_alignment_audit(validation_run_result, workspace.paths.reports_dir)
     except Exception:
         audit_paths = {}
 
-    return {"report_file": report_file, "manual_report_file": manual_report_file, **audit_paths}
+    registry = getattr(generator_instance, "artifact_registry", None)
+    if registry is not None:
+        registry.register_file(
+            artifact_role="validation",
+            artifact_type="validation_run_result",
+            artifact_version="v1",
+            path=validation_run_result_file,
+            producer="validator._write_validation_reports",
+            artifact_id=validation_run_result.validation_run_id,
+            metadata={
+                "execution_status": validation_run_result.execution_status.value,
+                "validation_disposition": validation_run_result.validation_disposition.value,
+                "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
+            },
+        )
+
+    return {
+        "validation_run_result_file": validation_run_result_file,
+        "report_file": report_file,
+        "manual_report_file": manual_report_file,
+        "completion_report_file": completion_report_file,
+        **audit_paths,
+    }
+
+
+def _terminal_validation_result(
+    generator_instance: Any,
+    *,
+    execution_status: ValidationExecutionStatus,
+    repair_policy: ValidationRepairPolicy,
+    diagnostic: str,
+    failure_reason: str = "",
+) -> tuple[ValidationRunResultV1, Dict[str, str]]:
+    workspace = _get_validation_workspace(generator_instance)
+    result = ValidationRunResultV1.create(
+        job_id=workspace.job_id,
+        execution_status=execution_status,
+        repair_policy=repair_policy.value,
+        diagnostics=(diagnostic,),
+        failure_reason=failure_reason,
+    )
+    try:
+        paths = _write_validation_reports(generator_instance, result, [], repair_policy)
+    except Exception as projection_error:
+        generator_instance.logger.error(
+            f"Failed to persist terminal validation result: {projection_error}"
+        )
+        paths = {}
+    return result, paths
+
+
+def _validation_return_payload(
+    result: ValidationRunResultV1,
+    report_paths: Mapping[str, str],
+) -> Dict[str, Any]:
+    return {
+        "validation_run_result": result,
+        "validation_run_result_payload": result.to_dict(),
+        "execution_status": result.execution_status.value,
+        "validation_disposition": result.validation_disposition.value,
+        **dict(report_paths),
+    }
 
 
 def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
@@ -1274,14 +1424,42 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
         )
         if not stage2_enabled:  # type: ignore
             generator_instance.logger.warning("Stage-2 validation is disabled; skipping review validation.")  # type: ignore
-            return {"success": True, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+            repair_policy = ValidationRepairPolicy.REPORT_ONLY
+            validation_result, report_paths = _terminal_validation_result(
+                generator_instance,
+                execution_status=ValidationExecutionStatus.SKIPPED,
+                repair_policy=repair_policy,
+                diagnostic="stage2_validation_disabled",
+            )
+            return {
+                "success": True,
+                "report": None,
+                "review_draft": None,
+                "citation_manifest": None,
+                "paper_artifacts": None,
+                **_validation_return_payload(validation_result, report_paths),
+            }
 
         repair_policy = _get_validation_repair_policy(generator_instance)
         generator_instance.logger.info(f"Validation repair policy: {repair_policy.value}")
 
         review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata = _load_validation_inputs(generator_instance)
         if review_draft is None or citation_manifest is None:
-            return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+            validation_result, report_paths = _terminal_validation_result(
+                generator_instance,
+                execution_status=ValidationExecutionStatus.FAILED,
+                repair_policy=repair_policy,
+                diagnostic="validation_inputs_missing",
+                failure_reason="review draft or citation manifest is missing",
+            )
+            return {
+                "success": False,
+                "report": None,
+                "review_draft": None,
+                "citation_manifest": None,
+                "paper_artifacts": None,
+                **_validation_return_payload(validation_result, report_paths),
+            }
         sections = review_draft.get("content", {}).get("sections", []) if isinstance(review_draft, dict) else []
         block_count = sum(len(section.get("blocks", [])) for section in sections)
         citation_sets = citation_manifest.get("citation_sets", []) if isinstance(citation_manifest, dict) else []
@@ -1318,7 +1496,13 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
         )
         final_report = _build_report_from_results(enriched_results)
         manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
-        report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items, repair_policy)
+        workspace = _get_validation_workspace(generator_instance)
+        validation_result = ValidationRunResultV1.from_report(
+            final_report,
+            job_id=workspace.job_id,
+            repair_policy=repair_policy.value,
+        )
+        report_paths = _write_validation_reports(generator_instance, validation_result, manual_review_items, repair_policy)
         generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
         generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
         if report_paths.get("claim_alignment_audit_json"):
@@ -1365,7 +1549,21 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             generator_instance.logger.info("Repairs applied; re-running review validation.")
             review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata = _load_validation_inputs(generator_instance)
             if review_draft is None or citation_manifest is None:
-                return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+                validation_result, report_paths = _terminal_validation_result(
+                    generator_instance,
+                    execution_status=ValidationExecutionStatus.FAILED,
+                    repair_policy=repair_policy,
+                    diagnostic="revalidation_inputs_missing",
+                    failure_reason="review draft or citation manifest is missing after repair",
+                )
+                return {
+                    "success": False,
+                    "report": None,
+                    "review_draft": None,
+                    "citation_manifest": None,
+                    "paper_artifacts": None,
+                    **_validation_return_payload(validation_result, report_paths),
+                }
             validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
             revalidated = _run_base_review_validation(
                 validator,
@@ -1379,7 +1577,12 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             )
             final_report = _build_report_from_results(rerun_results)
             manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
-            report_paths = _write_validation_reports(generator_instance, final_report, manual_review_items, repair_policy)
+            validation_result = ValidationRunResultV1.from_report(
+                final_report,
+                job_id=workspace.job_id,
+                repair_policy=repair_policy.value,
+            )
+            report_paths = _write_validation_reports(generator_instance, validation_result, manual_review_items, repair_policy)
             generator_instance.logger.success(f"Validation recheck report written: {report_paths['report_file']}")
             generator_instance.logger.info(f"Manual review recheck report written: {report_paths['manual_report_file']}")
             if report_paths.get("claim_alignment_audit_json"):
@@ -1405,16 +1608,51 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             "repair_policy": repair_policy.value,
             "unsafe_auto_rewrite_enabled": unsafe_auto_rewrite_enabled(repair_policy),
             "repair_pipeline": repair_pipeline_result,
-            **report_paths,
+            **_validation_return_payload(validation_result, report_paths),
         }
 
     except (configparser.NoSectionError, configparser.NoOptionError):
         generator_instance.logger.error("Validation configuration is incomplete.")
-        return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+        repair_policy = ValidationRepairPolicy.REPORT_ONLY
+        validation_result, report_paths = _terminal_validation_result(
+            generator_instance,
+            execution_status=ValidationExecutionStatus.FAILED,
+            repair_policy=repair_policy,
+            diagnostic="validation_configuration_incomplete",
+            failure_reason="validation configuration is incomplete",
+        )
+        return {
+            "success": False,
+            "report": None,
+            "review_draft": None,
+            "citation_manifest": None,
+            "paper_artifacts": None,
+            **_validation_return_payload(validation_result, report_paths),
+        }
     except Exception as exc:
         generator_instance.logger.error(f"Review validation failed: {exc}")
         traceback.print_exc()
-        return {"success": False, "report": None, "review_draft": None, "citation_manifest": None, "paper_artifacts": None}
+        repair_policy = locals().get("repair_policy", ValidationRepairPolicy.REPORT_ONLY)
+        execution_status = (
+            ValidationExecutionStatus.CANCELLED
+            if "cancel" in type(exc).__name__.lower()
+            else ValidationExecutionStatus.FAILED
+        )
+        validation_result, report_paths = _terminal_validation_result(
+            generator_instance,
+            execution_status=execution_status,
+            repair_policy=repair_policy,
+            diagnostic="validation_cancelled" if execution_status is ValidationExecutionStatus.CANCELLED else "validation_failed",
+            failure_reason=str(exc),
+        )
+        return {
+            "success": False,
+            "report": None,
+            "review_draft": None,
+            "citation_manifest": None,
+            "paper_artifacts": None,
+            **_validation_return_payload(validation_result, report_paths),
+        }
 
 def run_week3_review_validation(
     review_draft: Dict[str, Any],

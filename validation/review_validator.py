@@ -10,6 +10,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from services.citation_manifest import normalize_citation_set_key
+from services.sentence_segmenter import sentence_span_entries
 from . import PreprocessEvidenceLoader
 from .evidence_resolver import (
     EvidenceCandidate,
@@ -23,6 +24,7 @@ class ValidationConclusion(Enum):
     SUPPORTED = "SUPPORTED"
     PARTIAL_SUPPORT = "PARTIAL_SUPPORT"
     UNSUPPORTED = "UNSUPPORTED"
+    CONTRADICTED = "CONTRADICTED"
     WRONG_SOURCE = "WRONG_SOURCE"
     NEEDS_REVIEW = "NEEDS_REVIEW"
 
@@ -41,6 +43,7 @@ class EvidenceStatus(Enum):
     CLEAN_SUPPORTED = "clean_supported"
     EVIDENCE_GAP = "evidence_gap"
     UNSUPPORTED = "unsupported"
+    CONTRADICTED = "contradicted"
     WRONG_SOURCE = "wrong_source"
     NEEDS_REVIEW = "needs_review"
 
@@ -97,41 +100,17 @@ class ReviewValidationReport:
     citation_results: List[CitationValidationResult]
     narrowed_and_kept_count: int = 0
     evidence_gap_count: int = 0
-
-
-def _sentence_spans(block_text: str) -> List[tuple[int, int, str]]:
-    text = block_text or ""
-    spans: List[tuple[int, int, str]] = []
-    start = 0
-    for match in re.finditer(r"[。！？!?\.]+(?:\s+|$)", text):
-        end = match.end()
-        chunk = text[start:end].strip()
-        if chunk:
-            spans.append((start, end, chunk))
-        start = end
-    if start < len(text):
-        chunk = text[start:].strip()
-        if chunk:
-            spans.append((start, len(text), chunk))
-    if not spans and text.strip():
-        spans.append((0, len(text), text.strip()))
-    return spans
+    contradicted_count: int = 0
 
 
 def _strip_citation_tokens(text: str) -> str:
-    return " ".join(re.sub(r"\[\[cite:[^\]]+\]\]", "", text or "").split()).strip()
+    cleaned = re.sub(r"\[\[cite_ref:[^\]]+\]\]", "", text or "")
+    cleaned = re.sub(r"\[\[cite:[^\]]+\]\]", "", cleaned)
+    return " ".join(cleaned.split()).strip()
 
 
 def _sentence_span_entries(block_text: str) -> List[Dict[str, Any]]:
-    return [
-        {
-            "sentence_index": sentence_index,
-            "span_start": span_start,
-            "span_end": span_end,
-            "text": sentence_text,
-        }
-        for sentence_index, (span_start, span_end, sentence_text) in enumerate(_sentence_spans(block_text), start=1)
-    ]
+    return sentence_span_entries(block_text)
 
 
 _FUTURE_DIRECTION_HINTS = (
@@ -347,6 +326,8 @@ def _build_claim_unit(
     block_anchor_hash: str,
     claim_unit_id: str,
     paper_ids: Optional[List[str]] = None,
+    raw_text: str = "",
+    display_text: str = "",
 ) -> Dict[str, Any]:
     citation_set_key = str(bundle.get("citation_set_key") or bundle.get("bundle_id") or "unknown")
     resolved_paper_ids = list(paper_ids or bundle.get("paper_ids", []))
@@ -359,6 +340,8 @@ def _build_claim_unit(
         "sentence_index": sentence_index,
         "span_start": span_start,
         "span_end": span_end,
+        "raw_text": raw_text,
+        "display_text": display_text or raw_text.strip(),
         "claim_text": claim_text,
         "citation_tokens": citation_tokens,
         "block_anchor_hash": block_anchor_hash,
@@ -424,6 +407,8 @@ def _compat_conclusion_for_state(
     evidence_status: str,
     disposition: str,
 ) -> ValidationConclusion:
+    if evidence_status == EvidenceStatus.CONTRADICTED.value:
+        return ValidationConclusion.CONTRADICTED
     if evidence_status == EvidenceStatus.WRONG_SOURCE.value:
         return ValidationConclusion.WRONG_SOURCE
     if evidence_status == EvidenceStatus.CLEAN_SUPPORTED.value and disposition == ValidationDisposition.KEEP_AS_IS.value:
@@ -450,6 +435,7 @@ def _build_review_validation_report(citation_results: List[CitationValidationRes
         ),
         partial_support_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.PARTIAL_SUPPORT),
         unsupported_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.UNSUPPORTED),
+        contradicted_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.CONTRADICTED),
         wrong_source_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.WRONG_SOURCE),
         needs_review_count=sum(1 for item in citation_results if item.conclusion == ValidationConclusion.NEEDS_REVIEW),
         citation_results=citation_results,
@@ -594,13 +580,17 @@ class ReviewValidator:
             block_text = str(block.get("text") or "").strip() if block else ""
             if not block_text:
                 continue
+            assert block is not None
             block_anchor_hash = str(block.get("anchor_hash") or "")
-            sentences = block.get("span_map", {}).get("sentences", []) if block else []
-            if not sentences:
-                sentences = _sentence_span_entries(block_text)
+            # Old span maps can contain offsets calculated before text trimming.
+            # Rebuild them from canonical block text instead of trusting them as
+            # patch-safe source spans.
+            sentences = _sentence_span_entries(block_text)
 
             for sentence in sentences:
-                cleaned_sentence = _strip_citation_tokens(str(sentence.get("text") or ""))
+                cleaned_sentence = _strip_citation_tokens(
+                    str(sentence.get("display_text") or sentence.get("text") or "")
+                )
                 if claim_texts and cleaned_sentence not in claim_texts:
                     continue
                 claim_unit_id = hashlib.sha256(
@@ -617,6 +607,8 @@ class ReviewValidator:
                         citation_tokens=list(bundle.get("citation_tokens", [])),
                         block_anchor_hash=block_anchor_hash,
                         claim_unit_id=claim_unit_id,
+                        raw_text=str(sentence.get("raw_text") or ""),
+                        display_text=str(sentence.get("display_text") or sentence.get("text") or ""),
                     )
                 )
 
@@ -789,6 +781,9 @@ class ReviewValidator:
                 if paper_id in unit_missing_papers:
                     continue
                 paper_artifact = self.paper_artifacts.get(paper_id)
+                if paper_artifact is None:
+                    unit_missing_papers.append(paper_id)
+                    continue
                 paper_identity_hints.setdefault(
                     paper_id,
                     _paper_identity_hint(

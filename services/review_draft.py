@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from services.citation_ref_catalog import extract_ref_ids_from_token, resolve_ref_id
 from services.job_workspace import utc_now_iso
+from services.sentence_segmenter import build_sentence_span_map
 
 
 @dataclass(frozen=True)
@@ -277,35 +278,8 @@ def _extract_citations_from_text(
     return citations
 
 
-def _sentence_spans(text: str) -> List[tuple[int, int, str]]:
-    spans: List[tuple[int, int, str]] = []
-    start = 0
-    for match in re.finditer(r"[。！？!?\.]+(?:\s+|$)", text):
-        end = match.end()
-        chunk = text[start:end].strip()
-        if chunk:
-            spans.append((start, end, chunk))
-        start = end
-    if start < len(text):
-        chunk = text[start:].strip()
-        if chunk:
-            spans.append((start, len(text), chunk))
-    if not spans and text.strip():
-        spans.append((0, len(text), text.strip()))
-    return spans
-
-
 def _build_block_span_map(text: str) -> Dict[str, Any]:
-    sentences = [
-        {
-            "sentence_index": sentence_index,
-            "span_start": span_start,
-            "span_end": span_end,
-            "text": sentence_text,
-        }
-        for sentence_index, (span_start, span_end, sentence_text) in enumerate(_sentence_spans(text), start=1)
-    ]
-    return {"sentences": sentences}
+    return build_sentence_span_map(text)
 
 
 def _build_anchor_text(text: str) -> str:

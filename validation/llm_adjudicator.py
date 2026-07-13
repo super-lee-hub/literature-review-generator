@@ -195,10 +195,10 @@ def _build_prompts(packet: AdjudicationPacket) -> tuple[str, str]:
     system_prompt = (
         "Return JSON only with keys: status, confidence, repair_scope, disposition, low_confidence, reasoning, "
         "repair_hint, summary_paper_ids, manual_review_reason, claim_type, claim_type_confidence, claim_type_rationale, adjudication_status. "
-        "status must be one of supported, partial_support, evidence_gap, unsupported, wrong_source, low_confidence. "
+        "status must be one of supported, partial_support, evidence_gap, unsupported, contradicted, wrong_source, low_confidence. "
         "repair_scope must be one of none, summary, review, both, manual_review. "
         "disposition must be one of keep_as_is, narrowed_and_kept, manual_review, fail, summary_repair, review_repair, both_repair. "
-        "adjudication_status should summarize the semantic outcome (for example supported, evidence_gap, uncertain, wrong_source, unsupported)."
+        "adjudication_status should summarize the semantic outcome (for example supported, evidence_gap, uncertain, wrong_source, unsupported, contradicted)."
     )
     return prompt, system_prompt
 

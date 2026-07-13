@@ -12,7 +12,7 @@ from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_entry, stage_policy_for
 from runtime.validation_adapter import RuntimeValidationAdapter
-from services.artifact_registry import ArtifactDependencyRef, ArtifactRecord
+from services.artifact_registry import ArtifactDependencyRef, ArtifactDependencyRefV2, ArtifactRecord
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
 from services.job_workspace import atomic_write_json
 from services.queue_service import CancelToken
@@ -511,11 +511,28 @@ class AgentRuntimeBridge:
         adapter = self.build_validation_adapter(session)
         result = dict(validator_module.run_review_validation(adapter) or {})
 
+        from validation.run_result import ValidationExecutionStatus, ValidationRunResultV1
+
+        validation_run_result_file = str(result.get("validation_run_result_file") or "")
         report_file = str(result.get("report_file") or "")
         manual_report_file = str(result.get("manual_report_file") or "")
-        report_obj = result.get("report")
-        report_id = str(getattr(report_obj, "report_id", "") or "")
-        report_version = str(getattr(report_obj, "artifact_version", "") or "v1")
+        completion_report_file = str(result.get("completion_report_file") or "")
+        run_obj = result.get("validation_run_result")
+        if isinstance(run_obj, ValidationRunResultV1):
+            validation_run_result = run_obj
+        elif isinstance(run_obj, Mapping):
+            validation_run_result = ValidationRunResultV1.from_dict(run_obj)
+        elif validation_run_result_file and Path(validation_run_result_file).is_file():
+            validation_run_result = ValidationRunResultV1.from_dict(
+                json.loads(Path(validation_run_result_file).read_text(encoding="utf-8"))
+            )
+        else:
+            legacy_report = result.get("report")
+            legacy_payload: Mapping[str, Any] = legacy_report if isinstance(legacy_report, Mapping) else {}
+            validation_run_result = ValidationRunResultV1.from_legacy_report(
+                legacy_payload,
+                job_id=session.context.workspace.job_id,
+            )
 
         artifact_refs: list[StageArtifactRef] = []
         depends_on = [
@@ -529,27 +546,54 @@ class AgentRuntimeBridge:
             ),
         ]
 
-        if report_file:
-            record = session.context.registry.register_file(
+        canonical_record: ArtifactRecord | None = None
+        if validation_run_result_file:
+            canonical_record = session.context.registry.register_file(
                 artifact_role="validation",
-                artifact_type="validation_report",
-                artifact_version=report_version,
-                path=report_file,
-                producer=producer,
-                depends_on=depends_on,
-                artifact_id=report_id or None,
-            )
-            artifact_refs.append(self._artifact_ref_from_record(record))
-
-        if manual_report_file:
-            record = session.context.registry.register_file(
-                artifact_role="validation",
-                artifact_type="manual_review_report",
+                artifact_type="validation_run_result",
                 artifact_version="v1",
-                path=manual_report_file,
+                path=validation_run_result_file,
                 producer=producer,
                 depends_on=depends_on,
-                artifact_id=f"manual_review_report:{Path(manual_report_file).name}",
+                artifact_id=validation_run_result.validation_run_id,
+                metadata={
+                    "execution_status": validation_run_result.execution_status.value,
+                    "validation_disposition": validation_run_result.validation_disposition.value,
+                    "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
+                },
+            )
+            artifact_refs.append(self._artifact_ref_from_record(canonical_record))
+
+        projection_dependencies = depends_on
+        if canonical_record is not None:
+            projection_dependencies = [
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=session.context.workspace.job_id,
+                    artifact_id=canonical_record.artifact_id,
+                    artifact_type=canonical_record.artifact_type,
+                    path=canonical_record.path,
+                    content_hash=canonical_record.content_hash,
+                )
+            ]
+
+        projections = (
+            (report_file, "validation_report_projection", "validation-report"),
+            (manual_report_file, "manual_review_projection", "manual-review"),
+            (completion_report_file, "validation_completion_projection", "validation-completion"),
+            (str(result.get("claim_alignment_audit_json") or ""), "claim_alignment_audit_projection", "claim-alignment"),
+        )
+        for path, artifact_type, artifact_prefix in projections:
+            if not path:
+                continue
+            record = session.context.registry.register_file(
+                artifact_role="validation_projection",
+                artifact_type=artifact_type,
+                artifact_version="v1",
+                path=path,
+                producer=producer,
+                depends_on=projection_dependencies,
+                artifact_id=f"{artifact_prefix}:{Path(path).name}",
             )
             artifact_refs.append(self._artifact_ref_from_record(record))
 
@@ -561,18 +605,28 @@ class AgentRuntimeBridge:
                     step_name="run_review_validation",
                     producer=producer,
                     execution_mode=ExecutionMode.LOCAL,
-                    metadata={"report_file": report_file, "manual_report_file": manual_report_file},
+                    metadata={
+                        "validation_run_result_file": validation_run_result_file,
+                        "report_file": report_file,
+                        "manual_report_file": manual_report_file,
+                        "execution_status": validation_run_result.execution_status.value,
+                        "validation_disposition": validation_run_result.validation_disposition.value,
+                    },
                 )
             ],
         )
 
         return StageResult(
             stage_name="stage4_validate",
-            success=bool(result.get("success", False)),
+            success=validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED,
             artifacts=artifact_refs,
             metadata={
-                "manual_review_count": len(result.get("manual_review_items", []) or []),
-                "report_id": report_id,
+                "manual_review_count": validation_run_result.claim_verdict_counts.get("needs_review", 0),
+                "validation_run_id": validation_run_result.validation_run_id,
+                "execution_status": validation_run_result.execution_status.value,
+                "validation_disposition": validation_run_result.validation_disposition.value,
+                "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
+                "contradicted_count": validation_run_result.contradicted_count,
             },
         )
 
