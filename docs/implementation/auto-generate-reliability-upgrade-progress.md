@@ -375,3 +375,62 @@ code commit itself.
   public synthetic E2E remain Phase 8.
 - Repository-wide pyright debt remains a final-gate obligation; every changed
   Phase 5 runtime/service module is type-clean.
+
+## Phase 6 - Outline provider health and prompt-budget enforcement
+
+### Scope and provenance
+
+- Pre-phase commit: `5619a56`
+- Code checkpoint: `d7243c3`
+- Added the independent `outline_stage_health_v1.json` sidecar without changing
+  the schema/version of candidates, critiques, arbitration, final outline, or
+  coverage-audit artifacts.
+- Recorded logical provider calls, schema validity, input/output hashes, prompt
+  budgets, fallback provenance, and degradation reasons across candidate
+  generation, research-stream synthesis, critiques, and arbitration.
+- Made registered, current, non-degraded stage health a prerequisite for both
+  explicit adoption surfaces and downstream v2 resolution. Production
+  deterministic fallback/top-up is not adoptable; explicit test/dev doubles
+  remain testable without being confused with production fallback.
+- Added immutable `outline_manual_adoption` audit records referencing final,
+  audit, health, and adopted artifact identities/hashes.
+- Enforced the exact input-budget formula `context - max output - ceil(10% of
+  context)`, removed the `research_streams[:80]` truncation, and added complete
+  paper-packet research-stream synthesis plus hierarchical merge. Atomic inputs
+  that cannot fit fail closed rather than losing evidence.
+
+### Changed files
+
+- Health and budget contracts: `outline/stage_health.py`,
+  `outline/prompt_budget.py`, `outline/v2_config.py`.
+- Pipeline, prompt, adoption, and consumption gates: `outline/pipeline.py`,
+  `outline/candidates.py`, `outline/adoption.py`,
+  `outline/runtime_resolver.py`, `main.py`.
+- Health, budget, adoption, resolver, and regression tests under `tests/`.
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q tests/test_outline_stage_health.py tests/test_outline_prompt_budget.py tests/test_outline_adoption_gate.py tests/test_outline_runtime_alignment.py tests/test_outline_artifact_loop.py` | 0 | `34 passed in 4.46s` |
+| `python -m pytest -q tests -k "outline" --strict-markers` | 0 | `202 passed, 643 deselected in 12.46s` |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `823 passed, 22 deselected in 61.83s`; zero skips |
+| `python -m pyright outline/stage_health.py outline/prompt_budget.py outline/candidates.py outline/pipeline.py outline/adoption.py outline/runtime_resolver.py` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q outline main.py` | 0 | no diagnostics |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+
+### Artifact hashes
+
+- `outline/stage_health.py`: `236004a07d45d2d16f2a90998ee8988bd8b057e8b694466a34de3cd6fd89bb5e`
+- `outline/prompt_budget.py`: `58484c827f1404bb939e2fa999c74ac1c54f146fe42f05e24ef5c1b6a0ab862d`
+- `outline/pipeline.py`: `10b94fb3bafbad0b19b45942a4114a65e707f45f55694c093b71f5909d048093`
+- `outline/candidates.py`: `ddcec5794981a6274bca838bef5f7a2f620fb2e3f19aa5d82989236c7e7fc5b6`
+
+### Remaining risks
+
+- Phase 7 must make normalized text/chunks/page index/evidence manifest explicit
+  dependencies and move Validation recovery to claim-unit by paper edges.
+- Phase 8 must close provider preflight/circuit breakers, subprocess isolation,
+  Windows UTF-8 progress, compatibility documentation, and public synthetic E2E.
+- Repository-wide pyright debt remains a final-gate obligation; every changed
+  Phase 6 Outline module is type-clean.
