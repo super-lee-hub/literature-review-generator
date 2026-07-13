@@ -712,6 +712,72 @@ def test_process_paper_body_quality_failure_tries_other_reader_engine(tmp_path, 
     assert calls == [None, {"primary"}]
 
 
+def test_process_paper_accepts_backup_metadata_only_failure_without_reprocessing(tmp_path, monkeypatch) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
+    generator.mode = "zotero"
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.config = ConfigDict({
+        "Primary_Reader_API": {"api_key": "primary", "model": "m1", "api_base": "https://example.com/v1"},
+        "Backup_Reader_API": {"api_key": "backup", "model": "m2", "api_base": "https://example.com/v1"},
+    })
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_text("dummy pdf placeholder", encoding="utf-8")
+    reader_calls: list[set[str] | None] = []
+    preprocess_calls: list[str] = []
+
+    bad_summary = _quality_ready_ai_summary()
+    bad_summary["body_marker"] = "bad"
+    backup_summary = _quality_ready_ai_summary()
+    backup_summary["body_marker"] = "backup"
+
+    def _prepare_stage1_input(_path, preprocess_strategy="hybrid"):
+        preprocess_calls.append(preprocess_strategy)
+        return "x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}
+
+    def _fake_reader(*_args, skip_engines=None, **_kwargs):
+        reader_calls.append(skip_engines)
+        if skip_engines:
+            return {"content": backup_summary, "engine_type": "backup"}
+        return {"content": bad_summary, "engine_type": "primary"}
+
+    def _fake_validate(summary_data):
+        marker = summary_data["ai_summary"].get("body_marker")
+        if marker == "bad":
+            return False, "summary body missing"
+        return False, "journal metadata missing"
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", _prepare_stage1_input)
+    monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
+    monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
+    monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(generator, "_call_stage1_reader_with_scheduler", _fake_reader)
+    monkeypatch.setattr(generator, "_resolve_stage1_metadata_for_quality", lambda *_args: [])
+    monkeypatch.setattr(main, "validate_summary_quality", _fake_validate)
+    monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
+
+    result = generator.process_paper(
+        {
+            "title": "Working Paper",
+            "authors": ["Alice Example"],
+            "year": "2025",
+            "journal": "",
+            "doi": "10.2139/ssrn.1234",
+            "pdf_path": str(pdf_path),
+        },
+        0,
+        None,
+        1,
+    )
+
+    assert result is not None
+    assert result["status"] == "success"
+    assert result["model_used"] == "backup"
+    assert reader_calls == [None, {"primary"}]
+    assert preprocess_calls == ["hybrid"]
+    assert result["ai_summary"]["quality_audit"]["needs_manual_review"] is True
+
+
 def test_process_paper_returns_failed_when_all_stage1_strategies_fail(tmp_path, monkeypatch) -> None:
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
     generator.logger = cast(main.CustomLogger, _DummyLogger())
@@ -894,8 +960,9 @@ def test_process_paper_skips_ai_for_blocked_stage1_attempts(tmp_path, monkeypatc
     assert result is not None
     assert result["status"] == "success"
     assert ai_calls == ["primary"]
-    assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling"]
+    assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling", "mineru"]
     assert result["attempt_history"][0]["stage1_quality_reasons"] == ["incomplete_by_page_count"]
+    assert result["attempt_history"][-1]["success"] is True
 
 
 def test_stage1_strategy_policy_formal_precision_order() -> None:

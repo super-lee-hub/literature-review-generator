@@ -4112,6 +4112,41 @@ class LiteratureReviewGenerator:
                             }
                             
                             is_quality_ok_backup, quality_reason_backup = validate_summary_quality(temp_result_backup)
+
+                            if not is_quality_ok_backup and self._is_metadata_only_quality_failure(quality_reason_backup):
+                                resolved_fields = self._resolve_stage1_metadata_for_quality(
+                                    paper,
+                                    backup_result,
+                                    pdf_text,
+                                )
+                                if resolved_fields:
+                                    self.logger.info(
+                                        "Backup metadata-only quality issue resolved fields: "
+                                        f"{', '.join(resolved_fields)}"
+                                    )
+                                temp_result_backup = {
+                                    'paper_info': paper,
+                                    'status': 'success',
+                                    'ai_summary': backup_result,
+                                    'source_mode': self.mode,
+                                }
+                                is_quality_ok_backup, quality_reason_backup = validate_summary_quality(
+                                    temp_result_backup
+                                )
+                                if self._is_metadata_only_quality_failure(quality_reason_backup):
+                                    missing_fields = self._mark_summary_metadata_manual_review(
+                                        paper,
+                                        backup_result,
+                                        quality_reason_backup,
+                                    )
+                                    self.logger.warning(
+                                        "Backup Stage 1 summary body is usable but metadata remains incomplete; "
+                                        f"saved with manual-review flag: {', '.join(missing_fields) or quality_reason_backup}"
+                                    )
+                                    ai_result = backup_result
+                                    model_used = backup_model_used
+                                    strategy_succeeded = True
+                                    break
                             
                             if is_quality_ok_backup:
                                 self.logger.info("备用引擎内容质量检查通过")
@@ -4801,7 +4836,7 @@ class LiteratureReviewGenerator:
             file_index: Optional[FileIndex] = None
             if self.mode == "zotero":
                 paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
-                library_path: str = paths_config.get('library_path', '')
+                library_path: str = self.library_path or paths_config.get('library_path', '')
                 if library_path:
                     self.logger.info("正在创建文件索引...")
                     file_index = create_file_index(library_path)

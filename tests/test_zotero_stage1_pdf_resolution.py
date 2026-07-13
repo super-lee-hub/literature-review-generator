@@ -150,3 +150,46 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
     assert result is not None
     assert result["status"] == "success"
     assert seen["pdf_path"] == str(pdf_path)
+
+
+def test_process_all_papers_prefers_runtime_library_path(tmp_path: Path, monkeypatch) -> None:
+    runtime_library = tmp_path / "runtime-library"
+    runtime_library.mkdir()
+    configured_library = tmp_path / "configured-library"
+    configured_library.mkdir()
+
+    generator = main.LiteratureReviewGenerator(
+        project_name="demo",
+        pdf_folder=None,
+        library_path=str(runtime_library),
+    )
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.mode = "zotero"
+    generator.config = ConfigDict(
+        {
+            "Paths": {"library_path": str(configured_library)},
+            "Performance": {"max_workers": "1"},
+        }
+    )
+    generator.papers = [{"title": "Already processed", "authors": []}]
+    paper_key = generator.get_paper_key(generator.papers[0])
+    generator._checkpoint_processed_papers = {paper_key}
+    generator._checkpoint_failed_papers = set()
+
+    seen: dict[str, str] = {}
+
+    class _Index:
+        def __len__(self) -> int:
+            return 1
+
+    def _create_file_index(path: str) -> _Index:
+        seen["library_path"] = path
+        return _Index()
+
+    monkeypatch.setattr(main, "create_file_index", _create_file_index)
+    monkeypatch.setattr(generator, "_emit_stage1_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(generator, "save_summaries", lambda: True)
+    monkeypatch.setattr(generator, "save_checkpoint", lambda: True)
+
+    assert generator.process_all_papers() is True
+    assert seen["library_path"] == str(runtime_library)

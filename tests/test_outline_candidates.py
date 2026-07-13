@@ -533,6 +533,46 @@ class TestProductionCandidateGeneration:
         assert '"summary_index": 1' in captured["prompt"]
         assert '"paper_info"' in captured["prompt"]
 
+    def test_production_candidate_prompt_omits_runtime_summary_baggage(self):
+        summaries = _sample_summaries()
+        summaries[0]["preprocess"] = {"diagnostics": "x" * 10000}
+        summaries[0]["stage1_input"] = {"manifest": "y" * 10000}
+        summaries[0]["attempt_history"] = [{"error": "z" * 10000}]
+        summaries[0]["paper_info"]["source_descriptor"] = {"runtime": "w" * 10000}
+        lit_map = build_literature_map(summaries, "job-compact-stage1")
+        flow = build_synthesis_flow(lit_map, "job-compact-stage1")
+        flow_steps = [step.flow_step_id for step in flow.flow_steps if not step.placeholder_flow]
+        paper_keys = [node.paper_key for node in lit_map.paper_nodes]
+        captured = {}
+
+        def model_caller(route_name, prompt, metadata):
+            captured["prompt"] = prompt
+            return {
+                "candidates": [
+                    {
+                        "candidate_id": "candidate_1",
+                        "sections": _valid_provider_sections(flow_steps, paper_keys),
+                    }
+                ]
+            }
+
+        generate_candidates_production_with_report(
+            lit_map,
+            flow,
+            1,
+            "Outline_API",
+            model_caller,
+            OutlineQualityGateConfig(min_effective_sections=3),
+            source_summaries=summaries,
+        )
+
+        assert '"ai_summary"' in captured["prompt"]
+        assert '"preprocess"' not in captured["prompt"]
+        assert '"stage1_input"' not in captured["prompt"]
+        assert '"attempt_history"' not in captured["prompt"]
+        assert '"source_descriptor"' not in captured["prompt"]
+        assert "x" * 1000 not in captured["prompt"]
+
     def test_production_candidate_generation_calls_once_per_requested_candidate(self):
         lit_map = build_literature_map(_sample_summaries(), "job-split-candidates")
         flow = build_synthesis_flow(lit_map, "job-split-candidates")

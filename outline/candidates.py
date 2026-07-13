@@ -508,14 +508,63 @@ def generate_candidates_deterministic(
 
 
 def _source_summary_packet(summaries: Sequence[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+    semantic_paper_fields = (
+        "title",
+        "authors",
+        "year",
+        "date",
+        "journal",
+        "publication",
+        "doi",
+        "item_type",
+        "tags",
+        "abstract",
+        "other",
+        "canonical_paper_key",
+        "source_paper_id",
+        "paper_key_aliases",
+    )
+    semantic_legacy_fields = (
+        "summary",
+        "key_points",
+        "themes",
+        "methodology",
+        "findings",
+        "conclusions",
+        "limitations",
+        "theoretical_framework",
+        "research_gap",
+        "future_research_directions",
+        "common_core",
+        "type_specific_details",
+        "routing",
+        "paper_metadata",
+        "core_analysis",
+        "specialized_details",
+        "quality_audit",
+    )
     packets: List[Dict[str, Any]] = []
     for idx, summary in enumerate(summaries or [], 1):
         if not isinstance(summary, dict):
             continue
-        packets.append({
+        source_paper_info = summary.get("paper_info") or {}
+        paper_info = {
+            field: source_paper_info[field]
+            for field in semantic_paper_fields
+            if isinstance(source_paper_info, dict)
+            and field in source_paper_info
+            and source_paper_info.get(field) not in (None, "", [], {})
+        }
+        packet: Dict[str, Any] = {
             "summary_index": idx,
-            "summary": summary,
-        })
+            "paper_info": paper_info,
+            "status": summary.get("status"),
+            "ai_summary": dict(summary.get("ai_summary") or {}),
+        }
+        for field in semantic_legacy_fields:
+            if field in summary and summary.get(field) not in (None, "", [], {}):
+                packet[field] = summary[field]
+        packets.append(packet)
     return packets
 
 
@@ -627,14 +676,14 @@ def _candidate_prompt(
         "Chinese for a Chinese literature review. Keep machine fields such as "
         "candidate_id, section_id, argument_role, source_flow_steps, and paper_key "
         "exactly as controlled identifiers from the input. Do not translate paper_key "
-        "values. "
-        "return a single flattened object. Use only allowed flow roles/steps: "
+        "values. Return one root JSON object only. Use only allowed flow roles/steps: "
         f"required-capable={sorted(allowed_provider_flow_roles())}; "
         f"forbidden={sorted(forbidden_provider_flow_roles())}. Every candidate "
         "must contain a sections array, and every section must cite source flow steps and assigned "
         "controlled-corpus paper keys from controlled_literature_index.controlled_paper_keys. "
-        "The stage1_summaries_full array is the complete Stage 1 summary input; use it for "
-        "substantive judgment, not as a replacement for controlled paper_key values.\n\n"
+        "The stage1_summaries_full array contains the complete substantive Stage 1 evidence "
+        "without runtime diagnostics; use it for judgment, not as a replacement for controlled "
+        "paper_key values.\n\n"
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 

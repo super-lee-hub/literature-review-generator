@@ -5,10 +5,27 @@ pytest配置文件
 定义测试套件的共享fixtures和配置
 """
 
-import pytest
 import tempfile
 import os
 import sys
+from pathlib import Path
+
+import pytest
+
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+
+from offline_guard import configure_offline_environment, install_offline_guard
+
+
+configure_offline_environment()
+install_offline_guard()
+
+
+_OPTIONAL_MARKERS = {"live_api", "playwright", "heavy_ocr", "optional"}
+_OPTIONAL_NODEIDS: set[str] = set()
+_UNEXPECTED_SKIPS: list[str] = []
 
 
 @pytest.fixture
@@ -168,6 +185,18 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "unit: marks tests as unit tests"
     )
+    config.addinivalue_line(
+        "markers", "live_api: requires explicit external API opt-in and credentials"
+    )
+    config.addinivalue_line(
+        "markers", "playwright: optional browser-based GUI tests"
+    )
+    config.addinivalue_line(
+        "markers", "heavy_ocr: optional heavyweight OCR tests"
+    )
+    config.addinivalue_line(
+        "markers", "optional: test may skip for a declared optional capability"
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -179,3 +208,44 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.integration)
         else:
             item.add_marker(pytest.mark.unit)
+
+        marker_names = {marker.name for marker in item.iter_markers()}
+        if marker_names & _OPTIONAL_MARKERS:
+            _OPTIONAL_NODEIDS.add(item.nodeid)
+
+        if "live_api" in marker_names:
+            enabled = os.environ.get("AUTO_GENERATE_RUN_LIVE_API") == "1"
+            has_key = any(
+                os.environ.get(name)
+                for name in (
+                    "AUTO_GENERATE_LIVE_API_KEY",
+                    "OPENAI_API_KEY",
+                    "DEEPSEEK_API_KEY",
+                )
+            )
+            if not enabled or not has_key:
+                item.add_marker(pytest.mark.skip(reason="live API test not explicitly enabled"))
+        if "playwright" in marker_names and os.environ.get("AUTO_GENERATE_RUN_PLAYWRIGHT") != "1":
+            item.add_marker(pytest.mark.skip(reason="Playwright test not explicitly enabled"))
+        if "heavy_ocr" in marker_names and os.environ.get("AUTO_GENERATE_RUN_HEAVY_OCR") != "1":
+            item.add_marker(pytest.mark.skip(reason="heavy OCR test not explicitly enabled"))
+
+
+def pytest_runtest_logreport(report):
+    if report.skipped and report.nodeid not in _OPTIONAL_NODEIDS:
+        _UNEXPECTED_SKIPS.append(report.nodeid)
+
+
+def pytest_terminal_summary(terminalreporter):
+    if _UNEXPECTED_SKIPS:
+        terminalreporter.section("unexpected required-test skips", red=True, bold=True)
+        for nodeid in sorted(set(_UNEXPECTED_SKIPS)):
+            terminalreporter.write_line(nodeid)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if (
+        _UNEXPECTED_SKIPS
+        and os.environ.get("AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP", "1") == "1"
+    ):
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
