@@ -12,7 +12,7 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: `24f318d` (Phase 1)
+- Last-known-good checkpoint: `0d0f879` (Phase 2)
 
 ## Phase status
 
@@ -20,7 +20,7 @@ code commit itself.
 | --- | --- | --- | --- |
 | 0 - hotfix and offline baseline | completed | `63aeba8` | current ledger commit |
 | 1 - Zotero and FileIndex | completed | `24f318d` | current ledger commit |
-| 2 - identity, registry, audit, fingerprint | pending | - | - |
+| 2 - identity, registry, audit, fingerprint | completed | `0d0f879` | current ledger commit |
 | 3 - sentence and validation truth | pending | - | - |
 | 4 - ReviewBatch derivation | pending | - | - |
 | 5 - runtime runner and recovery | pending | - | - |
@@ -134,3 +134,68 @@ code commit itself.
   as inventory, quarantine, audit, and job-outcome artifacts.
 - Repository-wide pyright debt remains part of the final delivery gate; the
   four Phase 1 contract modules themselves are type-clean.
+
+## Phase 2 - source identity, transactional Registry, audit, and fingerprint
+
+### Scope and provenance
+
+- Pre-phase commit: `c5f25d2`
+- Code checkpoint: `0d0f879`
+- Added `SourceInventoryV1` as the content-hashed source truth used by runtime
+  fingerprints. A file changed at the same path now produces a different
+  fingerprint and a distinct Stage 1 workspace.
+- Added the DOI/title-author-year identity gate and persisted
+  `SourceIdentityResultV1`. Ambiguous or mismatched Zotero sources are
+  quarantined before any Stage 1 provider boundary is reached.
+- Replaced Artifact Registry writes with revisioned, cross-process locked,
+  atomic read-modify-write transactions and the additive
+  `ArtifactDependencyRefV2` contract. Missing ready files, corruption, lock
+  timeout, revision conflict, and artifact identity conflict fail closed with
+  typed errors.
+- Added immutable `AuditRecordV1`, `JobOutcomeV1`, readiness policy snapshot
+  hashing, append-only attempt primitives, random-suffixed workspace IDs, and
+  fail-closed readers for legacy unverified outcomes.
+
+### Changed files
+
+- Source contracts: `services/source_inventory.py`,
+  `services/source_identity.py`, `runtime/source_intake.py`.
+- Runtime/outcome integration: `runtime/lifecycle.py`,
+  `runtime/orchestrator.py`, `services/job_runner.py`,
+  `services/job_workspace.py`, `services/job_outcome.py`.
+- Transaction/audit contracts: `services/artifact_registry.py`,
+  `services/audit_record.py`.
+- Stage 1 compatibility projections: `main.py`, `models.py`,
+  `report_generator.py`.
+- Contract, concurrency, integration, and compatibility tests under `tests/`.
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest tests/test_source_identity.py tests/test_source_inventory.py tests/test_job_outcome.py tests/test_audit_record.py tests/test_job_workspace.py tests/test_artifact_registry.py tests/test_registry_transactions.py -q --strict-markers` | 0 | `58 passed in 8.38s` |
+| `python -m pytest tests/test_job_runner.py tests/test_runtime_lifecycle_parity.py tests/test_runtime_orchestrator.py tests/test_runtime_source_intake.py tests/test_zotero_stage1_pdf_resolution.py tests/test_outline_adoption_gate.py -q --strict-markers` | 0 | `39 passed in 17.62s` |
+| `python -m pytest tests/test_report_generator.py tests/test_report_generator_fields.py tests/test_report_generator_excel_layout.py tests/test_stage1_resume_retry.py tests/test_runtime_stage1_bridge.py tests/test_zotero_parser.py -q --strict-markers` | 0 | `19 passed in 11.12s` |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr" -ra` | 0 | Milestone A: `749 passed, 22 deselected in 45.73s`; zero skips |
+| `python -m pyright models.py report_generator.py runtime/lifecycle.py runtime/orchestrator.py runtime/source_intake.py services/artifact_registry.py services/audit_record.py services/job_outcome.py services/job_runner.py services/job_workspace.py services/source_identity.py services/source_inventory.py` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py models.py report_generator.py runtime services` | 0 | no diagnostics |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+
+### Artifact hashes
+
+- `services/source_inventory.py`: `25feeb9307eb25fc073f157b9d3ebc27d20e8ae6998ba43986e662caf4fa2a14`
+- `services/source_identity.py`: `2c0155810550d7547cb21c80782ac6af0102441aeeb42f856c0af66663db27bc`
+- `services/artifact_registry.py`: `68159e29c9f628350e028d67499964dc780a6f8b254ed97b6b745f8d554e0159`
+- `services/audit_record.py`: `87271e5e5ba9a0d7d1805452265923a00bd5f0532b95e4d82987544115b93e56`
+- `services/job_outcome.py`: `1173431ee6343002dcc2a492162f2d09b8a3e308f17537963c4eb0346be3d4f4`
+
+### Remaining risks
+
+- Attempt artifact persistence and stale-running recovery are intentionally
+  integrated in Phase 5; Phase 2 establishes and tests the immutable attempt
+  state contract used there.
+- Unified audits are now immutable and registry-compatible, but the concrete
+  legacy reuse, Outline adoption, dependency force-delete, and quarantine
+  release actions are wired in their owning later phases.
+- The repository-wide pyright baseline remains open for the final gate. All
+  Phase 2 contract and coordination modules listed above are type-clean.
