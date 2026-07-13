@@ -55,7 +55,14 @@ class AgentRuntimeBridge:
     def stage_policies(self) -> Dict[str, Dict[str, Any]]:
         return {
             stage_name: stage_policy_for(stage_name).to_dict()
-            for stage_name in ("source_intake", "stage1_analyze", "stage2_outline", "stage3_review", "stage4_validate")
+            for stage_name in (
+                "source_intake",
+                "stage1_analyze",
+                "stage1_derive",
+                "stage2_outline",
+                "stage3_review",
+                "stage4_validate",
+            )
         }
 
     def initial_stage_trace(self) -> list[dict[str, Any]]:
@@ -583,6 +590,7 @@ class AgentRuntimeBridge:
             (completion_report_file, "validation_completion_projection", "validation-completion"),
             (str(result.get("claim_alignment_audit_json") or ""), "claim_alignment_audit_projection", "claim-alignment"),
         )
+
         for path, artifact_type, artifact_prefix in projections:
             if not path:
                 continue
@@ -627,6 +635,62 @@ class AgentRuntimeBridge:
                 "validation_disposition": validation_run_result.validation_disposition.value,
                 "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
                 "contradicted_count": validation_run_result.contradicted_count,
+            },
+        )
+
+    def derive_review_batch(
+        self,
+        session: AgentRuntimeSession,
+        batch_spec: Any,
+        *,
+        producer: str = "runtime.orchestrator.AgentRuntimeBridge.derive_review_batch",
+    ) -> StageResult:
+        """Materialize a verified parent Stage 1 subset without invoking Stage 1."""
+
+        from services.review_batch import ReviewBatchSpecV1, derive_review_batch
+
+        if not isinstance(batch_spec, ReviewBatchSpecV1):
+            raise TypeError("batch_spec must be ReviewBatchSpecV1")
+        result = derive_review_batch(
+            batch_spec,
+            workspace=session.context.workspace,
+            registry=session.context.registry,
+            producer=producer,
+        )
+        session.generator.summary_file = result.summary_path
+        self._append_stage_trace_entries(
+            session,
+            [
+                build_runtime_stage_trace_entry(
+                    stage_name="stage1_derive",
+                    step_name="materialize_verified_parent_subset",
+                    producer=producer,
+                    execution_mode=ExecutionMode.LOCAL,
+                    metadata={
+                        "parent_job_id": result.parent_job_id,
+                        "parent_artifact_id": result.parent_artifact_id,
+                        "parent_summary_hash": result.parent_summary_hash,
+                        "selection_hash": result.selection_hash,
+                        "selected_count": result.selected_count,
+                        "stage1_model_calls": 0,
+                    },
+                )
+            ],
+        )
+        return StageResult(
+            stage_name="stage1_derive",
+            success=True,
+            artifacts=[
+                self._artifact_ref_from_record(result.selection_artifact),
+                self._artifact_ref_from_record(result.summary_artifact),
+            ],
+            metadata={
+                "parent_job_id": result.parent_job_id,
+                "parent_artifact_id": result.parent_artifact_id,
+                "parent_summary_hash": result.parent_summary_hash,
+                "selection_hash": result.selection_hash,
+                "selected_count": result.selected_count,
+                "stage1_model_calls": 0,
             },
         )
 

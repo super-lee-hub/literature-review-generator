@@ -40,6 +40,10 @@ class ArtifactConflict(RegistryError):
     """Raised when an artifact ID is reused for a different identity."""
 
 
+class ArtifactNotFound(RegistryError):
+    """Raised when a locked artifact mutation targets an unknown artifact."""
+
+
 DependencyKind = Literal["local_job", "external_job"]
 
 
@@ -565,6 +569,42 @@ class ArtifactRegistry:
                 ),
                 metadata=dict(metadata or {}),
                 created_at=utc_now_iso(),
+            )
+
+        return self._register_transaction(build_record, expected_revision=expected_revision)
+
+    def update_record(
+        self,
+        artifact_id: str,
+        *,
+        status: str | None = None,
+        depends_on: Iterable[ArtifactDependencyRefV2 | Mapping[str, Any]] | None = None,
+        metadata_updates: Mapping[str, Any] | None = None,
+        expected_revision: int | None = None,
+    ) -> ArtifactRecord:
+        """Update mutable artifact state through the same locked CAS transaction."""
+
+        if status is not None and status not in {"ready", "quarantined", "invalid"}:
+            raise ValueError(f"unsupported artifact status: {status}")
+
+        def build_record(artifacts: Mapping[str, ArtifactRecord]) -> ArtifactRecord:
+            current = artifacts.get(artifact_id)
+            if current is None:
+                raise ArtifactNotFound(f"artifact not found: {artifact_id}")
+            next_status = status or current.status
+            self._validate_ready_path(current.path, next_status)
+            next_dependencies = (
+                self._normalize_dependencies(depends_on, artifacts, owner_job_id=current.job_id)
+                if depends_on is not None
+                else list(current.depends_on)
+            )
+            next_metadata = dict(current.metadata)
+            next_metadata.update(dict(metadata_updates or {}))
+            return replace(
+                current,
+                status=next_status,
+                depends_on=next_dependencies,
+                metadata=next_metadata,
             )
 
         return self._register_transaction(build_record, expected_revision=expected_revision)

@@ -8118,6 +8118,12 @@ def handle_cleanup_mode(args: argparse.Namespace):  # type: ignore
         for workspace_path in other_workspaces:
             try:
                 print(f"  删除: {os.path.basename(workspace_path)}")
+                from services.dependency_lifecycle import guard_workspace_delete
+
+                guard_workspace_delete(
+                    workspace_path=workspace_path,
+                    output_root=output_base_path_abs,
+                )
                 shutil.rmtree(workspace_path)
                 deleted_count += 1
             except Exception as e:
