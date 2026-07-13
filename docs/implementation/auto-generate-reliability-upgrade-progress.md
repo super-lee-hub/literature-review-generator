@@ -12,7 +12,7 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: `89a3c9a` (Phase 3)
+- Last-known-good checkpoint: `99a0ce7` (Phase 4)
 
 ## Phase status
 
@@ -22,7 +22,7 @@ code commit itself.
 | 1 - Zotero and FileIndex | completed | `24f318d` | current ledger commit |
 | 2 - identity, registry, audit, fingerprint | completed | `0d0f879` | current ledger commit |
 | 3 - sentence and validation truth | completed | `89a3c9a` | current ledger commit |
-| 4 - ReviewBatch derivation | pending | - | - |
+| 4 - ReviewBatch derivation | completed | `99a0ce7` | current ledger commit |
 | 5 - runtime runner and recovery | pending | - | - |
 | 6 - outline health and budget | pending | - | - |
 | 7 - evidence and edge checkpoints | pending | - | - |
@@ -256,3 +256,63 @@ code commit itself.
   `ReviewValidationReport`; it no longer controls persisted validation truth.
 - Repository-wide pyright debt remains a final-gate obligation. Every Phase 3
   implementation and test module listed in the targeted command is type-clean.
+
+## Phase 4 - ReviewBatch derivation and cross-job lifecycle
+
+### Scope and provenance
+
+- Pre-phase commit: `6a3cb4d`
+- Code checkpoint: `99a0ce7`
+- Added `SummarySelectionSpecV1` and `ReviewBatchSpecV1`, including verified
+  parent Registry identity, parent content hash, ordered canonical paper keys,
+  classification-file hash, column/filter policy, expected count, duplicate
+  policy, and a stable selection hash.
+- Reused `SummaryCatalog.resolve_for_paper()` for every selection. Missing,
+  ambiguous, duplicate, count-mismatched, registry-mismatched, or hash-stale
+  inputs fail closed; no second paper matcher was introduced.
+- Added the runtime `stage1_derive` local-only path. Child summaries depend on
+  the canonical external `(job_id, artifact_id, content_hash)` and expose a
+  durable `stage1_model_calls=0` contract.
+- Added cross-workspace reverse-dependency scanning, locked Registry status and
+  dependency-edge mutation, local materialization, default deletion refusal,
+  and audited force breaking that invalidates child artifacts and makes an
+  existing child outcome non-ready and attention-required.
+- Routed the existing cleanup command through the workspace dependency guard
+  before `rmtree`.
+
+### Changed files
+
+- Batch contracts and derivation: `services/review_batch.py`.
+- Cross-job lifecycle: `services/dependency_lifecycle.py`,
+  `services/artifact_registry.py`, `main.py`.
+- Runtime exposure and execution policy: `runtime/orchestrator.py`,
+  `runtime/subagent_policy.py`.
+- Integration and lifecycle tests: `tests/test_review_batch.py`,
+  `tests/test_dependency_lifecycle.py`.
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q tests/test_review_batch.py tests/test_dependency_lifecycle.py tests/test_runtime_validation_bridge.py tests/test_runtime_subagent_contract.py` | 0 | `14 passed in 5.59s` |
+| `python -m pytest -q --strict-markers tests/test_review_batch.py tests/test_dependency_lifecycle.py tests/test_summary_reuse.py tests/test_artifact_registry.py tests/test_registry_transactions.py tests/test_runtime_stage1_bridge.py tests/test_runtime_orchestrator.py tests/test_runtime_subagent_contract.py tests/test_job_runner.py tests/test_main_dispatch_and_free_mode.py` | 0 | `87 passed in 13.78s` |
+| `python -m pyright services/review_batch.py services/dependency_lifecycle.py services/artifact_registry.py runtime/orchestrator.py runtime/subagent_policy.py tests/test_review_batch.py tests/test_dependency_lifecycle.py` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py runtime services` | 0 | no diagnostics |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+
+### Artifact hashes
+
+- `services/review_batch.py`: `3b67ab73cc74e4e9798c8c9c90871b44d658a4f69079067e5b70e93ff79c4a91`
+- `services/dependency_lifecycle.py`: `404230023bab0683da9439f8005197e46b7a8949e76c0e23407fcb4e3e32e06e`
+- `services/artifact_registry.py`: `d51092c29d4edf467afa9b3b49568871b775936890e7a411d910a8a283456266`
+- `runtime/orchestrator.py`: `9821ef07c0a305153ce7c1a899ba9d197696d959e02eb119b6b29f521ffd7636`
+
+### Remaining risks
+
+- Phase 5 must make batch specs runnable through the high-level runner and CLI,
+  with append-only attempts and reconcile/resume semantics.
+- The cleanup CLI currently exposes the safe default refusal. Audited force
+  breaking is available through the lifecycle service; user-facing force
+  option documentation is completed with the Phase 8 compatibility/docs pass.
+- Job-outcome invalidation is applied when a canonical outcome already exists;
+  Phase 5 makes outcome creation universal for runner-managed children.
