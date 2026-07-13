@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -134,4 +135,38 @@ def test_runtime_job_spec_round_trip(tmp_path: Path) -> None:
     save_runtime_job_spec(path, spec)
     loaded = load_runtime_job_spec(path)
 
-    assert loaded == spec
+    assert loaded.project_name == spec.project_name
+    assert loaded.source.pdf_folder == "D:\\papers"
+    assert loaded.config == str((tmp_path / "config.ini").resolve())
+    assert loaded.queue_file == str((tmp_path / "output/_queue/queue.json").resolve())
+    assert loaded.metadata == spec.metadata
+
+
+def test_runtime_job_spec_paths_are_resolved_from_spec_not_cwd(tmp_path: Path, monkeypatch) -> None:
+    from runtime.job_spec import load_runtime_job_spec
+
+    spec_dir = tmp_path / "spec"
+    spec_dir.mkdir()
+    payload = {
+        "project_name": "relative",
+        "source": {"mode": "direct", "pdf_folder": "papers"},
+        "config": "config/project.ini",
+        "summary_file": "artifacts/summary.json",
+        "summary_sources": ["sources/one.json"],
+        "reuse_summary_files": ["reuse/two.json"],
+        "queue_file": "queue/jobs.json",
+    }
+    path = spec_dir / "job.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    unrelated_cwd = tmp_path / "cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+
+    loaded = load_runtime_job_spec(path)
+
+    assert loaded.source.pdf_folder == str((spec_dir / "papers").resolve())
+    assert loaded.config == str((spec_dir / "config/project.ini").resolve())
+    assert loaded.summary_file == str((spec_dir / "artifacts/summary.json").resolve())
+    assert loaded.summary_sources == (str((spec_dir / "sources/one.json").resolve()),)
+    assert loaded.reuse_summary_files == (str((spec_dir / "reuse/two.json").resolve()),)
+    assert loaded.queue_file == str((spec_dir / "queue/jobs.json").resolve())

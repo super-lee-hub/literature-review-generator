@@ -20,6 +20,7 @@ from services.review_batch import (
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from tests.test_runtime_bridge_helpers import build_legacy_main
+from runtime.runner import AgentRuntimeRunner
 
 
 def _summaries(count: int = 61) -> list[dict]:
@@ -302,6 +303,49 @@ def test_runtime_bridge_exposes_downstream_only_batch_derivation(
     assert stage.stage_name == "stage1_derive"
     assert stage.metadata["stage1_model_calls"] == 0
     assert [item["paper_info"]["canonical_paper_key"] for item in json.loads(Path(session.generator.summary_file).read_text(encoding="utf-8"))] == [
+        "paper-002",
+        "paper-001",
+    ]
+
+
+def test_runtime_runner_derives_batch_without_stage1_handler_call(tmp_path: Path) -> None:
+    parent, parent_registry = _register_parent(tmp_path, _summaries(2))
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "placeholder.pdf").write_bytes(b"%PDF-1.4\n")
+    batch = ReviewBatchSpecV1(
+        project_name="derived-runner",
+        selection=SummarySelectionSpecV1(
+            parent_job_id="parent-job",
+            parent_registry_path=str(parent_registry),
+            parent_artifact_id="parent-summary",
+            parent_content_hash=file_sha256(parent),
+            parent_summary_path=str(parent),
+            ordered_paper_keys=("paper-002", "paper-001"),
+            expected_count=2,
+        ),
+    )
+
+    def forbidden_handler(*_args, **_kwargs):
+        pytest.fail("derived child crossed a generation-provider boundary")
+
+    result = AgentRuntimeRunner(
+        RuntimeJobSpec(
+            project_name="derived-runner",
+            source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+            action="generate_review",
+            config=str(tmp_path / "config.ini"),
+            queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
+            metadata={"review_batch_spec": batch.to_dict(), "requested_stages": []},
+        ),
+        legacy_main=build_legacy_main(),
+        stage_handler=forbidden_handler,
+    ).run()
+
+    assert result.job_status == "completed"
+    assert "analyze" in result.completed_stages
+    derived = Path(result.workspace_path) / "artifacts" / "derived-runner_summaries.json"
+    assert [item["paper_info"]["canonical_paper_key"] for item in json.loads(derived.read_text(encoding="utf-8"))] == [
         "paper-002",
         "paper-001",
     ]

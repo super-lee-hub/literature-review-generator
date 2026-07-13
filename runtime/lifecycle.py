@@ -38,6 +38,8 @@ class BootstrappedRuntimeContext:
     readiness_policy_snapshot: Dict[str, Any]
     required_stages: tuple[str, ...]
     job_outcome_path: str
+    attempt_number: int = 1
+    resumed_from_attempt: int | None = None
 
 
 def _required_stages_for_request(request: Any) -> tuple[str, ...]:
@@ -231,6 +233,7 @@ def finalize_job_runtime(
     completed_stages: Sequence[str] = (),
     failed_stage: str | None = None,
     degradation_reasons: Sequence[str] = (),
+    before_latest_pointer: Callable[[JobOutcomeV1], None] | None = None,
 ) -> str:
     final_resume_report = determine_resume_state(
         project_name=context.project_name,
@@ -281,7 +284,8 @@ def finalize_job_runtime(
     completed = tuple(dict.fromkeys(str(item) for item in completed_stages if str(item)))
     outcome = JobOutcomeV1.create(
         job_id=context.workspace.job_id,
-        attempt_number=1,
+        attempt_number=context.attempt_number,
+        resumed_from_attempt=context.resumed_from_attempt,
         job_status=typed_status,
         job_disposition=effective_disposition,
         canonical_ready=effective_ready,
@@ -308,7 +312,9 @@ def finalize_job_runtime(
             "outcome_revision": outcome.outcome_revision,
         },
     )
-    context.workspace.write_latest_pointer(
+    if before_latest_pointer is not None:
+        before_latest_pointer(outcome)
+    context.workspace.write_latest_pointer_if_owned(
         resume_state=final_resume_report.state,
         fingerprint_bundle=context.fingerprint_bundle,
         status=status,

@@ -1435,12 +1435,14 @@ class LiteratureReviewGenerator:
                         path=self.summary_file,
                     )
                 )
-            if citation_ref_catalog_path:
+            if citation_ref_catalog_path and os.path.isfile(citation_ref_catalog_path):
+                from services.artifact_registry import file_sha256
+
                 depends_on.append(
                     ArtifactDependencyRef(
                         artifact_type=self.CITATION_REF_CATALOG_ARTIFACT_TYPE,
                         path=citation_ref_catalog_path,
-                        content_hash=citation_ref_catalog_hash,
+                        content_hash=file_sha256(citation_ref_catalog_path),
                     )
                 )
 
@@ -1523,12 +1525,14 @@ class LiteratureReviewGenerator:
             citation_ref_catalog = self._load_citation_ref_catalog()
             citation_ref_catalog_path = self._citation_ref_catalog_path()
             citation_ref_catalog_hash = str((citation_ref_catalog or {}).get("catalog_hash") or "")
-            if citation_ref_catalog_path:
+            if citation_ref_catalog_path and os.path.isfile(citation_ref_catalog_path):
+                from services.artifact_registry import file_sha256
+
                 depends_on.append(
                     ArtifactDependencyRef(
                         artifact_type=self.CITATION_REF_CATALOG_ARTIFACT_TYPE,
                         path=citation_ref_catalog_path,
-                        content_hash=citation_ref_catalog_hash,
+                        content_hash=file_sha256(citation_ref_catalog_path),
                     )
                 )
 

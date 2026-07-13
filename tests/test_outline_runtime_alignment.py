@@ -133,6 +133,28 @@ def test_runtime_resolver_v2_enabled_without_adopted_fails_closed(tmp_path: Path
     assert result is None
 
 
+def test_runtime_resolver_v2_rejects_unregistered_convention_file(tmp_path: Path) -> None:
+    from outline.runtime_resolver import OutlineRuntimeResolver
+
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "test_adopted_final_outline.json").write_text("{}", encoding="utf-8")
+
+    class EmptyRegistry:
+        @staticmethod
+        def get(_artifact_id: str):
+            return None
+
+    resolver = OutlineRuntimeResolver(
+        config={"Outline": {"enable_outline_intelligence_v2": "true"}},
+        artifact_registry=EmptyRegistry(),
+        workspace_path=str(tmp_path),
+        project_name="test",
+    )
+
+    assert resolver.resolve_for_review() is None
+
+
 def test_runtime_resolver_v2_with_valid_adopted_outline(tmp_path: Path) -> None:
     from outline.runtime_resolver import OutlineRuntimeResolver
     from outline.v2_models import AdoptedFinalOutline, FinalOutline, compute_content_hash

@@ -358,6 +358,88 @@ def test_index_reusable_summaries_skips_incomplete_stage1_inputs(tmp_path: Path)
     assert rejected[0]["reason"] == "stage1_input_incomplete_or_blocked"
 
 
+def test_summary_internal_paths_resolve_from_summary_source_not_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    cwd_dir = tmp_path / "unrelated-cwd"
+    cwd_dir.mkdir()
+
+    relative_input = Path("preprocess/stage1_input.md")
+    relative_manifest = Path("preprocess/stage1_input_manifest.json")
+    relative_quality = Path("preprocess/stage1_quality_report.json")
+
+    source_input = source_dir / relative_input
+    source_input.parent.mkdir()
+    source_text = "Grounded source text with discussion and references. " * 110
+    source_input.write_text(source_text, encoding="utf-8")
+    (source_dir / relative_manifest).write_text(
+        json.dumps({"page_count": 4, "selected_text_length": len(source_text)}),
+        encoding="utf-8",
+    )
+    (source_dir / relative_quality).write_text(
+        json.dumps(
+            {
+                "candidate_reports": [
+                    {"source": "normalized_markdown", "text_length": len(source_text)}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    decoy_input = cwd_dir / relative_input
+    decoy_input.parent.mkdir()
+    decoy_input.write_text("decoy", encoding="utf-8")
+    (cwd_dir / relative_manifest).write_text(
+        json.dumps({"page_count": 10, "selected_text_length": 5}),
+        encoding="utf-8",
+    )
+    (cwd_dir / relative_quality).write_text(
+        json.dumps(
+            {
+                "candidate_reports": [
+                    {"source": "longer_decoy", "text_length": 20000}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _make_summary(
+        title="Relative Source Paths",
+        authors=["Alice Example"],
+        year="2024",
+        doi="10.1000/relative-source",
+    )
+    summary["preprocess"] = {
+        "stage1_quality_level": "PASS",
+        "stage1_quality_reasons": [],
+        "stage1_input_path": str(relative_input),
+        "stage1_input_manifest_path": str(relative_manifest),
+        "stage1_quality_report_path": str(relative_quality),
+    }
+    summary_path = source_dir / "summaries.json"
+    summary_path.write_text(json.dumps([summary]), encoding="utf-8")
+    monkeypatch.chdir(cwd_dir)
+
+    reusable, rejected = index_reusable_summaries(
+        [
+            SummarySource(
+                path=str(summary_path),
+                source_type="explicit",
+                priority=0,
+                label="source-relative",
+            )
+        ]
+    )
+
+    assert set(reusable) == {"10.1000/relative-source"}
+    assert rejected == []
+
+
 def test_load_existing_summaries_materializes_summary_file_override(tmp_path: Path) -> None:
     external_summary = tmp_path / "subset.json"
     external_summary.write_text(

@@ -449,7 +449,7 @@ class JobRunner:
         inventory = build_source_inventory(
             source_mode=cast(Any, inventory_mode),
             project_name=project_name,
-            source_bundle=source_bundle,
+            source_bundle=source_bundle if inventory_mode != "summary_only" else None,
             pdf_root=resolved_pdf_folder if effective_mode == "direct" else None,
             zotero_report=resolved_report if effective_mode == "zotero" else None,
             zotero_root=resolved_library if effective_mode == "zotero" else None,
@@ -579,7 +579,10 @@ class JobRunner:
                 )
         
         action = str(getattr(request, "action", "") or "")
-        allow_compat_artifact_recovery = action not in STAGE1_REUSE_ACTIONS
+        allow_compat_artifact_recovery = (
+            action not in STAGE1_REUSE_ACTIONS
+            and not str(getattr(request, "job_id", "") or "")
+        )
 
         # Downstream compatibility recovery remains available until Phase 5
         # replaces it with explicit prior-workspace dependencies. Stage 1 never

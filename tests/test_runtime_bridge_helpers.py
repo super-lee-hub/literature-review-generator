@@ -129,6 +129,8 @@ def make_bridge_session(tmp_path: Path, *, action: str = "run_all") -> tuple[Age
 
 
 def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict[str, Any]:
+    from services.artifact_registry import file_sha256
+
     pdf_path_str = str(pdf_path)
     return {
         "status": "success",
@@ -143,7 +145,7 @@ def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict
             "source_paper_id": pdf_path_str,
             "source_mode": "direct",
             "source_pdf": pdf_path_str,
-            "source_pdf_fingerprint": "sha256-demo",
+            "source_pdf_fingerprint": file_sha256(pdf_path),
         },
         "ai_summary": {
             "paper_metadata": {

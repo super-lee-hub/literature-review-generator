@@ -144,6 +144,29 @@ class AgentRuntimeBridge:
         )
 
     def persist_source_bundle(self, session: AgentRuntimeSession, source_bundle: SourceBundle) -> StageArtifactRef:
+        source_dependencies: list[ArtifactDependencyRefV2] = []
+        for item in source_bundle.paper_work_items:
+            source_path = Path(item.source_pdf)
+            if not source_path.is_file():
+                continue
+            source_record = session.context.registry.register_file(
+                artifact_role="source_pdf",
+                artifact_type="source_pdf",
+                artifact_version="v1",
+                path=source_path,
+                producer="runtime.orchestrator.AgentRuntimeBridge.persist_source_bundle",
+                artifact_id=f"source_pdf:{source_path.name}",
+            )
+            source_dependencies.append(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=source_record.job_id,
+                    artifact_id=source_record.artifact_id,
+                    artifact_type=source_record.artifact_type,
+                    path=source_record.path,
+                    content_hash=source_record.content_hash,
+                )
+            )
         path = session.context.workspace.artifact_path("source_bundle.json")
         atomic_write_json(path, source_bundle.to_dict())
         record = session.context.registry.register_file(
@@ -153,6 +176,7 @@ class AgentRuntimeBridge:
             path=path,
             producer="runtime.orchestrator.AgentRuntimeBridge.persist_source_bundle",
             artifact_id="source_bundle",
+            depends_on=source_dependencies,
         )
         return self._artifact_ref_from_record(record)
 
@@ -418,6 +442,18 @@ class AgentRuntimeBridge:
             generation_mode=generation_mode,
         ):
             raise RuntimeError("review_draft_v2 canonical reference update failed")
+
+        # The manifest depends on the final review_draft_v2 bytes.  Rebuild it
+        # after canonical references are projected so its dependency hash does
+        # not point at the provisional draft.
+        if not generator._persist_citation_manifest(
+            review_draft_path=review_draft_path,
+            review_word_path=review_word_path,
+        ):
+            raise RuntimeError("citation manifest final dependency refresh failed")
+        citation_manifest = generator._load_citation_manifest()
+        if not citation_manifest:
+            raise RuntimeError("final canonical citation manifest is unavailable")
 
         with open(review_draft_path, "r", encoding="utf-8") as handle:
             review_draft = json.load(handle)

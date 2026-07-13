@@ -157,8 +157,12 @@ class OutlineRuntimeResolver:
         """Determine the path to adopted_final_outline.json."""
         if self._registry:
             record = self._registry.get("adopted_final_outline")
-            if record and os.path.exists(record.path):
+            if record and record.status == "ready" and os.path.exists(record.path):
                 return record.path
+            # Once a Registry is bound it is the identity authority.  An
+            # unregistered convention file must never become canonical merely
+            # because it exists on disk.
+            return ""
         # Fallback to workspace convention
         if self._workspace_path and self._project_name:
             return os.path.join(
