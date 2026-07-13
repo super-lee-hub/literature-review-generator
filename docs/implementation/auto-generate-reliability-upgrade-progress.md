@@ -12,13 +12,13 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: pending Phase 0 checkpoint
+- Last-known-good checkpoint: `63aeba8` (Phase 0)
 
 ## Phase status
 
 | Phase | Status | Code checkpoint | Evidence checkpoint |
 | --- | --- | --- | --- |
-| 0 - hotfix and offline baseline | green, awaiting commit | pending | pending |
+| 0 - hotfix and offline baseline | completed | `63aeba8` | current ledger commit |
 | 1 - Zotero and FileIndex | pending | - | - |
 | 2 - identity, registry, audit, fingerprint | pending | - | - |
 | 3 - sentence and validation truth | pending | - | - |
