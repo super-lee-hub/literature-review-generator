@@ -12,7 +12,7 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: `0d0f879` (Phase 2)
+- Last-known-good checkpoint: `89a3c9a` (Phase 3)
 
 ## Phase status
 
@@ -21,7 +21,7 @@ code commit itself.
 | 0 - hotfix and offline baseline | completed | `63aeba8` | current ledger commit |
 | 1 - Zotero and FileIndex | completed | `24f318d` | current ledger commit |
 | 2 - identity, registry, audit, fingerprint | completed | `0d0f879` | current ledger commit |
-| 3 - sentence and validation truth | pending | - | - |
+| 3 - sentence and validation truth | completed | `89a3c9a` | current ledger commit |
 | 4 - ReviewBatch derivation | pending | - | - |
 | 5 - runtime runner and recovery | pending | - | - |
 | 6 - outline health and budget | pending | - | - |
@@ -199,3 +199,60 @@ code commit itself.
   release actions are wired in their owning later phases.
 - The repository-wide pyright baseline remains open for the final gate. All
   Phase 2 contract and coordination modules listed above are type-clean.
+
+## Phase 3 - sentence segmentation and canonical Validation truth
+
+### Scope and provenance
+
+- Pre-phase commit: `18c06c6`
+- Code checkpoint: `89a3c9a`
+- Replaced three divergent sentence splitters with one offset-preserving
+  segmenter. Every sentence retains `span_start`, `span_end`, `raw_text`, and
+  `display_text`, with raw spans anchored to the original block text.
+- Added `ValidationRunResultV1` as the sole structured truth source, including
+  the formal claim verdict enum, execution status, run disposition, exact
+  verdict counts, and fail-closed legacy reader.
+- Changed TXT, manual-review JSON, completion JSON, alignment audit, and runtime
+  metadata into projections of the canonical JSON. Unknown adjudicator states
+  now become `needs_review`; missing evidence remains `evidence_gap` and cannot
+  silently become `unsupported`.
+- Runtime registration now records the canonical result first and makes each
+  projection depend on its artifact ID and content hash.
+
+### Changed files
+
+- Sentence contract and consumers: `services/sentence_segmenter.py`,
+  `services/review_draft.py`, `services/citation_manifest.py`,
+  `validation/review_validator.py`.
+- Validation truth and projections: `validation/run_result.py`, `validator.py`,
+  `validation/claim_alignment_audit.py`, `validation/llm_adjudicator.py`,
+  `validation/__init__.py`, `runtime/orchestrator.py`.
+- Contract, projection-parity, sentence-offset, compatibility, and runtime
+  registration tests under `tests/`.
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q tests/test_validation_run_result.py tests/test_sentence_segmenter.py tests/test_runtime_validation_bridge.py tests/test_claim_paper_alignment_validation.py tests/test_review_draft_durability.py tests/test_structured_citations.py tests/test_week3_validation.py tests/test_week4_repair_integration.py tests/test_runtime_orchestrator.py tests/test_runtime_subagent_contract.py tests/test_runtime_validation_adapter_contract.py tests/test_review_validation_replay.py` | 0 | `129 passed in 13.42s` after compatibility fixes |
+| `python -m pytest -q tests/test_validation_projections.py tests/test_citation_v3_cutover.py tests/test_validator_adjudication_flow.py tests/test_runtime_validation_bridge.py` | 0 | `17 passed in 3.74s` |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `784 passed, 22 deselected in 59.00s`; zero skips |
+| `python -m pyright validation/run_result.py tests/test_validation_run_result.py tests/test_validation_projections.py services/sentence_segmenter.py services/review_draft.py services/citation_manifest.py validation/review_validator.py validation/claim_alignment_audit.py runtime/orchestrator.py validator.py` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q validator.py runtime/orchestrator.py validation services/sentence_segmenter.py services/review_draft.py services/citation_manifest.py` | 0 | no diagnostics |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+
+### Artifact hashes
+
+- `services/sentence_segmenter.py`: `efab84fd9cf5829d6edd3dd225343067c86e4cb31b681f370faa5f72e7cea76b`
+- `validation/run_result.py`: `a598abb84e548ba030cf98b0e1c03a70daa3867fdba60f16fef40f895766d2d2`
+- `validator.py`: `6ef89c9f94518030f9fb108dbbe7d17d7261a6a05cdde262960c934c6f03d6ca`
+- `runtime/orchestrator.py`: `c85cd3cd0c7ceee4f869d042ae297fbf7261bc1f434cd484933857dbef978755`
+
+### Remaining risks
+
+- Job-level readiness/Queue mapping and append-only attempt recovery remain in
+  Phase 5; Phase 3 supplies the canonical validation inputs for those rules.
+- Existing repair code intentionally continues to consume the compatibility
+  `ReviewValidationReport`; it no longer controls persisted validation truth.
+- Repository-wide pyright debt remains a final-gate obligation. Every Phase 3
+  implementation and test module listed in the targeted command is type-clean.
