@@ -7,7 +7,7 @@ from pathlib import Path
 import main
 import pytest
 
-from services.artifact_registry import ArtifactRegistry, file_sha256
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace
 from services.review_batch import (
     ParentSummaryIntegrityError,
@@ -167,6 +167,78 @@ def test_batch_derivation_fails_closed_for_parent_hash_change(tmp_path: Path) ->
             workspace=workspace,
             registry=ArtifactRegistry(workspace.paths.registry_path, workspace.job_id),
         )
+
+
+def test_child_paper_projection_keeps_parent_evidence_hash_dependencies(tmp_path: Path) -> None:
+    parent, parent_registry_path = _register_parent(tmp_path, _summaries(1))
+    parent_registry = ArtifactRegistry(parent_registry_path, "parent-job")
+    evidence = tmp_path / "normalized.md"
+    evidence.write_text("source-grounded evidence", encoding="utf-8")
+    evidence_record = parent_registry.register_file(
+        artifact_role="paper_evidence",
+        artifact_type="normalized_text",
+        artifact_version="v1",
+        path=evidence,
+        producer="test",
+        artifact_id="normalized:paper-001",
+    )
+    parent_paper = tmp_path / "paper-001.json"
+    parent_paper.write_text(
+        json.dumps(
+            {
+                "artifact_type": "paper_artifact",
+                "artifact_version": "v1",
+                "paper_identity": {
+                    "canonical_paper_key": "paper-001",
+                    "source_paper_id": "source-001",
+                    "paper_key_aliases": ["paper-001"],
+                },
+                "analysis": {"preprocess": {"markdown_path": str(evidence)}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    parent_paper_record = parent_registry.register_file(
+        artifact_role="paper_artifact",
+        artifact_type="paper_artifact",
+        artifact_version="v1",
+        path=parent_paper,
+        producer="test",
+        artifact_id="paper:paper-001",
+        depends_on=[
+            ArtifactDependencyRefV2(
+                job_id="parent-job",
+                artifact_id=evidence_record.artifact_id,
+                artifact_type=evidence_record.artifact_type,
+                path=evidence_record.path,
+                content_hash=evidence_record.content_hash,
+            )
+        ],
+    )
+    workspace = JobWorkspace(str(tmp_path / "output"), "child", "child-job")
+    result = derive_review_batch(
+        ReviewBatchSpecV1(
+            project_name="child",
+            selection=SummarySelectionSpecV1(
+                parent_job_id="parent-job",
+                parent_registry_path=str(parent_registry_path),
+                parent_artifact_id="parent-summary",
+                parent_content_hash=file_sha256(parent),
+                parent_summary_path=str(parent),
+                ordered_paper_keys=("paper-001",),
+                expected_count=1,
+            ),
+        ),
+        workspace=workspace,
+        registry=ArtifactRegistry(workspace.paths.registry_path, workspace.job_id),
+    )
+
+    assert len(result.paper_artifacts) == 1
+    dependencies = result.paper_artifacts[0].depends_on
+    assert {(item.job_id, item.artifact_id, item.content_hash) for item in dependencies} >= {
+        ("parent-job", parent_paper_record.artifact_id, parent_paper_record.content_hash),
+        ("parent-job", evidence_record.artifact_id, evidence_record.content_hash),
+    }
 
 
 def test_selection_rejects_duplicates_missing_and_ambiguous_records(tmp_path: Path) -> None:

@@ -499,10 +499,30 @@ def test_process_paper_links_visual_bundle_into_paper_artifact_with_text_only_fa
         job_id="job-stage1-visual-fallback",
     )
 
+    evidence_dir = tmp_path / "mock-evidence"
+    evidence_dir.mkdir()
+    normalized_path = evidence_dir / "normalized.md"
+    chunks_path = evidence_dir / "chunks.json"
+    page_index_path = evidence_dir / "page_index.json"
+    normalized_path.write_text("A" * 1400, encoding="utf-8")
+    chunks_path.write_text('[{"chunk_id":"c1","text":"source"}]', encoding="utf-8")
+    page_index_path.write_text(
+        '[{"page_number":1,"text":"Figure framework model and mechanism"}]',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         generator,
         "_prepare_stage1_input",
-        lambda *_args, **_kwargs: ("A" * 1400, {"analysis_input_kind": "text", "extractor_used": "mock"}),
+        lambda *_args, **_kwargs: (
+            "A" * 1400,
+            {
+                "analysis_input_kind": "text",
+                "extractor_used": "mock",
+                "markdown_path": str(normalized_path),
+                "chunks_path": str(chunks_path),
+                "page_index_path": str(page_index_path),
+            },
+        ),
     )
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)

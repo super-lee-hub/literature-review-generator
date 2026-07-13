@@ -132,6 +132,14 @@ def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict
     from services.artifact_registry import file_sha256
 
     pdf_path_str = str(pdf_path)
+    preprocess_dir = pdf_path.parent / f"{paper_key}_preprocess"
+    preprocess_dir.mkdir(exist_ok=True)
+    markdown_path = preprocess_dir / "normalized.md"
+    chunks_path = preprocess_dir / "chunks.json"
+    page_index_path = preprocess_dir / "page_index.json"
+    markdown_path.write_text("Paper A source evidence.", encoding="utf-8")
+    chunks_path.write_text('[{"chunk_id":"c1","text":"Paper A source evidence."}]', encoding="utf-8")
+    page_index_path.write_text('[{"page_number":1,"text":"Paper A source evidence."}]', encoding="utf-8")
     return {
         "status": "success",
         "paper_info": {
@@ -159,5 +167,9 @@ def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict
         "stage1_input": {"input_mode": "text", "selected_visual_refs": [], "multimodal_capability": {}},
         "text_length": 1200,
         "processing_time": "1.2",
-        "preprocess": {},
+        "preprocess": {
+            "markdown_path": str(markdown_path),
+            "chunks_path": str(chunks_path),
+            "page_index_path": str(page_index_path),
+        },
     }

@@ -8,15 +8,27 @@ from enum import Enum
 import hashlib
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence
+import json
+import os
+from pathlib import Path
 
 from services.citation_manifest import normalize_citation_set_key
-from services.sentence_segmenter import sentence_span_entries
+from services.sentence_segmenter import SENTENCE_SEGMENTER_VERSION, sentence_span_entries
 from . import PreprocessEvidenceLoader
 from .evidence_resolver import (
     EvidenceCandidate,
     EvidenceResolver,
     EvidenceResolverContext,
     SOURCE_GROUNDED_RESOLVER_TIERS,
+    build_bilingual_retrieval_queries,
+)
+from .edge_checkpoint import (
+    DEFAULT_ADJUDICATION_SCHEMA_VERSION,
+    DEFAULT_RETRIEVAL_CONFIG_VERSION,
+    ValidationEdgeCheckpointStore,
+    ValidationEdgeKeyV1,
+    canonical_hash,
+    file_or_value_hash,
 )
 
 
@@ -184,7 +196,9 @@ def _serialize_evidence_candidate(
         "claim_unit_id": claim_unit_id,
         "match_reason": candidate.match_reason,
         "resolver_tier": candidate.resolver_tier,
+        "window_rank": candidate.window_rank,
         "confidence": candidate.confidence,
+        "artifact_path": candidate.artifact_path,
         "page_span": list(candidate.page_span or []),
         "chunk_ids": list(candidate.chunk_ids or []),
         "text_excerpt": candidate.text_excerpt,
@@ -194,6 +208,31 @@ def _serialize_evidence_candidate(
         "evidence_scope": candidate.evidence_scope,
         "source_grounded": candidate.resolver_tier in SOURCE_GROUNDED_RESOLVER_TIERS,
     }
+
+
+def _deserialize_evidence_candidate(payload: Dict[str, Any]) -> EvidenceCandidate:
+    return EvidenceCandidate(
+        match_reason=str(payload.get("match_reason") or ""),
+        resolver_tier=str(payload.get("resolver_tier") or ""),
+        window_rank=int(payload.get("window_rank") or 0),
+        confidence=float(payload.get("confidence") or 0.0),
+        artifact_path=str(payload.get("artifact_path") or ""),
+        page_span=list(payload.get("page_span") or []) or None,
+        chunk_ids=[str(item) for item in payload.get("chunk_ids") or []] or None,
+        text_excerpt=str(payload.get("text_excerpt") or ""),
+        negative_evidence_reason=(
+            str(payload.get("negative_evidence_reason"))
+            if payload.get("negative_evidence_reason") is not None
+            else None
+        ),
+        visual_refs=[dict(item) for item in payload.get("visual_refs") or []] or None,
+        caption_excerpt=(
+            str(payload.get("caption_excerpt"))
+            if payload.get("caption_excerpt") is not None
+            else None
+        ),
+        evidence_scope=str(payload.get("evidence_scope") or ""),
+    )
 
 
 def _split_claim_into_segments(claim_text: str, *, max_segments: int = 6) -> List[str]:
@@ -452,6 +491,11 @@ class ReviewValidator:
         paper_artifacts: Sequence[Dict[str, Any]],
         preprocess_evidence: Optional[Dict[str, Any]] = None,
         paper_metadata: Optional[Dict[str, Any]] = None,
+        edge_checkpoint_store: ValidationEdgeCheckpointStore | None = None,
+        model_route: str = "Validator_API",
+        prompt_version: str = "validation_edge_prompt_v1",
+        adjudication_schema_version: str = DEFAULT_ADJUDICATION_SCHEMA_VERSION,
+        edge_checkpoint_callback: Optional[Callable[[ValidationEdgeKeyV1, str], None]] = None,
     ):
         self.review_draft = review_draft or {}
         self.citation_manifest = citation_manifest or {}
@@ -466,9 +510,144 @@ class ReviewValidator:
                     self.paper_artifacts[key] = artifact
         self.preprocess_evidence = preprocess_evidence or {}
         self.paper_metadata = paper_metadata or {}
+        self.edge_checkpoint_store = edge_checkpoint_store
+        self.model_route = model_route
+        self.prompt_version = prompt_version
+        self.adjudication_schema_version = adjudication_schema_version
+        self.edge_checkpoint_callback = edge_checkpoint_callback
         self.evidence_loader = PreprocessEvidenceLoader()
         self._resolver_context_cache: Dict[str, EvidenceResolverContext] = {}
         self._resolver_context_cache_lock = threading.Lock()
+
+    def _edge_key(
+        self,
+        *,
+        claim_unit: Dict[str, Any],
+        paper_id: str,
+        paper_artifact: Dict[str, Any],
+        retrieval_queries: Sequence[str],
+        segment_coverages: Sequence[Dict[str, Any]],
+    ) -> ValidationEdgeKeyV1:
+        preprocess = (
+            self.preprocess_evidence.get(paper_id, {})
+            or paper_artifact.get("analysis", {}).get("preprocess", {})
+        )
+        evidence_hashes: List[str] = []
+        for path_field, value_field in (
+            ("markdown_path", "normalized_text"),
+            ("chunks_path", "chunks"),
+            ("page_index_path", "page_index"),
+            ("manifest_path", "manifest"),
+        ):
+            evidence_hashes.append(canonical_hash({
+                "artifact_type": path_field,
+                "content_hash": file_or_value_hash(
+                    str(preprocess.get(path_field) or ""),
+                    preprocess.get(value_field),
+                ),
+            }))
+        stage1_inputs = paper_artifact.get("stage1_inputs", {})
+        evidence_hashes.append(canonical_hash({
+            "artifact_type": "evidence_manifest",
+            "content_hash": str(stage1_inputs.get("evidence_manifest_hash") or ""),
+        }))
+        canonical_paper_key = str(
+            paper_artifact.get("paper_identity", {}).get("canonical_paper_key") or paper_id
+        ).strip()
+        return ValidationEdgeKeyV1(
+            claim_unit_hash=canonical_hash({
+                "claim_unit": claim_unit,
+                "segment_coverages": list(segment_coverages),
+            }),
+            canonical_paper_key=canonical_paper_key,
+            evidence_hashes=tuple(evidence_hashes),
+            segmenter_version=SENTENCE_SEGMENTER_VERSION,
+            retrieval_config_hash=canonical_hash(
+                {
+                    "version": DEFAULT_RETRIEVAL_CONFIG_VERSION,
+                    "queries": list(retrieval_queries),
+                }
+            ),
+            model_route=self.model_route,
+            prompt_version=self.prompt_version,
+            adjudication_schema_version=self.adjudication_schema_version,
+        )
+
+    def _resolve_validation_edge(
+        self,
+        *,
+        claim_unit: Dict[str, Any],
+        paper_id: str,
+        paper_artifact: Dict[str, Any],
+        unit_claim_text: str,
+        segment_coverages: Sequence[Dict[str, Any]],
+        citation_fallback: str,
+    ) -> Dict[str, Any]:
+        retrieval_queries = build_bilingual_retrieval_queries(unit_claim_text, paper_artifact)
+        edge_key = self._edge_key(
+            claim_unit=claim_unit,
+            paper_id=paper_id,
+            paper_artifact=paper_artifact,
+            retrieval_queries=retrieval_queries,
+            segment_coverages=segment_coverages,
+        )
+        if self.edge_checkpoint_store is not None:
+            cached = self.edge_checkpoint_store.load(edge_key)
+            if cached is not None:
+                return cached
+
+        resolver = EvidenceResolver(self._resolver_context_for_paper(paper_id, paper_artifact))
+        selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", []) or []
+        whole_claim_candidates = resolver.resolve_evidence(
+            cited_span=unit_claim_text or citation_fallback,
+            locator=None,
+            selected_visual_refs=selected_visual_refs,
+            retrieval_queries=retrieval_queries,
+        )
+        segment_support: List[Dict[str, Any]] = []
+        paper_candidates: List[EvidenceCandidate] = list(whole_claim_candidates)
+        for coverage in segment_coverages:
+            segment_text = str(coverage.get("text") or "").strip()
+            segment_queries = build_bilingual_retrieval_queries(segment_text, paper_artifact)
+            segment_candidates = resolver.resolve_evidence(
+                cited_span=segment_text or unit_claim_text or citation_fallback,
+                locator=None,
+                selected_visual_refs=selected_visual_refs,
+                retrieval_queries=segment_queries,
+            )
+            paper_candidates.extend(segment_candidates)
+            support = _support_counts(segment_candidates)
+            segment_support.append(
+                {
+                    "segment_id": coverage["segment_id"],
+                    "segment_index": coverage["segment_index"],
+                    "text": segment_text,
+                    "high": support["high"],
+                    "medium": support["medium"],
+                }
+            )
+        paper_candidates = _dedupe_evidence_candidates(paper_candidates)
+        result = {
+            "paper_id": paper_id,
+            "claim_unit_id": str(claim_unit.get("claim_unit_id") or ""),
+            "selected_visual_refs": bool(selected_visual_refs),
+            "whole_claim_support": _support_counts(whole_claim_candidates),
+            "segment_support": segment_support,
+            "evidence_candidates": [
+                _serialize_evidence_candidate(
+                    candidate,
+                    paper_id=paper_id,
+                    claim_unit_id=str(claim_unit.get("claim_unit_id") or ""),
+                )
+                for candidate in paper_candidates
+            ],
+            "retrieval_queries": retrieval_queries,
+        }
+        if self.edge_checkpoint_store is not None:
+            checkpoint_path, created = self.edge_checkpoint_store.save(edge_key, result)
+            if created and self.edge_checkpoint_callback is not None:
+                self.edge_checkpoint_callback(edge_key, checkpoint_path)
+        return result
 
     def validate(
         self,
@@ -638,6 +817,30 @@ class ReviewValidator:
             return cached_context
 
         paper_preprocess_evidence = self.preprocess_evidence.get(paper_id, {}) or paper_artifact.get("analysis", {}).get("preprocess", {})
+        evidence_manifest_path = str(
+            paper_artifact.get("stage1_inputs", {}).get("evidence_manifest_path") or ""
+        )
+        if evidence_manifest_path:
+            from services.artifact_registry import file_sha256
+            from services.evidence_manifest import EvidenceManifestV1, verified_evidence_paths
+
+            expected_hash = str(
+                paper_artifact.get("stage1_inputs", {}).get("evidence_manifest_hash") or ""
+            )
+            if not os.path.isfile(evidence_manifest_path):
+                raise FileNotFoundError(f"evidence manifest is missing: {evidence_manifest_path}")
+            if expected_hash and file_sha256(evidence_manifest_path) != expected_hash:
+                raise ValueError("evidence manifest hash mismatch")
+            manifest = EvidenceManifestV1.from_dict(
+                json.loads(Path(evidence_manifest_path).read_text(encoding="utf-8"))
+            )
+            verified = verified_evidence_paths(manifest)
+            paper_preprocess_evidence = {
+                **paper_preprocess_evidence,
+                "markdown_path": verified["normalized_text"],
+                "chunks_path": verified["chunks"],
+                "page_index_path": verified["page_index"],
+            }
         paper_specific_metadata = self.paper_metadata.get(paper_id, {})
         evidence = self.evidence_loader.load_evidence(
             normalized_text_path=paper_preprocess_evidence.get("markdown_path"),
@@ -793,41 +996,27 @@ class ReviewValidator:
                     ),
                 )
 
-                resolver = EvidenceResolver(self._resolver_context_for_paper(paper_id, paper_artifact))
-                selected_visual_refs = paper_artifact.get("stage1_inputs", {}).get("selected_visual_refs", []) or []
-                any_visual_refs = any_visual_refs or bool(selected_visual_refs)
-                whole_claim_candidates = resolver.resolve_evidence(
-                    cited_span=unit_claim_text or str((bundle.get("citation_tokens") or [""])[0]),
-                    locator=None,
-                    selected_visual_refs=selected_visual_refs,
+                edge = self._resolve_validation_edge(
+                    claim_unit=claim_unit,
+                    paper_id=paper_id,
+                    paper_artifact=paper_artifact,
+                    unit_claim_text=unit_claim_text,
+                    segment_coverages=segment_coverages,
+                    citation_fallback=str((bundle.get("citation_tokens") or [""])[0]),
                 )
-                segment_support: List[Dict[str, Any]] = []
-                paper_candidates: List[EvidenceCandidate] = list(whole_claim_candidates)
-                for coverage in segment_coverages:
-                    segment_text = str(coverage.get("text") or "").strip()
-                    segment_candidates = resolver.resolve_evidence(
-                        cited_span=segment_text or unit_claim_text or str((bundle.get("citation_tokens") or [""])[0]),
-                        locator=None,
-                        selected_visual_refs=selected_visual_refs,
-                    )
-                    paper_candidates.extend(segment_candidates)
-                    support = _support_counts(segment_candidates)
-                    segment_support.append(
-                        {
-                            "segment_id": coverage["segment_id"],
-                            "segment_index": coverage["segment_index"],
-                            "text": segment_text,
-                            "high": support["high"],
-                            "medium": support["medium"],
-                        }
-                    )
+                any_visual_refs = any_visual_refs or bool(edge["selected_visual_refs"])
+                whole_claim_support = dict(edge["whole_claim_support"])
+                segment_support = [dict(item) for item in edge["segment_support"]]
+                paper_candidates = [
+                    _deserialize_evidence_candidate(dict(item))
+                    for item in edge["evidence_candidates"]
+                ]
+                for coverage, support in zip(segment_coverages, segment_support):
                     if support["high"] > 0:
                         coverage["supported_by_high"].append(paper_id)
                     elif support["medium"] > 0:
                         coverage["supported_by_medium"].append(paper_id)
 
-                whole_claim_support = _support_counts(whole_claim_candidates)
-                paper_candidates = _dedupe_evidence_candidates(paper_candidates)
                 unit_evidence_candidates.extend(paper_candidates)
                 per_paper_evidence_packets.setdefault(paper_id, {})[claim_unit_id] = [
                     _serialize_evidence_candidate(

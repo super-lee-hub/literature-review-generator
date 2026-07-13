@@ -221,6 +221,7 @@ class ReviewBatchDerivationResultV1:
     selection_manifest_path: str
     summary_artifact: ArtifactRecord
     selection_artifact: ArtifactRecord
+    paper_artifacts: tuple[ArtifactRecord, ...] = ()
     stage1_model_calls: int = 0
 
 
@@ -323,6 +324,23 @@ def derive_review_batch(
     if len(summaries) != selection.expected_count:
         raise SummarySelectionError("resolved summary count does not match expected_count")
 
+    parent_paper_records: Dict[str, tuple[ArtifactRecord, Dict[str, Any]]] = {}
+    for record in parent_registry.list_records():
+        if record.artifact_type != "paper_artifact" or record.status != "ready":
+            continue
+        try:
+            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        identity = payload.get("paper_identity", {}) if isinstance(payload, Mapping) else {}
+        aliases = {
+            str(identity.get("canonical_paper_key") or "").strip(),
+            str(identity.get("source_paper_id") or "").strip(),
+            *(str(item).strip() for item in identity.get("paper_key_aliases", []) or []),
+        }
+        for alias in aliases - {""}:
+            parent_paper_records[alias] = (record, dict(payload))
+
     parent_dependency = ArtifactDependencyRefV2(
         dependency_kind="external_job",
         job_id=selection.parent_job_id,
@@ -356,6 +374,62 @@ def derive_review_batch(
         depends_on=[parent_dependency],
         metadata={"selection_hash": selection.selection_hash, "selected_count": len(summaries)},
     )
+    child_paper_records: list[ArtifactRecord] = []
+    if parent_paper_records:
+        for order, key in enumerate(keys, start=1):
+            parent_paper = parent_paper_records.get(key)
+            if parent_paper is None:
+                raise ParentSummaryIntegrityError(
+                    f"selected paper has no parent paper artifact/evidence dependency: {key}"
+                )
+            parent_paper_record, paper_payload = parent_paper
+            paper_payload["projected_from"] = {
+                "job_id": selection.parent_job_id,
+                "artifact_id": parent_paper_record.artifact_id,
+                "content_hash": parent_paper_record.content_hash,
+            }
+            child_paper_path = workspace.artifact_path(
+                f"paper_artifacts/{order:04d}_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}.json"
+            )
+            atomic_write_json(child_paper_path, paper_payload)
+            external_dependencies = [
+                ArtifactDependencyRefV2(
+                    dependency_kind="external_job",
+                    job_id=selection.parent_job_id,
+                    artifact_id=dependency.artifact_id,
+                    artifact_type=dependency.artifact_type,
+                    path=dependency.path,
+                    content_hash=dependency.content_hash,
+                )
+                for dependency in parent_paper_record.depends_on
+            ]
+            external_dependencies.insert(
+                0,
+                ArtifactDependencyRefV2(
+                    dependency_kind="external_job",
+                    job_id=selection.parent_job_id,
+                    artifact_id=parent_paper_record.artifact_id,
+                    artifact_type=parent_paper_record.artifact_type,
+                    path=parent_paper_record.path,
+                    content_hash=parent_paper_record.content_hash,
+                ),
+            )
+            child_paper_records.append(
+                registry.register_file(
+                    artifact_role="paper_artifact",
+                    artifact_type="paper_artifact",
+                    artifact_version=str(paper_payload.get("artifact_version") or "v1"),
+                    path=child_paper_path,
+                    producer=producer,
+                    artifact_id=f"derived-paper:{selection.selection_hash}:{order:04d}",
+                    depends_on=external_dependencies,
+                    metadata={
+                        "canonical_paper_key": key,
+                        "parent_job_id": selection.parent_job_id,
+                        "parent_artifact_id": parent_paper_record.artifact_id,
+                    },
+                )
+            )
     atomic_write_json(summary_path, summaries)
     summary_record = registry.register_file(
         artifact_role="summary",
@@ -374,6 +448,16 @@ def derive_review_batch(
                 path=selection_record.path,
                 content_hash=selection_record.content_hash,
             ),
+        ] + [
+            ArtifactDependencyRefV2(
+                dependency_kind="local_job",
+                job_id=workspace.job_id,
+                artifact_id=record.artifact_id,
+                artifact_type=record.artifact_type,
+                path=record.path,
+                content_hash=record.content_hash,
+            )
+            for record in child_paper_records
         ],
         metadata={
             "parent_summary_hash": selection.parent_content_hash,
@@ -394,6 +478,7 @@ def derive_review_batch(
         selection_manifest_path=selection_manifest_path,
         summary_artifact=summary_record,
         selection_artifact=selection_record,
+        paper_artifacts=tuple(child_paper_records),
     )
 
 

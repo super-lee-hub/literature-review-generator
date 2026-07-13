@@ -138,6 +138,15 @@ def _validate_json_object(_record: ArtifactRecord, path: Path) -> None:
     _read_json_object(path)
 
 
+def _validate_json_array(_record: ArtifactRecord, path: Path) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReconcileValidationError(f"invalid JSON {path}: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ReconcileValidationError(f"JSON artifact must be an array: {path}")
+
+
 DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "job_outcome": _validate_job_outcome,
     STAGE_TERMINAL_ARTIFACT_TYPE: _validate_stage_terminal,
@@ -151,6 +160,10 @@ DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_json_object,
     "paper_artifact": _validate_json_object,
+    "evidence_manifest": _validate_json_object,
+    "normalized_text": _validate_nonempty_text,
+    "chunks": _validate_json_array,
+    "page_index": _validate_json_array,
     "review_draft": _validate_json_object,
     "citation_manifest": _validate_json_object,
     "citation_ref_catalog": _validate_json_object,

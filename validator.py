@@ -461,6 +461,47 @@ def _get_validation_workspace(generator_instance: Any) -> Any:
     return JobWorkspace(output_dir, project_name, job_id)
 
 
+def _validation_edge_checkpoint_store(generator_instance: Any) -> Any:
+    from validation.edge_checkpoint import ValidationEdgeCheckpointStore
+
+    workspace = getattr(generator_instance, "job_workspace", None)
+    if workspace is None:
+        return None
+    return ValidationEdgeCheckpointStore(os.path.join(workspace.paths.checkpoints_dir, "validation_edges"))
+
+
+def _run_adjudication_stage_checkpointed(
+    generator_instance: Any,
+    api_config: Optional[APIConfig],
+    packet: Any,
+    packet_dict: Dict[str, Any],
+    *,
+    stage: str,
+) -> Any:
+    from validation.adjudication_checkpoint import AdjudicationCheckpointStore, sanitized_route_hash
+
+    if api_config is None:
+        return None
+    workspace = getattr(generator_instance, "job_workspace", None)
+    if workspace is None:
+        return run_adjudication_stage(generator_instance, api_config, packet)
+    store = AdjudicationCheckpointStore(
+        os.path.join(workspace.paths.checkpoints_dir, "validation_adjudication")
+    )
+    key = store.key_for(
+        packet=packet_dict,
+        stage=stage,
+        route_hash=sanitized_route_hash(api_config),
+    )
+    cached = store.load(key)
+    if cached is not None:
+        return cached
+    report = run_adjudication_stage(generator_instance, api_config, packet)
+    if isinstance(report, dict):
+        store.save(key, report)
+    return report
+
+
 def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     review_draft_path = generator_instance._review_draft_v2_path()
     if not os.path.exists(review_draft_path):
@@ -930,7 +971,13 @@ def _run_ai_bundle_validation(generator_instance: Any, result: Any) -> Any:
         adjudication_status=_result_evidence_status(result) or "preflight",
         escalated=False,
     )
-    ai_report = run_adjudication_stage(generator_instance, validator_api_config, packet)
+    ai_report = _run_adjudication_stage_checkpointed(
+        generator_instance,
+        validator_api_config,
+        packet,
+        packet_dict,
+        stage="primary",
+    )
     if not isinstance(ai_report, dict):
         return result
     mapped = _map_ai_bundle_result(result, ai_report)
@@ -973,7 +1020,13 @@ def _run_stronger_ai_bundle_validation(generator_instance: Any, result: Any) -> 
         adjudication_status=str(result.details.get("adjudication_status") or _result_evidence_status(result) or "evidence_gap"),
         escalated=True,
     )
-    ai_report = run_adjudication_stage(generator_instance, validator_api_config, packet)
+    ai_report = _run_adjudication_stage_checkpointed(
+        generator_instance,
+        validator_api_config,
+        packet,
+        packet_dict,
+        stage="stronger",
+    )
     if not isinstance(ai_report, dict):
         return pending
     mapped = _map_ai_bundle_result(pending, ai_report)
@@ -1472,7 +1525,14 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
 
         from validation.review_validator import ReviewValidator
 
-        validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
+        validator = ReviewValidator(
+            review_draft,
+            citation_manifest,
+            paper_artifacts,
+            preprocess_evidence,
+            paper_metadata,
+            edge_checkpoint_store=_validation_edge_checkpoint_store(generator_instance),
+        )
         validation_max_workers = _get_validation_max_workers(generator_instance)
         def _progress_callback(index: int, total: int, bundle: Dict[str, Any]) -> None:
             generator_instance.logger.info(f"[base validation {index}/{total}] {_bundle_progress_label(bundle)}")
@@ -1564,7 +1624,14 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
                     "paper_artifacts": None,
                     **_validation_return_payload(validation_result, report_paths),
                 }
-            validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata)
+            validator = ReviewValidator(
+                review_draft,
+                citation_manifest,
+                paper_artifacts,
+                preprocess_evidence,
+                paper_metadata,
+                edge_checkpoint_store=_validation_edge_checkpoint_store(generator_instance),
+            )
             revalidated = _run_base_review_validation(
                 validator,
                 progress_callback=_progress_callback,

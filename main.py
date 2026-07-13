@@ -1242,20 +1242,79 @@ class LiteratureReviewGenerator:
                 result=result,
                 paper_key=paper_key,
             )
+            paper_artifact_payload = paper_artifact.to_dict()
+            from services.evidence_manifest import build_evidence_manifest_v1
+            from services.artifact_registry import file_sha256
+
+            evidence_manifest = build_evidence_manifest_v1(
+                job_id=self.job_workspace.job_id,
+                canonical_paper_key=paper_key,
+                preprocess=paper_artifact_payload.get("analysis", {}).get("preprocess", {}),
+            )
             artifact_path = self._paper_artifact_path(paper)
-            atomic_write_json(artifact_path, paper_artifact.to_dict())
+            evidence_manifest_path = self.job_workspace.artifact_path(
+                f"paper_artifacts/{self._paper_artifact_hash(paper_key)}.evidence_manifest_v1.json"
+            )
+            atomic_write_json(evidence_manifest_path, evidence_manifest.to_dict())
+            paper_artifact_payload.setdefault("stage1_inputs", {})["evidence_manifest_path"] = evidence_manifest_path
+            paper_artifact_payload["stage1_inputs"]["evidence_manifest_hash"] = file_sha256(
+                evidence_manifest_path
+            )
+            atomic_write_json(artifact_path, paper_artifact_payload)
 
             depends_on: List[ArtifactDependencyRef] = []
-            source_pdf = str(paper_artifact.source.get("source_pdf") or "")
+            evidence_dependencies: List[ArtifactDependencyRef] = []
+            artifact_hash = self._paper_artifact_hash(paper_key)
+            for evidence_ref in evidence_manifest.artifacts:
+                evidence_record = self.artifact_registry.register_file(
+                    artifact_role="paper_evidence",
+                    artifact_type=evidence_ref.artifact_type,
+                    artifact_version="v1",
+                    path=evidence_ref.path,
+                    producer="main.LiteratureReviewGenerator.process_paper",
+                    artifact_id=f"{evidence_ref.artifact_type}:{artifact_hash}",
+                )
+                evidence_dependencies.append(
+                    ArtifactDependencyRef(
+                        artifact_type=evidence_record.artifact_type,
+                        path=evidence_record.path,
+                        content_hash=evidence_record.content_hash,
+                        dependency_kind="local_job",
+                        job_id=evidence_record.job_id,
+                        artifact_id=evidence_record.artifact_id,
+                    )
+                )
+            evidence_manifest_record = self.artifact_registry.register_file(
+                artifact_role="paper_evidence",
+                artifact_type="evidence_manifest",
+                artifact_version="v1",
+                path=evidence_manifest_path,
+                producer="main.LiteratureReviewGenerator.process_paper",
+                artifact_id=f"evidence_manifest:{artifact_hash}",
+                depends_on=evidence_dependencies,
+            )
+            depends_on.extend(evidence_dependencies)
+            depends_on.append(
+                ArtifactDependencyRef(
+                    artifact_type=evidence_manifest_record.artifact_type,
+                    path=evidence_manifest_record.path,
+                    content_hash=evidence_manifest_record.content_hash,
+                    dependency_kind="local_job",
+                    job_id=evidence_manifest_record.job_id,
+                    artifact_id=evidence_manifest_record.artifact_id,
+                )
+            )
+
+            source_pdf = str(paper_artifact_payload.get("source", {}).get("source_pdf") or "")
             if source_pdf:
                 depends_on.append(
                     ArtifactDependencyRef(
                         artifact_type="source_pdf",
                         path=source_pdf,
-                        content_hash=str(paper_artifact.source.get("source_pdf_fingerprint") or ""),
+                        content_hash=str(paper_artifact_payload.get("source", {}).get("source_pdf_fingerprint") or ""),
                     )
                 )
-            visual_manifest_path = str(paper_artifact.stage1_inputs.get("visual_artifact_manifest_path") or "")
+            visual_manifest_path = str(paper_artifact_payload.get("stage1_inputs", {}).get("visual_artifact_manifest_path") or "")
             if visual_manifest_path:
                 depends_on.append(
                     ArtifactDependencyRef(
@@ -2512,6 +2571,7 @@ class LiteratureReviewGenerator:
             'markdown_path': getattr(preprocess_result, 'markdown_path', ''),
             'plain_text_path': getattr(preprocess_result, 'plain_text_path', ''),
             'page_index_path': getattr(preprocess_result, 'page_index_path', ''),
+            'chunks_path': getattr(preprocess_result, 'chunks_path', ''),
             'structured_json_path': getattr(preprocess_result, 'structured_json_path', ''),
             'diagnostics_path': getattr(preprocess_result, 'diagnostics_path', ''),
             'manifest_path': getattr(preprocess_result, 'manifest_path', ''),
