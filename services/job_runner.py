@@ -4,13 +4,20 @@ import argparse
 import json
 import os
 import glob
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, cast
 
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
+from runtime.source_intake import build_source_bundle_for_request
+from runtime.stage_contracts import SourceBundle
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.progress_state import determine_resume_state
+from services.source_inventory import (
+    SourceInventoryDiagnosticV1,
+    SourceInventoryV1,
+    build_source_inventory,
+)
 from services.queue_service import CancelToken, JobCancelledError
 from utils import sanitize_path_component
 
@@ -56,6 +63,7 @@ class JobRunRequest:
     project_name: Optional[str]
     pdf_folder: Optional[str]
     action: str
+    job_id: Optional[str] = None
     summary_file: Optional[str] = None
     summary_sources: tuple[str, ...] = ()
     reuse_stage1: bool = False
@@ -92,6 +100,20 @@ class JobRunResult:
     log_path: str
     report_paths: List[str]
     failure_summary: Optional[str]
+    job_status: str = "failed"
+    job_disposition: str = "unvalidated"
+    canonical_ready: bool = False
+    requires_attention: bool = True
+    job_outcome_path: str = ""
+
+
+@dataclass(frozen=True)
+class PreparedSourceInventory:
+    inventory: SourceInventoryV1
+    source_bundle: SourceBundle | None
+    canonical_ready: bool
+    degradation_reasons: tuple[str, ...]
+    identity_verdicts: tuple[str, ...]
 
 
 def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
@@ -143,6 +165,7 @@ def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
         project_name=cast(Optional[str], params.get("project_name", None)),
         pdf_folder=cast(Optional[str], params.get("pdf_folder", None)),
         action=action,
+        job_id=cast(Optional[str], params.get("job_id", None)),
         summary_file=summary_file,
         summary_sources=tuple(summary_source_items),
         reuse_stage1=reuse_stage1,
@@ -363,6 +386,138 @@ class JobRunner:
             "project_name": self._resolve_project_name(request),
         }
 
+    def _prepare_source_inventory(
+        self,
+        *,
+        generator: Any,
+        request: JobRunRequest,
+        project_name: str,
+    ) -> PreparedSourceInventory:
+        source_snapshot = self._source_snapshot(generator, request)
+        action_needs_stage1 = request.action in STAGE1_REUSE_ACTIONS
+        resolved_report = str(source_snapshot.get("zotero_report") or "")
+        resolved_library = str(source_snapshot.get("library_path") or "")
+        resolved_pdf_folder = str(source_snapshot.get("pdf_folder") or "")
+        effective_mode = (
+            "zotero"
+            if request.source_mode == "zotero" or (resolved_report and resolved_library)
+            else "direct"
+        )
+        source_bundle: SourceBundle | None = None
+        diagnostics: list[SourceInventoryDiagnosticV1] = []
+        degradation_reasons: list[str] = []
+
+        resolved_request = replace(
+            request,
+            source_mode=effective_mode,
+            pdf_folder=resolved_pdf_folder or None,
+            zotero_report=resolved_report or None,
+            library_path=resolved_library or None,
+        )
+        can_build_bundle = bool(
+            (effective_mode == "direct" and resolved_pdf_folder)
+            or (effective_mode == "zotero" and resolved_report and resolved_library)
+        )
+        if can_build_bundle:
+            try:
+                source_bundle = build_source_bundle_for_request(
+                    resolved_request,
+                    project_name=project_name,
+                )
+            except Exception as exc:
+                reason = f"source_intake_error:{type(exc).__name__}:{exc}"
+                degradation_reasons.append(reason)
+                diagnostics.append(
+                    SourceInventoryDiagnosticV1(
+                        code="source_intake_failed",
+                        severity="error",
+                        message=str(exc),
+                        source_type=effective_mode,
+                        path=resolved_report or resolved_pdf_folder,
+                    )
+                )
+
+        explicit_summaries = tuple(dict.fromkeys([
+            *(str(item) for item in request.summary_sources if str(item)),
+            *(str(item) for item in request.reuse_summary_files if str(item)),
+        ]))
+        inventory_mode = (
+            "summary_only"
+            if not action_needs_stage1 and explicit_summaries
+            else effective_mode
+        )
+        inventory = build_source_inventory(
+            source_mode=cast(Any, inventory_mode),
+            project_name=project_name,
+            source_bundle=source_bundle,
+            pdf_root=resolved_pdf_folder if effective_mode == "direct" else None,
+            zotero_report=resolved_report if effective_mode == "zotero" else None,
+            zotero_root=resolved_library if effective_mode == "zotero" else None,
+            external_summary_paths=explicit_summaries,
+            diagnostics=diagnostics,
+        )
+
+        identity_verdicts: list[str] = []
+        if source_bundle is not None:
+            raw_identity_results = source_bundle.source_snapshot.get("identity_results")
+            if isinstance(raw_identity_results, list):
+                identity_verdicts = [
+                    str(item.get("identity_verdict") or "")
+                    for item in raw_identity_results
+                    if isinstance(item, Mapping) and str(item.get("identity_verdict") or "")
+                ]
+            raw_quarantine = source_bundle.source_snapshot.get("quarantined_sources")
+            if isinstance(raw_quarantine, list) and raw_quarantine:
+                degradation_reasons.extend(
+                    f"source_identity_{str(item.get('identity_verdict') or 'ambiguous')}"
+                    for item in raw_quarantine
+                    if isinstance(item, Mapping)
+                )
+            if source_bundle.source_snapshot.get("ambiguous_matches"):
+                degradation_reasons.append("ambiguous_pdf_match")
+            if source_bundle.source_snapshot.get("missing_titles"):
+                degradation_reasons.append("missing_pdf_source")
+
+        error_diagnostics = [item for item in inventory.diagnostics if item.severity == "error"]
+        ready_pdf_count = sum(
+            1
+            for item in inventory.files
+            if item.source_type == "pdf" and item.status == "ready"
+        )
+        ready_summary_count = sum(
+            1
+            for item in inventory.files
+            if item.source_type == "external_summary" and item.status == "ready"
+        )
+        identity_blocked = any(verdict in {"ambiguous", "mismatch"} for verdict in identity_verdicts)
+        if action_needs_stage1:
+            canonical_ready = (
+                not error_diagnostics
+                and ready_pdf_count > 0
+                and not identity_blocked
+                and "ambiguous_pdf_match" not in degradation_reasons
+                and "missing_pdf_source" not in degradation_reasons
+            )
+            if not ready_pdf_count:
+                degradation_reasons.append("no_ready_pdf_sources")
+        elif explicit_summaries:
+            canonical_ready = not error_diagnostics and ready_summary_count == len(explicit_summaries)
+        else:
+            canonical_ready = False
+            degradation_reasons.append("legacy_unverified_source")
+
+        degradation_reasons.extend(
+            f"source_inventory:{item.code}"
+            for item in error_diagnostics
+        )
+        return PreparedSourceInventory(
+            inventory=inventory,
+            source_bundle=source_bundle,
+            canonical_ready=canonical_ready,
+            degradation_reasons=tuple(dict.fromkeys(degradation_reasons)),
+            identity_verdicts=tuple(identity_verdicts),
+        )
+
     def _collect_artifact_tracking_info(self, registry: ArtifactRegistry, workspace: JobWorkspace, failure_summary: Optional[str]) -> tuple[List[str], str, List[str]]:
         """收集产物追踪信息"""
         produced_artifacts = [record.path for record in registry.list_records() if record.status == "ready"]
@@ -409,6 +564,7 @@ class JobRunner:
         project_name: str,
         pointer_payload: dict[str, Any] | None,
         fingerprint_bundle: dict[str, Any],
+        request: JobRunRequest | None = None,
     ) -> JobWorkspace:
         # 策略1：优先检查是否有完全匹配的工作空间
         if pointer_payload:
@@ -422,12 +578,17 @@ class JobRunner:
                     job_id=str(pointer_job_id) if pointer_job_id else None,
                 )
         
-        # 策略2：查找最近的工作空间，即使不完全匹配
+        action = str(getattr(request, "action", "") or "")
+        allow_compat_artifact_recovery = action not in STAGE1_REUSE_ACTIONS
+
+        # Downstream compatibility recovery remains available until Phase 5
+        # replaces it with explicit prior-workspace dependencies. Stage 1 never
+        # reuses a workspace whose source inventory fingerprint differs.
         import glob
         workspace_pattern = os.path.join(os.path.abspath(base_output_dir), f"{project_name}__*")
         workspaces = glob.glob(workspace_pattern)
         
-        if workspaces:
+        if workspaces and allow_compat_artifact_recovery:
             # 按修改时间排序，找到最新的工作空间
             workspaces.sort(key=os.path.getmtime, reverse=True)
             latest_workspace_path = workspaces[0]
@@ -445,7 +606,11 @@ class JobRunner:
                 )
 
         # 如果找不到合适的工作空间，创建新的
-        return JobWorkspace.create(base_output_dir=base_output_dir, project_name=project_name)
+        return JobWorkspace.create(
+            base_output_dir=base_output_dir,
+            project_name=project_name,
+            job_id=request.job_id if request else None,
+        )
 
     def _write_resume_report(self, workspace: JobWorkspace, report: Any) -> str:
         path = workspace.artifact_path("resume_state_report.json")
@@ -463,33 +628,25 @@ class JobRunner:
     def _finalize_run_state(
         self,
         *,
-        workspace: JobWorkspace,
-        registry: ArtifactRegistry,
-        project_name: str,
-        summary_path: str,
-        progress_path: str,
-        checkpoint_path: str,
-        fingerprint_bundle: dict[str, Any],
+        context: BootstrappedRuntimeContext,
         status: str,
+        job_disposition: str | None = None,
+        canonical_ready: bool | None = None,
+        requires_attention: bool | None = None,
+        completed_stages: tuple[str, ...] = (),
+        failed_stage: str | None = None,
+        degradation_reasons: tuple[str, ...] = (),
     ) -> str:
-        context = BootstrappedRuntimeContext(
-            project_name=project_name,
-            output_base_dir=os.path.dirname(os.path.dirname(workspace.root_dir)),
-            pointer_path=os.path.join(os.path.dirname(workspace.root_dir), "_latest_job.json"),
-            workspace=workspace,
-            registry=registry,
-            compat_view=None,  # type: ignore[arg-type]
-            summary_path=summary_path,
-            progress_path=progress_path,
-            checkpoint_path=checkpoint_path,
-            fingerprint_bundle=fingerprint_bundle,
-            resume_report=None,
-            resume_report_path="",
-        )
         return finalize_job_runtime(
             context=context,
             write_resume_report=self._write_resume_report,
             status=status,
+            job_disposition=cast(Any, job_disposition),
+            canonical_ready=canonical_ready,
+            requires_attention=requires_attention,
+            completed_stages=completed_stages,
+            failed_stage=failed_stage,
+            degradation_reasons=degradation_reasons,
         )
 
     def _execute_legacy_action(
@@ -532,6 +689,14 @@ class JobRunner:
         except Exception as exc:
             return False, 1, str(exc)
 
+    @staticmethod
+    def _read_job_outcome(path: str) -> dict[str, Any]:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise ValueError("job outcome must be a JSON object")
+        return payload
+
     def run(self, request: JobRunRequest, cancel_token: CancelToken | None = None) -> JobRunResult:
         import main as legacy_main
 
@@ -542,6 +707,7 @@ class JobRunner:
         progress_path = ""
         checkpoint_path = ""
         fingerprint_bundle_dict: dict[str, Any] = {}
+        runtime_context: BootstrappedRuntimeContext | None = None
         active_cancel_token = cancel_token or CancelToken()
 
         request_error = validate_job_request_options(request)
@@ -628,6 +794,11 @@ class JobRunner:
                 f"Recovered project name from lossy CLI input: {request.project_name or ''} -> {resolved_project_name}"
             )
 
+        prepared_sources = self._prepare_source_inventory(
+            generator=generator,
+            request=request,
+            project_name=project_name,
+        )
         runtime_context = bootstrap_job_runtime(
             request=request,
             generator=generator,
@@ -636,6 +807,9 @@ class JobRunner:
             request_snapshot=self._request_snapshot(request),
             build_workspace=self._build_workspace,
             write_resume_report=self._write_resume_report,
+            source_inventory=prepared_sources.inventory,
+            source_canonical_ready=prepared_sources.canonical_ready,
+            source_degradation_reasons=prepared_sources.degradation_reasons,
         )
         workspace = runtime_context.workspace
         registry = runtime_context.registry
@@ -646,6 +820,40 @@ class JobRunner:
 
         try:
             active_cancel_token.check_cancelled()
+
+            if request.action in STAGE1_REUSE_ACTIONS and not prepared_sources.canonical_ready:
+                message = "source identity or inventory requires review; Stage 1 was not executed"
+                resume_state = self._finalize_run_state(
+                    context=runtime_context,
+                    status="completed",
+                    job_disposition="needs_review",
+                    canonical_ready=False,
+                    requires_attention=True,
+                    degradation_reasons=prepared_sources.degradation_reasons,
+                )
+                produced_artifacts, log_path, report_paths = self._collect_artifact_tracking_info(
+                    registry,
+                    workspace,
+                    message,
+                )
+                outcome = self._read_job_outcome(runtime_context.job_outcome_path)
+                return JobRunResult(
+                    success=bool(outcome.get("canonical_ready", False)),
+                    exit_code=0,
+                    message=message,
+                    workspace_path=workspace.root_dir,
+                    job_id=workspace.job_id,
+                    resume_state=resume_state,
+                    produced_artifacts=produced_artifacts,
+                    log_path=log_path,
+                    report_paths=report_paths,
+                    failure_summary=message,
+                    job_status=str(outcome.get("job_status") or "completed"),
+                    job_disposition=str(outcome.get("job_disposition") or "needs_review"),
+                    canonical_ready=bool(outcome.get("canonical_ready", False)),
+                    requires_attention=bool(outcome.get("requires_attention", True)),
+                    job_outcome_path=runtime_context.job_outcome_path,
+                )
 
             if request.concept:
                 generator.concept_mode = True
@@ -665,21 +873,18 @@ class JobRunner:
             legacy_args = self._legacy_args_namespace(request, project_name)
             success, exit_code, message = self._execute_legacy_action(legacy_main, generator, legacy_args, request)
             resume_state = self._finalize_run_state(
-                workspace=workspace,
-                registry=registry,
-                project_name=project_name,
-                summary_path=summary_path,
-                progress_path=progress_path,
-                checkpoint_path=checkpoint_path,
-                fingerprint_bundle=fingerprint_bundle_dict,
+                context=runtime_context,
                 status="completed" if success else "failed",
+                completed_stages=runtime_context.required_stages if success else (),
+                failed_stage=None if success else request.action,
             )
-            
-            failure_summary = message if not success else None
+            outcome = self._read_job_outcome(runtime_context.job_outcome_path)
+            canonical_ready = bool(outcome.get("canonical_ready", False))
+            failure_summary = message if not success else (None if canonical_ready else "canonical output is not ready")
             produced_artifacts, log_path, report_paths = self._collect_artifact_tracking_info(registry, workspace, failure_summary)
-            
+
             return JobRunResult(
-                success=success,
+                success=canonical_ready,
                 exit_code=exit_code,
                 message=message,
                 workspace_path=workspace.root_dir,
@@ -689,18 +894,20 @@ class JobRunner:
                 log_path=log_path,
                 report_paths=report_paths,
                 failure_summary=failure_summary,
+                job_status=str(outcome.get("job_status") or ("completed" if success else "failed")),
+                job_disposition=str(outcome.get("job_disposition") or "unvalidated"),
+                canonical_ready=canonical_ready,
+                requires_attention=bool(outcome.get("requires_attention", not canonical_ready)),
+                job_outcome_path=runtime_context.job_outcome_path,
             )
 
         except JobCancelledError as exc:
             resume_state = self._finalize_run_state(
-                workspace=workspace,
-                registry=registry,
-                project_name=project_name,
-                summary_path=summary_path,
-                progress_path=progress_path,
-                checkpoint_path=checkpoint_path,
-                fingerprint_bundle=fingerprint_bundle_dict,
+                context=runtime_context,
                 status="cancelled",
+                canonical_ready=False,
+                requires_attention=True,
+                failed_stage=request.action,
             )
             failure_summary = str(exc)
             produced_artifacts, log_path, report_paths = self._collect_artifact_tracking_info(registry, workspace, failure_summary)
@@ -716,17 +923,19 @@ class JobRunner:
                 log_path=log_path,
                 report_paths=report_paths,
                 failure_summary=failure_summary,
+                job_status="cancelled",
+                job_disposition="unvalidated",
+                canonical_ready=False,
+                requires_attention=True,
+                job_outcome_path=runtime_context.job_outcome_path,
             )
         except Exception as exc:
             resume_state = self._finalize_run_state(
-                workspace=workspace,
-                registry=registry,
-                project_name=project_name,
-                summary_path=summary_path,
-                progress_path=progress_path,
-                checkpoint_path=checkpoint_path,
-                fingerprint_bundle=fingerprint_bundle_dict,
+                context=runtime_context,
                 status="failed",
+                canonical_ready=False,
+                requires_attention=True,
+                failed_stage=request.action,
             )
             failure_summary = str(exc)
             produced_artifacts, log_path, report_paths = self._collect_artifact_tracking_info(registry, workspace, failure_summary)
@@ -742,4 +951,9 @@ class JobRunner:
                 log_path=log_path,
                 report_paths=report_paths,
                 failure_summary=failure_summary,
+                job_status="failed",
+                job_disposition="unvalidated",
+                canonical_ready=False,
+                requires_attention=True,
+                job_outcome_path=runtime_context.job_outcome_path,
             )

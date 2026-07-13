@@ -42,7 +42,15 @@ class AgentRuntimeBridge:
 
     def build_source_bundle(self) -> SourceBundle:
         request = self.build_job_request()
-        return build_source_bundle_for_request(request, project_name=self.job_spec.project_name)
+        bundle = build_source_bundle_for_request(request, project_name=self.job_spec.project_name)
+        if bundle.source_snapshot.get("canonical_ready") is False:
+            return SourceBundle(
+                source_mode=bundle.source_mode,
+                project_name=bundle.project_name,
+                paper_work_items=[],
+                source_snapshot=dict(bundle.source_snapshot),
+            )
+        return bundle
 
     def stage_policies(self) -> Dict[str, Dict[str, Any]]:
         return {
@@ -104,6 +112,11 @@ class AgentRuntimeBridge:
             project_name = resolved_project_name
             generator.project_name = resolved_project_name
 
+        prepared_sources = runner._prepare_source_inventory(
+            generator=generator,
+            request=request,
+            project_name=project_name,
+        )
         context = bootstrap_job_runtime(
             request=request,
             generator=generator,
@@ -112,6 +125,9 @@ class AgentRuntimeBridge:
             request_snapshot=runner._request_snapshot(request),
             build_workspace=runner._build_workspace,
             write_resume_report=runner._write_resume_report,
+            source_inventory=prepared_sources.inventory,
+            source_canonical_ready=prepared_sources.canonical_ready,
+            source_degradation_reasons=prepared_sources.degradation_reasons,
         )
         return AgentRuntimeSession(
             runner=runner,

@@ -466,6 +466,12 @@ def generate_failure_report(generator_instance: Any) -> bool:  # type: ignore
                         + json.dumps(failed_item["pdf_match"], ensure_ascii=False, sort_keys=True)
                         + "\n"
                     )
+                if failed_item.get("source_identity"):
+                    handle.write(
+                        "   Source identity: "
+                        + json.dumps(failed_item["source_identity"], ensure_ascii=False, sort_keys=True)
+                        + "\n"
+                    )
                 _write_attempt_history(handle, failed_item.get("attempt_history", []))
                 handle.write("-" * 60 + "\n")
 

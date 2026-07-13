@@ -306,11 +306,13 @@ def test_setup_output_directory_restores_registry_for_latest_workspace(tmp_path:
         status="ready",
     )
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    marker_path = Path(workspace.artifact_path("marker.txt"))
+    marker_path.write_text("marker", encoding="utf-8")
     registry.register_file(
         artifact_role="marker",
         artifact_type="marker",
         artifact_version="v1",
-        path=workspace.artifact_path("marker.txt"),
+        path=marker_path,
         producer="test",
         artifact_id="marker",
     )

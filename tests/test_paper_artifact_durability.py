@@ -12,6 +12,7 @@ from services.config_compat import CompatConfigView
 from services.job_workspace import JobWorkspace
 from services.progress_state import ResumeStateReport
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
+from services.source_identity import evaluate_source_identity
 
 
 class _DummyLogger:
@@ -165,6 +166,11 @@ def _stub_stage1_success(monkeypatch, generator) -> None:
     )
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(
+        main,
+        "inspect_text_identity",
+        lambda expected, _text, **_kwargs: evaluate_source_identity(expected, expected),
+    )
     monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
     monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (True, "ok"))
 

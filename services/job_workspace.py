@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -91,7 +92,8 @@ class JobWorkspace:
 
     @staticmethod
     def generate_job_id() -> str:
-        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return f"{timestamp}_{secrets.token_hex(4)}"
 
     @classmethod
     def from_workspace_path(cls, workspace_path: str, project_name: str, job_id: str | None = None) -> "JobWorkspace":

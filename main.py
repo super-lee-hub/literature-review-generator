@@ -82,6 +82,7 @@ from services.model_selection import (
     get_writer_api_config,
 )
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
+from services.source_identity import SourceIdentityResultV1, inspect_text_identity
 from services.summary_reuse import (
     ResolvedSummarySet,
     SummaryCatalog,
@@ -3728,6 +3729,42 @@ class LiteratureReviewGenerator:
             self.logger.error(f"重试失败章节时出错: {exc}")
             return False
     
+    def _persist_source_identity_result(
+        self,
+        paper: Mapping[str, Any],
+        result: SourceIdentityResultV1,
+    ) -> str:
+        if not self.job_workspace or not self.artifact_registry:
+            return ""
+        stable_identity = str(
+            paper.get("canonical_paper_key")
+            or paper.get("source_paper_id")
+            or paper.get("title")
+            or result.candidate_hash
+        )
+        artifact_suffix = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:20]
+        artifact_id = f"source_identity:{artifact_suffix}"
+        artifact_path = self.job_workspace.artifact_path(
+            f"source_identity/{artifact_suffix}.json"
+        )
+        atomic_write_json(artifact_path, result.to_dict())
+        self.artifact_registry.register_file(
+            artifact_role="source_identity",
+            artifact_type="source_identity_result",
+            artifact_version="v1",
+            path=artifact_path,
+            producer="main.LiteratureReviewGenerator._persist_source_identity_result",
+            artifact_id=artifact_id,
+            status=result.artifact_status,
+            metadata={
+                "identity_verdict": result.identity_verdict,
+                "canonical_ready": result.canonical_ready,
+                "candidate_hash": result.candidate_hash,
+                "evidence_hash": result.evidence_hash,
+            },
+        )
+        return artifact_path
+
     def process_paper(self, paper: PaperInfo, paper_index: int, file_index: Optional[FileIndex], total_papers: int) -> Optional[ProcessingResult]:
         """处理单篇论文"""
         try:
@@ -3813,6 +3850,13 @@ class LiteratureReviewGenerator:
                     'status': 'failed',
                     'failure_reason': failure_reason
                 }
+
+            expected_source_identity = {
+                "title": str(paper.get("title") or ""),
+                "authors": list(paper.get("authors") or []),
+                "year": str(paper.get("year") or ""),
+                "doi": str(paper.get("doi") or ""),
+            }
             
             strategy_policy = self._stage1_strategy_policy()
             preprocess_strategies = self._stage1_preprocess_strategies()
@@ -3904,6 +3948,33 @@ class LiteratureReviewGenerator:
                         quality_reason=failure_reason,
                     )
                     continue
+
+                if self.mode == "zotero":
+                    identity_result = inspect_text_identity(
+                        expected_source_identity,
+                        str(pdf_text),
+                        source_path=str(pdf_path),
+                        candidate_hash=str(paper.get("source_pdf_fingerprint") or ""),
+                    )
+                    identity_payload = identity_result.to_dict()
+                    paper["identity_verdict"] = identity_result.identity_verdict
+                    paper["artifact_status"] = identity_result.artifact_status
+                    paper["source_identity"] = identity_payload
+                    self._persist_source_identity_result(paper, identity_result)
+                    if not identity_result.canonical_ready:
+                        failure_reason = f"source_identity_{identity_result.identity_verdict}"
+                        self.logger.error(
+                            f"Source identity gate blocked Stage 1 for {paper_label}: "
+                            f"{identity_result.identity_verdict} ({', '.join(identity_result.reasons)})"
+                        )
+                        return {
+                            "paper_info": paper,
+                            "status": "failed",
+                            "failure_reason": failure_reason,
+                            "identity_verdict": identity_result.identity_verdict,
+                            "artifact_status": identity_result.artifact_status,
+                            "source_identity": identity_payload,
+                        }
 
                 input_kind = preprocess_metadata.get('analysis_input_kind', 'text')
                 extractor_used = preprocess_metadata.get('extractor_used', 'unknown')
@@ -4810,6 +4881,9 @@ class LiteratureReviewGenerator:
                     "doi": normalize_doi(paper_info.get('doi')),
                     "failure_reason": str(failed.get('failure_reason') or ''),
                     "pdf_match": dict(failed.get('pdf_match') or {}),
+                    "identity_verdict": str(failed.get('identity_verdict') or ''),
+                    "artifact_status": str(failed.get('artifact_status') or ''),
+                    "source_identity": dict(failed.get('source_identity') or {}),
                 }
             )
 
@@ -4964,6 +5038,11 @@ class LiteratureReviewGenerator:
                             pdf_match_payload = result.get('pdf_match') if result else None
                             if isinstance(pdf_match_payload, Mapping):
                                 failed_entry['pdf_match'] = dict(pdf_match_payload)
+                            identity_payload = result.get('source_identity') if result else None
+                            if isinstance(identity_payload, Mapping):
+                                failed_entry['source_identity'] = dict(identity_payload)
+                                failed_entry['identity_verdict'] = str(result.get('identity_verdict') or '')
+                                failed_entry['artifact_status'] = str(result.get('artifact_status') or '')
                             self.failed_papers.append(failed_entry)
                                 # 更新身份基断点跟踪
                             self._checkpoint_failed_papers.add(paper_key)
@@ -5228,6 +5307,11 @@ class LiteratureReviewGenerator:
                                     retry_pdf_match = result.get('pdf_match') if result else None
                                     if isinstance(retry_pdf_match, Mapping):
                                         retry_failure['pdf_match'] = dict(retry_pdf_match)
+                                    retry_identity = result.get('source_identity') if result else None
+                                    if isinstance(retry_identity, Mapping):
+                                        retry_failure['source_identity'] = dict(retry_identity)
+                                        retry_failure['identity_verdict'] = str(result.get('identity_verdict') or '')
+                                        retry_failure['artifact_status'] = str(result.get('artifact_status') or '')
                                     current_round_failures.append(retry_failure)
                                     failed_label = self._paper_progress_label(paper)
                                     self._emit_stage1_progress(

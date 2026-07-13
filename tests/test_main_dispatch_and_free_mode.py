@@ -11,6 +11,7 @@ from config_loader import ConfigDict
 from context_manager import validate_summary_quality
 import main
 from models import APIConfig, PaperInfo, ProcessingResult, SummariesList
+from services.source_identity import evaluate_source_identity
 
 
 REMOVED_QUEUE_FLAGS = [
@@ -542,6 +543,11 @@ def test_process_paper_syncs_zotero_paper_info_metadata_before_quality_check(tmp
     monkeypatch.setattr(generator, "_prepare_stage1_input", lambda *_args, **_kwargs: ("x" * 1200, {"analysis_input_kind": "text", "extractor_used": "mock"}))
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(
+        main,
+        "inspect_text_identity",
+        lambda expected, _text, **_kwargs: evaluate_source_identity(expected, expected),
+    )
     monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
     monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
 
@@ -587,6 +593,11 @@ def test_process_paper_persists_metadata_only_failure_with_manual_review(tmp_pat
     monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(
+        main,
+        "inspect_text_identity",
+        lambda expected, _text, **_kwargs: evaluate_source_identity(expected, expected),
+    )
     monkeypatch.setattr(generator, "_apply_stage1_text_metadata_backfill", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
     monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (False, "年份信息缺失; 期刊信息缺失"))
@@ -751,6 +762,11 @@ def test_process_paper_accepts_backup_metadata_only_failure_without_reprocessing
     monkeypatch.setattr(generator, "_build_stage1_visual_bundle", lambda **_kwargs: None)
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(
+        main,
+        "inspect_text_identity",
+        lambda expected, _text, **_kwargs: evaluate_source_identity(expected, expected),
+    )
     monkeypatch.setattr(generator, "_call_stage1_reader_with_scheduler", _fake_reader)
     monkeypatch.setattr(generator, "_resolve_stage1_metadata_for_quality", lambda *_args: [])
     monkeypatch.setattr(main, "validate_summary_quality", _fake_validate)

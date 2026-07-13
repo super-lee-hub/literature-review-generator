@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-from typing import Any, Callable, Dict, Mapping, MutableMapping, cast
+from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, cast
 
 from services.artifact_registry import ArtifactRegistry
 from services.config_compat import CompatConfigView
 from services.job_fingerprint import FingerprintInputs, build_fingerprint_bundle, sanitize_config_for_fingerprint
-from services.job_workspace import JobWorkspace
+from services.job_outcome import JobDisposition, JobOutcomeV1, JobStatus
+from services.job_workspace import JobWorkspace, atomic_write_json
 from services.progress_state import determine_resume_state
+from services.source_inventory import SourceInventoryV1
 
 
 ResumeReportWriter = Callable[[JobWorkspace, Any], str]
@@ -29,6 +31,49 @@ class BootstrappedRuntimeContext:
     fingerprint_bundle: Dict[str, Any]
     resume_report: Any
     resume_report_path: str
+    source_inventory: Dict[str, Any]
+    source_inventory_path: str
+    source_canonical_ready: bool
+    source_degradation_reasons: tuple[str, ...]
+    readiness_policy_snapshot: Dict[str, Any]
+    required_stages: tuple[str, ...]
+    job_outcome_path: str
+
+
+def _required_stages_for_request(request: Any) -> tuple[str, ...]:
+    action = str(getattr(request, "action", "analyze") or "analyze")
+    mapping = {
+        "analyze": ("source_intake", "analyze"),
+        "retry_failed": ("source_intake", "analyze"),
+        "generate_outline": ("source_intake", "outline"),
+        "generate_review": ("source_intake", "outline", "review"),
+        "generate_section": ("source_intake", "outline", "review"),
+        "retry_review_failed": ("source_intake", "outline", "review"),
+        "validate_review": ("source_intake", "validate"),
+        "run_all": ("source_intake", "analyze", "outline", "review"),
+    }
+    return mapping.get(action, ("source_intake", action))
+
+
+def _readiness_policy_for_request(request: Any) -> dict[str, Any]:
+    action = str(getattr(request, "action", "analyze") or "analyze")
+    validation_required = action == "validate_review"
+    return {
+        "validation_required": validation_required,
+        "require_clean_validation": validation_required,
+        "source_identity_required": str(getattr(request, "source_mode", "direct")) == "zotero",
+        "allow_unvalidated_when_validation_optional": not validation_required,
+    }
+
+
+def _coerce_inventory(
+    source_inventory: SourceInventoryV1 | Mapping[str, Any] | None,
+) -> SourceInventoryV1 | None:
+    if source_inventory is None:
+        return None
+    if isinstance(source_inventory, SourceInventoryV1):
+        return source_inventory
+    return SourceInventoryV1.from_dict(source_inventory)
 
 
 def bootstrap_job_runtime(
@@ -40,15 +85,31 @@ def bootstrap_job_runtime(
     request_snapshot: Mapping[str, Any],
     build_workspace: WorkspaceBuilder,
     write_resume_report: ResumeReportWriter,
+    source_inventory: SourceInventoryV1 | Mapping[str, Any] | None = None,
+    source_canonical_ready: bool | None = None,
+    source_degradation_reasons: Sequence[str] = (),
 ) -> BootstrappedRuntimeContext:
     generator_config = cast(MutableMapping[str, Dict[str, str]], generator.config)
     compat_view = CompatConfigView.from_config(generator_config)
     output_base_dir = generator_config.get("Paths", {}).get("output_path", "./output")
 
+    inventory = _coerce_inventory(source_inventory)
+    inventory_payload = inventory.to_dict() if inventory is not None else {}
+    fingerprint_source_snapshot = (
+        {
+            "source_inventory_hash": inventory.fingerprint(),
+            "source_inventory": inventory.fingerprint_payload(),
+        }
+        if inventory is not None
+        else {
+            "compatibility_status": "legacy_unverified",
+            "legacy_source_snapshot": dict(source_snapshot),
+        }
+    )
     fingerprint_bundle = build_fingerprint_bundle(
         FingerprintInputs(
             config_snapshot=sanitize_config_for_fingerprint(generator_config),
-            source_snapshot=dict(source_snapshot),
+            source_snapshot=fingerprint_source_snapshot,
             request_snapshot=dict(request_snapshot),
         )
     )
@@ -60,8 +121,28 @@ def bootstrap_job_runtime(
         project_name=project_name,
         pointer_payload=_load_pointer_payload(pointer_path),
         fingerprint_bundle=fingerprint_bundle_dict,
+        request=request,
     )
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+
+    effective_source_ready = bool(source_canonical_ready) if source_canonical_ready is not None else inventory is not None
+    source_inventory_path = ""
+    if inventory is not None:
+        source_inventory_path = workspace.artifact_path("source_inventory_v1.json")
+        atomic_write_json(source_inventory_path, inventory_payload)
+        registry.register_file(
+            artifact_role="source_inventory",
+            artifact_type="source_inventory",
+            artifact_version="v1",
+            path=source_inventory_path,
+            producer="runtime.lifecycle.bootstrap_job_runtime",
+            artifact_id="source_inventory",
+            status="ready" if effective_source_ready else "quarantined",
+            metadata={
+                "inventory_hash": inventory.fingerprint(),
+                "canonical_ready": effective_source_ready,
+            },
+        )
 
     summary_path = workspace.artifact_path(f"{project_name}_summaries.json")
     progress_path = workspace.artifact_path("stage1_progress_snapshot.json")
@@ -99,6 +180,23 @@ def bootstrap_job_runtime(
         status="running",
     )
 
+    readiness_policy_snapshot = _readiness_policy_for_request(request)
+    required_stages = _required_stages_for_request(request)
+    job_outcome_path = workspace.artifact_path("job_outcome_v1.json")
+    running_outcome = JobOutcomeV1.create(
+        job_id=workspace.job_id,
+        attempt_number=1,
+        job_status="running",
+        job_disposition="unvalidated",
+        canonical_ready=False,
+        requires_attention=not effective_source_ready,
+        readiness_policy_snapshot=readiness_policy_snapshot,
+        required_stages=required_stages,
+        completed_stages=("source_intake",) if effective_source_ready else (),
+        degradation_reasons=tuple(source_degradation_reasons),
+    )
+    atomic_write_json(job_outcome_path, running_outcome.to_dict())
+
     return BootstrappedRuntimeContext(
         project_name=project_name,
         output_base_dir=output_base_dir,
@@ -112,6 +210,13 @@ def bootstrap_job_runtime(
         fingerprint_bundle=fingerprint_bundle_dict,
         resume_report=resume_report,
         resume_report_path=resume_report_path,
+        source_inventory=inventory_payload,
+        source_inventory_path=source_inventory_path,
+        source_canonical_ready=effective_source_ready,
+        source_degradation_reasons=tuple(str(item) for item in source_degradation_reasons if str(item)),
+        readiness_policy_snapshot=readiness_policy_snapshot,
+        required_stages=required_stages,
+        job_outcome_path=job_outcome_path,
     )
 
 
@@ -120,6 +225,12 @@ def finalize_job_runtime(
     context: BootstrappedRuntimeContext,
     write_resume_report: ResumeReportWriter,
     status: str,
+    job_disposition: JobDisposition | None = None,
+    canonical_ready: bool | None = None,
+    requires_attention: bool | None = None,
+    completed_stages: Sequence[str] = (),
+    failed_stage: str | None = None,
+    degradation_reasons: Sequence[str] = (),
 ) -> str:
     final_resume_report = determine_resume_state(
         project_name=context.project_name,
@@ -137,6 +248,65 @@ def finalize_job_runtime(
         path=final_resume_report_path,
         producer="runtime.lifecycle.finalize_job_runtime",
         artifact_id="resume_state_report",
+    )
+    if status not in {"pending", "running", "completed", "failed", "cancelled"}:
+        raise ValueError(f"unsupported job status: {status}")
+    typed_status = cast(JobStatus, status)
+    validation_required = bool(context.readiness_policy_snapshot.get("validation_required", False))
+    identity_requires_review = any(
+        reason.startswith("source_identity_") or reason == "ambiguous_pdf_match"
+        for reason in context.source_degradation_reasons
+    )
+    effective_disposition: JobDisposition = job_disposition or (
+        "needs_review" if identity_requires_review else "unvalidated"
+    )
+    if canonical_ready is None:
+        effective_ready = bool(
+            typed_status == "completed"
+            and context.source_canonical_ready
+            and (not validation_required)
+            and effective_disposition != "needs_review"
+        )
+    else:
+        effective_ready = bool(canonical_ready)
+    effective_attention = (
+        bool(requires_attention)
+        if requires_attention is not None
+        else effective_disposition in {"findings", "needs_review"} or typed_status in {"failed", "cancelled"}
+    )
+    merged_reasons = tuple(dict.fromkeys([
+        *context.source_degradation_reasons,
+        *(str(item) for item in degradation_reasons if str(item)),
+    ]))
+    completed = tuple(dict.fromkeys(str(item) for item in completed_stages if str(item)))
+    outcome = JobOutcomeV1.create(
+        job_id=context.workspace.job_id,
+        attempt_number=1,
+        job_status=typed_status,
+        job_disposition=effective_disposition,
+        canonical_ready=effective_ready,
+        requires_attention=effective_attention,
+        readiness_policy_snapshot=context.readiness_policy_snapshot,
+        required_stages=context.required_stages,
+        completed_stages=completed,
+        failed_stage=failed_stage,
+        degradation_reasons=merged_reasons,
+        outcome_revision=2,
+    )
+    atomic_write_json(context.job_outcome_path, outcome.to_dict())
+    context.registry.register_file(
+        artifact_role="job_outcome",
+        artifact_type="job_outcome",
+        artifact_version="v1",
+        path=context.job_outcome_path,
+        producer="runtime.lifecycle.finalize_job_runtime",
+        artifact_id="job_outcome",
+        metadata={
+            "job_status": outcome.job_status,
+            "job_disposition": outcome.job_disposition,
+            "canonical_ready": outcome.canonical_ready,
+            "outcome_revision": outcome.outcome_revision,
+        },
     )
     context.workspace.write_latest_pointer(
         resume_state=final_resume_report.state,

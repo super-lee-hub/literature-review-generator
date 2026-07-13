@@ -1,6 +1,10 @@
 import json
 
-from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
+from services.artifact_registry import (
+    ArtifactDependencyRef,
+    ArtifactDependencyRefV2,
+    ArtifactRegistry,
+)
 
 
 def test_artifact_registry_persists_records_and_dependencies(tmp_path) -> None:
@@ -16,7 +20,13 @@ def test_artifact_registry_persists_records_and_dependencies(tmp_path) -> None:
         artifact_version="v1",
         path=str(artifact_path),
         producer="tests",
-        depends_on=[ArtifactDependencyRef(artifact_type="source", path="/tmp/source.pdf", content_hash="abc123")],
+        depends_on=[
+            ArtifactDependencyRef(
+                artifact_type="source",
+                path="/tmp/source.pdf",
+                content_hash="abc123",
+            )
+        ],
     )
 
     assert record.job_id == "job-123"
@@ -29,3 +39,19 @@ def test_artifact_registry_persists_records_and_dependencies(tmp_path) -> None:
     assert loaded is not None
     assert loaded.path == str(artifact_path.resolve())
     assert loaded.depends_on[0].content_hash == "abc123"
+    assert isinstance(loaded.depends_on[0], ArtifactDependencyRefV2)
+    assert loaded.depends_on[0].job_id == "job-123"
+    assert loaded.depends_on[0].artifact_id == "source:source.pdf"
+
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert payload["artifact_registry_version"] == "v2"
+    assert payload["revision"] == 1
+
+
+def test_legacy_dependency_constructor_keeps_positional_field_order() -> None:
+    dependency = ArtifactDependencyRef("source_pdf", "/tmp/source.pdf", "abc123")
+
+    assert dependency.artifact_type == "source_pdf"
+    assert dependency.path == "/tmp/source.pdf"
+    assert dependency.content_hash == "abc123"
+    assert dependency.dependency_kind == "local_job"

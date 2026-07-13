@@ -1,8 +1,10 @@
 import json
 import os
 import threading
+from pathlib import Path
 
 import main
+from runtime.stage_contracts import SourceBundle
 from services.job_runner import (
     JobRunRequest,
     JobRunResult,
@@ -76,6 +78,9 @@ class _DummyGenerator:
 
 def test_job_runner_creates_workspace_and_pointer(tmp_path, monkeypatch) -> None:
     output_dir = tmp_path / "output"
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "paper.pdf").write_bytes(b"%PDF-1.4\nsource")
     called = {}
 
     class _Generator(_DummyGenerator):
@@ -95,7 +100,7 @@ def test_job_runner_creates_workspace_and_pointer(tmp_path, monkeypatch) -> None
         JobRunRequest(
             config="config.ini",
             project_name="demo",
-            pdf_folder=None,
+            pdf_folder=str(pdf_dir),
             action="analyze",
         )
     )
@@ -110,6 +115,127 @@ def test_job_runner_creates_workspace_and_pointer(tmp_path, monkeypatch) -> None
     assert pointer_payload["artifact_registry_path"].endswith("artifact_registry.json")
     assert result.log_path.endswith(os.path.join("logs", "job.log"))
     assert os.path.exists(result.log_path)
+
+
+def test_job_runner_same_path_content_change_creates_new_stage1_workspace(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    pdf_path = pdf_dir / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\nsource-v1")
+    observed_workspaces: list[str] = []
+
+    class _Generator(_DummyGenerator):
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
+            super().__init__(config_file, project_name, pdf_folder, queue_file, zotero_report, library_path)
+            self.config = {"Paths": {"output_path": str(output_dir)}}
+
+    def _handle_stage_one(generator, _args):
+        observed_workspaces.append(generator.bound_workspace.root_dir)
+        return True
+
+    monkeypatch.setattr(main, "LiteratureReviewGenerator", _Generator)
+    monkeypatch.setattr(main, "handle_stage_one_mode", _handle_stage_one)
+    runner = JobRunner()
+    request = JobRunRequest(
+        config="config.ini",
+        project_name="demo",
+        pdf_folder=str(pdf_dir),
+        action="analyze",
+    )
+
+    first = runner.run(request)
+    first_inventory = json.loads(
+        (Path(first.workspace_path) / "artifacts" / "source_inventory_v1.json").read_text(encoding="utf-8")
+    )
+    pdf_path.write_bytes(b"%PDF-1.4\nsource-v2-with-different-content")
+    second = runner.run(request)
+    second_inventory = json.loads(
+        (Path(second.workspace_path) / "artifacts" / "source_inventory_v1.json").read_text(encoding="utf-8")
+    )
+
+    assert first.canonical_ready is True
+    assert second.canonical_ready is True
+    assert first.job_id != second.job_id
+    assert first.workspace_path != second.workspace_path
+    assert observed_workspaces == [first.workspace_path, second.workspace_path]
+    assert first_inventory["inventory_hash"] != second_inventory["inventory_hash"]
+
+
+def test_job_runner_quarantines_identity_mismatch_before_stage1_handler(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    report_path = tmp_path / "zotero-report.txt"
+    report_path.write_text("report", encoding="utf-8")
+    library_path = tmp_path / "library"
+    library_path.mkdir()
+    pdf_path = library_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\nwrong-source")
+    handler_calls = 0
+
+    class _Generator(_DummyGenerator):
+        def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
+            super().__init__(config_file, project_name, pdf_folder, queue_file, zotero_report, library_path)
+            self.config = {"Paths": {"output_path": str(output_dir)}}
+
+    mismatch_identity = {
+        "identity_verdict": "mismatch",
+        "artifact_status": "quarantined",
+        "expected": {"title": "Expected", "doi": "10.1234/expected"},
+        "observed": {"title": "Wrong", "doi": "10.9999/wrong"},
+    }
+    bundle = SourceBundle(
+        source_mode="zotero",
+        project_name="demo",
+        paper_work_items=[],
+        source_snapshot={
+            "zotero_report": str(report_path.resolve()),
+            "library_path": str(library_path.resolve()),
+            "identity_results": [mismatch_identity],
+            "quarantined_sources": [mismatch_identity],
+            "pdf_resolutions": [
+                {
+                    "status": "matched",
+                    "selected_path": str(pdf_path.resolve()),
+                    "title": "Expected",
+                    "identity": mismatch_identity,
+                }
+            ],
+        },
+    )
+
+    def _handle_stage_one(_generator, _args):
+        nonlocal handler_calls
+        handler_calls += 1
+        return True
+
+    monkeypatch.setattr(main, "LiteratureReviewGenerator", _Generator)
+    monkeypatch.setattr(main, "handle_stage_one_mode", _handle_stage_one)
+    monkeypatch.setattr("services.job_runner.build_source_bundle_for_request", lambda *_args, **_kwargs: bundle)
+
+    result = JobRunner().run(
+        JobRunRequest(
+            config="config.ini",
+            project_name="demo",
+            pdf_folder=None,
+            zotero_report=str(report_path),
+            library_path=str(library_path),
+            source_mode="zotero",
+            action="analyze",
+        )
+    )
+    registry_payload = json.loads(
+        (Path(result.workspace_path) / "artifact_registry.json").read_text(encoding="utf-8")
+    )
+    inventory_record = next(
+        item for item in registry_payload["artifacts"] if item["artifact_id"] == "source_inventory"
+    )
+
+    assert handler_calls == 0
+    assert result.job_status == "completed"
+    assert result.job_disposition == "needs_review"
+    assert result.canonical_ready is False
+    assert result.success is False
+    assert inventory_record["status"] == "quarantined"
 
 
 def test_job_runner_aborts_immediately_when_cancelled_before_start(monkeypatch) -> None:
@@ -143,6 +269,9 @@ def test_job_runner_aborts_immediately_when_cancelled_before_start(monkeypatch) 
 
 def test_job_runner_cancels_at_handler_loop_boundary(tmp_path, monkeypatch) -> None:
     output_dir = tmp_path / "output"
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "paper.pdf").write_bytes(b"%PDF-1.4\nsource")
     first_loop_boundary = threading.Event()
     continue_loop = threading.Event()
     observed_iterations: list[int] = []
@@ -173,7 +302,7 @@ def test_job_runner_cancels_at_handler_loop_boundary(tmp_path, monkeypatch) -> N
             JobRunRequest(
                 config="config.ini",
                 project_name="demo",
-                pdf_folder=None,
+                    pdf_folder=str(pdf_dir),
                 action="analyze",
             ),
             cancel_token=token,
@@ -200,6 +329,9 @@ def test_job_runner_cancels_at_handler_loop_boundary(tmp_path, monkeypatch) -> N
 
 def test_job_runner_marks_failed_handler_in_result_pointer_and_resume_report(tmp_path, monkeypatch) -> None:
     output_dir = tmp_path / "output"
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "paper.pdf").write_bytes(b"%PDF-1.4\nsource")
 
     class _Generator(_DummyGenerator):
         def __init__(self, config_file, project_name, pdf_folder, queue_file=None, zotero_report=None, library_path=None):
@@ -213,7 +345,7 @@ def test_job_runner_marks_failed_handler_in_result_pointer_and_resume_report(tmp
         JobRunRequest(
             config="config.ini",
             project_name="demo",
-            pdf_folder=None,
+            pdf_folder=str(pdf_dir),
             action="analyze",
         )
     )
@@ -347,7 +479,10 @@ def test_job_runner_validate_review_uses_validator_module_directly(tmp_path, mon
         )
     )
 
-    assert result.success is True
+    assert result.success is False
+    assert result.job_status == "completed"
+    assert result.job_disposition == "unvalidated"
+    assert result.canonical_ready is False
     assert isinstance(called["generator"], _Generator)
 
 
@@ -398,7 +533,10 @@ def test_job_runner_validate_review_recovers_lossy_project_name_from_existing_wo
     pointer_path = output_dir / recovered_project_name / "_latest_job.json"
     pointer_payload = json.loads(pointer_path.read_text(encoding="utf-8"))
 
-    assert result.success is True
+    assert result.success is False
+    assert result.job_status == "completed"
+    assert result.job_disposition == "unvalidated"
+    assert result.canonical_ready is False
     assert called["project_name"] == recovered_project_name
     assert str(called["workspace"]).endswith(f"{recovered_project_name}__20260418_041739")
     assert pointer_payload["workspace_path"].endswith(f"{recovered_project_name}__20260418_041739")

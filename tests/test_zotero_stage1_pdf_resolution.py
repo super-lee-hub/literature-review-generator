@@ -126,7 +126,7 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
         seen["pdf_path"] = resolved_pdf_path
         seen["strategy"] = strategy
         return (
-            "x" * 600,
+            "Resolved Paper\n" + "x" * 600,
             {
                 "analysis_input_kind": "text",
                 "extractor_used": "test",
@@ -241,6 +241,76 @@ def test_process_paper_blocks_ambiguous_pdf_before_stage1_provider(
     assert result["failure_reason"] == "ambiguous_pdf_match"
     assert result["pdf_match"]["status"] == "ambiguous"
     assert stage1_called is False
+
+
+def test_process_paper_quarantines_doi_mismatch_before_stage1_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    pdf_path = tmp_path / "wrong-source.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n" + b"x" * 2048)
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.mode = "zotero"
+    generator.config = ConfigDict({"Paths": {"library_path": str(tmp_path)}})
+    generator.library_path = str(tmp_path)
+    provider_calls = 0
+
+    monkeypatch.setattr(generator, "_check_cancelled", lambda: None)
+    monkeypatch.setattr(generator, "_emit_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_paper_progress_label",
+        lambda paper: str(paper.get("title") or "unknown"),
+    )
+    monkeypatch.setattr(
+        main,
+        "resolve_pdf_match",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="matched",
+            selected_path=str(pdf_path),
+            to_dict=lambda: {"status": "matched", "selected_path": str(pdf_path)},
+        ),
+    )
+    monkeypatch.setattr(
+        generator,
+        "_prepare_stage1_input",
+        lambda *_args, **_kwargs: (
+            "Wrong Source\nDOI 10.9999/wrong.2024\n" + "x" * 600,
+            {
+                "analysis_input_kind": "text",
+                "extractor_used": "test",
+                "preprocess_profile": "test",
+            },
+        ),
+    )
+
+    def unexpected_provider(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("Stage 1 provider must not run for a DOI mismatch")
+
+    monkeypatch.setattr(generator, "_call_stage1_reader_with_scheduler", unexpected_provider)
+
+    result = generator.process_paper(
+        {
+            "title": "Expected Source",
+            "authors": ["Alice Smith"],
+            "year": "2024",
+            "doi": "10.1234/right.2024",
+            "attachments": ["wrong-source.pdf"],
+        },
+        paper_index=0,
+        file_index=cast(main.FileIndex, object()),
+        total_papers=1,
+    )
+
+    assert result is not None
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "source_identity_mismatch"
+    assert result["identity_verdict"] == "mismatch"
+    assert result["artifact_status"] == "quarantined"
+    assert provider_calls == 0
 
 
 def test_process_all_papers_prefers_runtime_library_path(tmp_path: Path, monkeypatch) -> None:
