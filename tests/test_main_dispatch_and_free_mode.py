@@ -894,8 +894,9 @@ def test_process_paper_skips_ai_for_blocked_stage1_attempts(tmp_path, monkeypatc
     assert result is not None
     assert result["status"] == "success"
     assert ai_calls == ["primary"]
-    assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling"]
+    assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling", "mineru"]
     assert result["attempt_history"][0]["stage1_quality_reasons"] == ["incomplete_by_page_count"]
+    assert result["attempt_history"][-1]["success"] is True
 
 
 def test_stage1_strategy_policy_formal_precision_order() -> None:
