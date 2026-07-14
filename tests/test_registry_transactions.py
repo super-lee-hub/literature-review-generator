@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import multiprocessing
-import os
 import threading
 from pathlib import Path
 from queue import Empty
@@ -86,8 +85,12 @@ def test_v1_registry_is_read_additively_and_next_write_emits_v2(tmp_path: Path) 
         ),
         encoding="utf-8",
     )
+    legacy_bytes = registry_path.read_bytes()
 
     registry = ArtifactRegistry(registry_path, "job-legacy")
+
+    assert registry_path.read_bytes() == legacy_bytes
+
     legacy = registry.get("legacy-artifact")
 
     assert registry.revision == 0
@@ -121,6 +124,92 @@ def test_v1_registry_is_read_additively_and_next_write_emits_v2(tmp_path: Path) 
         "path",
         "content_hash",
     }
+
+
+@pytest.mark.parametrize(
+    ("persisted_version", "persisted_job_id", "expected_error"),
+    [
+        ("v99", "job-owned", "unsupported artifact_registry_version"),
+        ("v2", "job-foreign", "does not match expected owner"),
+    ],
+)
+def test_registry_header_mismatch_fails_closed_without_side_effects(
+    tmp_path: Path,
+    persisted_version: str,
+    persisted_job_id: str,
+    expected_error: str,
+) -> None:
+    registry_path = tmp_path / "artifact_registry.json"
+    original_bytes = json.dumps(
+        {
+            "artifact_registry_version": persisted_version,
+            "revision": 0,
+            "job_id": persisted_job_id,
+            "artifacts": [],
+        },
+        indent=2,
+    ).encode("utf-8")
+    registry_path.write_bytes(original_bytes)
+    before_entries = sorted(path.name for path in tmp_path.iterdir())
+
+    with pytest.raises(RegistryCorruption, match=expected_error):
+        ArtifactRegistry(registry_path, "job-owned")
+
+    assert registry_path.read_bytes() == original_bytes
+    assert sorted(path.name for path in tmp_path.iterdir()) == before_entries
+
+
+def test_registry_rejects_persisted_artifact_owned_by_another_job(tmp_path: Path) -> None:
+    artifact_path = _write_artifact(tmp_path / "foreign.json", "foreign")
+    registry_path = tmp_path / "artifact_registry.json"
+    payload = {
+        "artifact_registry_version": "v2",
+        "revision": 1,
+        "job_id": "job-owned",
+        "artifacts": [
+            {
+                "artifact_id": "foreign-artifact",
+                "artifact_role": "summary",
+                "artifact_type": "summary_file",
+                "artifact_version": "v1",
+                "path": str(artifact_path),
+                "producer": "tests",
+                "job_id": "job-foreign",
+                "status": "ready",
+                "content_hash": artifact_registry_module.file_sha256(artifact_path),
+                "depends_on": [],
+                "metadata": {},
+                "created_at": "2026-07-14T00:00:00+00:00",
+            }
+        ],
+    }
+    original_bytes = json.dumps(payload, indent=2).encode("utf-8")
+    registry_path.write_bytes(original_bytes)
+
+    with pytest.raises(RegistryCorruption, match="does not match registry owner"):
+        ArtifactRegistry(registry_path, "job-owned")
+
+    assert registry_path.read_bytes() == original_bytes
+
+
+def test_registry_rejects_registering_artifact_for_another_job(tmp_path: Path) -> None:
+    artifact_path = _write_artifact(tmp_path / "foreign.json", "foreign")
+    registry_path = tmp_path / "artifact_registry.json"
+    registry = ArtifactRegistry(registry_path, "job-owned")
+
+    with pytest.raises(ArtifactConflict, match="not registry owner"):
+        registry.register(
+            artifact_id="foreign-artifact",
+            artifact_type="summary_file",
+            artifact_version="v1",
+            path=artifact_path,
+            producer="tests",
+            job_id="job-foreign",
+        )
+
+    assert registry.revision == 0
+    assert registry.list_records() == []
+    assert not registry_path.exists()
 
 
 def test_dependency_v2_round_trip_preserves_external_identity(tmp_path: Path) -> None:

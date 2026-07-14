@@ -11,6 +11,14 @@ from services.job_runner import JobRunRequest, resolve_stage1_reuse
 SourceMode = Literal["direct", "zotero"]
 
 
+def _optional_bool(value: Any, *, field_name: str) -> bool | None:
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a JSON boolean")
+    return value
+
+
 @dataclass(frozen=True)
 class RuntimeSourceSpec:
     mode: SourceMode
@@ -84,13 +92,33 @@ class RuntimeJobSpec:
                 raise ValueError("generate_section must be greater than 0")
         requested_stages = self.metadata.get("requested_stages")
         if requested_stages is not None:
+            if not isinstance(requested_stages, (list, tuple)):
+                raise ValueError("requested_stages must be a JSON array")
             allowed_stages = {"source_intake", "analyze", "outline", "review", "validate"}
             invalid = [str(item) for item in requested_stages if str(item) not in allowed_stages]
             if invalid:
                 raise ValueError(f"unsupported requested_stages entries: {invalid}")
+        for field_name in (
+            "validation_required",
+            "require_clean_validation",
+            "allow_unvalidated_when_validation_optional",
+        ):
+            if field_name in self.metadata:
+                _optional_bool(self.metadata[field_name], field_name=field_name)
 
     def to_job_request(self) -> JobRunRequest:
         self.validate()
+        requested_stages_raw = self.metadata.get("requested_stages")
+        requested_stages = (
+            tuple(dict.fromkeys(str(item) for item in requested_stages_raw))
+            if requested_stages_raw is not None
+            else None
+        )
+        validation_default = (
+            "validate" in requested_stages
+            if requested_stages is not None
+            else self.action == "validate_review"
+        )
         return JobRunRequest(
             config=self.config,
             project_name=self.project_name,
@@ -115,6 +143,23 @@ class RuntimeJobSpec:
             zotero_report=self.source.zotero_report or None,
             library_path=self.source.library_path or None,
             queue_file=self.queue_file,
+            requested_stages=requested_stages,
+            validation_required=(
+                self.metadata["validation_required"]
+                if "validation_required" in self.metadata
+                else validation_default
+            ),
+            require_clean_validation=(
+                self.metadata["require_clean_validation"]
+                if "require_clean_validation" in self.metadata
+                else validation_default
+            ),
+            allow_unvalidated_when_validation_optional=(
+                self.metadata["allow_unvalidated_when_validation_optional"]
+                if "allow_unvalidated_when_validation_optional" in self.metadata
+                else not validation_default
+            ),
+            derived_summary_source=bool(self.metadata.get("review_batch_spec")),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -135,6 +180,18 @@ class RuntimeJobSpec:
             path = Path(value).expanduser()
             return str((path if path.is_absolute() else origin / path).resolve())
 
+        metadata = dict(self.metadata)
+        review_batch_spec = metadata.get("review_batch_spec")
+        if isinstance(review_batch_spec, (str, Path)) and str(review_batch_spec).strip():
+            metadata["review_batch_spec"] = resolve_path(str(review_batch_spec))
+        elif isinstance(review_batch_spec, Mapping):
+            from services.review_batch import ReviewBatchSpecV1
+
+            metadata["review_batch_spec"] = ReviewBatchSpecV1.from_dict(
+                review_batch_spec,
+                origin_dir=origin,
+            ).to_dict()
+
         return replace(
             self,
             source=replace(
@@ -148,6 +205,7 @@ class RuntimeJobSpec:
             summary_sources=tuple(resolve_path(item) for item in self.summary_sources),
             reuse_summary_files=tuple(resolve_path(item) for item in self.reuse_summary_files),
             queue_file=resolve_path(self.queue_file),
+            metadata=metadata,
         )
 
     @classmethod
@@ -165,7 +223,7 @@ class RuntimeJobSpec:
                 if str(item).strip()
             ),
             reuse_stage1=(
-                bool(payload["reuse_stage1"])
+                _optional_bool(payload["reuse_stage1"], field_name="reuse_stage1")
                 if payload.get("reuse_stage1") is not None
                 else None
             ),
@@ -180,7 +238,12 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            keep_legacy_projections=bool(payload.get("keep_legacy_projections", True)),
+            keep_legacy_projections=bool(
+                _optional_bool(
+                    payload.get("keep_legacy_projections", True),
+                    field_name="keep_legacy_projections",
+                )
+            ),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -208,7 +271,7 @@ class RuntimeJobSpec:
                 if str(item).strip()
             ),
             reuse_stage1=(
-                bool(payload["reuse_stage1"])
+                _optional_bool(payload["reuse_stage1"], field_name="reuse_stage1")
                 if payload.get("reuse_stage1") is not None
                 else None
             ),
@@ -223,7 +286,12 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            keep_legacy_projections=bool(payload.get("keep_legacy_projections", True)),
+            keep_legacy_projections=bool(
+                _optional_bool(
+                    payload.get("keep_legacy_projections", True),
+                    field_name="keep_legacy_projections",
+                )
+            ),
             metadata=dict(payload.get("metadata") or {}),
         )
 

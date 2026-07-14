@@ -78,7 +78,10 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
         fingerprint_bundle={"request": "demo"},
         resume_state_report=_resume_report(workspace),
     )
-    generator.summaries = [{"status": "success", "paper_info": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "canonical_paper_key": "paper_a"}, "ai_summary": {"paper_metadata": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "journal": "Journal of Tests", "doi": "10.1000/test.paper"}}}]
+    generator.summaries = cast(
+        main.SummariesList,
+        [{"status": "success", "paper_info": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "canonical_paper_key": "paper_a"}, "ai_summary": {"paper_metadata": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "journal": "Journal of Tests", "doi": "10.1000/test.paper"}}}],
+    )
     generator.summary_file = workspace.artifact_path(f"{project_name}_summaries.json")
     Path(generator.summary_file).write_text(json.dumps(generator.summaries), encoding="utf-8")
     return generator, workspace, registry

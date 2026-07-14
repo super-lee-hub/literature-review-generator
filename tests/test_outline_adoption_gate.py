@@ -1,9 +1,10 @@
-import json
 """Tests for explicit v2 adoption gate."""
 
+import json
 import os
 from pathlib import Path
-import pytest
+from typing import cast
+
 from outline.literature_map import build_literature_map
 from outline.synthesis_flow import build_synthesis_flow
 from outline.candidates import generate_candidates_deterministic
@@ -142,6 +143,7 @@ class TestAdoptionGate:
         final, audit = _make_final_and_audit()
         audit = _force_passing_audit(final)
         adopted, _ = adopt_final_outline(final, audit, "job-001", "test-user", _make_health(final, audit))
+        assert adopted is not None
         path = str(tmp_path / "adopted_final_outline.json")
         written = write_adopted_outline(adopted, path)
         assert os.path.exists(written)
@@ -201,7 +203,7 @@ def test_generator_adopt_outline_v2_writes_registered_adopted_artifact(tmp_path:
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
     cfg = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Outline": {"enable_outline_intelligence_v2": "true"}})
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
-    generator.logger = DummyLogger()
+    generator.logger = cast(main.CustomLogger, DummyLogger())
     generator.config = cfg
     generator.bind_job_workspace(
         workspace=workspace,
@@ -269,7 +271,7 @@ def test_generator_adopt_outline_v2_failed_audit_does_not_write_adopted_artifact
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
     cfg = ConfigDict({"Paths": {"output_path": str(tmp_path / "output")}, "Outline": {"enable_outline_intelligence_v2": "true"}})
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
-    generator.logger = DummyLogger()
+    generator.logger = cast(main.CustomLogger, DummyLogger())
     generator.config = cfg
     generator.bind_job_workspace(
         workspace=workspace,
@@ -345,7 +347,7 @@ def test_setup_output_directory_restores_registry_for_latest_workspace(tmp_path:
         "Outline": {"enable_outline_intelligence_v2": "true"},
     })
     generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
-    generator.logger = DummyLogger()
+    generator.logger = cast(main.CustomLogger, DummyLogger())
     generator.config = cfg
     generator.compat_config = CompatConfigView.from_config(cfg)
 

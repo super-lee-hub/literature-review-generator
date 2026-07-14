@@ -1,74 +1,34 @@
-# 真源体系与数据契约
+# 运行时真相源与数据契约
 
-> 受众：维护者、AI Agent。
-> 来源：TRUTH_SOURCES.md；AGENTS.md §5-7。
+本文列出当前运行时的规范持久化事实。未列为规范真相源的文件，只能视为投影、导出、缓存或兼容输入。
 
-本文档定义 auto-generate 项目各阶段的规范真相来源、数据契约和兼容性投影。
+## Job 与来源身份
 
-## 主真相来源
+- `source_inventory_v1.json`：Zotero 报告、PDF、显式 summary 和分类文件的内容级来源身份真相。
+- `artifact_registry.json` v2：artifact 与依赖图；采用工作区写锁、revision 事务、原子替换和损坏时 fail-closed。
+- `job_outcome_v1.json`：当前 job head，记录生命周期、disposition、readiness policy、必需/完成阶段与 `canonical_ready`。
+- `artifacts/job_attempts/snapshot-*.json`：append-only attempt 历史；陈旧 running attempt 终结为 `interrupted`，不会被下一次恢复改写。
+- `runtime_stage_terminals/*/*.json`：只有文件、Registry、hash、schema、依赖和终态记录全部有效时，才能证明阶段完成。
 
-### 阶段一：论文分析
-- **主真相来源**：canonical `*_summaries.json`
-- **伴随持久产物**：`paper_artifact.json`（workspace 路径活跃时）
-- **降级**：legacy summary 投影归一化到规范 summary schema
-- **关键产物**：`*_summaries.json`（规范摘要结构）、`paper_artifact.json`（持久论文分析记录）、`*_analyzed_papers.xlsx`（导出物，非真相来源）
+旧 `success` 仅投影 `canonical_ready`；Queue 生命周期只读取 `job_status`。
 
-canonical summary 核心块：`routing`、`paper_metadata`、`core_analysis`、`specialized_details`、`quality_audit`
+## 各阶段规范真相源
 
-### 阶段二：大纲生成
-- **主真相来源**：已注册的 markdown outline 产物 `*_literature_review_outline.md`
-- **降级**：workspace/registry 产物不可用时使用 legacy output-folder markdown outline
-- **关键产物**：`*_literature_review_outline.md`（综述生成使用的下游大纲）
+| 阶段 | 规范真相源 | 投影/导出 |
+|---|---|---|
+| 来源接入 | `source_inventory_v1.json`、`source_bundle.json` | 旧 `List[PaperInfo]` |
+| Stage 1 | 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest | Excel 与旧 summary 结构 |
+| Outline v2 | literature map、synthesis flow、candidates、critiques、arbitration、`final_outline`、coverage audit，以及独立 `outline_stage_health_v1.json`；v2 开启时下游只消费已注册 `adopted_final_outline` | 仅在显式关闭 v2 时使用旧 Markdown outline |
+| Review | `*_review_draft_v2.json`、`*_citation_manifest_v3.json`、citation-ref catalog | review draft v1 与 DOCX |
+| Validation | `validation_run_result_v1.json`（`ValidationRunResultV1`） | 从规范 JSON 投影的 TXT、manual-review、alignment audit 和 completion report |
+| Repair | 与 validation-run artifact 绑定的 repair plan 与 apply result | 人类可读修复摘要 |
 
-### 阶段三：综述草稿
-- **主真相来源**：`*_review_draft_v2.json` + `*_citation_manifest_v3.json`
-- **降级**：Legacy review draft 结构（元数据标记为 legacy）
-- **关键产物**：`*_review_draft_v2.json`（含 block 结构、`block_source`、`span_map`、持久 section context）、`*_citation_manifest_v3.json`（结构化引用）
+`claim_verdict` 为：`supported | partial_support | evidence_gap | unsupported | contradicted | wrong_source | needs_review`。没有足够证据只能是 `evidence_gap`，不能自动写成 `unsupported`。
 
-### 阶段四：DOCX 生成
-- **主真相来源**：`*_review_draft_v2.json` + `*_citation_manifest_v3.json`（仅引用参考文献）
-- **降级**：Legacy summary-based bibliography（仅显式 legacy 模式）
+身份为 `ambiguous/mismatch` 时，job 可以完成诊断，但必须 quarantine，且 `canonical_ready=false`。
 
-### 阶段五：验证和修复
-- **主真相来源**：`validation_report.json` + `repair_plan.json` + `repair_apply_result.json`
-- **关键产物**：`validation_report.json`、`repair_plan.json`、`repair_apply_result.json`、`applied_patch_*.json`
+## 派生综述与 AI-native 运行时
 
-### 阶段六：GUI 队列系统
-- **主真相来源**：GUI 内部 `queue.json` 及不可变工作流提交快照
-- **关键产物**：`queue.json`、`QueueJobSpec`、`QueueJobRuntime`
+`SummarySelectionSpecV1` 固定父 job、父 artifact ID/hash、有序 paper keys、分类文件 hash、选择策略和 selection hash；child 使用 `external_job` 依赖，禁止调用 Stage 1 provider。
 
-### 阶段七：AI-native 运行时桥接
-- **主真相来源**：活跃 job workspace + artifact registry，由 `RuntimeJobSpec` 和 `AgentRuntimeBridge` 驱动
-- **关键产物**：`source_bundle.json`、`runtime_stage_trace.json`
-
-## 当前真实主链
-
-### 输入模式
-- PDF folder 模式：直接扫描文件夹中的 PDF
-- Zotero 模式：通过 `Paths.zotero_report` + `Paths.library_path` 定位文献与附件
-
-### 阶段一链路
-1. 收集源论文描述 → 2. 解析并定位 PDF → 3. 预处理层 → 4. 构建 stage1 输入 → 5. Reader API 生成结构化摘要 → 6. 归一化到 canonical summary schema → 7. 写入 `*_summaries.json` → 8. 写入 `paper_artifact` → 9. 输出 Excel
-
-### 阶段二链路
-主输出：`*_literature_review_outline.md`，默认 API：`Outline_API`
-
-### 阶段三链路
-`review_draft_v2` → `citation_manifest_v3` → DOCX。`review_draft_v2 + citation_manifest_v3` 才是阶段三更重要的结构化真相来源，`docx` 是最终导出物。
-
-### 验证 / 修复链路
-独立管线：`validation_report` → `repair_plan` → `repair_apply_result`
-
-## 数据契约
-
-### 阶段一
-- 主真相：canonical `*_summaries.json`
-- 伴随 durable artifact：`paper_artifacts/*.json`
-- 结构事实来源：`summary_schema.py`
-
-### 阶段二
-- 主真相：`*_literature_review_outline.md`
-
-### 阶段三
-- 主真相：`review_drafts/*_review_draft_v2.json`
-- 引用主真相：`citation_manifests/*_citation_manifest_v3.json`
+`AgentRuntimeRunner` 复用现有 `AgentRuntimeBridge`：`run` 启动新任务，`resume` 创建新 attempt，`status` 只读，`reconcile` 只修复持久化投影且绝不调用 provider。相对路径按其所属 spec/config/summary 文件目录解析，不静默回退 CWD。

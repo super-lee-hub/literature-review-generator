@@ -5,10 +5,9 @@
 """
 
 import pytest
-import time
 import threading
-from unittest.mock import Mock, patch, MagicMock
-from requests.exceptions import RequestException, Timeout, ConnectionError, HTTPError  # type: ignore
+from unittest.mock import Mock, patch
+from requests.exceptions import Timeout, ConnectionError, HTTPError  # type: ignore
 import ai_interface
 from ai_interface import _normalize_type_specific_details
 
@@ -713,8 +712,8 @@ def test_stage1_reader_scheduler_alternates_transient_failures(monkeypatch) -> N
 
     result = ai_interface.get_summary_from_ai_with_fallback(
         "prompt",
-        {"api_key": "primary", "model": "m1"},
-        {"api_key": "backup", "model": "m2"},
+        {"api_key": "primary", "model": "m1", "api_base": "https://primary.example.com/v1"},
+        {"api_key": "backup", "model": "m2", "api_base": "https://backup.example.com/v1"},
     )
 
     assert result == {"ok": True}
@@ -759,8 +758,8 @@ def test_stage1_reader_scheduler_disables_quota_engine_for_round(monkeypatch) ->
 
     result = ai_interface.get_summary_from_ai_with_fallback(
         "prompt",
-        {"api_key": "primary", "model": "m1"},
-        {"api_key": "backup", "model": "m2"},
+        {"api_key": "primary", "model": "m1", "api_base": "https://primary.example.com/v1"},
+        {"api_key": "backup", "model": "m2", "api_base": "https://backup.example.com/v1"},
         disable_engine_callback=disable,
     )
 

@@ -340,6 +340,11 @@ Important environment variables include:
 - `LLM_VALIDATOR_API`
 - `MINERU_*`
 
+`MINERU_ALLOWED_URL_HOSTS` accepts comma-separated exact hostnames for trusted
+HTTPS upload, download, or storage URLs outside the configured MinerU origin.
+Do not include a scheme, path, or wildcard. Leave it empty unless the provider
+returns links on a trusted external storage host.
+
 ## 10. Troubleshooting shortcuts
 
 - **First run**: start with `--analyze-only`

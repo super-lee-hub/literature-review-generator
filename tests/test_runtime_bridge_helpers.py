@@ -10,6 +10,7 @@ from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
 from config_loader import ConfigDict
 from services.progress_state import ResumeStateReport
+from summary_schema import normalize_ai_summary
 
 
 class DummyLogger:
@@ -155,15 +156,23 @@ def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict
             "source_pdf": pdf_path_str,
             "source_pdf_fingerprint": file_sha256(pdf_path),
         },
-        "ai_summary": {
-            "paper_metadata": {
-                "title": "Paper A",
-                "authors": ["Alice Smith"],
-                "year": "2024",
-                "journal": "Journal of Tests",
-                "doi": "10.1000/test.paper",
+        "ai_summary": normalize_ai_summary(
+            {
+                "paper_metadata": {
+                    "title": "Paper A",
+                    "authors": ["Alice Smith"],
+                    "year": "2024",
+                    "journal": "Journal of Tests",
+                    "doi": "10.1000/test.paper",
+                },
+                "core_analysis": {
+                    "summary": "Paper A reports source-grounded evidence.",
+                    "methodology": "Fixture analysis.",
+                    "findings": "The fixture contains a deterministic result.",
+                    "conclusions": "The deterministic result supports runtime testing.",
+                },
             }
-        },
+        ),
         "stage1_input": {"input_mode": "text", "selected_visual_refs": [], "multimodal_capability": {}},
         "text_length": 1200,
         "processing_time": "1.2",

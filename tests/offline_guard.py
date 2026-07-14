@@ -8,11 +8,31 @@ import re
 import socket
 import subprocess
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping, Sequence
+from typing import Any, Collection, Mapping, MutableMapping, Sequence
 
 
 class OfflineNetworkError(OSError):
     """Raised when a test attempts to access a non-loopback network target."""
+
+
+_LIVE_API_CREDENTIAL_ENV_NAMES = (
+    "AUTO_GENERATE_LIVE_API_KEY",
+    "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+)
+
+
+def live_api_skip_reason(
+    marker_names: Collection[str],
+    environment: Mapping[str, str],
+) -> str | None:
+    if "live_api" not in marker_names:
+        return None
+    if environment.get("AUTO_GENERATE_RUN_LIVE_API") != "1":
+        return "live API test not explicitly enabled"
+    if not any(environment.get(name) for name in _LIVE_API_CREDENTIAL_ENV_NAMES):
+        return "live API credential is not configured"
+    return None
 
 
 _INSTALLED = False

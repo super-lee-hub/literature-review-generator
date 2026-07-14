@@ -1,77 +1,33 @@
-# 兼容性路径与弃用时间线
+# 兼容性契约
 
-> 受众：维护者、AI Agent。
-> 来源：TRUTH_SOURCES.md。
+兼容读取必须是 additive 且 fail-closed：旧 artifact 可以读取，但不会因此自动获得新的身份、Validation 或 readiness 保证。
 
-## 兼容性投影
+## 旧 workspace
 
-### 字段兼容性
-- **规范字段**：由 `summary_schema.py` 和规范阶段一摘要结构驱动
-- **修复归属提示**：`validation/summary_recheck.py` 中的 `FIELD_OWNER_REGISTRY`
-- **Legacy 字段**：仅在投影 / 归一化层中支持
+- 缺少 `SourceInventoryV1`、readiness policy、attempt history 或 V2 dependency identity 时，投影为 `legacy_unverified`。
+- 旧 `success` 只兼容投影 `canonical_ready`；Queue 状态不再从它推导。
+- 旧 Validation report 可经 adapter 读取，但不满足 `ValidationRunResultV1`。
+- 旧 Registry dependency 尽可能归一化为 V2；缺 artifact identity/hash 时不得推断为 ready。
+- 仅在显式关闭 Outline v2 时允许旧 Markdown outline；v2 开启后，缺少当前已注册 adopted outline 或 health sidecar 必须 fail-closed。
 
-### API 兼容性
-- `Primary_Reader_API`：文献分析
-- `Backup_Reader_API`：提取失败降级
-- `Writer_API`：综述段落生成 / 重新生成
-- `Outline_API`：大纲生成
-- `Free_Mode_API`：自由模式规划
-- `Validator_API`：综述验证
+`status` 和 `reconcile` 对仅含 summary 的旧 workspace 都是只读操作：它们只报告 `legacy_unverified` 以及“需要显式迁移或重新运行”，不会创建 Registry、job outcome 或 audit record。唯一公开的兼容迁移入口是：
 
-### 输入/输出兼容性
-- PDF Folder 模式、Zotero 模式、GUI Queue 模式、AI-native 模式
-- 主持久输出目录：`output/<project_name>__<job_id>/`
-- 兼容指针目录：`output/<project_name>/`（仅 `_latest_job.json`）
-- 预处理缓存：`output/_preprocess_cache/`
+```powershell
+python -m runtime.cli migrate-legacy <workspace> --actor <operator> --reason <reason>
+```
 
-## 已弃用路径
+`--actor` 与 `--reason` 均为必填。该命令不会调用 provider，只会物化 fail-closed 兼容头：`compatibility_status=legacy_unverified`、`canonical_ready=false`、`requires_attention=true`，并生成不可变 `AuditRecordV1`。使用相同参数重复迁移必须保持字节级幂等；native 或非 summary-only workspace 会被拒绝。迁移绝不会把旧证据升级为 canonical readiness。
 
-### 阶段一
-- 无规范 schema 的 legacy 摘要结构
-- 基于正则的引用提取作为主要来源
-- 无预处理验证的 OCR
+## 必须审计的兼容动作
 
-### 阶段二
-- 大纲的 auto-accept/auto-adopt
-- 使用 `Writer_API` 生成大纲（应使用 `Outline_API`）
+显式复用旧 summary、ambiguous identity 人工选择、Outline 人工采纳、force delete 和 quarantine release 都必须生成不可变 `AuditRecordV1`，记录 actor、reason、scope、input hashes、policy snapshot 以及 artifact ID/hash。项目不支持长期布尔绕过开关。
 
-### 阶段三
-- 无结构化引用的 APA 文内引用
-- 无 `block_source` 和 `span_map` 的综述草稿
+## 路径与跨 job 依赖
 
-### 阶段四
-- 基于摘要的参考文献（使用 manifest cited bibliography）
-- 无 citation manifest 的 DOCX 生成
+- spec/config/summary 内的相对路径分别按其所属文件目录解析。
+- 跨 job 依赖使用 `external_job`；`job_id + artifact_id + content_hash` 是身份，path 只是定位投影。
+- 父 artifact 有未失效 child dependency 时默认禁止删除；force delete 必须写审计并使相关 child 失效。
 
-## 移除时间线
+## 可选集成边界
 
-### Phase 1：当前版本 (v1.0)
-- 所有已弃用路径仍作为降级可用
-- 在元数据和日志中标记已弃用路径
-
-### Phase 2：下一个小版本 (v1.1)
-- 已弃用路径默认禁用，可通过配置重新启用
-- 为已弃用路径使用添加警告消息
-
-### Phase 3：下一个大版本 (v2.0)
-- 已弃用路径完全移除
-- 清理代码库并移除兼容层
-
-## 关键实现说明
-
-### 引用对象主链
-- `citation_manifest_v3` 中的结构化引用是主要真相来源
-- 基于正则的引用仅允许作为 legacy 降级
-- 所有引用必须映射到规范论文键
-- DOCX 参考文献仅包含实际被引用的条目
-
-### 验证和修复
-- `ReviewValidator` 使用 `review_draft + citation_manifest + preprocess/visual evidence + paper metadata`
-- 修复根因分类：`citation_mapping_error`（manifest mapping + rerender）、`summary_drift`（targeted summary recheck）、`review_drift`（block/span patch）
-
-### GUI 队列系统
-- 默认队列策略：串行执行、失败继续、显式恢复、失败/取消 GUI job 重试
-- CLI 和 AI-native 运行时是直接运行面，不暴露公共队列工作流
-
-### 可选大纲审查兼容面
-- `--outline-adopt` 是显式/手动兼容命令，不是默认工作流的一部分
+live API、Playwright 与 heavy OCR 测试属于 optional marker，必须显式启用并满足前置条件。strict-offline 测试禁止外部网络、允许 loopback，并把离线边界传播到 Python 子进程。

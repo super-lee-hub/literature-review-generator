@@ -1,5 +1,6 @@
 import types
 
+from models import APIConfig
 from services.job_workspace import JobWorkspace
 import validator
 
@@ -17,13 +18,22 @@ def test_adjudication_checkpoint_prevents_repeated_model_call(monkeypatch, tmp_p
         return {"status": "supported", "confidence": 0.99}
 
     monkeypatch.setattr(validator, "run_adjudication_stage", fake_stage)
-    config = {"model": "validator-model", "api_key": "secret-a"}
+    config: APIConfig = {
+        "model": "validator-model",
+        "api_key": "secret-a",
+        "api_base": "https://validator.example.com/v1",
+    }
     first = validator._run_adjudication_stage_checkpointed(
         generator, config, packet, packet_dict, stage="primary"
     )
+    rotated_config: APIConfig = {
+        "model": "validator-model",
+        "api_key": "rotated-secret",
+        "api_base": "https://validator.example.com/v1",
+    }
     second = validator._run_adjudication_stage_checkpointed(
         generator,
-        {"model": "validator-model", "api_key": "rotated-secret"},
+        rotated_config,
         packet,
         packet_dict,
         stage="primary",

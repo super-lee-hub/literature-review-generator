@@ -64,6 +64,7 @@ class SummaryMatch:
 class ResolvedSummarySet:
     summaries: List[Dict[str, Any]]
     source_items: List[Dict[str, Any]]
+    contributing_source_items: List[Dict[str, Any]]
     rejected_candidates: List[Dict[str, Any]]
 
 
@@ -512,7 +513,8 @@ class SummaryCatalog:
         for record in sorted(self.records, key=self._sort_key):
             winners.setdefault(record.unique_identity, record)
 
-        summaries = [deepcopy(record.summary) for record in sorted(winners.values(), key=self._sort_key)]
+        winner_records = sorted(winners.values(), key=self._sort_key)
+        summaries = [deepcopy(record.summary) for record in winner_records]
         source_items = [
             {
                 "path": source.path,
@@ -522,9 +524,16 @@ class SummaryCatalog:
             }
             for source in self.sources
         ]
+        contributing_paths = {record.source.path for record in winner_records}
+        contributing_source_items = [
+            dict(item)
+            for item in source_items
+            if str(item.get("path") or "") in contributing_paths
+        ]
         return ResolvedSummarySet(
             summaries=summaries,
             source_items=source_items,
+            contributing_source_items=contributing_source_items,
             rejected_candidates=list(self.rejected_candidates),
         )
 

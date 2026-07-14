@@ -19,9 +19,42 @@ STAGE_TERMINAL_DIR = "runtime_stage_terminals"
 TerminalStageStatus = Literal["succeeded", "failed", "cancelled", "blocked"]
 _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "blocked"})
 
+_STAGE_OUTPUT_CONTRACTS: Mapping[str, tuple[frozenset[str], ...]] = {
+    "source_intake": (frozenset({"source_bundle"}),),
+    "analyze": (frozenset({"summary_file"}),),
+    "outline": (
+        frozenset({"adopted_final_outline"}),
+        frozenset({"literature_review_outline"}),
+    ),
+    "review": (
+        frozenset({"review_draft", "citation_manifest", "review_docx"}),
+    ),
+    "validate": (frozenset({"validation_run_result"}),),
+}
+
 
 class StageTerminalContractError(ValueError):
     pass
+
+
+def validate_stage_output_contract(
+    stage_name: str,
+    output_artifact_refs: Sequence[ArtifactDependencyRefV2],
+) -> None:
+    """Require the canonical durable outputs for known runtime stages."""
+
+    alternatives = _STAGE_OUTPUT_CONTRACTS.get(stage_name)
+    if alternatives is None:
+        return
+    artifact_types = {ref.artifact_type for ref in output_artifact_refs}
+    if any(required.issubset(artifact_types) for required in alternatives):
+        return
+    expected = " or ".join(
+        "+".join(sorted(required)) for required in alternatives
+    )
+    raise StageTerminalContractError(
+        f"succeeded stage {stage_name!r} requires canonical outputs: {expected}"
+    )
 
 
 def _normalize_refs(
@@ -89,6 +122,8 @@ class TerminalStageRecordV1:
             raise StageTerminalContractError("started_at and finished_at are required")
         if self.status == "succeeded" and not self.output_artifact_refs:
             raise StageTerminalContractError("a succeeded stage requires at least one output artifact")
+        if self.status == "succeeded":
+            validate_stage_output_contract(self.stage_name, self.output_artifact_refs)
         identities = [
             (ref.dependency_kind, ref.job_id, ref.artifact_id, ref.content_hash)
             for ref in self.output_artifact_refs
@@ -223,6 +258,10 @@ class StageTerminalStore:
             if not isinstance(payload, dict):
                 raise StageTerminalContractError(f"stage terminal must be an object: {path}")
             record = TerminalStageRecordV1.from_dict(payload)
+            if record.job_id != self.registry.job_id:
+                raise StageTerminalContractError(
+                    f"stage terminal job_id does not match Registry owner: {path}"
+                )
             if path != self.path_for(record):
                 raise StageTerminalContractError(f"stage terminal path does not match record identity: {path}")
             records.append((record, path))

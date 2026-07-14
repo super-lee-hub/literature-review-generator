@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from offline_guard import OfflineNetworkError
+from offline_guard import OfflineNetworkError, live_api_skip_reason
 
 
 def test_external_dns_is_blocked() -> None:
@@ -49,3 +49,36 @@ def test_python_subprocess_inherits_offline_guard() -> None:
     )
     assert result.returncode != 0
     assert "OfflineNetworkError" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("marker_names", "environment", "expected_reason"),
+    [
+        (set(), {}, None),
+        ({"live_api"}, {}, "live API test not explicitly enabled"),
+        (
+            {"live_api"},
+            {"AUTO_GENERATE_RUN_LIVE_API": "1"},
+            "live API credential is not configured",
+        ),
+        (
+            {"live_api"},
+            {"AUTO_GENERATE_LIVE_API_KEY": "test-key"},
+            "live API test not explicitly enabled",
+        ),
+        (
+            {"live_api"},
+            {
+                "AUTO_GENERATE_RUN_LIVE_API": "1",
+                "AUTO_GENERATE_LIVE_API_KEY": "test-key",
+            },
+            None,
+        ),
+    ],
+)
+def test_live_api_gate_requires_marker_opt_in_and_credential(
+    marker_names: set[str],
+    environment: dict[str, str],
+    expected_reason: str | None,
+) -> None:
+    assert live_api_skip_reason(marker_names, environment) == expected_reason

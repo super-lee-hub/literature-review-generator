@@ -16,7 +16,11 @@ _TESTS_DIR = Path(__file__).resolve().parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
-from offline_guard import configure_offline_environment, install_offline_guard
+from offline_guard import (  # noqa: E402
+    configure_offline_environment,
+    install_offline_guard,
+    live_api_skip_reason,
+)
 
 
 configure_offline_environment()
@@ -213,18 +217,9 @@ def pytest_collection_modifyitems(config, items):
         if marker_names & _OPTIONAL_MARKERS:
             _OPTIONAL_NODEIDS.add(item.nodeid)
 
-        if "live_api" in marker_names:
-            enabled = os.environ.get("AUTO_GENERATE_RUN_LIVE_API") == "1"
-            has_key = any(
-                os.environ.get(name)
-                for name in (
-                    "AUTO_GENERATE_LIVE_API_KEY",
-                    "OPENAI_API_KEY",
-                    "DEEPSEEK_API_KEY",
-                )
-            )
-            if not enabled or not has_key:
-                item.add_marker(pytest.mark.skip(reason="live API test not explicitly enabled"))
+        live_api_reason = live_api_skip_reason(marker_names, os.environ)
+        if live_api_reason is not None:
+            item.add_marker(pytest.mark.skip(reason=live_api_reason))
         if "playwright" in marker_names and os.environ.get("AUTO_GENERATE_RUN_PLAYWRIGHT") != "1":
             item.add_marker(pytest.mark.skip(reason="Playwright test not explicitly enabled"))
         if "heavy_ocr" in marker_names and os.environ.get("AUTO_GENERATE_RUN_HEAVY_OCR") != "1":

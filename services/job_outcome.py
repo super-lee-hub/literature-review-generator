@@ -190,6 +190,11 @@ class JobOutcomeV1:
             raise JobOutcomeContractError("needs_review outcomes cannot be canonical-ready")
         if self.job_status in {"failed", "cancelled"} and self.canonical_ready:
             raise JobOutcomeContractError("failed or cancelled jobs cannot be canonical-ready")
+        if self.canonical_ready and not set(self.required_stages).issubset(self.completed_stages):
+            missing = sorted(set(self.required_stages) - set(self.completed_stages))
+            raise JobOutcomeContractError(
+                f"canonical_ready requires all required stages to be completed: {missing}"
+            )
         if self.failed_stage and self.failed_stage in self.completed_stages:
             raise JobOutcomeContractError("failed_stage cannot also be completed")
         if self.compatibility_status == "legacy_unverified":
@@ -353,6 +358,44 @@ class JobOutcomeV1:
             completed_stages=tuple(payload.get("completed_stages") or ()),
             failed_stage=str(payload.get("failed_stage") or "") or None,
             degradation_reasons=tuple(legacy_reasons),
+            compatibility_status="legacy_unverified",
+        )
+
+    @classmethod
+    def legacy_unverified(
+        cls,
+        *,
+        job_id: str,
+        job_status: JobStatus = "completed",
+        required_stages: Sequence[str] = (),
+        completed_stages: Sequence[str] = (),
+        degradation_reasons: Sequence[str] = (),
+    ) -> "JobOutcomeV1":
+        snapshot = MappingProxyType({"compatibility_mode": "legacy_unverified"})
+        policy_hash = build_readiness_policy_hash(LEGACY_READINESS_POLICY_VERSION, snapshot)
+        now = utc_now_iso()
+        return cls(
+            artifact_type=JOB_OUTCOME_ARTIFACT_TYPE,
+            artifact_version=JOB_OUTCOME_ARTIFACT_VERSION,
+            job_id=job_id,
+            attempt_number=1,
+            resumed_from_attempt=None,
+            job_status=job_status,
+            job_disposition="unvalidated",
+            canonical_ready=False,
+            requires_attention=True,
+            created_at=now,
+            updated_at=now,
+            outcome_revision=1,
+            readiness_policy_version=LEGACY_READINESS_POLICY_VERSION,
+            readiness_policy_snapshot=snapshot,
+            readiness_policy_hash=policy_hash,
+            required_stages=tuple(required_stages),
+            completed_stages=tuple(completed_stages),
+            failed_stage=None,
+            degradation_reasons=tuple(
+                dict.fromkeys(("legacy_unverified", *degradation_reasons))
+            ),
             compatibility_status="legacy_unverified",
         )
 

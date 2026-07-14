@@ -1,8 +1,9 @@
+from dataclasses import replace
 import threading
 
 import pytest
 
-from validation.edge_checkpoint import ValidationEdgeCheckpointStore
+from validation.edge_checkpoint import ValidationEdgeCheckpointStore, ValidationEdgeKeyV1
 from validation.review_validator import ReviewValidator
 
 
@@ -124,3 +125,36 @@ def test_checkpoint_identity_uses_canonical_key_not_manifest_alias(tmp_path):
         segment_coverages=[],
     )
     assert key.canonical_paper_key == "paper-a"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("claim_unit_hash", "claim-b"),
+        ("canonical_paper_key", "paper-b"),
+        ("evidence_hashes", ("evidence-b",)),
+        ("segmenter_version", "segmenter-v2"),
+        ("retrieval_config_hash", "retrieval-b"),
+        ("model_route", "provider-b/model-b"),
+        ("prompt_version", "prompt-v2"),
+        ("adjudication_schema_version", "schema-v2"),
+    ],
+)
+def test_checkpoint_key_changes_when_any_contract_identity_field_changes(
+    field_name: str,
+    replacement: object,
+) -> None:
+    baseline = ValidationEdgeKeyV1(
+        claim_unit_hash="claim-a",
+        canonical_paper_key="paper-a",
+        evidence_hashes=("evidence-a",),
+        segmenter_version="segmenter-v1",
+        retrieval_config_hash="retrieval-a",
+        model_route="provider-a/model-a",
+        prompt_version="prompt-v1",
+        adjudication_schema_version="schema-v1",
+    )
+
+    changed = replace(baseline, **{field_name: replacement})
+
+    assert changed.checkpoint_key != baseline.checkpoint_key

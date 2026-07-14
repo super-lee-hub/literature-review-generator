@@ -53,7 +53,7 @@ from docx_writer import create_word_document, append_section_to_word_document, g
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from preprocess.service import PreprocessManager
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
-from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry, file_sha256
 from services.citation_metadata import sanitize_metadata_fields
 from services.citation_ref_catalog import build_document_ref_catalog, validate_raw_citation_text
 from services.config_compat import CompatConfigView
@@ -64,7 +64,11 @@ from services.environment_service import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
-from services.paper_identity import build_paper_key as build_legacy_paper_key, normalize_doi
+from services.paper_identity import (
+    build_canonical_paper_key,
+    build_paper_key as build_legacy_paper_key,
+    normalize_doi,
+)
 from services.progress_state import (
     ResumeStateReport,
     Stage1ProgressSnapshot,
@@ -89,7 +93,6 @@ from services.summary_reuse import (
     SummaryMatch,
     SummarySource,
     SummarySourceError,
-    build_effective_summary_set,
     build_reused_summary,
     collect_summary_sources,
     describe_summary_candidate,
@@ -98,7 +101,7 @@ from services.summary_reuse import (
 from services.text_io import load_json_file_with_fallbacks
 from utils import ensure_dir
 from setup_wizard import run_setup_wizard
-from summary_schema import get_core_analysis, get_paper_metadata
+from summary_schema import get_core_analysis, get_paper_metadata, normalize_ai_summary
 from free_mode.profile_manager import build_profile_context, load_profile
 
 
@@ -384,6 +387,7 @@ class LiteratureReviewGenerator:
     CITATION_REF_CATALOG_ARTIFACT_TYPE = "citation_ref_catalog"
     CITATION_REF_CATALOG_ARTIFACT_ROLE = "citation_ref_catalog"
     CITATION_REF_CATALOG_ARTIFACT_VERSION = "v1"
+    LEGACY_SUMMARY_PROJECTION_VERSION = "legacy-summary-projection-v1"
     
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None, queue_file: str = 'output/_queue/queue.json', zotero_report: Optional[str] = None, library_path: Optional[str] = None):
         self.config_file: str = config_file
@@ -398,6 +402,9 @@ class LiteratureReviewGenerator:
         self.summary_file: Optional[str] = None
         self.summary_file_override: Optional[str] = None
         self.summary_source_overrides: List[str] = []
+        self.audit_actor: str = ""
+        self.audit_reason: str = ""
+        self.audit_scope: Dict[str, Any] = {}
         self.reuse_stage1: bool = False
         self.reuse_summary_files: List[str] = []
         self.papers: List[PaperInfo] = []
@@ -1154,6 +1161,7 @@ class LiteratureReviewGenerator:
         path: str,
         producer: str = "main.LiteratureReviewGenerator",
         depends_on: Optional[List[ArtifactDependencyRef]] = None,
+        status: str = "ready",
     ) -> None:
         if not self.artifact_registry:
             return
@@ -1163,7 +1171,38 @@ class LiteratureReviewGenerator:
             artifact_version=artifact_version,
             path=path,
             producer=producer,
+            status=status,
             depends_on=depends_on or [],
+        )
+
+    def _registered_dependency_for_path(
+        self,
+        path: str,
+        *,
+        fallback_artifact_type: str,
+    ) -> ArtifactDependencyRef:
+        if self.artifact_registry:
+            normalized = os.path.normcase(os.path.abspath(path))
+            record = next(
+                (
+                    item
+                    for item in self.artifact_registry.list_records()
+                    if os.path.normcase(os.path.abspath(item.path)) == normalized
+                ),
+                None,
+            )
+            if record is not None:
+                return ArtifactDependencyRef(
+                    artifact_type=record.artifact_type,
+                    path=record.path,
+                    content_hash=record.content_hash,
+                    dependency_kind="local_job",
+                    job_id=record.job_id,
+                    artifact_id=record.artifact_id,
+                )
+        return ArtifactDependencyRef(
+            artifact_type=fallback_artifact_type,
+            path=path,
         )
 
     def _write_stage1_progress_snapshot(self) -> bool:
@@ -1494,11 +1533,23 @@ class LiteratureReviewGenerator:
             return True
 
         try:
+            outline_dependency = (
+                self._registered_dependency_for_path(
+                    outline_file,
+                    fallback_artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                )
+                if outline_file
+                else None
+            )
             review_draft = build_review_draft_v1(
                 job_id=self.job_workspace.job_id,
                 project_name=self.project_name or "review",
                 draft_id=self.REVIEW_DRAFT_ARTIFACT_ID,
-                outline_artifact_id=self.OUTLINE_ARTIFACT_ID,
+                outline_artifact_id=(
+                    (outline_dependency.artifact_id or self.OUTLINE_ARTIFACT_ID)
+                    if outline_dependency
+                    else self.OUTLINE_ARTIFACT_ID
+                ),
                 outline_source_path=outline_file,
                 summary_file=self.summary_file or "",
                 review_word_path=word_file,
@@ -1510,13 +1561,8 @@ class LiteratureReviewGenerator:
             atomic_write_json(artifact_path, review_draft.to_dict())
 
             depends_on: List[ArtifactDependencyRef] = []
-            if outline_file:
-                depends_on.append(
-                    ArtifactDependencyRef(
-                        artifact_type=self.OUTLINE_ARTIFACT_TYPE,
-                        path=outline_file,
-                    )
-                )
+            if outline_dependency:
+                depends_on.append(outline_dependency)
             if self.summary_file:
                 depends_on.append(
                     ArtifactDependencyRef(
@@ -1553,6 +1599,14 @@ class LiteratureReviewGenerator:
             return True
 
         try:
+            outline_dependency = (
+                self._registered_dependency_for_path(
+                    outline_file,
+                    fallback_artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                )
+                if outline_file
+                else None
+            )
             # Use self.summaries if paper_summaries is not explicitly provided
             if paper_summaries is None:
                 paper_summaries = [dict(summary) for summary in self.summaries]
@@ -1564,7 +1618,11 @@ class LiteratureReviewGenerator:
                 job_id=self.job_workspace.job_id,
                 project_name=self.project_name or "review",
                 draft_id=self.REVIEW_DRAFT_V2_ARTIFACT_ID,
-                outline_artifact_id=self.OUTLINE_ARTIFACT_ID,
+                outline_artifact_id=(
+                    (outline_dependency.artifact_id or self.OUTLINE_ARTIFACT_ID)
+                    if outline_dependency
+                    else self.OUTLINE_ARTIFACT_ID
+                ),
                 outline_source_path=outline_file,
                 summary_file=self.summary_file or "",
                 review_word_path=word_file,
@@ -1581,13 +1639,8 @@ class LiteratureReviewGenerator:
             atomic_write_json(artifact_path, review_draft.to_dict())
 
             depends_on: List[ArtifactDependencyRef] = []
-            if outline_file:
-                depends_on.append(
-                    ArtifactDependencyRef(
-                        artifact_type=self.OUTLINE_ARTIFACT_TYPE,
-                        path=outline_file,
-                    )
-                )
+            if outline_dependency:
+                depends_on.append(outline_dependency)
             if self.summary_file:
                 depends_on.append(
                     ArtifactDependencyRef(
@@ -1682,9 +1735,8 @@ class LiteratureReviewGenerator:
                         path=review_draft_path,
                     )
                 )
-            citation_ref_catalog = self._load_citation_ref_catalog()
+            self._load_citation_ref_catalog()
             citation_ref_catalog_path = self._citation_ref_catalog_path()
-            citation_ref_catalog_hash = str((citation_ref_catalog or {}).get("catalog_hash") or "")
             if citation_ref_catalog_path and os.path.isfile(citation_ref_catalog_path):
                 from services.artifact_registry import file_sha256
 
@@ -2028,20 +2080,22 @@ class LiteratureReviewGenerator:
 
     def _materialize_effective_summaries(
         self,
-        summaries: List[Dict[str, Any]],
+        summaries: Sequence[Mapping[str, Any]],
         *,
         source_path: str = "",
         source_kind: str,
         producer: str,
-        source_items: Optional[List[Dict[str, Any]]] = None,
-        rejected_candidates: Optional[List[Dict[str, Any]]] = None,
+        source_items: Optional[Sequence[Mapping[str, Any]]] = None,
+        rejected_candidates: Optional[Sequence[Mapping[str, Any]]] = None,
+        registration_status: str = "ready",
     ) -> bool:
         if not self.summary_file:
             return False
 
+        summary_payload = [dict(summary) for summary in summaries]
         Path(self.summary_file).parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.summary_file, summaries)
-        effective_source_items = list(source_items or [])
+        atomic_write_json(self.summary_file, summary_payload)
+        effective_source_items = [dict(item) for item in (source_items or ())]
         if not effective_source_items and source_path:
             effective_source_items = [
                 {
@@ -2057,10 +2111,11 @@ class LiteratureReviewGenerator:
             artifact_version="v1",
             path=self.summary_file,
             producer=producer,
+            status=registration_status,
             depends_on=[
-                ArtifactDependencyRef(
-                    artifact_type="summary_source",
-                    path=str(item.get("path") or ""),
+                self._registered_dependency_for_path(
+                    str(item.get("path") or ""),
+                    fallback_artifact_type="summary_source",
                 )
                 for item in effective_source_items
                 if str(item.get("path") or "").strip()
@@ -2081,17 +2136,18 @@ class LiteratureReviewGenerator:
             "source_kind": source_kind,
             "source_path": primary_source_path,
             "source_items": effective_source_items,
-            "rejected_candidates": list(rejected_candidates or []),
+            "rejected_candidates": [dict(item) for item in (rejected_candidates or ())],
             "materialized_summary_file": self.summary_file,
-            "summary_count": len(summaries),
+            "summary_count": len(summary_payload),
         }
         atomic_write_json(manifest_path, manifest_payload)
         self._register_workspace_artifact(
             artifact_role="summary_source",
             artifact_type="summary_source_manifest",
-            artifact_version="v1",
+            artifact_version="v2",
             path=manifest_path,
             producer=producer,
+            status=registration_status,
             depends_on=[
                 ArtifactDependencyRef(
                     artifact_type="summary_file",
@@ -2100,6 +2156,66 @@ class LiteratureReviewGenerator:
             ],
         )
         return True
+
+    @staticmethod
+    def _project_legacy_summary_to_canonical(summary: Mapping[str, Any]) -> Dict[str, Any]:
+        raw_paper_info = summary.get("paper_info")
+        paper_info = dict(raw_paper_info) if isinstance(raw_paper_info, Mapping) else {}
+        ai_metadata = get_paper_metadata(summary.get("ai_summary"))
+        for field in ("title", "authors", "year", "journal", "doi"):
+            if not paper_info.get(field) and ai_metadata.get(field):
+                paper_info[field] = ai_metadata[field]
+
+        explicit_key = str(
+            paper_info.get("canonical_paper_key")
+            or paper_info.get("source_paper_id")
+            or ""
+        ).strip()
+        doi = normalize_doi(paper_info.get("doi"))
+        title = str(paper_info.get("title") or "").strip()
+        authors = paper_info.get("authors")
+        has_authors = bool(authors.strip()) if isinstance(authors, str) else bool(authors)
+        year = str(paper_info.get("year") or "").strip()
+        if not explicit_key and not doi and not (title and has_authors and year):
+            raise SummarySourceError(
+                "legacy summary records require DOI, an explicit paper key, or title/author/year identity"
+            )
+
+        if doi:
+            paper_info["doi"] = doi
+        canonical_key = normalize_doi(explicit_key) or explicit_key
+        if not canonical_key:
+            canonical_key = build_canonical_paper_key(paper_info)
+        paper_info["canonical_paper_key"] = canonical_key
+        paper_info.setdefault("source_paper_id", canonical_key)
+
+        canonical_ai_summary = normalize_ai_summary(summary.get("ai_summary"))
+        canonical_metadata = dict(canonical_ai_summary["paper_metadata"])
+        for field in ("title", "authors", "year", "journal", "doi"):
+            if not canonical_metadata.get(field) and paper_info.get(field):
+                canonical_metadata[field] = paper_info[field]
+        canonical_ai_summary["paper_metadata"] = canonical_metadata
+        canonical_ai_summary = normalize_ai_summary(canonical_ai_summary)
+
+        quality_audit = canonical_ai_summary.get("quality_audit")
+        missing_critical_fields = (
+            [str(item) for item in quality_audit.get("missing_critical_fields", [])]
+            if isinstance(quality_audit, Mapping)
+            else []
+        )
+        if missing_critical_fields:
+            identity = canonical_key or title or "unknown legacy summary"
+            raise SummarySourceError(
+                f"legacy summary {identity!r} cannot be projected to canonical summary; "
+                "missing critical ai_summary fields: "
+                + ", ".join(missing_critical_fields)
+            )
+
+        projected = dict(summary)
+        projected["status"] = "success"
+        projected["paper_info"] = paper_info
+        projected["ai_summary"] = canonical_ai_summary
+        return projected
 
     def _load_summaries_from_sources(
         self,
@@ -2117,21 +2233,243 @@ class LiteratureReviewGenerator:
             )
             for index, path in enumerate(paths)
         ]
-        resolved: ResolvedSummarySet = build_effective_summary_set(sources, logger=self.logger)
-        self.summaries = [dict(item) for item in resolved.summaries]
-        success_count = len(self.summaries)
+        catalog = SummaryCatalog.from_sources(sources, logger=self.logger)
+        resolved: ResolvedSummarySet = catalog.build_effective_summary_set()
+        if not resolved.summaries:
+            raise SummarySourceError(
+                "explicit legacy summary sources contain no reusable successful summary records"
+            )
+        # Validate every otherwise-reusable explicit record before any Registry or
+        # artifact mutation. This prevents a weak duplicate loser from bypassing
+        # the canonical projection quality gate.
+        for record in catalog.records:
+            self._project_legacy_summary_to_canonical(record.summary)
+
+        projected_summaries: SummariesList = [
+            cast(
+                ProcessingResult,
+                self._project_legacy_summary_to_canonical(item),
+            )
+            for item in resolved.summaries
+        ]
+
+        contributing_paths = {
+            os.path.normcase(os.path.abspath(str(item.get("path") or "")))
+            for item in resolved.contributing_source_items
+            if str(item.get("path") or "").strip()
+        }
+        rejection_reasons_by_path: Dict[str, Set[str]] = {}
+        for rejected in resolved.rejected_candidates:
+            rejected_path = str(rejected.get("path") or "").strip()
+            reason = str(rejected.get("reason") or "").strip()
+            if rejected_path and reason:
+                normalized_path = os.path.normcase(os.path.abspath(rejected_path))
+                rejection_reasons_by_path.setdefault(normalized_path, set()).add(reason)
+
+        selected_source_audit_items: List[Dict[str, Any]] = []
+        for index, source in enumerate(sources):
+            resolved_path = os.path.abspath(source.path)
+            normalized_path = os.path.normcase(resolved_path)
+            content_hash = file_sha256(resolved_path)
+            contributed = normalized_path in contributing_paths
+            rejection_reasons = sorted(rejection_reasons_by_path.get(normalized_path, set()))
+            if not contributed and not rejection_reasons:
+                rejection_reasons = ["not_selected_as_effective_winner"]
+            selected_source_audit_items.append(
+                {
+                    "index": index + 1,
+                    "path": resolved_path,
+                    "source_type": source.source_type,
+                    "label": source.label,
+                    "priority": source.priority,
+                    "content_hash": content_hash,
+                    "contributed": contributed,
+                    "rejection_reasons": rejection_reasons,
+                }
+            )
+
+        # Recheck every selected input before the first Registry mutation so a
+        # changed source cannot leave a partially registered legacy graph.
+        for item in selected_source_audit_items:
+            selected_path = str(item["path"])
+            if file_sha256(selected_path) != str(item["content_hash"]):
+                raise SummarySourceError(
+                    f"legacy summary source changed during projection: {selected_path}"
+                )
+
+        source_records = []
+        if self.artifact_registry and self.job_workspace:
+            for source in sources:
+                resolved_path = os.path.abspath(source.path)
+                if os.path.normcase(resolved_path) not in contributing_paths:
+                    continue
+                path_key = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()[:12]
+                source_record = self.artifact_registry.register_file(
+                    artifact_role="legacy_summary_source",
+                    artifact_type="legacy_summary_source",
+                    artifact_version="v1",
+                    path=resolved_path,
+                    producer=producer,
+                    status="quarantined",
+                    artifact_id=f"legacy-summary-source:{path_key}",
+                    metadata={
+                        "compatibility_status": "legacy_unverified",
+                        "canonical_ready": False,
+                    },
+                )
+                source_records.append(source_record)
+
+        self.summaries = projected_summaries
+        success_count = len(projected_summaries)
         self.logger.success(f"Loaded summary sources: {success_count} success, 0 failed")
         if resolved.rejected_candidates:
             self.logger.info(f"Summary source merge skipped {len(resolved.rejected_candidates)} non-reusable records")
-        self._materialize_effective_summaries(
-            self.summaries,
+        materialized = self._materialize_effective_summaries(
+            projected_summaries,
             source_path=str(paths[0]) if len(paths) == 1 else "",
             source_kind=source_kind,
             producer=producer,
-            source_items=resolved.source_items,
+            source_items=resolved.contributing_source_items,
             rejected_candidates=resolved.rejected_candidates,
+            registration_status="quarantined" if source_records else "ready",
         )
+        if materialized and source_records and self.artifact_registry and self.job_workspace and self.summary_file:
+            import getpass
+
+            from services.artifact_registry import ArtifactDependencyRefV2
+            from services.audit_record import AuditArtifactRefV1, AuditRecordV1
+
+            summary_path = os.path.abspath(self.summary_file)
+            summary_record = next(
+                (
+                    record
+                    for record in self.artifact_registry.list_records()
+                    if os.path.abspath(record.path) == summary_path
+                    and record.artifact_type == "summary_file"
+                    and record.artifact_role == "summary"
+                ),
+                None,
+            )
+            if summary_record is None:
+                raise RuntimeError("materialized summary file was not registered")
+            manifest_path = os.path.abspath(self._get_summary_source_manifest_path())
+            manifest_record = next(
+                (
+                    record
+                    for record in self.artifact_registry.list_records()
+                    if os.path.abspath(record.path) == manifest_path
+                    and record.artifact_type == "summary_source_manifest"
+                ),
+                None,
+            )
+            if manifest_record is None:
+                raise RuntimeError("materialized summary source manifest was not registered")
+            input_refs = [
+                AuditArtifactRefV1(
+                    artifact_id=record.artifact_id,
+                    artifact_type=record.artifact_type,
+                    job_id=record.job_id,
+                    content_hash=record.content_hash,
+                )
+                for record in source_records
+            ]
+            output_ref = AuditArtifactRefV1(
+                artifact_id=summary_record.artifact_id,
+                artifact_type=summary_record.artifact_type,
+                job_id=summary_record.job_id,
+                content_hash=summary_record.content_hash,
+            )
+            actor = self.audit_actor.strip() or getpass.getuser() or "local-user"
+            reason = self.audit_reason.strip() or "explicit legacy summary source selected"
+            audit = AuditRecordV1.create(
+                audit_type="legacy_reuse",
+                job_id=self.job_workspace.job_id,
+                attempt_id=f"legacy-reuse:{self.job_workspace.job_id}",
+                producer=producer,
+                actor=actor,
+                reason=reason,
+                scope={
+                    "operation": "explicit_summary_reuse",
+                    "source_count": len(source_records),
+                    "selected_source_count": len(selected_source_audit_items),
+                    "selected_sources": selected_source_audit_items,
+                    "canonical_projection": self.LEGACY_SUMMARY_PROJECTION_VERSION,
+                    **dict(self.audit_scope),
+                },
+                target_artifacts=[output_ref],
+                input_artifact_refs=input_refs,
+                output_artifact_refs=[output_ref],
+                input_hashes={
+                    f"summary_source_{item['index']}": str(item["content_hash"])
+                    for item in selected_source_audit_items
+                },
+                policy_snapshot={
+                    "explicit_selection_required": True,
+                    "legacy_inputs_are_not_identity_verified": True,
+                    "canonical_projection_required": True,
+                },
+                disposition="reused_with_audit",
+            )
+            audit_path = self.job_workspace.artifact_path(f"legacy_reuse_{audit.audit_id}.json")
+            atomic_write_json(audit_path, audit.to_dict())
+            dependencies = [
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=record.job_id,
+                    artifact_id=record.artifact_id,
+                    artifact_type=record.artifact_type,
+                    path=record.path,
+                    content_hash=record.content_hash,
+                )
+                for record in [*source_records, summary_record]
+            ]
+            self.artifact_registry.register_file(
+                artifact_role="audit_record",
+                artifact_type="audit_record",
+                artifact_version="v1",
+                path=audit_path,
+                producer=producer,
+                artifact_id=audit.audit_id,
+                depends_on=dependencies,
+                metadata={
+                    "audit_type": audit.audit_type,
+                    "record_hash": audit.record_hash,
+                },
+            )
+            release_metadata = {"legacy_reuse_audit_id": audit.audit_id}
+            for source_record in source_records:
+                self.artifact_registry.update_record(
+                    source_record.artifact_id,
+                    status="ready",
+                    metadata_updates=release_metadata,
+                )
+            self.artifact_registry.update_record(
+                manifest_record.artifact_id,
+                status="ready",
+                metadata_updates=release_metadata,
+            )
+            # The canonical summary becomes reusable only after every audit and
+            # compatibility projection artifact is durable.
+            self.artifact_registry.update_record(
+                summary_record.artifact_id,
+                status="ready",
+                metadata_updates=release_metadata,
+            )
         return True
+
+    def _assert_registered_summary_is_ready(self, path: str) -> None:
+        if not self.artifact_registry:
+            return
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        for record in self.artifact_registry.list_records():
+            if (
+                record.artifact_type == "summary_file"
+                and os.path.normcase(os.path.abspath(record.path)) == normalized_path
+                and record.status != "ready"
+            ):
+                raise SummarySourceError(
+                    "registered summary is not ready; its legacy reuse audit did not complete"
+                )
 
     def _load_summaries_from_path(
         self,
@@ -2141,8 +2479,12 @@ class LiteratureReviewGenerator:
         source_kind: str = "existing_summary_file",
         producer: str = "main.LiteratureReviewGenerator.load_existing_summaries",
     ) -> bool:
+        self._assert_registered_summary_is_ready(path)
         loaded_summaries = self._load_summary_records_from_path(path)
-        self.summaries = [dict(item) for item in loaded_summaries]
+        self.summaries = [
+            cast(ProcessingResult, dict(item))
+            for item in loaded_summaries
+        ]
         self._dedupe_summaries_by_paper_key()
 
         success_count = len([s for s in self.summaries if s.get("status") == "success"])
@@ -2168,6 +2510,7 @@ class LiteratureReviewGenerator:
 
     def load_existing_summaries(self) -> bool:
         """Load an existing summaries file for resume or downstream generation."""
+        explicit_summary_sources: List[str] = []
         try:
             explicit_summary_sources = self._explicit_summary_source_paths()
             if explicit_summary_sources:
@@ -2178,6 +2521,7 @@ class LiteratureReviewGenerator:
                 )
 
             if self.summary_file and os.path.exists(self.summary_file):
+                self._assert_registered_summary_is_ready(self.summary_file)
                 try:
                     return self._load_summaries_from_path(self.summary_file)
                 except SummarySourceError as exc:
@@ -2198,6 +2542,7 @@ class LiteratureReviewGenerator:
                     summary_file = os.path.join(workspace_path, "artifacts", f"{self.project_name}_summaries.json")
                     if not os.path.exists(summary_file):
                         continue
+                    self._assert_registered_summary_is_ready(summary_file)
                     try:
                         self.logger.info(f"Found historical summary file: {summary_file}")
                         return self._load_summaries_from_path(summary_file)
@@ -2214,6 +2559,10 @@ class LiteratureReviewGenerator:
             self.summaries = []
             return False
         except Exception as e:
+            if explicit_summary_sources:
+                self.logger.error(f"Failed to load explicit summary sources: {e}")
+                self.summaries = []
+                return False
             self.logger.warning(f"Failed to load existing summary file; starting a fresh run: {e}")
             self.summaries = []
             return True
@@ -2641,7 +2990,15 @@ class LiteratureReviewGenerator:
             )
         config_copy["Preprocess"] = preprocess_section
 
-        manager = PreprocessManager(config=config_copy, logger=self.logger)
+        manager = PreprocessManager(
+            config=config_copy,
+            logger=self.logger,
+            mineru_circuit_breaker=(
+                self.preprocess_manager.mineru_circuit_breaker
+                if self.preprocess_manager is not None
+                else None
+            ),
+        )
         if preprocess_strategy == "mineru":
             manager.parser_mode = "remote"
             manager.primary_parser = "mineru_remote"
@@ -4033,6 +4390,8 @@ class LiteratureReviewGenerator:
             model_used = 'primary'
             ai_result = None
             strategy_succeeded = False
+            strategy = ""
+            pdf_text = ""
 
             def record_attempt_failure(
                 strategy_name: str,
@@ -5152,7 +5511,13 @@ class LiteratureReviewGenerator:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # 提交所有任务
                 future_to_paper: Dict[concurrent.futures.Future['ProcessingResult | None'], Tuple[int, 'PaperInfo']] = {
-                    executor.submit(self.process_paper, dict(paper), i, file_index, total_papers): (i, paper)
+                    executor.submit(
+                        self.process_paper,
+                        cast(PaperInfo, dict(paper)),
+                        i,
+                        file_index,
+                        total_papers,
+                    ): (i, paper)
                     for i, paper in papers_to_process
                 }
                 
@@ -5204,7 +5569,7 @@ class LiteratureReviewGenerator:
                             if isinstance(pdf_match_payload, Mapping):
                                 failed_entry['pdf_match'] = dict(pdf_match_payload)
                             identity_payload = result.get('source_identity') if result else None
-                            if isinstance(identity_payload, Mapping):
+                            if isinstance(identity_payload, Mapping) and result is not None:
                                 failed_entry['source_identity'] = dict(identity_payload)
                                 failed_entry['identity_verdict'] = str(result.get('identity_verdict') or '')
                                 failed_entry['artifact_status'] = str(result.get('artifact_status') or '')
@@ -5655,7 +6020,9 @@ class LiteratureReviewGenerator:
                     progress_snapshot_path = snapshot_path
 
             # 加载现有摘要（兼容旧版本）
-            self.load_existing_summaries()
+            if not self.load_existing_summaries():
+                self.logger.error("Existing summary state is unsafe to reuse; aborting Stage 1")
+                return False
             
             if checkpoint_loaded:
                 self._merge_stage1_progress_from_loaded_summaries()
@@ -6674,7 +7041,7 @@ class LiteratureReviewGenerator:
             test_dev_mode = compat.outline_test_dev_fixture_mode()
             pipeline = V2Pipeline(
                 job_id=self.job_workspace.job_id if self.job_workspace else "standalone",
-                summaries=self.summaries,
+                summaries=[dict(summary) for summary in self.summaries],
                 config_view=compat,
                 artifact_registry=self.artifact_registry,
                 workspace=self.job_workspace,
@@ -7214,10 +7581,15 @@ Requirements:
                     self.logger.error(f"处理种子论文时出错 {os.path.basename(pdf_path)}: {e}")
                     return None
             
-            for future in concurrent.futures.as_completed(future_to_pdf):  # type: ignore
-                result: Optional[Dict[str, Any]] = future.result()  # type: ignore
-                if result:
-                    concept_papers.append(result)  # type: ignore
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_pdf = {
+                    executor.submit(process_seed_paper, pdf_path): pdf_path
+                    for pdf_path in seed_papers
+                }
+                for future in concurrent.futures.as_completed(future_to_pdf):
+                    result = future.result()
+                    if result:
+                        concept_papers.append(result)
             
             if not concept_papers:
                 self.logger.error("没有成功分析任何种子论文")
@@ -8194,6 +8566,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:  # type: ignore
     """Handle command line arguments and execute the selected workflow."""
+
+    from services.console_io import configure_utf8_stdio
+
+    configure_utf8_stdio()
 
     parser = build_parser()
     args = parser.parse_args()

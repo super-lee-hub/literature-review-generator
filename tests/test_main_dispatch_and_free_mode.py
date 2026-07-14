@@ -60,6 +60,7 @@ def test_cli_help_excludes_removed_queue_flags() -> None:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        encoding="utf-8",
         check=False,
     )
 
@@ -75,6 +76,7 @@ def test_removed_queue_flags_are_unknown_arguments() -> None:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        encoding="utf-8",
         check=False,
     )
 
@@ -90,6 +92,7 @@ def test_outline_alias_routes_to_generate_outline() -> None:
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        encoding="utf-8",
         check=False,
     )
 
@@ -619,7 +622,9 @@ def test_process_paper_persists_metadata_only_failure_with_manual_review(tmp_pat
 
     assert result is not None
     assert result["status"] == "success"
-    audit = result["ai_summary"]["quality_audit"]
+    ai_summary = result.get("ai_summary")
+    assert ai_summary is not None
+    audit = ai_summary["quality_audit"]
     assert audit["needs_manual_review"] is True
     assert "paper_metadata.year" in audit["missing_critical_fields"]
     assert "paper_metadata.journal" in audit["missing_critical_fields"]
@@ -662,7 +667,9 @@ def test_process_paper_direct_mode_marks_unresolved_metadata_manual_review(tmp_p
 
     assert result is not None
     assert result["status"] == "success"
-    audit = result["ai_summary"]["quality_audit"]
+    ai_summary = result.get("ai_summary")
+    assert ai_summary is not None
+    audit = ai_summary["quality_audit"]
     assert audit["needs_manual_review"] is True
     assert "paper_metadata.year" in audit["missing_critical_fields"]
     assert "paper_metadata.journal" in audit["missing_critical_fields"]
@@ -719,7 +726,7 @@ def test_process_paper_body_quality_failure_tries_other_reader_engine(tmp_path, 
 
     assert result is not None
     assert result["status"] == "success"
-    assert result["model_used"] == "backup"
+    assert result.get("model_used") == "backup"
     assert calls == [None, {"primary"}]
 
 
@@ -788,10 +795,12 @@ def test_process_paper_accepts_backup_metadata_only_failure_without_reprocessing
 
     assert result is not None
     assert result["status"] == "success"
-    assert result["model_used"] == "backup"
+    assert result.get("model_used") == "backup"
     assert reader_calls == [None, {"primary"}]
     assert preprocess_calls == ["hybrid"]
-    assert result["ai_summary"]["quality_audit"]["needs_manual_review"] is True
+    ai_summary = result.get("ai_summary")
+    assert ai_summary is not None
+    assert ai_summary["quality_audit"]["needs_manual_review"] is True
 
 
 def test_process_paper_returns_failed_when_all_stage1_strategies_fail(tmp_path, monkeypatch) -> None:
@@ -976,9 +985,11 @@ def test_process_paper_skips_ai_for_blocked_stage1_attempts(tmp_path, monkeypatc
     assert result is not None
     assert result["status"] == "success"
     assert ai_calls == ["primary"]
-    assert [attempt["preprocess_strategy"] for attempt in result["attempt_history"]] == ["hybrid", "docling", "mineru"]
-    assert result["attempt_history"][0]["stage1_quality_reasons"] == ["incomplete_by_page_count"]
-    assert result["attempt_history"][-1]["success"] is True
+    attempt_history = result.get("attempt_history")
+    assert attempt_history is not None
+    assert [attempt["preprocess_strategy"] for attempt in attempt_history] == ["hybrid", "docling", "mineru"]
+    assert attempt_history[0]["stage1_quality_reasons"] == ["incomplete_by_page_count"]
+    assert attempt_history[-1]["success"] is True
 
 
 def test_stage1_strategy_policy_formal_precision_order() -> None:

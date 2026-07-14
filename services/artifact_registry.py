@@ -15,6 +15,7 @@ from services.job_workspace import utc_now_iso
 
 
 REGISTRY_VERSION = "v2"
+SUPPORTED_REGISTRY_VERSIONS = frozenset({"v1", REGISTRY_VERSION})
 DEFAULT_REGISTRY_LOCK_TIMEOUT_SECONDS = 5.0
 DEFAULT_REGISTRY_LOCK_RETRY_INTERVAL_MS = 50
 DEFAULT_REGISTRY_REVISION_RETRY_LIMIT = 3
@@ -198,6 +199,18 @@ class ArtifactRegistry:
 
         if not isinstance(payload, dict):
             raise RegistryCorruption("registry root must be a JSON object")
+        raw_version = payload.get("artifact_registry_version")
+        if not isinstance(raw_version, str) or raw_version not in SUPPORTED_REGISTRY_VERSIONS:
+            raise RegistryCorruption(
+                f"unsupported artifact_registry_version: {raw_version!r}"
+            )
+        raw_job_id = payload.get("job_id")
+        if not isinstance(raw_job_id, str) or not raw_job_id:
+            raise RegistryCorruption(f"invalid registry job_id: {raw_job_id!r}")
+        if raw_job_id != self.job_id:
+            raise RegistryCorruption(
+                f"registry job_id {raw_job_id!r} does not match expected owner {self.job_id!r}"
+            )
         raw_revision = payload.get("revision", 0)
         if isinstance(raw_revision, bool) or not isinstance(raw_revision, int) or raw_revision < 0:
             raise RegistryCorruption(f"invalid registry revision: {raw_revision!r}")
@@ -205,7 +218,7 @@ class ArtifactRegistry:
         if not isinstance(raw_artifacts, list):
             raise RegistryCorruption("registry artifacts must be a JSON array")
 
-        default_job_id = str(payload.get("job_id") or self.job_id)
+        default_job_id = raw_job_id
         artifacts: Dict[str, ArtifactRecord] = {}
         for index, item in enumerate(raw_artifacts):
             if not isinstance(item, dict):
@@ -240,6 +253,11 @@ class ArtifactRegistry:
                 metadata=dict(metadata_payload),
                 created_at=str(item.get("created_at") or utc_now_iso()),
             )
+            if record.job_id != self.job_id:
+                raise RegistryCorruption(
+                    f"artifact[{index}].job_id {record.job_id!r} does not match "
+                    f"registry owner {self.job_id!r}"
+                )
             previous = artifacts.get(artifact_id)
             if previous is not None and previous != record:
                 raise RegistryCorruption(f"duplicate artifact_id with divergent records: {artifact_id}")
@@ -457,6 +475,11 @@ class ArtifactRegistry:
                     f"expected registry revision {expected_revision}, found {disk_revision}"
                 )
             candidate = build_record(artifacts)
+            if candidate.job_id != self.job_id:
+                raise ArtifactConflict(
+                    f"artifact {candidate.artifact_id!r} belongs to {candidate.job_id!r}, "
+                    f"not registry owner {self.job_id!r}"
+                )
             existing = artifacts.get(candidate.artifact_id)
             self._validate_artifact_merge(existing, candidate)
             if existing is not None and existing.created_at:
@@ -486,6 +509,11 @@ class ArtifactRegistry:
                     f"expected registry revision {compare_revision}, found {disk_revision}"
                 )
             for record in self._artifacts.values():
+                if record.job_id != self.job_id:
+                    raise ArtifactConflict(
+                        f"artifact {record.artifact_id!r} belongs to {record.job_id!r}, "
+                        f"not registry owner {self.job_id!r}"
+                    )
                 self._validate_artifact_merge(disk_artifacts.get(record.artifact_id), record)
             next_revision = disk_revision + 1
             snapshot = dict(self._artifacts)

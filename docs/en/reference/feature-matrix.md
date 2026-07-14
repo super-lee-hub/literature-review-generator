@@ -1,65 +1,24 @@
 # Feature Implementation Status Matrix
 
-> Audience: maintainers / AI agents / contributors.
-> This is an internal status document, not the primary end-user guide.
-> Source: FEATURE_MATRIX.md (full migration).
+Status reflects code and offline tests in the reliability-upgrade branch.
 
-## Legend
-- `implemented`: Feature is fully implemented and functional
-- `partial`: Feature is partially implemented but not fully functional
-- `legacy`: Feature is implemented but will be deprecated in future versions
-- `planned`: Feature is planned but not yet implemented
+| Feature | Status | Canonical implementation |
+|---|---|---|
+| Source inventory and identity gate | implemented | content hashes, match/ambiguous/mismatch, quarantine before Stage 1 |
+| Zotero parsing and FileIndex | implemented | diagnostic parse result, root-isolated read-only multi-candidate index |
+| Artifact Registry v2 | implemented | revisioned locked transactions, atomic save, V2 local/external dependencies |
+| Job outcome and attempts | implemented | `job_outcome_v1.json`, append-only attempts, pointer ownership |
+| Stage 1 summaries and paper evidence | implemented | canonical summaries, paper artifacts, evidence manifests and edge checkpoints |
+| ReviewBatch derivation | implemented | deterministic parent-hash subsets with zero child Stage 1 calls |
+| Outline Intelligence v2 | implemented | full artifact chain, prompt budgets, health sidecar, explicit adoption |
+| Review and citation chain | implemented | review draft v2, citation manifest v3, cited bibliography, DOCX |
+| Validation truth source | implemented | `ValidationRunResultV1` and claim-level verdicts; reports are projections |
+| AgentRuntimeRunner | implemented | run/resume/status/reconcile over `AgentRuntimeBridge` |
+| Queue outcome mapping | implemented | Queue reads `job_status`; `success` remains readiness compatibility only |
+| MinerU/Docling/OCR safety | implemented | preflight, shared auth circuit breaker, bounded subprocess timeouts |
+| Windows machine progress | implemented | UTF-8 console and ASCII-safe JSON progress |
+| GUI workflow | implemented | local workflow UI and serial persistent queue |
+| Legacy workspace reading | compatibility | additive readers mark missing new identity/readiness fields `legacy_unverified` |
+| Live provider smoke tests | optional | marker, explicit enable flag, and credentials required |
 
-## Core Features
-
-| Feature | Status | Description | Notes |
-|---------|--------|-------------|-------|
-| JobWorkspace | implemented | Job workspace management with artifact tracking | Fully functional |
-| ArtifactRegistry | implemented | Artifact registry for tracking dependencies | Fully functional |
-| Config Compatibility | implemented | Configuration compatibility layer | Fully functional |
-| Review Draft v2 | implemented | Updated review draft structure | Fully functional |
-| Citation Manifest v2 | implemented | Structured citation management | Fully functional |
-| Stage1 Multimodal Input | implemented | Support for multimodal inputs in stage 1 | Fully functional |
-| Citation Object Main Chain | implemented | Citation object as primary truth source | Fully functional |
-| Validation/Repair | implemented | Validation and repair pipeline | Fully functional |
-| GUI Queue System | implemented | Workflow-page serial background queue | Fully functional |
-| AI-native Skill Entrypoint | implemented | Repo-local Codex / OMX skill entry surface | Fully functional |
-| Runtime Stage Trace | implemented | AI-native runtime source/trace artifacts | Fully functional |
-| Outline Review Compatibility | partial | Optional outline critique/arbitration/adopt surface | Explicit/manual compatibility path |
-| Zotero Integration | implemented | Zotero report parsing and library integration | Fully functional |
-| PDF Extraction | implemented | PDF text extraction with multiple backends | Fully functional |
-| AI Integration | implemented | OpenAI-compatible API integration | Fully functional |
-| GUI Interface | implemented | Local GUI for workflow management | Fully functional |
-| CLI Interface | implemented | Command-line interface | Fully functional |
-
-## Roadmap
-
-### P0: Stability and Truth Alignment
-- Fix Windows pymupdf4llm/onnxruntime access violation
-- Unify --zotero-report and --library-path direct execution chain
-- Create feature reality matrix and update documentation
-
-### P1: Citation Object Main Chain
-- Make citation object the default truth source
-- Extend review_draft_v2 block structure
-- Update DOCX v2 path to use manifest bibliography
-
-### P2: Validation and Repair
-- Update ReviewValidator input structure
-- Modify SummaryRechecker to be canonical-only
-- Implement repair root cause classification
-
-### P3: Queue Productization
-- Extend QueueJobSpec/QueueJobRuntime
-- Add embedded workflow-page queue operations to GUI
-- Remove public CLI queue commands and keep CLI direct-run
-
-### P4: Outline review simplification
-- Keep markdown outline generation as the normal path
-- Avoid claiming critique/arbitration/adopt is part of the default workflow
-- Treat any remaining outline-review helpers as optional compatibility code
-
-### P5: Documentation and GUI Updates
-- Update GUI validation entry and configuration text
-- Clean up test temporary artifacts
-- Generate new truth source documentation
+There is no separate roadmap entry for features already marked implemented. Future work must be recorded as a specific limitation with an owner and testable acceptance criterion.

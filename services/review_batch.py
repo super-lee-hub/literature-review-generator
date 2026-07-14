@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Mapping, Sequence
 
+from runtime.reconcile import RuntimeReconciler, validate_canonical_ai_summary
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 from services.summary_reuse import SummaryCatalog, SummarySource
@@ -15,6 +16,8 @@ from services.summary_reuse import SummaryCatalog, SummarySource
 SELECTION_SCHEMA_VERSION = "summary-selection-v1"
 BATCH_SCHEMA_VERSION = "review-batch-v1"
 DuplicatePolicy = Literal["error", "first"]
+PAPER_EVIDENCE_TYPES = ("normalized_text", "chunks", "page_index")
+PAPER_EVIDENCE_MANIFEST_TYPE = "evidence_manifest"
 
 
 class ReviewBatchError(RuntimeError):
@@ -266,6 +269,234 @@ def _deduplicate_keys(keys: Sequence[str], policy: DuplicatePolicy) -> tuple[str
     return tuple(ordered)
 
 
+def _selected_parent_paper_records(
+    keys: Sequence[str],
+    *,
+    workspace: JobWorkspace,
+    parent_registry: ArtifactRegistry,
+) -> Dict[str, tuple[ArtifactRecord, Dict[str, Any]]]:
+    requested = set(keys)
+    candidates: Dict[str, list[tuple[ArtifactRecord, Dict[str, Any]]]] = {
+        key: [] for key in keys
+    }
+    malformed_record_ids: list[str] = []
+    for record in parent_registry.list_records():
+        if record.artifact_type != "paper_artifact":
+            continue
+        try:
+            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            malformed_record_ids.append(record.artifact_id)
+            continue
+        if not isinstance(payload, Mapping):
+            malformed_record_ids.append(record.artifact_id)
+            continue
+        identity = payload.get("paper_identity")
+        if not isinstance(identity, Mapping):
+            malformed_record_ids.append(record.artifact_id)
+            continue
+        canonical_key = str(identity.get("canonical_paper_key") or "").strip()
+        if not canonical_key:
+            malformed_record_ids.append(record.artifact_id)
+            continue
+        if canonical_key in requested:
+            candidates[canonical_key].append((record, dict(payload)))
+
+    missing = [key for key in keys if not candidates[key]]
+    duplicate = {key: len(candidates[key]) for key in keys if len(candidates[key]) > 1}
+    if missing or duplicate:
+        details: Dict[str, Any] = {"missing": missing, "duplicate": duplicate}
+        if missing and malformed_record_ids:
+            details["malformed_parent_artifact_ids"] = sorted(malformed_record_ids)
+        raise ParentSummaryIntegrityError(
+            "parent paper artifact selection failed: "
+            + json.dumps(details, ensure_ascii=False, sort_keys=True)
+        )
+
+    reconciler = RuntimeReconciler(
+        workspace,
+        parent_registry,
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_registry.job_id else None
+        ),
+    )
+    selected: Dict[str, tuple[ArtifactRecord, Dict[str, Any]]] = {}
+    for key in keys:
+        record, payload = candidates[key][0]
+        if not record.depends_on:
+            raise ParentSummaryIntegrityError(
+                f"parent paper artifact has no evidence dependencies: {key}"
+            )
+        unhashed_dependencies = [
+            dependency.artifact_id
+            for dependency in record.depends_on
+            if not dependency.content_hash
+        ]
+        if unhashed_dependencies:
+            raise ParentSummaryIntegrityError(
+                f"parent paper artifact has unhashed evidence dependencies for {key}: "
+                f"{sorted(unhashed_dependencies)}"
+            )
+        try:
+            reconciler.validate_record(record, registry=parent_registry)
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
+            raise ParentSummaryIntegrityError(
+                f"parent paper artifact is invalid for {key}: {exc}"
+            ) from exc
+        _validate_parent_paper_evidence(
+            key,
+            record=record,
+            parent_registry=parent_registry,
+        )
+        selected[key] = (record, payload)
+    return selected
+
+
+def _validate_parent_paper_evidence(
+    canonical_key: str,
+    *,
+    record: ArtifactRecord,
+    parent_registry: ArtifactRegistry,
+) -> None:
+    required_types = (*PAPER_EVIDENCE_TYPES, PAPER_EVIDENCE_MANIFEST_TYPE)
+    dependencies_by_type = {
+        artifact_type: [
+            dependency
+            for dependency in record.depends_on
+            if dependency.artifact_type == artifact_type
+        ]
+        for artifact_type in required_types
+    }
+    invalid_counts = {
+        artifact_type: len(dependencies)
+        for artifact_type, dependencies in dependencies_by_type.items()
+        if len(dependencies) != 1
+    }
+    if invalid_counts:
+        raise ParentSummaryIntegrityError(
+            f"parent paper artifact evidence dependency count is invalid for {canonical_key}: "
+            f"{invalid_counts}"
+        )
+
+    manifest_ref = dependencies_by_type[PAPER_EVIDENCE_MANIFEST_TYPE][0]
+    manifest_record = parent_registry.get(manifest_ref.artifact_id)
+    if manifest_record is None:
+        raise ParentSummaryIntegrityError(
+            f"parent paper evidence manifest is not registered for {canonical_key}"
+        )
+    try:
+        manifest_payload = json.loads(Path(manifest_record.path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ParentSummaryIntegrityError(
+            f"parent paper evidence manifest is unreadable for {canonical_key}: {exc}"
+        ) from exc
+    if not isinstance(manifest_payload, Mapping):
+        raise ParentSummaryIntegrityError(
+            f"parent paper evidence manifest is malformed for {canonical_key}"
+        )
+    if str(manifest_payload.get("canonical_paper_key") or "").strip() != canonical_key:
+        raise ParentSummaryIntegrityError(
+            f"parent paper evidence manifest identity mismatch for {canonical_key}"
+        )
+    manifest_items = manifest_payload.get("artifacts")
+    if not isinstance(manifest_items, list):
+        raise ParentSummaryIntegrityError(
+            f"parent paper evidence manifest artifacts are malformed for {canonical_key}"
+        )
+    manifest_by_type: Dict[str, list[Mapping[str, Any]]] = {
+        artifact_type: [
+            item
+            for item in manifest_items
+            if isinstance(item, Mapping)
+            and str(item.get("artifact_type") or "") == artifact_type
+        ]
+        for artifact_type in PAPER_EVIDENCE_TYPES
+    }
+    invalid_manifest_counts = {
+        artifact_type: len(items)
+        for artifact_type, items in manifest_by_type.items()
+        if len(items) != 1
+    }
+    if invalid_manifest_counts or len(manifest_items) != len(PAPER_EVIDENCE_TYPES):
+        raise ParentSummaryIntegrityError(
+            f"parent paper evidence manifest set is invalid for {canonical_key}: "
+            f"{invalid_manifest_counts}"
+        )
+    for artifact_type in PAPER_EVIDENCE_TYPES:
+        dependency = dependencies_by_type[artifact_type][0]
+        manifest_item = manifest_by_type[artifact_type][0]
+        if (
+            Path(dependency.path).resolve() != Path(str(manifest_item.get("path") or "")).resolve()
+            or dependency.content_hash != str(manifest_item.get("content_hash") or "")
+        ):
+            raise ParentSummaryIntegrityError(
+                f"parent paper evidence manifest does not match {artifact_type} dependency "
+                f"for {canonical_key}"
+            )
+
+
+def _validate_summary_paper_lineage(
+    canonical_key: str,
+    *,
+    summary: Mapping[str, Any],
+    paper_payload: Mapping[str, Any],
+) -> None:
+    summary_paper_info = summary.get("paper_info")
+    artifact_paper_info = paper_payload.get("paper_info")
+    artifact_identity = paper_payload.get("paper_identity")
+    if (
+        not isinstance(summary_paper_info, Mapping)
+        or not isinstance(artifact_paper_info, Mapping)
+        or not isinstance(artifact_identity, Mapping)
+    ):
+        raise ParentSummaryIntegrityError(
+            f"summary/paper artifact lineage mismatch for {canonical_key}: paper identity is malformed"
+        )
+
+    canonical_identities = {
+        str(summary_paper_info.get("canonical_paper_key") or "").strip(),
+        str(artifact_paper_info.get("canonical_paper_key") or "").strip(),
+        str(artifact_identity.get("canonical_paper_key") or "").strip(),
+    }
+    if canonical_identities != {canonical_key}:
+        raise ParentSummaryIntegrityError(
+            f"summary/paper artifact lineage mismatch for {canonical_key}: canonical identity diverged"
+        )
+    source_identities = {
+        str(summary_paper_info.get("source_paper_id") or "").strip(),
+        str(artifact_paper_info.get("source_paper_id") or "").strip(),
+        str(artifact_identity.get("source_paper_id") or "").strip(),
+    }
+    if "" in source_identities or len(source_identities) != 1:
+        raise ParentSummaryIntegrityError(
+            f"summary/paper artifact lineage mismatch for {canonical_key}: source identity diverged"
+        )
+    if dict(summary_paper_info) != dict(artifact_paper_info):
+        raise ParentSummaryIntegrityError(
+            f"summary/paper artifact lineage mismatch for {canonical_key}: paper_info diverged"
+        )
+
+    analysis = paper_payload.get("analysis")
+    artifact_ai_summary = analysis.get("ai_summary") if isinstance(analysis, Mapping) else None
+    try:
+        canonical_summary = validate_canonical_ai_summary(
+            summary.get("ai_summary"),
+            label=f"selected summary {canonical_key} ai_summary",
+        )
+        canonical_artifact_summary = validate_canonical_ai_summary(
+            artifact_ai_summary,
+            label=f"parent paper artifact {canonical_key} ai_summary",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ParentSummaryIntegrityError(
+            f"summary/paper artifact lineage mismatch for {canonical_key}: {exc}"
+        ) from exc
+    if dict(canonical_summary) != dict(canonical_artifact_summary):
+        raise ParentSummaryIntegrityError(
+            f"summary/paper artifact lineage mismatch for {canonical_key}: ai_summary diverged"
+        )
+
+
 def derive_review_batch(
     spec: ReviewBatchSpecV1,
     *,
@@ -324,22 +555,18 @@ def derive_review_batch(
     if len(summaries) != selection.expected_count:
         raise SummarySelectionError("resolved summary count does not match expected_count")
 
-    parent_paper_records: Dict[str, tuple[ArtifactRecord, Dict[str, Any]]] = {}
-    for record in parent_registry.list_records():
-        if record.artifact_type != "paper_artifact" or record.status != "ready":
-            continue
-        try:
-            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            continue
-        identity = payload.get("paper_identity", {}) if isinstance(payload, Mapping) else {}
-        aliases = {
-            str(identity.get("canonical_paper_key") or "").strip(),
-            str(identity.get("source_paper_id") or "").strip(),
-            *(str(item).strip() for item in identity.get("paper_key_aliases", []) or []),
-        }
-        for alias in aliases - {""}:
-            parent_paper_records[alias] = (record, dict(payload))
+    parent_paper_records = _selected_parent_paper_records(
+        keys,
+        workspace=workspace,
+        parent_registry=parent_registry,
+    )
+    for key, summary in zip(keys, summaries):
+        _parent_record, paper_payload = parent_paper_records[key]
+        _validate_summary_paper_lineage(
+            key,
+            summary=summary,
+            paper_payload=paper_payload,
+        )
 
     parent_dependency = ArtifactDependencyRefV2(
         dependency_kind="external_job",
@@ -375,61 +602,57 @@ def derive_review_batch(
         metadata={"selection_hash": selection.selection_hash, "selected_count": len(summaries)},
     )
     child_paper_records: list[ArtifactRecord] = []
-    if parent_paper_records:
-        for order, key in enumerate(keys, start=1):
-            parent_paper = parent_paper_records.get(key)
-            if parent_paper is None:
-                raise ParentSummaryIntegrityError(
-                    f"selected paper has no parent paper artifact/evidence dependency: {key}"
-                )
-            parent_paper_record, paper_payload = parent_paper
-            paper_payload["projected_from"] = {
-                "job_id": selection.parent_job_id,
-                "artifact_id": parent_paper_record.artifact_id,
-                "content_hash": parent_paper_record.content_hash,
-            }
-            child_paper_path = workspace.artifact_path(
-                f"paper_artifacts/{order:04d}_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}.json"
+    for order, key in enumerate(keys, start=1):
+        parent_paper_record, paper_payload = parent_paper_records[key]
+        paper_payload["created_from_job_id"] = workspace.job_id
+        paper_payload["created_at"] = utc_now_iso()
+        paper_payload["projected_from"] = {
+            "job_id": selection.parent_job_id,
+            "artifact_id": parent_paper_record.artifact_id,
+            "content_hash": parent_paper_record.content_hash,
+        }
+        child_paper_path = workspace.artifact_path(
+            f"paper_artifacts/{order:04d}_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}.json"
+        )
+        atomic_write_json(child_paper_path, paper_payload)
+        external_dependencies = [
+            ArtifactDependencyRefV2(
+                dependency_kind="external_job",
+                job_id=selection.parent_job_id,
+                artifact_id=dependency.artifact_id,
+                artifact_type=dependency.artifact_type,
+                path=dependency.path,
+                content_hash=dependency.content_hash,
             )
-            atomic_write_json(child_paper_path, paper_payload)
-            external_dependencies = [
-                ArtifactDependencyRefV2(
-                    dependency_kind="external_job",
-                    job_id=selection.parent_job_id,
-                    artifact_id=dependency.artifact_id,
-                    artifact_type=dependency.artifact_type,
-                    path=dependency.path,
-                    content_hash=dependency.content_hash,
-                )
-                for dependency in parent_paper_record.depends_on
-            ]
-            external_dependencies.insert(
-                0,
-                ArtifactDependencyRefV2(
-                    dependency_kind="external_job",
-                    job_id=selection.parent_job_id,
-                    artifact_id=parent_paper_record.artifact_id,
-                    artifact_type=parent_paper_record.artifact_type,
-                    path=parent_paper_record.path,
-                    content_hash=parent_paper_record.content_hash,
-                ),
+            for dependency in parent_paper_record.depends_on
+        ]
+        external_dependencies.insert(
+            0,
+            ArtifactDependencyRefV2(
+                dependency_kind="external_job",
+                job_id=selection.parent_job_id,
+                artifact_id=parent_paper_record.artifact_id,
+                artifact_type=parent_paper_record.artifact_type,
+                path=parent_paper_record.path,
+                content_hash=parent_paper_record.content_hash,
+            ),
+        )
+        child_paper_records.append(
+            registry.register_file(
+                artifact_role="paper_artifact",
+                artifact_type="paper_artifact",
+                artifact_version=str(paper_payload.get("artifact_version") or "v1"),
+                path=child_paper_path,
+                producer=producer,
+                artifact_id=f"derived-paper:{selection.selection_hash}:{order:04d}",
+                depends_on=external_dependencies,
+                metadata={
+                    "canonical_paper_key": key,
+                    "parent_job_id": selection.parent_job_id,
+                    "parent_artifact_id": parent_paper_record.artifact_id,
+                },
             )
-            child_paper_records.append(
-                registry.register_file(
-                    artifact_role="paper_artifact",
-                    artifact_type="paper_artifact",
-                    artifact_version=str(paper_payload.get("artifact_version") or "v1"),
-                    path=child_paper_path,
-                    producer=producer,
-                    artifact_id=f"derived-paper:{selection.selection_hash}:{order:04d}",
-                    depends_on=external_dependencies,
-                    metadata={
-                        "canonical_paper_key": key,
-                        "parent_job_id": selection.parent_job_id,
-                        "parent_artifact_id": parent_paper_record.artifact_id,
-                    },
-                )
-            )
+        )
     atomic_write_json(summary_path, summaries)
     summary_record = registry.register_file(
         artifact_role="summary",

@@ -6,6 +6,7 @@ import tempfile
 from typing import cast
 
 from main import LiteratureReviewGenerator
+from models import SummariesList
 from services.artifact_registry import ArtifactRegistry
 from services.config_compat import CompatConfigView
 from services.job_workspace import JobWorkspace
@@ -60,26 +61,29 @@ def _build_generator(temp_dir: str) -> LiteratureReviewGenerator:
     generator.project_name = "test_project"
     generator.output_dir = temp_dir
     generator.summary_file = os.path.join(temp_dir, "test_summaries.json")
-    generator.summaries = [
-        {
-            "status": "success",
-            "paper_info": {
-                "title": "Test Paper 1",
-                "authors": ["Author A", "Author B"],
-                "year": "2023",
-                "canonical_paper_key": "test_paper_1",
-            },
-            "ai_summary": {
-                "paper_metadata": {
+    generator.summaries = cast(
+        SummariesList,
+        [
+            {
+                "status": "success",
+                "paper_info": {
                     "title": "Test Paper 1",
                     "authors": ["Author A", "Author B"],
                     "year": "2023",
-                    "journal": "Journal of Testing",
-                    "doi": "10.1000/test.paper",
-                }
-            },
-        }
-    ]
+                    "canonical_paper_key": "test_paper_1",
+                },
+                "ai_summary": {
+                    "paper_metadata": {
+                        "title": "Test Paper 1",
+                        "authors": ["Author A", "Author B"],
+                        "year": "2023",
+                        "journal": "Journal of Testing",
+                        "doi": "10.1000/test.paper",
+                    }
+                },
+            }
+        ],
+    )
     return generator
 
 
@@ -139,7 +143,8 @@ def test_citation_manifest_v3_generation() -> None:
         assert payload["paper_entries"][0]["paper_id"] == "test_paper_1"
         assert payload["migration_report"]["contract_version"] == "v3"
 
-        registrations = [item for item in generator.artifact_registry.registered_files if item.get("artifact_type") == "citation_manifest"]
+        registry = cast(MockArtifactRegistry, generator.artifact_registry)
+        registrations = [item for item in registry.registered_files if item.get("artifact_type") == "citation_manifest"]
         assert any(item.get("artifact_version") == "v3" for item in registrations)
 
 

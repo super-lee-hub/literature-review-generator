@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-from typing import Iterable, Sequence
+import threading
+from typing import BinaryIO, Iterable, Sequence
 
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry
 from services.job_outcome import (
@@ -23,6 +24,92 @@ ATTEMPT_SNAPSHOT_DIR = "job_attempts"
 
 class AttemptStoreCorruption(ValueError):
     """Raised when durable attempt snapshots are missing, reordered, or invalid."""
+
+
+class AttemptAlreadyRunningError(RuntimeError):
+    """Raised when another process or thread owns the workspace attempt lease."""
+
+
+_ATTEMPT_LEASES_GUARD = threading.Lock()
+_ATTEMPT_LEASES: dict[str, threading.Lock] = {}
+
+
+def _attempt_process_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(str(path.resolve()))
+    with _ATTEMPT_LEASES_GUARD:
+        return _ATTEMPT_LEASES.setdefault(key, threading.Lock())
+
+
+class AttemptExecutionLease:
+    """Cross-process single-owner lease held for one runner execution attempt."""
+
+    def __init__(self, workspace: object) -> None:
+        self.path = Path(str(getattr(workspace, "artifact_path")("job_attempts/.execution.lock")))
+        self._process_lock = _attempt_process_lock(self.path)
+        self._handle: BinaryIO | None = None
+        self._acquired = False
+
+    def acquire(self) -> None:
+        if self._acquired:
+            raise RuntimeError("attempt execution lease is already acquired")
+        if not self._process_lock.acquire(blocking=False):
+            raise AttemptAlreadyRunningError("another runtime attempt is already active")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = self.path.open("a+b")
+            try:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"runtime attempt execution lease\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                handle.close()
+                raise AttemptAlreadyRunningError(
+                    "another runtime attempt is already active"
+                ) from exc
+            self._handle = handle
+            self._acquired = True
+        except BaseException:
+            self._process_lock.release()
+            raise
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        handle = self._handle
+        try:
+            if handle is not None:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+        finally:
+            self._handle = None
+            self._acquired = False
+            self._process_lock.release()
+
+    def __enter__(self) -> "AttemptExecutionLease":
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+        self.release()
 
 
 @dataclass(frozen=True)

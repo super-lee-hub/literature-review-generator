@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import main
 from config_loader import ConfigDict
@@ -182,14 +183,19 @@ def test_generate_review_fails_when_no_outline_is_available(tmp_path: Path, monk
 
 def test_create_literature_review_outline_v2_runs_pipeline_and_registers_artifacts(tmp_path: Path, monkeypatch) -> None:
     generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-v2-outline")
-    generator.config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
-    generator.config["Outline"]["test_dev_fixture_mode"] = "true"
-    generator.compat_config = CompatConfigView.from_config(generator.config)
-    generator.summaries = [
-        {"paper_info": {"title": "Core Paper", "classification": "core", "must_use": True}, "themes": ["core"], "methods": ["m"]},
-        {"paper_info": {"title": "Support Paper", "classification": "support"}, "themes": ["support"], "methods": ["m2"]},
-        {"paper_info": {"title": "Background Paper", "classification": "background_only"}, "themes": ["background"]},
-    ]
+    config = generator.config
+    assert config is not None
+    config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
+    config["Outline"]["test_dev_fixture_mode"] = "true"
+    generator.compat_config = CompatConfigView.from_config(config)
+    generator.summaries = cast(
+        main.SummariesList,
+        [
+            {"paper_info": {"title": "Core Paper", "classification": "core", "must_use": True}, "themes": ["core"], "methods": ["m"]},
+            {"paper_info": {"title": "Support Paper", "classification": "support"}, "themes": ["support"], "methods": ["m2"]},
+            {"paper_info": {"title": "Background Paper", "classification": "background_only"}, "themes": ["background"]},
+        ],
+    )
 
     assert generator.create_literature_review_outline() is True
 
@@ -232,8 +238,10 @@ def test_create_literature_review_outline_v2_runs_pipeline_and_registers_artifac
 def test_generate_review_v2_enabled_without_adoption_fails_closed(tmp_path: Path, monkeypatch) -> None:
     generator, _workspace, _registry = _make_bound_generator(tmp_path, job_id="job-v2-review-gate")
     _stub_stage2_bootstrap(monkeypatch, generator)
-    generator.config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
-    generator.compat_config = CompatConfigView.from_config(generator.config)
+    config = generator.config
+    assert config is not None
+    config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
+    generator.compat_config = CompatConfigView.from_config(config)
 
     legacy = Path(generator._get_legacy_outline_file_path())
     legacy.parent.mkdir(parents=True, exist_ok=True)
@@ -246,16 +254,17 @@ def test_candidate_generation_report_persisted_on_v2_candidate_failure(tmp_path:
     from outline.pipeline import V2Pipeline
 
     generator, workspace, registry = _make_bound_generator(tmp_path, job_id="job-v2-candidate-failure")
-    generator.summaries = [
+    summaries: list[dict[str, Any]] = [
         {"paper_info": {"title": "Lone Paper", "authors": ["A"], "year": 2020}, "themes": ["solo"]}
     ]
+    generator.summaries = cast(main.SummariesList, summaries)
 
     def bad_candidate_caller(_route, _prompt, _metadata):
         return {"candidates": [{"candidate_id": "bad", "sections": []}]}
 
     pipeline = V2Pipeline(
         job_id=workspace.job_id,
-        summaries=generator.summaries,
+        summaries=summaries,
         config_view=generator.compat_config,
         artifact_registry=registry,
         workspace=workspace,

@@ -5,6 +5,8 @@ V2 adds full literature map -> synthesis flow -> multi-candidate ->
 critique -> arbitration -> audit -> adoption pipeline.
 """
 
+from typing import TYPE_CHECKING
+
 from outline.models import (
     ArbitrationDecision,
     CritiqueArbitration,
@@ -43,6 +45,9 @@ from outline.legacy_adapter import (
 )
 
 from outline.runtime_resolver import OutlineRuntimeResolver, ResolveResult
+
+if TYPE_CHECKING:
+    from outline.pipeline import V2Pipeline, V2PipelineResult
 
 
 def __getattr__(name):

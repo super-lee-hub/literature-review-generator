@@ -71,13 +71,13 @@ def test_api_config_preserves_reasoning_transport_fields() -> None:
 
     api_config = get_writer_api_config(config)
 
-    assert api_config["endpoint_type"] == "responses"
-    assert api_config["provider_family"] == "aihubmix_openai"
-    assert api_config["reasoning_effort"] == "high"
-    assert api_config["text_verbosity"] == "high"
-    assert api_config["max_output_tokens"] == "32000"
-    assert api_config["force_highest_reasoning"] == "true"
-    assert api_config["omit_temperature_when_reasoning"] == "true"
+    assert api_config.get("endpoint_type") == "responses"
+    assert api_config.get("provider_family") == "aihubmix_openai"
+    assert api_config.get("reasoning_effort") == "high"
+    assert api_config.get("text_verbosity") == "high"
+    assert api_config.get("max_output_tokens") == "32000"
+    assert api_config.get("force_highest_reasoning") == "true"
+    assert api_config.get("omit_temperature_when_reasoning") == "true"
 
 
 def test_legacy_config_without_endpoint_type_stays_on_chat_completions() -> None:

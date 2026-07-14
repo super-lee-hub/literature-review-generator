@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+from services.review_batch import SummarySelectionError
 
 
 def test_runtime_job_spec_compiles_direct_source_into_canonical_job_request() -> None:
@@ -170,3 +171,100 @@ def test_runtime_job_spec_paths_are_resolved_from_spec_not_cwd(tmp_path: Path, m
     assert loaded.summary_sources == (str((spec_dir / "sources/one.json").resolve()),)
     assert loaded.reuse_summary_files == (str((spec_dir / "reuse/two.json").resolve()),)
     assert loaded.queue_file == str((spec_dir / "queue/jobs.json").resolve())
+
+
+def test_runtime_job_spec_resolves_review_batch_metadata_from_spec_origin(tmp_path: Path) -> None:
+    spec = RuntimeJobSpec(
+        project_name="batch",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="papers"),
+        metadata={"review_batch_spec": "batches/selection.json"},
+    )
+
+    resolved = spec.resolved_from(tmp_path)
+
+    assert resolved.metadata["review_batch_spec"] == str(
+        (tmp_path / "batches/selection.json").resolve()
+    )
+
+
+def test_runtime_job_spec_rejects_invalid_inline_review_batch_metadata(tmp_path: Path) -> None:
+    inline = {"schema_version": "v1", "selection": {"paper_keys": []}}
+    spec = RuntimeJobSpec(
+        project_name="batch",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="papers"),
+        metadata={"review_batch_spec": inline},
+    )
+
+    with pytest.raises(SummarySelectionError):
+        spec.resolved_from(tmp_path)
+
+
+def test_runtime_job_spec_resolves_inline_review_batch_paths_from_spec_origin(tmp_path: Path) -> None:
+    inline = {
+        "schema_version": "review-batch-v1",
+        "project_name": "batch",
+        "selection": {
+            "schema_version": "summary-selection-v1",
+            "parent_job_id": "parent-job",
+            "parent_registry_path": "parent/artifact_registry.json",
+            "parent_artifact_id": "parent-summary",
+            "parent_content_hash": "a" * 64,
+            "parent_summary_path": "parent/summaries.json",
+            "ordered_paper_keys": ["paper-1"],
+            "expected_count": 1,
+        },
+    }
+    spec = RuntimeJobSpec(
+        project_name="batch",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="papers"),
+        metadata={"review_batch_spec": inline},
+    )
+
+    resolved = spec.resolved_from(tmp_path)
+    selection = resolved.metadata["review_batch_spec"]["selection"]
+
+    assert selection["parent_registry_path"] == str(
+        (tmp_path / "parent/artifact_registry.json").resolve()
+    )
+    assert selection["parent_summary_path"] == str(
+        (tmp_path / "parent/summaries.json").resolve()
+    )
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "validation_required",
+        "require_clean_validation",
+        "allow_unvalidated_when_validation_optional",
+    ),
+)
+def test_runtime_job_spec_rejects_non_boolean_readiness_policy(field_name: str) -> None:
+    spec = RuntimeJobSpec(
+        project_name="validation-policy",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        metadata={field_name: "false"},
+    )
+
+    with pytest.raises(ValueError, match=rf"{field_name} must be a JSON boolean"):
+        spec.to_job_request()
+
+
+def test_runtime_job_spec_projects_explicit_readiness_policy() -> None:
+    spec = RuntimeJobSpec(
+        project_name="validation-policy",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        metadata={
+            "requested_stages": ["validate"],
+            "validation_required": True,
+            "require_clean_validation": False,
+            "allow_unvalidated_when_validation_optional": False,
+        },
+    )
+
+    request = spec.to_job_request()
+
+    assert request.requested_stages == ("validate",)
+    assert request.validation_required is True
+    assert request.require_clean_validation is False
+    assert request.allow_unvalidated_when_validation_optional is False

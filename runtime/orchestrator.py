@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Callable, Dict, Iterable, Mapping
 
 from runtime.architecture_gates import ArchitectureGateScope, collect_scannable_paths, scan_paths_for_forbidden_patterns
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
@@ -14,7 +14,7 @@ from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_ent
 from runtime.validation_adapter import RuntimeValidationAdapter
 from services.artifact_registry import ArtifactDependencyRef, ArtifactDependencyRefV2, ArtifactRecord
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
-from services.job_workspace import atomic_write_json
+from services.job_workspace import JobWorkspace, atomic_write_json
 from services.queue_service import CancelToken
 
 
@@ -79,7 +79,16 @@ class AgentRuntimeBridge:
             ),
         ]
 
-    def bootstrap(self, legacy_main: Any, *, cancel_token: CancelToken | None = None) -> AgentRuntimeSession:
+    def bootstrap(
+        self,
+        legacy_main: Any,
+        *,
+        cancel_token: CancelToken | None = None,
+        claim_latest_pointer: bool = True,
+        resume_requested: bool = False,
+        resume_preflight: Callable[[JobWorkspace], None] | None = None,
+        publish_running_state: bool = True,
+    ) -> AgentRuntimeSession:
         request = self.build_job_request()
         runner = JobRunner()
         project_name = runner._resolve_project_name(request)
@@ -100,6 +109,9 @@ class AgentRuntimeBridge:
         generator.free_mode_idea = request.free_mode_idea
         generator.summary_file_override = request.summary_file
         generator.summary_source_overrides = list(request.summary_sources)
+        generator.audit_actor = str(self.job_spec.metadata.get("audit_actor") or "")
+        generator.audit_reason = str(self.job_spec.metadata.get("audit_reason") or "")
+        generator.audit_scope = dict(self.job_spec.metadata.get("audit_scope") or {})
         generator.reuse_stage1 = request.reuse_stage1
         generator.reuse_summary_files = list(request.reuse_summary_files)
 
@@ -135,6 +147,10 @@ class AgentRuntimeBridge:
             source_inventory=prepared_sources.inventory,
             source_canonical_ready=prepared_sources.canonical_ready,
             source_degradation_reasons=prepared_sources.degradation_reasons,
+            claim_latest_pointer=claim_latest_pointer,
+            resume_requested=resume_requested,
+            resume_preflight=resume_preflight,
+            publish_running_state=publish_running_state,
         )
         return AgentRuntimeSession(
             runner=runner,
@@ -270,7 +286,7 @@ class AgentRuntimeBridge:
                     manifest_path,
                     artifact_role="summary_source",
                     artifact_type="summary_source_manifest",
-                    artifact_version="v1",
+                    artifact_version="v2",
                 )
             )
 

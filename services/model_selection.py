@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict
+from typing import Any, Dict, cast
 
 from models import APIConfig
 
@@ -44,7 +44,7 @@ def _section_to_api_config(section: Dict[str, Any] | None) -> APIConfig:
     api_key = _normalize_text(section.get("api_key"))
     if not _has_meaningful_api_key(api_key):
         api_key = ""
-    api_config: APIConfig = {
+    api_config: Dict[str, Any] = {
         "api_key": api_key,
         "model": _normalize_text(section.get("model")),
         "api_base": _normalize_text(section.get("api_base")) or "https://api.openai.com/v1",
@@ -53,7 +53,7 @@ def _section_to_api_config(section: Dict[str, Any] | None) -> APIConfig:
     for field in _API_CONFIG_OPTIONAL_FIELDS:
         if field in section and _normalize_text(section.get(field)):
             api_config[field] = section.get(field)
-    return api_config
+    return cast(APIConfig, api_config)
 
 
 def get_reader_api_config(config: Dict[str, Any] | None) -> APIConfig:

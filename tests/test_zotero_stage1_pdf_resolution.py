@@ -33,7 +33,7 @@ def test_main_zotero_parse_keeps_structured_partial_diagnostics(tmp_path: Path) 
     assert generator.parse_zotero_report(str(report)) is True
     assert generator.zotero_parse_result["status"] == "partial"
     assert generator.zotero_parse_result["diagnostics"][0]["code"] == "missing_title"
-    assert [paper["title"] for paper in generator.papers] == ["Good Paper"]
+    assert [paper.get("title") for paper in generator.papers] == ["Good Paper"]
 
 
 def test_main_zotero_parse_preserves_missing_source_diagnostic(tmp_path: Path) -> None:
@@ -183,9 +183,9 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
     assert result is not None
     assert result["status"] == "success"
     assert seen["pdf_path"] == str(pdf_path)
-    assert result["paper_info"]["pdf_path"] == str(pdf_path)
-    assert result["paper_info"]["source_pdf"] == str(pdf_path)
-    assert result["paper_info"]["source_pdf_fingerprint"]
+    assert result["paper_info"].get("pdf_path") == str(pdf_path)
+    assert result["paper_info"].get("source_pdf") == str(pdf_path)
+    assert result["paper_info"].get("source_pdf_fingerprint")
 
 
 def test_process_paper_blocks_ambiguous_pdf_before_stage1_provider(
@@ -238,8 +238,10 @@ def test_process_paper_blocks_ambiguous_pdf_before_stage1_provider(
 
     assert result is not None
     assert result["status"] == "failed"
-    assert result["failure_reason"] == "ambiguous_pdf_match"
-    assert result["pdf_match"]["status"] == "ambiguous"
+    assert result.get("failure_reason") == "ambiguous_pdf_match"
+    pdf_match = result.get("pdf_match")
+    assert pdf_match is not None
+    assert pdf_match["status"] == "ambiguous"
     assert stage1_called is False
 
 
@@ -307,9 +309,9 @@ def test_process_paper_quarantines_doi_mismatch_before_stage1_provider(
 
     assert result is not None
     assert result["status"] == "failed"
-    assert result["failure_reason"] == "source_identity_mismatch"
-    assert result["identity_verdict"] == "mismatch"
-    assert result["artifact_status"] == "quarantined"
+    assert result.get("failure_reason") == "source_identity_mismatch"
+    assert result.get("identity_verdict") == "mismatch"
+    assert result.get("artifact_status") == "quarantined"
     assert provider_calls == 0
 
 

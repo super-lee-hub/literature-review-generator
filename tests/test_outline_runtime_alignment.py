@@ -300,8 +300,10 @@ def test_runtime_resolver_v2_rejects_stale_adopted_outline_hash(tmp_path: Path) 
 
 def test_load_outline_artifact_v2_enabled_refuses_legacy_fallback(tmp_path: Path) -> None:
     generator, workspace = _make_bound_generator(tmp_path, job_id="job-v2-fail-closed")
-    generator.config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
-    generator.compat_config = CompatConfigView.from_config(generator.config)
+    config = generator.config
+    assert config is not None
+    config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
+    generator.compat_config = CompatConfigView.from_config(config)
 
     legacy = Path(generator._get_legacy_outline_file_path())
     legacy.parent.mkdir(parents=True, exist_ok=True)

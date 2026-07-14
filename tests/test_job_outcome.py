@@ -92,6 +92,19 @@ def test_job_outcome_rejects_hash_tampering_and_unsafe_ready_states() -> None:
             readiness_policy_snapshot=POLICY,
         )
 
+    with pytest.raises(JobOutcomeContractError, match="all required stages"):
+        JobOutcomeV1.create(
+            job_id="job-123",
+            attempt_number=1,
+            job_status="completed",
+            job_disposition="clean",
+            canonical_ready=True,
+            requires_attention=False,
+            readiness_policy_snapshot=POLICY,
+            required_stages=("source_intake", "analyze"),
+            completed_stages=("source_intake",),
+        )
+
     with pytest.raises(JobOutcomeContractError, match="needs_review"):
         JobOutcomeV1.create(
             job_id="job-123",

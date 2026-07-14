@@ -1,4 +1,5 @@
 import json
+from typing import cast
 
 import main
 from config_loader import ConfigDict
@@ -96,27 +97,30 @@ def test_save_summaries_dedupes_records_by_stable_paper_key(tmp_path) -> None:
         fingerprint_bundle={"request": "demo"},
         resume_state_report=_resume_report(workspace),
     )
-    generator.summaries = [
-        {
-            "status": "success",
-            "paper_info": {
-                "title": "Short Source Title",
-                "authors": ["Alice Smith"],
-                "year": "2025",
-                "canonical_paper_key": "short source title_smith",
+    generator.summaries = cast(
+        main.SummariesList,
+        [
+            {
+                "status": "success",
+                "paper_info": {
+                    "title": "Short Source Title",
+                    "authors": ["Alice Smith"],
+                    "year": "2025",
+                    "canonical_paper_key": "short source title_smith",
+                },
             },
-        },
-        {
-            "status": "success",
-            "paper_info": {
-                "title": "Short Source Title: Full Subtitle Filled By AI",
-                "authors": ["Alice Smith"],
-                "year": "2025",
-                "canonical_paper_key": "short source title_smith",
+            {
+                "status": "success",
+                "paper_info": {
+                    "title": "Short Source Title: Full Subtitle Filled By AI",
+                    "authors": ["Alice Smith"],
+                    "year": "2025",
+                    "canonical_paper_key": "short source title_smith",
+                },
+                "ai_summary": {"paper_metadata": {"title": "Short Source Title: Full Subtitle Filled By AI"}},
             },
-            "ai_summary": {"paper_metadata": {"title": "Short Source Title: Full Subtitle Filled By AI"}},
-        },
-    ]
+        ],
+    )
     generator._checkpoint_processed_papers.add("short source title_smith")
 
     assert generator.save_summaries() is True

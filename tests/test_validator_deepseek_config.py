@@ -33,12 +33,12 @@ def test_validator_api_config_carries_deepseek_reasoning_options() -> None:
     api_config = validator._get_validator_api_config(generator)
 
     assert api_config is not None
-    assert api_config["endpoint_type"] == "chat_completions"
-    assert api_config["provider_family"] == "deepseek"
-    assert api_config["thinking"] == "enabled"
-    assert api_config["reasoning_effort"] == "max"
-    assert api_config["max_context_tokens"] == "1000000"
-    assert api_config["force_highest_reasoning"] == "true"
+    assert api_config.get("endpoint_type") == "chat_completions"
+    assert api_config.get("provider_family") == "deepseek"
+    assert api_config.get("thinking") == "enabled"
+    assert api_config.get("reasoning_effort") == "max"
+    assert api_config.get("max_context_tokens") == "1000000"
+    assert api_config.get("force_highest_reasoning") == "true"
 
 
 def test_validator_text_truncation_uses_token_budget() -> None:

@@ -12,7 +12,6 @@ from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace, atomic_write_json
-from services.progress_state import determine_resume_state
 from services.source_inventory import (
     SourceInventoryDiagnosticV1,
     SourceInventoryV1,
@@ -85,6 +84,11 @@ class JobRunRequest:
     zotero_report: Optional[str] = None
     library_path: Optional[str] = None
     queue_file: str = "output/_queue/queue.json"
+    requested_stages: tuple[str, ...] | None = None
+    validation_required: bool | None = None
+    require_clean_validation: bool | None = None
+    allow_unvalidated_when_validation_optional: bool | None = None
+    derived_summary_source: bool = False
 
 
 @dataclass(frozen=True)
@@ -203,7 +207,11 @@ def validate_job_request_options(request: Any) -> Optional[str]:
 
     if summary_file and action not in {"generate_outline", "generate_review", "generate_section", "validate_review"}:
         return "--summary-file can only be used with generate-outline, generate-review, generate-section, or validate-review"
-    if summary_sources and action not in {"generate_outline", "generate_review", "generate_section", "validate_review"}:
+    if (
+        summary_sources
+        and action not in {"generate_outline", "generate_review", "generate_section", "validate_review"}
+        and not bool(getattr(request, "derived_summary_source", False))
+    ):
         return "--summary-source can only be used with generate-outline, generate-review, generate-section, or validate-review"
     if reuse_stage1 and action not in STAGE1_REUSE_ACTIONS:
         return "--reuse-stage1 can only be used with stage1 analysis or --run-all"
@@ -555,6 +563,11 @@ class JobRunner:
             "retry_failed": request.retry_failed,
             "concept": request.concept or "",
             "gui": bool(request.gui),
+            "requested_stages": list(request.requested_stages) if request.requested_stages is not None else None,
+            "validation_required": request.validation_required,
+            "require_clean_validation": request.require_clean_validation,
+            "allow_unvalidated_when_validation_optional": request.allow_unvalidated_when_validation_optional,
+            "derived_summary_source": request.derived_summary_source,
         }
 
     def _build_workspace(
@@ -566,6 +579,14 @@ class JobRunner:
         fingerprint_bundle: dict[str, Any],
         request: JobRunRequest | None = None,
     ) -> JobWorkspace:
+        explicit_job_id = str(getattr(request, "job_id", "") or "")
+        if explicit_job_id:
+            return JobWorkspace.create(
+                base_output_dir=base_output_dir,
+                project_name=project_name,
+                job_id=explicit_job_id,
+            )
+
         # 策略1：优先检查是否有完全匹配的工作空间
         if pointer_payload:
             pointer_fingerprint = pointer_payload.get("fingerprint_bundle", {})
@@ -612,7 +633,7 @@ class JobRunner:
         return JobWorkspace.create(
             base_output_dir=base_output_dir,
             project_name=project_name,
-            job_id=request.job_id if request else None,
+            job_id=None,
         )
 
     def _write_resume_report(self, workspace: JobWorkspace, report: Any) -> str:
@@ -706,10 +727,6 @@ class JobRunner:
         project_name = self._resolve_project_name(request)
         workspace: JobWorkspace | None = None
         registry: ArtifactRegistry | None = None
-        summary_path = ""
-        progress_path = ""
-        checkpoint_path = ""
-        fingerprint_bundle_dict: dict[str, Any] = {}
         runtime_context: BootstrappedRuntimeContext | None = None
         active_cancel_token = cancel_token or CancelToken()
 
@@ -816,11 +833,6 @@ class JobRunner:
         )
         workspace = runtime_context.workspace
         registry = runtime_context.registry
-        summary_path = runtime_context.summary_path
-        progress_path = runtime_context.progress_path
-        checkpoint_path = runtime_context.checkpoint_path
-        fingerprint_bundle_dict = runtime_context.fingerprint_bundle
-
         try:
             active_cancel_token.check_cancelled()
 
