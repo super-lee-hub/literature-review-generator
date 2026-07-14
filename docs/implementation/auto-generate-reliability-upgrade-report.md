@@ -7,12 +7,12 @@ implemented and locally verified on the single branch
 `codex/auto-generate-reliability-upgrade`.
 
 - Base: `origin/main@5becc4e50e234244162dca980062fe68e4e0e1e9`
-- Validated code SHA: `0fda818b21282c57ab9c524edb13b81ac5a79fd5`
+- Validated code SHA: `b9b1cf1fa572a31201e395855ee623752cc708af`
 - Validation disposition: `passed`
 - Independent code review: `APPROVE`
 - Independent architecture review: `CLEAR`
-- Final required test gate: `988 passed, 22 skipped`
-- Final strict-offline gate: `988 passed, 22 deselected`
+- Final required test gate: `989 passed, 22 skipped`
+- Final strict-offline gate: `989 passed, 22 deselected`
 - Repository-wide Pyright: `0 errors, 0 warnings, 0 informations`
 
 The report intentionally records the validated code SHA rather than its own
@@ -31,6 +31,7 @@ commit. The final PR head SHA and PR URL belong in the PR body.
 | 6 - Outline health/budget | `d7243c3` | `bcdc9a6` | passed |
 | 7 - evidence/edge checkpoints | `49e2275` | `ff667c1` | passed |
 | 8 - platform/docs/E2E | `0fda818` | `245c0bc` | passed |
+| Post-Phase-8 - Windows locale CI repair | `b9b1cf1` | `7688de9` | passed |
 
 ## Verification evidence
 
@@ -53,6 +54,7 @@ The traceability tables below refer to these executed evidence sets.
 | `VF-required` | `python -m pytest -q --strict-markers` | `988 passed, 22 skipped in 303.59s` |
 | `VF-offline` | `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | `988 passed, 22 deselected in 303.97s` |
 | `VF-static` | `python -m pyright`; `python -m compileall -q main.py runtime services validation outline preprocess`; Phase 8 production Ruff `E9,F821,F841`; `git diff --check` | all passed; Pyright reported zero diagnostics |
+| `V-CI-locale` | locale-strict Stage 2/report regressions; fresh required and strict-offline suites; Pyright, compileall, Ruff, non-ASCII `strftime` scan, and diff-check | `15 passed`; `989 passed, 22 skipped`; `989 passed, 22 deselected`; all static checks passed; independent reviews `APPROVE` and `CLEAR` |
 
 Historical phase-level command lines and artifact hashes are retained in
 `docs/implementation/auto-generate-reliability-upgrade-progress.md`.
@@ -157,6 +159,7 @@ Historical phase-level command lines and artifact hashes are retained in
 | Preflight MinerU and open a job-level circuit on 401/403 | `preprocess.provider_circuit.ProviderCircuitBreaker`; preprocess service | `tests/test_preprocess_platform_safety.py` | `V8-platform` | passed |
 | Run Docling/OCR in timeout-bounded subprocesses; metadata-only never invokes heavy OCR | `preprocess.docling_worker`; `preprocess.ocr_worker`; preprocess service | `tests/test_preprocess_platform_safety.py` | `V8-platform` | passed |
 | Configure UTF-8 stdout/stderr and ASCII-safe JSON progress on Windows | `services.console_io.configure_utf8_stdio`; `write_ascii_json_line` | `tests/test_console_io.py` | `V8-platform`, `V8-e2e` | passed |
+| Keep Chinese local-time labels safe under English Windows CPython 3.11 locales | `main._format_chinese_datetime`; Stage 2 DOCX and report-header callers | locale-strict cases in `tests/test_review_draft_durability.py` | `V-CI-locale` | passed |
 | Synchronize truth sources, feature matrix, compatibility, schema versions, and bilingual docs | `docs/en`, `docs/zh-CN`, README files | `tests/test_documentation_contract.py` | `V8-platform` | passed |
 | Keep old workspace status/reconcile byte-read-only, including corrupt outcomes; require explicit audited migration | `RuntimeReconciler.legacy_read_only_result`; `AgentRuntimeRunner.migrate_legacy` | `tests/test_runtime_legacy_workspace.py` | `V8-platform`, `V8-review-fix` | passed |
 | Validate Registry top-level version/owner/revision and reject malformed/future/foreign registries | `ArtifactRegistry._read_registry_unlocked` | `tests/test_registry_transactions.py`, `tests/test_reconcile_schema_contracts.py` | `V8-platform`, `V8-review-fix` | passed |
@@ -186,18 +189,18 @@ Historical phase-level command lines and artifact hashes are retained in
 
 ## Change surface
 
-The validated range contains 136 files, 24,270 insertions, and 1,879 deletions.
+The validated range contains 137 files, 24,654 insertions, and 1,881 deletions.
 The complete machine-readable manifest is reproducible with:
 
 ```text
-git diff --name-status 5becc4e50e234244162dca980062fe68e4e0e1e9..0fda818b21282c57ab9c524edb13b81ac5a79fd5
+git diff --name-status 5becc4e50e234244162dca980062fe68e4e0e1e9..b9b1cf1fa572a31201e395855ee623752cc708af
 ```
 
 | Area | Files | Principal changes |
 | --- | ---: | --- |
 | Repository root | 11 | entrypoints, schemas/config, README, pytest configuration |
 | `.github` | 1 | Windows Python 3.11 workflow |
-| `docs` | 7 | bilingual truth sources, compatibility, feature matrix, implementation ledger |
+| `docs` | 8 | bilingual truth sources, compatibility, feature matrix, implementation ledger and report |
 | `gui` | 1 | runtime/config compatibility typing and behavior |
 | `outline` | 8 | health sidecar, prompt budget, adoption/resolution gates |
 | `preprocess` | 4 | provider circuit and bounded Docling/OCR workers |
@@ -233,6 +236,15 @@ Both were fixed with quarantine-before-audit promotion, Stage 1 fail-fast
 behavior, and corrupt-outcome legacy read-only projection. The post-fix suite
 reported `101 passed`; the code reviewer returned `APPROVE`, and the independent
 architecture reviewer returned `CLEAR`.
+
+The first Windows Python 3.11 runs on PR head `7d98e54` then exposed a separate
+locale defect: ten Stage 2 durability tests returned before their first section
+call because English Windows could not encode Chinese literals inside a
+`strftime` format string. Code checkpoint `b9b1cf1` now renders the identical
+Chinese local-time labels from numeric datetime fields and covers both affected
+paths with a locale-strict proxy. Fresh gates reported `989 passed` in both
+required and strict-offline selections; the follow-up code review returned
+`APPROVE`, and the architecture review returned `CLEAR`.
 
 ## Remaining risks
 
