@@ -8,7 +8,14 @@ from typing import Any, Dict, Iterable, Literal, Optional, Set
 from models import APIConfig
 
 EndpointType = Literal["chat_completions", "responses"]
-ProviderFamily = Literal["aihubmix_openai", "aihubmix_claude", "deepseek", "generic"]
+ProviderFamily = Literal[
+    "openai_responses",
+    "claude_chat_reasoning",
+    "aihubmix_openai",
+    "aihubmix_claude",
+    "deepseek",
+    "generic",
+]
 ReasoningParamStyle = Literal["responses_reasoning", "chat_reasoning", "deepseek_thinking", "none"]
 
 
@@ -48,7 +55,14 @@ def _normalize_endpoint(value: Any) -> EndpointType:
 
 def _infer_provider_family(api_config: APIConfig) -> ProviderFamily:
     configured = _lower(api_config.get("provider_family")).replace("-", "_")
-    if configured in {"aihubmix_openai", "aihubmix_claude", "deepseek", "generic"}:
+    if configured in {
+        "openai_responses",
+        "claude_chat_reasoning",
+        "aihubmix_openai",
+        "aihubmix_claude",
+        "deepseek",
+        "generic",
+    }:
         return configured  # type: ignore[return-value]
 
     api_base = _lower(api_config.get("api_base"))
@@ -72,7 +86,7 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
     explicit_pdf_input = _truthy(api_config.get("supports_pdf_file_input")) or _truthy(api_config.get("pdf_file_input"))
     official_openai_host = "api.openai.com" in _lower(api_config.get("api_base"))
 
-    if provider_family == "aihubmix_openai" and endpoint_type == "responses":
+    if provider_family in {"openai_responses", "aihubmix_openai"} and endpoint_type == "responses":
         return ModelCapability(
             endpoint_type="responses",
             provider_family=provider_family,
@@ -85,7 +99,7 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
             disallowed_when_reasoning={"temperature", "top_p"},
         )
 
-    if provider_family == "aihubmix_claude":
+    if provider_family in {"claude_chat_reasoning", "aihubmix_claude"}:
         return ModelCapability(
             endpoint_type="chat_completions",
             provider_family=provider_family,

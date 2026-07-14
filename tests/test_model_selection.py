@@ -97,3 +97,39 @@ def test_legacy_config_without_endpoint_type_stays_on_chat_completions() -> None
     assert capability.endpoint_type == "chat_completions"
     assert capability.provider_family == "aihubmix_openai"
     assert capability.reasoning_param_style == "none"
+
+
+def test_custom_openai_responses_provider_supports_reasoning() -> None:
+    capability = resolve_model_capability(
+        {
+            "api_key": "writer-key",
+            "model": "gpt-5.6-sol",
+            "api_base": "https://api.example.com/v1",
+            "endpoint_type": "responses",
+            "provider_family": "openai_responses",
+            "reasoning_effort": "xhigh",
+        }
+    )
+
+    assert capability.endpoint_type == "responses"
+    assert capability.provider_family == "openai_responses"
+    assert capability.supports_reasoning is True
+    assert capability.reasoning_param_style == "responses_reasoning"
+
+
+def test_custom_claude_chat_provider_supports_reasoning() -> None:
+    capability = resolve_model_capability(
+        {
+            "api_key": "outline-key",
+            "model": "claude-opus-4-8",
+            "api_base": "https://api.example.com/v1",
+            "endpoint_type": "chat_completions",
+            "provider_family": "claude_chat_reasoning",
+            "reasoning_effort": "xhigh",
+        }
+    )
+
+    assert capability.endpoint_type == "chat_completions"
+    assert capability.provider_family == "claude_chat_reasoning"
+    assert capability.supports_reasoning is True
+    assert capability.reasoning_param_style == "chat_reasoning"

@@ -46,6 +46,51 @@ def test_validate_all_config_warns_for_mismatched_provider_endpoint_combo():
     assert any("aihubmix_openai reasoning config requires endpoint_type=responses" in warning for warning in warnings)
 
 
+def test_validate_all_config_accepts_custom_openai_responses_provider():
+    config = _base_config()
+    config["Writer_API"].update(
+        {
+            "model": "gpt-5.6-sol",
+            "api_base": "https://api.example.com/v1",
+            "provider_family": "openai_responses",
+            "reasoning_effort": "xhigh",
+        }
+    )
+
+    valid, warnings = validate_all_config(config)
+
+    assert valid is True
+    writer_warnings = [warning for warning in warnings if "[Writer_API]" in warning]
+    assert not any(
+        marker in warning
+        for warning in writer_warnings
+        for marker in ("provider_family", "endpoint_type", "reasoning fields")
+    )
+
+
+def test_validate_all_config_accepts_custom_claude_chat_provider():
+    config = _base_config()
+    config["Writer_API"].update(
+        {
+            "model": "claude-opus-4-8",
+            "api_base": "https://api.example.com/v1",
+            "endpoint_type": "chat_completions",
+            "provider_family": "claude_chat_reasoning",
+            "reasoning_effort": "xhigh",
+        }
+    )
+
+    valid, warnings = validate_all_config(config)
+
+    assert valid is True
+    writer_warnings = [warning for warning in warnings if "[Writer_API]" in warning]
+    assert not any(
+        marker in warning
+        for warning in writer_warnings
+        for marker in ("provider_family", "endpoint_type", "reasoning fields")
+    )
+
+
 def test_validate_all_config_warns_for_reasoning_fields_on_generic_provider():
     config = _base_config()
     config["Backup_Reader_API"]["reasoning_effort"] = "high"

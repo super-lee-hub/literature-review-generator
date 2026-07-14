@@ -35,12 +35,23 @@ def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) ->
     reasoning_display = _normalize_config_text(section.get("reasoning_display"))
     thinking = _normalize_config_text(section.get("thinking"))
 
-    if provider_family and provider_family not in {"aihubmix_openai", "aihubmix_claude", "deepseek", "generic"}:
+    if provider_family and provider_family not in {
+        "openai_responses",
+        "claude_chat_reasoning",
+        "aihubmix_openai",
+        "aihubmix_claude",
+        "deepseek",
+        "generic",
+    }:
         warnings.append(f"[{section_name}] provider_family={provider_family!r} is not supported")
     if endpoint_type and endpoint_type not in {"chat_completions", "responses", "response"}:
         warnings.append(f"[{section_name}] endpoint_type={endpoint_type!r} is not supported")
     if provider_family == "aihubmix_openai" and endpoint_type and endpoint_type not in {"responses", "response"}:
         warnings.append(f"[{section_name}] aihubmix_openai reasoning config requires endpoint_type=responses")
+    if provider_family == "openai_responses" and endpoint_type and endpoint_type not in {"responses", "response"}:
+        warnings.append(f"[{section_name}] openai_responses requires endpoint_type=responses")
+    if provider_family == "claude_chat_reasoning" and endpoint_type and endpoint_type not in {"chat_completions"}:
+        warnings.append(f"[{section_name}] claude_chat_reasoning requires endpoint_type=chat_completions")
     if provider_family == "aihubmix_claude" and endpoint_type and endpoint_type not in {"chat_completions"}:
         warnings.append(f"[{section_name}] aihubmix_claude requires endpoint_type=chat_completions")
     if provider_family == "deepseek" and endpoint_type and endpoint_type not in {"chat_completions"}:
