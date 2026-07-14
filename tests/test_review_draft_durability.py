@@ -1,4 +1,5 @@
 import json
+from datetime import datetime as RealDateTime
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +31,31 @@ class _DummyLogger:
 
     def debug(self, *_args, **_kwargs):
         self.messages.append(("debug", " ".join(str(arg) for arg in _args)))
+
+
+class _LocaleStrictTimestamp:
+    def __init__(self) -> None:
+        self._value = RealDateTime(2026, 7, 14, 9, 30, 45)
+
+    def __getattr__(self, name: str):
+        return getattr(self._value, name)
+
+    def strftime(self, format_string: str) -> str:
+        if not format_string.isascii():
+            raise UnicodeEncodeError(
+                "locale",
+                format_string,
+                0,
+                len(format_string),
+                "encoding error",
+            )
+        return self._value.strftime(format_string)
+
+
+class _LocaleStrictDateTime:
+    @staticmethod
+    def now() -> _LocaleStrictTimestamp:
+        return _LocaleStrictTimestamp()
 
 
 def _resume_report(workspace: JobWorkspace) -> ResumeStateReport:
@@ -98,6 +124,7 @@ def _stub_stage2_bootstrap(monkeypatch, generator) -> None:
 def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: Path, monkeypatch) -> None:
     generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-success")
     _stub_stage2_bootstrap(monkeypatch, generator)
+    monkeypatch.setattr(main, "datetime", _LocaleStrictDateTime)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
     outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
@@ -139,6 +166,22 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
     assert artifact_payload["projections"]["docx_path"] == str(word_path)
     assert "First Section generated content." in document_text
     assert any(dep["artifact_type"] == "literature_review_outline" for dep in review_records[0]["depends_on"])
+
+
+def test_review_content_timestamp_avoids_locale_sensitive_strftime(monkeypatch) -> None:
+    monkeypatch.setattr(main, "datetime", _LocaleStrictDateTime)
+
+    content = main.LiteratureReviewGenerator.format_review_content(
+        {"summary": "Review body"},
+        {
+            "total_papers": 1,
+            "successful_papers": 1,
+            "failed_papers": 0,
+            "papers": [],
+        },
+    )
+
+    assert "**生成时间**: 2026年07月14日 09:30" in content
 
 
 def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Path, monkeypatch) -> None:

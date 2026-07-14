@@ -121,6 +121,14 @@ def normalize_checkpoint_paper_key(paper_key: str) -> str:
         return normalized
     return str(paper_key or "").strip()
 
+
+def _format_chinese_datetime(value: datetime, *, include_time: bool = False) -> str:
+    """Format Chinese date labels without passing non-ASCII text to strftime."""
+    rendered = f"{value.year:04d}年{value.month:02d}月{value.day:02d}日"
+    if include_time:
+        rendered += f" {value.hour:02d}:{value.minute:02d}"
+    return rendered
+
 from context_manager import validate_summary_quality, optimize_context_for_synthesis, optimize_context_for_outline, estimate_tokens
 
 
@@ -6641,7 +6649,7 @@ class LiteratureReviewGenerator:
                     run.font.size = Pt(font_size_heading1 + 2)  # 主标题稍大  # type: ignore
                 
                 # 添加生成时间
-                date_para = doc.add_paragraph(f"生成时间: {datetime.now().strftime('%Y年%m月%d日')}")
+                date_para = doc.add_paragraph(f"生成时间: {_format_chinese_datetime(datetime.now())}")
                 date_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER  # type: ignore
                 
                 # 应用日期样式
@@ -7478,7 +7486,7 @@ Requirements:
 
     @staticmethod
     def format_review_content(review_content: Dict[str, Any], review_data: Dict[str, Any]) -> str:
-        header = f"# 文献综述报告\n\n**生成时间**: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}\n**文献数量**: {review_data['total_papers']}篇\n**成功处理**: {review_data['successful_papers']}篇\n**失败处理**: {review_data['failed_papers']}篇\n\n---\n\n"
+        header = f"# 文献综述报告\n\n**生成时间**: {_format_chinese_datetime(datetime.now(), include_time=True)}\n**文献数量**: {review_data['total_papers']}篇\n**成功处理**: {review_data['successful_papers']}篇\n**失败处理**: {review_data['failed_papers']}篇\n\n---\n\n"
         review_text = review_content if isinstance(review_content, str) else review_content.get('summary', json.dumps(  # type: ignore
             review_content, ensure_ascii=False, indent=2))
         references = "\n\n## 参考文献\n\n"
