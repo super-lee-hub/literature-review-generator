@@ -242,4 +242,3 @@ architecture reviewer returned `CLEAR`.
   external prerequisites and remain optional.
 - No new runtime dependency was added, no second runtime/truth source was
   created, and no required implementation remains as a TODO or stub.
-
