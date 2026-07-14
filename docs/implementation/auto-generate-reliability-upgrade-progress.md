@@ -12,7 +12,7 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: `99a0ce7` (Phase 4)
+- Last-known-good checkpoint: `0fda818` (Phase 8)
 
 ## Phase status
 
@@ -23,10 +23,10 @@ code commit itself.
 | 2 - identity, registry, audit, fingerprint | completed | `0d0f879` | current ledger commit |
 | 3 - sentence and validation truth | completed | `89a3c9a` | current ledger commit |
 | 4 - ReviewBatch derivation | completed | `99a0ce7` | current ledger commit |
-| 5 - runtime runner and recovery | pending | - | - |
-| 6 - outline health and budget | pending | - | - |
-| 7 - evidence and edge checkpoints | pending | - | - |
-| 8 - platform, compatibility, docs, E2E | pending | - | - |
+| 5 - runtime runner and recovery | completed | `2597c5d` | `5619a56` |
+| 6 - outline health and budget | completed | `d7243c3` | `bcdc9a6` |
+| 7 - evidence and edge checkpoints | completed | `49e2275` | `ff667c1` |
+| 8 - platform, compatibility, docs, E2E | completed | `0fda818` | current ledger commit |
 
 ## Phase 0 - hotfix and offline baseline
 
@@ -493,3 +493,90 @@ code commit itself.
 - Repository-wide pyright debt remains a final-gate obligation; every changed
   Phase 7 service/validation/runtime module is type-clean apart from existing
   `main.py` diagnostics that predate this phase.
+
+## Phase 8 - Platform stability, compatibility closure, documentation, and E2E
+
+### Scope and provenance
+
+- Pre-phase commit: `ff667c1`
+- Code checkpoint: `0fda818`
+- Replaced naked legacy-summary reuse with an audited compatibility path. The
+  selected legacy inputs, canonical summary, and summary manifest remain
+  quarantined until the immutable `AuditRecordV1` is durable and registered;
+  audit failure aborts before Stage 1 source scanning or provider calls.
+- Made Registry reads reject missing, malformed, foreign-owner, and future
+  top-level headers while preserving explicit-write upgrade compatibility for
+  valid v1 registries.
+- Kept status and reconcile read-only for recognizable legacy workspaces,
+  including partial state and corrupt `job_outcome_v1.json`; only the explicit
+  audited `migrate-legacy` command may materialize a fail-closed compatibility
+  head.
+- Added MinerU preflight and job-scoped authentication circuit breaking, plus
+  bounded Docling and OCR subprocess workers. Metadata-only paths do not invoke
+  heavy OCR.
+- Added UTF-8 console configuration and ASCII-safe JSON progress output for
+  Windows automation.
+- Closed runtime schema reconciliation, quarantine release/identity override,
+  path-origin, documentation contract, and canonical contributing-source
+  dependency behavior.
+- Added a public synthetic runtime E2E covering parent execution, 61/20/45
+  derived batches, clean/findings/needs-review/cancelled outcomes, crash and
+  resume recovery, latest pointers, recursively valid dependency hashes, and a
+  Chinese Windows path.
+- Closed the repository-wide Pyright gate with behavior-preserving type
+  narrowing in production and test fixtures.
+
+### Changed files
+
+- Platform preprocessing: `preprocess/service.py`,
+  `preprocess/provider_circuit.py`, `preprocess/docling_worker.py`, and
+  `preprocess/ocr_worker.py`.
+- Runtime and compatibility: `runtime/attempt_store.py`, `runtime/cli.py`,
+  `runtime/job_spec.py`, `runtime/lifecycle.py`, `runtime/reconcile.py`,
+  `runtime/runner.py`, and `runtime/stage_terminal.py`.
+- Durable services: `services/artifact_registry.py`,
+  `services/console_io.py`, `services/job_outcome.py`,
+  `services/quarantine_lifecycle.py`, `services/review_batch.py`, and
+  `services/summary_reuse.py`.
+- Legacy orchestration and compatibility projections: `main.py`, `gui/app.py`,
+  and the affected configuration, citation, and Stage 1 helpers.
+- English and Chinese truth-source, compatibility, feature-matrix, README, and
+  environment-example documentation.
+- Platform, Registry, legacy migration, documentation, quarantine, runtime,
+  summary reuse, and public synthetic E2E tests under `tests/`.
+
+### Verification evidence
+
+| Command | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q tests/test_console_io.py tests/test_preprocess_platform_safety.py tests/test_quarantine_lifecycle.py tests/test_reconcile_schema_contracts.py tests/test_runtime_legacy_workspace.py tests/test_config_path_origin.py tests/test_documentation_contract.py --strict-markers` | 0 | `57 passed in 11.61s` |
+| `python -m pytest -q tests/test_synthetic_runtime_e2e.py --strict-markers` | 0 | `8 passed in 442.59s` |
+| `python -m pytest -q tests/test_summary_reuse.py tests/test_runtime_legacy_workspace.py tests/test_registry_transactions.py tests/test_runtime_reconcile.py tests/test_runtime_runner.py --strict-markers` | 0 | `101 passed in 55.68s` after review fixes |
+| `python -m pytest -q --strict-markers` | 0 | final post-review gate: `988 passed, 22 skipped in 303.59s`; all skips are explicitly disabled Playwright tests |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | final strict-offline gate: `988 passed, 22 deselected in 303.97s` |
+| `python -m pyright` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py runtime services validation outline preprocess` | 0 | no diagnostics |
+| `python -m ruff check <Phase 8 production files> --select E9,F821,F841` | 0 | `All checks passed!` |
+| `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
+| Independent code review | 0 | final verdict `APPROVE` after both fail-closed findings were fixed |
+| Independent architecture review | 0 | final verdict `CLEAR` |
+
+### Artifact hashes
+
+- `main.py`: `122dc64e2d2453dfae1b74bf90b3af4e0b51138b153d74bbc0b53dccee242a56`
+- `runtime/reconcile.py`: `3cd78f4252973c9f92ff9dedf6389c9b1bbd47d0e523bbf3b2b061784f95124c`
+- `runtime/runner.py`: `6e634a184280ca23ccb2e03edc4be5e4b8e4fe3c26d696ef6a6d1c6427fb885a`
+- `services/artifact_registry.py`: `87aabe3259d771c7f3e845986ced1af9f645b13fc0cd3a7a63981efb3f247002`
+- `preprocess/service.py`: `5ed67afdae80454946f6c4f69d6d07fde3f916bf57ff8995a6afe770dc29492c`
+- `tests/test_synthetic_runtime_e2e.py`: `0340361d718b1dfa49e0d99a6c36e7a735ff2172a665c8cd5a3f1aec114b6e16`
+
+### Remaining risks
+
+- The 22 Playwright tests remain explicitly disabled locally and will require
+  their opt-in browser prerequisites; live-provider and heavy-OCR smoke tests
+  remain optional and are not substitutes for the completed offline gates.
+- Repository-wide Ruff still reports historical style findings outside the
+  Phase 8 correctness-lint surface; Pyright, compileall, targeted undefined and
+  unused-local checks, and both required pytest gates are clean.
+- The single draft PR and Windows Python 3.11 CI are still pending at this
+  checkpoint and are tracked by the final implementation report and PR body.
