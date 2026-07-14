@@ -12,7 +12,7 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: `0fda818` (Phase 8)
+- Last-known-good checkpoint: `b9b1cf1` (post-Phase-8 Windows locale repair)
 
 ## Phase status
 
@@ -26,7 +26,8 @@ code commit itself.
 | 5 - runtime runner and recovery | completed | `2597c5d` | `5619a56` |
 | 6 - outline health and budget | completed | `d7243c3` | `bcdc9a6` |
 | 7 - evidence and edge checkpoints | completed | `49e2275` | `ff667c1` |
-| 8 - platform, compatibility, docs, E2E | completed | `0fda818` | current ledger commit |
+| 8 - platform, compatibility, docs, E2E | completed | `0fda818` | `245c0bc` |
+| Post-Phase-8 - Windows locale CI repair | completed | `b9b1cf1` | current ledger commit |
 
 ## Phase 0 - hotfix and offline baseline
 
@@ -580,3 +581,53 @@ code commit itself.
   unused-local checks, and both required pytest gates are clean.
 - The single draft PR and Windows Python 3.11 CI are still pending at this
   checkpoint and are tracked by the final implementation report and PR body.
+
+## Post-Phase-8 - Windows Python 3.11 locale repair
+
+### Scope and provenance
+
+- Pre-repair PR head: `7d98e54aed9b70c65de6703ee08034dc796a47d6`.
+- Code checkpoint: `b9b1cf1fa572a31201e395855ee623752cc708af`.
+- Both Windows checks for the pre-repair head failed in the strict-offline
+  suite with `10 failed, 978 passed, 22 deselected`: push run `29321909317`
+  and pull-request run `29321989355`.
+- All ten failures entered Stage 2 but returned before the first section call.
+  The common cause was CPython 3.11 on an English Windows locale attempting to
+  encode Chinese literals embedded in `strftime` format strings.
+- Replaced both non-ASCII `strftime` sites with one helper that renders the
+  same local Chinese date/time text from numeric datetime fields. No dependency,
+  workflow, schema, or runtime contract changed.
+- Added a portable locale-strict datetime proxy. It rejects non-ASCII
+  `strftime` formats while exercising the complete Stage 2 DOCX path and the
+  separate review-report timestamp path.
+
+### Changed files
+
+- `main.py`: locale-independent Chinese date/time formatting and both callers.
+- `tests/test_review_draft_durability.py`: Stage 2 and report-header locale
+  regressions.
+
+### Verification evidence
+
+| Command/check | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q tests/test_citation_manifest_durability.py tests/test_review_draft_durability.py --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `15 passed in 11.20s` |
+| Required suite: `python -m pytest -q --strict-markers` with the strict offline environment | 0 | `989 passed, 22 skipped in 353.01s`; every skip is an explicitly disabled Playwright test |
+| Strict-offline suite: `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `989 passed, 22 deselected in 348.14s` |
+| `python -m pyright` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py runtime services validation outline preprocess` | 0 | no diagnostics |
+| `python -m ruff check main.py --select E9,F821,F841` | 0 | `All checks passed!` |
+| repository scan for non-ASCII `strftime` format strings | 1 | no matches, as expected |
+| `git diff --check` | 0 | no whitespace errors; only expected LF-to-CRLF notices |
+| Independent code review | 0 | `APPROVE`; no findings |
+| Independent architecture review | 0 | `CLEAR`; no scope, coupling, or portability blocker |
+
+### Artifact hashes
+
+- `main.py`: `6e55c4048cf1b5da5689bf33660fccc60a51e1004469b1426398e5819039c58b`
+- `tests/test_review_draft_durability.py`: `e2d43a5489a16f00cba7769278f348c65a6c96007b4fdc8b867626ab43c77fb9`
+
+### Remaining risk
+
+- The existing draft PR must remain draft until Windows Python 3.11 CI passes
+  on the final pushed documentation head derived from this code checkpoint.
