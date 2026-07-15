@@ -1623,29 +1623,29 @@ def _write_validation_reports(
 
     registry = getattr(generator_instance, "artifact_registry", None)
     if registry is not None:
-        from services.artifact_registry import ArtifactDependencyRefV2
+        from validation.input_dependencies import (
+            ValidationInputDependencyError,
+            resolve_validation_input_dependencies,
+        )
 
-        input_dependencies: List[ArtifactDependencyRefV2] = []
-        for artifact_id in (
-            validation_run_result.input_artifacts.review_draft_id,
-            validation_run_result.input_artifacts.citation_manifest_id,
-        ):
-            record = registry.get(artifact_id) if artifact_id else None
-            if record is None:
-                continue
-            input_dependencies.append(
-                ArtifactDependencyRefV2(
-                    dependency_kind="local_job",
-                    job_id=record.job_id,
-                    artifact_id=record.artifact_id,
-                    artifact_type=record.artifact_type,
-                    path=record.path,
-                    content_hash=record.content_hash,
-                )
+        external_registry_resolver = getattr(
+            generator_instance,
+            "validation_external_registry_resolver",
+            None,
+        )
+        dependency_error = ""
+        try:
+            input_dependencies = resolve_validation_input_dependencies(
+                registry,
+                validation_run_result.input_artifacts,
+                external_registry_resolver=external_registry_resolver,
             )
+        except ValidationInputDependencyError as exc:
+            input_dependencies = []
+            dependency_error = str(exc)
         registry_status = (
             "ready"
-            if validation_run_result.contract_satisfied and len(input_dependencies) == 2
+            if validation_run_result.contract_satisfied and not dependency_error
             else "quarantined"
         )
         registry.register_file(
@@ -1657,11 +1657,13 @@ def _write_validation_reports(
             artifact_id=validation_run_result.validation_run_id,
             status=registry_status,
             depends_on=input_dependencies,
+            external_registry_resolver=external_registry_resolver,
             metadata={
                 "execution_status": validation_run_result.execution_status.value,
                 "validation_disposition": validation_run_result.validation_disposition.value,
                 "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
                 "contract_satisfied": validation_run_result.contract_satisfied,
+                "dependency_error": dependency_error,
             },
         )
 

@@ -26,13 +26,20 @@ def test_validation_adapter_satisfies_run_review_validation_contract(tmp_path: P
     )
     session = bridge.bootstrap(build_legacy_main())
 
-    adapter = bridge.build_validation_adapter(session)
+    def external_registry_resolver(_job_id: str) -> None:
+        return None
+
+    adapter = bridge.build_validation_adapter(
+        session,
+        external_registry_resolver=external_registry_resolver,
+    )
 
     assert isinstance(adapter, RuntimeValidationAdapter)
     assert hasattr(adapter, "logger")
     assert hasattr(adapter, "config")
     assert hasattr(adapter, "artifact_registry")
     assert hasattr(adapter, "job_workspace")
+    assert adapter.validation_external_registry_resolver is external_registry_resolver
     assert callable(adapter._review_draft_v2_path)
     assert callable(adapter._citation_manifest_path)
     assert callable(adapter._get_review_word_file_path)

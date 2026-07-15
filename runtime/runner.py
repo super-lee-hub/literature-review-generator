@@ -427,6 +427,7 @@ class AgentRuntimeRunner:
         bundle: SourceBundle,
         results: Mapping[str, StageResult],
         attempt_id: str,
+        external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
     ) -> tuple[StageResult, int]:
         if stage == "analyze":
             response = self._call_handler("stage1_analyze", spec=spec, bundle=bundle, session=session, results=results)
@@ -516,6 +517,7 @@ class AgentRuntimeRunner:
                 session,
                 attempt_id=attempt_id,
                 validator_module=self.validator_module,
+                external_registry_resolver=external_registry_resolver,
             )
             return result, 0
         raise RuntimeRunnerError(f"unsupported runtime stage: {stage}")
@@ -775,6 +777,7 @@ class AgentRuntimeRunner:
                     bundle=bundle,
                     results=results,
                     attempt_id=running_attempt.attempt_id,
+                    external_registry_resolver=external_registry_resolver,
                 )
                 self._persist_terminal(
                     session,
@@ -804,8 +807,10 @@ class AgentRuntimeRunner:
                 policy.get("allow_unvalidated_when_validation_optional", not validation_required)
             )
             validation = results.get("validate")
-            if validation is not None:
+            if validation is not None and validation.success:
                 disposition = str(validation.metadata.get("validation_disposition") or "unvalidated")
+            elif validation is not None:
+                disposition = "unvalidated"
             canonical_ready = bool(
                 session.context.source_canonical_ready
                 and set(session.context.required_stages).issubset(completed)

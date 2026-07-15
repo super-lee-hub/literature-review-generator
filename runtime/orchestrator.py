@@ -235,8 +235,13 @@ class AgentRuntimeBridge:
         session: AgentRuntimeSession,
         *,
         attempt_id: str = "",
+        external_registry_resolver: Any | None = None,
     ) -> RuntimeValidationAdapter:
-        return RuntimeValidationAdapter(session.generator, validation_attempt_id=attempt_id)
+        return RuntimeValidationAdapter(
+            session.generator,
+            validation_attempt_id=attempt_id,
+            validation_external_registry_resolver=external_registry_resolver,
+        )
 
     def persist_stage1_results(
         self,
@@ -599,12 +604,17 @@ class AgentRuntimeBridge:
         *,
         attempt_id: str = "",
         validator_module: Any | None = None,
+        external_registry_resolver: Any | None = None,
         producer: str = "runtime.orchestrator.AgentRuntimeBridge.run_validation",
     ) -> StageResult:
         if validator_module is None:
             import validator as validator_module  # type: ignore
 
-        adapter = self.build_validation_adapter(session, attempt_id=attempt_id)
+        adapter = self.build_validation_adapter(
+            session,
+            attempt_id=attempt_id,
+            external_registry_resolver=external_registry_resolver,
+        )
         result = dict(validator_module.run_review_validation(adapter) or {})
 
         from validation.run_result import ValidationExecutionStatus, ValidationRunResultV1
@@ -683,31 +693,43 @@ class AgentRuntimeBridge:
                 },
             )
 
+        from validation.input_dependencies import (
+            ValidationInputDependencyError,
+            resolve_validation_input_dependencies,
+        )
+
+        dependency_error = ""
+        try:
+            depends_on = resolve_validation_input_dependencies(
+                session.context.registry,
+                validation_run_result.input_artifacts,
+                external_registry_resolver=external_registry_resolver,
+            )
+        except ValidationInputDependencyError as exc:
+            depends_on = []
+            dependency_error = str(exc)
+
         artifact_refs: list[StageArtifactRef] = []
         validation_contract_complete = bool(
             validation_run_result.contract_satisfied
             and validation_run_result.compatibility_status == "verified"
+            and not dependency_error
         )
         validation_success = bool(
             validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED
             and validation_contract_complete
         )
-        contract_failure = (
-            "validation_contract_incomplete"
-            if validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED
-            and not validation_contract_complete
-            else ""
-        )
-        depends_on = [
-            ArtifactDependencyRef(
-                artifact_type=session.generator.REVIEW_DRAFT_V2_ARTIFACT_TYPE,
-                path=session.generator._review_draft_v2_path(),
-            ),
-            ArtifactDependencyRef(
-                artifact_type=session.generator.CITATION_MANIFEST_ARTIFACT_TYPE,
-                path=session.generator._citation_manifest_path(),
-            ),
-        ]
+        contract_failure = ""
+        if validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED:
+            if dependency_error:
+                contract_failure = "validation_input_dependencies_unverified"
+            elif not validation_contract_complete:
+                contract_failure = "validation_contract_incomplete"
+        published_execution_status = validation_run_result.execution_status.value
+        published_validation_disposition = validation_run_result.validation_disposition.value
+        if contract_failure:
+            published_execution_status = ValidationExecutionStatus.FAILED.value
+            published_validation_disposition = "unvalidated"
 
         canonical_record: ArtifactRecord | None = None
         if validation_run_result_file:
@@ -719,11 +741,13 @@ class AgentRuntimeBridge:
                 producer=producer,
                 depends_on=depends_on,
                 artifact_id=validation_run_result.validation_run_id,
-                status="quarantined" if contract_failure else "ready",
+                status="ready" if validation_success else "quarantined",
+                external_registry_resolver=external_registry_resolver,
                 metadata={
                     "execution_status": validation_run_result.execution_status.value,
                     "validation_disposition": validation_run_result.validation_disposition.value,
                     "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
+                    "dependency_error": dependency_error,
                 },
             )
             if canonical_record.content_hash != canonical_digest:
@@ -746,7 +770,7 @@ class AgentRuntimeBridge:
                         "failure_reason": "canonical_validation_hash_changed",
                     },
                 )
-            if not contract_failure:
+            if validation_success:
                 artifact_refs.append(self._artifact_ref_from_record(canonical_record))
 
         projection_dependencies = [
@@ -758,7 +782,7 @@ class AgentRuntimeBridge:
                 path=canonical_record.path,
                 content_hash=canonical_record.content_hash,
             )
-        ] if canonical_record is not None and not contract_failure else []
+        ] if canonical_record is not None and validation_success else []
 
         projections = (
             (report_file, "validation_report_projection", "validation-report"),
@@ -768,7 +792,7 @@ class AgentRuntimeBridge:
         )
 
         for path, artifact_type, artifact_prefix in projections:
-            if not path or canonical_record is None or contract_failure:
+            if not path or canonical_record is None or not validation_success:
                 continue
             record = session.context.registry.register_file(
                 artifact_role="validation_projection",
@@ -793,8 +817,12 @@ class AgentRuntimeBridge:
                         "validation_run_result_file": validation_run_result_file,
                         "report_file": report_file,
                         "manual_report_file": manual_report_file,
-                        "execution_status": validation_run_result.execution_status.value,
-                        "validation_disposition": validation_run_result.validation_disposition.value,
+                        "execution_status": published_execution_status,
+                        "validation_disposition": published_validation_disposition,
+                        "declared_execution_status": validation_run_result.execution_status.value,
+                        "declared_validation_disposition": (
+                            validation_run_result.validation_disposition.value
+                        ),
                         "failure_reason": contract_failure,
                     },
                 )
@@ -808,8 +836,12 @@ class AgentRuntimeBridge:
             metadata={
                 "manual_review_count": validation_run_result.claim_verdict_counts.get("needs_review", 0),
                 "validation_run_id": validation_run_result.validation_run_id,
-                "execution_status": validation_run_result.execution_status.value,
-                "validation_disposition": validation_run_result.validation_disposition.value,
+                "execution_status": published_execution_status,
+                "validation_disposition": published_validation_disposition,
+                "declared_execution_status": validation_run_result.execution_status.value,
+                "declared_validation_disposition": (
+                    validation_run_result.validation_disposition.value
+                ),
                 "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
                 "contradicted_count": validation_run_result.contradicted_count,
                 "canonical_artifact_id": canonical_record.artifact_id if canonical_record else "",

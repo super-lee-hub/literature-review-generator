@@ -8,7 +8,12 @@ import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
-from services.artifact_registry import file_sha256
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRegistry,
+    file_sha256,
+)
+from services.job_workspace import JobWorkspace
 from tests.test_runtime_bridge_helpers import build_legacy_main, write_json
 from validation.run_result import (
     ValidationExecutionStatus,
@@ -37,6 +42,16 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
 
     review_draft_path = Path(session.generator._review_draft_v2_path())
     citation_manifest_path = Path(session.generator._citation_manifest_path())
+    parent_workspace = JobWorkspace.create(
+        str(tmp_path),
+        "validation-parent",
+        job_id="job-validation-parent",
+    )
+    parent_registry = ArtifactRegistry(
+        parent_workspace.paths.registry_path,
+        parent_workspace.job_id,
+    )
+    evidence_manifest_path = Path(parent_workspace.artifact_path("alpha.evidence_manifest_v1.json"))
     report_file = Path(session.context.workspace.report_path("demo-ai_validation_report.txt"))
     manual_report_file = Path(session.context.workspace.report_path("demo-ai_manual_review_report.json"))
     validation_run_result_file = Path(
@@ -50,6 +65,10 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
     write_json(
         citation_manifest_path,
         {"artifact_type": "citation_manifest", "artifact_version": "v3", "occurrences": [], "citation_sets": []},
+    )
+    write_json(
+        evidence_manifest_path,
+        {"artifact_type": "evidence_manifest", "artifact_version": "v1"},
     )
     review_record = session.context.registry.register_file(
         artifact_id="review-draft-v2",
@@ -67,6 +86,38 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
         path=citation_manifest_path,
         producer="tests",
     )
+    evidence_record = parent_registry.register_file(
+        artifact_id="evidence-manifest-alpha",
+        artifact_role="paper_evidence",
+        artifact_type="evidence_manifest",
+        artifact_version="v1",
+        path=evidence_manifest_path,
+        producer="tests",
+    )
+    external_evidence = ArtifactDependencyRefV2(
+        dependency_kind="external_job",
+        job_id=parent_workspace.job_id,
+        artifact_id=evidence_record.artifact_id,
+        artifact_type=evidence_record.artifact_type,
+        path=evidence_record.path,
+        content_hash=evidence_record.content_hash,
+    )
+    carrier_path = Path(session.context.workspace.artifact_path("derived-paper.json"))
+    write_json(carrier_path, {"artifact_type": "paper_artifact"})
+
+    def external_registry_resolver(job_id: str) -> ArtifactRegistry | None:
+        return parent_registry if job_id == parent_workspace.job_id else None
+
+    session.context.registry.register_file(
+        artifact_id="derived-paper-alpha",
+        artifact_role="paper_artifact",
+        artifact_type="paper_artifact",
+        artifact_version="v1",
+        path=carrier_path,
+        producer="tests",
+        depends_on=[external_evidence],
+        external_registry_resolver=external_registry_resolver,
+    )
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text("ok", encoding="utf-8")
     manual_report_file.write_text(json.dumps({"items": []}), encoding="utf-8")
@@ -80,6 +131,8 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
             review_draft_hash=review_record.content_hash,
             citation_manifest_id=citation_record.artifact_id,
             citation_manifest_hash=citation_record.content_hash,
+            evidence_manifest_ids=(evidence_record.artifact_id,),
+            evidence_manifest_hashes=(evidence_record.content_hash,),
         ),
         review_has_citations=False,
         evidence_complete=True,
@@ -100,6 +153,7 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
         session,
         attempt_id="attempt-1",
         validator_module=SimpleNamespace(run_review_validation=_fake_run_review_validation),
+        external_registry_resolver=external_registry_resolver,
     )
 
     registry_payload = json.loads(Path(session.context.workspace.paths.registry_path).read_text(encoding="utf-8"))
@@ -114,6 +168,60 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
     canonical_record = session.context.registry.get("validation_report_demo")
     assert canonical_record is not None
     assert canonical_record.content_hash == file_sha256(validation_run_result_file)
+    assert [
+        (dependency.artifact_type, dependency.artifact_id, dependency.content_hash)
+        for dependency in canonical_record.depends_on
+    ] == [
+        ("review_draft", review_record.artifact_id, review_record.content_hash),
+        ("citation_manifest", citation_record.artifact_id, citation_record.content_hash),
+        ("evidence_manifest", evidence_record.artifact_id, evidence_record.content_hash),
+    ]
+    assert canonical_record.depends_on[-1] == external_evidence
+
+    mismatched_result = ValidationRunResultV1.create(
+        job_id=session.context.workspace.job_id,
+        attempt_id="attempt-1",
+        execution_status=ValidationExecutionStatus.SUCCEEDED,
+        report_id="validation_report_mismatch",
+        input_artifacts=ValidationInputArtifactsV1(
+            review_draft_id=review_record.artifact_id,
+            review_draft_hash=review_record.content_hash,
+            citation_manifest_id=citation_record.artifact_id,
+            citation_manifest_hash=citation_record.content_hash,
+            evidence_manifest_ids=(evidence_record.artifact_id,),
+            evidence_manifest_hashes=("f" * 64,),
+        ),
+        review_has_citations=False,
+        evidence_complete=True,
+    )
+    mismatched_path = Path(
+        session.context.workspace.report_path("validation_run_result_mismatch.json")
+    )
+    write_json(mismatched_path, mismatched_result.to_dict())
+    mismatched_stage = bridge.run_validation(
+        session,
+        attempt_id="attempt-1",
+        validator_module=SimpleNamespace(
+            run_review_validation=lambda _adapter: {
+                "success": True,
+                "validation_run_result": mismatched_result,
+                "validation_run_result_file": str(mismatched_path),
+            }
+        ),
+        external_registry_resolver=external_registry_resolver,
+    )
+
+    mismatched_record = session.context.registry.get("validation_report_mismatch")
+    assert mismatched_stage.success is False
+    assert mismatched_stage.metadata["execution_status"] == "failed"
+    assert mismatched_stage.metadata["validation_disposition"] == "unvalidated"
+    assert mismatched_stage.metadata["declared_execution_status"] == "succeeded"
+    assert mismatched_stage.metadata["declared_validation_disposition"] == "clean"
+    assert mismatched_stage.metadata["failure_reason"] == (
+        "validation_input_dependencies_unverified"
+    )
+    assert mismatched_record is not None
+    assert mismatched_record.status == "quarantined"
 
 
 def test_runtime_validation_bridge_rejects_legacy_report_as_verified(tmp_path: Path) -> None:

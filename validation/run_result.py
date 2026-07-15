@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple, cast
 VALIDATION_RUN_ARTIFACT_TYPE = "validation_run_result"
 VALIDATION_RUN_ARTIFACT_VERSION = "v1"
 VALIDATION_RUN_SCHEMA_VERSION = "validation-run-result-v1"
+_LOWERCASE_SHA256_CHARS = frozenset("0123456789abcdef")
 
 
 class ValidationRunResultError(ValueError):
@@ -269,6 +270,24 @@ class ValidationInputArtifactsV1:
             raise ValidationRunResultError("evidence manifest artifact ids must be non-empty")
         if any(not item for item in self.evidence_manifest_hashes):
             raise ValidationRunResultError("evidence manifest artifact hashes must be non-empty")
+        hashes = (
+            ("review draft", self.review_draft_hash),
+            ("citation manifest", self.citation_manifest_hash),
+            *(
+                (f"evidence manifest[{index}]", content_hash)
+                for index, content_hash in enumerate(self.evidence_manifest_hashes)
+            ),
+        )
+        for label, content_hash in hashes:
+            if content_hash and (
+                len(content_hash) != 64
+                or any(character not in _LOWERCASE_SHA256_CHARS for character in content_hash)
+            ):
+                raise ValidationRunResultError(
+                    f"{label} artifact hash must be a 64-character lowercase SHA-256"
+                )
+        if len(set(self.evidence_manifest_ids)) != len(self.evidence_manifest_ids):
+            raise ValidationRunResultError("evidence manifest artifact ids must be unique")
 
     @classmethod
     def from_value(

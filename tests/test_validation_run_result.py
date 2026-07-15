@@ -127,11 +127,11 @@ def test_validation_run_result_round_trip_counts_all_verdicts() -> None:
         report_id="validation-1",
         input_artifacts=ValidationInputArtifactsV1(
             review_draft_id="review-1",
-            review_draft_hash="review-hash",
+            review_draft_hash="a" * 64,
             citation_manifest_id="citations-1",
-            citation_manifest_hash="citation-hash",
+            citation_manifest_hash="b" * 64,
             evidence_manifest_ids=("evidence-1", "evidence-2"),
-            evidence_manifest_hashes=("evidence-hash-1", "evidence-hash-2"),
+            evidence_manifest_hashes=("c" * 64, "d" * 64),
         ),
         expected_claim_count=len(claims),
         review_has_citations=True,
@@ -154,8 +154,8 @@ def test_validation_run_result_round_trip_counts_all_verdicts() -> None:
     assert restored.review_cleanliness is ValidationRunDisposition.NEEDS_REVIEW
     assert restored.input_artifacts.review_draft_id == "review-1"
     assert restored.input_artifacts.evidence_manifest_hashes == (
-        "evidence-hash-1",
-        "evidence-hash-2",
+        "c" * 64,
+        "d" * 64,
     )
     assert restored.repair_status == "not_requested"
     assert restored.recheck_status == "not_required"
@@ -301,9 +301,9 @@ def test_explicit_citation_free_review_can_be_clean_with_zero_claims() -> None:
         execution_status="succeeded",
         input_artifacts=ValidationInputArtifactsV1(
             review_draft_id="review-1",
-            review_draft_hash="review-hash",
+            review_draft_hash="a" * 64,
             citation_manifest_id="citation-1",
-            citation_manifest_hash="citation-hash",
+            citation_manifest_hash="b" * 64,
         ),
         expected_claim_count=0,
         review_has_citations=False,
@@ -336,9 +336,9 @@ def test_cited_run_requires_verified_evidence_manifest_identity() -> None:
         claim_results=[claim],
         input_artifacts=ValidationInputArtifactsV1(
             review_draft_id="review-1",
-            review_draft_hash="review-hash",
+            review_draft_hash="a" * 64,
             citation_manifest_id="citation-1",
-            citation_manifest_hash="citation-hash",
+            citation_manifest_hash="b" * 64,
         ),
         expected_claim_count=1,
         review_has_citations=True,
@@ -397,6 +397,57 @@ def test_incomplete_input_artifact_identity_is_rejected() -> None:
             execution_status="failed",
             input_artifacts={"review_draft_id": "review-1"},
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_hash",
+    (
+        "a" * 63,
+        "A" * 64,
+        "g" * 64,
+    ),
+)
+def test_input_artifact_hashes_require_lowercase_sha256(invalid_hash: str) -> None:
+    candidates = (
+        ValidationInputArtifactsV1(
+            review_draft_id="review-1",
+            review_draft_hash=invalid_hash,
+            citation_manifest_id="citation-1",
+            citation_manifest_hash="b" * 64,
+        ),
+        ValidationInputArtifactsV1(
+            review_draft_id="review-1",
+            review_draft_hash="a" * 64,
+            citation_manifest_id="citation-1",
+            citation_manifest_hash=invalid_hash,
+        ),
+        ValidationInputArtifactsV1(
+            review_draft_id="review-1",
+            review_draft_hash="a" * 64,
+            citation_manifest_id="citation-1",
+            citation_manifest_hash="b" * 64,
+            evidence_manifest_ids=("evidence-1",),
+            evidence_manifest_hashes=(invalid_hash,),
+        ),
+    )
+    for candidate in candidates:
+        with pytest.raises(
+            ValidationRunResultError,
+            match="64-character lowercase SHA-256",
+        ):
+            candidate.validate()
+
+
+def test_evidence_manifest_artifact_ids_must_be_unique() -> None:
+    with pytest.raises(ValidationRunResultError, match="artifact ids must be unique"):
+        ValidationInputArtifactsV1(
+            review_draft_id="review-1",
+            review_draft_hash="a" * 64,
+            citation_manifest_id="citation-1",
+            citation_manifest_hash="b" * 64,
+            evidence_manifest_ids=("evidence-1", "evidence-1"),
+            evidence_manifest_hashes=("c" * 64, "c" * 64),
+        ).validate()
 
 
 def test_pre_extension_v1_payload_is_readable_but_unverified() -> None:

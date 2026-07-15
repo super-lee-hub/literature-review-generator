@@ -1,18 +1,29 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 
 class RuntimeValidationAdapter:
     """Narrow generator-shaped adapter for validator.run_review_validation()."""
 
-    def __init__(self, generator: Any, *, validation_attempt_id: str = "") -> None:
+    def __init__(
+        self,
+        generator: Any,
+        *,
+        validation_attempt_id: str = "",
+        validation_external_registry_resolver: Callable[[str], Any | None] | None = None,
+    ) -> None:
         self._generator = generator
         self._validation_attempt_id = str(validation_attempt_id or "")
+        self._validation_external_registry_resolver = validation_external_registry_resolver
 
     @property
     def validation_attempt_id(self) -> str:
         return self._validation_attempt_id
+
+    @property
+    def validation_external_registry_resolver(self) -> Callable[[str], Any | None] | None:
+        return self._validation_external_registry_resolver
 
     @property
     def logger(self) -> Any:

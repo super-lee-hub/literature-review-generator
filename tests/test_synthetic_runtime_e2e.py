@@ -324,6 +324,31 @@ def test_public_runtime_cli_synthetic_parent_and_derived_batches(tmp_path: Path)
     validation_payload = json.loads(Path(validation["path"]).read_text(encoding="utf-8"))
     assert validation_payload["validation_disposition"] == "clean"
     assert validation_payload["total_claims"] == 1
+    inputs = validation_payload["input_artifacts"]
+    expected_validation_dependencies = [
+        ("review_draft", inputs["review_draft_id"], inputs["review_draft_hash"]),
+        (
+            "citation_manifest",
+            inputs["citation_manifest_id"],
+            inputs["citation_manifest_hash"],
+        ),
+        *[
+            ("evidence_manifest", artifact_id, content_hash)
+            for artifact_id, content_hash in zip(
+                inputs["evidence_manifest_ids"],
+                inputs["evidence_manifest_hashes"],
+                strict=True,
+            )
+        ],
+    ]
+    assert [
+        (
+            dependency["artifact_type"],
+            dependency["artifact_id"],
+            dependency["content_hash"],
+        )
+        for dependency in validation["depends_on"]
+    ] == expected_validation_dependencies
     validation_claim = validation_payload["claim_results"][0]
     assert validation_claim["citation_set_key"] == parent_keys[0]
     retrieval_queries = validation_claim["details"]["retrieval_queries"]

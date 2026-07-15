@@ -427,6 +427,10 @@ def _validate_pdf(_record: ArtifactRecord, path: Path) -> None:
 
 
 def _validate_validation_run_result(record: ArtifactRecord, path: Path) -> None:
+    from validation.input_dependencies import (
+        ValidationInputDependencyError,
+        validate_validation_dependency_contract,
+    )
     from validation.run_result import ValidationRunResultV1
 
     result = ValidationRunResultV1.from_dict(_read_json_object(path))
@@ -438,6 +442,10 @@ def _validate_validation_run_result(record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError(
             "validation run result does not satisfy the canonical completion contract"
         )
+    try:
+        validate_validation_dependency_contract(record, result.input_artifacts)
+    except ValidationInputDependencyError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _require_contract_header(
@@ -1824,8 +1832,17 @@ class RuntimeReconciler:
         *,
         visited: set[tuple[str, str]] | None = None,
         registry: ArtifactRegistry | None = None,
+        refreshed_registries: set[tuple[str, str]] | None = None,
     ) -> ArtifactRecord:
         target_registry = self._registry_for_ref(ref, local_registry=registry)
+        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
+        registry_key = (
+            os.path.normcase(os.path.abspath(target_registry.registry_path)),
+            target_registry.job_id,
+        )
+        if registry_key not in active_refreshed:
+            target_registry.reload()
+            active_refreshed.add(registry_key)
         record = target_registry.get(ref.artifact_id)
         if record is None:
             raise ReconcileValidationError(f"dependency is not registered: {ref.job_id}/{ref.artifact_id}")
@@ -1833,9 +1850,18 @@ class RuntimeReconciler:
             raise ReconcileValidationError(f"dependency job_id mismatch: {ref.artifact_id}")
         if ref.artifact_type and record.artifact_type != ref.artifact_type:
             raise ReconcileValidationError(f"dependency artifact_type mismatch: {ref.artifact_id}")
+        if ref.path and os.path.normcase(os.path.abspath(os.fspath(ref.path))) != os.path.normcase(
+            os.path.abspath(os.fspath(record.path))
+        ):
+            raise ReconcileValidationError(f"dependency path mismatch: {ref.artifact_id}")
         if ref.content_hash and record.content_hash != ref.content_hash:
             raise ReconcileValidationError(f"dependency declared hash mismatch: {ref.artifact_id}")
-        self.validate_record(record, registry=target_registry, visited=visited)
+        self.validate_record(
+            record,
+            registry=target_registry,
+            visited=visited,
+            refreshed_registries=active_refreshed,
+        )
         return record
 
     def validate_record(
@@ -1844,8 +1870,10 @@ class RuntimeReconciler:
         *,
         registry: ArtifactRegistry | None = None,
         visited: set[tuple[str, str]] | None = None,
+        refreshed_registries: set[tuple[str, str]] | None = None,
     ) -> None:
         active_registry = registry or self.registry
+        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
         key = (record.job_id, record.artifact_id)
         active_visited = visited if visited is not None else set()
         if key in active_visited:
@@ -1881,6 +1909,7 @@ class RuntimeReconciler:
                     dependency,
                     visited=active_visited,
                     registry=active_registry,
+                    refreshed_registries=active_refreshed,
                 )
         finally:
             active_visited.remove(key)

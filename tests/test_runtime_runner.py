@@ -12,15 +12,146 @@ from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.runner import AgentRuntimeRunner, RuntimeRunnerError
 from runtime.stage_contracts import StageArtifactRef, StageResult
 from runtime.stage_terminal import StageTerminalStore
-from services.job_workspace import atomic_write_json
-from services.artifact_registry import ArtifactRegistry
-from services.job_workspace import JobWorkspace
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRecord,
+    ArtifactRegistry,
+)
+from services.evidence_manifest import build_evidence_manifest_v1
+from services.job_workspace import JobWorkspace, atomic_write_json
 from tests.test_runtime_bridge_helpers import build_legacy_main, build_success_summary
 from validation.run_result import (
     ClaimValidationResultV1,
     ValidationInputArtifactsV1,
     ValidationRunResultV1,
 )
+
+
+_VALIDATION_FIXTURE_TIMESTAMP = "2026-07-15T00:00:00+00:00"
+
+
+def _validation_input_fixture(
+    session,
+    *,
+    include_evidence: bool,
+) -> tuple[ValidationInputArtifactsV1, list[ArtifactDependencyRefV2]]:
+    workspace = session.context.workspace
+    registry = session.context.registry
+    review_path = Path(workspace.artifact_path("validation-fixture-review-v1.json"))
+    citation_path = Path(workspace.artifact_path("validation-fixture-citation-v1.json"))
+    atomic_write_json(
+        str(review_path),
+        {
+            "artifact_type": "review_draft",
+            "artifact_version": "v1",
+            "created_from_job_id": workspace.job_id,
+            "created_at": _VALIDATION_FIXTURE_TIMESTAMP,
+            "draft_identity": {
+                "draft_id": "validation-fixture-review",
+                "project_name": workspace.project_name,
+            },
+            "generation_context": {"section_count": 1},
+            "content": {
+                "sections": [
+                    {
+                        "section_number": 1,
+                        "section_title": "Fixture",
+                        "content": "Fixture validation input.",
+                    }
+                ],
+                "references": [],
+            },
+            "projections": {},
+        },
+    )
+    atomic_write_json(
+        str(citation_path),
+        {
+            "artifact_type": "citation_manifest",
+            "artifact_version": "v1",
+            "created_from_job_id": workspace.job_id,
+            "created_at": _VALIDATION_FIXTURE_TIMESTAMP,
+            "manifest_identity": {
+                "manifest_id": "validation-fixture-citation",
+                "project_name": workspace.project_name,
+            },
+            "review_reference": {
+                "review_draft_path": str(review_path),
+                "review_word_path": str(workspace.report_path("validation-fixture.docx")),
+            },
+            "citations": [],
+        },
+    )
+    records: list[ArtifactRecord] = [
+        registry.register_file(
+            artifact_id="fixture-review-draft",
+            artifact_role="review_draft",
+            artifact_type="review_draft",
+            artifact_version="v1",
+            path=review_path,
+            producer="tests.test_runtime_runner",
+        ),
+        registry.register_file(
+            artifact_id="fixture-citation-manifest",
+            artifact_role="citation_manifest",
+            artifact_type="citation_manifest",
+            artifact_version="v1",
+            path=citation_path,
+            producer="tests.test_runtime_runner",
+        ),
+    ]
+    if include_evidence:
+        normalized_path = Path(workspace.artifact_path("validation-fixture-normalized.md"))
+        chunks_path = Path(workspace.artifact_path("validation-fixture-chunks.json"))
+        page_index_path = Path(workspace.artifact_path("validation-fixture-page-index.json"))
+        normalized_path.write_text("Fixture evidence.", encoding="utf-8")
+        atomic_write_json(str(chunks_path), [])
+        atomic_write_json(str(page_index_path), [])
+        manifest = replace(
+            build_evidence_manifest_v1(
+                job_id=workspace.job_id,
+                canonical_paper_key="fixture-paper",
+                preprocess={
+                    "markdown_path": str(normalized_path),
+                    "chunks_path": str(chunks_path),
+                    "page_index_path": str(page_index_path),
+                },
+            ),
+            created_at=_VALIDATION_FIXTURE_TIMESTAMP,
+        )
+        evidence_path = Path(workspace.artifact_path("validation-fixture-evidence-v1.json"))
+        atomic_write_json(str(evidence_path), manifest.to_dict())
+        records.append(
+            registry.register_file(
+                artifact_id="fixture-evidence",
+                artifact_role="paper_evidence",
+                artifact_type="evidence_manifest",
+                artifact_version="v1",
+                path=evidence_path,
+                producer="tests.test_runtime_runner",
+            )
+        )
+
+    input_artifacts = ValidationInputArtifactsV1(
+        review_draft_id=records[0].artifact_id,
+        review_draft_hash=records[0].content_hash,
+        citation_manifest_id=records[1].artifact_id,
+        citation_manifest_hash=records[1].content_hash,
+        evidence_manifest_ids=tuple(record.artifact_id for record in records[2:]),
+        evidence_manifest_hashes=tuple(record.content_hash for record in records[2:]),
+    )
+    dependencies = [
+        ArtifactDependencyRefV2(
+            dependency_kind="local_job",
+            job_id=record.job_id,
+            artifact_id=record.artifact_id,
+            artifact_type=record.artifact_type,
+            path=record.path,
+            content_hash=record.content_hash,
+        )
+        for record in records
+    ]
+    return input_artifacts, dependencies
 
 
 def _spec(tmp_path: Path, *, action: str = "run_all", job_id: str = "") -> RuntimeJobSpec:
@@ -698,19 +829,16 @@ def test_runner_applies_persisted_validation_readiness_policy(
                         }
                     )
                 )
+            input_artifacts, input_dependencies = _validation_input_fixture(
+                session,
+                include_evidence=bool(claim_results),
+            )
             validation_result = ValidationRunResultV1.create(
                 job_id=session.context.workspace.job_id,
                 attempt_id=attempt_id,
                 execution_status="succeeded",
                 claim_results=claim_results,
-                input_artifacts=ValidationInputArtifactsV1(
-                    review_draft_id="fixture-review-draft",
-                    review_draft_hash="a" * 64,
-                    citation_manifest_id="fixture-citation-manifest",
-                    citation_manifest_hash="b" * 64,
-                    evidence_manifest_ids=("fixture-evidence",) if claim_results else (),
-                    evidence_manifest_hashes=("c" * 64,) if claim_results else (),
-                ),
+                input_artifacts=input_artifacts,
                 review_has_citations=bool(claim_results),
                 evidence_complete=True,
             )
@@ -723,6 +851,7 @@ def test_runner_applies_persisted_validation_readiness_policy(
                 path=path,
                 producer="tests.test_runtime_runner",
                 artifact_id="validation_fixture",
+                depends_on=input_dependencies,
             )
             artifacts = [
                 StageArtifactRef(
@@ -776,6 +905,41 @@ def test_runner_applies_persisted_validation_readiness_policy(
     assert outcome["readiness_policy_snapshot"]["require_clean_validation"] is require_clean
 
 
+def test_runner_ignores_clean_metadata_from_failed_optional_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "runtime.orchestrator.AgentRuntimeBridge.run_validation",
+        lambda _bridge, _session, **_kwargs: StageResult(
+            stage_name="stage4_validate",
+            success=False,
+            artifacts=[],
+            metadata={
+                "execution_status": "succeeded",
+                "validation_disposition": "clean",
+            },
+        ),
+    )
+    result = AgentRuntimeRunner(
+        replace(
+            _spec(tmp_path),
+            metadata={
+                "requested_stages": ["validate"],
+                "validation_required": False,
+                "require_clean_validation": False,
+                "allow_unvalidated_when_validation_optional": True,
+            },
+        ),
+        legacy_main=build_legacy_main(),
+        origin_dir=tmp_path,
+    ).run()
+
+    assert result.job_status == "completed"
+    assert result.job_disposition == "unvalidated"
+    assert result.canonical_ready is True
+
+
 def test_resume_restores_clean_validation_result_without_rerunning_validator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -785,17 +949,16 @@ def test_resume_restores_clean_validation_result_without_rerunning_validator(
     def fake_validation(_bridge, session, *, attempt_id: str = "", **_kwargs):
         nonlocal validation_calls
         validation_calls += 1
+        input_artifacts, input_dependencies = _validation_input_fixture(
+            session,
+            include_evidence=False,
+        )
         validation_result = ValidationRunResultV1.create(
             job_id=session.context.workspace.job_id,
             attempt_id=attempt_id,
             execution_status="succeeded",
             claim_results=(),
-            input_artifacts=ValidationInputArtifactsV1(
-                review_draft_id="fixture-review-draft",
-                review_draft_hash="a" * 64,
-                citation_manifest_id="fixture-citation-manifest",
-                citation_manifest_hash="b" * 64,
-            ),
+            input_artifacts=input_artifacts,
             review_has_citations=False,
             evidence_complete=True,
         )
@@ -808,6 +971,7 @@ def test_resume_restores_clean_validation_result_without_rerunning_validator(
             path=path,
             producer="tests.test_runtime_runner",
             artifact_id=validation_result.validation_run_id,
+            depends_on=input_dependencies,
         )
         return StageResult(
             stage_name="stage4_validate",
@@ -854,6 +1018,108 @@ def test_resume_restores_clean_validation_result_without_rerunning_validator(
     assert validation_calls == 1
     assert first.job_disposition == resumed.job_disposition == "clean"
     assert first.canonical_ready is resumed.canonical_ready is True
+    assert resumed.completed_stages == ("source_intake", "validate")
+
+
+def test_resume_reruns_validation_after_evidence_manifest_is_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_calls = 0
+
+    def fake_validation(_bridge, session, *, attempt_id: str = "", **_kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        input_artifacts, input_dependencies = _validation_input_fixture(
+            session,
+            include_evidence=True,
+        )
+        claim = ClaimValidationResultV1.from_validation_result(
+            {
+                "citation_id": "fixture-citation",
+                "claim_text": "Fixture supported claim",
+                "evidence_status": "supported",
+            }
+        )
+        validation_result = ValidationRunResultV1.create(
+            job_id=session.context.workspace.job_id,
+            attempt_id=attempt_id,
+            execution_status="succeeded",
+            claim_results=(claim,),
+            input_artifacts=input_artifacts,
+            review_has_citations=True,
+            evidence_complete=True,
+        )
+        path = Path(
+            session.context.workspace.artifact_path(
+                f"validation-fixture-{attempt_id}.json"
+            )
+        )
+        atomic_write_json(str(path), validation_result.to_dict())
+        record = session.context.registry.register_file(
+            artifact_role="validation",
+            artifact_type="validation_run_result",
+            artifact_version="v1",
+            path=path,
+            producer="tests.test_runtime_runner",
+            artifact_id=validation_result.validation_run_id,
+            depends_on=input_dependencies,
+        )
+        return StageResult(
+            stage_name="stage4_validate",
+            success=True,
+            artifacts=[
+                StageArtifactRef(
+                    artifact_role=record.artifact_role,
+                    artifact_type=record.artifact_type,
+                    artifact_version=record.artifact_version,
+                    path=record.path,
+                    artifact_id=record.artifact_id,
+                )
+            ],
+            metadata={
+                "execution_status": validation_result.execution_status.value,
+                "validation_disposition": validation_result.validation_disposition.value,
+            },
+        )
+
+    monkeypatch.setattr(
+        "runtime.orchestrator.AgentRuntimeBridge.run_validation",
+        fake_validation,
+    )
+    spec = replace(
+        _spec(tmp_path),
+        metadata={
+            "requested_stages": ["validate"],
+            "validation_required": True,
+            "require_clean_validation": True,
+        },
+    )
+    runner = AgentRuntimeRunner(
+        spec,
+        legacy_main=build_legacy_main(),
+        origin_dir=tmp_path,
+    )
+
+    first = runner.run()
+    workspace = JobWorkspace.from_workspace_path(
+        first.workspace_path,
+        "runner-demo",
+        first.job_id,
+    )
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    evidence = registry.get("fixture-evidence")
+    assert evidence is not None
+    Path(evidence.path).unlink()
+
+    resumed = AgentRuntimeRunner(
+        replace(runner.job_spec, job_id=first.job_id),
+        legacy_main=build_legacy_main(),
+    ).resume()
+
+    assert validation_calls == 2
+    assert resumed.job_disposition == "clean"
+    assert resumed.canonical_ready is True
     assert resumed.completed_stages == ("source_intake", "validate")
 
 
