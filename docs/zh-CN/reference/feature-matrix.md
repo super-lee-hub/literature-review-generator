@@ -2,16 +2,16 @@
 
 | 功能 | 状态 | 规范实现 |
 |---|---|---|
-| 来源 inventory 与 identity gate | 已实现 | 内容 hash、match/ambiguous/mismatch、Stage 1 前 quarantine |
+| 来源 inventory 与 identity gate | 已实现 | 内容 hash；DOI 或标题加真实作者/年份证据；match/ambiguous/mismatch；Stage 1 前 quarantine |
 | Zotero 与 FileIndex | 已实现 | 带诊断解析、按 root 隔离、只读、多候选 |
-| Artifact Registry v2 | 已实现 | revision 锁事务、原子保存、本地/跨 job V2 依赖 |
+| Artifact Registry v2 | 已实现 | revision 锁事务、原子保存、READY 本地/跨 job 依赖即时 fail-closed 校验 |
 | Job outcome 与 attempts | 已实现 | job outcome、append-only attempts、pointer 所有权 |
-| Stage 1 与证据 | 已实现 | 规范 summaries、paper artifact、evidence manifest、edge checkpoint |
-| ReviewBatch 派生 | 已实现 | 固定父 hash，child Stage 1 调用为零 |
+| Stage 1 与证据 | 已实现 | 规范 summaries、paper artifact、evidence manifest、edge checkpoint；summary -> source_bundle -> 来源 PDF 依赖链 |
+| ReviewBatch 派生 | 已实现 | 固定父 hash、child Stage 1 调用为零、derivation/coordinator lease、单调 generation、immutable max-head projection receipt |
 | Outline Intelligence v2 | 已实现 | 完整 artifact 链、预算、health sidecar、显式采纳 |
 | Review/Citation/DOCX | 已实现 | review draft v2、manifest v3、实际引用 bibliography、DOCX |
-| Validation 真相源 | 已实现 | `ValidationRunResultV1`；其他报告仅为投影 |
-| AgentRuntimeRunner | 已实现 | 在 `AgentRuntimeBridge` 上提供 run/resume/status/reconcile |
+| Validation 真相源 | 已实现 | `ValidationRunResultV1` 持久化回读并绑定 job/attempt/hash；零 claim 必须显式 citation-free；其他报告仅为投影 |
+| AgentRuntimeRunner | 已实现 | 在 `AgentRuntimeBridge` 上提供 run/resume/status/reconcile；持久化 `BaseException` 终态并从规范 artifact 恢复 Validation disposition |
 | Queue 状态映射 | 已实现 | Queue 读取 `job_status`，旧 success 仅为 readiness 投影 |
 | MinerU/Docling/OCR 稳定性 | 已实现 | preflight、共享认证熔断、受控子进程 timeout |
 | Windows 输出 | 已实现 | UTF-8 控制台与 ASCII-safe JSON progress |

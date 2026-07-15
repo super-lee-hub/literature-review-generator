@@ -7,6 +7,10 @@ from outline.stage_health import OUTLINE_STAGE_HEALTH_TYPE, OUTLINE_STAGE_HEALTH
 from services.artifact_registry import REGISTRY_VERSION
 from services.audit_record import AUDIT_SCHEMA_VERSION
 from services.job_outcome import JOB_OUTCOME_ARTIFACT_TYPE, JOB_OUTCOME_ARTIFACT_VERSION
+from services.review_batch import (
+    PROJECTION_GENERATION_SCHEMA_VERSION,
+    PROJECTION_RECEIPT_SCHEMA_VERSION,
+)
 from services.source_inventory import SourceInventoryV1
 from validation.run_result import VALIDATION_RUN_ARTIFACT_TYPE, VALIDATION_RUN_ARTIFACT_VERSION
 
@@ -40,6 +44,11 @@ def test_truth_sources_name_current_canonical_artifacts() -> None:
             "outline_stage_health_v1.json",
             "adopted_final_outline",
             "external_job",
+            "projection_generation",
+            PROJECTION_GENERATION_SCHEMA_VERSION,
+            PROJECTION_RECEIPT_SCHEMA_VERSION,
+            "source_bundle",
+            "citation-free",
         ):
             assert fact in text, (path, fact)
         assert "validation_report.json` +" not in text
@@ -53,8 +62,32 @@ def test_feature_matrix_does_not_repeat_implemented_features_as_roadmap() -> Non
         text = _read(path)
         assert "AgentRuntimeRunner" in text
         assert "ValidationRunResultV1" in text
+        assert "source_bundle" in text
+        assert "generation" in text
+        assert "citation-free" in text
         assert "P0:" not in text
         assert "P1:" not in text
+
+
+def test_reliability_closure_reports_current_code_and_gates() -> None:
+    validated_sha = "ed6f0430c2aeb326e2fc26e183c1656ecc40e29e"
+    for path in (
+        "docs/implementation/auto-generate-reliability-upgrade-progress.md",
+        "docs/implementation/auto-generate-reliability-upgrade-report.md",
+    ):
+        text = _read(path)
+        for fact in (
+            validated_sha,
+            "1082 passed, 22 skipped",
+            "1082 passed, 22 deselected",
+            "projection_generation",
+            "source_bundle",
+            "SystemExit",
+            "citation-free",
+        ):
+            assert fact in text, (path, fact)
+        assert "5175013" not in text
+        assert "`APPROVE`" not in text
 
 
 def test_compatibility_docs_are_fail_closed_and_audited() -> None:

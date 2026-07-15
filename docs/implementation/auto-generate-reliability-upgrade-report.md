@@ -2,17 +2,17 @@
 
 ## Delivery result
 
-All Phase 0-8 requirements in the approved reliability-upgrade plan are
+All Phase 0-8 requirements and the post-review reliability closure are
 implemented and locally verified on the single branch
 `codex/auto-generate-reliability-upgrade`.
 
 - Base: `origin/main@5becc4e50e234244162dca980062fe68e4e0e1e9`
-- Validated code SHA: `b9b1cf1fa572a31201e395855ee623752cc708af`
+- Validated code SHA: `ed6f0430c2aeb326e2fc26e183c1656ecc40e29e`
 - Validation disposition: `passed`
-- Independent code review: `APPROVE`
-- Independent architecture review: `CLEAR`
-- Final required test gate: `989 passed, 22 skipped`
-- Final strict-offline gate: `989 passed, 22 deselected`
+- Adversarial ReviewBatch review: local verdict `PASS`
+- Six-blocker audit: all contracts passed after fixes
+- Final required test gate: `1082 passed, 22 skipped`
+- Final strict-offline gate: `1082 passed, 22 deselected`
 - Repository-wide Pyright: `0 errors, 0 warnings, 0 informations`
 
 The report intentionally records the validated code SHA rather than its own
@@ -32,6 +32,7 @@ commit. The final PR head SHA and PR URL belong in the PR body.
 | 7 - evidence/edge checkpoints | `49e2275` | `ff667c1` | passed |
 | 8 - platform/docs/E2E | `0fda818` | `245c0bc` | passed |
 | Post-Phase-8 - Windows locale CI repair | `b9b1cf1` | `7688de9` | passed |
+| Post-review reliability closure | `ed6f043` | this report | passed |
 
 ## Verification evidence
 
@@ -51,10 +52,11 @@ The traceability tables below refer to these executed evidence sets.
 | `V8-platform` | `python -m pytest -q tests/test_console_io.py tests/test_preprocess_platform_safety.py tests/test_quarantine_lifecycle.py tests/test_reconcile_schema_contracts.py tests/test_runtime_legacy_workspace.py tests/test_config_path_origin.py tests/test_documentation_contract.py --strict-markers` | `57 passed in 11.61s` |
 | `V8-e2e` | `python -m pytest -q tests/test_synthetic_runtime_e2e.py --strict-markers` | `8 passed in 442.59s` |
 | `V8-review-fix` | Summary/legacy/Registry/reconcile/runner regression suite | `101 passed in 55.68s` |
-| `VF-required` | `python -m pytest -q --strict-markers` | `988 passed, 22 skipped in 303.59s` |
-| `VF-offline` | `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | `988 passed, 22 deselected in 303.97s` |
+| `VF-required` | `python -m pytest -q --strict-markers` | `1082 passed, 22 skipped in 552.69s` |
+| `VF-offline` | `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | `1082 passed, 22 deselected in 544.06s` |
 | `VF-static` | `python -m pyright`; `python -m compileall -q main.py runtime services validation outline preprocess`; Phase 8 production Ruff `E9,F821,F841`; `git diff --check` | all passed; Pyright reported zero diagnostics |
-| `V-CI-locale` | locale-strict Stage 2/report regressions; fresh required and strict-offline suites; Pyright, compileall, Ruff, non-ASCII `strftime` scan, and diff-check | `15 passed`; `989 passed, 22 skipped`; `989 passed, 22 deselected`; all static checks passed; independent reviews `APPROVE` and `CLEAR` |
+| `V-CI-locale` | locale-strict Stage 2/report regressions and static checks | `15 passed`; historical local reviewer verdicts were `PASS` and `CLEAR`; final suite evidence is superseded by `V-post-review` |
+| `V-post-review` | ReviewBatch, six-blocker, Stage 1 lineage, modified-module, required, strict-offline, Pyright, compileall, Ruff, and diff gates | `58 + 18 + 134 + 363 passed`; final `1082 passed, 22 skipped`; final `1082 passed, 22 deselected`; all static checks passed |
 
 Historical phase-level command lines and artifact hashes are retained in
 `docs/implementation/auto-generate-reliability-upgrade-progress.md`.
@@ -234,21 +236,37 @@ The first independent code review found two high-severity fail-open paths:
 
 Both were fixed with quarantine-before-audit promotion, Stage 1 fail-fast
 behavior, and corrupt-outcome legacy read-only projection. The post-fix suite
-reported `101 passed`; the code reviewer returned `APPROVE`, and the independent
-architecture reviewer returned `CLEAR`.
+reported `101 passed`; local reviewer verdicts were `PASS` and `CLEAR`. These
+were engineering review results, not a formal GitHub approval.
 
 The first Windows Python 3.11 runs on PR head `7d98e54` then exposed a separate
 locale defect: ten Stage 2 durability tests returned before their first section
 call because English Windows could not encode Chinese literals inside a
 `strftime` format string. Code checkpoint `b9b1cf1` now renders the identical
 Chinese local-time labels from numeric datetime fields and covers both affected
-paths with a locale-strict proxy. Fresh gates reported `989 passed` in both
-required and strict-offline selections; the follow-up code review returned
-`APPROVE`, and the architecture review returned `CLEAR`.
+paths with a locale-strict proxy. That checkpoint's local reviews returned
+`PASS` and `CLEAR`; its test counts are superseded by the final post-review
+gates above.
+
+The final audit then closed six release blockers: title plus author/year source
+identity, durable `SystemExit` terminal persistence and rethrow, Validation
+disposition recovery, canonical Validation read-back with job/attempt/hash
+binding, fail-closed READY dependency verification, and explicit citation-free
+handling for zero claims. Stage 1 READY summaries now depend on the registered
+`source_bundle`, which transitively depends on source PDFs.
+
+ReviewBatch now reserves a monotonic `projection_generation` before child or
+manifest writes, serializes writers with derivation and coordinator leases, and
+uses the fully validated Registry manifest with the unique maximum generation
+as its durable head. The mutable projection is repaired only from that head;
+projection receipts record `projected` or `superseded` plus the observed head
+identity and hash. Tests cover manifest, Registry, projection, receipt, child,
+terminal, and resume crash windows without using mtime ordering. Independent
+adversarial review found no remaining crash/order blocker.
 
 ## Remaining risks
 
-- Windows Python 3.11 GitHub CI must pass on the final pushed head before the
+- Windows Python 3.11 GitHub CI must pass on the final pushed documentation head before the
   single draft PR is marked ready.
 - Browser, live-provider, and heavy-OCR smoke tests require their explicit
   external prerequisites and remain optional.

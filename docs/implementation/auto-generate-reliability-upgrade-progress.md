@@ -559,7 +559,7 @@ code commit itself.
 | `python -m compileall -q main.py runtime services validation outline preprocess` | 0 | no diagnostics |
 | `python -m ruff check <Phase 8 production files> --select E9,F821,F841` | 0 | `All checks passed!` |
 | `git diff --check` | 0 | no whitespace errors; Git reported only expected LF-to-CRLF notices |
-| Independent code review | 0 | final verdict `APPROVE` after both fail-closed findings were fixed |
+| Independent code review | 0 | local reviewer verdict `PASS` after both fail-closed findings were fixed |
 | Independent architecture review | 0 | final verdict `CLEAR` |
 
 ### Artifact hashes
@@ -612,14 +612,14 @@ code commit itself.
 | Command/check | Exit | Evidence |
 | --- | ---: | --- |
 | `python -m pytest -q tests/test_citation_manifest_durability.py tests/test_review_draft_durability.py --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `15 passed in 11.20s` |
-| Required suite: `python -m pytest -q --strict-markers` with the strict offline environment | 0 | `989 passed, 22 skipped in 353.01s`; every skip is an explicitly disabled Playwright test |
-| Strict-offline suite: `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `989 passed, 22 deselected in 348.14s` |
+| Final required suite after reliability closure: `python -m pytest -q --strict-markers` | 0 | `1082 passed, 22 skipped in 552.69s`; every skip is an explicitly disabled Playwright test |
+| Final strict-offline suite after reliability closure: `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `1082 passed, 22 deselected in 544.06s` |
 | `python -m pyright` | 0 | `0 errors, 0 warnings, 0 informations` |
 | `python -m compileall -q main.py runtime services validation outline preprocess` | 0 | no diagnostics |
 | `python -m ruff check main.py --select E9,F821,F841` | 0 | `All checks passed!` |
 | repository scan for non-ASCII `strftime` format strings | 1 | no matches, as expected |
 | `git diff --check` | 0 | no whitespace errors; only expected LF-to-CRLF notices |
-| Independent code review | 0 | `APPROVE`; no findings |
+| Independent code review | 0 | historical local reviewer verdict `PASS`; no findings |
 | Independent architecture review | 0 | `CLEAR`; no scope, coupling, or portability blocker |
 
 ### Artifact hashes
@@ -631,3 +631,60 @@ code commit itself.
 
 - The existing draft PR must remain draft until Windows Python 3.11 CI passes
   on the final pushed documentation head derived from this code checkpoint.
+
+## Post-review reliability closure
+
+### Scope and provenance
+
+- Validated code checkpoint: `ed6f0430c2aeb326e2fc26e183c1656ecc40e29e`.
+- Closed all six release blockers from the final audit:
+  1. Source identity requires a title match plus a real first-author or year
+     match when DOI is absent; first-page PDF text now supplies author/year
+     evidence without treating the title itself as evidence.
+  2. `SystemExit` and other `BaseException` paths persist a durable terminal
+     state before the original exception is re-raised.
+  3. Resume reconstructs Validation disposition from the canonical terminal
+     artifact rather than defaulting to an unvalidated state.
+  4. Successful Validation requires durable canonical JSON, read-back, and
+     job/attempt/content-hash agreement before success is published.
+  5. READY Registry dependencies are verified immediately and fail closed;
+     Stage 1 summaries are linked to the registered `source_bundle`, which in
+     turn links to the source PDFs.
+  6. A zero-claim Validation result is clean only when the review is explicitly
+     citation-free; otherwise it remains incomplete and non-clean.
+- Hardened multi-variant ReviewBatch coordination with deterministic child
+  ownership, pre-write path/alias/reparse checks, a per-derivation execution
+  lease, and a coordinator projection lease.
+- Each derivation reserves a durable monotonic `projection_generation` before
+  child or manifest writes. The fully validated Registry manifest with the
+  unique maximum generation is the coordinator head.
+- `review_batch_manifest.json` is repaired only from that immutable head.
+  Per-derivation projection receipts record `projected` or `superseded`, the
+  observed head generation/identity/hash, and never use mtime or wall-clock
+  ordering.
+- Recovery tests cover child, immutable manifest, Registry, projection, receipt,
+  stage-terminal, and runner-resume crash windows, including two successive
+  derivations crashing after Registry commit but before projection write.
+
+### Verification evidence
+
+| Command/check | Exit | Evidence |
+| --- | ---: | --- |
+| `python -m pytest -q --strict-markers tests/test_review_batch.py` | 0 | `58 passed in 149.00s` |
+| Source identity and source-intake regression suite | 0 | `18 passed` |
+| ReviewBatch/runtime/dependency/outline combined suite | 0 | `134 passed` |
+| All modified test modules | 0 | `363 passed in 418.56s` |
+| `python -m pytest -q --strict-markers` | 0 | `1082 passed, 22 skipped in 552.69s` |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `1082 passed, 22 deselected in 544.06s` |
+| `python -m pyright` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py runtime services validation outline preprocess` | 0 | no diagnostics |
+| Changed-production Ruff `E9,F821,F841` | 0 | `All checks passed!` |
+| `git diff --check` | 0 | no whitespace errors; only expected LF-to-CRLF notices |
+| Adversarial ReviewBatch review | 0 | local reviewer verdict `PASS`; no remaining crash/order blocker |
+| Six-blocker audit | 0 | all six contracts passed after source identity and Stage 1 lineage fixes |
+
+### Remaining risk
+
+- Windows Python 3.11 CI must pass on the pushed documentation head before the
+  draft PR can be considered ready. Browser, live-provider, and heavy-OCR
+  checks remain optional because they require explicit external prerequisites.
