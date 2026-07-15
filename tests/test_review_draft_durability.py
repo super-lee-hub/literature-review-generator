@@ -110,6 +110,13 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
     )
     generator.summary_file = workspace.artifact_path(f"{project_name}_summaries.json")
     Path(generator.summary_file).write_text(json.dumps(generator.summaries), encoding="utf-8")
+    registry.register_file(
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=generator.summary_file,
+        producer="tests",
+    )
     return generator, workspace, registry
 
 
@@ -127,8 +134,7 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
     monkeypatch.setattr(main, "datetime", _LocaleStrictDateTime)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
@@ -189,8 +195,7 @@ def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Pa
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
@@ -223,8 +228,7 @@ def test_stage2_stops_after_first_failed_section(tmp_path: Path, monkeypatch) ->
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section\n\n## 3. Third Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
     generated_sections = []
 
     def _section_content(section_title: str, _outline: str):
@@ -250,8 +254,7 @@ def test_stage2_retries_section_missing_structured_citations(tmp_path: Path, mon
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     retry_calls = []
 
@@ -318,8 +321,7 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     word_path = Path(workspace.report_path("demo_literature_review.docx"))
     existing_doc = Document()
@@ -369,8 +371,7 @@ def test_review_draft_checkpoint_without_docx_restarts_from_first_section(
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
     checkpoint_path = Path(workspace.checkpoint_path("demo_review_checkpoint.json"))
     checkpoint_path.write_text(
         json.dumps(
@@ -456,8 +457,7 @@ def test_successful_stage2_generation_creates_registered_review_draft_v2(tmp_pat
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
@@ -500,8 +500,7 @@ def test_stage2_with_failed_sections_does_not_register_review_draft_v2(tmp_path:
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
@@ -529,8 +528,7 @@ def test_review_draft_v2_written_to_job_workspace_not_project_root(tmp_path: Pat
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. Single Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
@@ -558,8 +556,7 @@ def test_review_draft_v1_and_v2_coexist_in_registry(tmp_path: Path, monkeypatch)
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(

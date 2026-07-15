@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import zipfile
 
+from runtime.stage_contracts import StageArtifactRef, StageResult
 from runtime.stage_terminal import (
     STAGE_TERMINAL_ARTIFACT_TYPE,
     STAGE_TERMINAL_ARTIFACT_VERSION,
@@ -94,6 +97,16 @@ def _read_json_object(path: Path) -> dict[str, Any]:
         raise ReconcileValidationError(f"invalid JSON {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ReconcileValidationError(f"JSON artifact must be an object: {path}")
+    return payload
+
+
+def _read_json_array(path: Path) -> list[Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReconcileValidationError(f"invalid JSON {path}: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ReconcileValidationError(f"JSON artifact must be an array: {path}")
     return payload
 
 
@@ -413,10 +426,18 @@ def _validate_pdf(_record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError(f"cannot read PDF artifact {path}: {exc}") from exc
 
 
-def _validate_validation_run_result(_record: ArtifactRecord, path: Path) -> None:
+def _validate_validation_run_result(record: ArtifactRecord, path: Path) -> None:
     from validation.run_result import ValidationRunResultV1
 
-    ValidationRunResultV1.from_dict(_read_json_object(path))
+    result = ValidationRunResultV1.from_dict(_read_json_object(path))
+    if result.job_id != record.job_id:
+        raise ReconcileValidationError(
+            "validation run result job_id does not match its Registry owner"
+        )
+    if not result.contract_satisfied:
+        raise ReconcileValidationError(
+            "validation run result does not satisfy the canonical completion contract"
+        )
 
 
 def _require_contract_header(
@@ -931,12 +952,7 @@ def _validate_json_object(_record: ArtifactRecord, path: Path) -> None:
 
 
 def _validate_json_array(_record: ArtifactRecord, path: Path) -> None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ReconcileValidationError(f"invalid JSON {path}: {exc}") from exc
-    if not isinstance(payload, list):
-        raise ReconcileValidationError(f"JSON artifact must be an array: {path}")
+    _read_json_array(path)
 
 
 def _validate_audit_record(record: ArtifactRecord, path: Path) -> None:
@@ -979,7 +995,14 @@ def _validate_audit_record(record: ArtifactRecord, path: Path) -> None:
             )
             for dependency in record.depends_on
         }
-        if audit_ref_identities != dependency_identities:
+        detached_audit_types = {
+            "identity_override",
+            "artifact_quarantine_release",
+            "legacy_reuse",
+        }
+        dependencies_match = audit_ref_identities == dependency_identities
+        detached_audit = not record.depends_on and audit.audit_type in detached_audit_types
+        if not dependencies_match and not detached_audit:
             raise ReconcileValidationError(
                 "audit_record Registry dependencies do not match its live artifact references"
             )
@@ -1043,6 +1066,651 @@ def _validate_summary_selection(record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError("summary_selection metadata hash is inconsistent")
 
 
+def validate_review_batch_manifest_location(
+    record: ArtifactRecord,
+    path: Path,
+    registry: ArtifactRegistry,
+) -> Mapping[str, Any]:
+    """Bind a batch manifest to its real Registry workspace before trusting links."""
+
+    if record.job_id != registry.job_id:
+        raise ReconcileValidationError(
+            "review_batch_manifest does not belong to the active Registry owner"
+        )
+    registry_path = Path(os.path.abspath(os.path.expanduser(registry.registry_path)))
+    if registry_path.name != "artifact_registry.json":
+        raise ReconcileValidationError(
+            "review_batch_manifest active Registry is outside a canonical workspace"
+        )
+    coordinator_workspace = registry_path.parent
+    artifacts_dir = coordinator_workspace / "artifacts"
+    lexical_path = Path(os.path.abspath(os.path.expanduser(str(path))))
+    try:
+        lexical_path.relative_to(coordinator_workspace)
+    except ValueError as exc:
+        raise ReconcileValidationError(
+            "review_batch_manifest is outside the active Registry workspace"
+        ) from exc
+
+    relative_parts = lexical_path.relative_to(coordinator_workspace).parts
+    current = coordinator_workspace
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    for part in ("", *relative_parts):
+        if part:
+            current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise ReconcileValidationError(
+                "review_batch_manifest path cannot be inspected"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode) or (
+            reparse_flag
+            and int(getattr(info, "st_file_attributes", 0)) & reparse_flag
+        ):
+            raise ReconcileValidationError(
+                "review_batch_manifest path contains a symlink or reparse point"
+            )
+
+    physical_workspace = coordinator_workspace.resolve()
+    physical_path = lexical_path.resolve()
+    try:
+        physical_path.relative_to(physical_workspace)
+    except ValueError as exc:
+        raise ReconcileValidationError(
+            "review_batch_manifest resolves outside the active Registry workspace"
+        ) from exc
+
+    payload = _read_json_object(lexical_path)
+    coordinator_job_id = _require_nonempty_string(
+        payload.get("coordinator_job_id"),
+        label="review_batch_manifest coordinator_job_id",
+    )
+    if coordinator_job_id != registry.job_id:
+        raise ReconcileValidationError(
+            "review_batch_manifest coordinator does not match the active Registry"
+        )
+    batch_id = _require_nonempty_string(
+        payload.get("batch_id"),
+        label="review_batch_manifest batch_id",
+    )
+    derivation_id = str(payload.get("derivation_id") or "").strip()
+    if derivation_id:
+        if len(derivation_id) != 24 or any(
+            char not in "0123456789abcdef" for char in derivation_id
+        ):
+            raise ReconcileValidationError(
+                "review_batch_manifest derivation_id must be a 24-character hex digest"
+            )
+        if record.artifact_id != f"{batch_id}:{derivation_id}":
+            raise ReconcileValidationError(
+                "review_batch_manifest identity does not match its Registry identity"
+            )
+        projection_path = artifacts_dir / "review_batch_manifest.json"
+        if os.path.normcase(str(lexical_path)) == os.path.normcase(str(projection_path)):
+            raise ReconcileValidationError(
+                "review_batch_manifest derivation must use its immutable derivation path"
+            )
+        expected_path = (
+            artifacts_dir / "review_batch_manifests" / f"{derivation_id}.json"
+        )
+    else:
+        if record.artifact_id != batch_id:
+            raise ReconcileValidationError(
+                "review_batch_manifest identity does not match its Registry identity"
+            )
+        expected_path = artifacts_dir / "review_batch_manifest.json"
+    if os.path.normcase(str(lexical_path)) != os.path.normcase(str(expected_path)):
+        raise ReconcileValidationError(
+            "review_batch_manifest is outside the active Registry workspace"
+        )
+    return payload
+
+
+def _absolute_lexical_path(path: str | Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _validate_child_owned_path(
+    child_workspace: Path,
+    target: Path,
+    *,
+    label: str,
+) -> Path:
+    child_lexical = _absolute_lexical_path(child_workspace)
+    target_lexical = _absolute_lexical_path(target)
+    try:
+        relative = target_lexical.relative_to(child_lexical)
+    except ValueError as exc:
+        raise ReconcileValidationError(f"{label} is outside its child workspace") from exc
+    current = child_lexical
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    for part in ("", *relative.parts):
+        if part:
+            current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            raise ReconcileValidationError(f"{label} cannot be inspected") from exc
+        if stat.S_ISLNK(info.st_mode) or (
+            reparse_flag
+            and int(getattr(info, "st_file_attributes", 0)) & reparse_flag
+        ):
+            raise ReconcileValidationError(
+                f"{label} contains a symlink or reparse point"
+            )
+    physical_child = child_lexical.resolve()
+    physical_target = target_lexical.resolve()
+    try:
+        physical_target.relative_to(physical_child)
+    except ValueError as exc:
+        raise ReconcileValidationError(
+            f"{label} resolves outside its child workspace"
+        ) from exc
+    return target_lexical
+
+
+def _validate_review_batch_manifest(record: ArtifactRecord, path: Path) -> None:
+    from services.review_batch import (
+        BATCH_SCHEMA_VERSION,
+        PROJECTION_GENERATION_SCHEMA_VERSION,
+    )
+
+    payload = _read_json_object(path)
+    _require_contract_header(
+        record,
+        payload,
+        artifact_type="review_batch_manifest",
+        versions=("v1",),
+    )
+    _require_fields(
+        payload,
+        (
+            "schema_version",
+            "batch_id",
+            "projection_generation",
+            "project_name",
+            "coordinator_job_id",
+            "created_at",
+            "parent",
+            "variants",
+            "completed_variant_count",
+            "failed_variant_count",
+            "stage1_model_calls",
+            "status",
+        ),
+        label="review_batch_manifest",
+    )
+    if str(payload.get("schema_version") or "") != BATCH_SCHEMA_VERSION:
+        raise ReconcileValidationError("review_batch_manifest schema_version is invalid")
+    _require_owned_job(record, payload, field="coordinator_job_id")
+    if path.parent.name == "review_batch_manifests":
+        coordinator_artifacts_dir = path.parent.parent
+    elif path.parent.name == "artifacts":
+        coordinator_artifacts_dir = path.parent
+    else:
+        raise ReconcileValidationError(
+            "review_batch_manifest is outside the coordinator artifacts directory"
+        )
+    coordinator_workspace_lexical = _absolute_lexical_path(
+        coordinator_artifacts_dir.parent
+    )
+    coordinator_workspace_path = coordinator_workspace_lexical.resolve()
+    if (
+        coordinator_artifacts_dir.name != "artifacts"
+        or "__" not in coordinator_workspace_path.name
+        or coordinator_workspace_path.name.rsplit("__", 1)[1] != record.job_id
+    ):
+        raise ReconcileValidationError(
+            "review_batch_manifest path does not match its coordinator workspace"
+        )
+    coordinator_output_root = coordinator_workspace_path.parent
+    coordinator_output_root_lexical = coordinator_workspace_lexical.parent
+    batch_id = _require_nonempty_string(
+        payload.get("batch_id"),
+        label="review_batch_manifest batch_id",
+    )
+    derivation_id = str(payload.get("derivation_id") or "").strip()
+    if derivation_id and (
+        len(derivation_id) != 24
+        or any(char not in "0123456789abcdef" for char in derivation_id)
+    ):
+        raise ReconcileValidationError(
+            "review_batch_manifest derivation_id must be a 24-character hex digest"
+        )
+    projection_generation = payload.get("projection_generation")
+    if (
+        isinstance(projection_generation, bool)
+        or not isinstance(projection_generation, int)
+        or projection_generation <= 0
+    ):
+        raise ReconcileValidationError(
+            "review_batch_manifest projection_generation must be a positive integer"
+        )
+    expected_artifact_id = (
+        f"{batch_id}:{derivation_id}" if derivation_id else batch_id
+    )
+    if expected_artifact_id != record.artifact_id:
+        raise ReconcileValidationError(
+            "review_batch_manifest identity does not match its Registry identity"
+        )
+    _require_nonempty_string(
+        payload.get("project_name"),
+        label="review_batch_manifest project_name",
+    )
+    _require_nonempty_string(
+        payload.get("created_at"),
+        label="review_batch_manifest created_at",
+    )
+    parent = _require_mapping(payload.get("parent"), label="review_batch_manifest parent")
+    parent_registry_path = Path(
+        _require_nonempty_string(
+            parent.get("registry_path"),
+            label="review batch parent registry_path",
+        )
+    ).resolve()
+    parent_identity = (
+        _require_nonempty_string(parent.get("job_id"), label="review batch parent job_id"),
+        _require_nonempty_string(
+            parent.get("artifact_id"), label="review batch parent artifact_id"
+        ),
+        "summary_file",
+        _require_nonempty_string(
+            parent.get("summary_path"), label="review batch parent summary_path"
+        ),
+        _require_nonempty_string(
+            parent.get("content_hash"), label="review batch parent content_hash"
+        ),
+    )
+    if len(parent_identity[4]) != 64:
+        raise ReconcileValidationError(
+            "review_batch_manifest parent content_hash must be a SHA-256 digest"
+        )
+    if not parent_registry_path.is_file():
+        raise ReconcileValidationError("review_batch_manifest parent Registry is missing")
+    try:
+        parent_registry = ArtifactRegistry(parent_registry_path, parent_identity[0])
+    except Exception as exc:
+        raise ReconcileValidationError(
+            f"review_batch_manifest parent Registry is invalid: {exc}"
+        ) from exc
+    parent_record = parent_registry.get(parent_identity[1])
+    if (
+        parent_record is None
+        or parent_record.status != "ready"
+        or parent_record.artifact_type != parent_identity[2]
+        or Path(parent_record.path).resolve() != Path(parent_identity[3]).resolve()
+        or parent_record.content_hash != parent_identity[4]
+    ):
+        raise ReconcileValidationError(
+            "review_batch_manifest parent Registry identity is invalid"
+        )
+    if (
+        not Path(parent_identity[3]).is_file()
+        or file_sha256(parent_identity[3]) != parent_identity[4]
+    ):
+        raise ReconcileValidationError(
+            "review_batch_manifest parent content hash changed"
+        )
+
+    variants = _require_list(payload.get("variants"), label="review_batch_manifest variants")
+    if not variants:
+        raise ReconcileValidationError("review_batch_manifest has no variants")
+    completed_count = payload.get("completed_variant_count")
+    failed_count = payload.get("failed_variant_count")
+    for label, value in (
+        ("completed_variant_count", completed_count),
+        ("failed_variant_count", failed_count),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ReconcileValidationError(
+                f"review_batch_manifest {label} must be a non-negative integer"
+            )
+    if payload.get("stage1_model_calls") != 0:
+        raise ReconcileValidationError(
+            "review_batch_manifest must not contain Stage 1 provider calls"
+        )
+
+    variant_ids: set[str] = set()
+    project_names: set[str] = set()
+    child_job_ids: set[str] = set()
+    completed_seen = 0
+    failed_seen = 0
+    output_identities: set[tuple[str, str, str, str, str]] = set()
+    for index, raw_variant in enumerate(variants):
+        variant = _require_mapping(raw_variant, label=f"review batch variant[{index}]")
+        variant_id = _require_nonempty_string(
+            variant.get("variant_id"), label=f"review batch variant[{index}] variant_id"
+        )
+        project_name = _require_nonempty_string(
+            variant.get("project_name"),
+            label=f"review batch variant[{index}] project_name",
+        )
+        child_job_id = _require_nonempty_string(
+            variant.get("child_job_id"),
+            label=f"review batch variant[{index}] child_job_id",
+        )
+        child_workspace_path = _absolute_lexical_path(
+            _require_nonempty_string(
+                variant.get("child_workspace_path"),
+                label=f"review batch variant[{index}] child_workspace_path",
+            )
+        )
+        child_registry_path = _absolute_lexical_path(
+            _require_nonempty_string(
+                variant.get("child_registry_path"),
+                label=f"review batch variant[{index}] child_registry_path",
+            )
+        )
+        expected_registry_path = child_workspace_path / "artifact_registry.json"
+        if os.path.normcase(str(child_registry_path)) != os.path.normcase(
+            str(expected_registry_path)
+        ):
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] Registry is outside its child workspace"
+            )
+        if os.path.normcase(str(child_workspace_path.parent)) != os.path.normcase(
+            str(coordinator_output_root_lexical)
+        ):
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] workspace is outside the coordinator output root"
+            )
+        _validate_child_owned_path(
+            child_workspace_path,
+            child_workspace_path,
+            label=f"review batch variant[{index}] workspace",
+        )
+        if child_workspace_path.resolve().parent != coordinator_output_root:
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] workspace resolves outside the coordinator output root"
+            )
+        child_artifacts_path = _validate_child_owned_path(
+            child_workspace_path,
+            child_workspace_path / "artifacts",
+            label=f"review batch variant[{index}] artifacts directory",
+        )
+        _validate_child_owned_path(
+            child_workspace_path,
+            child_registry_path,
+            label=f"review batch variant[{index}] Registry",
+        )
+        expected_child_workspace_name = f"{project_name}__{child_job_id}"
+        if child_workspace_path.name != expected_child_workspace_name:
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] workspace identity is inconsistent"
+            )
+        selection_hash = _require_nonempty_string(
+            variant.get("selection_hash"),
+            label=f"review batch variant[{index}] selection_hash",
+        )
+        if len(selection_hash) != 64:
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] selection_hash must be a SHA-256 digest"
+            )
+        if variant_id in variant_ids or project_name in project_names or child_job_id in child_job_ids:
+            raise ReconcileValidationError(
+                "review_batch_manifest variant identities must be unique"
+            )
+        variant_ids.add(variant_id)
+        project_names.add(project_name)
+        child_job_ids.add(child_job_id)
+        if variant.get("stage1_model_calls") != 0:
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] contains Stage 1 provider calls"
+            )
+        selected_count = variant.get("selected_count")
+        if isinstance(selected_count, bool) or not isinstance(selected_count, int) or selected_count < 0:
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] selected_count must be a non-negative integer"
+            )
+
+        status = str(variant.get("status") or "")
+        outputs = _require_mapping(
+            variant.get("output_artifacts"),
+            label=f"review batch variant[{index}] output_artifacts",
+        )
+        failure_reason = str(variant.get("failure_reason") or "")
+        if status == "failed":
+            failed_seen += 1
+            if outputs or not failure_reason or selected_count != 0:
+                raise ReconcileValidationError(
+                    f"review batch failed variant[{index}] has inconsistent outputs"
+                )
+            continue
+        if status != "completed":
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] has unsupported status {status!r}"
+            )
+        completed_seen += 1
+        if failure_reason or selected_count <= 0:
+            raise ReconcileValidationError(
+                f"review batch completed variant[{index}] has inconsistent status fields"
+            )
+        if set(outputs) != {"summary", "selection"}:
+            raise ReconcileValidationError(
+                f"review batch completed variant[{index}] must link summary and selection outputs"
+            )
+        if not child_registry_path.is_file():
+            raise ReconcileValidationError(
+                f"review batch completed variant[{index}] Registry is missing"
+            )
+        try:
+            child_registry = ArtifactRegistry(child_registry_path, child_job_id)
+        except Exception as exc:
+            raise ReconcileValidationError(
+                f"review batch completed variant[{index}] Registry is invalid: {exc}"
+            ) from exc
+        for output_name, expected_type in (
+            ("summary", "summary_file"),
+            ("selection", "summary_selection"),
+        ):
+            link = _require_mapping(
+                outputs.get(output_name),
+                label=f"review batch variant[{index}] {output_name} link",
+            )
+            artifact_id = _require_nonempty_string(
+                link.get("artifact_id"),
+                label=f"review batch variant[{index}] {output_name} artifact_id",
+            )
+            artifact_type = _require_nonempty_string(
+                link.get("artifact_type"),
+                label=f"review batch variant[{index}] {output_name} artifact_type",
+            )
+            artifact_path = _absolute_lexical_path(_require_nonempty_string(
+                link.get("path"),
+                label=f"review batch variant[{index}] {output_name} path",
+            ))
+            content_hash = _require_nonempty_string(
+                link.get("content_hash"),
+                label=f"review batch variant[{index}] {output_name} content_hash",
+            )
+            if artifact_type != expected_type or len(content_hash) != 64:
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] {output_name} identity is invalid"
+                )
+            expected_output_path = (
+                child_artifacts_path / f"{project_name}_summaries.json"
+                if output_name == "summary"
+                else child_artifacts_path / "summary_selection_v1.json"
+            )
+            if os.path.normcase(str(artifact_path)) != os.path.normcase(
+                str(expected_output_path)
+            ):
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] {output_name} path is not canonical"
+                )
+            _validate_child_owned_path(
+                child_workspace_path,
+                artifact_path,
+                label=f"review batch variant[{index}] {output_name}",
+            )
+            child_record = child_registry.get(artifact_id)
+            if (
+                child_record is None
+                or child_record.status != "ready"
+                or child_record.artifact_type != artifact_type
+                or os.path.normcase(str(_absolute_lexical_path(child_record.path)))
+                != os.path.normcase(str(artifact_path))
+                or child_record.content_hash != content_hash
+            ):
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] {output_name} Registry identity is invalid"
+                )
+            if not artifact_path.is_file() or file_sha256(artifact_path) != content_hash:
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] {output_name} content hash changed"
+                )
+            if str(child_record.metadata.get("selection_hash") or "") != selection_hash:
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] {output_name} selection hash is inconsistent"
+                )
+            if child_record.metadata.get("selected_count") != selected_count:
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] {output_name} selected count is inconsistent"
+                )
+            if output_name == "summary":
+                summary_payload = _read_json_array(Path(artifact_path))
+                if len(summary_payload) != selected_count:
+                    raise ReconcileValidationError(
+                        f"review batch variant[{index}] summary count is inconsistent"
+                    )
+            else:
+                selection_payload = _read_json_object(Path(artifact_path))
+                if selection_payload.get("selected_count") != selected_count:
+                    raise ReconcileValidationError(
+                        f"review batch variant[{index}] selection count is inconsistent"
+                    )
+            output_identities.add(
+                (child_job_id, artifact_id, artifact_type, str(artifact_path), content_hash)
+            )
+
+        paper_root = child_artifacts_path / "paper_artifacts"
+        _validate_child_owned_path(
+            child_workspace_path,
+            paper_root,
+            label=f"review batch variant[{index}] paper artifacts directory",
+        )
+        paper_prefix = f"derived-paper:{selection_hash}:"
+        paper_records = tuple(
+            child_record
+            for child_record in child_registry.list_records()
+            if child_record.artifact_id.startswith(paper_prefix)
+        )
+        if len(paper_records) != selected_count:
+            raise ReconcileValidationError(
+                f"review batch variant[{index}] paper artifact count is inconsistent"
+            )
+        for paper_record in paper_records:
+            paper_path = _absolute_lexical_path(paper_record.path)
+            if (
+                paper_record.status != "ready"
+                or paper_record.artifact_type != "paper_artifact"
+                or os.path.normcase(str(paper_path.parent))
+                != os.path.normcase(str(paper_root))
+            ):
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] paper artifact identity is invalid"
+                )
+            _validate_child_owned_path(
+                child_workspace_path,
+                paper_path,
+                label=f"review batch variant[{index}] paper artifact",
+            )
+            if (
+                not paper_path.is_file()
+                or file_sha256(paper_path) != paper_record.content_hash
+            ):
+                raise ReconcileValidationError(
+                    f"review batch variant[{index}] paper artifact content hash changed"
+                )
+
+    if completed_count != completed_seen or failed_count != failed_seen:
+        raise ReconcileValidationError("review_batch_manifest variant counts are inconsistent")
+    expected_status = "completed" if failed_seen == 0 else "needs_review"
+    if str(payload.get("status") or "") != expected_status:
+        raise ReconcileValidationError("review_batch_manifest aggregate status is inconsistent")
+    metadata_checks = {
+        "batch_id": batch_id,
+        "projection_generation": projection_generation,
+        "variant_count": len(variants),
+        "completed_variant_count": completed_seen,
+        "failed_variant_count": failed_seen,
+        "stage1_model_calls": 0,
+    }
+    if derivation_id:
+        metadata_checks["derivation_id"] = derivation_id
+    if any(record.metadata.get(key) != value for key, value in metadata_checks.items()):
+        raise ReconcileValidationError("review_batch_manifest Registry metadata is inconsistent")
+
+    if any(
+        dependency.dependency_kind != "external_job"
+        for dependency in record.depends_on
+    ):
+        raise ReconcileValidationError(
+            "review_batch_manifest may contain only external job dependencies"
+        )
+    dependency_identities = {
+        (
+            dependency.job_id,
+            dependency.artifact_id,
+            dependency.artifact_type,
+            dependency.path,
+            dependency.content_hash,
+        )
+        for dependency in record.depends_on
+    }
+    if dependency_identities != {parent_identity, *output_identities}:
+        raise ReconcileValidationError(
+            "review_batch_manifest Registry dependencies do not match its linked outputs"
+        )
+    if derivation_id:
+        reservation_path = (
+            coordinator_artifacts_dir
+            / "review_batch_manifests"
+            / f".{derivation_id}.projection.generation"
+        )
+        try:
+            reservation_info = os.lstat(reservation_path)
+        except OSError as exc:
+            raise ReconcileValidationError(
+                "review_batch_manifest projection generation reservation is missing"
+            ) from exc
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if stat.S_ISLNK(reservation_info.st_mode) or (
+            reparse_flag
+            and int(getattr(reservation_info, "st_file_attributes", 0)) & reparse_flag
+        ):
+            raise ReconcileValidationError(
+                "review_batch_manifest projection generation reservation is a reparse point"
+            )
+        reservation = _read_json_object(reservation_path)
+        expected_reservation = {
+            "artifact_type": "review_batch_projection_generation",
+            "artifact_version": "v1",
+            "schema_version": PROJECTION_GENERATION_SCHEMA_VERSION,
+            "batch_id": batch_id,
+            "derivation_id": derivation_id,
+            "projection_generation": projection_generation,
+            "coordinator_job_id": record.job_id,
+        }
+        if reservation != expected_reservation:
+            raise ReconcileValidationError(
+                "review_batch_manifest projection generation reservation is inconsistent"
+            )
+
+
+def validate_review_batch_manifest_for_bootstrap(
+    record: ArtifactRecord,
+    path: Path,
+    registry: ArtifactRegistry,
+) -> Mapping[str, Any]:
+    """Fully validate batch links before runner bootstraps external Registries."""
+
+    payload = validate_review_batch_manifest_location(record, path, registry)
+    _validate_review_batch_manifest(record, path)
+    return payload
+
+
 DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "job_outcome": _validate_job_outcome,
     STAGE_TERMINAL_ARTIFACT_TYPE: _validate_stage_terminal,
@@ -1058,6 +1726,7 @@ DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_summary_source_manifest,
     "summary_selection": _validate_summary_selection,
+    "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,
     "evidence_manifest": _validate_evidence_manifest,
     "normalized_text": _validate_nonempty_text,
@@ -1199,6 +1868,8 @@ class RuntimeReconciler:
             actual_hash = file_sha256(path)
             if actual_hash != record.content_hash:
                 raise ReconcileValidationError(f"artifact content hash mismatch: {record.artifact_id}")
+            if record.artifact_type == "review_batch_manifest":
+                validate_review_batch_manifest_location(record, path, active_registry)
             validator = self.schema_validators.get(record.artifact_type)
             if validator is None:
                 raise ReconcileValidationError(
@@ -1214,7 +1885,30 @@ class RuntimeReconciler:
         finally:
             active_visited.remove(key)
 
-    def stage_is_complete(self, stage_name: str) -> bool:
+    def _validate_stage_recovery_identity(self, record: TerminalStageRecordV1) -> None:
+        if record.stage_name != "validate":
+            return
+        canonical_refs = [
+            ref
+            for ref in record.output_artifact_refs
+            if ref.artifact_type == "validation_run_result"
+        ]
+        if len(canonical_refs) != 1:
+            raise ReconcileValidationError(
+                "completed Validation stage requires exactly one canonical validation run result"
+            )
+        from validation.run_result import ValidationRunResultV1
+
+        canonical = self.validate_dependency_ref(canonical_refs[0])
+        validation = ValidationRunResultV1.from_dict(
+            _read_json_object(Path(canonical.path))
+        )
+        if validation.attempt_id != record.attempt_id:
+            raise ReconcileValidationError(
+                "completed Validation result attempt_id does not match its terminal record"
+            )
+
+    def _completed_stage_record(self, stage_name: str) -> TerminalStageRecordV1 | None:
         candidates = [
             (record, path)
             for record, path in self.stage_store.load_records()
@@ -1238,10 +1932,87 @@ class RuntimeReconciler:
                 self.validate_record(registered)
                 for output_ref in record.output_artifact_refs:
                     self.validate_dependency_ref(output_ref)
+                self._validate_stage_recovery_identity(record)
             except ReconcileValidationError:
                 continue
-            return True
-        return False
+            return record
+        return None
+
+    def stage_is_complete(self, stage_name: str) -> bool:
+        return self._completed_stage_record(stage_name) is not None
+
+    def load_completed_stage_result(self, stage_name: str) -> StageResult | None:
+        """Rehydrate a completed stage from its durable terminal outputs."""
+
+        terminal = self._completed_stage_record(stage_name)
+        if terminal is None:
+            return None
+
+        artifacts: list[StageArtifactRef] = []
+        resolved_outputs: list[tuple[ArtifactDependencyRefV2, ArtifactRecord]] = []
+        for output_ref in terminal.output_artifact_refs:
+            output = self.validate_dependency_ref(output_ref)
+            resolved_outputs.append((output_ref, output))
+            artifacts.append(
+                StageArtifactRef(
+                    artifact_role=output.artifact_role,
+                    artifact_type=output.artifact_type,
+                    artifact_version=output.artifact_version,
+                    path=output.path,
+                    artifact_id=output.artifact_id,
+                )
+            )
+
+        metadata: dict[str, Any] = {
+            "recovered_from_terminal": terminal.record_id,
+            "model_call_count": terminal.model_call_count,
+        }
+        if stage_name == "validate":
+            canonical_outputs = [
+                output
+                for output_ref, output in resolved_outputs
+                if output_ref.artifact_type == "validation_run_result"
+            ]
+            if len(canonical_outputs) != 1:
+                raise ReconcileValidationError(
+                    "completed Validation stage requires exactly one canonical validation run result"
+                )
+            from validation.run_result import ValidationRunResultV1
+
+            validation = ValidationRunResultV1.from_dict(
+                _read_json_object(Path(canonical_outputs[0].path))
+            )
+            if validation.job_id != self.registry.job_id:
+                raise ReconcileValidationError(
+                    "completed Validation result belongs to another job"
+                )
+            if validation.attempt_id != terminal.attempt_id:
+                raise ReconcileValidationError(
+                    "completed Validation result belongs to another attempt"
+                )
+            if not validation.contract_satisfied:
+                raise ReconcileValidationError(
+                    "completed Validation terminal does not reference a contract-satisfied result"
+                )
+            metadata.update(
+                {
+                    "manual_review_count": validation.claim_verdict_counts.get(
+                        "needs_review", 0
+                    ),
+                    "validation_run_id": validation.validation_run_id,
+                    "execution_status": validation.execution_status.value,
+                    "validation_disposition": validation.validation_disposition.value,
+                    "claim_verdict_counts": dict(validation.claim_verdict_counts),
+                    "contradicted_count": validation.contradicted_count,
+                }
+            )
+
+        return StageResult(
+            stage_name=stage_name,
+            success=True,
+            artifacts=artifacts,
+            metadata=metadata,
+        )
 
     def _repair_outcome_registration(self) -> tuple[bool, str | None, JobOutcomeV1 | None]:
         path = Path(str(getattr(self.workspace, "artifact_path")("job_outcome_v1.json")))

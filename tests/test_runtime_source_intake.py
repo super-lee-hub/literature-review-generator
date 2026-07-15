@@ -126,6 +126,7 @@ def test_zotero_source_intake_surfaces_ambiguous_pdf_candidates(tmp_path: Path) 
     document = fitz.open()
     page = document.new_page()
     page.insert_text((72, 72), "Unique Paper")
+    document.set_metadata({"author": "Alice Smith"})
     document.save(unique_pdf)
     document.close()
 
@@ -135,6 +136,7 @@ def test_zotero_source_intake_surfaces_ambiguous_pdf_candidates(tmp_path: Path) 
             [
                 "*",
                 "Unique Paper",
+                "作者\tAlice Smith",
                 "附件\tUNIQUE/unique.pdf",
                 "*",
                 "Ambiguous Paper",
@@ -261,3 +263,70 @@ def test_zotero_source_intake_quarantines_identity_mismatch(
     assert bundle.paper_work_items == []
     assert bundle.source_snapshot["canonical_ready"] is False
     assert bundle.source_snapshot["quarantined_sources"][0]["identity_verdict"] == "mismatch"
+
+
+def test_zotero_source_intake_quarantines_title_only_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    report = tmp_path / "report.txt"
+    report.write_text("stub", encoding="utf-8")
+    library = tmp_path / "library"
+    library.mkdir()
+    pdf = library / "paper.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n" + b"x" * 2048)
+    paper = {
+        "title": "Expected Paper",
+        "authors": ["Alice Smith"],
+        "year": "2024",
+        "doi": "",
+        "attachments": ["paper.pdf"],
+    }
+    monkeypatch.setattr(
+        "runtime.source_intake.parse_zotero_report_result",
+        lambda _path: SimpleNamespace(
+            papers=[paper],
+            status="ok",
+            parser_route="standard",
+            parser_version="zotero-parser-v1",
+            report_hash="report-hash",
+            parse_confidence=1.0,
+            stats=SimpleNamespace(to_dict=lambda: {"parsed_entries": 1}),
+            diagnostics=(),
+        ),
+    )
+    monkeypatch.setattr("runtime.source_intake.create_file_index", lambda _path: object())
+    monkeypatch.setattr(
+        "runtime.source_intake.resolve_pdf_match",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="matched",
+            selected_path=str(pdf),
+            to_dict=lambda: {
+                "status": "matched",
+                "selected_path": str(pdf),
+                "candidates": [],
+                "diagnostics": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "runtime.source_intake.inspect_pdf_identity",
+        lambda expected, path: evaluate_source_identity(
+            expected,
+            {"title": expected["title"], "authors": [], "year": "", "doi": ""},
+            source_path=path,
+        ),
+    )
+
+    bundle = build_zotero_source_bundle(
+        project_name="title-only-quarantine",
+        zotero_report=str(report),
+        library_path=str(library),
+    )
+
+    assert bundle.paper_work_items == []
+    assert bundle.source_snapshot["canonical_ready"] is False
+    quarantined = bundle.source_snapshot["quarantined_sources"]
+    assert len(quarantined) == 1
+    assert quarantined[0]["identity_verdict"] == "ambiguous"
+    assert quarantined[0]["artifact_status"] == "quarantined"

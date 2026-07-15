@@ -8,6 +8,7 @@ import pytest
 from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.audit_record import AuditRecordV1
 from services.job_workspace import JobWorkspace
+from runtime.reconcile import RuntimeReconciler
 from services.quarantine_lifecycle import (
     IdentityOverrideError,
     QuarantineReleaseError,
@@ -90,6 +91,8 @@ def test_ambiguous_identity_override_requires_exact_candidate_hash_and_writes_au
     audit_record = registry.get(audit.audit_id)
     assert audit_record is not None
     assert audit_record.status == "ready"
+    assert audit_record.depends_on == []
+    RuntimeReconciler(workspace, registry).validate_record(audit_record)
 
 
 @pytest.mark.parametrize(
@@ -158,6 +161,60 @@ def test_generic_quarantine_release_changes_registry_state_and_writes_audit(tmp_
     assert target is not None
     assert target.status == "ready"
     assert target.metadata["quarantine_release_audit_id"] == audit.audit_id
+    audit_record = registry.get(audit.audit_id)
+    assert audit_record is not None
+    assert audit_record.status == "ready"
+    assert audit_record.depends_on == []
+    RuntimeReconciler(workspace, registry).validate_record(audit_record)
+
+
+def test_release_persists_ready_audit_before_promoting_quarantined_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, registry = _workspace_and_registry(tmp_path)
+    candidate = Path(workspace.artifact_path("quarantine/candidate.json"))
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text('{"status":"reviewed"}', encoding="utf-8")
+    registry.register_file(
+        artifact_role="source_candidate",
+        artifact_type="source_candidate",
+        artifact_version="v1",
+        path=candidate,
+        producer="test",
+        artifact_id="candidate:paper-a",
+        status="quarantined",
+    )
+
+    original_update = registry.update_record
+
+    def fail_target_promotion(artifact_id: str, **kwargs):
+        if artifact_id == "candidate:paper-a":
+            raise RuntimeError("injected target promotion failure")
+        return original_update(artifact_id, **kwargs)
+
+    monkeypatch.setattr(registry, "update_record", fail_target_promotion)
+
+    with pytest.raises(RuntimeError, match="target promotion failure"):
+        release_quarantined_artifact(
+            workspace=workspace,
+            registry=registry,
+            artifact_id="candidate:paper-a",
+            actor="operator@example.test",
+            reason="manual quarantine review completed",
+            attempt_id="attempt-3",
+        )
+
+    registry.reload()
+    target = registry.get("candidate:paper-a")
+    assert target is not None
+    assert target.status == "quarantined"
+    audit_records = [
+        record for record in registry.list_records() if record.artifact_type == "audit_record"
+    ]
+    assert len(audit_records) == 1
+    assert audit_records[0].status == "ready"
+    assert audit_records[0].depends_on == []
 
 
 def test_generic_release_cannot_bypass_identity_override_policy(tmp_path: Path) -> None:

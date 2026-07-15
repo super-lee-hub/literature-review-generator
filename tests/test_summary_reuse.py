@@ -626,12 +626,12 @@ def test_explicit_legacy_summary_reuse_writes_unified_audit_record(tmp_path: Pat
     summary_record = next(
         record for record in registry.list_records() if record.artifact_type == "summary_file"
     )
+    assert {dependency.artifact_type for dependency in summary_record.depends_on} == {
+        "legacy_summary_source"
+    }
     assert audit.output_artifact_refs[0].content_hash == summary_record.content_hash
     assert json.loads(Path(summary_record.path).read_text(encoding="utf-8")) == [first_projection]
-    assert {dependency.artifact_id for dependency in audit_records[0].depends_on} == {
-        source_record.artifact_id,
-        "summary_file:audit_summaries.json",
-    }
+    assert audit_records[0].depends_on == []
     reconciler = RuntimeReconciler(workspace, registry)
     reconciler.validate_record(summary_record)
     reconciler.validate_record(audit_records[0])
@@ -693,6 +693,75 @@ def test_explicit_legacy_summary_audit_failure_remains_quarantined(
     assert generator.summaries
     assert {record.status for record in registry.list_records()} == {"ready"}
     assert any(record.artifact_type == "audit_record" for record in registry.list_records())
+
+
+def test_legacy_reuse_promotes_summary_only_after_ready_audit_and_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    external_summary = tmp_path / "legacy-summary.json"
+    external_summary.write_text(
+        json.dumps(
+            [
+                _make_canonical_summary(
+                    title="Promotion Failure Paper",
+                    authors=["Alice Example"],
+                    year="2024",
+                    doi="10.1000/promotion-failure",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    workspace = JobWorkspace.create(
+        str(tmp_path / "output"),
+        "promotion-failure",
+        job_id="job-promotion-failure",
+    )
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    generator = main.LiteratureReviewGenerator(
+        project_name="promotion-failure",
+        pdf_folder=str(tmp_path),
+    )
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.job_workspace = workspace
+    generator.artifact_registry = registry
+    generator.output_dir = workspace.root_dir
+    generator.summary_file = workspace.artifact_path("promotion-failure_summaries.json")
+    generator.summary_file_override = str(external_summary)
+
+    original_update = registry.update_record
+
+    def fail_summary_promotion(artifact_id: str, **kwargs):
+        if artifact_id.startswith("summary_file:"):
+            raise RuntimeError("injected summary promotion failure")
+        return original_update(artifact_id, **kwargs)
+
+    monkeypatch.setattr(registry, "update_record", fail_summary_promotion)
+
+    assert generator.load_existing_summaries() is False
+    assert generator.summaries == []
+    registry.reload()
+    records = registry.list_records()
+    audit_records = [record for record in records if record.artifact_type == "audit_record"]
+    assert len(audit_records) == 1
+    assert audit_records[0].status == "ready"
+    assert audit_records[0].depends_on == []
+    source_record = next(
+        record for record in records if record.artifact_type == "legacy_summary_source"
+    )
+    manifest_record = next(
+        record for record in records if record.artifact_type == "summary_source_manifest"
+    )
+    summary_record = next(
+        record for record in records if record.artifact_type == "summary_file"
+    )
+    assert source_record.status == "ready"
+    assert manifest_record.status == "ready"
+    assert summary_record.status == "quarantined"
+    assert {dependency.artifact_id for dependency in manifest_record.depends_on} == {
+        source_record.artifact_id
+    }
 
 
 def test_stage_one_aborts_before_source_or_provider_work_when_summary_load_fails(
@@ -978,10 +1047,7 @@ def test_nonreusable_legacy_source_is_excluded_from_ready_dependency_chain(
     assert {dependency.artifact_id for dependency in summary_record.depends_on} == {
         source_records[0].artifact_id
     }
-    assert {dependency.artifact_id for dependency in audit_record.depends_on} == {
-        source_records[0].artifact_id,
-        summary_record.artifact_id,
-    }
+    assert audit_record.depends_on == []
 
     reconciler = RuntimeReconciler(workspace, registry)
     for record in (summary_record, manifest_record, audit_record):

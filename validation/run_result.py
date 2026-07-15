@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple, cast
@@ -42,6 +42,21 @@ class ValidationRunDisposition(str, Enum):
 
 
 _ALL_VERDICTS = tuple(item.value for item in ClaimVerdict)
+_EXTENDED_CONTRACT_FIELDS = frozenset(
+    {
+        "input_artifacts",
+        "expected_claim_count",
+        "validated_claim_count",
+        "review_has_citations",
+        "evidence_complete",
+        "review_cleanliness",
+        "repair_status",
+        "recheck_status",
+        "degradation_reasons",
+    }
+)
+_BLOCKING_REPAIR_STATUSES = frozenset({"failed", "incomplete"})
+_BLOCKING_RECHECK_STATUSES = frozenset({"failed", "incomplete", "pending", "required"})
 
 
 def _utc_now_iso() -> str:
@@ -75,6 +90,24 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 
 def _string_list(values: Iterable[Any]) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
+
+
+def _nonnegative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValidationRunResultError(f"{field_name} must be a non-negative integer")
+    return value
+
+
+def _boolean(value: Any, field_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValidationRunResultError(f"{field_name} must be boolean")
+    return value
+
+
+def _optional_boolean(value: Any, field_name: str) -> bool | None:
+    if value is None:
+        return None
+    return _boolean(value, field_name)
 
 
 def _legacy_conclusion(value: Any) -> str:
@@ -162,14 +195,41 @@ def claim_verdict_for_result(value: Any) -> ClaimVerdict:
 def reduce_validation_disposition(
     execution_status: ValidationExecutionStatus | str,
     verdicts: Iterable[ClaimVerdict | str],
+    *,
+    expected_claim_count: int | None = None,
+    validated_claim_count: int | None = None,
+    review_has_citations: bool | None = None,
+    evidence_complete: bool = True,
+    repair_status: str = "not_requested",
+    recheck_status: str = "not_required",
+    degradation_reasons: Sequence[str] = (),
 ) -> ValidationRunDisposition:
     execution = ValidationExecutionStatus(str(getattr(execution_status, "value", execution_status)))
     if execution is not ValidationExecutionStatus.SUCCEEDED:
         return ValidationRunDisposition.UNVALIDATED
-    normalized = {
+    normalized_verdicts = tuple(
         ClaimVerdict(str(getattr(item, "value", item)))
         for item in verdicts
-    }
+    )
+    effective_validated_count = (
+        len(normalized_verdicts)
+        if validated_claim_count is None
+        else validated_claim_count
+    )
+    if expected_claim_count is not None and validated_claim_count is not None:
+        if expected_claim_count != validated_claim_count:
+            return ValidationRunDisposition.NEEDS_REVIEW
+    if effective_validated_count == 0 and review_has_citations is not False:
+        return ValidationRunDisposition.NEEDS_REVIEW
+    if not evidence_complete:
+        return ValidationRunDisposition.NEEDS_REVIEW
+    if _string_list(degradation_reasons):
+        return ValidationRunDisposition.NEEDS_REVIEW
+    if repair_status.strip().lower() in _BLOCKING_REPAIR_STATUSES:
+        return ValidationRunDisposition.NEEDS_REVIEW
+    if recheck_status.strip().lower() in _BLOCKING_RECHECK_STATUSES:
+        return ValidationRunDisposition.NEEDS_REVIEW
+    normalized = set(normalized_verdicts)
     if normalized.intersection(
         {ClaimVerdict.WRONG_SOURCE, ClaimVerdict.CONTRADICTED, ClaimVerdict.NEEDS_REVIEW}
     ):
@@ -179,6 +239,74 @@ def reduce_validation_disposition(
     ):
         return ValidationRunDisposition.FINDINGS
     return ValidationRunDisposition.CLEAN
+
+
+@dataclass(frozen=True)
+class ValidationInputArtifactsV1:
+    """Content-addressed identities for inputs consumed by Validation."""
+
+    review_draft_id: str = ""
+    review_draft_hash: str = ""
+    citation_manifest_id: str = ""
+    citation_manifest_hash: str = ""
+    evidence_manifest_ids: Tuple[str, ...] = ()
+    evidence_manifest_hashes: Tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        if bool(self.review_draft_id) != bool(self.review_draft_hash):
+            raise ValidationRunResultError(
+                "review draft artifact identity requires both id and hash"
+            )
+        if bool(self.citation_manifest_id) != bool(self.citation_manifest_hash):
+            raise ValidationRunResultError(
+                "citation manifest artifact identity requires both id and hash"
+            )
+        if len(self.evidence_manifest_ids) != len(self.evidence_manifest_hashes):
+            raise ValidationRunResultError(
+                "evidence manifest artifact ids and hashes must have equal length"
+            )
+        if any(not item for item in self.evidence_manifest_ids):
+            raise ValidationRunResultError("evidence manifest artifact ids must be non-empty")
+        if any(not item for item in self.evidence_manifest_hashes):
+            raise ValidationRunResultError("evidence manifest artifact hashes must be non-empty")
+
+    @classmethod
+    def from_value(
+        cls,
+        value: "ValidationInputArtifactsV1 | Mapping[str, Any] | None",
+    ) -> "ValidationInputArtifactsV1":
+        if isinstance(value, ValidationInputArtifactsV1):
+            value.validate()
+            return value
+        if value is not None and not isinstance(value, Mapping):
+            raise ValidationRunResultError("input_artifacts must be an object")
+        payload: Mapping[str, Any] = value if isinstance(value, Mapping) else {}
+        instance = cls(
+            review_draft_id=str(payload.get("review_draft_id") or "").strip(),
+            review_draft_hash=str(payload.get("review_draft_hash") or "").strip(),
+            citation_manifest_id=str(payload.get("citation_manifest_id") or "").strip(),
+            citation_manifest_hash=str(payload.get("citation_manifest_hash") or "").strip(),
+            evidence_manifest_ids=tuple(
+                str(item).strip()
+                for item in (payload.get("evidence_manifest_ids") or ())
+            ),
+            evidence_manifest_hashes=tuple(
+                str(item).strip()
+                for item in (payload.get("evidence_manifest_hashes") or ())
+            ),
+        )
+        instance.validate()
+        return instance
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "review_draft_id": self.review_draft_id,
+            "review_draft_hash": self.review_draft_hash,
+            "citation_manifest_id": self.citation_manifest_id,
+            "citation_manifest_hash": self.citation_manifest_hash,
+            "evidence_manifest_ids": list(self.evidence_manifest_ids),
+            "evidence_manifest_hashes": list(self.evidence_manifest_hashes),
+        }
 
 
 @dataclass(frozen=True)
@@ -341,6 +469,17 @@ class ValidationRunResultV1:
     total_claims: int
     diagnostics: Tuple[str, ...]
     failure_reason: str
+    input_artifacts: ValidationInputArtifactsV1 = field(
+        default_factory=ValidationInputArtifactsV1
+    )
+    expected_claim_count: int = 0
+    validated_claim_count: int = 0
+    review_has_citations: bool | None = None
+    evidence_complete: bool = False
+    review_cleanliness: ValidationRunDisposition = ValidationRunDisposition.UNVALIDATED
+    repair_status: str = "not_requested"
+    recheck_status: str = "not_required"
+    degradation_reasons: Tuple[str, ...] = ()
     compatibility_status: str = "verified"
 
     def validate(self) -> None:
@@ -350,6 +489,11 @@ class ValidationRunResultV1:
             raise ValidationRunResultError(f"unsupported artifact_version: {self.artifact_version}")
         if self.schema_version != VALIDATION_RUN_SCHEMA_VERSION:
             raise ValidationRunResultError(f"unsupported schema_version: {self.schema_version}")
+        self.input_artifacts.validate()
+        _nonnegative_int(self.expected_claim_count, "expected_claim_count")
+        _nonnegative_int(self.validated_claim_count, "validated_claim_count")
+        _optional_boolean(self.review_has_citations, "review_has_citations")
+        _boolean(self.evidence_complete, "evidence_complete")
         actual = {name: 0 for name in _ALL_VERDICTS}
         for result in self.claim_results:
             actual[result.verdict.value] += 1
@@ -358,14 +502,51 @@ class ValidationRunResultV1:
             raise ValidationRunResultError("claim_verdict_counts do not match claim_results")
         if self.total_claims != len(self.claim_results):
             raise ValidationRunResultError("total_claims does not match claim_results")
+        if self.validated_claim_count != len(self.claim_results):
+            raise ValidationRunResultError("validated_claim_count does not match claim_results")
+        if self.total_claims != self.validated_claim_count:
+            raise ValidationRunResultError("total_claims does not match validated_claim_count")
         if self.contradicted_count != actual[ClaimVerdict.CONTRADICTED.value]:
             raise ValidationRunResultError("contradicted_count does not match claim_verdict_counts")
+        count_complete = self.expected_claim_count == self.validated_claim_count
+        zero_claim_failure = (
+            self.validated_claim_count == 0 and self.review_has_citations is not False
+        )
+        if self.evidence_complete and (not count_complete or zero_claim_failure):
+            raise ValidationRunResultError(
+                "evidence_complete cannot be true when expected claims are unmet"
+            )
+        if not self.repair_status.strip():
+            raise ValidationRunResultError("repair_status must be non-empty")
+        if not self.recheck_status.strip():
+            raise ValidationRunResultError("recheck_status must be non-empty")
         expected_disposition = reduce_validation_disposition(
             self.execution_status,
             (item.verdict for item in self.claim_results),
+            expected_claim_count=self.expected_claim_count,
+            validated_claim_count=self.validated_claim_count,
+            review_has_citations=self.review_has_citations,
+            evidence_complete=self.evidence_complete,
+            repair_status=self.repair_status,
+            recheck_status=self.recheck_status,
+            degradation_reasons=self.degradation_reasons,
         )
-        if self.compatibility_status == "verified" and self.validation_disposition is not expected_disposition:
-            raise ValidationRunResultError("validation_disposition does not match execution status and verdicts")
+        if self.compatibility_status == "verified":
+            if self.validation_disposition is not expected_disposition:
+                raise ValidationRunResultError(
+                    "validation_disposition does not match execution status and completeness"
+                )
+            if self.review_cleanliness is not expected_disposition:
+                raise ValidationRunResultError(
+                    "review_cleanliness does not match validation disposition"
+                )
+        elif (
+            self.validation_disposition is not ValidationRunDisposition.UNVALIDATED
+            or self.review_cleanliness is not ValidationRunDisposition.UNVALIDATED
+        ):
+            raise ValidationRunResultError(
+                "unverified validation results must remain unvalidated"
+            )
 
     @classmethod
     def create(
@@ -379,6 +560,14 @@ class ValidationRunResultV1:
         repair_policy: str = "report_only",
         diagnostics: Sequence[str] = (),
         failure_reason: str = "",
+        input_artifacts: ValidationInputArtifactsV1 | Mapping[str, Any] | None = None,
+        expected_claim_count: int | None = None,
+        validated_claim_count: int | None = None,
+        review_has_citations: bool | None = None,
+        evidence_complete: bool | None = None,
+        repair_status: str = "not_requested",
+        recheck_status: str = "not_required",
+        degradation_reasons: Sequence[str] = (),
         compatibility_status: str = "verified",
         validation_run_id: str = "",
         created_at: str = "",
@@ -386,6 +575,54 @@ class ValidationRunResultV1:
         execution = ValidationExecutionStatus(str(getattr(execution_status, "value", execution_status)))
         now = created_at or _utc_now_iso()
         results = tuple(claim_results)
+        actual_validated_count = len(results)
+        if validated_claim_count is not None:
+            declared_validated_count = _nonnegative_int(
+                validated_claim_count,
+                "validated_claim_count",
+            )
+            if declared_validated_count != actual_validated_count:
+                raise ValidationRunResultError(
+                    "validated_claim_count does not match claim_results"
+                )
+        if expected_claim_count is None:
+            expected_count = actual_validated_count
+        else:
+            expected_count = _nonnegative_int(expected_claim_count, "expected_claim_count")
+        if review_has_citations is not None and not isinstance(review_has_citations, bool):
+            raise ValidationRunResultError("review_has_citations must be boolean")
+        if evidence_complete is not None and not isinstance(evidence_complete, bool):
+            raise ValidationRunResultError("evidence_complete must be boolean")
+        has_citations = True if results and review_has_citations is None else review_has_citations
+        count_complete = expected_count == actual_validated_count
+        run_completed = execution is ValidationExecutionStatus.SUCCEEDED
+        zero_claim_failure = (
+            run_completed
+            and actual_validated_count == 0
+            and has_citations is not False
+        )
+        complete = (
+            run_completed and count_complete and not zero_claim_failure
+            if evidence_complete is None
+            else evidence_complete and run_completed and count_complete and not zero_claim_failure
+        )
+        degradation = list(_string_list(degradation_reasons))
+        if not count_complete:
+            degradation.append("expected_claim_count_unmet")
+        if zero_claim_failure and has_citations is True:
+            degradation.append("citations_present_without_validated_claims")
+        elif zero_claim_failure:
+            degradation.append("citation_presence_unknown_for_zero_claims")
+        if not complete and count_complete and not zero_claim_failure:
+            degradation.append("validation_evidence_incomplete")
+        normalized_repair_status = str(repair_status or "").strip()
+        normalized_recheck_status = str(recheck_status or "").strip()
+        if normalized_repair_status.lower() in _BLOCKING_REPAIR_STATUSES:
+            degradation.append(f"repair_status:{normalized_repair_status.lower()}")
+        if normalized_recheck_status.lower() in _BLOCKING_RECHECK_STATUSES:
+            degradation.append(f"recheck_status:{normalized_recheck_status.lower()}")
+        normalized_degradation = _string_list(degradation)
+        normalized_input_artifacts = ValidationInputArtifactsV1.from_value(input_artifacts)
         counts = {name: 0 for name in _ALL_VERDICTS}
         for result in results:
             counts[result.verdict.value] += 1
@@ -395,7 +632,17 @@ class ValidationRunResultV1:
         disposition = (
             ValidationRunDisposition.UNVALIDATED
             if compatibility_status != "verified"
-            else reduce_validation_disposition(execution, (item.verdict for item in results))
+            else reduce_validation_disposition(
+                execution,
+                (item.verdict for item in results),
+                expected_claim_count=expected_count,
+                validated_claim_count=actual_validated_count,
+                review_has_citations=has_citations,
+                evidence_complete=complete,
+                repair_status=normalized_repair_status,
+                recheck_status=normalized_recheck_status,
+                degradation_reasons=normalized_degradation,
+            )
         )
         instance = cls(
             artifact_type=VALIDATION_RUN_ARTIFACT_TYPE,
@@ -416,6 +663,15 @@ class ValidationRunResultV1:
             total_claims=len(results),
             diagnostics=_string_list(diagnostics),
             failure_reason=failure_reason,
+            input_artifacts=normalized_input_artifacts,
+            expected_claim_count=expected_count,
+            validated_claim_count=actual_validated_count,
+            review_has_citations=has_citations,
+            evidence_complete=complete,
+            review_cleanliness=disposition,
+            repair_status=normalized_repair_status,
+            recheck_status=normalized_recheck_status,
+            degradation_reasons=normalized_degradation,
             compatibility_status=compatibility_status,
         )
         instance.validate()
@@ -429,11 +685,32 @@ class ValidationRunResultV1:
         job_id: str,
         attempt_id: str = "",
         repair_policy: str = "report_only",
+        input_artifacts: ValidationInputArtifactsV1 | Mapping[str, Any] | None = None,
+        expected_claim_count: int | None = None,
+        review_has_citations: bool | None = None,
+        evidence_complete: bool | None = None,
+        repair_status: str = "not_requested",
+        recheck_status: str = "not_required",
+        degradation_reasons: Sequence[str] = (),
     ) -> "ValidationRunResultV1":
         results = tuple(
             ClaimValidationResultV1.from_validation_result(item)
             for item in (_field(report, "citation_results", []) or [])
         )
+        declared_expected = expected_claim_count
+        if declared_expected is None:
+            declared_expected = _field(report, "expected_claim_count", None)
+        if declared_expected is None:
+            declared_expected = _field(report, "total_citations", len(results))
+        normalized_expected = _nonnegative_int(
+            declared_expected,
+            "expected_claim_count",
+        )
+        declared_has_citations = review_has_citations
+        if declared_has_citations is None:
+            declared_has_citations = _field(report, "review_has_citations", None)
+        if declared_has_citations is None and normalized_expected > 0:
+            declared_has_citations = True
         return cls.create(
             job_id=job_id,
             execution_status=ValidationExecutionStatus.SUCCEEDED,
@@ -441,6 +718,17 @@ class ValidationRunResultV1:
             report_id=str(_field(report, "report_id", "") or ""),
             attempt_id=attempt_id,
             repair_policy=repair_policy,
+            input_artifacts=(
+                input_artifacts
+                if input_artifacts is not None
+                else _field(report, "input_artifacts", None)
+            ),
+            expected_claim_count=normalized_expected,
+            review_has_citations=declared_has_citations,
+            evidence_complete=evidence_complete,
+            repair_status=repair_status,
+            recheck_status=recheck_status,
+            degradation_reasons=degradation_reasons,
             created_at=str(_field(report, "created_at", "") or ""),
         )
 
@@ -459,6 +747,12 @@ class ValidationRunResultV1:
             repair_policy=str(payload.get("repair_policy") or "legacy_unknown"),
             diagnostics=("legacy_validation_report_unverified",),
             failure_reason="legacy validation artifact does not satisfy ValidationRunResultV1",
+            expected_claim_count=int(payload.get("total_citations") or len(results)),
+            review_has_citations=bool(payload.get("total_citations") or results),
+            evidence_complete=False,
+            repair_status="legacy_unknown",
+            recheck_status="legacy_unknown",
+            degradation_reasons=("legacy_validation_report_unverified",),
             compatibility_status="legacy_unverified",
             created_at=str(payload.get("created_at") or "") or _utc_now_iso(),
         )
@@ -483,6 +777,15 @@ class ValidationRunResultV1:
             "total_claims": self.total_claims,
             "diagnostics": list(self.diagnostics),
             "failure_reason": self.failure_reason,
+            "input_artifacts": self.input_artifacts.to_dict(),
+            "expected_claim_count": self.expected_claim_count,
+            "validated_claim_count": self.validated_claim_count,
+            "review_has_citations": self.review_has_citations,
+            "evidence_complete": self.evidence_complete,
+            "review_cleanliness": self.review_cleanliness.value,
+            "repair_status": self.repair_status,
+            "recheck_status": self.recheck_status,
+            "degradation_reasons": list(self.degradation_reasons),
             "compatibility_status": self.compatibility_status,
         }
 
@@ -490,6 +793,45 @@ class ValidationRunResultV1:
     def from_dict(cls, payload: Mapping[str, Any]) -> "ValidationRunResultV1":
         if str(payload.get("artifact_type") or "") != VALIDATION_RUN_ARTIFACT_TYPE:
             return cls.from_legacy_report(payload)
+        has_extended_contract = _EXTENDED_CONTRACT_FIELDS.issubset(payload)
+        compatibility_status = str(payload.get("compatibility_status") or "verified")
+        degradation_reasons = _string_list(payload.get("degradation_reasons") or ())
+        if not has_extended_contract:
+            compatibility_status = "legacy_unverified"
+            degradation_reasons = _string_list(
+                (*degradation_reasons, "legacy_validation_run_result_contract_incomplete")
+            )
+        claim_results = tuple(
+            ClaimValidationResultV1.from_dict(item)
+            for item in (payload.get("claim_results") or [])
+            if isinstance(item, Mapping)
+        )
+        validated_claim_count = (
+            _nonnegative_int(
+                payload.get("validated_claim_count"),
+                "validated_claim_count",
+            )
+            if has_extended_contract
+            else len(claim_results)
+        )
+        expected_claim_count = (
+            _nonnegative_int(
+                payload.get("expected_claim_count"),
+                "expected_claim_count",
+            )
+            if has_extended_contract
+            else int(payload.get("total_claims") or len(claim_results))
+        )
+        validation_disposition = (
+            ValidationRunDisposition(str(payload.get("validation_disposition") or "unvalidated"))
+            if has_extended_contract and compatibility_status == "verified"
+            else ValidationRunDisposition.UNVALIDATED
+        )
+        review_cleanliness = (
+            ValidationRunDisposition(str(payload.get("review_cleanliness") or "unvalidated"))
+            if has_extended_contract and compatibility_status == "verified"
+            else ValidationRunDisposition.UNVALIDATED
+        )
         instance = cls(
             artifact_type=str(payload.get("artifact_type") or ""),
             artifact_version=str(payload.get("artifact_version") or ""),
@@ -501,15 +843,9 @@ class ValidationRunResultV1:
             created_at=str(payload.get("created_at") or ""),
             updated_at=str(payload.get("updated_at") or ""),
             execution_status=ValidationExecutionStatus(str(payload.get("execution_status") or "skipped")),
-            validation_disposition=ValidationRunDisposition(
-                str(payload.get("validation_disposition") or "unvalidated")
-            ),
+            validation_disposition=validation_disposition,
             repair_policy=str(payload.get("repair_policy") or "report_only"),
-            claim_results=tuple(
-                ClaimValidationResultV1.from_dict(item)
-                for item in (payload.get("claim_results") or [])
-                if isinstance(item, Mapping)
-            ),
+            claim_results=claim_results,
             claim_verdict_counts={
                 str(key): int(value)
                 for key, value in dict(payload.get("claim_verdict_counts") or {}).items()
@@ -518,16 +854,68 @@ class ValidationRunResultV1:
             total_claims=int(payload.get("total_claims") or 0),
             diagnostics=_string_list(payload.get("diagnostics") or []),
             failure_reason=str(payload.get("failure_reason") or ""),
-            compatibility_status=str(payload.get("compatibility_status") or "verified"),
+            input_artifacts=ValidationInputArtifactsV1.from_value(
+                payload.get("input_artifacts") if has_extended_contract else None
+            ),
+            expected_claim_count=expected_claim_count,
+            validated_claim_count=validated_claim_count,
+            review_has_citations=(
+                _optional_boolean(
+                    payload.get("review_has_citations"),
+                    "review_has_citations",
+                )
+                if has_extended_contract
+                else expected_claim_count > 0
+            ),
+            evidence_complete=(
+                _boolean(payload.get("evidence_complete"), "evidence_complete")
+                if has_extended_contract
+                else False
+            ),
+            review_cleanliness=review_cleanliness,
+            repair_status=(
+                str(payload.get("repair_status") or "")
+                if has_extended_contract
+                else "legacy_unknown"
+            ),
+            recheck_status=(
+                str(payload.get("recheck_status") or "")
+                if has_extended_contract
+                else "legacy_unknown"
+            ),
+            degradation_reasons=degradation_reasons,
+            compatibility_status=compatibility_status,
         )
         instance.validate()
         return instance
 
     @property
     def contract_satisfied(self) -> bool:
+        primary_inputs_verified = all(
+            (
+                self.input_artifacts.review_draft_id,
+                self.input_artifacts.review_draft_hash,
+                self.input_artifacts.citation_manifest_id,
+                self.input_artifacts.citation_manifest_hash,
+            )
+        )
+        evidence_inputs_verified = (
+            self.review_has_citations is False
+            or bool(self.input_artifacts.evidence_manifest_ids)
+        )
         return (
             self.compatibility_status == "verified"
             and self.execution_status is ValidationExecutionStatus.SUCCEEDED
+            and self.evidence_complete
+            and self.expected_claim_count == self.validated_claim_count
+            and primary_inputs_verified
+            and evidence_inputs_verified
+            and self.repair_status.strip().lower() not in _BLOCKING_REPAIR_STATUSES
+            and self.recheck_status.strip().lower() not in _BLOCKING_RECHECK_STATUSES
+            and not (
+                self.validated_claim_count == 0
+                and self.review_has_citations is not False
+            )
         )
 
     def stable_hash(self) -> str:

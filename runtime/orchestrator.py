@@ -12,7 +12,12 @@ from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_entry, stage_policy_for
 from runtime.validation_adapter import RuntimeValidationAdapter
-from services.artifact_registry import ArtifactDependencyRef, ArtifactDependencyRefV2, ArtifactRecord
+from services.artifact_registry import (
+    ArtifactDependencyRef,
+    ArtifactDependencyRefV2,
+    ArtifactRecord,
+    file_sha256,
+)
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.queue_service import CancelToken
@@ -87,6 +92,7 @@ class AgentRuntimeBridge:
         claim_latest_pointer: bool = True,
         resume_requested: bool = False,
         resume_preflight: Callable[[JobWorkspace], None] | None = None,
+        workspace_preflight: Callable[[JobWorkspace], None] | None = None,
         publish_running_state: bool = True,
     ) -> AgentRuntimeSession:
         request = self.build_job_request()
@@ -130,6 +136,14 @@ class AgentRuntimeBridge:
         if resolved_project_name != project_name:
             project_name = resolved_project_name
             generator.project_name = resolved_project_name
+
+        if workspace_preflight is not None:
+            planned_workspace = JobWorkspace(
+                output_base_dir,
+                project_name,
+                str(request.job_id or self.job_spec.job_id),
+            )
+            workspace_preflight(planned_workspace)
 
         prepared_sources = runner._prepare_source_inventory(
             generator=generator,
@@ -216,8 +230,13 @@ class AgentRuntimeBridge:
         )
         return self._artifact_ref_from_record(record)
 
-    def build_validation_adapter(self, session: AgentRuntimeSession) -> RuntimeValidationAdapter:
-        return RuntimeValidationAdapter(session.generator)
+    def build_validation_adapter(
+        self,
+        session: AgentRuntimeSession,
+        *,
+        attempt_id: str = "",
+    ) -> RuntimeValidationAdapter:
+        return RuntimeValidationAdapter(session.generator, validation_attempt_id=attempt_id)
 
     def persist_stage1_results(
         self,
@@ -233,6 +252,22 @@ class AgentRuntimeBridge:
     ) -> StageResult:
         generator = session.generator
         normalized_summaries = [dict(summary) for summary in summaries]
+        source_bundle_record = session.context.registry.get("source_bundle")
+        if source_bundle_record is None:
+            self.persist_source_bundle(session, self.build_source_bundle())
+            source_bundle_record = session.context.registry.get("source_bundle")
+        if source_bundle_record is None or source_bundle_record.status != "ready":
+            raise RuntimeError("stage1 source bundle is not registered and ready")
+        source_dependencies = [
+            ArtifactDependencyRef(
+                dependency_kind="local_job",
+                job_id=source_bundle_record.job_id,
+                artifact_id=source_bundle_record.artifact_id,
+                artifact_type=source_bundle_record.artifact_type,
+                path=source_bundle_record.path,
+                content_hash=source_bundle_record.content_hash,
+            )
+        ]
         generator.summaries = normalized_summaries
         generator._checkpoint_processed_papers = set()
         generator._checkpoint_failed_papers = set()
@@ -247,7 +282,7 @@ class AgentRuntimeBridge:
             else:
                 generator._checkpoint_failed_papers.add(paper_key)
 
-        if not generator.save_summaries():
+        if not generator.save_summaries(depends_on=source_dependencies):
             raise RuntimeError("stage1 summary persistence failed")
 
         manifest_path = ""
@@ -258,6 +293,7 @@ class AgentRuntimeBridge:
                 producer=producer,
                 source_items=source_items,
                 rejected_candidates=rejected_candidates,
+                source_dependencies_override=source_dependencies,
             ):
                 raise RuntimeError("summary source manifest persistence failed")
             manifest_path = generator._get_summary_source_manifest_path()
@@ -561,13 +597,14 @@ class AgentRuntimeBridge:
         self,
         session: AgentRuntimeSession,
         *,
+        attempt_id: str = "",
         validator_module: Any | None = None,
         producer: str = "runtime.orchestrator.AgentRuntimeBridge.run_validation",
     ) -> StageResult:
         if validator_module is None:
             import validator as validator_module  # type: ignore
 
-        adapter = self.build_validation_adapter(session)
+        adapter = self.build_validation_adapter(session, attempt_id=attempt_id)
         result = dict(validator_module.run_review_validation(adapter) or {})
 
         from validation.run_result import ValidationExecutionStatus, ValidationRunResultV1
@@ -578,22 +615,89 @@ class AgentRuntimeBridge:
         completion_report_file = str(result.get("completion_report_file") or "")
         run_obj = result.get("validation_run_result")
         if isinstance(run_obj, ValidationRunResultV1):
-            validation_run_result = run_obj
+            candidate_result = run_obj
         elif isinstance(run_obj, Mapping):
-            validation_run_result = ValidationRunResultV1.from_dict(run_obj)
-        elif validation_run_result_file and Path(validation_run_result_file).is_file():
-            validation_run_result = ValidationRunResultV1.from_dict(
-                json.loads(Path(validation_run_result_file).read_text(encoding="utf-8"))
-            )
+            candidate_result = ValidationRunResultV1.from_dict(run_obj)
         else:
             legacy_report = result.get("report")
             legacy_payload: Mapping[str, Any] = legacy_report if isinstance(legacy_report, Mapping) else {}
-            validation_run_result = ValidationRunResultV1.from_legacy_report(
+            candidate_result = ValidationRunResultV1.from_legacy_report(
                 legacy_payload,
                 job_id=session.context.workspace.job_id,
             )
 
+        validation_run_result = candidate_result
+        canonical_digest = ""
+        durability_failure = ""
+        if validation_run_result_file:
+            canonical_path = Path(validation_run_result_file).expanduser().resolve()
+            if not canonical_path.is_file():
+                durability_failure = "canonical_validation_result_missing"
+            else:
+                try:
+                    validation_run_result = ValidationRunResultV1.from_dict(
+                        json.loads(canonical_path.read_text(encoding="utf-8"))
+                    )
+                    canonical_digest = file_sha256(canonical_path)
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                    durability_failure = "canonical_validation_result_invalid"
+        elif candidate_result.execution_status is ValidationExecutionStatus.SUCCEEDED:
+            durability_failure = "canonical_validation_result_missing"
+
+        if not durability_failure and validation_run_result_file:
+            if validation_run_result.job_id != session.context.workspace.job_id:
+                durability_failure = "canonical_validation_job_mismatch"
+            elif validation_run_result.attempt_id != str(attempt_id or ""):
+                durability_failure = "canonical_validation_attempt_mismatch"
+
+        if durability_failure:
+            self._append_stage_trace_entries(
+                session,
+                [
+                    build_runtime_stage_trace_entry(
+                        stage_name="stage4_validate",
+                        step_name="run_review_validation",
+                        producer=producer,
+                        execution_mode=ExecutionMode.LOCAL,
+                        metadata={
+                            "validation_run_result_file": validation_run_result_file,
+                            "execution_status": "failed",
+                            "validation_disposition": "unvalidated",
+                            "failure_reason": durability_failure,
+                        },
+                    )
+                ],
+            )
+            return StageResult(
+                stage_name="stage4_validate",
+                success=False,
+                artifacts=[],
+                metadata={
+                    "manual_review_count": 0,
+                    "validation_run_id": "",
+                    "execution_status": "failed",
+                    "validation_disposition": "unvalidated",
+                    "claim_verdict_counts": {},
+                    "contradicted_count": 0,
+                    "failure_reason": durability_failure,
+                },
+            )
+
         artifact_refs: list[StageArtifactRef] = []
+        validation_contract_complete = bool(
+            validation_run_result.contract_satisfied
+            and validation_run_result.compatibility_status == "verified"
+        )
+        validation_success = bool(
+            validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED
+            and validation_contract_complete
+        )
+        contract_failure = (
+            "validation_contract_incomplete"
+            if validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED
+            and not validation_contract_complete
+            else ""
+        )
         depends_on = [
             ArtifactDependencyRef(
                 artifact_type=session.generator.REVIEW_DRAFT_V2_ARTIFACT_TYPE,
@@ -615,26 +719,46 @@ class AgentRuntimeBridge:
                 producer=producer,
                 depends_on=depends_on,
                 artifact_id=validation_run_result.validation_run_id,
+                status="quarantined" if contract_failure else "ready",
                 metadata={
                     "execution_status": validation_run_result.execution_status.value,
                     "validation_disposition": validation_run_result.validation_disposition.value,
                     "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
                 },
             )
-            artifact_refs.append(self._artifact_ref_from_record(canonical_record))
-
-        projection_dependencies = depends_on
-        if canonical_record is not None:
-            projection_dependencies = [
-                ArtifactDependencyRefV2(
-                    dependency_kind="local_job",
-                    job_id=session.context.workspace.job_id,
-                    artifact_id=canonical_record.artifact_id,
-                    artifact_type=canonical_record.artifact_type,
-                    path=canonical_record.path,
-                    content_hash=canonical_record.content_hash,
+            if canonical_record.content_hash != canonical_digest:
+                session.context.registry.update_record(
+                    canonical_record.artifact_id,
+                    status="invalid",
+                    metadata_updates={"invalid_reason": "canonical_validation_hash_changed"},
                 )
-            ]
+                return StageResult(
+                    stage_name="stage4_validate",
+                    success=False,
+                    artifacts=[],
+                    metadata={
+                        "manual_review_count": 0,
+                        "validation_run_id": validation_run_result.validation_run_id,
+                        "execution_status": "failed",
+                        "validation_disposition": "unvalidated",
+                        "claim_verdict_counts": {},
+                        "contradicted_count": 0,
+                        "failure_reason": "canonical_validation_hash_changed",
+                    },
+                )
+            if not contract_failure:
+                artifact_refs.append(self._artifact_ref_from_record(canonical_record))
+
+        projection_dependencies = [
+            ArtifactDependencyRefV2(
+                dependency_kind="local_job",
+                job_id=session.context.workspace.job_id,
+                artifact_id=canonical_record.artifact_id,
+                artifact_type=canonical_record.artifact_type,
+                path=canonical_record.path,
+                content_hash=canonical_record.content_hash,
+            )
+        ] if canonical_record is not None and not contract_failure else []
 
         projections = (
             (report_file, "validation_report_projection", "validation-report"),
@@ -644,7 +768,7 @@ class AgentRuntimeBridge:
         )
 
         for path, artifact_type, artifact_prefix in projections:
-            if not path:
+            if not path or canonical_record is None or contract_failure:
                 continue
             record = session.context.registry.register_file(
                 artifact_role="validation_projection",
@@ -671,6 +795,7 @@ class AgentRuntimeBridge:
                         "manual_report_file": manual_report_file,
                         "execution_status": validation_run_result.execution_status.value,
                         "validation_disposition": validation_run_result.validation_disposition.value,
+                        "failure_reason": contract_failure,
                     },
                 )
             ],
@@ -678,7 +803,7 @@ class AgentRuntimeBridge:
 
         return StageResult(
             stage_name="stage4_validate",
-            success=validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED,
+            success=validation_success,
             artifacts=artifact_refs,
             metadata={
                 "manual_review_count": validation_run_result.claim_verdict_counts.get("needs_review", 0),
@@ -687,6 +812,9 @@ class AgentRuntimeBridge:
                 "validation_disposition": validation_run_result.validation_disposition.value,
                 "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
                 "contradicted_count": validation_run_result.contradicted_count,
+                "canonical_artifact_id": canonical_record.artifact_id if canonical_record else "",
+                "canonical_content_hash": canonical_record.content_hash if canonical_record else "",
+                "failure_reason": contract_failure,
             },
         )
 
@@ -695,11 +823,17 @@ class AgentRuntimeBridge:
         session: AgentRuntimeSession,
         batch_spec: Any,
         *,
+        derivation_id: str = "",
         producer: str = "runtime.orchestrator.AgentRuntimeBridge.derive_review_batch",
     ) -> StageResult:
         """Materialize a verified parent Stage 1 subset without invoking Stage 1."""
 
-        from services.review_batch import ReviewBatchSpecV1, derive_review_batch
+        from services.review_batch import (
+            ReviewBatchDerivationResultV1,
+            ReviewBatchSpecV1,
+            ReviewVariantDerivationResultV1,
+            derive_review_batch,
+        )
 
         if not isinstance(batch_spec, ReviewBatchSpecV1):
             raise TypeError("batch_spec must be ReviewBatchSpecV1")
@@ -707,8 +841,45 @@ class AgentRuntimeBridge:
             batch_spec,
             workspace=session.context.workspace,
             registry=session.context.registry,
+            derivation_id=derivation_id,
             producer=producer,
         )
+        if isinstance(result, ReviewBatchDerivationResultV1):
+            metadata = {
+                "batch_id": result.batch_id,
+                "derivation_id": result.derivation_id,
+                "parent_job_id": result.parent_job_id,
+                "parent_artifact_id": result.parent_artifact_id,
+                "parent_summary_hash": result.parent_summary_hash,
+                "variant_count": len(batch_spec.variant_specs()),
+                "completed_variant_count": len(result.variant_results),
+                "failed_variant_count": len(result.failed_variants),
+                "failed_variants": dict(result.failed_variants),
+                "review_batch_manifest_path": result.manifest_path,
+                "review_batch_projection_path": result.projection_path,
+                "stage1_model_calls": 0,
+            }
+            self._append_stage_trace_entries(
+                session,
+                [
+                    build_runtime_stage_trace_entry(
+                        stage_name="stage1_derive",
+                        step_name="coordinate_review_batch_variants",
+                        producer=producer,
+                        execution_mode=ExecutionMode.LOCAL,
+                        metadata=metadata,
+                    )
+                ],
+            )
+            return StageResult(
+                stage_name="derive_review_batch",
+                success=result.success,
+                artifacts=[self._artifact_ref_from_record(result.manifest_artifact)],
+                metadata=metadata,
+            )
+
+        if not isinstance(result, ReviewVariantDerivationResultV1):
+            raise TypeError("derive_review_batch returned an unsupported result")
         session.generator.summary_file = result.summary_path
         self._append_stage_trace_entries(
             session,

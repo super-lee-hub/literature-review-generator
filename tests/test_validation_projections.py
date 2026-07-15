@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import validator
+from services.artifact_registry import ArtifactRegistry, file_sha256
+from services.job_workspace import JobWorkspace, atomic_write_json
 from services.repair_policy import ValidationRepairPolicy
 from validation.run_result import ValidationRunResultV1
 
@@ -119,3 +121,145 @@ def test_projection_writer_ignores_legacy_manual_item_list(tmp_path: Path) -> No
         "unsafe_auto_rewrite_enabled": False,
         "validation_run_id": canonical.validation_run_id,
     }
+
+
+def test_validator_populates_verified_input_artifact_contract(tmp_path: Path) -> None:
+    workspace = JobWorkspace.create(
+        str(tmp_path),
+        "validation-input-contract",
+        job_id="job-input-contract",
+    )
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    review_path = workspace.artifact_path("review_draft_v2.json")
+    citation_path = workspace.artifact_path("citation_manifest_v3.json")
+    evidence_path = workspace.artifact_path("paper_artifacts/paper-a.evidence_manifest_v1.json")
+    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v2"})
+    atomic_write_json(
+        citation_path,
+        {
+            "artifact_type": "citation_manifest",
+            "artifact_version": "v3",
+            "citation_sets": [{"citation_set_key": "paper-a", "paper_ids": ["paper-a"]}],
+            "occurrences": [],
+        },
+    )
+    atomic_write_json(evidence_path, {"artifact_type": "evidence_manifest", "artifact_version": "v1"})
+    review_record = registry.register_file(
+        artifact_id="review:v2",
+        artifact_role="review_draft",
+        artifact_type="review_draft",
+        artifact_version="v2",
+        path=review_path,
+        producer="tests",
+    )
+    citation_record = registry.register_file(
+        artifact_id="citation:v3",
+        artifact_role="citation_manifest",
+        artifact_type="citation_manifest",
+        artifact_version="v3",
+        path=citation_path,
+        producer="tests",
+    )
+    evidence_record = registry.register_file(
+        artifact_id="evidence:paper-a",
+        artifact_role="evidence",
+        artifact_type="evidence_manifest",
+        artifact_version="v1",
+        path=evidence_path,
+        producer="tests",
+    )
+    generator = SimpleNamespace(
+        job_workspace=workspace,
+        artifact_registry=registry,
+        _review_draft_v2_path=lambda: review_path,
+        _citation_manifest_path=lambda: citation_path,
+    )
+    paper_artifact = {
+        "paper_identity": {"canonical_paper_key": "paper-a"},
+        "stage1_inputs": {
+            "evidence_manifest_path": evidence_path,
+            "evidence_manifest_hash": file_sha256(evidence_path),
+        },
+    }
+
+    inputs, expected, has_citations, complete, reasons = validator._validation_input_contract(
+        generator,
+        json.loads(Path(review_path).read_text(encoding="utf-8")),
+        json.loads(Path(citation_path).read_text(encoding="utf-8")),
+        [paper_artifact],
+    )
+
+    assert inputs.review_draft_id == review_record.artifact_id
+    assert inputs.review_draft_hash == review_record.content_hash
+    assert inputs.citation_manifest_id == citation_record.artifact_id
+    assert inputs.citation_manifest_hash == citation_record.content_hash
+    assert inputs.evidence_manifest_ids == (evidence_record.artifact_id,)
+    assert inputs.evidence_manifest_hashes == (evidence_record.content_hash,)
+    assert expected == 1
+    assert has_citations is True
+    assert complete is True
+    assert reasons == ()
+
+
+def test_validator_does_not_treat_cited_draft_with_empty_manifest_as_citation_free(
+    tmp_path: Path,
+) -> None:
+    workspace = JobWorkspace.create(str(tmp_path), "cited-empty-manifest", job_id="job-empty")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    review_path = workspace.artifact_path("review_draft_v2.json")
+    citation_path = workspace.artifact_path("citation_manifest_v3.json")
+    review_draft = {
+        "artifact_type": "review_draft",
+        "artifact_version": "v2",
+        "content": {
+            "sections": [
+                {
+                    "blocks": [
+                        {
+                            "block_id": "block-1",
+                            "text": "Claim [[cite_ref:ref-1]].",
+                            "citations": [{"ref_id": "ref-1"}],
+                        }
+                    ]
+                }
+            ]
+        },
+    }
+    citation_manifest = {
+        "artifact_type": "citation_manifest",
+        "artifact_version": "v3",
+        "citation_sets": [],
+        "occurrences": [],
+    }
+    atomic_write_json(review_path, review_draft)
+    atomic_write_json(citation_path, citation_manifest)
+    for artifact_id, artifact_type, path in (
+        ("review:v2", "review_draft", review_path),
+        ("citation:v3", "citation_manifest", citation_path),
+    ):
+        registry.register_file(
+            artifact_id=artifact_id,
+            artifact_role=artifact_type,
+            artifact_type=artifact_type,
+            artifact_version="v2" if artifact_type == "review_draft" else "v3",
+            path=path,
+            producer="tests",
+        )
+    generator = SimpleNamespace(
+        job_workspace=workspace,
+        artifact_registry=registry,
+        _review_draft_v2_path=lambda: review_path,
+        _citation_manifest_path=lambda: citation_path,
+    )
+
+    _inputs, expected, has_citations, complete, reasons = validator._validation_input_contract(
+        generator,
+        review_draft,
+        citation_manifest,
+        [],
+    )
+
+    assert expected == 1
+    assert has_citations is True
+    assert complete is False
+    assert "citation_manifest_missing_review_citations" in reasons

@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import time
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -43,6 +44,14 @@ class ArtifactConflict(RegistryError):
 
 class ArtifactNotFound(RegistryError):
     """Raised when a locked artifact mutation targets an unknown artifact."""
+
+
+class UnverifiedDependency(RegistryError):
+    """Raised when a ready artifact dependency cannot be verified durably."""
+
+
+class UnverifiedArtifact(RegistryError):
+    """Raised when a ready artifact's durable file identity cannot be verified."""
 
 
 DependencyKind = Literal["local_job", "external_job"]
@@ -409,6 +418,8 @@ class ArtifactRegistry:
         artifacts: Mapping[str, ArtifactRecord],
         *,
         owner_job_id: str,
+        require_ready: bool = False,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
     ) -> List[ArtifactDependencyRefV2]:
         normalized: List[ArtifactDependencyRefV2] = []
         for dependency in dependencies:
@@ -422,15 +433,18 @@ class ArtifactRegistry:
             registered = artifacts.get(ref.artifact_id) if ref.artifact_id else None
             if registered is None and ref.path:
                 normalized_path = os.path.abspath(os.fspath(ref.path))
-                registered = next(
-                    (
-                        record
-                        for record in artifacts.values()
-                        if os.path.normcase(record.path) == os.path.normcase(normalized_path)
-                        and (not ref.artifact_type or record.artifact_type == ref.artifact_type)
-                    ),
-                    None,
-                )
+                candidates = [
+                    record
+                    for record in artifacts.values()
+                    if os.path.normcase(record.path) == os.path.normcase(normalized_path)
+                    and (not ref.artifact_type or record.artifact_type == ref.artifact_type)
+                ]
+                if len(candidates) > 1:
+                    raise UnverifiedDependency(
+                        "dependency path resolves to multiple Registry records: "
+                        f"{normalized_path}"
+                    )
+                registered = candidates[0] if candidates else None
             artifact_type = ref.artifact_type or (registered.artifact_type if registered else "unknown")
             path = ref.path or (registered.path if registered else "")
             artifact_id = ref.artifact_id or (
@@ -441,17 +455,94 @@ class ArtifactRegistry:
             dependency_kind: DependencyKind = ref.dependency_kind
             if job_id and job_id != owner_job_id:
                 dependency_kind = "external_job"
-            normalized.append(
-                ArtifactDependencyRefV2(
-                    dependency_kind=dependency_kind,
-                    job_id=job_id,
-                    artifact_id=artifact_id,
-                    artifact_type=artifact_type,
-                    path=os.fspath(path),
-                    content_hash=content_hash,
-                )
+            normalized_ref = ArtifactDependencyRefV2(
+                dependency_kind=dependency_kind,
+                job_id=job_id,
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                path=os.fspath(path),
+                content_hash=content_hash,
             )
+            if require_ready:
+                normalized_ref = self._verify_ready_dependency(
+                    normalized_ref,
+                    artifacts=artifacts,
+                    owner_job_id=owner_job_id,
+                    external_registry_resolver=external_registry_resolver,
+                )
+            normalized.append(normalized_ref)
         return normalized
+
+    def _verify_ready_dependency(
+        self,
+        ref: ArtifactDependencyRefV2,
+        *,
+        artifacts: Mapping[str, ArtifactRecord],
+        owner_job_id: str,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None,
+    ) -> ArtifactDependencyRefV2:
+        if ref.dependency_kind == "local_job":
+            if ref.job_id and ref.job_id != owner_job_id:
+                raise UnverifiedDependency(
+                    f"local dependency names another job: {ref.job_id}/{ref.artifact_id}"
+                )
+            record = artifacts.get(ref.artifact_id)
+        else:
+            if not ref.job_id or ref.job_id == owner_job_id:
+                raise UnverifiedDependency(
+                    f"external dependency has invalid job identity: {ref.job_id}/{ref.artifact_id}"
+                )
+            if external_registry_resolver is None:
+                raise UnverifiedDependency(
+                    f"external dependency cannot be verified without a resolver: "
+                    f"{ref.job_id}/{ref.artifact_id}"
+                )
+            target_registry = external_registry_resolver(ref.job_id)
+            if target_registry is None:
+                raise UnverifiedDependency(
+                    f"external dependency Registry is unavailable: {ref.job_id}/{ref.artifact_id}"
+                )
+            if target_registry.job_id != ref.job_id:
+                raise UnverifiedDependency(
+                    f"external dependency Registry owner mismatch: {ref.job_id}/{ref.artifact_id}"
+                )
+            target_registry.reload()
+            record = target_registry.get(ref.artifact_id)
+
+        if record is None:
+            raise UnverifiedDependency(
+                f"dependency is not registered: {ref.job_id or owner_job_id}/{ref.artifact_id}"
+            )
+        if record.status != "ready":
+            raise UnverifiedDependency(
+                f"dependency is not ready: {record.job_id}/{record.artifact_id} ({record.status})"
+            )
+        if ref.job_id and record.job_id != ref.job_id:
+            raise UnverifiedDependency(f"dependency job_id mismatch: {ref.artifact_id}")
+        if ref.artifact_type and record.artifact_type != ref.artifact_type:
+            raise UnverifiedDependency(f"dependency artifact_type mismatch: {ref.artifact_id}")
+
+        record_path = os.path.abspath(os.fspath(record.path))
+        if ref.path and os.path.normcase(os.path.abspath(os.fspath(ref.path))) != os.path.normcase(record_path):
+            raise UnverifiedDependency(f"dependency path mismatch: {ref.artifact_id}")
+        if not os.path.isfile(record_path):
+            raise UnverifiedDependency(f"dependency file is missing: {ref.artifact_id}")
+        if not record.content_hash:
+            raise UnverifiedDependency(f"dependency content hash is missing: {ref.artifact_id}")
+        actual_hash = file_sha256(record_path)
+        if actual_hash != record.content_hash:
+            raise UnverifiedDependency(f"dependency content hash changed: {ref.artifact_id}")
+        if ref.content_hash and ref.content_hash != record.content_hash:
+            raise UnverifiedDependency(f"dependency declared hash mismatch: {ref.artifact_id}")
+
+        return ArtifactDependencyRefV2(
+            dependency_kind=ref.dependency_kind,
+            job_id=record.job_id,
+            artifact_id=record.artifact_id,
+            artifact_type=record.artifact_type,
+            path=record_path,
+            content_hash=record.content_hash,
+        )
 
     @staticmethod
     def _validate_ready_path(path: str, status: str) -> str:
@@ -461,6 +552,26 @@ class ArtifactRegistry:
         if os.path.exists(abs_path) and not os.path.isfile(abs_path):
             raise IsADirectoryError(f"artifact path is not a file: {abs_path}")
         return abs_path
+
+    @classmethod
+    def _verify_ready_artifact(cls, record: ArtifactRecord) -> None:
+        artifact_path = cls._validate_ready_path(record.path, "ready")
+        if not record.content_hash:
+            raise UnverifiedArtifact(
+                f"artifact content hash is missing: {record.artifact_id}"
+            )
+        if file_sha256(artifact_path) != record.content_hash:
+            raise UnverifiedArtifact(
+                f"artifact content hash changed: {record.artifact_id}"
+            )
+
+    @staticmethod
+    def _copy_record(record: ArtifactRecord) -> ArtifactRecord:
+        return replace(
+            record,
+            depends_on=list(record.depends_on),
+            metadata=deepcopy(record.metadata),
+        )
 
     def _register_transaction(
         self,
@@ -484,6 +595,8 @@ class ArtifactRegistry:
             self._validate_artifact_merge(existing, candidate)
             if existing is not None and existing.created_at:
                 candidate = replace(candidate, created_at=existing.created_at)
+            if candidate.status == "ready":
+                self._verify_ready_artifact(candidate)
             merged = dict(artifacts)
             merged[candidate.artifact_id] = candidate
             next_revision = disk_revision + 1
@@ -491,9 +604,14 @@ class ArtifactRegistry:
             # Memory changes only after the durable os.replace succeeds.
             self._artifacts = merged
             self._revision = next_revision
-            return candidate
+            return self._copy_record(candidate)
 
-    def save(self, *, expected_revision: Optional[int] = None) -> None:
+    def save(
+        self,
+        *,
+        expected_revision: Optional[int] = None,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+    ) -> None:
         """Persist an explicit in-memory snapshot with compare-and-swap protection.
 
         Registration callers should use :meth:`register_file` or :meth:`register`.
@@ -508,6 +626,7 @@ class ArtifactRegistry:
                 raise RegistryRevisionConflict(
                     f"expected registry revision {compare_revision}, found {disk_revision}"
                 )
+            snapshot: Dict[str, ArtifactRecord] = {}
             for record in self._artifacts.values():
                 if record.job_id != self.job_id:
                     raise ArtifactConflict(
@@ -515,16 +634,48 @@ class ArtifactRegistry:
                         f"not registry owner {self.job_id!r}"
                     )
                 self._validate_artifact_merge(disk_artifacts.get(record.artifact_id), record)
+                if record.status == "ready":
+                    self._verify_ready_artifact(record)
+                    record = replace(
+                        record,
+                        depends_on=self._normalize_dependencies(
+                            record.depends_on,
+                            self._artifacts,
+                            owner_job_id=record.job_id,
+                            require_ready=True,
+                            external_registry_resolver=external_registry_resolver,
+                        ),
+                    )
+                snapshot[record.artifact_id] = record
             next_revision = disk_revision + 1
-            snapshot = dict(self._artifacts)
             self._write_registry_unlocked(snapshot, next_revision)
+            self._artifacts = snapshot
             self._revision = next_revision
 
     def list_records(self) -> List[ArtifactRecord]:
-        return list(self._artifacts.values())
+        return [self._copy_record(record) for record in self._artifacts.values()]
 
     def get(self, artifact_id: str) -> Optional[ArtifactRecord]:
-        return self._artifacts.get(artifact_id)
+        record = self._artifacts.get(artifact_id)
+        return self._copy_record(record) if record is not None else None
+
+    def verify_ready_dependencies(
+        self,
+        dependencies: Iterable[ArtifactDependencyRefV2 | Mapping[str, Any]],
+        *,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+    ) -> List[ArtifactDependencyRefV2]:
+        """Validate dependencies against the latest durable Registry state."""
+
+        with self._transaction_lock():
+            _revision, artifacts = self._read_registry_unlocked()
+            return self._normalize_dependencies(
+                dependencies,
+                artifacts,
+                owner_job_id=self.job_id,
+                require_ready=True,
+                external_registry_resolver=external_registry_resolver,
+            )
 
     def register_file(
         self,
@@ -536,6 +687,7 @@ class ArtifactRegistry:
         producer: str,
         status: str = "ready",
         depends_on: Iterable[ArtifactDependencyRefV2 | Mapping[str, Any]] | None = None,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
         artifact_id: str | None = None,
         expected_revision: int | None = None,
         metadata: Mapping[str, Any] | None = None,
@@ -554,9 +706,13 @@ class ArtifactRegistry:
                 status=status,
                 content_hash=content_hash,
                 depends_on=self._normalize_dependencies(
-                    depends_on or [], artifacts, owner_job_id=self.job_id
+                    depends_on or [],
+                    artifacts,
+                    owner_job_id=self.job_id,
+                    require_ready=status == "ready",
+                    external_registry_resolver=external_registry_resolver,
                 ),
-                metadata=dict(metadata or {}),
+                metadata=deepcopy(dict(metadata or {})),
                 created_at=utc_now_iso(),
             )
 
@@ -573,6 +729,7 @@ class ArtifactRegistry:
         job_id: str,
         status: str = "ready",
         depends_on: Iterable[ArtifactDependencyRefV2 | Mapping[str, Any]] | None = None,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
         artifact_role: str | None = None,
         expected_revision: int | None = None,
         metadata: Mapping[str, Any] | None = None,
@@ -593,9 +750,13 @@ class ArtifactRegistry:
                 status=status,
                 content_hash=content_hash,
                 depends_on=self._normalize_dependencies(
-                    depends_on or [], artifacts, owner_job_id=job_id
+                    depends_on or [],
+                    artifacts,
+                    owner_job_id=job_id,
+                    require_ready=status == "ready",
+                    external_registry_resolver=external_registry_resolver,
                 ),
-                metadata=dict(metadata or {}),
+                metadata=deepcopy(dict(metadata or {})),
                 created_at=utc_now_iso(),
             )
 
@@ -607,6 +768,7 @@ class ArtifactRegistry:
         *,
         status: str | None = None,
         depends_on: Iterable[ArtifactDependencyRefV2 | Mapping[str, Any]] | None = None,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
         metadata_updates: Mapping[str, Any] | None = None,
         expected_revision: int | None = None,
     ) -> ArtifactRecord:
@@ -621,13 +783,16 @@ class ArtifactRegistry:
                 raise ArtifactNotFound(f"artifact not found: {artifact_id}")
             next_status = status or current.status
             self._validate_ready_path(current.path, next_status)
-            next_dependencies = (
-                self._normalize_dependencies(depends_on, artifacts, owner_job_id=current.job_id)
-                if depends_on is not None
-                else list(current.depends_on)
+            dependency_source = depends_on if depends_on is not None else current.depends_on
+            next_dependencies = self._normalize_dependencies(
+                dependency_source,
+                artifacts,
+                owner_job_id=current.job_id,
+                require_ready=next_status == "ready",
+                external_registry_resolver=external_registry_resolver,
             )
-            next_metadata = dict(current.metadata)
-            next_metadata.update(dict(metadata_updates or {}))
+            next_metadata = deepcopy(current.metadata)
+            next_metadata.update(deepcopy(dict(metadata_updates or {})))
             return replace(
                 current,
                 status=next_status,

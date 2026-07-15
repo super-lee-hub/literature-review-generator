@@ -15,7 +15,7 @@ from runtime.reconcile import (
     validate_canonical_ai_summary,
 )
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry
-from services.audit_record import AuditArtifactRefV1, AuditRecordV1
+from services.audit_record import AuditArtifactRefV1, AuditRecordV1, AuditType
 from services.citation_manifest import build_citation_manifest_v3_from_review_draft
 from services.citation_ref_catalog import build_document_ref_catalog
 from services.evidence_manifest import build_evidence_manifest_v1
@@ -441,7 +441,7 @@ def test_audit_record_dependencies_must_match_live_audit_references(tmp_path: Pa
         content_hash=source_record.content_hash,
     )
     audit = AuditRecordV1.create(
-        audit_type="legacy_reuse",
+        audit_type="outline_manual_adoption",
         job_id=workspace.job_id,
         attempt_id="attempt-1",
         producer="tests",
@@ -466,3 +466,67 @@ def test_audit_record_dependencies_must_match_live_audit_references(tmp_path: Pa
 
     with pytest.raises(ReconcileValidationError, match="dependencies"):
         RuntimeReconciler(workspace, registry).validate_record(audit_record)
+
+
+@pytest.mark.parametrize(
+    "audit_type",
+    ("identity_override", "artifact_quarantine_release", "legacy_reuse"),
+)
+def test_detached_audit_records_preserve_signed_refs_without_live_dependencies(
+    tmp_path: Path,
+    audit_type: AuditType,
+) -> None:
+    workspace = JobWorkspace.create(str(tmp_path), audit_type, job_id=f"job-{audit_type}")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    target_path = Path(workspace.artifact_path("quarantined-target.json"))
+    target_path.write_text(json.dumps({"status": "quarantined"}), encoding="utf-8")
+    target_record = registry.register_file(
+        artifact_role="quarantined_target",
+        artifact_type="quarantined_target",
+        artifact_version="v1",
+        path=target_path,
+        producer="tests",
+        artifact_id="quarantined-target",
+        status="quarantined",
+    )
+    target_ref = AuditArtifactRefV1(
+        artifact_id=target_record.artifact_id,
+        artifact_type=target_record.artifact_type,
+        job_id=target_record.job_id,
+        content_hash=target_record.content_hash,
+    )
+    audit = AuditRecordV1.create(
+        audit_type=audit_type,
+        job_id=workspace.job_id,
+        attempt_id="attempt-1",
+        producer="tests",
+        actor="operator",
+        reason="authorized detached audit",
+        scope={"operation": "detached_audit_contract"},
+        target_artifacts=[target_ref],
+        input_artifact_refs=[target_ref],
+        output_artifact_refs=[target_ref],
+        input_hashes={"quarantined_target": target_record.content_hash},
+        disposition="authorized",
+    )
+    audit_path = Path(workspace.artifact_path(f"{audit_type}-audit.json"))
+    audit_path.write_text(json.dumps(audit.to_dict()), encoding="utf-8")
+    audit_record = registry.register_file(
+        artifact_role="audit_record",
+        artifact_type="audit_record",
+        artifact_version="v1",
+        path=audit_path,
+        producer="tests",
+        artifact_id=audit.audit_id,
+        depends_on=(),
+        metadata={"record_hash": audit.record_hash},
+    )
+
+    RuntimeReconciler(workspace, registry).validate_record(audit_record)
+    persisted = AuditRecordV1.from_dict(json.loads(audit_path.read_text(encoding="utf-8")))
+    assert persisted.record_hash == audit.record_hash
+    assert persisted.input_hashes == {"quarantined_target": target_record.content_hash}
+    assert {(ref.artifact_id, ref.content_hash) for ref in persisted.target_artifacts} == {
+        (target_record.artifact_id, target_record.content_hash)
+    }
+    assert audit_record.depends_on == []

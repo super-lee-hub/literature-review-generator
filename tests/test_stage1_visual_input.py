@@ -257,6 +257,33 @@ def test_visual_bundle_writes_manifest_and_registers_artifacts(tmp_path: Path) -
     assert "table_crop" not in artifact_types
 
 
+def test_visual_input_dependency_does_not_reuse_wrong_artifact_type(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n")
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo", job_id="job-input-type")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    wrong_record = registry.register_file(
+        artifact_id="wrong-type-record",
+        artifact_role="preprocess_manifest",
+        artifact_type="preprocess_manifest",
+        artifact_version="v1",
+        path=source_path,
+        producer="tests",
+    )
+
+    dependency = Stage1VisualArtifactBuilder._registered_input_dependency(
+        registry,
+        artifact_type="source_pdf",
+        path=str(source_path),
+    )
+
+    assert dependency.artifact_type == "source_pdf"
+    assert dependency.artifact_id != wrong_record.artifact_id
+    registered = registry.get(dependency.artifact_id)
+    assert registered is not None
+    assert registered.artifact_type == "source_pdf"
+
+
 def test_visual_bundle_skips_oversized_page_render(tmp_path: Path) -> None:
     pdf_path = tmp_path / "huge-page.pdf"
     doc = fitz.open()

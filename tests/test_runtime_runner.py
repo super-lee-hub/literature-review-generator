@@ -16,7 +16,11 @@ from services.job_workspace import atomic_write_json
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from tests.test_runtime_bridge_helpers import build_legacy_main, build_success_summary
-from validation.run_result import ClaimValidationResultV1, ValidationRunResultV1
+from validation.run_result import (
+    ClaimValidationResultV1,
+    ValidationInputArtifactsV1,
+    ValidationRunResultV1,
+)
 
 
 def _spec(tmp_path: Path, *, action: str = "run_all", job_id: str = "") -> RuntimeJobSpec:
@@ -548,6 +552,43 @@ def test_runner_maps_keyboard_interrupt_to_cancelled_terminal_state(tmp_path: Pa
     assert result.failed_stage == "analyze"
 
 
+def test_runner_persists_system_exit_terminal_state_before_reraising(tmp_path: Path) -> None:
+    exit_error = SystemExit(17)
+
+    def exit_stage(stage_name, request):
+        del stage_name, request
+        raise exit_error
+
+    runner = AgentRuntimeRunner(
+        _spec(tmp_path, action="analyze"),
+        legacy_main=build_legacy_main(),
+        stage_handler=exit_stage,
+        origin_dir=tmp_path,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        runner.run()
+
+    assert raised.value is exit_error
+    workspace_path = next((tmp_path / "output").glob("runner-demo__*"))
+    job_id = workspace_path.name.split("__", 1)[1]
+    workspace = JobWorkspace.from_workspace_path(str(workspace_path), "runner-demo", job_id)
+    registry = ArtifactRegistry(workspace.paths.registry_path, job_id)
+    history = AttemptStore(workspace, registry).load_history()
+    assert [item.status for item in history] == ["pending", "running", "cancelled"]
+    assert history[-1].terminal_reason == "17"
+
+    outcome = json.loads(
+        Path(workspace.artifact_path("job_outcome_v1.json")).read_text(encoding="utf-8")
+    )
+    assert outcome["job_status"] == "cancelled"
+    assert outcome["canonical_ready"] is False
+    assert outcome["failed_stage"] == "analyze"
+
+    latest = json.loads(Path(workspace.latest_pointer_path()).read_text(encoding="utf-8"))
+    assert latest["status"] == "cancelled"
+
+
 def test_runner_rejects_unregistered_outline_dependency(tmp_path: Path) -> None:
     lure = tmp_path / "unregistered-outline.md"
     lure.write_text("# lure", encoding="utf-8")
@@ -638,7 +679,7 @@ def test_runner_applies_persisted_validation_readiness_policy(
     expected_status: str,
     expected_ready: bool,
 ) -> None:
-    def fake_validation(_bridge, session, **_kwargs):
+    def fake_validation(_bridge, session, *, attempt_id: str = "", **_kwargs):
         artifacts = []
         if stage_success:
             path = session.context.workspace.artifact_path("validation-fixture.json")
@@ -659,8 +700,19 @@ def test_runner_applies_persisted_validation_readiness_policy(
                 )
             validation_result = ValidationRunResultV1.create(
                 job_id=session.context.workspace.job_id,
+                attempt_id=attempt_id,
                 execution_status="succeeded",
                 claim_results=claim_results,
+                input_artifacts=ValidationInputArtifactsV1(
+                    review_draft_id="fixture-review-draft",
+                    review_draft_hash="a" * 64,
+                    citation_manifest_id="fixture-citation-manifest",
+                    citation_manifest_hash="b" * 64,
+                    evidence_manifest_ids=("fixture-evidence",) if claim_results else (),
+                    evidence_manifest_hashes=("c" * 64,) if claim_results else (),
+                ),
+                review_has_citations=bool(claim_results),
+                evidence_complete=True,
             )
             assert validation_result.validation_disposition.value == disposition
             atomic_write_json(path, validation_result.to_dict())
@@ -722,6 +774,87 @@ def test_runner_applies_persisted_validation_readiness_policy(
     )
     assert outcome["readiness_policy_snapshot"]["validation_required"] is validation_required
     assert outcome["readiness_policy_snapshot"]["require_clean_validation"] is require_clean
+
+
+def test_resume_restores_clean_validation_result_without_rerunning_validator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation_calls = 0
+
+    def fake_validation(_bridge, session, *, attempt_id: str = "", **_kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        validation_result = ValidationRunResultV1.create(
+            job_id=session.context.workspace.job_id,
+            attempt_id=attempt_id,
+            execution_status="succeeded",
+            claim_results=(),
+            input_artifacts=ValidationInputArtifactsV1(
+                review_draft_id="fixture-review-draft",
+                review_draft_hash="a" * 64,
+                citation_manifest_id="fixture-citation-manifest",
+                citation_manifest_hash="b" * 64,
+            ),
+            review_has_citations=False,
+            evidence_complete=True,
+        )
+        path = Path(session.context.workspace.artifact_path("validation-fixture.json"))
+        atomic_write_json(str(path), validation_result.to_dict())
+        record = session.context.registry.register_file(
+            artifact_role="validation",
+            artifact_type="validation_run_result",
+            artifact_version="v1",
+            path=path,
+            producer="tests.test_runtime_runner",
+            artifact_id=validation_result.validation_run_id,
+        )
+        return StageResult(
+            stage_name="stage4_validate",
+            success=True,
+            artifacts=[
+                StageArtifactRef(
+                    artifact_role=record.artifact_role,
+                    artifact_type=record.artifact_type,
+                    artifact_version=record.artifact_version,
+                    path=record.path,
+                    artifact_id=record.artifact_id,
+                )
+            ],
+            metadata={
+                "execution_status": validation_result.execution_status.value,
+                "validation_disposition": validation_result.validation_disposition.value,
+            },
+        )
+
+    monkeypatch.setattr(
+        "runtime.orchestrator.AgentRuntimeBridge.run_validation",
+        fake_validation,
+    )
+    spec = replace(
+        _spec(tmp_path),
+        metadata={
+            "requested_stages": ["validate"],
+            "validation_required": True,
+            "require_clean_validation": True,
+        },
+    )
+    runner = AgentRuntimeRunner(
+        spec,
+        legacy_main=build_legacy_main(),
+        origin_dir=tmp_path,
+    )
+
+    first = runner.run()
+    resumed = AgentRuntimeRunner(
+        replace(runner.job_spec, job_id=first.job_id),
+        legacy_main=build_legacy_main(),
+    ).resume()
+
+    assert validation_calls == 1
+    assert first.job_disposition == resumed.job_disposition == "clean"
+    assert first.canonical_ready is resumed.canonical_ready is True
+    assert resumed.completed_stages == ("source_intake", "validate")
 
 
 def test_runner_explicit_empty_stage_set_is_source_only(tmp_path: Path) -> None:

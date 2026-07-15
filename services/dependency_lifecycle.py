@@ -4,7 +4,7 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Callable, Mapping
 
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -280,6 +280,7 @@ def materialize_external_dependency(
     dependent_artifact_id: str,
     external: ArtifactDependencyRefV2,
     local_copy_path: str | Path,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
     producer: str = "services.dependency_lifecycle.materialize_external_dependency",
 ) -> ArtifactRecord:
     """Replace one external dependency edge with a verified child-local copy."""
@@ -293,40 +294,75 @@ def materialize_external_dependency(
 
     if file_sha256(source) != external.content_hash:
         raise DependencyLifecycleError("external dependency hash changed before materialization")
-    destination = Path(local_copy_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, destination)
-    local = registry.register_file(
-        artifact_role="materialized_dependency",
-        artifact_type=external.artifact_type,
-        artifact_version="v1",
-        path=destination,
-        producer=producer,
-        artifact_id=f"materialized:{external.job_id}:{external.artifact_id}",
-        metadata={"materialized_from": external.to_dict()},
-    )
+    registry.reload()
     dependent = registry.get(dependent_artifact_id)
     if dependent is None:
         raise DependencyLifecycleError(f"dependent artifact not found: {dependent_artifact_id}")
-    replacement = ArtifactDependencyRefV2(
-        dependency_kind="local_job",
-        job_id=registry.job_id,
-        artifact_id=local.artifact_id,
-        artifact_type=local.artifact_type,
-        path=local.path,
-        content_hash=local.content_hash,
+    if external not in dependent.depends_on:
+        raise DependencyLifecycleError(
+            "dependent artifact does not reference the requested external edge"
+        )
+    remaining_dependencies = [item for item in dependent.depends_on if item != external]
+    registry.verify_ready_dependencies(
+        remaining_dependencies,
+        external_registry_resolver=external_registry_resolver,
     )
-    updated_dependencies = [
-        replacement if item == external else item
-        for item in dependent.depends_on
-    ]
-    if all(item != replacement for item in updated_dependencies):
-        raise DependencyLifecycleError("dependent artifact does not reference the requested external edge")
-    return registry.update_record(
-        dependent_artifact_id,
-        depends_on=updated_dependencies,
-        metadata_updates={
-            "materialized_dependency": local.artifact_id,
-            "retired_external_dependency": external.to_dict(),
-        },
-    )
+
+    destination = Path(local_copy_path)
+    if destination.exists():
+        raise DependencyLifecycleError(
+            f"materialization destination already exists: {destination}"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    local: ArtifactRecord | None = None
+    try:
+        shutil.copy2(source, destination)
+        local = registry.register_file(
+            artifact_role="materialized_dependency",
+            artifact_type=external.artifact_type,
+            artifact_version="v1",
+            path=destination,
+            producer=producer,
+            artifact_id=f"materialized:{external.job_id}:{external.artifact_id}",
+            metadata={"materialized_from": external.to_dict()},
+        )
+        replacement = ArtifactDependencyRefV2(
+            dependency_kind="local_job",
+            job_id=registry.job_id,
+            artifact_id=local.artifact_id,
+            artifact_type=local.artifact_type,
+            path=local.path,
+            content_hash=local.content_hash,
+        )
+        updated_dependencies = [
+            replacement if item == external else item
+            for item in dependent.depends_on
+        ]
+        return registry.update_record(
+            dependent_artifact_id,
+            depends_on=updated_dependencies,
+            external_registry_resolver=external_registry_resolver,
+            metadata_updates={
+                "materialized_dependency": local.artifact_id,
+                "retired_external_dependency": external.to_dict(),
+            },
+        )
+    except Exception as exc:
+        cleanup_errors: list[str] = []
+        if local is not None:
+            try:
+                registry.update_record(
+                    local.artifact_id,
+                    status="invalid",
+                    metadata_updates={"invalid_reason": "materialization_edge_update_failed"},
+                )
+            except Exception as cleanup_error:
+                cleanup_errors.append(f"Registry invalidation failed: {cleanup_error}")
+        if destination.is_file():
+            try:
+                destination.unlink()
+            except Exception as cleanup_error:
+                cleanup_errors.append(f"copy removal failed: {cleanup_error}")
+        if cleanup_errors and hasattr(exc, "add_note"):
+            exc.add_note("; ".join(cleanup_errors))
+        raise

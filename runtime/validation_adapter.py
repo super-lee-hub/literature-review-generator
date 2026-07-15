@@ -6,8 +6,13 @@ from typing import Any, Dict, List
 class RuntimeValidationAdapter:
     """Narrow generator-shaped adapter for validator.run_review_validation()."""
 
-    def __init__(self, generator: Any) -> None:
+    def __init__(self, generator: Any, *, validation_attempt_id: str = "") -> None:
         self._generator = generator
+        self._validation_attempt_id = str(validation_attempt_id or "")
+
+    @property
+    def validation_attempt_id(self) -> str:
+        return self._validation_attempt_id
 
     @property
     def logger(self) -> Any:

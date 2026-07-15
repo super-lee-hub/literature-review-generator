@@ -22,6 +22,7 @@ _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "blocked"})
 _STAGE_OUTPUT_CONTRACTS: Mapping[str, tuple[frozenset[str], ...]] = {
     "source_intake": (frozenset({"source_bundle"}),),
     "analyze": (frozenset({"summary_file"}),),
+    "derive_review_batch": (frozenset({"review_batch_manifest"}),),
     "outline": (
         frozenset({"adopted_final_outline"}),
         frozenset({"literature_review_outline"}),

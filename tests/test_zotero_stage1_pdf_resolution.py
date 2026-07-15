@@ -126,7 +126,7 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
         seen["pdf_path"] = resolved_pdf_path
         seen["strategy"] = strategy
         return (
-            "Resolved Paper\n" + "x" * 600,
+            "Resolved Paper\nDOI 10.1234/resolved.2024\n" + "x" * 600,
             {
                 "analysis_input_kind": "text",
                 "extractor_used": "test",
@@ -175,6 +175,7 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
     paper: PaperInfo = {
         "title": "Resolved Paper",
         "authors": ["Alice Smith"],
+        "doi": "10.1234/resolved.2024",
         "attachments": ["Resolved Paper"],
     }
 

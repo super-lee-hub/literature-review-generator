@@ -50,6 +50,9 @@ def _required_stages_for_request(
     validation_required: bool,
 ) -> tuple[str, ...]:
     requested_stages = getattr(request, "requested_stages", None)
+    action = str(getattr(request, "action", "analyze") or "analyze")
+    if action == "derive_review_batch":
+        return ("source_intake", "derive_review_batch")
     if requested_stages is not None:
         stages = tuple(dict.fromkeys((
             "source_intake",
@@ -58,9 +61,9 @@ def _required_stages_for_request(
         return tuple(
             stage for stage in stages if validation_required or stage != "validate"
         )
-    action = str(getattr(request, "action", "analyze") or "analyze")
     mapping = {
         "analyze": ("source_intake", "analyze"),
+        "derive_review_batch": ("source_intake", "derive_review_batch"),
         "retry_failed": ("source_intake", "analyze"),
         "generate_outline": ("source_intake", "outline"),
         "generate_review": ("source_intake", "outline", "review"),

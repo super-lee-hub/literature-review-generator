@@ -13,7 +13,11 @@ from validation.evidence_resolver import (
     build_bilingual_retrieval_queries,
     build_evidence_resolver_context,
 )
-from validation.run_result import ClaimValidationResultV1, ValidationRunResultV1
+from validation.run_result import (
+    ClaimValidationResultV1,
+    ValidationInputArtifactsV1,
+    ValidationRunResultV1,
+)
 
 
 def _record_provider_call(kind: str, key: str) -> None:
@@ -228,12 +232,49 @@ def _build_claim_result(adapter: Any) -> ClaimValidationResultV1:
 def run_review_validation(adapter: Any) -> dict[str, Any]:
     workspace = adapter.job_workspace
     claim_result = _build_claim_result(adapter)
+    records = adapter.artifact_registry.list_records()
+    review_draft_path = Path(adapter._review_draft_v2_path()).resolve()
+    citation_manifest_path = Path(adapter._citation_manifest_path()).resolve()
+    review_draft = next(
+        record
+        for record in records
+        if record.artifact_type == "review_draft"
+        and record.status == "ready"
+        and Path(record.path).resolve() == review_draft_path
+    )
+    citation_manifest = next(
+        record
+        for record in records
+        if record.artifact_type == "citation_manifest"
+        and record.status == "ready"
+        and Path(record.path).resolve() == citation_manifest_path
+    )
+    evidence_manifests = tuple(
+        record
+        for record in records
+        if record.artifact_type == "evidence_manifest" and record.status == "ready"
+    )
     result = ValidationRunResultV1.create(
         job_id=workspace.job_id,
-        attempt_id="synthetic-validation",
+        attempt_id=adapter.validation_attempt_id,
         execution_status="succeeded",
         claim_results=(claim_result,),
         repair_policy="report_only",
+        input_artifacts=ValidationInputArtifactsV1(
+            review_draft_id=review_draft.artifact_id,
+            review_draft_hash=review_draft.content_hash,
+            citation_manifest_id=citation_manifest.artifact_id,
+            citation_manifest_hash=citation_manifest.content_hash,
+            evidence_manifest_ids=tuple(
+                record.artifact_id for record in evidence_manifests
+            ),
+            evidence_manifest_hashes=tuple(
+                record.content_hash for record in evidence_manifests
+            ),
+        ),
+        expected_claim_count=1,
+        review_has_citations=True,
+        evidence_complete=True,
     )
     canonical = Path(workspace.artifact_path("validation_run_result_v1.json"))
     canonical.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")

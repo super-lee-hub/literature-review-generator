@@ -8,6 +8,7 @@ from validation.run_result import (
     ClaimValidationResultV1,
     ClaimVerdict,
     ValidationExecutionStatus,
+    ValidationInputArtifactsV1,
     ValidationRunDisposition,
     ValidationRunResultError,
     ValidationRunResultV1,
@@ -124,6 +125,20 @@ def test_validation_run_result_round_trip_counts_all_verdicts() -> None:
         execution_status="succeeded",
         claim_results=claims,
         report_id="validation-1",
+        input_artifacts=ValidationInputArtifactsV1(
+            review_draft_id="review-1",
+            review_draft_hash="review-hash",
+            citation_manifest_id="citations-1",
+            citation_manifest_hash="citation-hash",
+            evidence_manifest_ids=("evidence-1", "evidence-2"),
+            evidence_manifest_hashes=("evidence-hash-1", "evidence-hash-2"),
+        ),
+        expected_claim_count=len(claims),
+        review_has_citations=True,
+        evidence_complete=True,
+        repair_status="not_requested",
+        recheck_status="not_required",
+        degradation_reasons=("non_blocking_diagnostic",),
     )
 
     restored = ValidationRunResultV1.from_dict(result.to_dict())
@@ -133,6 +148,18 @@ def test_validation_run_result_round_trip_counts_all_verdicts() -> None:
     assert restored.contradicted_count == 1
     assert restored.claim_verdict_counts == {verdict.value: 1 for verdict in ClaimVerdict}
     assert restored.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert restored.validated_claim_count == 7
+    assert restored.expected_claim_count == 7
+    assert restored.evidence_complete is True
+    assert restored.review_cleanliness is ValidationRunDisposition.NEEDS_REVIEW
+    assert restored.input_artifacts.review_draft_id == "review-1"
+    assert restored.input_artifacts.evidence_manifest_hashes == (
+        "evidence-hash-1",
+        "evidence-hash-2",
+    )
+    assert restored.repair_status == "not_requested"
+    assert restored.recheck_status == "not_required"
+    assert restored.degradation_reasons == ("non_blocking_diagnostic",)
     assert restored.contract_satisfied is True
 
 
@@ -146,6 +173,9 @@ def test_non_succeeded_execution_is_unvalidated(execution_status: str) -> None:
 
     assert result.execution_status.value == execution_status
     assert result.validation_disposition is ValidationRunDisposition.UNVALIDATED
+    assert result.review_cleanliness is ValidationRunDisposition.UNVALIDATED
+    assert result.evidence_complete is False
+    assert "validation_evidence_incomplete" in result.degradation_reasons
     assert result.contract_satisfied is False
 
 
@@ -167,6 +197,23 @@ def test_run_disposition_reducer(
     assert reduce_validation_disposition(ValidationExecutionStatus.SUCCEEDED, verdicts) is expected
 
 
+def test_run_disposition_reducer_treats_zero_claim_context_as_unknown() -> None:
+    assert (
+        reduce_validation_disposition(ValidationExecutionStatus.SUCCEEDED, ())
+        is ValidationRunDisposition.NEEDS_REVIEW
+    )
+    assert (
+        reduce_validation_disposition(
+            ValidationExecutionStatus.SUCCEEDED,
+            (),
+            expected_claim_count=0,
+            validated_claim_count=0,
+            review_has_citations=False,
+        )
+        is ValidationRunDisposition.CLEAN
+    )
+
+
 def test_tampered_counts_are_rejected() -> None:
     claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
     payload = ValidationRunResultV1.create(
@@ -178,6 +225,208 @@ def test_tampered_counts_are_rejected() -> None:
 
     with pytest.raises(ValidationRunResultError, match="claim_verdict_counts"):
         ValidationRunResultV1.from_dict(payload)
+
+
+def test_succeeded_run_with_unmet_expected_claim_count_fails_closed() -> None:
+    claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
+
+    result = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        claim_results=[claim],
+        expected_claim_count=2,
+        review_has_citations=True,
+        evidence_complete=True,
+    )
+
+    assert result.validated_claim_count == 1
+    assert result.evidence_complete is False
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert result.review_cleanliness is ValidationRunDisposition.NEEDS_REVIEW
+    assert "expected_claim_count_unmet" in result.degradation_reasons
+    assert result.contract_satisfied is False
+
+
+def test_succeeded_run_with_citations_and_zero_claims_fails_closed() -> None:
+    result = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        expected_claim_count=0,
+        review_has_citations=True,
+        evidence_complete=True,
+    )
+
+    assert result.validated_claim_count == 0
+    assert result.evidence_complete is False
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert result.review_cleanliness is ValidationRunDisposition.NEEDS_REVIEW
+    assert "citations_present_without_validated_claims" in result.degradation_reasons
+    assert result.contract_satisfied is False
+
+
+def test_succeeded_zero_claim_run_without_citation_inventory_fails_closed() -> None:
+    result = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+    )
+
+    assert result.review_has_citations is None
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert result.review_cleanliness is ValidationRunDisposition.NEEDS_REVIEW
+    assert "citation_presence_unknown_for_zero_claims" in result.degradation_reasons
+    assert result.contract_satisfied is False
+
+
+def test_empty_report_projection_requires_explicit_citation_free_declaration() -> None:
+    report = SimpleNamespace(
+        report_id="empty-report",
+        total_citations=0,
+        citation_results=[],
+    )
+
+    unknown = ValidationRunResultV1.from_report(report, job_id="job-1")
+    citation_free = ValidationRunResultV1.from_report(
+        report,
+        job_id="job-1",
+        review_has_citations=False,
+    )
+
+    assert unknown.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert citation_free.validation_disposition is ValidationRunDisposition.CLEAN
+
+
+def test_explicit_citation_free_review_can_be_clean_with_zero_claims() -> None:
+    result = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        input_artifacts=ValidationInputArtifactsV1(
+            review_draft_id="review-1",
+            review_draft_hash="review-hash",
+            citation_manifest_id="citation-1",
+            citation_manifest_hash="citation-hash",
+        ),
+        expected_claim_count=0,
+        review_has_citations=False,
+        evidence_complete=True,
+    )
+
+    assert result.validation_disposition is ValidationRunDisposition.CLEAN
+    assert result.review_cleanliness is ValidationRunDisposition.CLEAN
+    assert result.contract_satisfied is True
+
+
+def test_clean_run_without_verified_input_identities_does_not_satisfy_contract() -> None:
+    result = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        expected_claim_count=0,
+        review_has_citations=False,
+        evidence_complete=True,
+    )
+
+    assert result.validation_disposition is ValidationRunDisposition.CLEAN
+    assert result.contract_satisfied is False
+
+
+def test_cited_run_requires_verified_evidence_manifest_identity() -> None:
+    claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
+    result = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        claim_results=[claim],
+        input_artifacts=ValidationInputArtifactsV1(
+            review_draft_id="review-1",
+            review_draft_hash="review-hash",
+            citation_manifest_id="citation-1",
+            citation_manifest_hash="citation-hash",
+        ),
+        expected_claim_count=1,
+        review_has_citations=True,
+        evidence_complete=True,
+    )
+
+    assert result.contract_satisfied is False
+
+
+@pytest.mark.parametrize(
+    ("repair_status", "recheck_status", "reason"),
+    [
+        ("failed", "not_required", "repair_status:failed"),
+        ("applied", "pending", "recheck_status:pending"),
+    ],
+)
+def test_incomplete_repair_or_recheck_cannot_be_clean(
+    repair_status: str,
+    recheck_status: str,
+    reason: str,
+) -> None:
+    claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
+
+    result = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        claim_results=[claim],
+        repair_status=repair_status,
+        recheck_status=recheck_status,
+    )
+
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert reason in result.degradation_reasons
+
+
+def test_tampered_clean_disposition_is_rejected_when_expected_claims_are_unmet() -> None:
+    claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
+    payload = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        claim_results=[claim],
+        expected_claim_count=2,
+        review_has_citations=True,
+    ).to_dict()
+    payload["validation_disposition"] = "clean"
+    payload["review_cleanliness"] = "clean"
+
+    with pytest.raises(ValidationRunResultError, match="validation_disposition"):
+        ValidationRunResultV1.from_dict(payload)
+
+
+def test_incomplete_input_artifact_identity_is_rejected() -> None:
+    with pytest.raises(ValidationRunResultError, match="review draft artifact identity"):
+        ValidationRunResultV1.create(
+            job_id="job-1",
+            execution_status="failed",
+            input_artifacts={"review_draft_id": "review-1"},
+        )
+
+
+def test_pre_extension_v1_payload_is_readable_but_unverified() -> None:
+    claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
+    payload = ValidationRunResultV1.create(
+        job_id="job-1",
+        execution_status="succeeded",
+        claim_results=[claim],
+    ).to_dict()
+    for key in (
+        "input_artifacts",
+        "expected_claim_count",
+        "validated_claim_count",
+        "review_has_citations",
+        "evidence_complete",
+        "review_cleanliness",
+        "repair_status",
+        "recheck_status",
+        "degradation_reasons",
+    ):
+        payload.pop(key)
+
+    restored = ValidationRunResultV1.from_dict(payload)
+
+    assert restored.execution_status is ValidationExecutionStatus.SUCCEEDED
+    assert restored.validation_disposition is ValidationRunDisposition.UNVALIDATED
+    assert restored.review_cleanliness is ValidationRunDisposition.UNVALIDATED
+    assert restored.compatibility_status == "legacy_unverified"
+    assert "legacy_validation_run_result_contract_incomplete" in restored.degradation_reasons
+    assert restored.contract_satisfied is False
 
 
 def test_legacy_report_reader_is_explicitly_unverified() -> None:

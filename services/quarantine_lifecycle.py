@@ -4,7 +4,6 @@ from pathlib import Path
 import re
 
 from services.artifact_registry import (
-    ArtifactDependencyRefV2,
     ArtifactNotFound,
     ArtifactRecord,
     ArtifactRegistry,
@@ -58,7 +57,6 @@ def _persist_audit(
     *,
     workspace: JobWorkspace,
     registry: ArtifactRegistry,
-    target: ArtifactRecord,
     audit: AuditRecordV1,
 ) -> str:
     path = Path(workspace.artifact_path(f"audits/{audit.audit_id}.json"))
@@ -70,16 +68,8 @@ def _persist_audit(
         path=path,
         producer=audit.producer,
         artifact_id=audit.audit_id,
-        depends_on=[
-            ArtifactDependencyRefV2(
-                dependency_kind="local_job",
-                job_id=target.job_id,
-                artifact_id=target.artifact_id,
-                artifact_type=target.artifact_type,
-                path=target.path,
-                content_hash=target.content_hash,
-            )
-        ],
+        status="ready",
+        depends_on=[],
         metadata={"audit_type": audit.audit_type, "record_hash": audit.record_hash},
     )
     return str(path)
@@ -142,7 +132,6 @@ def override_ambiguous_identity(
     audit_path = _persist_audit(
         workspace=workspace,
         registry=registry,
-        target=target,
         audit=audit,
     )
     registry.update_record(
@@ -201,7 +190,6 @@ def release_quarantined_artifact(
     audit_path = _persist_audit(
         workspace=workspace,
         registry=registry,
-        target=target,
         audit=audit,
     )
     registry.update_record(

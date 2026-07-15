@@ -68,6 +68,15 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
         resume_state_report=_resume_report(workspace),
     )
     generator.summaries = [{"status": "success", "paper_info": {"title": "Paper A"}}]
+    generator.summary_file = workspace.artifact_path(f"{project_name}_summaries.json")
+    Path(generator.summary_file).write_text(json.dumps(generator.summaries), encoding="utf-8")
+    registry.register_file(
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=generator.summary_file,
+        producer="tests",
+    )
     return generator, workspace, registry
 
 

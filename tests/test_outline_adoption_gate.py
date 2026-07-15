@@ -228,8 +228,26 @@ def test_generator_adopt_outline_v2_writes_registered_adopted_artifact(tmp_path:
 
     final, audit = _make_final_and_audit()
     audit = _force_passing_audit(final)
-    Path(workspace.artifact_path("demo_final_outline.json")).write_text(json.dumps(final.to_dict()), encoding="utf-8")
-    Path(workspace.artifact_path("demo_outline_coverage_audit.json")).write_text(json.dumps(audit.to_dict()), encoding="utf-8")
+    final_path = Path(workspace.artifact_path("demo_final_outline.json"))
+    final_path.write_text(json.dumps(final.to_dict()), encoding="utf-8")
+    audit_path = Path(workspace.artifact_path("demo_outline_coverage_audit.json"))
+    audit_path.write_text(json.dumps(audit.to_dict()), encoding="utf-8")
+    registry.register_file(
+        artifact_role="final_outline",
+        artifact_type="final_outline",
+        artifact_version="v1",
+        path=final_path,
+        producer="test",
+        artifact_id="final_outline",
+    )
+    registry.register_file(
+        artifact_role="outline_coverage_audit",
+        artifact_type="outline_coverage_audit",
+        artifact_version="v1",
+        path=audit_path,
+        producer="test",
+        artifact_id="outline_coverage_audit",
+    )
     health = _make_health(final, audit, job_id=final.created_from_job_id)
     health_path = Path(workspace.artifact_path("demo_outline_stage_health_v1.json"))
     health_path.write_text(json.dumps(health.to_dict()), encoding="utf-8")

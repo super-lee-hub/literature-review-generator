@@ -122,6 +122,32 @@ def test_runtime_job_spec_compiles_generate_section_action() -> None:
     assert request.generate_section == 2
 
 
+def test_runtime_job_spec_compiles_review_batch_coordinator_action() -> None:
+    spec = RuntimeJobSpec(
+        project_name="batch-coordinator",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        action="derive_review_batch",
+        metadata={"review_batch_spec": {"schema_version": "review-batch-v1"}},
+    )
+
+    request = spec.to_job_request()
+
+    assert request.action == "derive_review_batch"
+    assert request.derived_summary_source is True
+    assert request.requested_stages is None
+
+
+def test_runtime_job_spec_requires_review_batch_spec_for_coordinator_action() -> None:
+    spec = RuntimeJobSpec(
+        project_name="batch-coordinator",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder="D:/papers"),
+        action="derive_review_batch",
+    )
+
+    with pytest.raises(ValueError, match="requires review_batch_spec"):
+        spec.validate()
+
+
 def test_runtime_job_spec_round_trip(tmp_path: Path) -> None:
     from runtime.job_spec import load_runtime_job_spec, save_runtime_job_spec
 

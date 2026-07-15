@@ -1188,18 +1188,25 @@ class LiteratureReviewGenerator:
         path: str,
         *,
         fallback_artifact_type: str,
+        expected_artifact_types: Optional[Sequence[str]] = None,
     ) -> ArtifactDependencyRef:
+        allowed_types = tuple(
+            dict.fromkeys(expected_artifact_types or (fallback_artifact_type,))
+        )
         if self.artifact_registry:
             normalized = os.path.normcase(os.path.abspath(path))
-            record = next(
-                (
-                    item
-                    for item in self.artifact_registry.list_records()
-                    if os.path.normcase(os.path.abspath(item.path)) == normalized
-                ),
-                None,
-            )
-            if record is not None:
+            candidates = [
+                item
+                for item in self.artifact_registry.list_records()
+                if os.path.normcase(os.path.abspath(item.path)) == normalized
+                and item.artifact_type in allowed_types
+            ]
+            if len(candidates) > 1:
+                raise RuntimeError(
+                    f"ambiguous Registry identity for {allowed_types}: {path}"
+                )
+            if candidates:
+                record = candidates[0]
                 return ArtifactDependencyRef(
                     artifact_type=record.artifact_type,
                     path=record.path,
@@ -1354,13 +1361,37 @@ class LiteratureReviewGenerator:
 
             source_pdf = str(paper_artifact_payload.get("source", {}).get("source_pdf") or "")
             if source_pdf:
-                depends_on.append(
-                    ArtifactDependencyRef(
-                        artifact_type="source_pdf",
-                        path=source_pdf,
-                        content_hash=str(paper_artifact_payload.get("source", {}).get("source_pdf_fingerprint") or ""),
-                    )
+                source_dependency = self._registered_dependency_for_path(
+                    source_pdf,
+                    fallback_artifact_type="source_pdf",
                 )
+                if not source_dependency.artifact_id:
+                    resolved_source_pdf = os.path.abspath(source_pdf)
+                    source_record = self.artifact_registry.register_file(
+                        artifact_role="source_pdf",
+                        artifact_type="source_pdf",
+                        artifact_version="v1",
+                        path=resolved_source_pdf,
+                        producer="main.LiteratureReviewGenerator.process_paper",
+                        artifact_id=(
+                            f"source_pdf:"
+                            f"{hashlib.sha256(resolved_source_pdf.encode('utf-8')).hexdigest()[:16]}"
+                        ),
+                    )
+                    source_dependency = ArtifactDependencyRef(
+                        artifact_type=source_record.artifact_type,
+                        path=source_record.path,
+                        content_hash=source_record.content_hash,
+                        dependency_kind="local_job",
+                        job_id=source_record.job_id,
+                        artifact_id=source_record.artifact_id,
+                    )
+                expected_source_hash = str(
+                    paper_artifact_payload.get("source", {}).get("source_pdf_fingerprint") or ""
+                )
+                if expected_source_hash and source_dependency.content_hash != expected_source_hash:
+                    raise ValueError("source PDF hash changed before paper artifact registration")
+                depends_on.append(source_dependency)
             visual_manifest_path = str(paper_artifact_payload.get("stage1_inputs", {}).get("visual_artifact_manifest_path") or "")
             if visual_manifest_path:
                 depends_on.append(
@@ -1545,6 +1576,10 @@ class LiteratureReviewGenerator:
                 self._registered_dependency_for_path(
                     outline_file,
                     fallback_artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                    expected_artifact_types=(
+                        self.OUTLINE_ARTIFACT_TYPE,
+                        "adopted_final_outline",
+                    ),
                 )
                 if outline_file
                 else None
@@ -1611,6 +1646,10 @@ class LiteratureReviewGenerator:
                 self._registered_dependency_for_path(
                     outline_file,
                     fallback_artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                    expected_artifact_types=(
+                        self.OUTLINE_ARTIFACT_TYPE,
+                        "adopted_final_outline",
+                    ),
                 )
                 if outline_file
                 else None
@@ -2092,9 +2131,13 @@ class LiteratureReviewGenerator:
         *,
         source_path: str = "",
         source_kind: str,
+        source_artifact_type: str = "summary_source",
         producer: str,
         source_items: Optional[Sequence[Mapping[str, Any]]] = None,
         rejected_candidates: Optional[Sequence[Mapping[str, Any]]] = None,
+        source_dependencies_override: Optional[
+            Sequence[ArtifactDependencyRef]
+        ] = None,
         registration_status: str = "ready",
     ) -> bool:
         if not self.summary_file:
@@ -2113,6 +2156,18 @@ class LiteratureReviewGenerator:
                     "priority": 0,
                 }
             ]
+        source_dependencies = (
+            list(source_dependencies_override)
+            if source_dependencies_override is not None
+            else [
+                self._registered_dependency_for_path(
+                    str(item.get("path") or ""),
+                    fallback_artifact_type=source_artifact_type,
+                )
+                for item in effective_source_items
+                if str(item.get("path") or "").strip()
+            ]
+        )
         self._register_workspace_artifact(
             artifact_role="summary",
             artifact_type="summary_file",
@@ -2120,14 +2175,7 @@ class LiteratureReviewGenerator:
             path=self.summary_file,
             producer=producer,
             status=registration_status,
-            depends_on=[
-                self._registered_dependency_for_path(
-                    str(item.get("path") or ""),
-                    fallback_artifact_type="summary_source",
-                )
-                for item in effective_source_items
-                if str(item.get("path") or "").strip()
-            ],
+            depends_on=source_dependencies,
         )
 
         manifest_path = self._get_summary_source_manifest_path()
@@ -2156,12 +2204,16 @@ class LiteratureReviewGenerator:
             path=manifest_path,
             producer=producer,
             status=registration_status,
-            depends_on=[
-                ArtifactDependencyRef(
-                    artifact_type="summary_file",
-                    path=self.summary_file,
-                )
-            ],
+            depends_on=(
+                source_dependencies
+                if registration_status == "quarantined"
+                else [
+                    ArtifactDependencyRef(
+                        artifact_type="summary_file",
+                        path=self.summary_file,
+                    )
+                ]
+            ),
         )
         return True
 
@@ -2336,6 +2388,7 @@ class LiteratureReviewGenerator:
             projected_summaries,
             source_path=str(paths[0]) if len(paths) == 1 else "",
             source_kind=source_kind,
+            source_artifact_type="legacy_summary_source",
             producer=producer,
             source_items=resolved.contributing_source_items,
             rejected_candidates=resolved.rejected_candidates,
@@ -2344,7 +2397,6 @@ class LiteratureReviewGenerator:
         if materialized and source_records and self.artifact_registry and self.job_workspace and self.summary_file:
             import getpass
 
-            from services.artifact_registry import ArtifactDependencyRefV2
             from services.audit_record import AuditArtifactRefV1, AuditRecordV1
 
             summary_path = os.path.abspath(self.summary_file)
@@ -2420,17 +2472,6 @@ class LiteratureReviewGenerator:
             )
             audit_path = self.job_workspace.artifact_path(f"legacy_reuse_{audit.audit_id}.json")
             atomic_write_json(audit_path, audit.to_dict())
-            dependencies = [
-                ArtifactDependencyRefV2(
-                    dependency_kind="local_job",
-                    job_id=record.job_id,
-                    artifact_id=record.artifact_id,
-                    artifact_type=record.artifact_type,
-                    path=record.path,
-                    content_hash=record.content_hash,
-                )
-                for record in [*source_records, summary_record]
-            ]
             self.artifact_registry.register_file(
                 artifact_role="audit_record",
                 artifact_type="audit_record",
@@ -2438,7 +2479,8 @@ class LiteratureReviewGenerator:
                 path=audit_path,
                 producer=producer,
                 artifact_id=audit.audit_id,
-                depends_on=dependencies,
+                status="ready",
+                depends_on=[],
                 metadata={
                     "audit_type": audit.audit_type,
                     "record_hash": audit.record_hash,
@@ -2456,8 +2498,8 @@ class LiteratureReviewGenerator:
                 status="ready",
                 metadata_updates=release_metadata,
             )
-            # The canonical summary becomes reusable only after every audit and
-            # compatibility projection artifact is durable.
+            # The canonical summary is the final ready transition after its
+            # audit, sources, and compatibility manifest are durable.
             self.artifact_registry.update_record(
                 summary_record.artifact_id,
                 status="ready",
@@ -5050,7 +5092,11 @@ class LiteratureReviewGenerator:
             }
             return failed_result
     
-    def save_summaries(self) -> bool:
+    def save_summaries(
+        self,
+        *,
+        depends_on: Optional[Sequence[ArtifactDependencyRef]] = None,
+    ) -> bool:
         """保存摘要到JSON文件（线程安全版本）"""
         try:
             if not self.output_dir or not self.summary_file:
@@ -5088,6 +5134,7 @@ class LiteratureReviewGenerator:
                 artifact_version="v1",
                 path=self.summary_file,
                 producer="main.LiteratureReviewGenerator.save_summaries",
+                depends_on=list(depends_on or ()),
             )
             self._write_stage1_progress_snapshot()
             

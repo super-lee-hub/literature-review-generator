@@ -75,6 +75,7 @@ class RuntimeJobSpec:
         self.source.validate()
         allowed_actions = {
             "analyze",
+            "derive_review_batch",
             "generate_outline",
             "generate_review",
             "generate_section",
@@ -90,14 +91,29 @@ class RuntimeJobSpec:
                 raise ValueError("generate_section action requires generate_section")
             if self.generate_section <= 0:
                 raise ValueError("generate_section must be greater than 0")
+        if self.action == "derive_review_batch" and not self.metadata.get("review_batch_spec"):
+            raise ValueError("derive_review_batch action requires review_batch_spec metadata")
         requested_stages = self.metadata.get("requested_stages")
         if requested_stages is not None:
             if not isinstance(requested_stages, (list, tuple)):
                 raise ValueError("requested_stages must be a JSON array")
-            allowed_stages = {"source_intake", "analyze", "outline", "review", "validate"}
+            allowed_stages = {
+                "source_intake",
+                "analyze",
+                "derive_review_batch",
+                "outline",
+                "review",
+                "validate",
+            }
             invalid = [str(item) for item in requested_stages if str(item) not in allowed_stages]
             if invalid:
                 raise ValueError(f"unsupported requested_stages entries: {invalid}")
+            if self.action == "derive_review_batch" and tuple(
+                str(item) for item in requested_stages if str(item) != "source_intake"
+            ) not in {(), ("derive_review_batch",)}:
+                raise ValueError(
+                    "derive_review_batch requested_stages may contain only derive_review_batch"
+                )
         for field_name in (
             "validation_required",
             "require_clean_validation",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import re
@@ -48,6 +48,21 @@ def _normalize_identity_input(value: Mapping[str, Any]) -> dict[str, Any]:
         "year": _safe_year(value.get("year")),
         "doi": normalize_doi(value.get("doi")),
     }
+
+
+def _normalized_doi_candidates(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw_candidates = [value]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        raw_candidates = list(value)
+    else:
+        raw_candidates = []
+    candidates: list[str] = []
+    for raw_candidate in raw_candidates:
+        candidate = normalize_doi(raw_candidate)
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return tuple(candidates)
 
 
 @dataclass(frozen=True)
@@ -107,10 +122,16 @@ def evaluate_source_identity(
 ) -> SourceIdentityResultV1:
     expected_value = _normalize_identity_input(expected)
     observed_value = _normalize_identity_input(observed)
+    observed_doi_candidates = _normalized_doi_candidates(
+        observed.get("doi_candidates")
+    )
     expected_doi = expected_value["doi"]
     observed_doi = observed_value["doi"]
 
-    if expected_doi and observed_doi and expected_doi != observed_doi:
+    if len(observed_doi_candidates) > 1:
+        verdict: IdentityVerdict = "ambiguous"
+        reasons = ("multiple_distinct_doi_candidates",)
+    elif expected_doi and observed_doi and expected_doi != observed_doi:
         verdict: IdentityVerdict = "mismatch"
         reasons = ("nonempty_doi_mismatch",)
     elif expected_doi and observed_doi and expected_doi == observed_doi:
@@ -130,10 +151,21 @@ def evaluate_source_identity(
             and observed_authors
             and expected_authors[0] != observed_authors[0]
         )
+        author_match = bool(
+            expected_authors
+            and observed_authors
+            and expected_authors[0] == observed_authors[0]
+        )
         expected_year = expected_value["year"]
         observed_year = observed_value["year"]
         year_conflict = bool(expected_year and observed_year and expected_year != observed_year)
-        if title_matches and not author_conflict and not year_conflict:
+        year_match = bool(expected_year and observed_year and expected_year == observed_year)
+        if (
+            title_matches
+            and not author_conflict
+            and not year_conflict
+            and (author_match or year_match)
+        ):
             verdict = "match"
             reasons = ("normalized_title_match_without_author_year_conflict",)
         else:
@@ -173,6 +205,34 @@ def _first_page_identity_observation(
     title = metadata_title
     if expected_title_key != "unknown_title" and expected_title_key in normalized_text:
         title = expected_value["title"]
+    identity_evidence_text = normalized_text
+    if expected_title_key != "unknown_title" and expected_title_key in normalized_text:
+        identity_evidence_text = normalized_text.replace(expected_title_key, " ", 1)
+
+    metadata_author = str(metadata.get("author") or "").strip()
+    observed_authors = [metadata_author] if metadata_author else []
+    if not observed_authors:
+        expected_authors = expected_value["authors"]
+        expected_author_key = (
+            normalized_title_key(expected_authors[0]) if expected_authors else "unknown_title"
+        )
+        first_author_is_observed = bool(
+            expected_authors
+            and expected_author_key != "unknown_title"
+            and expected_author_key in identity_evidence_text
+        )
+        if first_author_is_observed:
+            observed_authors = [expected_authors[0]]
+
+    expected_year = expected_value["year"]
+    observed_year = (
+        expected_year
+        if expected_year
+        and re.search(
+            rf"(?<!\d){re.escape(expected_year)}(?!\d)", identity_evidence_text
+        )
+        else ""
+    )
 
     doi_candidates: list[str] = []
     for raw_value in [
@@ -184,13 +244,12 @@ def _first_page_identity_observation(
             doi = normalize_doi(match.group(0))
             if doi and doi not in doi_candidates:
                 doi_candidates.append(doi)
-    expected_doi = expected_value["doi"]
-    observed_doi = expected_doi if expected_doi in doi_candidates else (doi_candidates[0] if doi_candidates else "")
+    observed_doi = doi_candidates[0] if len(doi_candidates) == 1 else ""
 
     return {
         "title": title,
-        "authors": [str(metadata.get("author") or "").strip()] if metadata.get("author") else [],
-        "year": "",
+        "authors": observed_authors,
+        "year": observed_year,
         "doi": observed_doi,
         "doi_candidates": doi_candidates,
     }

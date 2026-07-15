@@ -15,6 +15,8 @@ from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRegistry,
     RegistryCorruption,
+    UnverifiedArtifact,
+    UnverifiedDependency,
     RegistryLockTimeout,
     RegistryRevisionConflict,
 )
@@ -215,13 +217,24 @@ def test_registry_rejects_registering_artifact_for_another_job(tmp_path: Path) -
 def test_dependency_v2_round_trip_preserves_external_identity(tmp_path: Path) -> None:
     registry_path = tmp_path / "artifact_registry.json"
     artifact_path = _write_artifact(tmp_path / "child.json", "child")
+    parent_registry_path = tmp_path / "parent" / "artifact_registry.json"
+    parent_path = _write_artifact(tmp_path / "parent" / "summary.json", "parent")
+    parent_registry = ArtifactRegistry(parent_registry_path, "parent-job")
+    parent_record = parent_registry.register_file(
+        artifact_id="parent-summary",
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
     dependency = ArtifactDependencyRefV2(
         dependency_kind="external_job",
         job_id="parent-job",
         artifact_id="parent-summary",
         artifact_type="summary_file",
-        path=str(tmp_path / "parent" / "summary.json"),
-        content_hash="a" * 64,
+        path=parent_record.path,
+        content_hash=parent_record.content_hash,
     )
 
     ArtifactRegistry(registry_path, "child-job").register_file(
@@ -232,6 +245,7 @@ def test_dependency_v2_round_trip_preserves_external_identity(tmp_path: Path) ->
         path=artifact_path,
         producer="tests",
         depends_on=[dependency],
+        external_registry_resolver=lambda job_id: parent_registry if job_id == "parent-job" else None,
         metadata={"identity_verdict": "match", "canonical_ready": True},
     )
 
@@ -239,6 +253,170 @@ def test_dependency_v2_round_trip_preserves_external_identity(tmp_path: Path) ->
     assert loaded is not None
     assert loaded.depends_on == [dependency]
     assert loaded.metadata == {"identity_verdict": "match", "canonical_ready": True}
+
+
+def test_ready_registration_rejects_external_dependency_without_resolver(tmp_path: Path) -> None:
+    registry_path = tmp_path / "artifact_registry.json"
+    artifact_path = _write_artifact(tmp_path / "child.json", "child")
+    dependency = ArtifactDependencyRefV2(
+        dependency_kind="external_job",
+        job_id="parent-job",
+        artifact_id="parent-summary",
+        artifact_type="summary_file",
+        path=str(tmp_path / "parent" / "summary.json"),
+        content_hash="a" * 64,
+    )
+
+    with pytest.raises(UnverifiedDependency, match="external dependency cannot be verified"):
+        ArtifactRegistry(registry_path, "child-job").register_file(
+            artifact_id="child-review",
+            artifact_role="review",
+            artifact_type="review_draft",
+            artifact_version="v1",
+            path=artifact_path,
+            producer="tests",
+            depends_on=[dependency],
+        )
+
+    assert not registry_path.exists()
+
+
+def test_ready_registration_rejects_external_dependency_when_parent_is_not_ready(
+    tmp_path: Path,
+) -> None:
+    parent_registry = ArtifactRegistry(tmp_path / "parent" / "artifact_registry.json", "parent-job")
+    parent_path = _write_artifact(tmp_path / "parent" / "summary.json", "parent")
+    parent_record = parent_registry.register_file(
+        artifact_id="parent-summary",
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+        status="quarantined",
+    )
+    child_registry_path = tmp_path / "child" / "artifact_registry.json"
+    child_path = _write_artifact(tmp_path / "child" / "review.json", "child")
+
+    with pytest.raises(UnverifiedDependency, match="dependency is not ready"):
+        ArtifactRegistry(child_registry_path, "child-job").register_file(
+            artifact_id="child-review",
+            artifact_role="review",
+            artifact_type="review_draft",
+            artifact_version="v1",
+            path=child_path,
+            producer="tests",
+            depends_on=[
+                ArtifactDependencyRefV2(
+                    dependency_kind="external_job",
+                    job_id=parent_record.job_id,
+                    artifact_id=parent_record.artifact_id,
+                    artifact_type=parent_record.artifact_type,
+                    path=parent_record.path,
+                    content_hash=parent_record.content_hash,
+                )
+            ],
+            external_registry_resolver=lambda job_id: (
+                parent_registry if job_id == parent_registry.job_id else None
+            ),
+        )
+
+    assert not child_registry_path.exists()
+
+
+def test_ready_registration_rejects_external_dependency_after_parent_hash_changes(
+    tmp_path: Path,
+) -> None:
+    parent_registry = ArtifactRegistry(tmp_path / "parent" / "artifact_registry.json", "parent-job")
+    parent_path = _write_artifact(tmp_path / "parent" / "summary.json", "parent")
+    parent_record = parent_registry.register_file(
+        artifact_id="parent-summary",
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
+    dependency = ArtifactDependencyRefV2(
+        dependency_kind="external_job",
+        job_id=parent_record.job_id,
+        artifact_id=parent_record.artifact_id,
+        artifact_type=parent_record.artifact_type,
+        path=parent_record.path,
+        content_hash=parent_record.content_hash,
+    )
+    parent_path.write_text("tampered", encoding="utf-8")
+    child_registry_path = tmp_path / "child" / "artifact_registry.json"
+    child_path = _write_artifact(tmp_path / "child" / "review.json", "child")
+
+    with pytest.raises(UnverifiedDependency, match="dependency content hash changed"):
+        ArtifactRegistry(child_registry_path, "child-job").register_file(
+            artifact_id="child-review",
+            artifact_role="review",
+            artifact_type="review_draft",
+            artifact_version="v1",
+            path=child_path,
+            producer="tests",
+            depends_on=[dependency],
+            external_registry_resolver=lambda job_id: (
+                parent_registry if job_id == parent_registry.job_id else None
+            ),
+        )
+
+    assert not child_registry_path.exists()
+
+
+def test_quarantined_external_dependency_is_reverified_before_ready_transition(
+    tmp_path: Path,
+) -> None:
+    parent_registry = ArtifactRegistry(tmp_path / "parent" / "artifact_registry.json", "parent-job")
+    parent_path = _write_artifact(tmp_path / "parent" / "summary.json", "parent")
+    parent_record = parent_registry.register_file(
+        artifact_id="parent-summary",
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
+    dependency = ArtifactDependencyRefV2(
+        dependency_kind="external_job",
+        job_id=parent_record.job_id,
+        artifact_id=parent_record.artifact_id,
+        artifact_type=parent_record.artifact_type,
+        path=parent_record.path,
+        content_hash=parent_record.content_hash,
+    )
+    child_registry = ArtifactRegistry(tmp_path / "child" / "artifact_registry.json", "child-job")
+    child_path = _write_artifact(tmp_path / "child" / "review.json", "child")
+    child_registry.register_file(
+        artifact_id="child-review",
+        artifact_role="review",
+        artifact_type="review_draft",
+        artifact_version="v1",
+        path=child_path,
+        producer="tests",
+        status="quarantined",
+        depends_on=[dependency],
+    )
+    quarantined_revision = child_registry.revision
+
+    with pytest.raises(UnverifiedDependency, match="external dependency cannot be verified"):
+        child_registry.update_record("child-review", status="ready")
+
+    assert child_registry.revision == quarantined_revision
+    assert child_registry.get("child-review").status == "quarantined"  # type: ignore[union-attr]
+
+    ready = child_registry.update_record(
+        "child-review",
+        status="ready",
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_registry.job_id else None
+        ),
+    )
+
+    assert ready.status == "ready"
+    assert ready.depends_on == [dependency]
 
 
 def test_ready_registration_requires_an_existing_file(tmp_path: Path) -> None:
@@ -378,6 +556,150 @@ def test_stale_compatibility_save_cannot_overwrite_newer_registry(tmp_path: Path
     reloaded = ArtifactRegistry(registry_path, "job-save-cas")
     assert reloaded.revision == 1
     assert reloaded.get("artifact") is not None
+
+
+def test_record_accessors_return_defensive_copies_before_save(tmp_path: Path) -> None:
+    registry_path = tmp_path / "artifact_registry.json"
+    parent_path = _write_artifact(tmp_path / "parent.json", "parent")
+    child_path = _write_artifact(tmp_path / "child.json", "child")
+    registry = ArtifactRegistry(registry_path, "job-defensive-copy")
+    parent = registry.register_file(
+        artifact_id="parent",
+        artifact_role="source",
+        artifact_type="source",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
+    registry.register_file(
+        artifact_id="child",
+        artifact_role="summary",
+        artifact_type="summary",
+        artifact_version="v1",
+        path=child_path,
+        producer="tests",
+        depends_on=[
+            ArtifactDependencyRefV2(
+                job_id=parent.job_id,
+                artifact_id=parent.artifact_id,
+                artifact_type=parent.artifact_type,
+                path=parent.path,
+                content_hash=parent.content_hash,
+            )
+        ],
+        metadata={"nested": {"state": "original"}},
+    )
+
+    exposed_by_get = registry.get("child")
+    assert exposed_by_get is not None
+    exposed_by_get.depends_on.clear()
+    exposed_by_get.metadata["nested"]["state"] = "mutated-by-get"
+    exposed_by_list = next(record for record in registry.list_records() if record.artifact_id == "child")
+    exposed_by_list.metadata["nested"]["state"] = "mutated-by-list"
+    registry.save()
+
+    reloaded = ArtifactRegistry(registry_path, "job-defensive-copy").get("child")
+    assert reloaded is not None
+    assert [dependency.artifact_id for dependency in reloaded.depends_on] == ["parent"]
+    assert reloaded.metadata == {"nested": {"state": "original"}}
+
+
+def test_save_revalidates_ready_artifact_and_local_dependency_hashes(tmp_path: Path) -> None:
+    registry_path = tmp_path / "artifact_registry.json"
+    parent_path = _write_artifact(tmp_path / "parent.json", "parent")
+    child_path = _write_artifact(tmp_path / "child.json", "child")
+    registry = ArtifactRegistry(registry_path, "job-save-verify")
+    parent = registry.register_file(
+        artifact_id="parent",
+        artifact_role="source",
+        artifact_type="source",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
+    registry.register_file(
+        artifact_id="child",
+        artifact_role="summary",
+        artifact_type="summary",
+        artifact_version="v1",
+        path=child_path,
+        producer="tests",
+        depends_on=[
+            ArtifactDependencyRefV2(
+                job_id=parent.job_id,
+                artifact_id=parent.artifact_id,
+                artifact_type=parent.artifact_type,
+                path=parent.path,
+                content_hash=parent.content_hash,
+            )
+        ],
+    )
+    ready_revision = registry.revision
+    child_path.write_text("tampered-child", encoding="utf-8")
+
+    with pytest.raises(UnverifiedArtifact, match="artifact content hash changed: child"):
+        registry.save()
+
+    assert registry.revision == ready_revision
+    child_path.write_text(json.dumps({"value": "child"}), encoding="utf-8")
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    child_payload = next(item for item in payload["artifacts"] if item["artifact_id"] == "child")
+    child_payload["depends_on"][0]["content_hash"] = "0" * 64
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+    registry = ArtifactRegistry(registry_path, "job-save-verify")
+
+    with pytest.raises(UnverifiedDependency, match="dependency declared hash mismatch: parent"):
+        registry.save()
+
+    assert registry.revision == ready_revision
+
+
+def test_save_requires_resolver_for_ready_external_dependency(tmp_path: Path) -> None:
+    parent_registry = ArtifactRegistry(tmp_path / "parent" / "artifact_registry.json", "parent-job")
+    parent_path = _write_artifact(tmp_path / "parent" / "parent.json", "parent")
+    parent = parent_registry.register_file(
+        artifact_id="parent",
+        artifact_role="source",
+        artifact_type="source",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
+    child_registry = ArtifactRegistry(tmp_path / "child" / "artifact_registry.json", "child-job")
+    child_path = _write_artifact(tmp_path / "child" / "child.json", "child")
+    child_registry.register_file(
+        artifact_id="child",
+        artifact_role="summary",
+        artifact_type="summary",
+        artifact_version="v1",
+        path=child_path,
+        producer="tests",
+        depends_on=[
+            ArtifactDependencyRefV2(
+                dependency_kind="external_job",
+                job_id=parent.job_id,
+                artifact_id=parent.artifact_id,
+                artifact_type=parent.artifact_type,
+                path=parent.path,
+                content_hash=parent.content_hash,
+            )
+        ],
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_registry.job_id else None
+        ),
+    )
+    ready_revision = child_registry.revision
+
+    with pytest.raises(UnverifiedDependency, match="external dependency cannot be verified"):
+        child_registry.save()
+
+    assert child_registry.revision == ready_revision
+    child_registry.save(
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_registry.job_id else None
+        )
+    )
+    assert child_registry.revision == ready_revision + 1
 
 
 def test_artifact_identity_conflict_does_not_modify_durable_state(tmp_path: Path) -> None:

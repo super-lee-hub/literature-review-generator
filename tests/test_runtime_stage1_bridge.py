@@ -27,7 +27,39 @@ def test_runtime_stage1_bridge_persists_summaries_progress_and_paper_artifacts(t
     assert json.loads(summary_path.read_text(encoding="utf-8"))[0]["paper_info"]["canonical_paper_key"] == "paper_a"
 
     artifact_types = {item["artifact_type"] for item in registry_payload["artifacts"]}
+    assert "source_pdf" in artifact_types
+    assert "source_bundle" in artifact_types
     assert "summary_file" in artifact_types
     assert "stage1_progress_snapshot" in artifact_types
     assert "summary_source_manifest" in artifact_types
     assert "paper_artifact" in artifact_types
+    summary_record = next(
+        item for item in registry_payload["artifacts"] if item["artifact_type"] == "summary_file"
+    )
+    assert [item["artifact_id"] for item in summary_record["depends_on"]] == [
+        "source_bundle"
+    ]
+
+
+def test_runtime_stage1_bridge_always_binds_summary_to_source_bundle(
+    tmp_path: Path,
+) -> None:
+    bridge, session, _pdf_dir, pdf_path = make_bridge_session(tmp_path, action="analyze")
+
+    bridge.persist_stage1_results(session, [build_success_summary(pdf_path)])
+
+    registry_payload = json.loads(
+        Path(session.context.workspace.paths.registry_path).read_text(encoding="utf-8")
+    )
+    summary_record = next(
+        item for item in registry_payload["artifacts"] if item["artifact_type"] == "summary_file"
+    )
+    source_bundle_record = next(
+        item for item in registry_payload["artifacts"] if item["artifact_type"] == "source_bundle"
+    )
+    assert [item["artifact_id"] for item in summary_record["depends_on"]] == [
+        "source_bundle"
+    ]
+    assert [item["artifact_type"] for item in source_bundle_record["depends_on"]] == [
+        "source_pdf"
+    ]

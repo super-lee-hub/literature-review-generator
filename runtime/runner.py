@@ -21,6 +21,7 @@ from runtime.reconcile import (
     RuntimeReconciler,
     project_legacy_workspace_outcome,
     validate_canonical_ai_summary,
+    validate_review_batch_manifest_for_bootstrap,
 )
 from runtime.stage_contracts import SourceBundle, StageResult
 from runtime.stage_terminal import StageTerminalStore, TerminalStageRecordV1
@@ -29,6 +30,7 @@ from services.artifact_registry import (
     ArtifactRecord,
     ArtifactRegistry,
     RegistryError,
+    file_sha256,
 )
 from services.job_outcome import JobOutcomeV1
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
@@ -185,6 +187,7 @@ class AgentRuntimeRunner:
             )
         mapping = {
             "analyze": ("analyze",),
+            "derive_review_batch": ("derive_review_batch",),
             "retry_failed": ("analyze",),
             "generate_outline": ("outline",),
             "generate_review": ("outline", "review"),
@@ -423,6 +426,7 @@ class AgentRuntimeRunner:
         spec: RuntimeJobSpec,
         bundle: SourceBundle,
         results: Mapping[str, StageResult],
+        attempt_id: str,
     ) -> tuple[StageResult, int]:
         if stage == "analyze":
             response = self._call_handler("stage1_analyze", spec=spec, bundle=bundle, session=session, results=results)
@@ -508,7 +512,11 @@ class AgentRuntimeRunner:
                 int(response.get("model_call_count") or 1),
             )
         if stage == "validate":
-            result = bridge.run_validation(session, validator_module=self.validator_module)
+            result = bridge.run_validation(
+                session,
+                attempt_id=attempt_id,
+                validator_module=self.validator_module,
+            )
             return result, 0
         raise RuntimeRunnerError(f"unsupported runtime stage: {stage}")
 
@@ -521,12 +529,49 @@ class AgentRuntimeRunner:
     def _execute(self, *, resume: bool) -> RuntimeExecutionResult:
         spec = self._normalized_spec(resume=resume)
         batch_spec = self._review_batch_spec(spec)
+        if spec.action == "derive_review_batch" and batch_spec is None:
+            raise RuntimeRunnerError("derive_review_batch action requires a review batch spec")
+        if (
+            spec.action == "derive_review_batch"
+            and batch_spec is not None
+            and not batch_spec.is_multi_variant
+        ):
+            raise RuntimeRunnerError(
+                "derive_review_batch action requires a multi-variant review batch spec"
+            )
+        if (
+            batch_spec is not None
+            and batch_spec.is_multi_variant
+            and spec.action != "derive_review_batch"
+        ):
+            raise RuntimeRunnerError(
+                "multi-variant review batches require the derive_review_batch action"
+            )
         if batch_spec is not None and not spec.summary_sources:
-            spec = replace(spec, summary_sources=(batch_spec.selection.parent_summary_path,))
+            spec = replace(
+                spec,
+                summary_sources=(batch_spec.parent_selection().parent_summary_path,),
+            )
+        validated_batch_parent_registry_path: str | None = None
+        if batch_spec is not None:
+            from services.review_batch import validate_review_batch_parent
+
+            _parent_path, validated_parent_registry = validate_review_batch_parent(
+                batch_spec.parent_selection()
+            )
+            validated_batch_parent_registry_path = validated_parent_registry.registry_path
         bridge = AgentRuntimeBridge(spec)
         normalized_spec_payload = spec.to_dict()
         resume_preflight = None
+        workspace_preflight = None
         execution_lease: AttemptExecutionLease | None = None
+        if batch_spec is not None and batch_spec.is_multi_variant:
+            from services.review_batch import validate_review_batch_layout
+
+            def validate_batch_workspace(workspace: JobWorkspace) -> None:
+                validate_review_batch_layout(batch_spec, workspace=workspace)
+
+            workspace_preflight = validate_batch_workspace
         if resume:
             def validate_resume(workspace: JobWorkspace) -> None:
                 nonlocal execution_lease
@@ -546,6 +591,7 @@ class AgentRuntimeRunner:
                 claim_latest_pointer=not resume,
                 resume_requested=resume,
                 resume_preflight=resume_preflight,
+                workspace_preflight=workspace_preflight,
                 publish_running_state=False,
             )
         except BaseException as exc:
@@ -568,6 +614,7 @@ class AgentRuntimeRunner:
                 spec=spec,
                 bridge=bridge,
                 batch_spec=batch_spec,
+                validated_batch_parent_registry_path=validated_batch_parent_registry_path,
                 resume=resume,
                 normalized_spec_payload=normalized_spec_payload,
             )
@@ -581,6 +628,7 @@ class AgentRuntimeRunner:
         spec: RuntimeJobSpec,
         bridge: AgentRuntimeBridge,
         batch_spec: Any | None,
+        validated_batch_parent_registry_path: str | None,
         resume: bool,
         normalized_spec_payload: Mapping[str, Any],
     ) -> RuntimeExecutionResult:
@@ -604,8 +652,8 @@ class AgentRuntimeRunner:
         results: dict[str, StageResult] = {}
         active_stage = "source_intake"
         external_registry_paths = (
-            (batch_spec.selection.parent_registry_path,)
-            if batch_spec is not None
+            (validated_batch_parent_registry_path,)
+            if validated_batch_parent_registry_path is not None
             else ()
         )
         external_registry_resolver = self._external_registry_resolver(
@@ -666,27 +714,58 @@ class AgentRuntimeRunner:
             completed.append("source_intake")
 
             if batch_spec is not None:
-                active_stage = "analyze"
-                derived = bridge.derive_review_batch(session, batch_spec)
-                results["analyze"] = derived
-                self._persist_terminal(
-                    session,
-                    attempt_id=running_attempt.attempt_id,
-                    stage_name="analyze",
-                    result=derived,
-                    started_at=utc_now_iso(),
-                    model_call_count=0,
-                    external_registry_resolver=external_registry_resolver,
+                batch_stage = (
+                    "derive_review_batch" if batch_spec.is_multi_variant else "analyze"
                 )
-                completed.append("analyze")
+                active_stage = batch_stage
+                recovered_batch = (
+                    reconciler.load_completed_stage_result(batch_stage) if resume else None
+                )
+                if recovered_batch is not None:
+                    results[batch_stage] = recovered_batch
+                    completed.append(batch_stage)
+                    if batch_stage == "analyze":
+                        summary_artifact = next(
+                            (
+                                artifact
+                                for artifact in recovered_batch.artifacts
+                                if artifact.artifact_type == "summary_file"
+                            ),
+                            None,
+                        )
+                        if summary_artifact is not None:
+                            session.generator.summary_file = summary_artifact.path
+                else:
+                    derived = bridge.derive_review_batch(
+                        session,
+                        batch_spec,
+                        derivation_id=running_attempt.attempt_id,
+                    )
+                    results[batch_stage] = derived
+                    self._persist_terminal(
+                        session,
+                        attempt_id=running_attempt.attempt_id,
+                        stage_name=batch_stage,
+                        result=derived,
+                        started_at=utc_now_iso(),
+                        model_call_count=0,
+                        external_registry_resolver=external_registry_resolver,
+                    )
+                    if not derived.success:
+                        failed_stage = batch_stage
+                        raise RuntimeRunnerError("review batch derivation has failed variants")
+                    completed.append(batch_stage)
 
             for stage in self._requested_stages(spec):
                 active_stage = stage
-                if stage == "analyze" and "analyze" in results:
+                if stage in results:
                     continue
-                if resume and reconciler.stage_is_complete(stage):
-                    completed.append(stage)
-                    continue
+                if resume:
+                    recovered_result = reconciler.load_completed_stage_result(stage)
+                    if recovered_result is not None:
+                        results[stage] = recovered_result
+                        completed.append(stage)
+                        continue
                 started_at = utc_now_iso()
                 result, model_calls = self._execute_stage(
                     stage,
@@ -695,6 +774,7 @@ class AgentRuntimeRunner:
                     spec=spec,
                     bundle=bundle,
                     results=results,
+                    attempt_id=running_attempt.attempt_id,
                 )
                 self._persist_terminal(
                     session,
@@ -753,6 +833,33 @@ class AgentRuntimeRunner:
                 requires_attention=requires_attention,
                 message="completed",
             )
+        except SystemExit as exc:
+            try:
+                history = attempt_store.load_history()
+            except Exception as inspection_error:
+                raise exc from inspection_error
+            if not history or history[-1] != running_attempt:
+                raise
+            failed_stage = failed_stage or active_stage
+            try:
+                attempt_store.finish(
+                    running_attempt,
+                    "cancelled",
+                    reason=str(exc) or type(exc).__name__,
+                )
+                self._finalize_result(
+                    session,
+                    status="cancelled",
+                    disposition="unvalidated",
+                    canonical_ready=False,
+                    completed=tuple(completed),
+                    failed_stage=failed_stage,
+                    requires_attention=True,
+                    message=str(exc) or type(exc).__name__,
+                )
+            except Exception as persistence_error:
+                raise exc from persistence_error
+            raise
         except (KeyboardInterrupt, JobCancelledError) as exc:
             try:
                 history = attempt_store.load_history()
@@ -863,6 +970,51 @@ class AgentRuntimeRunner:
         job_id = workspace.job_id
         return workspace, ArtifactRegistry(workspace.paths.registry_path, job_id)
 
+    @staticmethod
+    def _review_batch_registry_paths(registry: ArtifactRegistry) -> tuple[str, ...]:
+        """Bootstrap external Registry paths from hash-verified batch manifests."""
+
+        paths: list[str] = []
+        for record in registry.list_records():
+            if (
+                record.job_id != registry.job_id
+                or record.artifact_role != "review_batch_manifest"
+                or record.artifact_type != "review_batch_manifest"
+                or record.artifact_version != "v1"
+                or record.status != "ready"
+                or not record.content_hash
+            ):
+                continue
+            manifest_path = Path(record.path)
+            try:
+                if not manifest_path.is_file() or file_sha256(manifest_path) != record.content_hash:
+                    continue
+                payload = validate_review_batch_manifest_for_bootstrap(
+                    record,
+                    manifest_path,
+                    registry,
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError, ReconcileValidationError):
+                continue
+            if (
+                not isinstance(payload, Mapping)
+                or str(payload.get("coordinator_job_id") or "") != registry.job_id
+            ):
+                continue
+            parent = payload.get("parent")
+            if isinstance(parent, Mapping) and str(parent.get("registry_path") or "").strip():
+                paths.append(str(parent["registry_path"]))
+            variants = payload.get("variants")
+            if isinstance(variants, list):
+                paths.extend(
+                    str(variant["child_registry_path"])
+                    for variant in variants
+                    if isinstance(variant, Mapping)
+                    and str(variant.get("status") or "") == "completed"
+                    and str(variant.get("child_registry_path") or "").strip()
+                )
+        return tuple(dict.fromkeys(paths))
+
     @classmethod
     def status(cls, workspace_path: str | Path) -> RuntimeExecutionResult:
         """Read the canonical job head without mutating workspace state."""
@@ -905,10 +1057,14 @@ class AgentRuntimeRunner:
         """Repair only durable projections; this surface has no provider input."""
 
         workspace, registry = cls._open_workspace(workspace_path)
+        external_registry_paths = cls._review_batch_registry_paths(registry)
         reconciler = RuntimeReconciler(
             workspace,
             registry,
-            external_registry_resolver=cls._external_registry_resolver(workspace),
+            external_registry_resolver=cls._external_registry_resolver(
+                workspace,
+                registry_paths=external_registry_paths,
+            ),
         )
         legacy_result = reconciler.legacy_read_only_result()
         if legacy_result is not None:

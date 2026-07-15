@@ -197,7 +197,12 @@ class Stage1VisualArtifactBuilder:
                 page_blocks = fallback_page_blocks
 
         pdf_hash = file_sha256(source_pdf)
-        depends_on = self._build_base_dependencies(source_pdf, pdf_hash, preprocess_metadata)
+        depends_on = self._build_base_dependencies(
+            source_pdf,
+            pdf_hash,
+            preprocess_metadata,
+            artifact_registry,
+        )
         page_candidates = self._select_page_candidates(page_index, policy)
         figure_candidates = self._select_figure_candidates(page_blocks, page_index, policy)
 
@@ -314,14 +319,16 @@ class Stage1VisualArtifactBuilder:
         source_pdf: str,
         pdf_hash: str,
         preprocess_metadata: Mapping[str, Any],
+        artifact_registry: ArtifactRegistry,
     ) -> List[ArtifactDependencyRef]:
-        depends_on = [
-            ArtifactDependencyRef(
-                artifact_type="source_pdf",
-                path=source_pdf,
-                content_hash=pdf_hash,
-            )
-        ]
+        source_dependency = self._registered_input_dependency(
+            artifact_registry,
+            artifact_type="source_pdf",
+            path=source_pdf,
+        )
+        if source_dependency.content_hash != pdf_hash:
+            raise ValueError("source PDF hash changed before visual artifact registration")
+        depends_on = [source_dependency]
         for artifact_type, key in (
             ("preprocess_manifest", "manifest_path"),
             ("preprocess_page_index", "page_index_path"),
@@ -330,13 +337,56 @@ class Stage1VisualArtifactBuilder:
             path = str(preprocess_metadata.get(key) or "").strip()
             if path and os.path.exists(path):
                 depends_on.append(
-                    ArtifactDependencyRef(
+                    self._registered_input_dependency(
+                        artifact_registry,
                         artifact_type=artifact_type,
                         path=path,
-                        content_hash=file_sha256(path),
                     )
                 )
         return depends_on
+
+    @staticmethod
+    def _registered_input_dependency(
+        artifact_registry: ArtifactRegistry,
+        *,
+        artifact_type: str,
+        path: str,
+    ) -> ArtifactDependencyRef:
+        resolved_path = os.path.abspath(path)
+        normalized_path = os.path.normcase(resolved_path)
+        candidates = [
+            item
+            for item in artifact_registry.list_records()
+            if os.path.normcase(os.path.abspath(item.path)) == normalized_path
+            and item.artifact_type == artifact_type
+        ]
+        if len(candidates) > 1:
+            raise ValueError(
+                f"ambiguous Registry identity for visual input {artifact_type}: {resolved_path}"
+            )
+        record = candidates[0] if candidates else None
+        if record is not None and record.status != "ready":
+            raise ValueError(
+                f"visual input dependency is not ready: {record.artifact_id} ({record.status})"
+            )
+        if record is None:
+            path_hash = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()[:16]
+            record = artifact_registry.register_file(
+                artifact_role="visual_input",
+                artifact_type=artifact_type,
+                artifact_version="v1",
+                path=resolved_path,
+                producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+                artifact_id=f"visual-input:{artifact_type}:{path_hash}",
+            )
+        return ArtifactDependencyRef(
+            artifact_type=record.artifact_type,
+            path=record.path,
+            content_hash=record.content_hash,
+            dependency_kind="local_job",
+            job_id=record.job_id,
+            artifact_id=record.artifact_id,
+        )
 
     def _load_page_index(self, preprocess_metadata: Mapping[str, Any]) -> List[Dict[str, Any]]:
         page_index_path = str(preprocess_metadata.get("page_index_path") or "").strip()

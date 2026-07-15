@@ -11,7 +11,11 @@ import zipfile
 import pytest
 
 from services.artifact_registry import file_sha256
-from services.review_batch import ReviewBatchSpecV1, SummarySelectionSpecV1
+from services.review_batch import (
+    ReviewBatchSpecV1,
+    ReviewVariantSpecV1,
+    SummarySelectionSpecV1,
+)
 from runtime.job_spec import load_runtime_job_spec
 from runtime.runner import AgentRuntimeRunner
 from tests import synthetic_runtime_fakes
@@ -359,66 +363,98 @@ def test_public_runtime_cli_synthetic_parent_and_derived_batches(tmp_path: Path)
     _assert_latest_pointer(output, "synthetic-parent", parent)
 
     selected = {"ABC": parent_keys, "A": parent_keys[:20], "AB": parent_keys[:45]}
+    batch_path = root / "review-batch.json"
+    batch = ReviewBatchSpecV1(
+        project_name="synthetic-review-batch",
+        batch_label="ABC-A-AB",
+        variants=tuple(
+            ReviewVariantSpecV1(
+                variant_id=label,
+                project_name=f"synthetic-{label}",
+                child_job_id=f"synthetic-{label}-job",
+                selection=SummarySelectionSpecV1(
+                    parent_job_id=parent["job_id"],
+                    parent_registry_path=str(workspace / "artifact_registry.json"),
+                    parent_artifact_id=summary_record["artifact_id"],
+                    parent_content_hash=summary_record["content_hash"],
+                    parent_summary_path=str(summary_path),
+                    ordered_paper_keys=keys,
+                    expected_count=len(keys),
+                ),
+            )
+            for label, keys in selected.items()
+        ),
+    )
+    _write_spec(batch_path, batch.to_dict())
+    coordinator_spec = root / "review-batch-coordinator.json"
+    _write_spec(
+        coordinator_spec,
+        {
+            "project_name": "synthetic-review-batch",
+            "source": {"mode": "direct", "pdf_folder": str(papers)},
+            "config": str(config),
+            "action": "derive_review_batch",
+            "queue_file": str(root / "queue-review-batch.json"),
+            "metadata": {"review_batch_spec": str(batch_path)},
+        },
+    )
+    coordinator = _run_cli(repo, "run", str(coordinator_spec), env=env)
+    assert coordinator["job_status"] == "completed"
+    assert coordinator["canonical_ready"] is True
+    coordinator_workspace = Path(coordinator["workspace_path"])
+    coordinator_registry = _read_registry(coordinator_workspace)
+    registries_by_job[coordinator["job_id"]] = coordinator_registry
+    manifest_record = next(
+        item
+        for item in coordinator_registry["artifacts"]
+        if item["artifact_type"] == "review_batch_manifest"
+    )
+    manifest = json.loads(Path(manifest_record["path"]).read_text(encoding="utf-8"))
+    assert manifest["batch_id"] == batch.batch_id
+    assert manifest["coordinator_job_id"] == coordinator["job_id"]
+    assert manifest["parent"]["content_hash"] == summary_record["content_hash"]
+    assert manifest["status"] == "completed"
+    assert manifest["completed_variant_count"] == 3
+    assert manifest["failed_variant_count"] == 0
+    assert manifest["stage1_model_calls"] == 0
+
     child_hashes = set()
-    for label, keys in selected.items():
-        batch_path = root / f"batch-{label}.json"
-        batch = ReviewBatchSpecV1(
-            project_name=f"synthetic-{label}",
-            batch_label=label,
-            selection=SummarySelectionSpecV1(
-                parent_job_id=parent["job_id"],
-                parent_registry_path=str(workspace / "artifact_registry.json"),
-                parent_artifact_id=summary_record["artifact_id"],
-                parent_content_hash=summary_record["content_hash"],
-                parent_summary_path=str(summary_path),
-                ordered_paper_keys=keys,
-                expected_count=len(keys),
-            ),
-        )
-        _write_spec(batch_path, batch.to_dict())
-        child_spec = root / f"child-{label}.json"
-        _write_spec(
-            child_spec,
-            {
-                "project_name": f"synthetic-{label}",
-                "source": {"mode": "direct", "pdf_folder": str(papers)},
-                "config": str(config),
-                "action": "analyze",
-                "queue_file": str(root / f"queue-{label}.json"),
-                "metadata": {
-                    "requested_stages": ["analyze"],
-                    "review_batch_spec": str(batch_path),
-                },
-            },
-        )
-        child = _run_cli(repo, "run", str(child_spec), env=env)
-        assert child["job_status"] == "completed"
-        child_workspace = Path(child["workspace_path"])
-        child_registry = _read_registry(child_workspace)
-        registries_by_job[child["job_id"]] = child_registry
+    assert [item["variant_id"] for item in manifest["variants"]] == ["ABC", "A", "AB"]
+    assert [item["selected_count"] for item in manifest["variants"]] == [61, 20, 45]
+    assert all(item["status"] == "completed" for item in manifest["variants"])
+    assert all(item["stage1_model_calls"] == 0 for item in manifest["variants"])
+    for variant, (label, keys) in zip(manifest["variants"], selected.items()):
+        assert variant["project_name"] == f"synthetic-{label}"
+        child_registry = _read_registry(Path(variant["child_workspace_path"]))
+        registries_by_job[variant["child_job_id"]] = child_registry
         child_summary = next(
-            item for item in child_registry["artifacts"] if item["artifact_role"] == "summary"
+            item
+            for item in child_registry["artifacts"]
+            if item["artifact_id"] == variant["output_artifacts"]["summary"]["artifact_id"]
         )
-        child_payload = json.loads(Path(child_summary["path"]).read_text(encoding="utf-8"))
+        assert child_summary["content_hash"] == variant["output_artifacts"]["summary"]["content_hash"]
+        child_payload = json.loads(
+            Path(variant["output_artifacts"]["summary"]["path"]).read_text(encoding="utf-8")
+        )
         assert len(child_payload) == len(keys)
         child_hashes.add(next(
             dep["content_hash"]
             for dep in child_summary["depends_on"]
             if dep["dependency_kind"] == "external_job" and dep["artifact_id"] == summary_record["artifact_id"]
         ))
-        analyze_terminal = next(
-            json.loads(Path(item["path"]).read_text(encoding="utf-8"))
-            for item in child_registry["artifacts"]
-            if item["artifact_type"] == "runtime_stage_terminal"
-            and item["metadata"].get("stage_name") == "analyze"
-        )
-        assert analyze_terminal["model_call_count"] == 0
-        assert [item["status"] for item in _attempt_history(child_workspace)] == [
-            "pending",
-            "running",
-            "succeeded",
-        ]
-        _assert_latest_pointer(output, f"synthetic-{label}", child)
+    analyze_terminal = next(
+        json.loads(Path(item["path"]).read_text(encoding="utf-8"))
+        for item in coordinator_registry["artifacts"]
+        if item["artifact_type"] == "runtime_stage_terminal"
+        and item["metadata"].get("stage_name") == "derive_review_batch"
+    )
+    assert analyze_terminal["model_call_count"] == 0
+    assert [item["status"] for item in _attempt_history(coordinator_workspace)] == [
+        "pending",
+        "running",
+        "succeeded",
+    ]
+    _assert_latest_pointer(output, "synthetic-review-batch", coordinator)
     assert child_hashes == {summary_record["content_hash"]}
     calls = _provider_calls(counter)
     assert sum(item["kind"] == "stage1" for item in calls) == 61
@@ -441,11 +477,15 @@ def test_public_runtime_cli_quarantines_duplicate_and_wrong_zotero_pdfs(tmp_path
     (library / "AAAA").mkdir(parents=True)
     (library / "BBBB").mkdir(parents=True)
     (library / "WRONG").mkdir(parents=True)
+    (library / "TITLE_ONLY").mkdir(parents=True)
     duplicate_pdf = _minimal_text_pdf("DOI 10.1234/duplicate")
     (library / "AAAA" / "duplicate.pdf").write_bytes(duplicate_pdf)
     (library / "BBBB" / "duplicate.pdf").write_bytes(duplicate_pdf)
     (library / "WRONG" / "wrong-source.pdf").write_bytes(
         _minimal_text_pdf("Wrong Source DOI 10.9999/wrong.2024")
+    )
+    (library / "TITLE_ONLY" / "title-only.pdf").write_bytes(
+        _minimal_text_pdf("Title Only Source")
     )
     report = root / "Zotero 导出.txt"
     report.write_text(
@@ -465,6 +505,12 @@ def test_public_runtime_cli_quarantines_duplicate_and_wrong_zotero_pdfs(tmp_path
                 "DOI\t10.1234/right.2024",
                 "附件",
                 "  o WRONG/wrong-source.pdf",
+                "*",
+                "Title Only Source",
+                "作者\tCarol White",
+                "年份\t2025",
+                "附件",
+                "  o TITLE_ONLY/title-only.pdf",
             ]
         ),
         encoding="utf-8",
@@ -511,12 +557,20 @@ def test_public_runtime_cli_quarantines_duplicate_and_wrong_zotero_pdfs(tmp_path
     assert len(snapshot["ambiguous_matches"]) == 1
     assert snapshot["ambiguous_matches"][0]["status"] == "ambiguous"
     assert len(snapshot["ambiguous_matches"][0]["candidates"]) == 2
-    assert len(snapshot["quarantined_sources"]) == 1
-    wrong = snapshot["quarantined_sources"][0]
+    assert len(snapshot["quarantined_sources"]) == 2
+    quarantined_by_title = {
+        item["expected"]["title"]: item for item in snapshot["quarantined_sources"]
+    }
+    wrong = quarantined_by_title["Expected Source"]
     assert wrong["identity_verdict"] == "mismatch"
     assert wrong["artifact_status"] == "quarantined"
     assert wrong["expected"]["doi"] == "10.1234/right.2024"
     assert wrong["observed"]["doi"] == "10.9999/wrong.2024"
+    title_only = quarantined_by_title["Title Only Source"]
+    assert title_only["identity_verdict"] == "ambiguous"
+    assert title_only["artifact_status"] == "quarantined"
+    assert title_only["observed"]["authors"] == []
+    assert title_only["observed"]["year"] == ""
     assert source_bundle["paper_work_items"] == []
     assert [item["status"] for item in _attempt_history(workspace)] == [
         "pending",

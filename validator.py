@@ -55,6 +55,7 @@ from services.repair_policy import (
 from validation.run_result import (
     ClaimVerdict,
     ValidationExecutionStatus,
+    ValidationInputArtifactsV1,
     ValidationRunResultV1,
 )
 
@@ -568,6 +569,222 @@ def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str,
             paper_metadata[source_paper_id] = identity
 
     return review_draft, citation_manifest, paper_artifacts, preprocess_evidence, paper_metadata
+
+
+def _normalized_artifact_path(path: Any) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path))) if path else ""
+
+
+def _cited_paper_ids(citation_manifest: Mapping[str, Any]) -> List[str]:
+    paper_ids: List[str] = []
+    for citation_set in citation_manifest.get("citation_sets", []) or []:
+        if not isinstance(citation_set, Mapping):
+            continue
+        paper_ids.extend(
+            str(item).strip()
+            for item in (citation_set.get("paper_ids") or citation_set.get("paper_keys") or [])
+            if str(item).strip()
+        )
+    for occurrence in citation_manifest.get("occurrences", []) or []:
+        if not isinstance(occurrence, Mapping):
+            continue
+        paper_id = str(occurrence.get("paper_id") or occurrence.get("paper_key") or "").strip()
+        if paper_id:
+            paper_ids.append(paper_id)
+    return list(dict.fromkeys(paper_ids))
+
+
+def _validation_input_contract(
+    generator_instance: Any,
+    review_draft: Mapping[str, Any],
+    citation_manifest: Mapping[str, Any],
+    paper_artifacts: List[Dict[str, Any]],
+) -> tuple[ValidationInputArtifactsV1, int, bool, bool, tuple[str, ...]]:
+    """Resolve and verify the exact durable artifacts consumed by Validation."""
+
+    from services.artifact_registry import ArtifactRegistry, file_sha256
+
+    degradation_reasons: List[str] = []
+    workspace = _get_validation_workspace(generator_instance)
+    registry = getattr(generator_instance, "artifact_registry", None)
+    if registry is None and getattr(getattr(workspace, "paths", None), "registry_path", ""):
+        try:
+            registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+        except Exception:
+            registry = None
+    records = list(registry.list_records()) if registry is not None else []
+
+    def _registered_identity(path: Any, artifact_type: str) -> tuple[str, str]:
+        normalized_path = _normalized_artifact_path(path)
+        matches = [
+            record
+            for record in records
+            if record.artifact_type == artifact_type
+            and record.status == "ready"
+            and _normalized_artifact_path(record.path) == normalized_path
+        ]
+        if len(matches) != 1 or not normalized_path or not os.path.isfile(normalized_path):
+            degradation_reasons.append(f"{artifact_type}_artifact_identity_unverified")
+            return "", ""
+        record = matches[0]
+        actual_hash = file_sha256(normalized_path)
+        if not record.content_hash or record.content_hash != actual_hash:
+            degradation_reasons.append(f"{artifact_type}_artifact_hash_mismatch")
+            return "", ""
+        return record.artifact_id, actual_hash
+
+    review_path_getter = getattr(generator_instance, "_review_draft_v2_path", None)
+    citation_path_getter = getattr(generator_instance, "_citation_manifest_path", None)
+    review_draft_path = review_path_getter() if callable(review_path_getter) else ""
+    citation_manifest_path = citation_path_getter() if callable(citation_path_getter) else ""
+    review_draft_id, review_draft_hash = _registered_identity(
+        review_draft_path,
+        "review_draft",
+    )
+    citation_manifest_id, citation_manifest_hash = _registered_identity(
+        citation_manifest_path,
+        "citation_manifest",
+    )
+
+    cited_paper_ids = _cited_paper_ids(citation_manifest)
+    citation_sets = citation_manifest.get("citation_sets", []) or []
+    occurrences = citation_manifest.get("occurrences", []) or []
+    draft_citation_count = sum(
+        len(block.get("citations") or [])
+        for section in review_draft.get("content", {}).get("sections", []) or []
+        if isinstance(section, Mapping)
+        for block in section.get("blocks", []) or []
+        if isinstance(block, Mapping)
+    )
+    review_has_citations = bool(
+        draft_citation_count or citation_sets or occurrences or cited_paper_ids
+    )
+    expected_claim_count = len(citation_sets) if isinstance(citation_sets, list) else 0
+    if review_has_citations and expected_claim_count == 0:
+        expected_claim_count = max(
+            len(occurrences) if isinstance(occurrences, list) else 0,
+            1 if draft_citation_count else 0,
+        )
+        degradation_reasons.append("citation_set_inventory_missing")
+    if draft_citation_count and not (citation_sets or occurrences):
+        degradation_reasons.append("citation_manifest_missing_review_citations")
+    if review_has_citations and not cited_paper_ids:
+        degradation_reasons.append("citation_paper_identity_missing")
+
+    paper_artifact_by_id: Dict[str, Dict[str, Any]] = {}
+    for artifact in paper_artifacts:
+        identity = artifact.get("paper_identity", {}) if isinstance(artifact, Mapping) else {}
+        aliases = [
+            identity.get("canonical_paper_key"),
+            identity.get("source_paper_id"),
+            artifact.get("source", {}).get("source_pdf")
+            if isinstance(artifact.get("source"), Mapping)
+            else "",
+        ]
+        for alias in aliases:
+            normalized_alias = str(alias or "").strip()
+            if normalized_alias:
+                paper_artifact_by_id.setdefault(normalized_alias, artifact)
+
+    evidence_identities: List[tuple[str, str]] = []
+    for paper_id in cited_paper_ids:
+        artifact = paper_artifact_by_id.get(paper_id)
+        if artifact is None:
+            degradation_reasons.append(f"cited_paper_artifact_missing:{paper_id}")
+            continue
+        stage1_inputs = artifact.get("stage1_inputs", {})
+        if not isinstance(stage1_inputs, Mapping):
+            degradation_reasons.append(f"evidence_manifest_missing:{paper_id}")
+            continue
+        evidence_path = str(stage1_inputs.get("evidence_manifest_path") or "").strip()
+        expected_hash = str(stage1_inputs.get("evidence_manifest_hash") or "").strip()
+        normalized_evidence_path = _normalized_artifact_path(evidence_path)
+        if not normalized_evidence_path or not os.path.isfile(normalized_evidence_path):
+            degradation_reasons.append(f"evidence_manifest_missing:{paper_id}")
+            continue
+        actual_hash = file_sha256(normalized_evidence_path)
+        if not expected_hash or expected_hash != actual_hash:
+            degradation_reasons.append(f"evidence_manifest_hash_mismatch:{paper_id}")
+            continue
+
+        evidence_id = ""
+        for record in records:
+            if (
+                record.artifact_type == "evidence_manifest"
+                and record.status == "ready"
+                and _normalized_artifact_path(record.path) == normalized_evidence_path
+                and record.content_hash == actual_hash
+            ):
+                evidence_id = record.artifact_id
+                break
+        if not evidence_id:
+            for record in records:
+                if record.status != "ready":
+                    continue
+                dependency = next(
+                    (
+                        item
+                        for item in record.depends_on
+                        if item.artifact_type == "evidence_manifest"
+                        and _normalized_artifact_path(item.path) == normalized_evidence_path
+                        and item.content_hash == actual_hash
+                    ),
+                    None,
+                )
+                if dependency is not None:
+                    evidence_id = dependency.artifact_id
+                    break
+        if not evidence_id:
+            degradation_reasons.append(f"evidence_manifest_identity_unverified:{paper_id}")
+            continue
+        evidence_identities.append((evidence_id, actual_hash))
+
+    unique_evidence = list(dict.fromkeys(evidence_identities))
+    input_artifacts = ValidationInputArtifactsV1(
+        review_draft_id=review_draft_id,
+        review_draft_hash=review_draft_hash,
+        citation_manifest_id=citation_manifest_id,
+        citation_manifest_hash=citation_manifest_hash,
+        evidence_manifest_ids=tuple(item[0] for item in unique_evidence),
+        evidence_manifest_hashes=tuple(item[1] for item in unique_evidence),
+    )
+    evidence_complete = not degradation_reasons and (
+        not review_has_citations or bool(unique_evidence)
+    )
+    return (
+        input_artifacts,
+        expected_claim_count,
+        review_has_citations,
+        evidence_complete,
+        tuple(dict.fromkeys(degradation_reasons)),
+    )
+
+
+def _validation_repair_state(
+    repair_policy: ValidationRepairPolicy,
+    repair_pipeline_result: Any,
+    *,
+    repairs_applied: bool,
+    recheck_performed: bool,
+) -> tuple[str, str]:
+    result = repair_pipeline_result if isinstance(repair_pipeline_result, Mapping) else {}
+    status = str(result.get("status") or "").strip().lower()
+    if status == "failed":
+        return "failed", "not_required"
+    applied = repairs_applied or bool(result.get("applied"))
+    if applied:
+        if recheck_performed or result.get("recheck_success") is True:
+            return "applied", "completed"
+        if result.get("recheck_success") is False:
+            return "applied", "failed"
+        return "applied", "required"
+    if repair_policy is ValidationRepairPolicy.REPORT_ONLY:
+        return "report_only", "not_required"
+    if status.startswith("skipped"):
+        return "skipped", "not_required"
+    if int(result.get("proposals_count") or 0) > 0:
+        return "planned", "not_required"
+    return "not_needed", "not_required"
 
 
 def _bundle_progress_label(bundle: Dict[str, Any]) -> str:
@@ -1301,6 +1518,7 @@ def _write_validation_reports(
         else ValidationRunResultV1.from_report(
             report,
             job_id=str(getattr(workspace, "job_id", "") or "legacy-workspace"),
+            attempt_id=str(getattr(generator_instance, "validation_attempt_id", "") or ""),
             repair_policy=repair_policy.value,
         )
     )
@@ -1405,6 +1623,31 @@ def _write_validation_reports(
 
     registry = getattr(generator_instance, "artifact_registry", None)
     if registry is not None:
+        from services.artifact_registry import ArtifactDependencyRefV2
+
+        input_dependencies: List[ArtifactDependencyRefV2] = []
+        for artifact_id in (
+            validation_run_result.input_artifacts.review_draft_id,
+            validation_run_result.input_artifacts.citation_manifest_id,
+        ):
+            record = registry.get(artifact_id) if artifact_id else None
+            if record is None:
+                continue
+            input_dependencies.append(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=record.job_id,
+                    artifact_id=record.artifact_id,
+                    artifact_type=record.artifact_type,
+                    path=record.path,
+                    content_hash=record.content_hash,
+                )
+            )
+        registry_status = (
+            "ready"
+            if validation_run_result.contract_satisfied and len(input_dependencies) == 2
+            else "quarantined"
+        )
         registry.register_file(
             artifact_role="validation",
             artifact_type="validation_run_result",
@@ -1412,10 +1655,13 @@ def _write_validation_reports(
             path=validation_run_result_file,
             producer="validator._write_validation_reports",
             artifact_id=validation_run_result.validation_run_id,
+            status=registry_status,
+            depends_on=input_dependencies,
             metadata={
                 "execution_status": validation_run_result.execution_status.value,
                 "validation_disposition": validation_run_result.validation_disposition.value,
                 "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
+                "contract_satisfied": validation_run_result.contract_satisfied,
             },
         )
 
@@ -1439,6 +1685,7 @@ def _terminal_validation_result(
     workspace = _get_validation_workspace(generator_instance)
     result = ValidationRunResultV1.create(
         job_id=workspace.job_id,
+        attempt_id=str(getattr(generator_instance, "validation_attempt_id", "") or ""),
         execution_status=execution_status,
         repair_policy=repair_policy.value,
         diagnostics=(diagnostic,),
@@ -1557,16 +1804,6 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
         final_report = _build_report_from_results(enriched_results)
         manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
         workspace = _get_validation_workspace(generator_instance)
-        validation_result = ValidationRunResultV1.from_report(
-            final_report,
-            job_id=workspace.job_id,
-            repair_policy=repair_policy.value,
-        )
-        report_paths = _write_validation_reports(generator_instance, validation_result, manual_review_items, repair_policy)
-        generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
-        generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
-        if report_paths.get("claim_alignment_audit_json"):
-            generator_instance.logger.info(f"Claim alignment audit written: {report_paths['claim_alignment_audit_json']}")
 
         repair_pipeline_result = None
         try:
@@ -1599,6 +1836,7 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
 
         touched_summaries: List[str] = []
         touched_blocks: List[str] = []
+        recheck_performed = False
         if unsafe_auto_rewrite_enabled(repair_policy):
             touched_summaries = _apply_summary_repairs(generator_instance, enriched_results, paper_artifacts)
             touched_blocks = _apply_review_repairs(generator_instance, review_draft, enriched_results)
@@ -1644,16 +1882,7 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             )
             final_report = _build_report_from_results(rerun_results)
             manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
-            validation_result = ValidationRunResultV1.from_report(
-                final_report,
-                job_id=workspace.job_id,
-                repair_policy=repair_policy.value,
-            )
-            report_paths = _write_validation_reports(generator_instance, validation_result, manual_review_items, repair_policy)
-            generator_instance.logger.success(f"Validation recheck report written: {report_paths['report_file']}")
-            generator_instance.logger.info(f"Manual review recheck report written: {report_paths['manual_report_file']}")
-            if report_paths.get("claim_alignment_audit_json"):
-                generator_instance.logger.info(f"Claim alignment recheck audit written: {report_paths['claim_alignment_audit_json']}")
+            recheck_performed = True
 
         repair_pipeline_failed = (
             isinstance(repair_pipeline_result, dict)
@@ -1663,6 +1892,47 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             repair_pipeline_failed
             and repair_policy != ValidationRepairPolicy.REPORT_ONLY
         )
+        (
+            input_artifacts,
+            expected_claim_count,
+            review_has_citations,
+            evidence_complete,
+            degradation_reasons,
+        ) = _validation_input_contract(
+            generator_instance,
+            review_draft,
+            citation_manifest,
+            paper_artifacts,
+        )
+        repair_status, recheck_status = _validation_repair_state(
+            repair_policy,
+            repair_pipeline_result,
+            repairs_applied=bool(touched_summaries or touched_blocks),
+            recheck_performed=recheck_performed,
+        )
+        validation_result = ValidationRunResultV1.from_report(
+            final_report,
+            job_id=workspace.job_id,
+            attempt_id=str(getattr(generator_instance, "validation_attempt_id", "") or ""),
+            repair_policy=repair_policy.value,
+            input_artifacts=input_artifacts,
+            expected_claim_count=expected_claim_count,
+            review_has_citations=review_has_citations,
+            evidence_complete=evidence_complete,
+            repair_status=repair_status,
+            recheck_status=recheck_status,
+            degradation_reasons=degradation_reasons,
+        )
+        report_paths = _write_validation_reports(
+            generator_instance,
+            validation_result,
+            manual_review_items,
+            repair_policy,
+        )
+        generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
+        generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
+        if report_paths.get("claim_alignment_audit_json"):
+            generator_instance.logger.info(f"Claim alignment audit written: {report_paths['claim_alignment_audit_json']}")
 
         return {
             "success": not repair_pipeline_blocks_success,

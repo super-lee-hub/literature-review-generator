@@ -69,6 +69,7 @@ def _contract_ref(artifact_type: str, index: int = 0) -> ArtifactDependencyRefV2
     [
         ("source_intake", ("source_bundle",)),
         ("analyze", ("summary_file",)),
+        ("derive_review_batch", ("review_batch_manifest",)),
         ("outline", ("adopted_final_outline",)),
         ("outline", ("literature_review_outline",)),
         ("review", ("review_draft", "citation_manifest", "review_docx")),
@@ -97,6 +98,7 @@ def test_succeeded_stage_terminal_accepts_only_complete_stage_output_contracts(
     [
         ("source_intake", ("summary_file",)),
         ("analyze", ("source_bundle",)),
+        ("derive_review_batch", ("summary_file",)),
         ("outline", ("final_outline",)),
         ("review", ("review_draft", "citation_manifest")),
         ("validate", ("validation_report_projection",)),
@@ -391,6 +393,9 @@ def test_external_job_dependency_resolves_by_registry_identity(tmp_path: Path) -
                 path=parent_record.path,
                 content_hash=parent_record.content_hash,
             ),
+        ),
+        external_registry_resolver=(
+            lambda job_id: parent_registry if job_id == parent.job_id else None
         ),
     )
     child_ref = ArtifactDependencyRefV2(
