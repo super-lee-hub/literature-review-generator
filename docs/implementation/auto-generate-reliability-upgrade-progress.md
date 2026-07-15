@@ -12,7 +12,7 @@ code commit itself.
 - Worktree: `D:\auto-generate-reliability-upgrade`
 - Target: `origin/main`
 - Git writer: leader only
-- Last-known-good checkpoint: `b9b1cf1` (post-Phase-8 Windows locale repair)
+- Last-known-good checkpoint: `8365f1d` (final Validation evidence-dependency closure)
 
 ## Phase status
 
@@ -28,6 +28,8 @@ code commit itself.
 | 7 - evidence and edge checkpoints | completed | `49e2275` | `ff667c1` |
 | 8 - platform, compatibility, docs, E2E | completed | `0fda818` | `245c0bc` |
 | Post-Phase-8 - Windows locale CI repair | completed | `b9b1cf1` | current ledger commit |
+| Post-review reliability closure | completed | `ed6f043` | `fb53ead` |
+| Final Validation evidence-dependency closure | completed | `8365f1d` | current ledger commit |
 
 ## Phase 0 - hotfix and offline baseline
 
@@ -688,3 +690,63 @@ code commit itself.
 - Windows Python 3.11 CI must pass on the pushed documentation head before the
   draft PR can be considered ready. Browser, live-provider, and heavy-OCR
   checks remain optional because they require explicit external prerequisites.
+
+## Final Validation evidence-dependency closure
+
+### Scope and provenance
+
+- Pre-fix PR head: `fb53eadd27385b8def840d68b7116ca89ec25b72`.
+- Validated code checkpoint: `8365f1df5f778e8ec8372925fc5002550f72de72`.
+- Closed the final post-audit blocker: canonical Validation now binds its
+  declared review draft, citation manifest, and every evidence manifest to the
+  exact Registry `depends_on` closure.
+- `ValidationInputArtifactsV1` rejects hashes that are not 64-character
+  lowercase SHA-256 values and rejects duplicate evidence artifact IDs.
+- `validation.input_dependencies` resolves local inputs and ReviewBatch parent
+  evidence edges without erasing `external_job` identity. Ambiguous external
+  candidates fail closed.
+- Validator pre-registration and runtime re-registration use the same resolver.
+  A declared/Registry mismatch quarantines the canonical result and publishes
+  the stage as `failed/unvalidated`, even when the payload claims `clean`.
+- Reconcile compares the declared and registered ID/type/hash multisets exactly,
+  validates job kind and normalized path, refreshes each durable Registry once
+  per recursive traversal, and then validates files/hashes/schemas recursively.
+- Deleting, changing, quarantining, or invalidating an evidence manifest makes
+  the Validation terminal incomplete. Resume reruns Validation instead of
+  restoring the stale disposition.
+- An initial per-edge Registry reload implementation made the 61-paper synthetic
+  subprocess exceed its 180-second timeout. The final implementation preserves
+  fresh durable state while reloading each Registry only once per traversal;
+  the same E2E then passed.
+
+### Changed files
+
+- Contracts and dependency resolution: `validation/run_result.py`,
+  `validation/input_dependencies.py`.
+- Registration and recovery: `validator.py`, `runtime/orchestrator.py`,
+  `runtime/validation_adapter.py`, `runtime/runner.py`, `runtime/reconcile.py`.
+- Regression coverage: `tests/test_validation_input_dependencies.py`,
+  `tests/test_validation_run_result.py`, `tests/test_validation_projections.py`,
+  `tests/test_runtime_validation_bridge.py`,
+  `tests/test_runtime_validation_adapter_contract.py`,
+  `tests/test_runtime_runner.py`, and `tests/test_synthetic_runtime_e2e.py`.
+
+### Verification evidence
+
+| Command/check | Exit | Evidence |
+| --- | ---: | --- |
+| Validation dependency, bridge, runner, reconcile, and external-evidence targeted suites | 0 | latest focused gate: `35 passed`; independent test review found no remaining coverage gap |
+| 61-paper parent/derived synthetic E2E plus state/path regressions | 0 | `3 passed in 376.19s` |
+| `python -m pytest -q --strict-markers` | 0 | `1103 passed, 22 skipped in 770.08s` |
+| `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `1103 passed, 22 deselected in 656.83s` |
+| `python -m pyright` | 0 | `0 errors, 0 warnings, 0 informations` |
+| `python -m compileall -q main.py runtime services validation outline preprocess` | 0 | no diagnostics |
+| Changed production/test Ruff | 0 | `All checks passed!` |
+| `git diff --check` | 0 | no whitespace errors; only expected LF-to-CRLF notices |
+| Independent code and test review | 0 | both final verdicts `PASS`; no remaining blocker or test gap |
+
+### Remaining risk
+
+- The pushed documentation head still requires both Windows Python 3.11 GitHub
+  checks before PR readiness is declared. Browser, live-provider, and heavy-OCR
+  checks remain optional and explicitly prerequisite-gated.

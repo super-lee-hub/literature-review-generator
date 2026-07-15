@@ -49,6 +49,8 @@ def test_truth_sources_name_current_canonical_artifacts() -> None:
             PROJECTION_RECEIPT_SCHEMA_VERSION,
             "source_bundle",
             "citation-free",
+            "depends_on",
+            "evidence manifest",
         ):
             assert fact in text, (path, fact)
         assert "validation_report.json` +" not in text
@@ -65,12 +67,14 @@ def test_feature_matrix_does_not_repeat_implemented_features_as_roadmap() -> Non
         assert "source_bundle" in text
         assert "generation" in text
         assert "citation-free" in text
+        assert "depends_on" in text
+        assert "SHA-256" in text
         assert "P0:" not in text
         assert "P1:" not in text
 
 
 def test_reliability_closure_reports_current_code_and_gates() -> None:
-    validated_sha = "ed6f0430c2aeb326e2fc26e183c1656ecc40e29e"
+    validated_sha = "8365f1df5f778e8ec8372925fc5002550f72de72"
     for path in (
         "docs/implementation/auto-generate-reliability-upgrade-progress.md",
         "docs/implementation/auto-generate-reliability-upgrade-report.md",
@@ -78,12 +82,13 @@ def test_reliability_closure_reports_current_code_and_gates() -> None:
         text = _read(path)
         for fact in (
             validated_sha,
-            "1082 passed, 22 skipped",
-            "1082 passed, 22 deselected",
+            "1103 passed, 22 skipped",
+            "1103 passed, 22 deselected",
             "projection_generation",
             "source_bundle",
             "SystemExit",
             "citation-free",
+            "depends_on",
         ):
             assert fact in text, (path, fact)
         assert "5175013" not in text

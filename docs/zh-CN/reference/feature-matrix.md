@@ -10,7 +10,7 @@
 | ReviewBatch 派生 | 已实现 | 固定父 hash、child Stage 1 调用为零、derivation/coordinator lease、单调 generation、immutable max-head projection receipt |
 | Outline Intelligence v2 | 已实现 | 完整 artifact 链、预算、health sidecar、显式采纳 |
 | Review/Citation/DOCX | 已实现 | review draft v2、manifest v3、实际引用 bibliography、DOCX |
-| Validation 真相源 | 已实现 | `ValidationRunResultV1` 持久化回读并绑定 job/attempt/hash；零 claim 必须显式 citation-free；其他报告仅为投影 |
+| Validation 真相源 | 已实现 | `ValidationRunResultV1` 持久化回读并绑定 job/attempt/hash；review/citation/evidence `depends_on` 精确闭包；输入为 64 位小写 SHA-256；零 claim 必须显式 citation-free；evidence 失效后 terminal/resume 不得复用；其他报告仅为投影 |
 | AgentRuntimeRunner | 已实现 | 在 `AgentRuntimeBridge` 上提供 run/resume/status/reconcile；持久化 `BaseException` 终态并从规范 artifact 恢复 Validation disposition |
 | Queue 状态映射 | 已实现 | Queue 读取 `job_status`，旧 success 仅为 readiness 投影 |
 | MinerU/Docling/OCR 稳定性 | 已实现 | preflight、共享认证熔断、受控子进程 timeout |

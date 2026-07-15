@@ -21,7 +21,7 @@
 | Stage 1 | 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest；READY summary 依赖已注册 `source_bundle`，后者再依赖来源 PDF | Excel 与旧 summary 结构 |
 | Outline v2 | literature map、synthesis flow、candidates、critiques、arbitration、`final_outline`、coverage audit，以及独立 `outline_stage_health_v1.json`；v2 开启时下游只消费已注册 `adopted_final_outline` | 仅在显式关闭 v2 时使用旧 Markdown outline |
 | Review | `*_review_draft_v2.json`、`*_citation_manifest_v3.json`、citation-ref catalog | review draft v1 与 DOCX |
-| Validation | `validation_run_result_v1.json`（`ValidationRunResultV1`） | 从规范 JSON 投影的 TXT、manual-review、alignment audit 和 completion report |
+| Validation | `validation_run_result_v1.json`（`ValidationRunResultV1`）及其精确 Registry `depends_on` 闭包：review draft、citation manifest、全部已声明 evidence manifest | 从规范 JSON 投影的 TXT、manual-review、alignment audit 和 completion report |
 | Repair | 与 validation-run artifact 绑定的 repair plan 与 apply result | 人类可读修复摘要 |
 
 `claim_verdict` 为：`supported | partial_support | evidence_gap | unsupported | contradicted | wrong_source | needs_review`。没有足够证据只能是 `evidence_gap`，不能自动写成 `unsupported`。
@@ -29,6 +29,8 @@
 身份为 `ambiguous/mismatch` 时，job 可以完成诊断，但必须 quarantine，且 `canonical_ready=false`。
 
 零 claim 的 Validation 结果只有在综述被显式声明为 citation-free 时才能为 clean；否则 claim completeness 为 false，不能发布 clean disposition。Validation 成功还必须在规范 JSON 回读后确认 job ID、attempt ID 与内容 hash 一致。
+
+review、citation 与 evidence 输入 hash 均必须是 64 位小写 SHA-256。规范 payload 中声明的 artifact ID/type/hash 多重集合必须与 Registry `depends_on` 多重集合完全一致；缺失、额外、重复、类型错误、job-kind 错误、路径错误或 hash 错误都必须 fail closed。ReviewBatch child 可以继续使用 `external_job` evidence 依赖，但必须唯一解析并递归校验。evidence manifest 被删除、篡改、quarantine 或标记 invalid 后，Validation terminal 立即失效，`resume` 不得复用该 Validation 结果。
 
 ## 派生综述与 AI-native 运行时
 

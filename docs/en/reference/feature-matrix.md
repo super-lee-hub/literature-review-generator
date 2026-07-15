@@ -12,7 +12,7 @@ Status reflects code and offline tests in the reliability-upgrade branch.
 | ReviewBatch derivation | implemented | deterministic parent-hash subsets, zero child Stage 1 calls, derivation/coordinator leases, monotonic generation, immutable max-head projection receipts |
 | Outline Intelligence v2 | implemented | full artifact chain, prompt budgets, health sidecar, explicit adoption |
 | Review and citation chain | implemented | review draft v2, citation manifest v3, cited bibliography, DOCX |
-| Validation truth source | implemented | durable `ValidationRunResultV1` read-back with job/attempt/hash binding; zero claims require explicit citation-free status; reports are projections |
+| Validation truth source | implemented | durable `ValidationRunResultV1` read-back with job/attempt/hash binding; exact review/citation/evidence `depends_on` closure; 64-character lowercase SHA-256 inputs; zero claims require explicit citation-free status; invalid evidence prevents terminal/resume reuse; reports are projections |
 | AgentRuntimeRunner | implemented | run/resume/status/reconcile over `AgentRuntimeBridge`; durable `BaseException` terminals and canonical Validation disposition recovery |
 | Queue outcome mapping | implemented | Queue reads `job_status`; `success` remains readiness compatibility only |
 | MinerU/Docling/OCR safety | implemented | preflight, shared auth circuit breaker, bounded subprocess timeouts |

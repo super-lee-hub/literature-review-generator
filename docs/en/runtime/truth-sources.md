@@ -21,7 +21,7 @@ This document names the canonical durable facts used by the current runtime. Fil
 | Stage 1 | canonical `*_summaries.json`; registered `paper_artifacts/*.json`; evidence manifests; READY summaries depend on the registered `source_bundle`, which depends on source PDFs | Excel and legacy summary shapes |
 | Outline v2 | registered literature map, synthesis flow, candidates, critiques, arbitration, `final_outline`, coverage audit, and independent `outline_stage_health_v1.json`; downstream review consumes only registered `adopted_final_outline` when v2 is enabled | legacy Markdown outline when v2 is explicitly disabled |
 | Review | `*_review_draft_v2.json` plus `*_citation_manifest_v3.json` and citation-ref catalog | review draft v1 and DOCX |
-| Validation | `validation_run_result_v1.json` (`ValidationRunResultV1`) | TXT report, manual-review JSON, alignment audit, and completion report derived from the canonical JSON |
+| Validation | `validation_run_result_v1.json` (`ValidationRunResultV1`) plus its exact Registry `depends_on` closure: review draft, citation manifest, and every declared evidence manifest | TXT report, manual-review JSON, alignment audit, and completion report derived from the canonical JSON |
 | Repair | registered repair plan and apply result tied to the validation-run artifact | human-readable repair summaries |
 
 ## Public outcomes
@@ -35,6 +35,8 @@ This document names the canonical durable facts used by the current runtime. Fil
 No evidence maps to `evidence_gap`, never automatically to `unsupported`. Identity `ambiguous` or `mismatch` completes diagnostics but quarantines canonical generation and sets `canonical_ready=false`.
 
 A zero-claim Validation result is clean only when the review is explicitly citation-free. Otherwise claim completeness is false and the result cannot publish a clean disposition. Successful Validation is published only after canonical JSON read-back confirms the job ID, attempt ID, and content hash.
+
+Every declared review, citation, and evidence input hash is a 64-character lowercase SHA-256. The canonical payload's artifact ID/type/hash multiset must exactly equal the Registry `depends_on` multiset; missing, extra, duplicate, wrong-type, wrong-job-kind, wrong-path, or wrong-hash edges fail closed. Evidence may remain an `external_job` dependency for a derived ReviewBatch child, but it must resolve uniquely and validate recursively. A deleted, changed, quarantined, or invalid evidence manifest invalidates the Validation terminal, so `resume` cannot reuse that Validation result.
 
 ## Derived review batches
 

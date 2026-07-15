@@ -2,17 +2,19 @@
 
 ## Delivery result
 
-All Phase 0-8 requirements and the post-review reliability closure are
+All Phase 0-8 requirements, the post-review reliability closure, and the final
+Validation evidence-dependency closure are
 implemented and locally verified on the single branch
 `codex/auto-generate-reliability-upgrade`.
 
 - Base: `origin/main@5becc4e50e234244162dca980062fe68e4e0e1e9`
-- Validated code SHA: `ed6f0430c2aeb326e2fc26e183c1656ecc40e29e`
+- Validated code SHA: `8365f1df5f778e8ec8372925fc5002550f72de72`
 - Validation disposition: `passed`
 - Adversarial ReviewBatch review: local verdict `PASS`
 - Six-blocker audit: all contracts passed after fixes
-- Final required test gate: `1082 passed, 22 skipped`
-- Final strict-offline gate: `1082 passed, 22 deselected`
+- Validation evidence-dependency audit: final code and test verdicts `PASS`
+- Final required test gate: `1103 passed, 22 skipped`
+- Final strict-offline gate: `1103 passed, 22 deselected`
 - Repository-wide Pyright: `0 errors, 0 warnings, 0 informations`
 
 The report intentionally records the validated code SHA rather than its own
@@ -33,6 +35,7 @@ commit. The final PR head SHA and PR URL belong in the PR body.
 | 8 - platform/docs/E2E | `0fda818` | `245c0bc` | passed |
 | Post-Phase-8 - Windows locale CI repair | `b9b1cf1` | `7688de9` | passed |
 | Post-review reliability closure | `ed6f043` | this report | passed |
+| Final Validation evidence-dependency closure | `8365f1d` | this report | passed |
 
 ## Verification evidence
 
@@ -52,11 +55,12 @@ The traceability tables below refer to these executed evidence sets.
 | `V8-platform` | `python -m pytest -q tests/test_console_io.py tests/test_preprocess_platform_safety.py tests/test_quarantine_lifecycle.py tests/test_reconcile_schema_contracts.py tests/test_runtime_legacy_workspace.py tests/test_config_path_origin.py tests/test_documentation_contract.py --strict-markers` | `57 passed in 11.61s` |
 | `V8-e2e` | `python -m pytest -q tests/test_synthetic_runtime_e2e.py --strict-markers` | `8 passed in 442.59s` |
 | `V8-review-fix` | Summary/legacy/Registry/reconcile/runner regression suite | `101 passed in 55.68s` |
-| `VF-required` | `python -m pytest -q --strict-markers` | `1082 passed, 22 skipped in 552.69s` |
-| `VF-offline` | `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | `1082 passed, 22 deselected in 544.06s` |
+| `VF-required` | `python -m pytest -q --strict-markers` | `1103 passed, 22 skipped in 770.08s` |
+| `VF-offline` | `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | `1103 passed, 22 deselected in 656.83s` |
 | `VF-static` | `python -m pyright`; `python -m compileall -q main.py runtime services validation outline preprocess`; Phase 8 production Ruff `E9,F821,F841`; `git diff --check` | all passed; Pyright reported zero diagnostics |
 | `V-CI-locale` | locale-strict Stage 2/report regressions and static checks | `15 passed`; historical local reviewer verdicts were `PASS` and `CLEAR`; final suite evidence is superseded by `V-post-review` |
 | `V-post-review` | ReviewBatch, six-blocker, Stage 1 lineage, modified-module, required, strict-offline, Pyright, compileall, Ruff, and diff gates | `58 + 18 + 134 + 363 passed`; final `1082 passed, 22 skipped`; final `1082 passed, 22 deselected`; all static checks passed |
+| `V-validation-closure` | exact Validation input/dependency tests, 61-paper parent/derived E2E, required/offline gates, Pyright, compileall, Ruff, diff, and two independent reviews | focused gates passed; `3 passed in 376.19s`; final `1103 passed, 22 skipped`; final `1103 passed, 22 deselected`; reviewers `PASS` |
 
 Historical phase-level command lines and artifact hashes are retained in
 `docs/implementation/auto-generate-reliability-upgrade-progress.md`.
@@ -104,6 +108,7 @@ Historical phase-level command lines and artifact hashes are retained in
 | Use one raw-offset sentence segmentation contract | `services.sentence_segmenter` | `tests/test_sentence_segmenter.py` | `V3` | passed |
 | Preserve Chinese no-space text, citation-only/line citations, decimals, and abbreviations | sentence segmenter rules | targeted fixtures in `tests/test_sentence_segmenter.py` | `V3` | passed |
 | Make `ValidationRunResultV1` the canonical structured result and verdict summary | `validation.run_result.ValidationRunResultV1` | `tests/test_validation_run_result.py` | `V3` | passed |
+| Require 64-character lowercase SHA-256 input identities and exact declared-vs-Registry Validation dependencies | `ValidationInputArtifactsV1`; `validation.input_dependencies`; runtime registration/reconcile | `tests/test_validation_input_dependencies.py`, projection/bridge/runner/E2E regressions | `V-validation-closure` | passed |
 | Derive TXT, audit, runtime metadata, completion, and alignment reports from canonical JSON | `validator.py`; validation projection helpers | `tests/test_validation_projections.py`, `tests/test_runtime_validation_bridge.py` | `V3` | passed |
 | Keep old Validation readers without treating old output as satisfying the new contract | compatibility adapter in Validation loaders | compatibility cases in `tests/test_validation_run_result.py` | `V3` | passed |
 
@@ -147,6 +152,7 @@ Historical phase-level command lines and artifact hashes are retained in
 | --- | --- | --- | --- | --- |
 | Bind paper artifacts to normalized text, chunks, page index, and evidence manifest | `services.evidence_manifest.EvidenceManifestV1`; paper artifact persistence | `tests/test_evidence_manifest.py`, `tests/test_paper_artifact_durability.py` | `V7` | passed |
 | Project parent evidence artifact identities/hashes into child jobs | `services.review_batch` evidence dependency projection | `tests/test_review_batch.py` | `V7` | passed |
+| Bind canonical Validation to review, citation, and all local/external evidence manifests; invalidate terminal/resume when any edge changes | shared Validation dependency resolver and recursive reconcile | `tests/test_validation_input_dependencies.py`, `tests/test_synthetic_runtime_e2e.py` | `V-validation-closure` | passed |
 | Use English concepts/keywords only to improve bilingual recall; ground conclusions in original evidence | `validation.evidence_resolver`; Stage 1 query builder | alignment and evidence resolver tests | `V7`, `V8-e2e` | passed |
 | Persist checkpoints by claim-unit x paper | `validation.edge_checkpoint.ValidationEdgeCheckpointStore` | `tests/test_validation_edge_checkpoint.py` | `V7` | passed |
 | Resume serial interruption after durable edge 20/43 with exactly 23 remaining | edge checkpoint replay | 43-edge interruption fixture | `V7` | passed |
@@ -181,7 +187,7 @@ Historical phase-level command lines and artifact hashes are retained in
 | Artifact Registry | v2 with `ArtifactDependencyRefV2` | valid v1 reads remain supported; explicit writes upgrade; malformed/future/foreign headers fail |
 | `AuditRecordV1` | immutable audit v1 | shared by identity, legacy reuse/migration, manual adoption, deletion, and quarantine actions |
 | `JobOutcomeV1`, `AttemptV1`, terminal stage record | runtime durability v1 | Queue `success` is a compatibility projection; `job_status` is canonical |
-| `ValidationRunResultV1` | Validation truth v1 | TXT/manual/completion/alignment are projections; legacy reports do not satisfy v1 |
+| `ValidationRunResultV1` | Validation truth v1 | TXT/manual/completion/alignment are projections; legacy reports do not satisfy v1; READY requires exact review/citation/evidence `depends_on` identity with 64-character lowercase SHA-256 hashes |
 | `SummarySelectionSpecV1`, `ReviewBatchSpecV1`, derivation result | batch derivation v1 | children reuse parent canonical summaries/evidence through external dependencies |
 | `OutlineStageHealthV1`, `PromptBudgetV1` | additive Outline sidecars | Outline v2 schema remains canonical and unchanged |
 | `EvidenceManifestV1`, edge/adjudication checkpoints | evidence/recovery v1 | additive hash-bearing dependencies and replay checkpoints |
@@ -191,11 +197,11 @@ Historical phase-level command lines and artifact hashes are retained in
 
 ## Change surface
 
-The validated range contains 137 files, 24,654 insertions, and 1,881 deletions.
+The validated range contains 143 files, 34,371 insertions, and 1,957 deletions.
 The complete machine-readable manifest is reproducible with:
 
 ```text
-git diff --name-status 5becc4e50e234244162dca980062fe68e4e0e1e9..b9b1cf1fa572a31201e395855ee623752cc708af
+git diff --name-status 5becc4e50e234244162dca980062fe68e4e0e1e9..8365f1df5f778e8ec8372925fc5002550f72de72
 ```
 
 | Area | Files | Principal changes |
@@ -205,12 +211,12 @@ git diff --name-status 5becc4e50e234244162dca980062fe68e4e0e1e9..b9b1cf1fa572a31
 | `docs` | 8 | bilingual truth sources, compatibility, feature matrix, implementation ledger and report |
 | `gui` | 1 | runtime/config compatibility typing and behavior |
 | `outline` | 8 | health sidecar, prompt budget, adoption/resolution gates |
-| `preprocess` | 4 | provider circuit and bounded Docling/OCR workers |
-| `runtime` | 10 | runner, attempts, terminals, reconcile, lifecycle, CLI |
+| `preprocess` | 5 | provider circuit, visual artifact safety, and bounded Docling/OCR workers |
+| `runtime` | 11 | runner, attempts, terminals, reconcile, lifecycle, CLI, Validation adapter |
 | `services` | 22 | Registry/audit/outcome/identity/batch/evidence/quarantine/console contracts |
-| `validation` | 8 | canonical result, evidence resolution, edge/adjudication recovery |
+| `validation` | 9 | canonical result, exact input dependencies, evidence resolution, edge/adjudication recovery |
 | `tools` | 1 | preprocessing audit compatibility |
-| `tests` | 63 | unit, integration, concurrency, platform, documentation, and public synthetic E2E |
+| `tests` | 66 | unit, integration, concurrency, platform, documentation, and public synthetic E2E |
 
 ## Optional skips and validation boundaries
 
@@ -263,6 +269,17 @@ projection receipts record `projected` or `superseded` plus the observed head
 identity and hash. Tests cover manifest, Registry, projection, receipt, child,
 terminal, and resume crash windows without using mtime ordering. Independent
 adversarial review found no remaining crash/order blocker.
+
+The final Validation evidence audit found that the canonical payload declared
+evidence manifests without binding them into the Registry dependency graph.
+Code checkpoint `8365f1d` closes that gap with one shared resolver used by both
+registration paths, exact payload/Registry identity comparison, 64-character
+lowercase SHA-256 validation, local and ReviewBatch external evidence support,
+fresh durable Registry snapshots, and normalized path checks. Failed dependency
+closure is published only as `failed/unvalidated`; a failed optional Validation
+cannot leak a declared `clean` disposition into the job outcome. Evidence
+deletion, mutation, quarantine, or invalidation now makes the terminal and
+resume result incomplete. Both final independent reviews returned `PASS`.
 
 ## Remaining risks
 
