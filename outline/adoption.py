@@ -19,6 +19,7 @@ from outline.v2_models import (
     FinalOutline,
     compute_content_hash,
 )
+from outline.stage_health import OutlineStageHealthV1
 
 
 def _utc_now_iso() -> str:
@@ -28,11 +29,29 @@ def _utc_now_iso() -> str:
 def verify_adoption_prerequisites(
     final_outline: FinalOutline,
     audit: CoverageAudit,
+    stage_health: OutlineStageHealthV1 | None = None,
 ) -> Tuple[bool, str]:
     """Verify prerequisites for adoption.
 
     Returns (ok, error_message).
     """
+    if stage_health is None:
+        return False, "Outline stage health sidecar is required; adoption is blocked"
+
+    if stage_health.job_id != final_outline.created_from_job_id:
+        return False, "Outline stage health belongs to a different job; adoption is blocked"
+
+    if not stage_health.adoptable:
+        reasons = "; ".join(stage_health.degradation_reasons) or "stage health is not adoptable"
+        return False, f"Outline provider chain is degraded; adoption is blocked: {reasons}"
+
+    current_final_hash = compute_content_hash(final_outline.to_dict())
+    current_audit_hash = compute_content_hash(audit.to_dict())
+    if stage_health.source_final_outline_hash != current_final_hash:
+        return False, "Stale stage health: final outline hash does not match"
+    if stage_health.source_coverage_audit_hash != current_audit_hash:
+        return False, "Stale stage health: coverage audit hash does not match"
+
     if not audit.passed:
         return False, "Coverage audit did not pass; adoption is blocked"
 
@@ -42,7 +61,6 @@ def verify_adoption_prerequisites(
     if final_outline.blocking_critique_ids:
         return False, "Final outline has unresolved blocking critiques; adoption is blocked"
 
-    current_final_hash = compute_content_hash(final_outline.to_dict())
     if audit.source_final_outline_hash != current_final_hash:
         return False, (
             f"Stale audit: audit hash ({audit.source_final_outline_hash[:16]}...) "
@@ -57,13 +75,14 @@ def adopt_final_outline(
     audit: CoverageAudit,
     job_id: str,
     adopted_by: str,
+    stage_health: OutlineStageHealthV1 | None = None,
 ) -> Tuple[Optional[AdoptedFinalOutline], str]:
     """Adopt a final outline after passing audit.
 
     Returns (adopted_outline_or_none, status_message).
     Does NOT overwrite legacy Markdown or reviewed_outline.json.
     """
-    ok, err = verify_adoption_prerequisites(final_outline, audit)
+    ok, err = verify_adoption_prerequisites(final_outline, audit, stage_health)
     if not ok:
         return None, err
 

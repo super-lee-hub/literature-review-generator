@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Mapping
 
 
 _UNKNOWN_DOI_VALUES = {"", "unknown", "n/a", "na", "none", "null"}
-_DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[-._;()/:A-Z0-9]+$", re.IGNORECASE)
+_DOI_PATTERN = re.compile(r"^10\.\d{4,9}/[-._;()/:A-Z0-9&]+$", re.IGNORECASE)
 
 
 def _safe_str(value: Any) -> str:
@@ -34,7 +34,7 @@ def normalize_doi(value: Any) -> str:
 
     candidate = _strip_doi_prefix(text).strip().rstrip(" .;,")
     decorated_match = re.fullmatch(
-        r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)\s*[<\[]https?://(?:dx\.)?doi\.org/.*[>\]]?",
+        r"(10\.\d{4,9}/[-._;()/:A-Z0-9&]+)\s*[<\[]https?://(?:dx\.)?doi\.org/.*[>\]]?",
         candidate,
         flags=re.IGNORECASE,
     )

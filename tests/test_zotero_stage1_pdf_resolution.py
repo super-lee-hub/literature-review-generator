@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import main
@@ -18,6 +19,30 @@ class _DummyLogger:
 
     def success(self, *_args, **_kwargs):
         pass
+
+
+def test_main_zotero_parse_keeps_structured_partial_diagnostics(tmp_path: Path) -> None:
+    report = tmp_path / "partial.txt"
+    report.write_text(
+        "*\nGood Paper\n作者\tAlice Smith\n*\n作者\tMissing Title",
+        encoding="utf-8",
+    )
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+
+    assert generator.parse_zotero_report(str(report)) is True
+    assert generator.zotero_parse_result["status"] == "partial"
+    assert generator.zotero_parse_result["diagnostics"][0]["code"] == "missing_title"
+    assert [paper.get("title") for paper in generator.papers] == ["Good Paper"]
+
+
+def test_main_zotero_parse_preserves_missing_source_diagnostic(tmp_path: Path) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+
+    assert generator.parse_zotero_report(str(tmp_path / "missing.txt")) is False
+    assert generator.zotero_parse_result["status"] == "failed"
+    assert generator.zotero_parse_result["diagnostics"][0]["code"] == "source_missing"
 
 
 def _quality_ready_ai_summary() -> dict:
@@ -101,7 +126,7 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
         seen["pdf_path"] = resolved_pdf_path
         seen["strategy"] = strategy
         return (
-            "x" * 600,
+            "Resolved Paper\nDOI 10.1234/resolved.2024\n" + "x" * 600,
             {
                 "analysis_input_kind": "text",
                 "extractor_used": "test",
@@ -110,7 +135,15 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
         )
 
     monkeypatch.setattr(main, "create_file_index", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(main, "find_pdf", lambda *_args, **_kwargs: str(pdf_path))
+    monkeypatch.setattr(
+        main,
+        "resolve_pdf_match",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="matched",
+            selected_path=str(pdf_path),
+            to_dict=lambda: {"status": "matched", "selected_path": str(pdf_path)},
+        ),
+    )
     monkeypatch.setattr(generator, "_check_cancelled", lambda: None)
     monkeypatch.setattr(generator, "_emit_progress", lambda **_kwargs: None)
     monkeypatch.setattr(
@@ -142,6 +175,7 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
     paper: PaperInfo = {
         "title": "Resolved Paper",
         "authors": ["Alice Smith"],
+        "doi": "10.1234/resolved.2024",
         "attachments": ["Resolved Paper"],
     }
 
@@ -150,3 +184,176 @@ def test_process_paper_uses_full_pdf_path_returned_by_find_pdf(
     assert result is not None
     assert result["status"] == "success"
     assert seen["pdf_path"] == str(pdf_path)
+    assert result["paper_info"].get("pdf_path") == str(pdf_path)
+    assert result["paper_info"].get("source_pdf") == str(pdf_path)
+    assert result["paper_info"].get("source_pdf_fingerprint")
+
+
+def test_process_paper_blocks_ambiguous_pdf_before_stage1_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.mode = "zotero"
+    generator.config = ConfigDict({"Paths": {"library_path": str(tmp_path)}})
+    generator.library_path = str(tmp_path)
+    stage1_called = False
+
+    monkeypatch.setattr(generator, "_check_cancelled", lambda: None)
+    monkeypatch.setattr(generator, "_emit_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_paper_progress_label",
+        lambda paper: str(paper.get("title") or "unknown"),
+    )
+    monkeypatch.setattr(
+        main,
+        "resolve_pdf_match",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="ambiguous",
+            selected_path="",
+            to_dict=lambda: {
+                "status": "ambiguous",
+                "selected_path": "",
+                "candidates": [{"path": "a.pdf"}, {"path": "b.pdf"}],
+                "diagnostics": ["top_candidates_within_margin"],
+            },
+        ),
+    )
+
+    def unexpected_stage1(*_args, **_kwargs):
+        nonlocal stage1_called
+        stage1_called = True
+        raise AssertionError("Stage 1 must not run for ambiguous PDF identity")
+
+    monkeypatch.setattr(generator, "_prepare_stage1_input", unexpected_stage1)
+    monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", unexpected_stage1)
+
+    result = generator.process_paper(
+        {"title": "Ambiguous Paper", "authors": [], "attachments": ["paper.pdf"]},
+        paper_index=0,
+        file_index=cast(main.FileIndex, object()),
+        total_papers=1,
+    )
+
+    assert result is not None
+    assert result["status"] == "failed"
+    assert result.get("failure_reason") == "ambiguous_pdf_match"
+    pdf_match = result.get("pdf_match")
+    assert pdf_match is not None
+    assert pdf_match["status"] == "ambiguous"
+    assert stage1_called is False
+
+
+def test_process_paper_quarantines_doi_mismatch_before_stage1_provider(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    pdf_path = tmp_path / "wrong-source.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n" + b"x" * 2048)
+    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=None)
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.mode = "zotero"
+    generator.config = ConfigDict({"Paths": {"library_path": str(tmp_path)}})
+    generator.library_path = str(tmp_path)
+    provider_calls = 0
+
+    monkeypatch.setattr(generator, "_check_cancelled", lambda: None)
+    monkeypatch.setattr(generator, "_emit_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_paper_progress_label",
+        lambda paper: str(paper.get("title") or "unknown"),
+    )
+    monkeypatch.setattr(
+        main,
+        "resolve_pdf_match",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="matched",
+            selected_path=str(pdf_path),
+            to_dict=lambda: {"status": "matched", "selected_path": str(pdf_path)},
+        ),
+    )
+    monkeypatch.setattr(
+        generator,
+        "_prepare_stage1_input",
+        lambda *_args, **_kwargs: (
+            "Wrong Source\nDOI 10.9999/wrong.2024\n" + "x" * 600,
+            {
+                "analysis_input_kind": "text",
+                "extractor_used": "test",
+                "preprocess_profile": "test",
+            },
+        ),
+    )
+
+    def unexpected_provider(*_args, **_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("Stage 1 provider must not run for a DOI mismatch")
+
+    monkeypatch.setattr(generator, "_call_stage1_reader_with_scheduler", unexpected_provider)
+
+    result = generator.process_paper(
+        {
+            "title": "Expected Source",
+            "authors": ["Alice Smith"],
+            "year": "2024",
+            "doi": "10.1234/right.2024",
+            "attachments": ["wrong-source.pdf"],
+        },
+        paper_index=0,
+        file_index=cast(main.FileIndex, object()),
+        total_papers=1,
+    )
+
+    assert result is not None
+    assert result["status"] == "failed"
+    assert result.get("failure_reason") == "source_identity_mismatch"
+    assert result.get("identity_verdict") == "mismatch"
+    assert result.get("artifact_status") == "quarantined"
+    assert provider_calls == 0
+
+
+def test_process_all_papers_prefers_runtime_library_path(tmp_path: Path, monkeypatch) -> None:
+    runtime_library = tmp_path / "runtime-library"
+    runtime_library.mkdir()
+    configured_library = tmp_path / "configured-library"
+    configured_library.mkdir()
+
+    generator = main.LiteratureReviewGenerator(
+        project_name="demo",
+        pdf_folder=None,
+        library_path=str(runtime_library),
+    )
+    generator.logger = cast(main.CustomLogger, _DummyLogger())
+    generator.mode = "zotero"
+    generator.config = ConfigDict(
+        {
+            "Paths": {"library_path": str(configured_library)},
+            "Performance": {"max_workers": "1"},
+        }
+    )
+    generator.papers = [{"title": "Already processed", "authors": []}]
+    paper_key = generator.get_paper_key(generator.papers[0])
+    generator._checkpoint_processed_papers = {paper_key}
+    generator._checkpoint_failed_papers = set()
+
+    seen: dict[str, str] = {}
+
+    class _Index:
+        def __len__(self) -> int:
+            return 1
+
+    def _create_file_index(path: str) -> _Index:
+        seen["library_path"] = path
+        return _Index()
+
+    monkeypatch.setattr(main, "create_file_index", _create_file_index)
+    monkeypatch.setattr(generator, "_emit_stage1_progress", lambda **_kwargs: None)
+    monkeypatch.setattr(generator, "save_summaries", lambda: True)
+    monkeypatch.setattr(generator, "save_checkpoint", lambda: True)
+
+    assert generator.process_all_papers() is True
+    assert seen["library_path"] == str(runtime_library)

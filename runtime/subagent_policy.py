@@ -39,6 +39,13 @@ DEFAULT_STAGE_POLICIES: dict[str, StageExecutionPolicy] = {
         total_attempt_budget=2,
         quality_retry_budget=1,
     ),
+    "stage1_derive": StageExecutionPolicy(
+        stage_name="stage1_derive",
+        execution_mode=ExecutionMode.LOCAL,
+        max_concurrency=1,
+        total_attempt_budget=1,
+        legacy_api_path_allowed=False,
+    ),
     "stage2_outline": StageExecutionPolicy(
         stage_name="stage2_outline",
         execution_mode=ExecutionMode.SUBAGENT,

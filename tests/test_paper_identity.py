@@ -6,6 +6,7 @@ from services.paper_identity import normalize_doi, normalize_paper_identity
 def test_valid_doi_and_doi_url_normalize():
     assert normalize_doi("DOI:10.1000/ABC.") == "10.1000/abc"
     assert normalize_doi("https://doi.org/10.5555/Foo-Bar") == "10.5555/foo-bar"
+    assert normalize_doi("10.1207/S15327663JCP13-1&2_07") == "10.1207/s15327663jcp13-1&2_07"
 
 
 def test_decorated_doi_url_suffix_normalizes_to_bare_doi():

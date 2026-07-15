@@ -71,6 +71,13 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
     )
     generator.summary_file = workspace.artifact_path(f"{project_name}_summaries.json")
     Path(generator.summary_file).write_text(json.dumps([{"status": "success"}]), encoding="utf-8")
+    registry.register_file(
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=generator.summary_file,
+        producer="tests",
+    )
     return generator, workspace
 
 
@@ -90,6 +97,61 @@ def test_load_outline_artifact_uses_registered_markdown_even_if_reviewed_outline
 
     assert loaded_path == str(outline_path)
     assert loaded_text == outline_text
+
+
+def test_registered_dependency_for_path_does_not_reuse_wrong_artifact_type(
+    tmp_path: Path,
+) -> None:
+    generator, workspace = _make_bound_generator(tmp_path, job_id="job-path-type")
+    shared_path = Path(workspace.artifact_path("shared.json"))
+    shared_path.write_text("{}", encoding="utf-8")
+    assert generator.artifact_registry is not None
+    wrong_record = generator.artifact_registry.register_file(
+        artifact_id="wrong-type-record",
+        artifact_role="citation_manifest",
+        artifact_type="citation_manifest",
+        artifact_version="v3",
+        path=shared_path,
+        producer="tests",
+    )
+
+    dependency = generator._registered_dependency_for_path(
+        str(shared_path),
+        fallback_artifact_type="literature_review_outline",
+    )
+
+    assert dependency.artifact_type == "literature_review_outline"
+    assert dependency.artifact_id == ""
+    assert dependency.content_hash == ""
+    assert dependency.artifact_id != wrong_record.artifact_id
+
+
+def test_registered_outline_dependency_accepts_adopted_outline_type(tmp_path: Path) -> None:
+    generator, workspace = _make_bound_generator(tmp_path, job_id="job-adopted-type")
+    adopted_path = Path(workspace.artifact_path("demo_adopted_final_outline.json"))
+    adopted_path.write_text("{}", encoding="utf-8")
+    assert generator.artifact_registry is not None
+    adopted_record = generator.artifact_registry.register_file(
+        artifact_id="adopted_final_outline",
+        artifact_role="adopted_final_outline",
+        artifact_type="adopted_final_outline",
+        artifact_version="v1",
+        path=adopted_path,
+        producer="tests",
+    )
+
+    dependency = generator._registered_dependency_for_path(
+        str(adopted_path),
+        fallback_artifact_type="literature_review_outline",
+        expected_artifact_types=(
+            "literature_review_outline",
+            "adopted_final_outline",
+        ),
+    )
+
+    assert dependency.artifact_type == "adopted_final_outline"
+    assert dependency.artifact_id == adopted_record.artifact_id
+    assert dependency.content_hash == adopted_record.content_hash
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +195,28 @@ def test_runtime_resolver_v2_enabled_without_adopted_fails_closed(tmp_path: Path
     assert result is None
 
 
+def test_runtime_resolver_v2_rejects_unregistered_convention_file(tmp_path: Path) -> None:
+    from outline.runtime_resolver import OutlineRuntimeResolver
+
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir(parents=True)
+    (artifacts_dir / "test_adopted_final_outline.json").write_text("{}", encoding="utf-8")
+
+    class EmptyRegistry:
+        @staticmethod
+        def get(_artifact_id: str):
+            return None
+
+    resolver = OutlineRuntimeResolver(
+        config={"Outline": {"enable_outline_intelligence_v2": "true"}},
+        artifact_registry=EmptyRegistry(),
+        workspace_path=str(tmp_path),
+        project_name="test",
+    )
+
+    assert resolver.resolve_for_review() is None
+
+
 def test_runtime_resolver_v2_with_valid_adopted_outline(tmp_path: Path) -> None:
     from outline.runtime_resolver import OutlineRuntimeResolver
     from outline.v2_models import AdoptedFinalOutline, FinalOutline, compute_content_hash
@@ -158,6 +242,17 @@ def test_runtime_resolver_v2_with_valid_adopted_outline(tmp_path: Path) -> None:
 
     adopted_path = artifacts_dir / "test_adopted_final_outline.json"
     adopted_path.write_text(json.dumps(adopted.to_dict()), encoding="utf-8")
+    from outline.stage_health import OutlineStageHealthV1, make_test_double_entry
+    health = OutlineStageHealthV1(
+        job_id="job-001",
+        execution_mode="test_dev",
+        stages=(make_test_double_entry("outline_candidates", "test", {}, {}),),
+        source_final_outline_hash=adopted.source_final_outline_hash,
+        source_coverage_audit_hash=adopted.source_coverage_audit_hash,
+    )
+    (artifacts_dir / "test_outline_stage_health_v1.json").write_text(
+        json.dumps(health.to_dict()), encoding="utf-8"
+    )
 
     config = {"Outline": {"enable_outline_intelligence_v2": "true"}}
     resolver = OutlineRuntimeResolver(
@@ -267,8 +362,10 @@ def test_runtime_resolver_v2_rejects_stale_adopted_outline_hash(tmp_path: Path) 
 
 def test_load_outline_artifact_v2_enabled_refuses_legacy_fallback(tmp_path: Path) -> None:
     generator, workspace = _make_bound_generator(tmp_path, job_id="job-v2-fail-closed")
-    generator.config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
-    generator.compat_config = CompatConfigView.from_config(generator.config)
+    config = generator.config
+    assert config is not None
+    config.setdefault("Outline", {})["enable_outline_intelligence_v2"] = "true"
+    generator.compat_config = CompatConfigView.from_config(config)
 
     legacy = Path(generator._get_legacy_outline_file_path())
     legacy.parent.mkdir(parents=True, exist_ok=True)

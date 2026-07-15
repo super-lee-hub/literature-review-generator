@@ -1,4 +1,5 @@
 import json
+from datetime import datetime as RealDateTime
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +31,31 @@ class _DummyLogger:
 
     def debug(self, *_args, **_kwargs):
         self.messages.append(("debug", " ".join(str(arg) for arg in _args)))
+
+
+class _LocaleStrictTimestamp:
+    def __init__(self) -> None:
+        self._value = RealDateTime(2026, 7, 14, 9, 30, 45)
+
+    def __getattr__(self, name: str):
+        return getattr(self._value, name)
+
+    def strftime(self, format_string: str) -> str:
+        if not format_string.isascii():
+            raise UnicodeEncodeError(
+                "locale",
+                format_string,
+                0,
+                len(format_string),
+                "encoding error",
+            )
+        return self._value.strftime(format_string)
+
+
+class _LocaleStrictDateTime:
+    @staticmethod
+    def now() -> _LocaleStrictTimestamp:
+        return _LocaleStrictTimestamp()
 
 
 def _resume_report(workspace: JobWorkspace) -> ResumeStateReport:
@@ -78,9 +104,19 @@ def _make_bound_generator(tmp_path: Path, project_name: str = "demo", job_id: st
         fingerprint_bundle={"request": "demo"},
         resume_state_report=_resume_report(workspace),
     )
-    generator.summaries = [{"status": "success", "paper_info": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "canonical_paper_key": "paper_a"}, "ai_summary": {"paper_metadata": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "journal": "Journal of Tests", "doi": "10.1000/test.paper"}}}]
+    generator.summaries = cast(
+        main.SummariesList,
+        [{"status": "success", "paper_info": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "canonical_paper_key": "paper_a"}, "ai_summary": {"paper_metadata": {"title": "Paper A", "authors": ["Alice Smith"], "year": "2024", "journal": "Journal of Tests", "doi": "10.1000/test.paper"}}}],
+    )
     generator.summary_file = workspace.artifact_path(f"{project_name}_summaries.json")
     Path(generator.summary_file).write_text(json.dumps(generator.summaries), encoding="utf-8")
+    registry.register_file(
+        artifact_role="summary",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=generator.summary_file,
+        producer="tests",
+    )
     return generator, workspace, registry
 
 
@@ -95,10 +131,10 @@ def _stub_stage2_bootstrap(monkeypatch, generator) -> None:
 def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: Path, monkeypatch) -> None:
     generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-success")
     _stub_stage2_bootstrap(monkeypatch, generator)
+    monkeypatch.setattr(main, "datetime", _LocaleStrictDateTime)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
@@ -138,13 +174,28 @@ def test_successful_stage2_generation_creates_registered_review_draft(tmp_path: 
     assert any(dep["artifact_type"] == "literature_review_outline" for dep in review_records[0]["depends_on"])
 
 
+def test_review_content_timestamp_avoids_locale_sensitive_strftime(monkeypatch) -> None:
+    monkeypatch.setattr(main, "datetime", _LocaleStrictDateTime)
+
+    content = main.LiteratureReviewGenerator.format_review_content(
+        {"summary": "Review body"},
+        {
+            "total_papers": 1,
+            "successful_papers": 1,
+            "failed_papers": 0,
+            "papers": [],
+        },
+    )
+
+    assert "**生成时间**: 2026年07月14日 09:30" in content
+
+
 def test_stage2_with_failed_sections_does_not_register_review_draft(tmp_path: Path, monkeypatch) -> None:
     generator, workspace, _registry = _make_bound_generator(tmp_path, job_id="job-review-failed")
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
@@ -177,8 +228,7 @@ def test_stage2_stops_after_first_failed_section(tmp_path: Path, monkeypatch) ->
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section\n\n## 3. Third Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
     generated_sections = []
 
     def _section_content(section_title: str, _outline: str):
@@ -204,8 +254,7 @@ def test_stage2_retries_section_missing_structured_citations(tmp_path: Path, mon
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     retry_calls = []
 
@@ -272,8 +321,7 @@ def test_review_draft_resume_path_keeps_existing_sections_and_registers_on_compl
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     word_path = Path(workspace.report_path("demo_literature_review.docx"))
     existing_doc = Document()
@@ -323,8 +371,7 @@ def test_review_draft_checkpoint_without_docx_restarts_from_first_section(
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
     checkpoint_path = Path(workspace.checkpoint_path("demo_review_checkpoint.json"))
     checkpoint_path.write_text(
         json.dumps(
@@ -410,8 +457,7 @@ def test_successful_stage2_generation_creates_registered_review_draft_v2(tmp_pat
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
@@ -454,8 +500,7 @@ def test_stage2_with_failed_sections_does_not_register_review_draft_v2(tmp_path:
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section\n\n## 2. Second Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     def _section_content(section_title: str, _outline: str):
         if section_title == "Second Section":
@@ -483,8 +528,7 @@ def test_review_draft_v2_written_to_job_workspace_not_project_root(tmp_path: Pat
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. Single Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(
@@ -512,8 +556,7 @@ def test_review_draft_v1_and_v2_coexist_in_registry(tmp_path: Path, monkeypatch)
     _stub_stage2_bootstrap(monkeypatch, generator)
 
     outline_text = "# Demo Outline\n\n## 1. First Section"
-    outline_path = Path(workspace.artifact_path("demo_literature_review_outline.md"))
-    outline_path.write_text(outline_text, encoding="utf-8")
+    outline_path = Path(generator._write_outline_artifact(outline_text, producer="tests"))
 
     monkeypatch.setattr(generator, "_load_outline_artifact", lambda: (str(outline_path), outline_text))
     monkeypatch.setattr(

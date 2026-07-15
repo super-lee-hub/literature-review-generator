@@ -10,6 +10,7 @@ from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
 from config_loader import ConfigDict
 from services.progress_state import ResumeStateReport
+from summary_schema import normalize_ai_summary
 
 
 class DummyLogger:
@@ -129,7 +130,17 @@ def make_bridge_session(tmp_path: Path, *, action: str = "run_all") -> tuple[Age
 
 
 def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict[str, Any]:
+    from services.artifact_registry import file_sha256
+
     pdf_path_str = str(pdf_path)
+    preprocess_dir = pdf_path.parent / f"{paper_key}_preprocess"
+    preprocess_dir.mkdir(exist_ok=True)
+    markdown_path = preprocess_dir / "normalized.md"
+    chunks_path = preprocess_dir / "chunks.json"
+    page_index_path = preprocess_dir / "page_index.json"
+    markdown_path.write_text("Paper A source evidence.", encoding="utf-8")
+    chunks_path.write_text('[{"chunk_id":"c1","text":"Paper A source evidence."}]', encoding="utf-8")
+    page_index_path.write_text('[{"page_number":1,"text":"Paper A source evidence."}]', encoding="utf-8")
     return {
         "status": "success",
         "paper_info": {
@@ -143,19 +154,31 @@ def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict
             "source_paper_id": pdf_path_str,
             "source_mode": "direct",
             "source_pdf": pdf_path_str,
-            "source_pdf_fingerprint": "sha256-demo",
+            "source_pdf_fingerprint": file_sha256(pdf_path),
         },
-        "ai_summary": {
-            "paper_metadata": {
-                "title": "Paper A",
-                "authors": ["Alice Smith"],
-                "year": "2024",
-                "journal": "Journal of Tests",
-                "doi": "10.1000/test.paper",
+        "ai_summary": normalize_ai_summary(
+            {
+                "paper_metadata": {
+                    "title": "Paper A",
+                    "authors": ["Alice Smith"],
+                    "year": "2024",
+                    "journal": "Journal of Tests",
+                    "doi": "10.1000/test.paper",
+                },
+                "core_analysis": {
+                    "summary": "Paper A reports source-grounded evidence.",
+                    "methodology": "Fixture analysis.",
+                    "findings": "The fixture contains a deterministic result.",
+                    "conclusions": "The deterministic result supports runtime testing.",
+                },
             }
-        },
+        ),
         "stage1_input": {"input_mode": "text", "selected_visual_refs": [], "multimodal_capability": {}},
         "text_length": 1200,
         "processing_time": "1.2",
-        "preprocess": {},
+        "preprocess": {
+            "markdown_path": str(markdown_path),
+            "chunks_path": str(chunks_path),
+            "page_index_path": str(page_index_path),
+        },
     }

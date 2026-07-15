@@ -94,8 +94,11 @@ def _outline_bool(view: "CompatConfigView", key: str, default: bool = False) -> 
 
 def _outline_int(view: "CompatConfigView", key: str, default: int = 0) -> int:
     outline = view.raw_config.get("Outline", {})
+    value = outline.get(key)
+    if value is None:
+        return default
     try:
-        return int(outline.get(key, default))
+        return int(value)
     except (ValueError, TypeError):
         return default
 
@@ -106,6 +109,8 @@ def _outline_int_parse_error(view: "CompatConfigView", key: str) -> str:
     if key not in outline:
         return ""
     value = outline.get(key)
+    if value is None:
+        return f"{key}=None must be an integer"
     try:
         int(value)
     except (ValueError, TypeError):
@@ -118,6 +123,8 @@ def _cost_int_parse_error(view: "CompatConfigView", key: str) -> str:
     if key not in cost:
         return ""
     value = cost.get(key)
+    if value is None:
+        return f"{key}=None must be an integer"
     try:
         int(value)
     except (ValueError, TypeError):

@@ -46,6 +46,16 @@ from validation.repair_apply import (
     check_apply_guards,
     run_repair_apply,
 )
+from validation.run_result import (
+    ClaimValidationResultV1,
+    ClaimVerdict,
+    ValidationExecutionStatus,
+    ValidationRunDisposition,
+    ValidationRunResultError,
+    ValidationRunResultV1,
+    claim_verdict_for_result,
+    reduce_validation_disposition,
+)
 
 __all__ = [
     # Week 3 validation
@@ -83,4 +93,13 @@ __all__ = [
     "RepairApplier",
     "check_apply_guards",
     "run_repair_apply",
+    # Canonical validation truth source
+    "ClaimValidationResultV1",
+    "ClaimVerdict",
+    "ValidationExecutionStatus",
+    "ValidationRunDisposition",
+    "ValidationRunResultError",
+    "ValidationRunResultV1",
+    "claim_verdict_for_result",
+    "reduce_validation_disposition",
 ]

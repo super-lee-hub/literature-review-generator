@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.playwright
+
 playwright = pytest.importorskip("playwright.sync_api")
 expect = playwright.expect
 sync_playwright = playwright.sync_playwright

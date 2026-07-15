@@ -37,6 +37,8 @@ OUTLINE_COST_CONTROL_DEFAULTS: Dict[str, str] = {
     "max_critique_models": "2",
     "max_summary_refs_per_prompt": "80",
     "max_outline_retry_count": "2",
+    "model_context_limit": "128000",
+    "max_output_tokens": "16000",
 }
 
 OUTLINE_QUALITY_GATE_DEFAULTS: Dict[str, str] = {
@@ -168,6 +170,8 @@ class OutlineV2Config:
     max_critique_models: int = 2
     max_summary_refs_per_prompt: int = 80
     max_outline_retry_count: int = 2
+    model_context_limit: int = 128000
+    max_output_tokens: int = 16000
 
     # Mode
     is_test_fixture_mode: bool = False
@@ -276,6 +280,14 @@ class OutlineV2Config:
             max_outline_retry_count=_as_int(
                 cost_section.get("max_outline_retry_count"),
                 default=_as_int(OUTLINE_COST_CONTROL_DEFAULTS["max_outline_retry_count"]),
+            ),
+            model_context_limit=_as_int(
+                cost_section.get("model_context_limit"),
+                default=_as_int(OUTLINE_COST_CONTROL_DEFAULTS["model_context_limit"]),
+            ),
+            max_output_tokens=_as_int(
+                cost_section.get("max_output_tokens"),
+                default=_as_int(OUTLINE_COST_CONTROL_DEFAULTS["max_output_tokens"]),
             ),
             is_test_fixture_mode=is_test_fixture_mode,
             validation_errors=tuple(errors),

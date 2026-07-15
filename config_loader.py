@@ -63,6 +63,13 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
         section = config[section_name]
         config_dict[section_name] = {str(key): str(value) for key, value in section.items()}
 
+    config_origin = os.path.dirname(os.path.abspath(config_path))
+    for key, raw_value in list(config_dict.get("Paths", {}).items()):
+        value = str(raw_value or "").strip()
+        if not value or os.path.isabs(value):
+            continue
+        config_dict["Paths"][key] = os.path.abspath(os.path.join(config_origin, value))
+
     config_dict = apply_validation_compat_sections(config_dict)
     validation_settings = read_validation_settings(config_dict)
     stage1_enabled = validation_settings.stage1_enabled

@@ -257,6 +257,33 @@ def test_visual_bundle_writes_manifest_and_registers_artifacts(tmp_path: Path) -
     assert "table_crop" not in artifact_types
 
 
+def test_visual_input_dependency_does_not_reuse_wrong_artifact_type(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(b"%PDF-1.4\n")
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo", job_id="job-input-type")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    wrong_record = registry.register_file(
+        artifact_id="wrong-type-record",
+        artifact_role="preprocess_manifest",
+        artifact_type="preprocess_manifest",
+        artifact_version="v1",
+        path=source_path,
+        producer="tests",
+    )
+
+    dependency = Stage1VisualArtifactBuilder._registered_input_dependency(
+        registry,
+        artifact_type="source_pdf",
+        path=str(source_path),
+    )
+
+    assert dependency.artifact_type == "source_pdf"
+    assert dependency.artifact_id != wrong_record.artifact_id
+    registered = registry.get(dependency.artifact_id)
+    assert registered is not None
+    assert registered.artifact_type == "source_pdf"
+
+
 def test_visual_bundle_skips_oversized_page_render(tmp_path: Path) -> None:
     pdf_path = tmp_path / "huge-page.pdf"
     doc = fitz.open()
@@ -499,10 +526,30 @@ def test_process_paper_links_visual_bundle_into_paper_artifact_with_text_only_fa
         job_id="job-stage1-visual-fallback",
     )
 
+    evidence_dir = tmp_path / "mock-evidence"
+    evidence_dir.mkdir()
+    normalized_path = evidence_dir / "normalized.md"
+    chunks_path = evidence_dir / "chunks.json"
+    page_index_path = evidence_dir / "page_index.json"
+    normalized_path.write_text("A" * 1400, encoding="utf-8")
+    chunks_path.write_text('[{"chunk_id":"c1","text":"source"}]', encoding="utf-8")
+    page_index_path.write_text(
+        '[{"page_number":1,"text":"Figure framework model and mechanism"}]',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         generator,
         "_prepare_stage1_input",
-        lambda *_args, **_kwargs: ("A" * 1400, {"analysis_input_kind": "text", "extractor_used": "mock"}),
+        lambda *_args, **_kwargs: (
+            "A" * 1400,
+            {
+                "analysis_input_kind": "text",
+                "extractor_used": "mock",
+                "markdown_path": str(normalized_path),
+                "chunks_path": str(chunks_path),
+                "page_index_path": str(page_index_path),
+            },
+        ),
     )
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)

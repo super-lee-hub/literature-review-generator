@@ -1,77 +1,33 @@
-# Compatibility Paths & Removal Timeline
+# Compatibility Contract
 
-> Audience: Maintainers, AI agents.
-> Source: TRUTH_SOURCES.md.
+Compatibility is additive and fail-closed. Old artifacts remain readable, but reading them does not grant new identity, validation, or readiness guarantees.
 
-## Compatibility Projections
+## Legacy workspace rules
 
-### Field Compatibility
-- **Canonical Fields**: Driven by `summary_schema.py` and the canonical stage-1 summary structure
-- **Repair ownership hints**: `FIELD_OWNER_REGISTRY` in `validation/summary_recheck.py`
-- **Legacy Fields**: Only supported in projection / normalization layers
+- Missing `SourceInventoryV1`, readiness policy, attempt history, or V2 dependency identity is projected as `legacy_unverified`.
+- Old `success` reads as a compatibility projection of `canonical_ready`; Queue state is never derived from it.
+- Old validation reports are readable through a compatibility adapter but do not satisfy `ValidationRunResultV1`.
+- Old Registry dependencies are normalized to V2 fields when possible. Missing artifact identity/hash never becomes `ready` by inference.
+- Legacy Markdown outlines are usable only when Outline v2 is explicitly disabled. V2 review fails closed without a current registered adopted outline and health sidecar.
 
-### API Compatibility
-- `Primary_Reader_API`: Literature analysis
-- `Backup_Reader_API`: Fallback for extraction failures
-- `Writer_API`: Review section generation / regeneration
-- `Outline_API`: Outline generation
-- `Free_Mode_API`: Free mode planning
-- `Validator_API`: Review validation
+`status` and `reconcile` are read-only with respect to a summary-only legacy workspace. They report `legacy_unverified` and the need for an explicit migration or rerun, but do not create a Registry, job outcome, or audit record. The only public compatibility migration command is:
 
-### Input/Output Compatibility
-- PDF Folder Mode, Zotero Mode, GUI Queue Mode, AI-native Mode
-- Primary Durable Output Directory: `output/<project_name>__<job_id>/`
-- Compatibility Pointer Directory: `output/<project_name>/` (for `_latest_job.json` only)
-- Preprocess Cache: `output/_preprocess_cache/`
+```powershell
+python -m runtime.cli migrate-legacy <workspace> --actor <operator> --reason <reason>
+```
 
-## Deprecated Paths
+`--actor` and `--reason` are required. The command makes no provider calls and materializes only a fail-closed compatibility head: `compatibility_status=legacy_unverified`, `canonical_ready=false`, and `requires_attention=true`, plus an immutable `AuditRecordV1`. Repeating the same migration is byte-idempotent. Native or non-summary-only workspaces are rejected; migration never upgrades legacy evidence to canonical readiness.
 
-### Stage 1
-- Legacy summary structure without canonical schema
-- Regex-based citation extraction as primary source
-- OCR without preprocess validation
+## Audited compatibility actions
 
-### Stage 2
-- Auto-accept/auto-adopt of outline
-- Using `Writer_API` for outline generation (should use `Outline_API`)
+Explicit legacy summary reuse, ambiguous identity selection, manual outline adoption, force deletion, and quarantine release produce immutable `AuditRecordV1` artifacts. An audit includes actor, reason, scope, input hashes, policy snapshot, and artifact ID/hash references. A long-lived boolean bypass is not supported.
 
-### Stage 3
-- APA in-text citations without structured refs
-- Review draft without `block_source` and `span_map`
+## Path and dependency rules
 
-### Stage 4
-- Summary-based bibliography (use manifest cited bibliography)
-- DOCX generation without citation manifest
+- Spec paths resolve from the spec directory; config paths from the config directory; summary-owned relative paths from the summary directory.
+- Cross-job dependencies use `dependency_kind=external_job` with `job_id + artifact_id + content_hash` as identity. `path` is a location projection.
+- A parent artifact cannot be deleted while a non-invalid child dependency remains, unless a force-delete audit is written and affected children are invalidated.
 
-## Removal Timeline
+## Optional integration boundaries
 
-### Phase 1: Current Release (v1.0)
-- All deprecated paths still available as fallback
-- Mark deprecated paths in metadata and logs
-
-### Phase 2: Next Minor Release (v1.1)
-- Deprecated paths disabled by default, re-enable via config
-- Add warning messages for deprecated paths usage
-
-### Phase 3: Next Major Release (v2.0)
-- Deprecated paths removed entirely
-- Clean up codebase and remove compatibility layers
-
-## Key Implementation Notes
-
-### Citation Object Main Chain
-- Structured citations in `citation_manifest_v3` are the primary truth source
-- Regex-based citations are only allowed as legacy fallback
-- All citations must be mapped to canonical paper keys
-- DOCX bibliography only includes actually cited items
-
-### Validation and Repair
-- `ReviewValidator` uses `review_draft + citation_manifest + preprocess/visual evidence + paper metadata`
-- Repair root cause classification: `citation_mapping_error` (manifest mapping + rerender), `summary_drift` (targeted summary recheck), `review_drift` (block/span patch)
-
-### GUI Queue System
-- Default queue policy: serial execution, fail-continue, explicit recovery, retry of failed/cancelled GUI jobs
-- CLI and AI-native runtime are direct-run surfaces and do not expose public queue workflows
-
-### Optional Outline Review Compatibility
-- `--outline-adopt` is an explicit/manual compatibility command, not part of the default workflow
+Live API, Playwright, and heavy OCR tests are optional markers. They require explicit enablement and prerequisites. Strict-offline tests reject external network access while allowing loopback and propagate the offline boundary to Python subprocesses.

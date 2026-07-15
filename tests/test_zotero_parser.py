@@ -7,6 +7,7 @@
 import pytest
 import os
 import tempfile
+import json
 from unittest.mock import Mock, patch
 from pathlib import Path
 
@@ -178,3 +179,76 @@ Title: A Minimal Paper
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_parse_result_v1_joins_wrapped_standard_fields(tmp_path: Path) -> None:
+    report_path = tmp_path / "wrapped-report.txt"
+    report_path.write_text(
+        "\n".join(
+            [
+                "*",
+                "A Long Study of",
+                "Consumer Fairness",
+                "作者\tSmith, John",
+                "作者\tDoe, Jane",
+                "摘要\tFirst abstract line",
+                "continued abstract line",
+                "网址\thttps://example.com/",
+                "article",
+                "刊名\tJournal of Testing",
+                "DOI\t10.1234/",
+                "wrapped",
+                "附件",
+                "  o KEY/paper.pdf",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    parser = __import__("zotero_parser", fromlist=["parse_zotero_report_result"])
+    result = parser.parse_zotero_report_result(str(report_path))
+
+    assert result.status == "ok"
+    assert result.parser_route == "standard"
+    assert result.report_hash
+    assert result.parser_version == "zotero-parser-v1"
+    assert result.stats.wrapped_fields_joined == 3
+    assert result.papers[0]["title"] == "A Long Study of Consumer Fairness"
+    assert result.papers[0]["abstract"] == "First abstract line continued abstract line"
+    assert result.papers[0]["url"] == "https://example.com/article"
+    assert result.papers[0]["doi"] == "10.1234/wrapped"
+    assert result.papers[0]["journal"] == "Journal of Testing"
+    assert result.papers[0]["authors"] == ["Smith, John", "Doe, Jane"]
+    abstract_source = result.records[0].field_sources["abstract"][0]
+    assert abstract_source.line_end == abstract_source.line_start + 1
+    serialized = result.to_dict()
+    json.dumps(serialized, ensure_ascii=False)
+    assert parser.ZoteroParseResultV1.from_dict(serialized).to_dict() == serialized
+
+
+def test_parse_result_v1_reports_partial_without_dropping_good_entries(tmp_path: Path) -> None:
+    report_path = tmp_path / "partial-report.txt"
+    report_path.write_text(
+        "*\nGood Paper\n作者\tAlice Smith\n*\n作者\tMissing Title",
+        encoding="utf-8",
+    )
+
+    parser = __import__("zotero_parser", fromlist=["parse_zotero_report_result"])
+    result = parser.parse_zotero_report_result(str(report_path))
+
+    assert result.status == "partial"
+    assert [paper["title"] for paper in result.papers] == ["Good Paper"]
+    assert result.stats.detected_entries == 2
+    assert result.stats.skipped_entries == 1
+    assert any(item.code == "missing_title" and item.entry_index == 2 for item in result.diagnostics)
+
+
+def test_parse_result_v1_failure_preserves_legacy_empty_projection(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.txt"
+    parser = __import__("zotero_parser", fromlist=["parse_zotero_report_result"])
+
+    result = parser.parse_zotero_report_result(str(missing))
+
+    assert result.status == "failed"
+    assert result.diagnostics[0].code == "source_missing"
+    assert parser.parse_zotero_report(str(missing)) == []

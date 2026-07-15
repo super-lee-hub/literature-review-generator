@@ -1,70 +1,58 @@
-# Truth Sources & Data Contracts
+# Runtime Truth Sources and Contracts
 
-> Audience: Maintainers, AI agents.
-> Source: TRUTH_SOURCES.md; AGENTS.md §5-7.
+This document names the canonical durable facts used by the current runtime. Files not listed as canonical are projections, exports, caches, or compatibility inputs.
 
-This document defines the canonical truth sources, data contracts, and compatibility projections for the auto-generate project.
+## Job and source identity
 
-## Main Truth Sources
+- `source_inventory_v1.json` is the content-hashed source identity truth for Zotero reports, PDFs, explicit summaries, and classification files.
+- Without a DOI, canonical source identity requires a normalized title match plus a real first-author or year match. A title-only observation remains quarantined.
+- `artifact_registry.json` v2 is the artifact/dependency graph. Registry writes use a workspace lease, revisioned transaction, atomic replacement, and fail-closed corruption handling. Every READY dependency is verified against durable Registry identity, status, path, and content hash before commit.
+- `job_outcome_v1.json` is the current job-head projection: lifecycle status, disposition, readiness policy, required/completed stages, and `canonical_ready`.
+- `artifacts/job_attempts/snapshot-*.json` is append-only attempt history. A stale running attempt becomes `interrupted`; it is never rewritten as the next attempt.
+- `runtime_stage_terminals/*/*.json` proves stage completion only when every output, hash, schema, dependency, and terminal record validates.
 
-### Stage 1: Paper Analysis
-- **Primary Truth Source**: canonical `*_summaries.json`
-- **Companion durable artifact**: `paper_artifact.json` when the workspace path is active
-- **Fallback**: legacy summary projections normalized into the canonical summary schema
-- **Key Artifacts**: `*_summaries.json`, `paper_artifact.json`, `*_analyzed_papers.xlsx` (export, not source of truth)
+`legacy success` is only a projection of `canonical_ready`. Queue lifecycle reads `job_status`.
 
-Canonical summary core blocks: `routing`, `paper_metadata`, `core_analysis`, `specialized_details`, `quality_audit`
+## Pipeline truth sources
 
-### Stage 2: Outline Generation
-- **Primary Truth Source**: registered markdown outline artifact `*_literature_review_outline.md`
-- **Fallback**: legacy output-folder markdown outline when workspace/registry artifact unavailable
+| Stage | Canonical truth | Projections / exports |
+|---|---|---|
+| Source intake | `source_inventory_v1.json`, `source_bundle.json` | parser compatibility `List[PaperInfo]` |
+| Stage 1 | canonical `*_summaries.json`; registered `paper_artifacts/*.json`; evidence manifests; READY summaries depend on the registered `source_bundle`, which depends on source PDFs | Excel and legacy summary shapes |
+| Outline v2 | registered literature map, synthesis flow, candidates, critiques, arbitration, `final_outline`, coverage audit, and independent `outline_stage_health_v1.json`; downstream review consumes only registered `adopted_final_outline` when v2 is enabled | legacy Markdown outline when v2 is explicitly disabled |
+| Review | `*_review_draft_v2.json` plus `*_citation_manifest_v3.json` and citation-ref catalog | review draft v1 and DOCX |
+| Validation | `validation_run_result_v1.json` (`ValidationRunResultV1`) plus its exact Registry `depends_on` closure: review draft, citation manifest, and every declared evidence manifest | TXT report, manual-review JSON, alignment audit, and completion report derived from the canonical JSON |
+| Repair | registered repair plan and apply result tied to the validation-run artifact | human-readable repair summaries |
 
-### Stage 3: Review Draft
-- **Primary Truth Source**: `*_review_draft_v2.json` + `*_citation_manifest_v3.json`
-- **Fallback**: legacy review draft structure (marked as legacy in metadata)
-- `review_draft_v2 + citation_manifest_v3` are the structured truth sources; `docx` is the final export
+## Public outcomes
 
-### Stage 4: DOCX Generation
-- **Primary Truth Source**: `*_review_draft_v2.json` + `*_citation_manifest_v3.json` (cited bibliography only)
+`job_status`: `pending | running | completed | failed | cancelled`.
 
-### Stage 5: Validation and Repair
-- **Primary Truth Source**: `validation_report.json` + `repair_plan.json` + `repair_apply_result.json`
+`job_disposition`: `clean | findings | needs_review | unvalidated`.
 
-### Stage 6: GUI Queue System
-- **Primary Truth Source**: GUI-internal `queue.json` with immutable workflow submission snapshots
+`claim_verdict`: `supported | partial_support | evidence_gap | unsupported | contradicted | wrong_source | needs_review`.
 
-### Stage 7: AI-native Runtime Bridge
-- **Primary Truth Source**: active job workspace + artifact registry, driven by `RuntimeJobSpec` and `AgentRuntimeBridge`
-- **Key Artifacts**: `source_bundle.json`, `runtime_stage_trace.json`
+No evidence maps to `evidence_gap`, never automatically to `unsupported`. Identity `ambiguous` or `mismatch` completes diagnostics but quarantines canonical generation and sets `canonical_ready=false`.
 
-## Current Main Pipeline
+A zero-claim Validation result is clean only when the review is explicitly citation-free. Otherwise claim completeness is false and the result cannot publish a clean disposition. Successful Validation is published only after canonical JSON read-back confirms the job ID, attempt ID, and content hash.
 
-### Input Modes
-- PDF folder mode: scans a folder of PDFs directly
-- Zotero mode: uses `Paths.zotero_report` + `Paths.library_path`
+Every declared review, citation, and evidence input hash is a 64-character lowercase SHA-256. The canonical payload's artifact ID/type/hash multiset must exactly equal the Registry `depends_on` multiset; missing, extra, duplicate, wrong-type, wrong-job-kind, wrong-path, or wrong-hash edges fail closed. Evidence may remain an `external_job` dependency for a derived ReviewBatch child, but it must resolve uniquely and validate recursively. A deleted, changed, quarantined, or invalid evidence manifest invalidates the Validation terminal, so `resume` cannot reuse that Validation result.
 
-### Stage 1 Chain
-1. Collect source paper descriptors → 2. Resolve and locate PDFs → 3. Preprocess layer → 4. Build stage1 input → 5. Reader API generates structured summary → 6. Normalize to canonical summary schema → 7. Write `*_summaries.json` → 8. Write `paper_artifact` → 9. Output Excel
+## Derived review batches
 
-### Stage 2 Chain
-Main output: `*_literature_review_outline.md`. Default API: `Outline_API`.
+`SummarySelectionSpecV1` fixes the parent job, parent artifact ID/hash, ordered paper keys, optional classification-file hash, selection policy, and selection hash. Child artifacts use `external_job` dependencies. Child derivation must not cross the Stage 1 provider boundary.
 
-### Stage 3 Chain
-`review_draft_v2` → `citation_manifest_v3` → DOCX. `review_draft_v2 + citation_manifest_v3` are the primary structured truth sources; `docx` is the final export.
+Each multi-variant derivation reserves a durable monotonic `projection_generation` before child or manifest writes. Per-derivation and coordinator leases serialize ownership and projection publication. The fully validated immutable Registry manifest with the unique maximum generation is the coordinator head; `review_batch_manifest.json` is only a repairable projection of that head. `review-batch-projection-generation-v1` reservations and `review-batch-projection-receipt-v2` receipts record the durable order plus `projected` or `superseded` head identity/generation/hash. Ordering never depends on mtime or wall-clock timestamps.
 
-### Validation / Repair Chain
-Dedicated pipeline: `validation_report` → `repair_plan` → `repair_apply_result`
+## AI-native runtime
 
-## Data Contracts
+`RuntimeJobSpec` and `AgentRuntimeRunner` are the public execution contract layered on the existing `AgentRuntimeBridge`:
 
-### Stage 1
-- Primary truth: canonical `*_summaries.json`
-- Companion durable artifact: `paper_artifacts/*.json`
-- Structure fact source: `summary_schema.py`
+- `run`: new job and attempt;
+- `resume`: new append-only attempt, reusing only proven durable stages;
+- `status`: read-only job head;
+- `reconcile`: provider-free repair of Registry, pointer, and terminal projections.
 
-### Stage 2
-- Primary truth: `*_literature_review_outline.md`
+`SystemExit` and other `BaseException` paths persist a durable terminal state before re-raising the original exception. Resume reconstructs Validation disposition from the canonical terminal artifact and never infers it from human-readable projections.
 
-### Stage 3
-- Primary truth: `review_drafts/*_review_draft_v2.json`
-- Citation primary truth: `citation_manifests/*_citation_manifest_v3.json`
+Relative paths are resolved from their owning spec/config/summary file, never silently from the process CWD.

@@ -32,6 +32,9 @@ class PaperInfo(TypedDict, total=False):
     metadata_confidence: str
     metadata_source_priority_snapshot: List[str]
     source_descriptor: Dict[str, Any]
+    identity_verdict: str
+    artifact_status: str
+    source_identity: Dict[str, Any]
 
 
 class LegacyCommonCoreSummary(TypedDict, total=False):
@@ -166,11 +169,19 @@ class ProcessingResult(TypedDict):
     failure_reason: NotRequired[Optional[str]]
     attempt_history: NotRequired[List[Dict[str, Any]]]
     model_used: NotRequired[str]
+    pdf_match: NotRequired[Dict[str, Any]]
+    identity_verdict: NotRequired[str]
+    artifact_status: NotRequired[str]
+    source_identity: NotRequired[Dict[str, Any]]
 
 
 class FailedPaper(TypedDict):
     paper_info: PaperInfo
     failure_reason: str
+    pdf_match: NotRequired[Dict[str, Any]]
+    identity_verdict: NotRequired[str]
+    artifact_status: NotRequired[str]
+    source_identity: NotRequired[Dict[str, Any]]
 
 
 class APIConfig(TypedDict):

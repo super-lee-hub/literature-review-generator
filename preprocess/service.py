@@ -7,6 +7,9 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -19,6 +22,7 @@ import requests  # type: ignore
 
 from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
+from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -95,7 +99,13 @@ class PreprocessResult:
 class PreprocessManager:
     """Create stable preprocess artifacts before stage-one AI analysis."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, logger: Any = None):
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        logger: Any = None,
+        *,
+        mineru_circuit_breaker: ProviderCircuitBreaker | None = None,
+    ):
         self.config = config or {}
         self.logger = logger
         preprocess_section = self.config.get("Preprocess", {}) if isinstance(self.config, dict) else {}
@@ -149,6 +159,29 @@ class PreprocessManager:
             if item.strip()
         }
         self.allow_local_parse_fallback = _as_bool(os.getenv("ALLOW_LOCAL_PARSE_FALLBACK", "true"), default=True)
+        self.docling_timeout_seconds = _as_float(
+            preprocess_section.get("docling_timeout_seconds", os.getenv("DOCLING_TIMEOUT_SECONDS", "300")),
+            300.0,
+        )
+        self.ocr_timeout_seconds = _as_float(
+            preprocess_section.get("ocr_timeout_seconds", os.getenv("OCR_TIMEOUT_SECONDS", "120")),
+            120.0,
+        )
+        self.mineru_circuit_breaker = mineru_circuit_breaker or ProviderCircuitBreaker("mineru")
+
+    def preflight_mineru(self) -> None:
+        """Validate local route configuration before creating a remote task."""
+        self.mineru_circuit_breaker.ensure_closed()
+        if not self.mineru_api_token:
+            raise ValueError("MINERU_API_TOKEN is not configured")
+        parsed = urlparse(self.mineru_base_url)
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            raise ValueError("MINERU_BASE_URL must be an absolute HTTPS URL")
+        self._validate_mineru_url(
+            self.mineru_base_url,
+            purpose="preflight URL",
+            require_mineru_origin=True,
+        )
 
     def prepare_pdf(self, pdf_path: str) -> Optional[PreprocessResult]:
         """Build or reuse cached preprocess artifacts for a PDF."""
@@ -400,8 +433,15 @@ class PreprocessManager:
             self.parser_mode == "hybrid" and self.primary_parser == "mineru_remote"
         )
         remote_enabled = remote_requested
+        circuit_snapshot = self.mineru_circuit_breaker.snapshot
+        if remote_requested and circuit_snapshot.open:
+            remote_enabled = False
+            self._log(
+                f"MinerU disabled for this job because its circuit is open: {circuit_snapshot.reason}",
+                level="warning",
+            )
         if self.parser_mode == "hybrid" and remote_requested:
-            remote_enabled = self._should_try_remote_in_hybrid(
+            remote_enabled = remote_enabled and self._should_try_remote_in_hybrid(
                 baseline_plain_text=baseline_plain_text,
                 baseline_page_diagnostics=baseline_page_diagnostics,
             )
@@ -439,7 +479,7 @@ class PreprocessManager:
         if remote_enabled and not mineru_token_present:
             self._log("MinerU remote parsing skipped because MINERU_API_TOKEN is not configured.", level="info")
 
-        if not self.allow_local_parse_fallback and remote_enabled:
+        if not self.allow_local_parse_fallback and remote_requested and not mineru_succeeded:
             return {
                 "markdown_text": "",
                 "plain_text": "",
@@ -574,6 +614,7 @@ class PreprocessManager:
         baseline_page_blocks: List[Dict[str, Any]],
         baseline_page_index: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        self.preflight_mineru()
         upload_url = self._join_base_url(self.mineru_upload_endpoint)
         payload = {
             "files": [
@@ -600,12 +641,22 @@ class PreprocessManager:
             pdf_bytes = handle.read()
 
         for target in upload_targets:
+            self.mineru_circuit_breaker.ensure_closed()
             response = requests.put(
                 self._validate_mineru_url(target, purpose="upload URL"),
                 data=pdf_bytes,
                 timeout=120,
                 allow_redirects=False,
             )
+            if response.status_code in {401, 403}:
+                self.mineru_circuit_breaker.open(
+                    reason="upload_authorization_rejected",
+                    status_code=int(response.status_code),
+                )
+                raise ProviderCircuitOpen(
+                    f"MinerU upload authorization rejected with HTTP {response.status_code}",
+                    snapshot=self.mineru_circuit_breaker.snapshot,
+                )
             response.raise_for_status()
 
         poll_payload = self._poll_mineru_result(batch_id=batch_id, seed_payload=upload_response)
@@ -632,6 +683,7 @@ class PreprocessManager:
         last_exception: Optional[Exception] = None
         for attempt in range(self.mineru_request_max_retries + 1):
             try:
+                self.mineru_circuit_breaker.ensure_closed()
                 response = requests.request(
                     method=method.upper(),
                     url=safe_url,
@@ -640,8 +692,19 @@ class PreprocessManager:
                     allow_redirects=False,
                     **kwargs,
                 )
+                if response.status_code in {401, 403}:
+                    self.mineru_circuit_breaker.open(
+                        reason="authorization_rejected",
+                        status_code=int(response.status_code),
+                    )
+                    raise ProviderCircuitOpen(
+                        f"MinerU authorization rejected with HTTP {response.status_code}",
+                        snapshot=self.mineru_circuit_breaker.snapshot,
+                    )
                 response.raise_for_status()
                 return response.json()
+            except ProviderCircuitOpen:
+                raise
             except Exception as exc:  # pragma: no cover - transport path.
                 last_exception = exc
                 if attempt >= self.mineru_request_max_retries:
@@ -663,10 +726,25 @@ class PreprocessManager:
         try:
             for attempt in range(self.mineru_request_max_retries + 1):
                 try:
-                    headers = self._mineru_headers() if self._is_mineru_origin_url(safe_url) else {}
+                    is_mineru_origin = self._is_mineru_origin_url(safe_url)
+                    if is_mineru_origin:
+                        self.mineru_circuit_breaker.ensure_closed()
+                    headers = self._mineru_headers() if is_mineru_origin else {}
                     response = session.get(safe_url, headers=headers, timeout=120, allow_redirects=False)
+                    status_code = int(getattr(response, "status_code", 200))
+                    if status_code in {401, 403}:
+                        self.mineru_circuit_breaker.open(
+                            reason="artifact_authorization_rejected",
+                            status_code=status_code,
+                        )
+                        raise ProviderCircuitOpen(
+                            f"MinerU artifact authorization rejected with HTTP {status_code}",
+                            snapshot=self.mineru_circuit_breaker.snapshot,
+                        )
                     response.raise_for_status()
                     return response.content
+                except ProviderCircuitOpen:
+                    raise
                 except Exception as exc:  # pragma: no cover - transport path.
                     last_exception = exc
                     if attempt >= self.mineru_request_max_retries:
@@ -692,6 +770,8 @@ class PreprocessManager:
             for url in candidate_urls:
                 try:
                     payload = self._request_json("get", url)
+                except ProviderCircuitOpen:
+                    raise
                 except Exception:  # pragma: no cover - transport path.
                     continue
                 if not payload:
@@ -877,32 +957,41 @@ class PreprocessManager:
         baseline_page_index: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         try:
-            from docling.document_converter import DocumentConverter  # type: ignore
-        except Exception:
-            return None
-
-        try:
-            converter = DocumentConverter()
-            result = converter.convert(pdf_path)
-            document = getattr(result, "document", None)
-            if document is None:
+            with tempfile.TemporaryDirectory(prefix="auto-generate-docling-") as temp_dir:
+                output_path = os.path.join(temp_dir, "result.json")
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "preprocess.docling_worker",
+                        os.path.abspath(pdf_path),
+                        output_path,
+                    ],
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=max(1.0, self.docling_timeout_seconds),
+                    check=False,
+                )
+                if not os.path.isfile(output_path):
+                    if completed.returncode != 0:
+                        return None
+                    raise RuntimeError("Docling worker produced no result artifact")
+                with open(output_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            if not payload.get("ok"):
+                self._log(
+                    "Docling worker failed: "
+                    f"{payload.get('error_type') or 'WorkerError'}: {payload.get('error') or 'unknown error'}",
+                    level="warning",
+                )
                 return None
-
-            markdown_text = ""
-            if hasattr(document, "export_to_markdown"):
-                markdown_text = str(document.export_to_markdown() or "")
-
-            plain_text = ""
-            if hasattr(document, "export_to_text"):
-                plain_text = str(document.export_to_text() or "")
-            if not plain_text:
-                plain_text = markdown_text
-
-            structured_payload: Dict[str, Any] = {}
-            if hasattr(document, "export_to_dict"):
-                exported = document.export_to_dict()
-                if isinstance(exported, dict):
-                    structured_payload = exported
+            worker_result = payload.get("result") or {}
+            markdown_text = str(worker_result.get("markdown_text") or "")
+            plain_text = str(worker_result.get("plain_text") or markdown_text)
+            structured_payload = dict(worker_result.get("structured_payload") or {})
 
             if not markdown_text and not plain_text:
                 return None
@@ -923,6 +1012,12 @@ class PreprocessManager:
                 "conversion_used": "native_pdf",
                 "used_ocr": False,
             }
+        except subprocess.TimeoutExpired:
+            self._log(
+                f"Docling preprocessing timed out after {self.docling_timeout_seconds:.1f}s.",
+                level="warning",
+            )
+            return None
         except Exception as exc:  # pragma: no cover - optional dependency path.
             self._log(f"Docling preprocessing fallback skipped: {exc}", level="warning")
             return None
@@ -996,11 +1091,11 @@ class PreprocessManager:
                     effective_text = raw_text
 
                     # 避免 OCR 操作以减少崩溃风险
-                    # if allow_ocr and self._should_try_ocr(scanned_candidate):
-                    #     ocr_text = self._ocr_page(page)
-                    #     if ocr_text:
-                    #         effective_text = ocr_text
-                    #         used_ocr = True
+                    if allow_ocr and self._should_try_ocr(scanned_candidate):
+                        ocr_text = self._ocr_page(page)
+                        if ocr_text:
+                            effective_text = ocr_text
+                            used_ocr = True
 
                     plain_parts.append(f"\n--- Page {page_number + 1} ---\n{effective_text.strip()}\n")
                     page_blocks.append(
@@ -1610,15 +1705,17 @@ class PreprocessManager:
         if not selected_text:
             return chunks
 
-        page_lookup = {
-            int(page.get("page_number")): str(page.get("text") or "").strip()
-            for page in page_index
-            if str(page.get("page_number") or "").isdigit()
-        }
+        page_lookup: Dict[int, str] = {}
+        for page in page_index:
+            raw_page_number = str(page.get("page_number") or "")
+            if raw_page_number.isdigit():
+                page_lookup[int(raw_page_number)] = str(page.get("text") or "").strip()
         page_sections = self._split_stage1_text_pages(selected_text)
         if page_sections:
             for index, (page_number, text) in enumerate(page_sections, start=1):
-                chunk_text = text.strip() or page_lookup.get(page_number, "")
+                chunk_text = text.strip() or (
+                    page_lookup.get(page_number, "") if page_number is not None else ""
+                )
                 if not chunk_text:
                     continue
                 chunks.append(
@@ -1801,9 +1898,45 @@ class PreprocessManager:
 
     def _ocr_page(self, page: Any) -> str:
         try:
-            textpage = page.get_textpage_ocr(language=self.ocr_languages, dpi=300, full=True)
-            ocr_text = page.get_text("text", textpage=textpage)
-            return ocr_text if isinstance(ocr_text, str) else ""
+            source_pdf = str(getattr(getattr(page, "parent", None), "name", "") or "")
+            if not source_pdf:
+                return ""
+            source_pdf = os.path.abspath(source_pdf)
+            with tempfile.TemporaryDirectory(prefix="auto-generate-ocr-") as temp_dir:
+                output_path = os.path.join(temp_dir, "result.json")
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "preprocess.ocr_worker",
+                        source_pdf,
+                        str(int(page.number)),
+                        self.ocr_languages,
+                        output_path,
+                    ],
+                    cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=max(1.0, self.ocr_timeout_seconds),
+                    check=False,
+                )
+                if not os.path.isfile(output_path):
+                    return ""
+                with open(output_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            if not payload.get("ok"):
+                self._log(
+                    "OCR worker failed: "
+                    f"{payload.get('error_type') or 'WorkerError'}: {payload.get('error') or 'unknown error'}",
+                    level="warning",
+                )
+                return ""
+            return str(payload.get("text") or "")
+        except subprocess.TimeoutExpired:
+            self._log(f"OCR timed out on page {page.number + 1}", level="warning")
+            return ""
         except Exception as exc:  # pragma: no cover - depends on local OCR runtime.
             self._log(f"OCR failed on page {page.number + 1}: {exc}", level="warning")
             return ""

@@ -23,7 +23,7 @@ import logging
 import re
 import copy
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, Sequence
+from typing import List, Dict, Any, Optional, Set, Tuple, Iterator, Union, Mapping, Sequence, cast
 from datetime import datetime
 
 ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
@@ -37,8 +37,8 @@ from models import (
     APIConfig, AISummary
 )
 from config_loader import load_config, ConfigDict
-from zotero_parser import parse_zotero_report
-from file_finder import create_file_index, FileIndex, find_pdf
+from zotero_parser import parse_zotero_report, parse_zotero_report_result
+from file_finder import create_file_index, FileIndex, resolve_pdf_match
 from pdf_extractor import extract_text_from_pdf  # type: ignore
 from ai_interface import (  # type: ignore
     get_summary_from_ai,
@@ -53,7 +53,7 @@ from docx_writer import create_word_document, append_section_to_word_document, g
 from report_generator import generate_excel_report, generate_failure_report, generate_retry_zotero_report  # type: ignore
 from preprocess.service import PreprocessManager
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
-from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry, file_sha256
 from services.citation_metadata import sanitize_metadata_fields
 from services.citation_ref_catalog import build_document_ref_catalog, validate_raw_citation_text
 from services.config_compat import CompatConfigView
@@ -64,7 +64,11 @@ from services.environment_service import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.paper_artifact import build_paper_artifact_v1
-from services.paper_identity import build_paper_key as build_legacy_paper_key, normalize_doi
+from services.paper_identity import (
+    build_canonical_paper_key,
+    build_paper_key as build_legacy_paper_key,
+    normalize_doi,
+)
 from services.progress_state import (
     ResumeStateReport,
     Stage1ProgressSnapshot,
@@ -82,13 +86,13 @@ from services.model_selection import (
     get_writer_api_config,
 )
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
+from services.source_identity import SourceIdentityResultV1, inspect_text_identity
 from services.summary_reuse import (
     ResolvedSummarySet,
     SummaryCatalog,
     SummaryMatch,
     SummarySource,
     SummarySourceError,
-    build_effective_summary_set,
     build_reused_summary,
     collect_summary_sources,
     describe_summary_candidate,
@@ -97,7 +101,7 @@ from services.summary_reuse import (
 from services.text_io import load_json_file_with_fallbacks
 from utils import ensure_dir
 from setup_wizard import run_setup_wizard
-from summary_schema import get_core_analysis, get_paper_metadata
+from summary_schema import get_core_analysis, get_paper_metadata, normalize_ai_summary
 from free_mode.profile_manager import build_profile_context, load_profile
 
 
@@ -116,6 +120,14 @@ def normalize_checkpoint_paper_key(paper_key: str) -> str:
     if normalized:
         return normalized
     return str(paper_key or "").strip()
+
+
+def _format_chinese_datetime(value: datetime, *, include_time: bool = False) -> str:
+    """Format Chinese date labels without passing non-ASCII text to strftime."""
+    rendered = f"{value.year:04d}年{value.month:02d}月{value.day:02d}日"
+    if include_time:
+        rendered += f" {value.hour:02d}:{value.minute:02d}"
+    return rendered
 
 from context_manager import validate_summary_quality, optimize_context_for_synthesis, optimize_context_for_outline, estimate_tokens
 
@@ -383,6 +395,7 @@ class LiteratureReviewGenerator:
     CITATION_REF_CATALOG_ARTIFACT_TYPE = "citation_ref_catalog"
     CITATION_REF_CATALOG_ARTIFACT_ROLE = "citation_ref_catalog"
     CITATION_REF_CATALOG_ARTIFACT_VERSION = "v1"
+    LEGACY_SUMMARY_PROJECTION_VERSION = "legacy-summary-projection-v1"
     
     def __init__(self, config_file: str = 'config.ini', project_name: Optional[str] = None, pdf_folder: Optional[str] = None, queue_file: str = 'output/_queue/queue.json', zotero_report: Optional[str] = None, library_path: Optional[str] = None):
         self.config_file: str = config_file
@@ -397,10 +410,14 @@ class LiteratureReviewGenerator:
         self.summary_file: Optional[str] = None
         self.summary_file_override: Optional[str] = None
         self.summary_source_overrides: List[str] = []
+        self.audit_actor: str = ""
+        self.audit_reason: str = ""
+        self.audit_scope: Dict[str, Any] = {}
         self.reuse_stage1: bool = False
         self.reuse_summary_files: List[str] = []
         self.papers: List[PaperInfo] = []
         self.source_descriptors: List[Dict[str, Any]] = []
+        self.zotero_parse_result: Dict[str, Any] = {}
         self.summaries: SummariesList = []
         self.failed_papers: List[FailedPaper] = []
         self.preprocess_manager: Optional[PreprocessManager] = None
@@ -967,7 +984,11 @@ class LiteratureReviewGenerator:
             self.logger.debug(f"详细错误信息: {traceback.format_exc()}")
             return False
 
-    def adopt_outline_v2(self, adopted_by: str = "user") -> bool:
+    def adopt_outline_v2(
+        self,
+        adopted_by: str = "user",
+        reason: str = "explicit Outline v2 adoption",
+    ) -> bool:
         """Explicitly adopt v2 final_outline.json after a passing, current audit."""
         try:
             self.logger.info("开始执行 Outline Intelligence v2 显式采纳...")
@@ -977,9 +998,14 @@ class LiteratureReviewGenerator:
 
             from outline.v2_models import CoverageAudit, FinalOutline
             from outline.adoption import adopt_final_outline, write_adopted_outline
+            from outline.stage_health import OutlineStageHealthV1
+            from services.artifact_registry import file_sha256
 
             final_path = self.job_workspace.artifact_path(f"{self.project_name}_final_outline.json")
             audit_path = self.job_workspace.artifact_path(f"{self.project_name}_outline_coverage_audit.json")
+            health_path = self.job_workspace.artifact_path(
+                f"{self.project_name}_outline_stage_health_v1.json"
+            )
             if not os.path.exists(final_path):
                 self.logger.error(f"final_outline.json 不存在: {final_path}")
                 return False
@@ -987,16 +1013,32 @@ class LiteratureReviewGenerator:
                 self.logger.error(f"outline_coverage_audit.json 不存在: {audit_path}")
                 return False
 
+            if not self.artifact_registry:
+                self.logger.error("Outline v2 adoption requires an Artifact Registry")
+                return False
+            health_record = self.artifact_registry.get("outline_stage_health")
+            if (
+                health_record is None
+                or not os.path.isfile(health_path)
+                or os.path.abspath(health_record.path) != os.path.abspath(health_path)
+                or health_record.content_hash != file_sha256(health_path)
+            ):
+                self.logger.error("Registered outline_stage_health evidence is missing or stale")
+                return False
+
             with open(final_path, "r", encoding="utf-8") as handle:
                 final_outline = FinalOutline.from_dict(json.load(handle))
             with open(audit_path, "r", encoding="utf-8") as handle:
                 audit = CoverageAudit.from_dict(json.load(handle))
+            with open(health_path, "r", encoding="utf-8") as handle:
+                stage_health = OutlineStageHealthV1.from_dict(json.load(handle))
 
             adopted, message = adopt_final_outline(
                 final_outline=final_outline,
                 audit=audit,
                 job_id=self.job_workspace.job_id,
                 adopted_by=adopted_by,
+                stage_health=stage_health,
             )
             if adopted is None:
                 self.logger.error(f"Outline v2 采纳失败: {message}")
@@ -1010,15 +1052,18 @@ class LiteratureReviewGenerator:
 
                 depends_on = [
                     ArtifactDependencyRef(
-                        artifact_type="final_outline",
-                        path=final_path,
-                        content_hash=file_sha256(final_path),
-                    ),
-                    ArtifactDependencyRef(
-                        artifact_type="outline_coverage_audit",
-                        path=audit_path,
-                        content_hash=file_sha256(audit_path),
-                    ),
+                        artifact_type=artifact_type,
+                        path=path,
+                        content_hash=file_sha256(path),
+                        dependency_kind="local_job",
+                        job_id=self.job_workspace.job_id,
+                        artifact_id=artifact_id,
+                    )
+                    for artifact_id, artifact_type, path in (
+                        ("final_outline", "final_outline", final_path),
+                        ("outline_coverage_audit", "outline_coverage_audit", audit_path),
+                        ("outline_stage_health", "outline_stage_health", health_path),
+                    )
                 ]
                 self.artifact_registry.register_file(
                     artifact_role="adopted_final_outline",
@@ -1028,6 +1073,79 @@ class LiteratureReviewGenerator:
                     producer="main.LiteratureReviewGenerator.adopt_outline_v2",
                     depends_on=depends_on,
                     artifact_id="adopted_final_outline",
+                )
+
+                from services.audit_record import AuditArtifactRefV1, AuditRecordV1
+                from services.job_workspace import atomic_write_json
+
+                input_refs = [
+                    AuditArtifactRefV1(
+                        artifact_id=artifact_id,
+                        artifact_type=artifact_type,
+                        job_id=self.job_workspace.job_id,
+                        content_hash=file_sha256(path),
+                    )
+                    for artifact_id, artifact_type, path in (
+                        ("final_outline", "final_outline", final_path),
+                        ("outline_coverage_audit", "outline_coverage_audit", audit_path),
+                        ("outline_stage_health", "outline_stage_health", health_path),
+                    )
+                ]
+                adopted_hash = file_sha256(adopted_path)
+                audit_record = AuditRecordV1.create(
+                    audit_type="outline_manual_adoption",
+                    job_id=self.job_workspace.job_id,
+                    attempt_id=f"outline-adoption:{self.job_workspace.job_id}",
+                    producer="main.LiteratureReviewGenerator.adopt_outline_v2",
+                    actor=adopted_by,
+                    reason=reason,
+                    scope={
+                        "operation": "explicit_adoption",
+                        "execution_mode": stage_health.execution_mode,
+                    },
+                    target_artifacts=input_refs,
+                    input_artifact_refs=input_refs,
+                    output_artifact_refs=[
+                        AuditArtifactRefV1(
+                            artifact_id="adopted_final_outline",
+                            artifact_type="adopted_final_outline",
+                            job_id=self.job_workspace.job_id,
+                            content_hash=adopted_hash,
+                        )
+                    ],
+                    input_hashes={
+                        "final_outline": file_sha256(final_path),
+                        "coverage_audit": file_sha256(audit_path),
+                        "stage_health": file_sha256(health_path),
+                    },
+                    policy_snapshot={
+                        "require_stage_health": True,
+                        "production_fallback_adoptable": False,
+                    },
+                    disposition="adopted",
+                )
+                audit_record_path = self.job_workspace.artifact_path(
+                    f"outline_manual_adoption_{audit_record.audit_id}.json"
+                )
+                atomic_write_json(audit_record_path, audit_record.to_dict())
+                self.artifact_registry.register_file(
+                    artifact_role="audit_record",
+                    artifact_type="audit_record",
+                    artifact_version="v1",
+                    path=audit_record_path,
+                    producer="main.LiteratureReviewGenerator.adopt_outline_v2",
+                    artifact_id=audit_record.audit_id,
+                    depends_on=[
+                        *depends_on,
+                        ArtifactDependencyRef(
+                            artifact_type="adopted_final_outline",
+                            path=adopted_path,
+                            content_hash=adopted_hash,
+                            dependency_kind="local_job",
+                            job_id=self.job_workspace.job_id,
+                            artifact_id="adopted_final_outline",
+                        ),
+                    ],
                 )
 
             self.logger.success(f"Outline v2 采纳成功，已保存到: {adopted_path}")
@@ -1051,6 +1169,7 @@ class LiteratureReviewGenerator:
         path: str,
         producer: str = "main.LiteratureReviewGenerator",
         depends_on: Optional[List[ArtifactDependencyRef]] = None,
+        status: str = "ready",
     ) -> None:
         if not self.artifact_registry:
             return
@@ -1060,7 +1179,45 @@ class LiteratureReviewGenerator:
             artifact_version=artifact_version,
             path=path,
             producer=producer,
+            status=status,
             depends_on=depends_on or [],
+        )
+
+    def _registered_dependency_for_path(
+        self,
+        path: str,
+        *,
+        fallback_artifact_type: str,
+        expected_artifact_types: Optional[Sequence[str]] = None,
+    ) -> ArtifactDependencyRef:
+        allowed_types = tuple(
+            dict.fromkeys(expected_artifact_types or (fallback_artifact_type,))
+        )
+        if self.artifact_registry:
+            normalized = os.path.normcase(os.path.abspath(path))
+            candidates = [
+                item
+                for item in self.artifact_registry.list_records()
+                if os.path.normcase(os.path.abspath(item.path)) == normalized
+                and item.artifact_type in allowed_types
+            ]
+            if len(candidates) > 1:
+                raise RuntimeError(
+                    f"ambiguous Registry identity for {allowed_types}: {path}"
+                )
+            if candidates:
+                record = candidates[0]
+                return ArtifactDependencyRef(
+                    artifact_type=record.artifact_type,
+                    path=record.path,
+                    content_hash=record.content_hash,
+                    dependency_kind="local_job",
+                    job_id=record.job_id,
+                    artifact_id=record.artifact_id,
+                )
+        return ArtifactDependencyRef(
+            artifact_type=fallback_artifact_type,
+            path=path,
         )
 
     def _write_stage1_progress_snapshot(self) -> bool:
@@ -1139,20 +1296,103 @@ class LiteratureReviewGenerator:
                 result=result,
                 paper_key=paper_key,
             )
+            paper_artifact_payload = paper_artifact.to_dict()
+            from services.evidence_manifest import build_evidence_manifest_v1
+            from services.artifact_registry import file_sha256
+
+            evidence_manifest = build_evidence_manifest_v1(
+                job_id=self.job_workspace.job_id,
+                canonical_paper_key=paper_key,
+                preprocess=paper_artifact_payload.get("analysis", {}).get("preprocess", {}),
+            )
             artifact_path = self._paper_artifact_path(paper)
-            atomic_write_json(artifact_path, paper_artifact.to_dict())
+            evidence_manifest_path = self.job_workspace.artifact_path(
+                f"paper_artifacts/{self._paper_artifact_hash(paper_key)}.evidence_manifest_v1.json"
+            )
+            atomic_write_json(evidence_manifest_path, evidence_manifest.to_dict())
+            paper_artifact_payload.setdefault("stage1_inputs", {})["evidence_manifest_path"] = evidence_manifest_path
+            paper_artifact_payload["stage1_inputs"]["evidence_manifest_hash"] = file_sha256(
+                evidence_manifest_path
+            )
+            atomic_write_json(artifact_path, paper_artifact_payload)
 
             depends_on: List[ArtifactDependencyRef] = []
-            source_pdf = str(paper_artifact.source.get("source_pdf") or "")
-            if source_pdf:
-                depends_on.append(
+            evidence_dependencies: List[ArtifactDependencyRef] = []
+            artifact_hash = self._paper_artifact_hash(paper_key)
+            for evidence_ref in evidence_manifest.artifacts:
+                evidence_record = self.artifact_registry.register_file(
+                    artifact_role="paper_evidence",
+                    artifact_type=evidence_ref.artifact_type,
+                    artifact_version="v1",
+                    path=evidence_ref.path,
+                    producer="main.LiteratureReviewGenerator.process_paper",
+                    artifact_id=f"{evidence_ref.artifact_type}:{artifact_hash}",
+                )
+                evidence_dependencies.append(
                     ArtifactDependencyRef(
-                        artifact_type="source_pdf",
-                        path=source_pdf,
-                        content_hash=str(paper_artifact.source.get("source_pdf_fingerprint") or ""),
+                        artifact_type=evidence_record.artifact_type,
+                        path=evidence_record.path,
+                        content_hash=evidence_record.content_hash,
+                        dependency_kind="local_job",
+                        job_id=evidence_record.job_id,
+                        artifact_id=evidence_record.artifact_id,
                     )
                 )
-            visual_manifest_path = str(paper_artifact.stage1_inputs.get("visual_artifact_manifest_path") or "")
+            evidence_manifest_record = self.artifact_registry.register_file(
+                artifact_role="paper_evidence",
+                artifact_type="evidence_manifest",
+                artifact_version="v1",
+                path=evidence_manifest_path,
+                producer="main.LiteratureReviewGenerator.process_paper",
+                artifact_id=f"evidence_manifest:{artifact_hash}",
+                depends_on=evidence_dependencies,
+            )
+            depends_on.extend(evidence_dependencies)
+            depends_on.append(
+                ArtifactDependencyRef(
+                    artifact_type=evidence_manifest_record.artifact_type,
+                    path=evidence_manifest_record.path,
+                    content_hash=evidence_manifest_record.content_hash,
+                    dependency_kind="local_job",
+                    job_id=evidence_manifest_record.job_id,
+                    artifact_id=evidence_manifest_record.artifact_id,
+                )
+            )
+
+            source_pdf = str(paper_artifact_payload.get("source", {}).get("source_pdf") or "")
+            if source_pdf:
+                source_dependency = self._registered_dependency_for_path(
+                    source_pdf,
+                    fallback_artifact_type="source_pdf",
+                )
+                if not source_dependency.artifact_id:
+                    resolved_source_pdf = os.path.abspath(source_pdf)
+                    source_record = self.artifact_registry.register_file(
+                        artifact_role="source_pdf",
+                        artifact_type="source_pdf",
+                        artifact_version="v1",
+                        path=resolved_source_pdf,
+                        producer="main.LiteratureReviewGenerator.process_paper",
+                        artifact_id=(
+                            f"source_pdf:"
+                            f"{hashlib.sha256(resolved_source_pdf.encode('utf-8')).hexdigest()[:16]}"
+                        ),
+                    )
+                    source_dependency = ArtifactDependencyRef(
+                        artifact_type=source_record.artifact_type,
+                        path=source_record.path,
+                        content_hash=source_record.content_hash,
+                        dependency_kind="local_job",
+                        job_id=source_record.job_id,
+                        artifact_id=source_record.artifact_id,
+                    )
+                expected_source_hash = str(
+                    paper_artifact_payload.get("source", {}).get("source_pdf_fingerprint") or ""
+                )
+                if expected_source_hash and source_dependency.content_hash != expected_source_hash:
+                    raise ValueError("source PDF hash changed before paper artifact registration")
+                depends_on.append(source_dependency)
+            visual_manifest_path = str(paper_artifact_payload.get("stage1_inputs", {}).get("visual_artifact_manifest_path") or "")
             if visual_manifest_path:
                 depends_on.append(
                     ArtifactDependencyRef(
@@ -1332,11 +1572,27 @@ class LiteratureReviewGenerator:
             return True
 
         try:
+            outline_dependency = (
+                self._registered_dependency_for_path(
+                    outline_file,
+                    fallback_artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                    expected_artifact_types=(
+                        self.OUTLINE_ARTIFACT_TYPE,
+                        "adopted_final_outline",
+                    ),
+                )
+                if outline_file
+                else None
+            )
             review_draft = build_review_draft_v1(
                 job_id=self.job_workspace.job_id,
                 project_name=self.project_name or "review",
                 draft_id=self.REVIEW_DRAFT_ARTIFACT_ID,
-                outline_artifact_id=self.OUTLINE_ARTIFACT_ID,
+                outline_artifact_id=(
+                    (outline_dependency.artifact_id or self.OUTLINE_ARTIFACT_ID)
+                    if outline_dependency
+                    else self.OUTLINE_ARTIFACT_ID
+                ),
                 outline_source_path=outline_file,
                 summary_file=self.summary_file or "",
                 review_word_path=word_file,
@@ -1348,13 +1604,8 @@ class LiteratureReviewGenerator:
             atomic_write_json(artifact_path, review_draft.to_dict())
 
             depends_on: List[ArtifactDependencyRef] = []
-            if outline_file:
-                depends_on.append(
-                    ArtifactDependencyRef(
-                        artifact_type=self.OUTLINE_ARTIFACT_TYPE,
-                        path=outline_file,
-                    )
-                )
+            if outline_dependency:
+                depends_on.append(outline_dependency)
             if self.summary_file:
                 depends_on.append(
                     ArtifactDependencyRef(
@@ -1391,6 +1642,18 @@ class LiteratureReviewGenerator:
             return True
 
         try:
+            outline_dependency = (
+                self._registered_dependency_for_path(
+                    outline_file,
+                    fallback_artifact_type=self.OUTLINE_ARTIFACT_TYPE,
+                    expected_artifact_types=(
+                        self.OUTLINE_ARTIFACT_TYPE,
+                        "adopted_final_outline",
+                    ),
+                )
+                if outline_file
+                else None
+            )
             # Use self.summaries if paper_summaries is not explicitly provided
             if paper_summaries is None:
                 paper_summaries = [dict(summary) for summary in self.summaries]
@@ -1402,7 +1665,11 @@ class LiteratureReviewGenerator:
                 job_id=self.job_workspace.job_id,
                 project_name=self.project_name or "review",
                 draft_id=self.REVIEW_DRAFT_V2_ARTIFACT_ID,
-                outline_artifact_id=self.OUTLINE_ARTIFACT_ID,
+                outline_artifact_id=(
+                    (outline_dependency.artifact_id or self.OUTLINE_ARTIFACT_ID)
+                    if outline_dependency
+                    else self.OUTLINE_ARTIFACT_ID
+                ),
                 outline_source_path=outline_file,
                 summary_file=self.summary_file or "",
                 review_word_path=word_file,
@@ -1419,13 +1686,8 @@ class LiteratureReviewGenerator:
             atomic_write_json(artifact_path, review_draft.to_dict())
 
             depends_on: List[ArtifactDependencyRef] = []
-            if outline_file:
-                depends_on.append(
-                    ArtifactDependencyRef(
-                        artifact_type=self.OUTLINE_ARTIFACT_TYPE,
-                        path=outline_file,
-                    )
-                )
+            if outline_dependency:
+                depends_on.append(outline_dependency)
             if self.summary_file:
                 depends_on.append(
                     ArtifactDependencyRef(
@@ -1433,12 +1695,14 @@ class LiteratureReviewGenerator:
                         path=self.summary_file,
                     )
                 )
-            if citation_ref_catalog_path:
+            if citation_ref_catalog_path and os.path.isfile(citation_ref_catalog_path):
+                from services.artifact_registry import file_sha256
+
                 depends_on.append(
                     ArtifactDependencyRef(
                         artifact_type=self.CITATION_REF_CATALOG_ARTIFACT_TYPE,
                         path=citation_ref_catalog_path,
-                        content_hash=citation_ref_catalog_hash,
+                        content_hash=file_sha256(citation_ref_catalog_path),
                     )
                 )
 
@@ -1518,15 +1782,16 @@ class LiteratureReviewGenerator:
                         path=review_draft_path,
                     )
                 )
-            citation_ref_catalog = self._load_citation_ref_catalog()
+            self._load_citation_ref_catalog()
             citation_ref_catalog_path = self._citation_ref_catalog_path()
-            citation_ref_catalog_hash = str((citation_ref_catalog or {}).get("catalog_hash") or "")
-            if citation_ref_catalog_path:
+            if citation_ref_catalog_path and os.path.isfile(citation_ref_catalog_path):
+                from services.artifact_registry import file_sha256
+
                 depends_on.append(
                     ArtifactDependencyRef(
                         artifact_type=self.CITATION_REF_CATALOG_ARTIFACT_TYPE,
                         path=citation_ref_catalog_path,
-                        content_hash=citation_ref_catalog_hash,
+                        content_hash=file_sha256(citation_ref_catalog_path),
                     )
                 )
 
@@ -1808,14 +2073,21 @@ class LiteratureReviewGenerator:
                 paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
                 zotero_report_path: str = paths_config.get('zotero_report', '')
             
-            if not zotero_report_path or not os.path.exists(zotero_report_path):
-                self.logger.error(f"Zotero报告文件不存在: {zotero_report_path}")
+            if not zotero_report_path:
+                self.logger.error("Zotero report path is empty")
                 return False
             
             self.logger.info(f"正在解析Zotero报告: {zotero_report_path}")
             
             # 解析报告
-            self.papers = parse_zotero_report(zotero_report_path)
+            parse_result = parse_zotero_report_result(zotero_report_path)
+            self.papers = parse_result.papers
+            self.zotero_parse_result = parse_result.to_dict()
+            for diagnostic in parse_result.diagnostics:
+                if diagnostic.severity == "error":
+                    self.logger.error(f"Zotero parser [{diagnostic.code}]: {diagnostic.message}")
+                elif diagnostic.severity == "warning":
+                    self.logger.warning(f"Zotero parser [{diagnostic.code}]: {diagnostic.message}")
             
             if not self.papers:
                 self.logger.error("Zotero报告解析失败或报告为空")
@@ -1855,20 +2127,26 @@ class LiteratureReviewGenerator:
 
     def _materialize_effective_summaries(
         self,
-        summaries: List[Dict[str, Any]],
+        summaries: Sequence[Mapping[str, Any]],
         *,
         source_path: str = "",
         source_kind: str,
+        source_artifact_type: str = "summary_source",
         producer: str,
-        source_items: Optional[List[Dict[str, Any]]] = None,
-        rejected_candidates: Optional[List[Dict[str, Any]]] = None,
+        source_items: Optional[Sequence[Mapping[str, Any]]] = None,
+        rejected_candidates: Optional[Sequence[Mapping[str, Any]]] = None,
+        source_dependencies_override: Optional[
+            Sequence[ArtifactDependencyRef]
+        ] = None,
+        registration_status: str = "ready",
     ) -> bool:
         if not self.summary_file:
             return False
 
+        summary_payload = [dict(summary) for summary in summaries]
         Path(self.summary_file).parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(self.summary_file, summaries)
-        effective_source_items = list(source_items or [])
+        atomic_write_json(self.summary_file, summary_payload)
+        effective_source_items = [dict(item) for item in (source_items or ())]
         if not effective_source_items and source_path:
             effective_source_items = [
                 {
@@ -1878,20 +2156,26 @@ class LiteratureReviewGenerator:
                     "priority": 0,
                 }
             ]
+        source_dependencies = (
+            list(source_dependencies_override)
+            if source_dependencies_override is not None
+            else [
+                self._registered_dependency_for_path(
+                    str(item.get("path") or ""),
+                    fallback_artifact_type=source_artifact_type,
+                )
+                for item in effective_source_items
+                if str(item.get("path") or "").strip()
+            ]
+        )
         self._register_workspace_artifact(
             artifact_role="summary",
             artifact_type="summary_file",
             artifact_version="v1",
             path=self.summary_file,
             producer=producer,
-            depends_on=[
-                ArtifactDependencyRef(
-                    artifact_type="summary_source",
-                    path=str(item.get("path") or ""),
-                )
-                for item in effective_source_items
-                if str(item.get("path") or "").strip()
-            ],
+            status=registration_status,
+            depends_on=source_dependencies,
         )
 
         manifest_path = self._get_summary_source_manifest_path()
@@ -1908,25 +2192,90 @@ class LiteratureReviewGenerator:
             "source_kind": source_kind,
             "source_path": primary_source_path,
             "source_items": effective_source_items,
-            "rejected_candidates": list(rejected_candidates or []),
+            "rejected_candidates": [dict(item) for item in (rejected_candidates or ())],
             "materialized_summary_file": self.summary_file,
-            "summary_count": len(summaries),
+            "summary_count": len(summary_payload),
         }
         atomic_write_json(manifest_path, manifest_payload)
         self._register_workspace_artifact(
             artifact_role="summary_source",
             artifact_type="summary_source_manifest",
-            artifact_version="v1",
+            artifact_version="v2",
             path=manifest_path,
             producer=producer,
-            depends_on=[
-                ArtifactDependencyRef(
-                    artifact_type="summary_file",
-                    path=self.summary_file,
-                )
-            ],
+            status=registration_status,
+            depends_on=(
+                source_dependencies
+                if registration_status == "quarantined"
+                else [
+                    ArtifactDependencyRef(
+                        artifact_type="summary_file",
+                        path=self.summary_file,
+                    )
+                ]
+            ),
         )
         return True
+
+    @staticmethod
+    def _project_legacy_summary_to_canonical(summary: Mapping[str, Any]) -> Dict[str, Any]:
+        raw_paper_info = summary.get("paper_info")
+        paper_info = dict(raw_paper_info) if isinstance(raw_paper_info, Mapping) else {}
+        ai_metadata = get_paper_metadata(summary.get("ai_summary"))
+        for field in ("title", "authors", "year", "journal", "doi"):
+            if not paper_info.get(field) and ai_metadata.get(field):
+                paper_info[field] = ai_metadata[field]
+
+        explicit_key = str(
+            paper_info.get("canonical_paper_key")
+            or paper_info.get("source_paper_id")
+            or ""
+        ).strip()
+        doi = normalize_doi(paper_info.get("doi"))
+        title = str(paper_info.get("title") or "").strip()
+        authors = paper_info.get("authors")
+        has_authors = bool(authors.strip()) if isinstance(authors, str) else bool(authors)
+        year = str(paper_info.get("year") or "").strip()
+        if not explicit_key and not doi and not (title and has_authors and year):
+            raise SummarySourceError(
+                "legacy summary records require DOI, an explicit paper key, or title/author/year identity"
+            )
+
+        if doi:
+            paper_info["doi"] = doi
+        canonical_key = normalize_doi(explicit_key) or explicit_key
+        if not canonical_key:
+            canonical_key = build_canonical_paper_key(paper_info)
+        paper_info["canonical_paper_key"] = canonical_key
+        paper_info.setdefault("source_paper_id", canonical_key)
+
+        canonical_ai_summary = normalize_ai_summary(summary.get("ai_summary"))
+        canonical_metadata = dict(canonical_ai_summary["paper_metadata"])
+        for field in ("title", "authors", "year", "journal", "doi"):
+            if not canonical_metadata.get(field) and paper_info.get(field):
+                canonical_metadata[field] = paper_info[field]
+        canonical_ai_summary["paper_metadata"] = canonical_metadata
+        canonical_ai_summary = normalize_ai_summary(canonical_ai_summary)
+
+        quality_audit = canonical_ai_summary.get("quality_audit")
+        missing_critical_fields = (
+            [str(item) for item in quality_audit.get("missing_critical_fields", [])]
+            if isinstance(quality_audit, Mapping)
+            else []
+        )
+        if missing_critical_fields:
+            identity = canonical_key or title or "unknown legacy summary"
+            raise SummarySourceError(
+                f"legacy summary {identity!r} cannot be projected to canonical summary; "
+                "missing critical ai_summary fields: "
+                + ", ".join(missing_critical_fields)
+            )
+
+        projected = dict(summary)
+        projected["status"] = "success"
+        projected["paper_info"] = paper_info
+        projected["ai_summary"] = canonical_ai_summary
+        return projected
 
     def _load_summaries_from_sources(
         self,
@@ -1944,21 +2293,233 @@ class LiteratureReviewGenerator:
             )
             for index, path in enumerate(paths)
         ]
-        resolved: ResolvedSummarySet = build_effective_summary_set(sources, logger=self.logger)
-        self.summaries = [dict(item) for item in resolved.summaries]
-        success_count = len(self.summaries)
+        catalog = SummaryCatalog.from_sources(sources, logger=self.logger)
+        resolved: ResolvedSummarySet = catalog.build_effective_summary_set()
+        if not resolved.summaries:
+            raise SummarySourceError(
+                "explicit legacy summary sources contain no reusable successful summary records"
+            )
+        # Validate every otherwise-reusable explicit record before any Registry or
+        # artifact mutation. This prevents a weak duplicate loser from bypassing
+        # the canonical projection quality gate.
+        for record in catalog.records:
+            self._project_legacy_summary_to_canonical(record.summary)
+
+        projected_summaries: SummariesList = [
+            cast(
+                ProcessingResult,
+                self._project_legacy_summary_to_canonical(item),
+            )
+            for item in resolved.summaries
+        ]
+
+        contributing_paths = {
+            os.path.normcase(os.path.abspath(str(item.get("path") or "")))
+            for item in resolved.contributing_source_items
+            if str(item.get("path") or "").strip()
+        }
+        rejection_reasons_by_path: Dict[str, Set[str]] = {}
+        for rejected in resolved.rejected_candidates:
+            rejected_path = str(rejected.get("path") or "").strip()
+            reason = str(rejected.get("reason") or "").strip()
+            if rejected_path and reason:
+                normalized_path = os.path.normcase(os.path.abspath(rejected_path))
+                rejection_reasons_by_path.setdefault(normalized_path, set()).add(reason)
+
+        selected_source_audit_items: List[Dict[str, Any]] = []
+        for index, source in enumerate(sources):
+            resolved_path = os.path.abspath(source.path)
+            normalized_path = os.path.normcase(resolved_path)
+            content_hash = file_sha256(resolved_path)
+            contributed = normalized_path in contributing_paths
+            rejection_reasons = sorted(rejection_reasons_by_path.get(normalized_path, set()))
+            if not contributed and not rejection_reasons:
+                rejection_reasons = ["not_selected_as_effective_winner"]
+            selected_source_audit_items.append(
+                {
+                    "index": index + 1,
+                    "path": resolved_path,
+                    "source_type": source.source_type,
+                    "label": source.label,
+                    "priority": source.priority,
+                    "content_hash": content_hash,
+                    "contributed": contributed,
+                    "rejection_reasons": rejection_reasons,
+                }
+            )
+
+        # Recheck every selected input before the first Registry mutation so a
+        # changed source cannot leave a partially registered legacy graph.
+        for item in selected_source_audit_items:
+            selected_path = str(item["path"])
+            if file_sha256(selected_path) != str(item["content_hash"]):
+                raise SummarySourceError(
+                    f"legacy summary source changed during projection: {selected_path}"
+                )
+
+        source_records = []
+        if self.artifact_registry and self.job_workspace:
+            for source in sources:
+                resolved_path = os.path.abspath(source.path)
+                if os.path.normcase(resolved_path) not in contributing_paths:
+                    continue
+                path_key = hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()[:12]
+                source_record = self.artifact_registry.register_file(
+                    artifact_role="legacy_summary_source",
+                    artifact_type="legacy_summary_source",
+                    artifact_version="v1",
+                    path=resolved_path,
+                    producer=producer,
+                    status="quarantined",
+                    artifact_id=f"legacy-summary-source:{path_key}",
+                    metadata={
+                        "compatibility_status": "legacy_unverified",
+                        "canonical_ready": False,
+                    },
+                )
+                source_records.append(source_record)
+
+        self.summaries = projected_summaries
+        success_count = len(projected_summaries)
         self.logger.success(f"Loaded summary sources: {success_count} success, 0 failed")
         if resolved.rejected_candidates:
             self.logger.info(f"Summary source merge skipped {len(resolved.rejected_candidates)} non-reusable records")
-        self._materialize_effective_summaries(
-            self.summaries,
+        materialized = self._materialize_effective_summaries(
+            projected_summaries,
             source_path=str(paths[0]) if len(paths) == 1 else "",
             source_kind=source_kind,
+            source_artifact_type="legacy_summary_source",
             producer=producer,
-            source_items=resolved.source_items,
+            source_items=resolved.contributing_source_items,
             rejected_candidates=resolved.rejected_candidates,
+            registration_status="quarantined" if source_records else "ready",
         )
+        if materialized and source_records and self.artifact_registry and self.job_workspace and self.summary_file:
+            import getpass
+
+            from services.audit_record import AuditArtifactRefV1, AuditRecordV1
+
+            summary_path = os.path.abspath(self.summary_file)
+            summary_record = next(
+                (
+                    record
+                    for record in self.artifact_registry.list_records()
+                    if os.path.abspath(record.path) == summary_path
+                    and record.artifact_type == "summary_file"
+                    and record.artifact_role == "summary"
+                ),
+                None,
+            )
+            if summary_record is None:
+                raise RuntimeError("materialized summary file was not registered")
+            manifest_path = os.path.abspath(self._get_summary_source_manifest_path())
+            manifest_record = next(
+                (
+                    record
+                    for record in self.artifact_registry.list_records()
+                    if os.path.abspath(record.path) == manifest_path
+                    and record.artifact_type == "summary_source_manifest"
+                ),
+                None,
+            )
+            if manifest_record is None:
+                raise RuntimeError("materialized summary source manifest was not registered")
+            input_refs = [
+                AuditArtifactRefV1(
+                    artifact_id=record.artifact_id,
+                    artifact_type=record.artifact_type,
+                    job_id=record.job_id,
+                    content_hash=record.content_hash,
+                )
+                for record in source_records
+            ]
+            output_ref = AuditArtifactRefV1(
+                artifact_id=summary_record.artifact_id,
+                artifact_type=summary_record.artifact_type,
+                job_id=summary_record.job_id,
+                content_hash=summary_record.content_hash,
+            )
+            actor = self.audit_actor.strip() or getpass.getuser() or "local-user"
+            reason = self.audit_reason.strip() or "explicit legacy summary source selected"
+            audit = AuditRecordV1.create(
+                audit_type="legacy_reuse",
+                job_id=self.job_workspace.job_id,
+                attempt_id=f"legacy-reuse:{self.job_workspace.job_id}",
+                producer=producer,
+                actor=actor,
+                reason=reason,
+                scope={
+                    "operation": "explicit_summary_reuse",
+                    "source_count": len(source_records),
+                    "selected_source_count": len(selected_source_audit_items),
+                    "selected_sources": selected_source_audit_items,
+                    "canonical_projection": self.LEGACY_SUMMARY_PROJECTION_VERSION,
+                    **dict(self.audit_scope),
+                },
+                target_artifacts=[output_ref],
+                input_artifact_refs=input_refs,
+                output_artifact_refs=[output_ref],
+                input_hashes={
+                    f"summary_source_{item['index']}": str(item["content_hash"])
+                    for item in selected_source_audit_items
+                },
+                policy_snapshot={
+                    "explicit_selection_required": True,
+                    "legacy_inputs_are_not_identity_verified": True,
+                    "canonical_projection_required": True,
+                },
+                disposition="reused_with_audit",
+            )
+            audit_path = self.job_workspace.artifact_path(f"legacy_reuse_{audit.audit_id}.json")
+            atomic_write_json(audit_path, audit.to_dict())
+            self.artifact_registry.register_file(
+                artifact_role="audit_record",
+                artifact_type="audit_record",
+                artifact_version="v1",
+                path=audit_path,
+                producer=producer,
+                artifact_id=audit.audit_id,
+                status="ready",
+                depends_on=[],
+                metadata={
+                    "audit_type": audit.audit_type,
+                    "record_hash": audit.record_hash,
+                },
+            )
+            release_metadata = {"legacy_reuse_audit_id": audit.audit_id}
+            for source_record in source_records:
+                self.artifact_registry.update_record(
+                    source_record.artifact_id,
+                    status="ready",
+                    metadata_updates=release_metadata,
+                )
+            self.artifact_registry.update_record(
+                manifest_record.artifact_id,
+                status="ready",
+                metadata_updates=release_metadata,
+            )
+            # The canonical summary is the final ready transition after its
+            # audit, sources, and compatibility manifest are durable.
+            self.artifact_registry.update_record(
+                summary_record.artifact_id,
+                status="ready",
+                metadata_updates=release_metadata,
+            )
         return True
+
+    def _assert_registered_summary_is_ready(self, path: str) -> None:
+        if not self.artifact_registry:
+            return
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        for record in self.artifact_registry.list_records():
+            if (
+                record.artifact_type == "summary_file"
+                and os.path.normcase(os.path.abspath(record.path)) == normalized_path
+                and record.status != "ready"
+            ):
+                raise SummarySourceError(
+                    "registered summary is not ready; its legacy reuse audit did not complete"
+                )
 
     def _load_summaries_from_path(
         self,
@@ -1968,8 +2529,12 @@ class LiteratureReviewGenerator:
         source_kind: str = "existing_summary_file",
         producer: str = "main.LiteratureReviewGenerator.load_existing_summaries",
     ) -> bool:
+        self._assert_registered_summary_is_ready(path)
         loaded_summaries = self._load_summary_records_from_path(path)
-        self.summaries = [dict(item) for item in loaded_summaries]
+        self.summaries = [
+            cast(ProcessingResult, dict(item))
+            for item in loaded_summaries
+        ]
         self._dedupe_summaries_by_paper_key()
 
         success_count = len([s for s in self.summaries if s.get("status") == "success"])
@@ -1995,6 +2560,7 @@ class LiteratureReviewGenerator:
 
     def load_existing_summaries(self) -> bool:
         """Load an existing summaries file for resume or downstream generation."""
+        explicit_summary_sources: List[str] = []
         try:
             explicit_summary_sources = self._explicit_summary_source_paths()
             if explicit_summary_sources:
@@ -2005,6 +2571,7 @@ class LiteratureReviewGenerator:
                 )
 
             if self.summary_file and os.path.exists(self.summary_file):
+                self._assert_registered_summary_is_ready(self.summary_file)
                 try:
                     return self._load_summaries_from_path(self.summary_file)
                 except SummarySourceError as exc:
@@ -2025,6 +2592,7 @@ class LiteratureReviewGenerator:
                     summary_file = os.path.join(workspace_path, "artifacts", f"{self.project_name}_summaries.json")
                     if not os.path.exists(summary_file):
                         continue
+                    self._assert_registered_summary_is_ready(summary_file)
                     try:
                         self.logger.info(f"Found historical summary file: {summary_file}")
                         return self._load_summaries_from_path(summary_file)
@@ -2041,6 +2609,10 @@ class LiteratureReviewGenerator:
             self.summaries = []
             return False
         except Exception as e:
+            if explicit_summary_sources:
+                self.logger.error(f"Failed to load explicit summary sources: {e}")
+                self.summaries = []
+                return False
             self.logger.warning(f"Failed to load existing summary file; starting a fresh run: {e}")
             self.summaries = []
             return True
@@ -2398,6 +2970,7 @@ class LiteratureReviewGenerator:
             'markdown_path': getattr(preprocess_result, 'markdown_path', ''),
             'plain_text_path': getattr(preprocess_result, 'plain_text_path', ''),
             'page_index_path': getattr(preprocess_result, 'page_index_path', ''),
+            'chunks_path': getattr(preprocess_result, 'chunks_path', ''),
             'structured_json_path': getattr(preprocess_result, 'structured_json_path', ''),
             'diagnostics_path': getattr(preprocess_result, 'diagnostics_path', ''),
             'manifest_path': getattr(preprocess_result, 'manifest_path', ''),
@@ -2467,7 +3040,15 @@ class LiteratureReviewGenerator:
             )
         config_copy["Preprocess"] = preprocess_section
 
-        manager = PreprocessManager(config=config_copy, logger=self.logger)
+        manager = PreprocessManager(
+            config=config_copy,
+            logger=self.logger,
+            mineru_circuit_breaker=(
+                self.preprocess_manager.mineru_circuit_breaker
+                if self.preprocess_manager is not None
+                else None
+            ),
+        )
         if preprocess_strategy == "mineru":
             manager.parser_mode = "remote"
             manager.primary_parser = "mineru_remote"
@@ -3720,6 +4301,42 @@ class LiteratureReviewGenerator:
             self.logger.error(f"重试失败章节时出错: {exc}")
             return False
     
+    def _persist_source_identity_result(
+        self,
+        paper: Mapping[str, Any],
+        result: SourceIdentityResultV1,
+    ) -> str:
+        if not self.job_workspace or not self.artifact_registry:
+            return ""
+        stable_identity = str(
+            paper.get("canonical_paper_key")
+            or paper.get("source_paper_id")
+            or paper.get("title")
+            or result.candidate_hash
+        )
+        artifact_suffix = hashlib.sha256(stable_identity.encode("utf-8")).hexdigest()[:20]
+        artifact_id = f"source_identity:{artifact_suffix}"
+        artifact_path = self.job_workspace.artifact_path(
+            f"source_identity/{artifact_suffix}.json"
+        )
+        atomic_write_json(artifact_path, result.to_dict())
+        self.artifact_registry.register_file(
+            artifact_role="source_identity",
+            artifact_type="source_identity_result",
+            artifact_version="v1",
+            path=artifact_path,
+            producer="main.LiteratureReviewGenerator._persist_source_identity_result",
+            artifact_id=artifact_id,
+            status=result.artifact_status,
+            metadata={
+                "identity_verdict": result.identity_verdict,
+                "canonical_ready": result.canonical_ready,
+                "candidate_hash": result.candidate_hash,
+                "evidence_hash": result.evidence_hash,
+            },
+        )
+        return artifact_path
+
     def process_paper(self, paper: PaperInfo, paper_index: int, file_index: Optional[FileIndex], total_papers: int) -> Optional[ProcessingResult]:
         """处理单篇论文"""
         try:
@@ -3762,22 +4379,36 @@ class LiteratureReviewGenerator:
                     }
                 
                 # 创建文件索引（如果还没有）
-                if not file_index:
+                if file_index is None:
                     file_index = create_file_index(library_path)
                 
-                # 使用 file_finder.py 中强大的 find_pdf 函数
-                find_result = find_pdf(dict(paper), library_path, file_index)
+                match_result = resolve_pdf_match(dict(paper), library_path, file_index)
+                find_result = match_result.selected_path
                 
                 if find_result:
                     pdf_path = find_result
+                    paper['pdf_path'] = pdf_path
+                    paper['source_pdf'] = pdf_path
+                    refreshed_descriptor = normalize_source_papers("zotero", [paper])[0]
+                    paper.update(
+                        project_descriptors_to_legacy_papers(
+                            [paper],
+                            [refreshed_descriptor],
+                        )[0]
+                    )
                     self.logger.info(f"智能查找到PDF: {os.path.basename(pdf_path)}")
                 else:
-                    failure_reason = "未找到PDF文件"
+                    failure_reason = (
+                        "ambiguous_pdf_match"
+                        if match_result.status == "ambiguous"
+                        else "pdf_not_found"
+                    )
                     self.logger.error(f"未找到PDF文件: {file_title} - 原因: {failure_reason}")
                     return {
                         'paper_info': paper,
                         'status': 'failed',
-                        'failure_reason': failure_reason
+                        'failure_reason': failure_reason,
+                        'pdf_match': match_result.to_dict(),
                     }
             elif not pdf_path and self.mode == "direct":
                 # 直接模式下PDF路径应该已经存在
@@ -3791,6 +4422,13 @@ class LiteratureReviewGenerator:
                     'status': 'failed',
                     'failure_reason': failure_reason
                 }
+
+            expected_source_identity = {
+                "title": str(paper.get("title") or ""),
+                "authors": list(paper.get("authors") or []),
+                "year": str(paper.get("year") or ""),
+                "doi": str(paper.get("doi") or ""),
+            }
             
             strategy_policy = self._stage1_strategy_policy()
             preprocess_strategies = self._stage1_preprocess_strategies()
@@ -3802,6 +4440,8 @@ class LiteratureReviewGenerator:
             model_used = 'primary'
             ai_result = None
             strategy_succeeded = False
+            strategy = ""
+            pdf_text = ""
 
             def record_attempt_failure(
                 strategy_name: str,
@@ -3882,6 +4522,33 @@ class LiteratureReviewGenerator:
                         quality_reason=failure_reason,
                     )
                     continue
+
+                if self.mode == "zotero":
+                    identity_result = inspect_text_identity(
+                        expected_source_identity,
+                        str(pdf_text),
+                        source_path=str(pdf_path),
+                        candidate_hash=str(paper.get("source_pdf_fingerprint") or ""),
+                    )
+                    identity_payload = identity_result.to_dict()
+                    paper["identity_verdict"] = identity_result.identity_verdict
+                    paper["artifact_status"] = identity_result.artifact_status
+                    paper["source_identity"] = identity_payload
+                    self._persist_source_identity_result(paper, identity_result)
+                    if not identity_result.canonical_ready:
+                        failure_reason = f"source_identity_{identity_result.identity_verdict}"
+                        self.logger.error(
+                            f"Source identity gate blocked Stage 1 for {paper_label}: "
+                            f"{identity_result.identity_verdict} ({', '.join(identity_result.reasons)})"
+                        )
+                        return {
+                            "paper_info": paper,
+                            "status": "failed",
+                            "failure_reason": failure_reason,
+                            "identity_verdict": identity_result.identity_verdict,
+                            "artifact_status": identity_result.artifact_status,
+                            "source_identity": identity_payload,
+                        }
 
                 input_kind = preprocess_metadata.get('analysis_input_kind', 'text')
                 extractor_used = preprocess_metadata.get('extractor_used', 'unknown')
@@ -4112,6 +4779,41 @@ class LiteratureReviewGenerator:
                             }
                             
                             is_quality_ok_backup, quality_reason_backup = validate_summary_quality(temp_result_backup)
+
+                            if not is_quality_ok_backup and self._is_metadata_only_quality_failure(quality_reason_backup):
+                                resolved_fields = self._resolve_stage1_metadata_for_quality(
+                                    paper,
+                                    backup_result,
+                                    pdf_text,
+                                )
+                                if resolved_fields:
+                                    self.logger.info(
+                                        "Backup metadata-only quality issue resolved fields: "
+                                        f"{', '.join(resolved_fields)}"
+                                    )
+                                temp_result_backup = {
+                                    'paper_info': paper,
+                                    'status': 'success',
+                                    'ai_summary': backup_result,
+                                    'source_mode': self.mode,
+                                }
+                                is_quality_ok_backup, quality_reason_backup = validate_summary_quality(
+                                    temp_result_backup
+                                )
+                                if self._is_metadata_only_quality_failure(quality_reason_backup):
+                                    missing_fields = self._mark_summary_metadata_manual_review(
+                                        paper,
+                                        backup_result,
+                                        quality_reason_backup,
+                                    )
+                                    self.logger.warning(
+                                        "Backup Stage 1 summary body is usable but metadata remains incomplete; "
+                                        f"saved with manual-review flag: {', '.join(missing_fields) or quality_reason_backup}"
+                                    )
+                                    ai_result = backup_result
+                                    model_used = backup_model_used
+                                    strategy_succeeded = True
+                                    break
                             
                             if is_quality_ok_backup:
                                 self.logger.info("备用引擎内容质量检查通过")
@@ -4390,7 +5092,11 @@ class LiteratureReviewGenerator:
             }
             return failed_result
     
-    def save_summaries(self) -> bool:
+    def save_summaries(
+        self,
+        *,
+        depends_on: Optional[Sequence[ArtifactDependencyRef]] = None,
+    ) -> bool:
         """保存摘要到JSON文件（线程安全版本）"""
         try:
             if not self.output_dir or not self.summary_file:
@@ -4428,6 +5134,7 @@ class LiteratureReviewGenerator:
                 artifact_version="v1",
                 path=self.summary_file,
                 producer="main.LiteratureReviewGenerator.save_summaries",
+                depends_on=list(depends_on or ()),
             )
             self._write_stage1_progress_snapshot()
             
@@ -4752,6 +5459,10 @@ class LiteratureReviewGenerator:
                     "title": str(paper_info.get('title') or ''),
                     "doi": normalize_doi(paper_info.get('doi')),
                     "failure_reason": str(failed.get('failure_reason') or ''),
+                    "pdf_match": dict(failed.get('pdf_match') or {}),
+                    "identity_verdict": str(failed.get('identity_verdict') or ''),
+                    "artifact_status": str(failed.get('artifact_status') or ''),
+                    "source_identity": dict(failed.get('source_identity') or {}),
                 }
             )
 
@@ -4801,7 +5512,7 @@ class LiteratureReviewGenerator:
             file_index: Optional[FileIndex] = None
             if self.mode == "zotero":
                 paths_config: Dict[str, str] = self.config.get('Paths', {}) if self.config else {}
-                library_path: str = paths_config.get('library_path', '')
+                library_path: str = self.library_path or paths_config.get('library_path', '')
                 if library_path:
                     self.logger.info("正在创建文件索引...")
                     file_index = create_file_index(library_path)
@@ -4855,7 +5566,13 @@ class LiteratureReviewGenerator:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # 提交所有任务
                 future_to_paper: Dict[concurrent.futures.Future['ProcessingResult | None'], Tuple[int, 'PaperInfo']] = {
-                    executor.submit(self.process_paper, dict(paper), i, file_index, total_papers): (i, paper)
+                    executor.submit(
+                        self.process_paper,
+                        cast(PaperInfo, dict(paper)),
+                        i,
+                        file_index,
+                        total_papers,
+                    ): (i, paper)
                     for i, paper in papers_to_process
                 }
                 
@@ -4897,12 +5614,21 @@ class LiteratureReviewGenerator:
                             failure_reason = result.get('failure_reason') or '未知错误' if result else '处理返回空结果'
                             if not isinstance(failure_reason, str):  # type: ignore
                                 failure_reason = '未知错误'
-                            failed_paper = result.get('paper_info', paper) if result else paper
+                            failed_paper = cast(PaperInfo, result.get('paper_info', paper) if result else paper)
                             
-                            self.failed_papers.append({  # type: ignore
-                                    'paper_info': failed_paper,
-                                    'failure_reason': failure_reason
-                                })
+                            failed_entry: FailedPaper = {
+                                'paper_info': failed_paper,
+                                'failure_reason': failure_reason,
+                            }
+                            pdf_match_payload = result.get('pdf_match') if result else None
+                            if isinstance(pdf_match_payload, Mapping):
+                                failed_entry['pdf_match'] = dict(pdf_match_payload)
+                            identity_payload = result.get('source_identity') if result else None
+                            if isinstance(identity_payload, Mapping) and result is not None:
+                                failed_entry['source_identity'] = dict(identity_payload)
+                                failed_entry['identity_verdict'] = str(result.get('identity_verdict') or '')
+                                failed_entry['artifact_status'] = str(result.get('artifact_status') or '')
+                            self.failed_papers.append(failed_entry)
                                 # 更新身份基断点跟踪
                             self._checkpoint_failed_papers.add(paper_key)
                             
@@ -5107,7 +5833,7 @@ class LiteratureReviewGenerator:
                         break
                     
                     # 重置当前轮次的失败列表
-                    current_round_failures: List[Dict[str, Any]] = []
+                    current_round_failures: List[FailedPaper] = []
                     
                     # 创建线程池进行重试处理
                     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as retry_executor:
@@ -5159,10 +5885,19 @@ class LiteratureReviewGenerator:
                                 else:
                                     # 重试仍然失败
                                     failure_reason = result.get('failure_reason', '重试失败') if result else '重试返回空结果'
-                                    current_round_failures.append({
-                                        'paper_info': paper,
-                                        'failure_reason': failure_reason
-                                    })
+                                    retry_failure: FailedPaper = {
+                                        'paper_info': cast(PaperInfo, paper),
+                                        'failure_reason': str(failure_reason),
+                                    }
+                                    retry_pdf_match = result.get('pdf_match') if result else None
+                                    if isinstance(retry_pdf_match, Mapping):
+                                        retry_failure['pdf_match'] = dict(retry_pdf_match)
+                                    retry_identity = result.get('source_identity') if result else None
+                                    if isinstance(retry_identity, Mapping):
+                                        retry_failure['source_identity'] = dict(retry_identity)
+                                        retry_failure['identity_verdict'] = str(result.get('identity_verdict') or '')
+                                        retry_failure['artifact_status'] = str(result.get('artifact_status') or '')
+                                    current_round_failures.append(retry_failure)
                                     failed_label = self._paper_progress_label(paper)
                                     self._emit_stage1_progress(
                                         total=tracked_total,
@@ -5193,7 +5928,7 @@ class LiteratureReviewGenerator:
                                 # 重试异常
                                 failure_reason = f"重试过程发生异常: {str(e)}"
                                 current_round_failures.append({
-                                    'paper_info': paper,
+                                    'paper_info': cast(PaperInfo, paper),
                                     'failure_reason': failure_reason
                                 })
                                 failed_label = self._paper_progress_label(paper)
@@ -5340,7 +6075,9 @@ class LiteratureReviewGenerator:
                     progress_snapshot_path = snapshot_path
 
             # 加载现有摘要（兼容旧版本）
-            self.load_existing_summaries()
+            if not self.load_existing_summaries():
+                self.logger.error("Existing summary state is unsafe to reuse; aborting Stage 1")
+                return False
             
             if checkpoint_loaded:
                 self._merge_stage1_progress_from_loaded_summaries()
@@ -5959,7 +6696,7 @@ class LiteratureReviewGenerator:
                     run.font.size = Pt(font_size_heading1 + 2)  # 主标题稍大  # type: ignore
                 
                 # 添加生成时间
-                date_para = doc.add_paragraph(f"生成时间: {datetime.now().strftime('%Y年%m月%d日')}")
+                date_para = doc.add_paragraph(f"生成时间: {_format_chinese_datetime(datetime.now())}")
                 date_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER  # type: ignore
                 
                 # 应用日期样式
@@ -6359,7 +7096,7 @@ class LiteratureReviewGenerator:
             test_dev_mode = compat.outline_test_dev_fixture_mode()
             pipeline = V2Pipeline(
                 job_id=self.job_workspace.job_id if self.job_workspace else "standalone",
-                summaries=self.summaries,
+                summaries=[dict(summary) for summary in self.summaries],
                 config_view=compat,
                 artifact_registry=self.artifact_registry,
                 workspace=self.job_workspace,
@@ -6796,7 +7533,7 @@ Requirements:
 
     @staticmethod
     def format_review_content(review_content: Dict[str, Any], review_data: Dict[str, Any]) -> str:
-        header = f"# 文献综述报告\n\n**生成时间**: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}\n**文献数量**: {review_data['total_papers']}篇\n**成功处理**: {review_data['successful_papers']}篇\n**失败处理**: {review_data['failed_papers']}篇\n\n---\n\n"
+        header = f"# 文献综述报告\n\n**生成时间**: {_format_chinese_datetime(datetime.now(), include_time=True)}\n**文献数量**: {review_data['total_papers']}篇\n**成功处理**: {review_data['successful_papers']}篇\n**失败处理**: {review_data['failed_papers']}篇\n\n---\n\n"
         review_text = review_content if isinstance(review_content, str) else review_content.get('summary', json.dumps(  # type: ignore
             review_content, ensure_ascii=False, indent=2))
         references = "\n\n## 参考文献\n\n"
@@ -6899,10 +7636,15 @@ Requirements:
                     self.logger.error(f"处理种子论文时出错 {os.path.basename(pdf_path)}: {e}")
                     return None
             
-            for future in concurrent.futures.as_completed(future_to_pdf):  # type: ignore
-                result: Optional[Dict[str, Any]] = future.result()  # type: ignore
-                if result:
-                    concept_papers.append(result)  # type: ignore
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_pdf = {
+                    executor.submit(process_seed_paper, pdf_path): pdf_path
+                    for pdf_path in seed_papers
+                }
+                for future in concurrent.futures.as_completed(future_to_pdf):
+                    result = future.result()
+                    if result:
+                        concept_papers.append(result)
             
             if not concept_papers:
                 self.logger.error("没有成功分析任何种子论文")
@@ -7880,6 +8622,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:  # type: ignore
     """Handle command line arguments and execute the selected workflow."""
 
+    from services.console_io import configure_utf8_stdio
+
+    configure_utf8_stdio()
+
     parser = build_parser()
     args = parser.parse_args()
     dispatch_command(args)
@@ -7968,6 +8714,12 @@ def handle_cleanup_mode(args: argparse.Namespace):  # type: ignore
         for workspace_path in other_workspaces:
             try:
                 print(f"  删除: {os.path.basename(workspace_path)}")
+                from services.dependency_lifecycle import guard_workspace_delete
+
+                guard_workspace_delete(
+                    workspace_path=workspace_path,
+                    output_root=output_base_path_abs,
+                )
                 shutil.rmtree(workspace_path)
                 deleted_count += 1
             except Exception as e:

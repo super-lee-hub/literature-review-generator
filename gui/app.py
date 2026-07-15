@@ -3506,18 +3506,29 @@ def launch_gui(
                         ui.label(str(latest_snapshot["workspace_path"])).classes("text-body1")
 
                     with ui.row().classes("gap-2 q-mt-md flex-wrap"):
-                        ui.button(t("打开工作区"), on_click=lambda path=latest_snapshot["workspace_path"]: _open_path(path, controller.language)).props("unelevated")
+                        ui.button(
+                            t("打开工作区"),
+                            on_click=lambda _event, path=latest_snapshot["workspace_path"]: _open_path(
+                                path, controller.language
+                            ),
+                        ).props("unelevated")
                         ui.button(
                             t("打开产物目录"),
-                            on_click=lambda path=str(Path(latest_snapshot["workspace_path"]) / "artifacts"): _open_path(path, controller.language),
+                            on_click=lambda _event, path=str(
+                                Path(latest_snapshot["workspace_path"]) / "artifacts"
+                            ): _open_path(path, controller.language),
                         ).props("outline")
                         ui.button(
                             t("打开报告目录"),
-                            on_click=lambda path=str(Path(latest_snapshot["workspace_path"]) / "reports"): _open_path(path, controller.language),
+                            on_click=lambda _event, path=str(
+                                Path(latest_snapshot["workspace_path"]) / "reports"
+                            ): _open_path(path, controller.language),
                         ).props("outline")
                         ui.button(
                             t("打开注册表"),
-                            on_click=lambda path=latest_snapshot["artifact_registry_path"]: _open_path(path, controller.language),
+                            on_click=lambda _event, path=latest_snapshot[
+                                "artifact_registry_path"
+                            ]: _open_path(path, controller.language),
                         ).props("outline")
 
                     ui.label(t("主要产物")).classes("ag-subtle q-mt-md")

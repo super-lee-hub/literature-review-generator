@@ -20,7 +20,17 @@ from outline.v2_models import ArbitrationReport, FinalOutline
 
 def _sample_summaries():
     return [
-        {"paper_info": {"title": f"Paper {i}", "authors": [str(i)], "year": 2020 + i, "classification": "core" if i == 0 else "support"}, "themes": [f"theme_{i}"], "methods": [f"method_{i}"]}
+        {
+            "paper_info": {
+                "title": f"Paper {i}",
+                "authors": [str(i)],
+                "year": 2020 + i,
+                "classification": "core" if i == 0 else "support",
+            },
+            "themes": ["promotion fairness", f"context_{i}"],
+            "methods": [f"method_{i}"],
+            "abstract": "Examines promotion fairness across consumer contexts.",
+        }
         for i in range(3)
     ]
 
@@ -231,8 +241,7 @@ def test_fallback_selected_without_revised_sections_is_blocked():
 def test_valid_revised_sections_can_resolve_high_severity_blocking_critique():
     _, _, candidates, _ = _make_pipeline_artifacts()
     base = candidates.candidates[0]
-    if not base.sections:
-        pytest.skip("fixture has no structurally valid sections to revise")
+    assert base.sections, "fixture must contain structurally valid sections"
     blocking = "crit-blocking"
     revised = [section.to_dict() for section in base.sections]
     report = ArbitrationReport(
@@ -257,8 +266,7 @@ def test_valid_revised_sections_can_resolve_high_severity_blocking_critique():
 def test_invalid_revised_sections_do_not_clear_high_severity_blocking_critique():
     _, _, candidates, _ = _make_pipeline_artifacts()
     base = candidates.candidates[0]
-    if not base.sections:
-        pytest.skip("fixture has no structurally valid sections to revise")
+    assert base.sections, "fixture must contain structurally valid sections"
     blocking = "crit-blocking"
     revised = [section.to_dict() for section in base.sections]
     revised[0]["source_flow_steps"] = ["not_a_real_flow_step"]
@@ -283,8 +291,7 @@ def test_invalid_revised_sections_do_not_clear_high_severity_blocking_critique()
 def test_revised_sections_must_apply_blocking_critique_before_clearing_it():
     _, _, candidates, _ = _make_pipeline_artifacts()
     base = candidates.candidates[0]
-    if not base.sections:
-        pytest.skip("fixture has no structurally valid sections to revise")
+    assert base.sections, "fixture must contain structurally valid sections"
     blocking = "crit-blocking"
     revised = [section.to_dict() for section in base.sections]
     report = ArbitrationReport(
@@ -332,8 +339,7 @@ def test_provider_candidate_with_candidate_id_strategy_is_not_treated_as_fallbac
 def test_complete_final_outline_coverage_removes_duplicates_and_covers_required_steps():
     lit_map, flow, candidates, _ = _make_pipeline_artifacts()
     first = candidates.candidates[0]
-    if not first.sections:
-        pytest.skip("fixture has no sections")
+    assert first.sections, "fixture must contain structurally valid sections"
     required_steps = [
         step.flow_step_id
         for step in flow.flow_steps
@@ -392,8 +398,7 @@ def test_complete_final_outline_coverage_removes_duplicates_and_covers_required_
 def test_complete_final_outline_coverage_removes_parent_child_duplicates():
     lit_map, flow, candidates, _ = _make_pipeline_artifacts()
     first = candidates.candidates[0]
-    if not first.sections:
-        pytest.skip("fixture has no sections")
+    assert first.sections, "fixture must contain structurally valid sections"
     from outline.coverage_audit import run_coverage_audit
     from outline.v2_models import FinalOutline, FinalSection
 

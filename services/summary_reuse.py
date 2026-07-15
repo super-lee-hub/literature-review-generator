@@ -64,6 +64,7 @@ class SummaryMatch:
 class ResolvedSummarySet:
     summaries: List[Dict[str, Any]]
     source_items: List[Dict[str, Any]]
+    contributing_source_items: List[Dict[str, Any]]
     rejected_candidates: List[Dict[str, Any]]
 
 
@@ -183,7 +184,11 @@ def summary_success(summary: Mapping[str, Any]) -> bool:
     return str(summary.get("status") or "").strip().lower() == "success"
 
 
-def summary_stage1_reuse_block_reason(summary: Mapping[str, Any]) -> str:
+def summary_stage1_reuse_block_reason(
+    summary: Mapping[str, Any],
+    *,
+    origin_dir: str | Path | None = None,
+) -> str:
     preprocess = summary.get("preprocess")
     if not isinstance(preprocess, Mapping):
         return ""
@@ -194,7 +199,7 @@ def summary_stage1_reuse_block_reason(summary: Mapping[str, Any]) -> str:
         for reason in (preprocess.get("stage1_quality_reasons") or [])
         if str(reason).strip()
     ]
-    completeness = _summary_completeness_metrics(preprocess)
+    completeness = _summary_completeness_metrics(preprocess, origin_dir=origin_dir)
     reasons = sorted({*reasons, *(str(reason) for reason in completeness.get("reasons") or [])})
     if is_blocked_stage1_quality(quality_level, reasons):
         return "stage1_input_incomplete_or_blocked"
@@ -268,10 +273,23 @@ def describe_summary_candidate(summary: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _summary_completeness_metrics(preprocess: Mapping[str, Any]) -> Dict[str, Any]:
-    manifest = _load_optional_json(preprocess.get("stage1_input_manifest_path"))
-    quality_report = _load_optional_json(preprocess.get("stage1_quality_report_path"))
-    stage1_text = _read_optional_text(preprocess.get("stage1_input_path"))
+def _summary_completeness_metrics(
+    preprocess: Mapping[str, Any],
+    *,
+    origin_dir: str | Path | None = None,
+) -> Dict[str, Any]:
+    manifest = _load_optional_json(
+        preprocess.get("stage1_input_manifest_path"),
+        origin_dir=origin_dir,
+    )
+    quality_report = _load_optional_json(
+        preprocess.get("stage1_quality_report_path"),
+        origin_dir=origin_dir,
+    )
+    stage1_text = _read_optional_text(
+        preprocess.get("stage1_input_path"),
+        origin_dir=origin_dir,
+    )
     existing_metrics = {}
     if isinstance(preprocess.get("stage1_completeness_metrics"), Mapping):
         existing_metrics = dict(preprocess.get("stage1_completeness_metrics") or {})
@@ -322,8 +340,12 @@ def _summary_completeness_metrics(preprocess: Mapping[str, Any]) -> Dict[str, An
     )
 
 
-def _load_optional_json(value: Any) -> Dict[str, Any]:
-    path = _resolve_optional_path(value)
+def _load_optional_json(
+    value: Any,
+    *,
+    origin_dir: str | Path | None = None,
+) -> Dict[str, Any]:
+    path = _resolve_optional_path(value, origin_dir=origin_dir)
     if not path:
         return {}
     try:
@@ -333,8 +355,12 @@ def _load_optional_json(value: Any) -> Dict[str, Any]:
     return dict(payload) if isinstance(payload, Mapping) else {}
 
 
-def _read_optional_text(value: Any) -> str:
-    path = _resolve_optional_path(value)
+def _read_optional_text(
+    value: Any,
+    *,
+    origin_dir: str | Path | None = None,
+) -> str:
+    path = _resolve_optional_path(value, origin_dir=origin_dir)
     if not path:
         return ""
     try:
@@ -343,14 +369,20 @@ def _read_optional_text(value: Any) -> str:
         return ""
 
 
-def _resolve_optional_path(value: Any) -> Optional[Path]:
+def _resolve_optional_path(
+    value: Any,
+    *,
+    origin_dir: str | Path | None = None,
+) -> Optional[Path]:
     raw = str(value or "").strip()
     if not raw:
         return None
     path = Path(raw)
     if path.is_absolute():
         return path
-    return Path.cwd() / path
+    if origin_dir is None:
+        return None
+    return Path(origin_dir).expanduser().resolve() / path
 
 
 class SummaryCatalog:
@@ -413,7 +445,10 @@ class SummaryCatalog:
                     )
                     continue
 
-                stage1_block_reason = summary_stage1_reuse_block_reason(summary)
+                stage1_block_reason = summary_stage1_reuse_block_reason(
+                    summary,
+                    origin_dir=Path(source.path).expanduser().resolve().parent,
+                )
                 if stage1_block_reason:
                     rejected.append(
                         {
@@ -478,7 +513,8 @@ class SummaryCatalog:
         for record in sorted(self.records, key=self._sort_key):
             winners.setdefault(record.unique_identity, record)
 
-        summaries = [deepcopy(record.summary) for record in sorted(winners.values(), key=self._sort_key)]
+        winner_records = sorted(winners.values(), key=self._sort_key)
+        summaries = [deepcopy(record.summary) for record in winner_records]
         source_items = [
             {
                 "path": source.path,
@@ -488,9 +524,16 @@ class SummaryCatalog:
             }
             for source in self.sources
         ]
+        contributing_paths = {record.source.path for record in winner_records}
+        contributing_source_items = [
+            dict(item)
+            for item in source_items
+            if str(item.get("path") or "") in contributing_paths
+        ]
         return ResolvedSummarySet(
             summaries=summaries,
             source_items=source_items,
+            contributing_source_items=contributing_source_items,
             rejected_candidates=list(self.rejected_candidates),
         )
 

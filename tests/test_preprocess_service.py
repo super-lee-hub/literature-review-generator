@@ -767,6 +767,7 @@ def test_hybrid_tries_mineru_when_baseline_is_incomplete_by_page_count(monkeypat
 
     result = manager._extract_preferred_content("sample.pdf")
 
+    assert result is not None
     assert result is remote_result
     assert result["mineru_attempted"] is True
     assert result["mineru_succeeded"] is True

@@ -199,7 +199,8 @@ def test_queue_runner_reconstructs_summary_source_and_reuse_fields(tmp_path: Pat
                 "_Result",
                 (),
                 {
-                    "success": True,
+                    "success": False,
+                    "job_status": "completed",
                     "exit_code": 0,
                     "message": "ok",
                     "workspace_path": str(tmp_path / "workspace"),
@@ -270,6 +271,7 @@ def test_queue_runner_persists_progress_snapshot_and_failure_log_path(tmp_path: 
                 (),
                 {
                     "success": False,
+                    "job_status": "failed",
                     "exit_code": 1,
                     "message": "failed",
                     "workspace_path": str(log_path.parent.parent),
@@ -326,6 +328,7 @@ def test_queue_runner_respects_reordered_job_order(tmp_path: Path) -> None:
                 (),
                 {
                     "success": True,
+                    "job_status": "completed",
                     "exit_code": 0,
                     "message": "ok",
                     "workspace_path": str(tmp_path / f"{request.project_name}__workspace"),

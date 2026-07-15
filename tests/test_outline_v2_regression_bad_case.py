@@ -14,6 +14,7 @@ from outline.literature_map import build_literature_map
 from outline.quality_rules import is_placeholder_title
 from outline.synthesis_flow import build_synthesis_flow
 from outline.v2_models import OutlineCritiquesV2, compute_content_hash
+from outline.stage_health import OutlineStageHealthV1, make_test_double_entry
 
 
 def _bad_case_sources(paper_count=30):
@@ -212,7 +213,16 @@ def test_failed_bad_case_audit_blocks_v2_adoption():
     final_outline = _final_outline_from_candidates(candidates, literature_map, synthesis_flow)
     audit = run_coverage_audit(final_outline, literature_map, synthesis_flow)
 
-    adopted, message = adopt_final_outline(final_outline, audit, "job-outline-v2-bad", "regression-test")
+    health = OutlineStageHealthV1(
+        job_id="job-outline-v2-bad",
+        execution_mode="test_dev",
+        stages=(make_test_double_entry("outline_candidates", "test", {}, {}),),
+        source_final_outline_hash=compute_content_hash(final_outline.to_dict()),
+        source_coverage_audit_hash=compute_content_hash(audit.to_dict()),
+    )
+    adopted, message = adopt_final_outline(
+        final_outline, audit, "job-outline-v2-bad", "regression-test", health
+    )
 
     assert audit.passed is False
     assert adopted is None

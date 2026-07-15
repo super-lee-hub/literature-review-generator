@@ -217,7 +217,10 @@ def _score_legacy_preprocess(preprocess: Dict[str, Any]) -> tuple[str, str, List
 
 
 def _stage1_completeness_metrics(payload: Dict[str, Any], preprocess: Dict[str, Any]) -> Dict[str, Any]:
-    stage1_inputs = payload.get("stage1_inputs") if isinstance(payload.get("stage1_inputs"), dict) else {}
+    raw_stage1_inputs = payload.get("stage1_inputs")
+    stage1_inputs: Dict[str, Any] = (
+        dict(raw_stage1_inputs) if isinstance(raw_stage1_inputs, dict) else {}
+    )
     manifest = _load_json(_resolve_stage1_path(preprocess, stage1_inputs, "stage1_input_manifest_path"), default={})
     quality_report = _load_json(_resolve_stage1_path(preprocess, stage1_inputs, "stage1_quality_report_path"), default={})
     stage1_text = _read_text(_resolve_stage1_path(preprocess, stage1_inputs, "stage1_input_path"))
@@ -278,7 +281,10 @@ def _stage1_artifact_newer_than_summary(
     payload: Dict[str, Any],
     preprocess: Dict[str, Any],
 ) -> bool:
-    stage1_inputs = payload.get("stage1_inputs") if isinstance(payload.get("stage1_inputs"), dict) else {}
+    raw_stage1_inputs = payload.get("stage1_inputs")
+    stage1_inputs: Dict[str, Any] = (
+        dict(raw_stage1_inputs) if isinstance(raw_stage1_inputs, dict) else {}
+    )
     candidate_paths = [
         _resolve_stage1_path(preprocess, stage1_inputs, "stage1_input_manifest_path"),
         _resolve_stage1_path(preprocess, stage1_inputs, "stage1_quality_report_path"),

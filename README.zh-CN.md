@@ -302,6 +302,8 @@ enable_local_rag = false
 
 如果没有 MinerU token 或远程解析失败，系统可以按配置回退到本地解析。不同论文是否真的调用了 MinerU，请看对应 workspace 里的 preprocess diagnostics / manifest，而不是只看全局配置。
 
+`MINERU_ALLOWED_URL_HOSTS` 仅用于信任 MinerU 配置源站之外的 HTTPS 上传、下载或存储地址。值必须是逗号分隔的精确主机名，不能包含协议、路径或通配符；除非服务商确实返回受信任的外部存储链接，否则保持为空。
+
 ## 12. API 与模型配置
 
 建议把敏感 API key 放在 `.env`，把非敏感运行参数放在 `config.ini`。
@@ -316,6 +318,7 @@ LLM_OUTLINE_API=your_outline_key
 LLM_FREE_MODE_API=your_free_mode_key
 LLM_VALIDATOR_API=your_validator_key
 MINERU_API_TOKEN=your_mineru_token
+MINERU_ALLOWED_URL_HOSTS=
 ```
 
 主要 API 角色：

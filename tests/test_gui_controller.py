@@ -45,11 +45,11 @@ class _FakeElement:
     def enable(self) -> None:
         self.disabled = False
 
-    def props(self, *args, **kwargs) -> None:
+    def props(self, *args, **kwargs) -> _FakeElement:
         self.props_calls.append((args, kwargs))
         return self
 
-    def classes(self, *args, **kwargs) -> None:
+    def classes(self, *args, **kwargs) -> _FakeElement:
         self.class_calls.append((args, kwargs))
         return self
 

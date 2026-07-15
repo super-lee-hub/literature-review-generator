@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
-from file_finder import create_file_index, find_pdf
+from file_finder import create_file_index, resolve_pdf_match
 from runtime.stage_contracts import SourceBundle, build_source_bundle
-from zotero_parser import parse_zotero_report
+from services.source_identity import inspect_pdf_identity
+from services.paper_identity import build_canonical_paper_key
+from zotero_parser import parse_zotero_report_result
 
 
 def _abs(path: str) -> str:
@@ -56,19 +58,56 @@ def build_direct_source_bundle(*, project_name: str, pdf_folder: str) -> SourceB
 def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library_path: str) -> SourceBundle:
     report_path = _abs(zotero_report)
     library_root = _abs(library_path)
-    parsed_papers = parse_zotero_report(report_path)
+    parse_result = parse_zotero_report_result(report_path)
+    if parse_result.status == "failed":
+        codes = ",".join(item.code for item in parse_result.diagnostics) or "unknown"
+        raise ValueError(f"zotero_parse_failed:{codes}")
+    parsed_papers = parse_result.papers
     file_index = create_file_index(library_root)
 
     matched_papers: list[Dict[str, Any]] = []
     missing_titles: list[str] = []
-    for raw_paper in parsed_papers:
+    ambiguous_matches: list[Dict[str, Any]] = []
+    pdf_resolutions: list[Dict[str, Any]] = []
+    identity_results: list[Dict[str, Any]] = []
+    quarantined_sources: list[Dict[str, Any]] = []
+    for paper_index, raw_paper in enumerate(parsed_papers):
         paper = dict(raw_paper)
-        pdf_path = find_pdf(paper, library_root, file_index)
-        if not pdf_path:
+        match_result = resolve_pdf_match(paper, library_root, file_index)
+        resolution = match_result.to_dict()
+        resolution.update(
+            {
+                "paper_index": paper_index,
+                "title": str(paper.get("title") or "unknown"),
+                "canonical_paper_key": build_canonical_paper_key(paper),
+            }
+        )
+        pdf_resolutions.append(resolution)
+        if match_result.status == "ambiguous":
+            ambiguous_matches.append(dict(resolution))
+            continue
+        pdf_path = match_result.selected_path
+        if match_result.status != "matched" or not pdf_path:
             missing_titles.append(str(paper.get("title") or "unknown"))
             continue
         paper["pdf_path"] = _abs(pdf_path)
         paper["source_pdf"] = paper["pdf_path"]
+        identity_result = inspect_pdf_identity(paper, paper["pdf_path"])
+        identity_payload = identity_result.to_dict()
+        identity_payload.update(
+            {
+                "paper_index": paper_index,
+                "title": str(paper.get("title") or "unknown"),
+            }
+        )
+        identity_results.append(identity_payload)
+        resolution["identity"] = identity_payload
+        if not identity_result.canonical_ready:
+            quarantined_sources.append(identity_payload)
+            continue
+        paper["identity_verdict"] = identity_result.identity_verdict
+        paper["artifact_status"] = identity_result.artifact_status
+        paper["source_identity"] = identity_payload
         matched_papers.append(paper)
 
     return build_source_bundle(
@@ -80,6 +119,20 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
             "library_path": library_root,
             "matched_count": len(matched_papers),
             "missing_titles": missing_titles,
+            "ambiguous_matches": ambiguous_matches,
+            "pdf_resolutions": pdf_resolutions,
+            "identity_results": identity_results,
+            "quarantined_sources": quarantined_sources,
+            "canonical_ready": not quarantined_sources and not ambiguous_matches and not missing_titles,
+            "zotero_parse": {
+                "status": parse_result.status,
+                "parser_route": parse_result.parser_route,
+                "parser_version": parse_result.parser_version,
+                "report_hash": parse_result.report_hash,
+                "parse_confidence": parse_result.parse_confidence,
+                "stats": parse_result.stats.to_dict(),
+                "diagnostic_codes": [item.code for item in parse_result.diagnostics],
+            },
         },
     )
 

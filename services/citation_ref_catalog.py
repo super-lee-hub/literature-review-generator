@@ -229,6 +229,59 @@ def build_document_ref_catalog(
     }
 
 
+def validate_document_ref_catalog(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    if payload.get("artifact_type") != ARTIFACT_TYPE:
+        raise ValueError("not a citation_ref_catalog artifact")
+    if payload.get("artifact_version") != ARTIFACT_VERSION:
+        raise ValueError("unsupported citation_ref_catalog version")
+    for field_name in (
+        "created_from_job_id",
+        "catalog_id",
+        "scope",
+        "catalog_hash",
+        "entries",
+    ):
+        if field_name not in payload:
+            raise ValueError(f"citation_ref_catalog is missing {field_name}")
+    if not str(payload.get("created_from_job_id") or "").strip():
+        raise ValueError("citation_ref_catalog created_from_job_id is required")
+    if not str(payload.get("catalog_id") or "").strip():
+        raise ValueError("citation_ref_catalog catalog_id is required")
+    if payload.get("scope") != CATALOG_SCOPE:
+        raise ValueError("citation_ref_catalog scope is invalid")
+    entries_value = payload.get("entries")
+    if not isinstance(entries_value, list):
+        raise ValueError("citation_ref_catalog entries must be an array")
+
+    entries: List[Dict[str, Any]] = []
+    ref_ids: set[str] = set()
+    for index, raw_entry in enumerate(entries_value):
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(f"citation_ref_catalog entry {index} must be an object")
+        entry = dict(raw_entry)
+        ref_id = str(entry.get("ref_id") or "")
+        if not re.fullmatch(r"R\d{3,}", ref_id):
+            raise ValueError(f"citation_ref_catalog entry {index} has invalid ref_id")
+        if ref_id in ref_ids:
+            raise ValueError(f"citation_ref_catalog contains duplicate ref_id: {ref_id}")
+        ref_ids.add(ref_id)
+        if entry.get("scope") != ENTRY_SCOPE:
+            raise ValueError(f"citation_ref_catalog entry {ref_id} has invalid scope")
+        if entry.get("status") not in {ACTIVE_STATUS, TOMBSTONED_STATUS}:
+            raise ValueError(f"citation_ref_catalog entry {ref_id} has invalid status")
+        for field_name in ("paper_id", "canonical_paper_key", "title", "source_summary_hash"):
+            if not str(entry.get(field_name) or "").strip():
+                raise ValueError(f"citation_ref_catalog entry {ref_id} is missing {field_name}")
+        if not isinstance(entry.get("authors"), list):
+            raise ValueError(f"citation_ref_catalog entry {ref_id} authors must be an array")
+        entries.append(entry)
+
+    expected_hash = _canonical_json_hash(_entry_hash_payload(entries))
+    if str(payload.get("catalog_hash") or "") != expected_hash:
+        raise ValueError("citation_ref_catalog catalog_hash does not match its entries")
+    return dict(payload)
+
+
 def build_section_ref_view(
     catalog: Mapping[str, Any],
     *,

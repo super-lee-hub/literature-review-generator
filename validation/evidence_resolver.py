@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 from services.visual_artifact_resolver import normalize_visual_artifact
@@ -35,6 +35,52 @@ SOURCE_GROUNDED_RESOLVER_TIERS = frozenset(
     }
 )
 SUMMARY_HINT_RESOLVER_TIERS = frozenset({"ai_summary"})
+
+
+def build_bilingual_retrieval_queries(
+    cited_span: str,
+    paper_artifact: Dict[str, Any],
+    *,
+    max_english_terms: int = 12,
+) -> List[str]:
+    """Add Stage 1 English concepts for recall while preserving the source claim."""
+    queries = [str(cited_span or "").strip()]
+    ai_summary = paper_artifact.get("analysis", {}).get("ai_summary", {}) or {}
+    candidate_values: List[Any] = []
+    for container in (
+        ai_summary.get("core_analysis", {}),
+        ai_summary.get("routing", {}),
+        ai_summary.get("specialized_details", {}),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key, value in container.items():
+            lowered = str(key).lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "keyword",
+                    "concept",
+                    "theme",
+                    "mechanism",
+                    "theor",
+                    "key_point",
+                    "finding",
+                )
+            ):
+                candidate_values.extend(value if isinstance(value, list) else [value])
+    english_terms: List[str] = []
+    for value in candidate_values:
+        for phrase in re.findall(r"[A-Za-z][A-Za-z-]*(?:\s+[A-Za-z][A-Za-z-]*){0,4}", str(value)):
+            normalized = " ".join(phrase.lower().split())
+            if len(normalized) > 2 and normalized not in english_terms:
+                english_terms.append(normalized)
+            if len(english_terms) >= max_english_terms:
+                break
+        if len(english_terms) >= max_english_terms:
+            break
+    queries.extend(english_terms)
+    return [query for query in queries if query]
 
 
 @dataclass(frozen=True)
@@ -177,23 +223,54 @@ class EvidenceResolver:
         cited_span: str,
         locator: Optional[str] = None,
         selected_visual_refs: Optional[List[Dict[str, Any]]] = None,
+        retrieval_queries: Optional[Sequence[str]] = None,
     ) -> List[EvidenceCandidate]:
         candidates: List[EvidenceCandidate] = []
 
         # Explicit tier order as required
         # Tier 0: AI Summary (highest priority)
         candidates.extend(self._resolve_from_ai_summary(cited_span))
-        # Tier 1: Locator + Page Index
-        candidates.extend(self._resolve_from_locator_page_index(cited_span, locator))
-        # Tier 2: Preprocess chunks
-        candidates.extend(self._resolve_from_preprocess_chunks(cited_span))
-        # Tier 3: Normalized text
-        candidates.extend(self._resolve_from_normalized_text(cited_span))
-        # Tier 4: Plain text fallback
-        candidates.extend(self._resolve_from_plain_text(cited_span))
+        recall_queries: List[str] = list(
+            dict.fromkeys(
+                str(item)
+                for item in (cited_span, *(retrieval_queries or ()))
+                if str(item)
+            )
+        )
+        for query_index, query in enumerate(recall_queries):
+            grounded: List[EvidenceCandidate] = []
+            # Tier 1: Locator + Page Index
+            grounded.extend(self._resolve_from_locator_page_index(query, locator))
+            # Tier 2: Preprocess chunks
+            grounded.extend(self._resolve_from_preprocess_chunks(query))
+            # Tier 3: Normalized text
+            grounded.extend(self._resolve_from_normalized_text(query))
+            # Tier 4: Plain text fallback
+            grounded.extend(self._resolve_from_plain_text(query))
+            if query_index:
+                grounded = [
+                    replace(item, match_reason=f"bilingual_retrieval:{item.match_reason}")
+                    for item in grounded
+                ]
+            candidates.extend(grounded)
         # Tier 5: Visual refs
         if selected_visual_refs:
             candidates.extend(self._resolve_from_visual_refs(selected_visual_refs, cited_span))
+
+        deduped: List[EvidenceCandidate] = []
+        seen = set()
+        for candidate in candidates:
+            identity = (
+                candidate.resolver_tier,
+                candidate.artifact_path,
+                candidate.text_excerpt,
+                tuple(candidate.page_span or ()),
+                tuple(candidate.chunk_ids or ()),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                deduped.append(candidate)
+        candidates = deduped
 
         # Now add negative evidence if no candidates were found
         if not candidates:

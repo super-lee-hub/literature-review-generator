@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -13,6 +16,51 @@ def utc_now_iso() -> str:
 
 
 import time
+
+
+_POINTER_LOCKS_GUARD = threading.Lock()
+_POINTER_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _pointer_process_lock(path: str) -> threading.RLock:
+    key = os.path.normcase(os.path.abspath(path))
+    with _POINTER_LOCKS_GUARD:
+        return _POINTER_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def _latest_pointer_lock(pointer_path: str):
+    process_lock = _pointer_process_lock(pointer_path)
+    with process_lock:
+        lock_path = pointer_path + ".lock"
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with open(lock_path, "a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"latest pointer ownership lock\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 def atomic_write_json(path: str, payload: Any) -> None:
     directory = os.path.dirname(os.path.abspath(path))
@@ -91,7 +139,8 @@ class JobWorkspace:
 
     @staticmethod
     def generate_job_id() -> str:
-        return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        return f"{timestamp}_{secrets.token_hex(4)}"
 
     @classmethod
     def from_workspace_path(cls, workspace_path: str, project_name: str, job_id: str | None = None) -> "JobWorkspace":
@@ -154,6 +203,39 @@ class JobWorkspace:
         )
         pointer_dir = self.project_pointer_dir()
         os.makedirs(pointer_dir, exist_ok=True)
-        atomic_write_json(self.latest_pointer_path(), asdict(pointer))
-        return self.latest_pointer_path()
+        pointer_path = self.latest_pointer_path()
+        with _latest_pointer_lock(pointer_path):
+            atomic_write_json(pointer_path, asdict(pointer))
+        return pointer_path
+
+    def write_latest_pointer_if_owned(
+        self,
+        *,
+        resume_state: str,
+        fingerprint_bundle: Dict[str, Any],
+        status: str,
+    ) -> bool:
+        """Finalize the project pointer only while this job still owns it."""
+
+        pointer_path = self.latest_pointer_path()
+        with _latest_pointer_lock(pointer_path):
+            try:
+                with open(pointer_path, "r", encoding="utf-8") as handle:
+                    current = json.load(handle)
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                return False
+            if not isinstance(current, dict) or str(current.get("job_id") or "") != self.job_id:
+                return False
+            pointer = LatestJobPointer(
+                project_name=self.project_name,
+                job_id=self.job_id,
+                workspace_path=self.paths.root_dir,
+                artifact_registry_path=self.paths.registry_path,
+                resume_state=resume_state,
+                fingerprint_bundle=fingerprint_bundle,
+                status=status,
+                updated_at=utc_now_iso(),
+            )
+            atomic_write_json(pointer_path, asdict(pointer))
+            return True
 

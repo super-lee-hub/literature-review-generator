@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import os
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, cast
+
+from models import APIConfig
 
 from services.model_capabilities import resolve_model_capability
 from services.multimodal_capability import detect_multimodal_capability
@@ -112,7 +114,9 @@ class Stage1InputBuilder:
 
         prompt_text = prompt_template.replace("{{PAPER_FULL_TEXT}}", paper_body)
         capability = detect_multimodal_capability(reader_api_config)
-        model_capability = resolve_model_capability(dict(reader_api_config or {}))
+        model_capability = resolve_model_capability(
+            cast(APIConfig, dict(reader_api_config or {}))
+        )
         provider_forced_pdf = force_pdf_file_input_for_provider and model_capability.endpoint_type == "responses"
         pdf_file_input_supported = bool(model_capability.supports_pdf_file_input or provider_forced_pdf)
         pdf_attachment_status = "not_requested"
@@ -143,6 +147,7 @@ class Stage1InputBuilder:
         formal_input_path = "pdf_plus_rich_evidence" if original_pdf_attached else "text_only_rich_evidence"
         text_only_evidence_used = "rich_mineru_evidence_v1" if rich_evidence_appendix else "stage1_input_text"
 
+        user_message_content: Optional[List[Dict[str, Any]]]
         if not selected_visual_refs:
             user_message_content = None
             if pdf_item:
@@ -189,7 +194,7 @@ class Stage1InputBuilder:
                 text_only_evidence_used=text_only_evidence_used,
             )
 
-        user_message_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+        user_message_content = [{"type": "text", "text": prompt_text}]
         if pdf_item:
             user_message_content.append(pdf_item)
         for visual in selected_visual_refs:

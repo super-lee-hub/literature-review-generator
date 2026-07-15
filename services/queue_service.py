@@ -488,7 +488,8 @@ class QueueRunner:
                 "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
             })
             
-            if result.success:
+            job_status = str(getattr(result, "job_status", "failed") or "failed")
+            if job_status == "completed":
                 # 更新任务状态为完成
                 self.queue_service.update_job_state(job_spec.job_id, QueueState.COMPLETED)
                 
@@ -503,7 +504,9 @@ class QueueRunner:
                 self.queue_service.set_job_result(job_spec.job_id, result_summary)
             else:
                 # 检查是否因为取消而失败
-                if result.exit_code == 130:
+                # Queue lifecycle follows canonical execution status.  The
+                # legacy success projection describes canonical readiness.
+                if job_status == "cancelled":
                     self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
                 else:
                     self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Sequence
 
 
@@ -10,9 +11,57 @@ def _unique_non_empty(values: Sequence[Any]) -> List[str]:
     return list(dict.fromkeys(str(item).strip() for item in values if str(item).strip()))
 
 
+def _canonical_claim_payloads(report: Any) -> List[Dict[str, Any]]:
+    raw = report.get("claim_results", []) if isinstance(report, dict) else getattr(report, "claim_results", [])
+    payloads: List[Dict[str, Any]] = []
+    for item in raw or []:
+        if isinstance(item, dict):
+            payloads.append(dict(item))
+        elif hasattr(item, "to_dict"):
+            payloads.append(dict(item.to_dict()))
+    return payloads
+
+
+def _result_values(report: Any) -> List[Any]:
+    canonical = _canonical_claim_payloads(report)
+    if canonical:
+        projected: List[Any] = []
+        for claim in canonical:
+            details = dict(claim.get("details") or {})
+            compatibility = dict(claim.get("compatibility") or {})
+            verdict = str(claim.get("verdict") or "needs_review")
+            projected.append(
+                SimpleNamespace(
+                    citation_set_key=str(claim.get("citation_set_key") or claim.get("claim_result_id") or ""),
+                    citation_id=str(claim.get("claim_result_id") or ""),
+                    paper_ids=list(claim.get("paper_ids") or []),
+                    block_ids=list(claim.get("block_ids") or []),
+                    claim_text=str(claim.get("claim_text") or ""),
+                    claim_context=str(claim.get("claim_context") or ""),
+                    block_context=str(details.get("block_context") or ""),
+                    claim_units=list(details.get("claim_units") or []),
+                    details=details,
+                    conclusion=compatibility.get("legacy_conclusion") or verdict.upper(),
+                    evidence_status=verdict,
+                    disposition=compatibility.get("legacy_repair_disposition") or "",
+                    claim_verdict=verdict,
+                )
+            )
+        return projected
+    if isinstance(report, dict):
+        return list(report.get("citation_results", []) or [])
+    return list(getattr(report, "citation_results", []) or [])
+
+
+def _report_value(report: Any, name: str, default: Any = "") -> Any:
+    if isinstance(report, dict):
+        return report.get(name, default)
+    return getattr(report, name, default)
+
+
 def _paper_titles(report: Any) -> Dict[str, str]:
     titles: Dict[str, str] = {}
-    for result in getattr(report, "citation_results", []) or []:
+    for result in _result_values(report):
         hints = (getattr(result, "details", {}) or {}).get("paper_identity_hints", {}) or {}
         for paper_id, hint in hints.items():
             title = str((hint or {}).get("title") or "").strip()
@@ -92,6 +141,7 @@ def _row_for_claim_unit(
         "contributing_paper_ids": contributing_paper_ids,
         "pooled_paper_ids": pooled_paper_ids,
         "conclusion": getattr(getattr(result, "conclusion", None), "value", getattr(result, "conclusion", "")),
+        "claim_verdict": str(getattr(result, "claim_verdict", "") or ""),
         "evidence_status": item.get("evidence_status") or getattr(result, "evidence_status", ""),
         "disposition": item.get("disposition") or getattr(result, "disposition", ""),
         "reason": item.get("reason") or (getattr(result, "details", {}) or {}).get("reason", ""),
@@ -125,7 +175,9 @@ def build_claim_alignment_audit(report: Any) -> Dict[str, Any]:
     gap_rows: List[Dict[str, Any]] = []
     supported_rows: List[Dict[str, Any]] = []
 
-    for result in getattr(report, "citation_results", []) or []:
+    contradicted_rows: List[Dict[str, Any]] = []
+
+    for result in _result_values(report):
         unit_lookup = _claim_unit_lookup(result)
         for item in (getattr(result, "details", {}) or {}).get("claim_unit_results", []) or []:
             if not isinstance(item, dict):
@@ -133,30 +185,38 @@ def build_claim_alignment_audit(report: Any) -> Dict[str, Any]:
             unit = unit_lookup.get(str(item.get("claim_unit_id") or ""), {})
             row = _row_for_claim_unit(result=result, claim_unit=unit, item=item, paper_titles=paper_titles)
             conclusion = str(row.get("conclusion") or "")
+            claim_verdict = str(row.get("claim_verdict") or "")
             reason = str(row.get("reason") or "")
             evidence_status = str(row.get("evidence_status") or "")
-            if conclusion == "WRONG_SOURCE" or evidence_status == "wrong_source":
+            if claim_verdict == "wrong_source" or conclusion == "WRONG_SOURCE" or evidence_status == "wrong_source":
                 wrong_source_rows.append(row)
+            if claim_verdict == "contradicted" or conclusion == "CONTRADICTED":
+                contradicted_rows.append(row)
             if reason == "ambiguous_claim_paper_alignment":
                 ambiguous_rows.append(row)
-            if evidence_status in {"evidence_gap", "needs_review"}:
+            if claim_verdict in {"evidence_gap", "needs_review"} or evidence_status in {"evidence_gap", "needs_review"}:
                 gap_rows.append(row)
-            if conclusion == "SUPPORTED" or evidence_status == "clean_supported":
+            if claim_verdict == "supported" or conclusion == "SUPPORTED" or evidence_status == "clean_supported":
                 supported_rows.append(row)
 
     gap_rows.sort(key=lambda row: (not _is_multi_paper_row(row), row.get("citation_set_key", "")))
     supported_rows.sort(key=lambda row: (not _is_multi_paper_row(row), row.get("citation_set_key", "")))
 
     return {
-        "generated_at": datetime.now().isoformat(),
-        "report_id": getattr(report, "report_id", ""),
+        "generated_at": str(_report_value(report, "updated_at", "") or datetime.now().isoformat()),
+        "report_id": str(
+            _report_value(report, "validation_run_id", "")
+            or _report_value(report, "report_id", "")
+        ),
         "summary": {
             "wrong_source_rows": len(wrong_source_rows),
+            "contradicted_rows": len(contradicted_rows),
             "ambiguous_claim_paper_alignment_rows": len(ambiguous_rows),
             "sampled_evidence_gap_or_needs_review_rows": min(len(gap_rows), 20),
             "sampled_supported_rows": min(len(supported_rows), 10),
         },
         "wrong_source": wrong_source_rows,
+        "contradicted": contradicted_rows,
         "ambiguous_claim_paper_alignment": ambiguous_rows,
         "evidence_gap_or_needs_review_sample": gap_rows[:20],
         "supported_sample": supported_rows[:10],
@@ -173,6 +233,7 @@ def _write_markdown(path: str, audit: Dict[str, Any]) -> None:
     ]
     for section_key, title in (
         ("wrong_source", "WRONG_SOURCE"),
+        ("contradicted", "CONTRADICTED"),
         ("ambiguous_claim_paper_alignment", "Ambiguous Claim-Paper Alignment"),
         ("evidence_gap_or_needs_review_sample", "Evidence Gap / Needs Review Sample"),
         ("supported_sample", "Supported Sample"),

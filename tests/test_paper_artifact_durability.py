@@ -12,6 +12,7 @@ from services.config_compat import CompatConfigView
 from services.job_workspace import JobWorkspace
 from services.progress_state import ResumeStateReport
 from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
+from services.source_identity import evaluate_source_identity
 
 
 class _DummyLogger:
@@ -147,6 +148,14 @@ def _normalized_paper(tmp_path: Path, *, source_mode: str) -> PaperInfo:
 
 
 def _stub_stage1_success(monkeypatch, generator) -> None:
+    evidence_dir = Path(generator.job_workspace.paths.checkpoints_dir) / "mock-preprocess"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = evidence_dir / "normalized.md"
+    chunks_path = evidence_dir / "chunks.json"
+    page_index_path = evidence_dir / "page_index.json"
+    markdown_path.write_text("x" * 1200, encoding="utf-8")
+    chunks_path.write_text('[{"chunk_id":"c1","text":"source"}]', encoding="utf-8")
+    page_index_path.write_text('[{"page_number":1,"text":"source"}]', encoding="utf-8")
     monkeypatch.setattr(
         generator,
         "_prepare_stage1_input",
@@ -157,7 +166,10 @@ def _stub_stage1_success(monkeypatch, generator) -> None:
                 "extractor_used": "mock",
                 "selected_text_source": "plain_text",
                 "stage1_quality_level": "FALLBACK",
-                "stage1_input_path": str(Path("cache") / "stage1_input.md"),
+                "stage1_input_path": str(markdown_path),
+                "markdown_path": str(markdown_path),
+                "chunks_path": str(chunks_path),
+                "page_index_path": str(page_index_path),
                 "stage1_input_manifest_path": str(Path("cache") / "stage1_input_manifest.json"),
                 "stage1_quality_report_path": str(Path("cache") / "stage1_text_quality_report.json"),
             },
@@ -165,6 +177,11 @@ def _stub_stage1_success(monkeypatch, generator) -> None:
     )
     monkeypatch.setattr(generator, "_load_stage1_prompt_template", lambda: "{{PAPER_FULL_TEXT}}")
     monkeypatch.setattr(generator, "_inject_free_mode_context", lambda prompt: prompt)
+    monkeypatch.setattr(
+        main,
+        "inspect_text_identity",
+        lambda expected, _text, **_kwargs: evaluate_source_identity(expected, expected),
+    )
     monkeypatch.setattr(main, "get_summary_from_ai_with_fallback", lambda *args, **kwargs: _quality_ready_ai_summary())
     monkeypatch.setattr(main, "validate_summary_quality", lambda _summary_data: (True, "ok"))
 
@@ -207,6 +224,9 @@ def test_successful_process_paper_creates_registered_paper_artifact(
     assert artifact_payload["analysis"]["ai_summary"]["routing"]["paper_type"] == "empirical"
     assert artifact_payload["analysis"]["preprocess"]["selected_text_source"] == "plain_text"
     assert artifact_payload["analysis"]["preprocess"]["stage1_quality_level"] == "FALLBACK"
+    assert Path(artifact_payload["stage1_inputs"]["evidence_manifest_path"]).is_file()
+    dependency_types = {item["artifact_type"] for item in paper_records[0]["depends_on"]}
+    assert {"normalized_text", "chunks", "page_index", "evidence_manifest"} <= dependency_types
     assert artifact_payload["stage1_inputs"]["selected_text_source"] == "plain_text"
     assert artifact_payload["stage1_inputs"]["stage1_quality_level"] == "FALLBACK"
     assert artifact_payload["stage1_inputs"]["stage1_input_manifest_path"].endswith("stage1_input_manifest.json")
