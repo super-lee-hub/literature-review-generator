@@ -3,9 +3,9 @@ import os
 import re
 import types
 
-import pytest
-
 from services.citation_manifest import build_citation_manifest_v3_from_review_draft
+from services.citation_ref_catalog import build_document_ref_catalog
+from services.review_draft import build_review_draft_v2
 from validation.claim_alignment_audit import build_claim_alignment_audit
 from validation.review_validator import ReviewValidator, ValidationConclusion
 import validator
@@ -267,6 +267,183 @@ def test_manifest_builder_generates_alignment_fields():
     assert claim_unit["alignment_confidence"] > 0
     assert claim_unit["supporting_paper_ids"] == []
     assert set(claim_unit["pooled_paper_ids"]) == {"A", "B", "C"}
+
+
+def test_manifest_builder_infers_grouped_citations_when_prior_claims_are_locally_cited():
+    review_draft = _review_draft(
+        "Claim1 A support [[cite:A]]. "
+        "Claim2 B and C joint support [[cite:B]] [[cite:C]]."
+    )
+    summaries = [
+        {"status": "success", "paper_info": {"title": "A", "canonical_paper_key": "A"}, "ai_summary": {"paper_metadata": {"title": "A"}}},
+        {"status": "success", "paper_info": {"title": "B", "canonical_paper_key": "B"}, "ai_summary": {"paper_metadata": {"title": "B"}}},
+        {"status": "success", "paper_info": {"title": "C", "canonical_paper_key": "C"}, "ai_summary": {"paper_metadata": {"title": "C"}}},
+    ]
+
+    manifest = build_citation_manifest_v3_from_review_draft(
+        job_id="job",
+        project_name="project",
+        manifest_id="manifest",
+        review_draft_path="review.json",
+        review_word_path="review.docx",
+        review_draft_v2=review_draft,
+        paper_summaries=summaries,
+    ).to_dict()
+    grouped = next(
+        unit
+        for citation_set in manifest["citation_sets"]
+        for unit in citation_set["claim_units"]
+        if set(unit.get("supporting_paper_ids") or []) == {"B", "C"}
+    )
+
+    assert grouped["alignment_status"] == "inferred"
+    assert grouped["alignment_confidence"] == 0.74
+    assert "pooled_paper_ids" not in grouped
+
+
+def test_manifest_builder_associates_post_punctuation_citations_with_prior_claim():
+    review_draft = _review_draft(
+        "Claim1 A support. [[cite:A]] "
+        "Claim2 B and C joint support. [[cite:B]] [[cite:C]]"
+    )
+    summaries = [
+        {"status": "success", "paper_info": {"title": "A", "canonical_paper_key": "A"}, "ai_summary": {"paper_metadata": {"title": "A"}}},
+        {"status": "success", "paper_info": {"title": "B", "canonical_paper_key": "B"}, "ai_summary": {"paper_metadata": {"title": "B"}}},
+        {"status": "success", "paper_info": {"title": "C", "canonical_paper_key": "C"}, "ai_summary": {"paper_metadata": {"title": "C"}}},
+    ]
+
+    manifest = build_citation_manifest_v3_from_review_draft(
+        job_id="job",
+        project_name="project",
+        manifest_id="manifest",
+        review_draft_path="review.json",
+        review_word_path="review.docx",
+        review_draft_v2=review_draft,
+        paper_summaries=summaries,
+    ).to_dict()
+    grouped = next(
+        unit
+        for citation_set in manifest["citation_sets"]
+        for unit in citation_set["claim_units"]
+        if set(unit.get("supporting_paper_ids") or []) == {"B", "C"}
+    )
+
+    assert grouped["alignment_status"] == "inferred"
+    assert grouped["alignment_confidence"] == 0.74
+
+
+def test_manifest_builder_infers_one_structured_group_token_despite_prior_uncited_claim():
+    token = "[[cite_ref:R001,R002]]"
+    summaries = [
+        {"status": "success", "paper_info": {"title": "B", "canonical_paper_key": "B"}, "ai_summary": {"paper_metadata": {"title": "B"}}},
+        {"status": "success", "paper_info": {"title": "C", "canonical_paper_key": "C"}, "ai_summary": {"paper_metadata": {"title": "C"}}},
+    ]
+    catalog = build_document_ref_catalog(
+        summaries,
+        project_name="project",
+        job_id="job",
+    )
+    review_draft = build_review_draft_v2(
+        job_id="job",
+        project_name="project",
+        draft_id="draft",
+        outline_artifact_id="outline",
+        outline_source_path="outline.md",
+        summary_file="summaries.json",
+        review_word_path="review.docx",
+        sections=[
+            {
+                "section_number": 1,
+                "section_title": "Findings",
+                "content": (
+                    "Uncited bridge claim. "
+                    f"Claim jointly supported by B and C {token}."
+                ),
+            }
+        ],
+        references=[],
+        generation_mode="full_review",
+        paper_summaries=summaries,
+        citation_ref_catalog=catalog,
+    ).to_dict()
+
+    manifest = build_citation_manifest_v3_from_review_draft(
+        job_id="job",
+        project_name="project",
+        manifest_id="manifest",
+        review_draft_path="review.json",
+        review_word_path="review.docx",
+        review_draft_v2=review_draft,
+        paper_summaries=summaries,
+        citation_ref_catalog=catalog,
+    ).to_dict()
+    grouped = next(
+        unit
+        for citation_set in manifest["citation_sets"]
+        for unit in citation_set["claim_units"]
+        if set(unit.get("supporting_paper_ids") or []) == {"B", "C"}
+    )
+
+    assert grouped["alignment_status"] == "inferred"
+    assert grouped["alignment_confidence"] == 0.82
+    assert "pooled_paper_ids" not in grouped
+
+
+def test_manifest_builder_infers_adjacent_structured_tokens_as_one_joint_tail():
+    token = "[[cite_ref:R001]] [[cite_ref:R002]]"
+    summaries = [
+        {"status": "success", "paper_info": {"title": "B", "canonical_paper_key": "B"}, "ai_summary": {"paper_metadata": {"title": "B"}}},
+        {"status": "success", "paper_info": {"title": "C", "canonical_paper_key": "C"}, "ai_summary": {"paper_metadata": {"title": "C"}}},
+    ]
+    catalog = build_document_ref_catalog(
+        summaries,
+        project_name="project",
+        job_id="job",
+    )
+    review_draft = build_review_draft_v2(
+        job_id="job",
+        project_name="project",
+        draft_id="draft",
+        outline_artifact_id="outline",
+        outline_source_path="outline.md",
+        summary_file="summaries.json",
+        review_word_path="review.docx",
+        sections=[
+            {
+                "section_number": 1,
+                "section_title": "Findings",
+                "content": (
+                    "Uncited bridge claim. "
+                    f"Claim jointly supported by B and C {token}."
+                ),
+            }
+        ],
+        references=[],
+        generation_mode="full_review",
+        paper_summaries=summaries,
+        citation_ref_catalog=catalog,
+    ).to_dict()
+
+    manifest = build_citation_manifest_v3_from_review_draft(
+        job_id="job",
+        project_name="project",
+        manifest_id="manifest",
+        review_draft_path="review.json",
+        review_word_path="review.docx",
+        review_draft_v2=review_draft,
+        paper_summaries=summaries,
+        citation_ref_catalog=catalog,
+    ).to_dict()
+    grouped = next(
+        unit
+        for citation_set in manifest["citation_sets"]
+        for unit in citation_set["claim_units"]
+        if set(unit.get("supporting_paper_ids") or []) == {"B", "C"}
+    )
+
+    assert grouped["alignment_status"] == "inferred"
+    assert grouped["alignment_confidence"] == 0.78
+    assert "pooled_paper_ids" not in grouped
 
 
 def test_claim_alignment_audit_contains_reviewable_rows():

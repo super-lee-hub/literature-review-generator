@@ -240,6 +240,119 @@ def test_runner_executes_full_chain_and_resume_skips_durable_generation(tmp_path
     ]
 
 
+def test_runner_routes_outline_v2_replay_to_local_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay_manifest = tmp_path / "outline-v2-replay.json"
+    replay_manifest.write_text('{"status":"complete"}\n', encoding="utf-8")
+    summary_file = tmp_path / "summary.json"
+    summary_file.write_text("[]\n", encoding="utf-8")
+    captured: dict[str, str] = {}
+
+    def fake_persist_outline_v2_replay(
+        _bridge,
+        session,
+        *,
+        response_manifest_path: str,
+        adopted_by: str,
+        adoption_reason: str,
+        **_kwargs,
+    ) -> StageResult:
+        captured.update(
+            {
+                "response_manifest_path": response_manifest_path,
+                "adopted_by": adopted_by,
+                "adoption_reason": adoption_reason,
+            }
+        )
+        adopted_path = session.context.workspace.artifact_path(
+            "runner-demo_literature_review_outline.md"
+        )
+        Path(adopted_path).write_text("# Replayed outline\n", encoding="utf-8")
+        record = session.context.registry.register_file(
+            artifact_role="outline",
+            artifact_type="literature_review_outline",
+            artifact_version="v1",
+            path=adopted_path,
+            producer="tests",
+            artifact_id="literature_review_outline",
+        )
+        return StageResult(
+            stage_name="stage2_outline",
+            success=True,
+            artifacts=[_bridge._artifact_ref_from_record(record)],
+            metadata={"model_call_count": 7},
+        )
+
+    monkeypatch.setattr(
+        "runtime.orchestrator.AgentRuntimeBridge.persist_outline_v2_replay",
+        fake_persist_outline_v2_replay,
+    )
+
+    def handler(stage_name, _request):
+        assert stage_name == "stage2_outline"
+        return {
+            "outline_v2_replay_manifest_path": str(replay_manifest),
+            "adopted_by": "codex-runtime",
+            "adoption_reason": "hash-bound subagent responses",
+        }
+
+    result = AgentRuntimeRunner(
+        replace(
+            _spec(tmp_path, action="generate_outline"),
+            summary_sources=(str(summary_file),),
+            metadata={"requested_stages": ["outline"]},
+        ),
+        legacy_main=build_legacy_main(),
+        stage_handler=handler,
+        origin_dir=tmp_path,
+    ).run()
+
+    assert result.job_status == "completed", result.message
+    assert result.canonical_ready is True
+    assert captured == {
+        "response_manifest_path": str(replay_manifest),
+        "adopted_by": "codex-runtime",
+        "adoption_reason": "hash-bound subagent responses",
+    }
+
+
+def test_runner_preserves_explicit_zero_stage1_model_call_count(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "papers" / "alpha.pdf"
+
+    def local_stage1(stage_name, request):
+        assert stage_name == "stage1_analyze"
+        item = request.source_bundle.paper_work_items[0]
+        summary = build_success_summary(
+            pdf_path,
+            paper_key=item.canonical_paper_key,
+        )
+        summary["paper_info"]["source_paper_id"] = item.source_paper_id
+        return {"summaries": [summary], "model_call_count": 0}
+
+    result = AgentRuntimeRunner(
+        _spec(tmp_path, action="analyze"),
+        legacy_main=build_legacy_main(),
+        stage_handler=local_stage1,
+        origin_dir=tmp_path,
+    ).run()
+
+    workspace = JobWorkspace.from_workspace_path(
+        result.workspace_path,
+        "runner-demo",
+        result.job_id,
+    )
+    records = StageTerminalStore(
+        workspace,
+        ArtifactRegistry(workspace.paths.registry_path, result.job_id),
+    ).load_records()
+    analyze = next(record for record, _path in records if record.stage_name == "analyze")
+
+    assert result.job_status == "completed"
+    assert analyze.model_call_count == 0
+
+
 def test_two_new_runs_with_identical_inputs_create_distinct_jobs(tmp_path: Path) -> None:
     calls: list[str] = []
     spec = _spec(tmp_path, action="analyze")

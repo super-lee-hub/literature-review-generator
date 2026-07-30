@@ -1481,6 +1481,14 @@ def _extract_raw_candidate_list(raw_output: Any) -> tuple[List[Any], str]:
     raise ValueError(f"Unexpected candidate output type: {type(raw_output).__name__}")
 
 
+def _raw_top_level_keys(raw_output: Any) -> str:
+    if isinstance(raw_output, dict):
+        return ", ".join(str(key) for key in raw_output.keys()) or "<none>"
+    if isinstance(raw_output, list):
+        return "<array-root>"
+    return type(raw_output).__name__
+
+
 def normalize_candidate_output_with_report(
     raw_output: Any,
     literature_map: LiteratureMap,
@@ -1541,6 +1549,8 @@ def normalize_candidate_output_with_report(
         generator_model=generator_model,
         top_keys=top_keys,
     )
+    if isinstance(raw_output, dict) and raw_output.get("provider_strategy_errors"):
+        report["provider_strategy_errors"] = list(raw_output.get("provider_strategy_errors") or [])
     report["provider_total"] = len(raw_candidates)
 
     candidates: List[OutlineCandidate] = []
@@ -1794,25 +1804,107 @@ def generate_candidates_production_with_report(
                     "stage": "outline_candidates",
                     "candidate_index": idx + 1,
                     "prompt_budget": prompt_budget.metadata(prompt) if prompt_budget else {},
+                    "semantic_retry": 0,
                 },
             )
-            try:
-                one_raw, _top_keys = _extract_raw_candidate_list(raw_output)
-                if one_raw:
-                    item = one_raw[0]
-                    if isinstance(item, dict):
-                        item = _force_provider_candidate_identity(item, idx + 1)
-                    raw_candidates.append(item)
-                    continue
-            except Exception as exc:
+
+            attempt_diagnostics: List[Dict[str, Any]] = []
+
+            def first_candidate_item(raw_value: Any, *, attempt: int) -> tuple[Any | None, bool]:
+                try:
+                    one_raw, top_keys = _extract_raw_candidate_list(raw_value)
+                except Exception as exc:
+                    attempt_diagnostics.append({
+                        "attempt": attempt,
+                        "top_level_keys": _raw_top_level_keys(raw_value),
+                        "reason": str(exc),
+                    })
+                    return None, False
+                if not one_raw:
+                    attempt_diagnostics.append({
+                        "attempt": attempt,
+                        "top_level_keys": top_keys,
+                        "reason": "candidate output contained no candidate items",
+                    })
+                    return None, False
+                item = one_raw[0]
+                if not isinstance(item, dict):
+                    attempt_diagnostics.append({
+                        "attempt": attempt,
+                        "top_level_keys": top_keys,
+                        "reason": f"candidate item is {type(item).__name__}, expected object",
+                    })
+                    return None, False
+                if not _extract_candidate_sections_value(item):
+                    attempt_diagnostics.append({
+                        "attempt": attempt,
+                        "top_level_keys": top_keys,
+                        "reason": "candidate item has no usable sections",
+                    })
+                    return None, True
+                return _force_provider_candidate_identity(item, idx + 1), False
+
+            item, semantic_retry_allowed = first_candidate_item(raw_output, attempt=1)
+            if item is not None:
+                raw_candidates.append(item)
+                continue
+            if not semantic_retry_allowed:
                 per_strategy_errors.append({
                     "candidate_index": idx + 1,
-                    "reason": str(exc),
+                    "recovered_by_semantic_retry": False,
+                    "semantic_retry_skipped": True,
+                    "attempts": attempt_diagnostics,
                 })
+                raw_candidates.append({
+                    "candidate_id": f"candidate_{idx + 1}",
+                    "sections": [],
+                    "provider_error": "empty_or_unparseable_single_candidate_response",
+                    "provider_attempt_diagnostics": attempt_diagnostics,
+                })
+                continue
+
+            retry_reason = attempt_diagnostics[-1]["reason"] if attempt_diagnostics else "missing candidate sections"
+            retry_prompt = (
+                prompt
+                + "\n\nSEMANTIC RETRY FOR THIS STRATEGY ONLY:\n"
+                + f"The previous JSON for candidate_{idx + 1} was rejected before validation because {retry_reason}. "
+                + "Return exactly one candidate object inside a top-level candidates array. "
+                + "The candidate must contain a non-empty sections array. Do not return an empty outline, "
+                + "diagnostics, prose, or a restatement of the schema."
+            )
+            if prompt_budget is not None:
+                prompt_budget.assert_fits(retry_prompt, stage="outline_candidates")
+            retry_raw_output = model_caller(
+                generator_model,
+                retry_prompt,
+                {
+                    "stage": "outline_candidates",
+                    "candidate_index": idx + 1,
+                    "prompt_budget": prompt_budget.metadata(retry_prompt) if prompt_budget else {},
+                    "semantic_retry": 1,
+                    "previous_provider_error": retry_reason,
+                },
+            )
+            item, _semantic_retry_allowed = first_candidate_item(retry_raw_output, attempt=2)
+            if item is not None:
+                raw_candidates.append(item)
+                per_strategy_errors.append({
+                    "candidate_index": idx + 1,
+                    "recovered_by_semantic_retry": True,
+                    "attempts": attempt_diagnostics,
+                })
+                continue
+
+            per_strategy_errors.append({
+                "candidate_index": idx + 1,
+                "recovered_by_semantic_retry": False,
+                "attempts": attempt_diagnostics,
+            })
             raw_candidates.append({
                 "candidate_id": f"candidate_{idx + 1}",
                 "sections": [],
                 "provider_error": "empty_or_unparseable_single_candidate_response",
+                "provider_attempt_diagnostics": attempt_diagnostics,
             })
         raw_output = {"candidates": raw_candidates}
         if per_strategy_errors:

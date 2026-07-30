@@ -526,7 +526,7 @@ def _validate_outline_stage_health(record: ArtifactRecord, path: Path) -> None:
     )
     health = OutlineStageHealthV1.from_dict(payload)
     _require_owned_job(record, payload, field="job_id")
-    if health.execution_mode not in {"production", "test_dev"}:
+    if health.execution_mode not in {"production", "test_dev", "subagent_replay"}:
         raise ReconcileValidationError("outline_stage_health execution_mode is invalid")
     if not health.stages:
         raise ReconcileValidationError("outline_stage_health has no stage entries")
@@ -544,6 +544,91 @@ def _validate_outline_stage_health(record: ArtifactRecord, path: Path) -> None:
             raise ReconcileValidationError(f"invalid execution_status for outline stage {stage_name}")
         if entry.attempts < 0:
             raise ReconcileValidationError(f"negative attempt count for outline stage {stage_name}")
+
+
+def _validate_outline_v2_subagent_request(
+    record: ArtifactRecord,
+    path: Path,
+) -> None:
+    from runtime.outline_v2_replay import (
+        REPLAY_REQUEST_SCHEMA,
+        canonical_json_sha256,
+        prompt_sha256,
+    )
+
+    payload = _read_json_object(path)
+    _require_contract_header(
+        record,
+        payload,
+        artifact_type="outline_v2_subagent_request",
+        versions=("v1",),
+    )
+    if payload.get("schema_version") != REPLAY_REQUEST_SCHEMA:
+        raise ReconcileValidationError("Outline v2 subagent request schema is invalid")
+    _require_nonempty_string(payload.get("route"), label="Outline v2 replay route")
+    _require_nonempty_string(payload.get("stage"), label="Outline v2 replay stage")
+    prompt = _require_nonempty_string(
+        payload.get("prompt"),
+        label="Outline v2 replay prompt",
+    )
+    metadata = _require_mapping(
+        payload.get("metadata"),
+        label="Outline v2 replay metadata",
+    )
+    if payload.get("prompt_sha256") != prompt_sha256(prompt):
+        raise ReconcileValidationError("Outline v2 replay request prompt hash is stale")
+    if payload.get("metadata_sha256") != canonical_json_sha256(metadata):
+        raise ReconcileValidationError("Outline v2 replay request metadata hash is stale")
+
+
+def _validate_outline_v2_subagent_response(
+    record: ArtifactRecord,
+    path: Path,
+) -> None:
+    from runtime.outline_v2_replay import REPLAY_RAW_OUTPUT_SCHEMA
+
+    payload = _read_json_object(path)
+    _require_contract_header(
+        record,
+        payload,
+        artifact_type="outline_v2_subagent_response",
+        versions=("v1",),
+    )
+    if payload.get("schema_version") != REPLAY_RAW_OUTPUT_SCHEMA:
+        raise ReconcileValidationError("Outline v2 subagent response schema is invalid")
+    _require_nonempty_string(
+        payload.get("request_sha256"),
+        label="Outline v2 replay response request hash",
+    )
+    _require_nonempty_string(
+        payload.get("subagent_run_id"),
+        label="Outline v2 replay response subagent_run_id",
+    )
+    if "response" not in payload:
+        raise ReconcileValidationError("Outline v2 replay response payload is missing")
+
+
+def _validate_outline_v2_subagent_response_manifest(
+    record: ArtifactRecord,
+    path: Path,
+) -> None:
+    from runtime.outline_v2_replay import (
+        OutlineV2ReplayCaller,
+        OutlineV2ReplayError,
+    )
+
+    payload = _read_json_object(path)
+    _require_contract_header(
+        record,
+        payload,
+        artifact_type="outline_v2_subagent_response_manifest",
+        versions=("v1",),
+    )
+    try:
+        replay = OutlineV2ReplayCaller(path)
+        replay.verify_artifacts()
+    except OutlineV2ReplayError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_final_outline_payload(
@@ -1719,6 +1804,25 @@ def validate_review_batch_manifest_for_bootstrap(
     return payload
 
 
+def _validate_visual_manifest(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    if payload.get("artifact_type") != record.artifact_type:
+        raise ReconcileValidationError("visual_manifest artifact_type is inconsistent")
+    if str(payload.get("artifact_version") or "").strip() != "v1":
+        raise ReconcileValidationError("visual_manifest artifact_version must be v1")
+    if not str(payload.get("paper_key") or "").strip():
+        raise ReconcileValidationError("visual_manifest paper_key is required")
+    visuals = payload.get("visuals")
+    if not isinstance(visuals, list):
+        raise ReconcileValidationError("visual_manifest visuals must be an array")
+    for index, visual in enumerate(visuals):
+        if not isinstance(visual, Mapping):
+            raise ReconcileValidationError(f"visual_manifest visual #{index} must be an object")
+        image_path = str(visual.get("image_path") or "").strip()
+        if image_path and not Path(image_path).is_file():
+            raise ReconcileValidationError(f"visual_manifest image_path is missing: {image_path}")
+
+
 DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "job_outcome": _validate_job_outcome,
     STAGE_TERMINAL_ARTIFACT_TYPE: _validate_stage_terminal,
@@ -1737,6 +1841,7 @@ DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,
     "evidence_manifest": _validate_evidence_manifest,
+    "visual_manifest": _validate_visual_manifest,
     "normalized_text": _validate_nonempty_text,
     "chunks": _validate_json_array,
     "page_index": _validate_json_array,
@@ -1757,6 +1862,11 @@ DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "final_outline": _validate_final_outline,
     "outline_coverage_audit": _validate_outline_coverage_audit,
     "outline_stage_health": _validate_outline_stage_health,
+    "outline_v2_subagent_request": _validate_outline_v2_subagent_request,
+    "outline_v2_subagent_response": _validate_outline_v2_subagent_response,
+    "outline_v2_subagent_response_manifest": (
+        _validate_outline_v2_subagent_response_manifest
+    ),
     "adopted_final_outline": _validate_adopted_final_outline,
 }
 
@@ -2526,6 +2636,35 @@ class RuntimeReconciler:
             )
         return repaired, issues
 
+    def _registered_artifact_integrity_issues(self) -> tuple[ReconcileIssue, ...]:
+        """Hash-check every ready Registry record, including non-stage diagnostics."""
+
+        self.registry.reload()
+        issues: list[ReconcileIssue] = []
+        for record in self.registry.list_records():
+            if record.status != "ready":
+                continue
+            message = ""
+            if record.job_id != self.registry.job_id:
+                message = "artifact job_id does not match Registry owner"
+            else:
+                path = Path(record.path)
+                if not path.is_file():
+                    message = "artifact file is missing"
+                elif not record.content_hash:
+                    message = "artifact content hash is missing"
+                elif file_sha256(path) != record.content_hash:
+                    message = "artifact content hash mismatch"
+            if message:
+                issues.append(
+                    ReconcileIssue(
+                        "registered_artifact_integrity_failed",
+                        f"{message}: {record.artifact_id}",
+                        artifact_id=record.artifact_id,
+                    )
+                )
+        return tuple(issues)
+
     def reconcile(
         self,
         *,
@@ -2589,6 +2728,7 @@ class RuntimeReconciler:
         completed = tuple(sorted(stage for stage in stage_names if self.stage_is_complete(stage)))
         pointer_repaired, pointer_issues = self._repair_owned_pointer(outcome)
         issues.extend(pointer_issues)
+        issues.extend(self._registered_artifact_integrity_issues())
         return ReconcileResult(
             job_id=self.registry.job_id,
             completed_stages=completed,

@@ -806,6 +806,7 @@ class ValidationRunResultV1:
             "recheck_status": self.recheck_status,
             "degradation_reasons": list(self.degradation_reasons),
             "compatibility_status": self.compatibility_status,
+            "contract_satisfied": self.contract_satisfied,
         }
 
     @classmethod

@@ -4,7 +4,7 @@ from typing import Any, cast
 
 import main
 from config_loader import ConfigDict
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
 from services.config_compat import CompatConfigView
 from services.job_workspace import JobWorkspace
 from services.progress_state import ResumeStateReport
@@ -241,6 +241,80 @@ def test_create_literature_review_outline_v2_runs_pipeline_and_registers_artifac
     final_record = next(item for item in registry_payload["artifacts"] if item["artifact_id"] == "final_outline")
     assert all(dep["artifact_type"] != "candidate_generation_report" for dep in final_record["depends_on"])
     assert all(dep["content_hash"] for dep in final_record["depends_on"])
+
+
+def test_outline_v2_candidates_depend_on_registered_model_evidence(tmp_path: Path) -> None:
+    from outline.pipeline import V2Pipeline
+
+    generator, workspace, registry = _make_bound_generator(
+        tmp_path,
+        job_id="job-v2-model-evidence",
+    )
+    summaries: list[dict[str, Any]] = [
+        {
+            "paper_info": {
+                "title": "Core Paper",
+                "classification": "core",
+                "must_use": True,
+            },
+            "themes": ["core"],
+            "methods": ["experiment"],
+        },
+        {
+            "paper_info": {
+                "title": "Support Paper",
+                "classification": "support",
+            },
+            "themes": ["support"],
+            "methods": ["survey"],
+        },
+    ]
+    evidence_path = tmp_path / "outline-v2-replay-manifest.json"
+    evidence_path.write_text('{"status":"complete"}\n', encoding="utf-8")
+    evidence_record = registry.register_file(
+        artifact_role="outline_v2_subagent_response_manifest",
+        artifact_type="outline_v2_subagent_response_manifest",
+        artifact_version="v1",
+        path=evidence_path,
+        producer="tests",
+        artifact_id="outline_v2_subagent_response_manifest",
+    )
+    evidence_dependency = ArtifactDependencyRef(
+        artifact_type=evidence_record.artifact_type,
+        path=evidence_record.path,
+        content_hash=evidence_record.content_hash,
+        dependency_kind="local_job",
+        job_id=evidence_record.job_id,
+        artifact_id=evidence_record.artifact_id,
+    )
+    pipeline = V2Pipeline(
+        job_id=workspace.job_id,
+        summaries=summaries,
+        config_view=generator.compat_config,
+        artifact_registry=registry,
+        workspace=workspace,
+        output_dir=str(tmp_path / "output"),
+        project_name="demo",
+        model_dependencies=[evidence_dependency],
+        logger=generator.logger,
+    )
+
+    result = pipeline.run(candidate_count=3, test_dev_mode=True)
+    assert result.ok is True
+    pipeline.persist_artifacts(result)
+
+    registry_payload = json.loads(
+        Path(workspace.paths.registry_path).read_text(encoding="utf-8")
+    )
+    candidate_record = next(
+        item
+        for item in registry_payload["artifacts"]
+        if item["artifact_id"] == "outline_candidates"
+    )
+    dependency_ids = {
+        dependency["artifact_id"] for dependency in candidate_record["depends_on"]
+    }
+    assert "outline_v2_subagent_response_manifest" in dependency_ids
 
 
 

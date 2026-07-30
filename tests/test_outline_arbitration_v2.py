@@ -14,6 +14,7 @@ from outline.arbitration_v2 import (
     arbitrate_production,
     build_final_outline,
     complete_final_outline_coverage,
+    normalize_arbitration_output,
 )
 from outline.v2_models import ArbitrationReport, FinalOutline
 
@@ -189,6 +190,39 @@ class TestProductionArbitration:
         }
         assert report.final_decision["fallback_reason"].startswith("provider_arbitration_failed")
         assert report.merged_strategy == "fallback_select_validated_candidate_after_provider_failure"
+
+    def test_normalizes_provider_candidate_score_objects(self):
+        _, _, candidates, critiques = _make_pipeline_artifacts()
+        selected = candidates.candidates[0].candidate_id
+        raw_output = {
+            "source_candidates": [c.candidate_id for c in candidates.candidates],
+            "source_critiques": [c.critique_id for c in critiques.critiques],
+            "candidate_scores": {selected: {"score": "0.82", "rationale": "best synthesis"}},
+            "accepted_points": [],
+            "rejected_points": [],
+            "merged_strategy": "provider_test",
+            "final_decision": {"selected_base_candidate": selected},
+        }
+
+        report = normalize_arbitration_output(raw_output, candidates, critiques, "Outline_API")
+
+        assert report.candidate_scores[selected] == pytest.approx(0.82)
+
+    def test_candidate_score_objects_without_numeric_score_fail_closed(self):
+        _, _, candidates, critiques = _make_pipeline_artifacts()
+        selected = candidates.candidates[0].candidate_id
+        raw_output = {
+            "source_candidates": [c.candidate_id for c in candidates.candidates],
+            "source_critiques": [c.critique_id for c in critiques.critiques],
+            "candidate_scores": {selected: {"rationale": "best synthesis"}},
+            "accepted_points": [],
+            "rejected_points": [],
+            "merged_strategy": "provider_test",
+            "final_decision": {"selected_base_candidate": selected},
+        }
+
+        with pytest.raises(ValueError, match="without an explicit numeric score"):
+            normalize_arbitration_output(raw_output, candidates, critiques, "Outline_API")
 
 
 def test_production_arbitration_preserves_high_severity_blocking_critiques():

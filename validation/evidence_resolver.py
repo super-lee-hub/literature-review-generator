@@ -36,6 +36,50 @@ SOURCE_GROUNDED_RESOLVER_TIERS = frozenset(
 )
 SUMMARY_HINT_RESOLVER_TIERS = frozenset({"ai_summary"})
 
+_CLAIM_RETRIEVAL_HINTS: Sequence[tuple[tuple[str, ...], tuple[str, ...]]] = (
+    (
+        ("量表", "测量", "测度"),
+        ("scale development", "knowledge measure", "seventeen-item index"),
+    ),
+    (
+        ("信度", "可靠性"),
+        ("reliability", "test-retest reliability", "PRL reliability"),
+    ),
+    (
+        ("效度",),
+        ("validity", "content validity", "known-group validity"),
+    ),
+    (
+        ("消费者教育", "教育消费者"),
+        (
+            "provide education",
+            "help consumers recognize",
+            "recognize the persuasive techniques",
+        ),
+    ),
+    (("实验室",), ("lab setting",)),
+    (("真实购物", "购物环境"), ("realistic shopping environments",)),
+    (
+        ("条目更新", "新增条目", "新定价策略"),
+        ("items might also need to be added", "update the proposed knowledge measure"),
+    ),
+    (("开放式调查", "开放式回答"), ("open-ended responses",)),
+    (("专家评判", "专家评定"), ("expert judges",)),
+    (
+        ("竞争构念", "广告怀疑", "说服知识信心"),
+        ("competing variables", "advertising skepticism", "knowledge confidence"),
+    ),
+)
+
+
+def _claim_retrieval_hints(cited_span: str) -> List[str]:
+    claim = str(cited_span or "")
+    hints: List[str] = []
+    for markers, phrases in _CLAIM_RETRIEVAL_HINTS:
+        if any(marker in claim for marker in markers):
+            hints.extend(phrase for phrase in phrases if phrase not in hints)
+    return hints
+
 
 def build_bilingual_retrieval_queries(
     cited_span: str,
@@ -66,20 +110,37 @@ def build_bilingual_retrieval_queries(
                     "theor",
                     "key_point",
                     "finding",
+                    "method",
+                    "conclusion",
+                    "relevance",
+                    "limitation",
+                    "recommend",
+                    "implication",
+                    "education",
+                    "valid",
+                    "reliab",
+                    "measure",
+                    "scale",
                 )
             ):
                 candidate_values.extend(value if isinstance(value, list) else [value])
-    english_terms: List[str] = []
+    english_terms = _claim_retrieval_hints(cited_span)
     for value in candidate_values:
+        if not isinstance(value, str):
+            continue
         for phrase in re.findall(r"[A-Za-z][A-Za-z-]*(?:\s+[A-Za-z][A-Za-z-]*){0,4}", str(value)):
             normalized = " ".join(phrase.lower().split())
-            if len(normalized) > 2 and normalized not in english_terms:
+            if (
+                len(normalized) > 2
+                and normalized not in {"none", "null"}
+                and normalized not in english_terms
+            ):
                 english_terms.append(normalized)
             if len(english_terms) >= max_english_terms:
                 break
         if len(english_terms) >= max_english_terms:
             break
-    queries.extend(english_terms)
+    queries.extend(english_terms[:max_english_terms])
     return [query for query in queries if query]
 
 

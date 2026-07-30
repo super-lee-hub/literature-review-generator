@@ -442,11 +442,32 @@ class AgentRuntimeRunner:
                     rejected_candidates=list(response.get("rejected_candidates") or []),
                     subagent_run_id=str(response.get("subagent_run_id") or "") or None,
                 ),
-                int(response.get("model_call_count") or len(bundle.paper_work_items)),
+                (
+                    int(response["model_call_count"])
+                    if "model_call_count" in response
+                    else len(bundle.paper_work_items)
+                ),
             )
         if stage == "outline":
             response = self._call_handler("stage2_outline", spec=spec, bundle=bundle, session=session, results=results)
             payload = response if isinstance(response, Mapping) else {"outline_text": response}
+            replay_manifest_path = str(
+                payload.get("outline_v2_replay_manifest_path") or ""
+            ).strip()
+            if replay_manifest_path:
+                replay_result = bridge.persist_outline_v2_replay(
+                    session,
+                    response_manifest_path=replay_manifest_path,
+                    adopted_by=str(payload.get("adopted_by") or "runtime-handler"),
+                    adoption_reason=str(
+                        payload.get("adoption_reason")
+                        or "explicit runtime Outline v2 subagent replay adoption"
+                    ),
+                )
+                return (
+                    replay_result,
+                    int(replay_result.metadata.get("model_call_count") or 0),
+                )
             if bool(payload.get("use_generator_outline_v2", False)):
                 if not session.generator.create_literature_review_outline():
                     raise RuntimeRunnerError("generator Outline v2 pipeline failed")

@@ -585,6 +585,23 @@ def _semantic_block_claim_count(text: str) -> int:
     return len(parts) if parts else 0
 
 
+def _prior_uncited_semantic_claim_exists(text: str) -> bool:
+    """Return whether prior prose contains a claim with no local citation token."""
+    sentence_with_trailing_citations = re.compile(
+        r"[^.!?;；。！？]*(?:[.!?;；。！？]+|$)"
+        r"(?:\s*\[\[(?:cite_ref|cite):[^\]]+\]\])*"
+    )
+    for match in sentence_with_trailing_citations.finditer(text or ""):
+        segment = match.group(0)
+        cleaned = _strip_citation_tokens(segment)
+        if not cleaned or not re.search(r"\w", cleaned, flags=re.UNICODE):
+            continue
+        has_citation = bool(re.search(r"\[\[(?:cite_ref|cite):[^\]]+\]\]", segment))
+        if not has_citation and _semantic_claim_count(cleaned) > 0:
+            return True
+    return False
+
+
 def _alignment_for_sentence(
     *,
     sentence_text: str,
@@ -602,10 +619,26 @@ def _alignment_for_sentence(
         sentence_occurrences,
         sentence_start=sentence_start,
     ) == ""
-    semantic_claim_count = _semantic_claim_count(_strip_citation_tokens(sentence_text))
-    block_claim_count = _semantic_block_claim_count(block_text_before_sentence) + semantic_claim_count
+    citation_tokens = _unique_non_empty(
+        occurrence.citation_token for occurrence in sentence_occurrences
+    )
+    if (
+        len(sentence_occurrences) > 1
+        and citation_tail_empty
+        and len(citation_tokens) == 1
+        and citation_tokens[0].startswith("[[cite_ref:")
+    ):
+        return "inferred", 0.82
+    if (
+        len(sentence_occurrences) > 1
+        and citation_tail_empty
+        and citation_tokens
+        and all(token.startswith("[[cite_ref:") for token in citation_tokens)
+    ):
+        return "inferred", 0.78
+    prior_uncited_claim_exists = _prior_uncited_semantic_claim_exists(block_text_before_sentence)
 
-    if len(sentence_occurrences) > 1 and citation_tail_empty and block_claim_count > 1:
+    if len(sentence_occurrences) > 1 and citation_tail_empty and prior_uncited_claim_exists:
         return "ambiguous", 0.35
     if len(sentence_occurrences) == 1 and citation_tail_empty:
         return "inferred", 0.86

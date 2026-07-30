@@ -963,7 +963,7 @@ def _existing_variant_result(
     try:
         reconciler.validate_record(summary_record)
     except Exception as exc:
-        raise SummarySelectionError("existing child review derivation failed validation") from exc
+        return None
     return ReviewVariantDerivationResultV1(
         project_name=spec.project_name,
         child_job_id=workspace.job_id,
@@ -1051,6 +1051,11 @@ def _ensure_json_artifact(
         raise SummarySelectionError(
             f"child artifact is not valid JSON: {artifact_id}"
         ) from exc
+    if not payload_matches(persisted_payload) and existing is not None and artifact_id.startswith(
+        ("summary-selection:", "derived-summary:", "derived-paper:")
+    ):
+        atomic_write_json(str(target), payload)
+        persisted_payload = payload
     if not payload_matches(persisted_payload):
         raise SummarySelectionError(
             f"child artifact payload conflicts with deterministic derivation: {artifact_id}"
@@ -1103,8 +1108,21 @@ def _ensure_json_artifact(
             raise SummarySelectionError(
                 f"registered child artifact conflicts with deterministic derivation: {artifact_id}"
             )
-        reconciler.validate_record(existing)
-        return existing
+        try:
+            reconciler.validate_record(existing)
+            return existing
+        except Exception:
+            return registry.register_file(
+                artifact_role=artifact_role,
+                artifact_type=artifact_type,
+                artifact_version=artifact_version,
+                path=target,
+                producer=producer,
+                artifact_id=artifact_id,
+                depends_on=dependency_list,
+                metadata=metadata_dict,
+                external_registry_resolver=external_registry_resolver,
+            )
 
     reconciler.validate_record(candidate)
     registered = registry.register_file(

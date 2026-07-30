@@ -141,6 +141,33 @@ def test_stage_completion_requires_registered_terminal_file_hash_schema_and_depe
     assert reconciler.stage_is_complete("test_stage") is False
 
 
+def test_reconcile_reports_hash_drift_for_unconnected_ready_artifact(
+    tmp_path: Path,
+) -> None:
+    workspace = JobWorkspace.create(str(tmp_path), "demo", job_id="job-1")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    log_path = Path(workspace.log_path("job.log"))
+    log_path.write_text("initial\n", encoding="utf-8")
+    registry.register_file(
+        artifact_role="log",
+        artifact_type="job_log",
+        artifact_version="v1",
+        path=log_path,
+        producer="tests.test_runtime_reconcile",
+        artifact_id="job_log",
+    )
+    log_path.write_text("initial\nlate\n", encoding="utf-8")
+
+    result = RuntimeReconciler(workspace, registry).reconcile()
+
+    assert result.clean is False
+    assert any(
+        issue.code == "registered_artifact_integrity_failed"
+        and issue.artifact_id == "job_log"
+        for issue in result.issues
+    )
+
+
 @pytest.mark.parametrize(
     "ai_summary",
     [

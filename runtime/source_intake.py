@@ -138,7 +138,7 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
 
 
 def build_source_bundle_for_request(request: Any, *, project_name: str | None = None) -> SourceBundle:
-    source_mode = str(getattr(request, "source_mode", "") or ("zotero" if getattr(request, "zotero_report", None) else "direct"))
+    source_mode = str(getattr(request, "mode", "") or getattr(request, "source_mode", "") or ("zotero" if getattr(request, "zotero_report", None) else "direct"))
     resolved_project_name = project_name or str(getattr(request, "project_name", "") or "").strip()
     if not resolved_project_name:
         pdf_folder = getattr(request, "pdf_folder", None)

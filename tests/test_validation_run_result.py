@@ -141,9 +141,11 @@ def test_validation_run_result_round_trip_counts_all_verdicts() -> None:
         degradation_reasons=("non_blocking_diagnostic",),
     )
 
-    restored = ValidationRunResultV1.from_dict(result.to_dict())
+    serialized = result.to_dict()
+    restored = ValidationRunResultV1.from_dict(serialized)
 
     assert restored == result
+    assert serialized["contract_satisfied"] is True
     assert restored.total_claims == 7
     assert restored.contradicted_count == 1
     assert restored.claim_verdict_counts == {verdict.value: 1 for verdict in ClaimVerdict}

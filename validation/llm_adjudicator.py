@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 
 from ai_interface import _call_ai_api
@@ -17,6 +19,72 @@ SOURCE_GROUNDED_TIERS = frozenset(
         "visual_refs",
     }
 )
+
+PRIORITY_EVIDENCE_PHRASES = (
+    "consumer education",
+    "consumer knowledge",
+    "educate consumers",
+    "educating consumers",
+    "help consumers recognize",
+    "recognize the persuasive techniques",
+)
+
+SUBSTANTIVE_EVIDENCE_MARKERS = frozenset(
+    {
+        "anova",
+        "analysis",
+        "conclusion",
+        "conclusions",
+        "discussion",
+        "educate",
+        "education",
+        "educational",
+        "effect",
+        "experiment",
+        "finding",
+        "findings",
+        "hypotheses",
+        "hypothesis",
+        "model",
+        "regression",
+        "reliability",
+        "result",
+        "results",
+        "study",
+        "validity",
+    }
+)
+
+NON_SUBSTANTIVE_EVIDENCE_MARKERS = frozenset(
+    {
+        "age",
+        "appendices",
+        "appendix",
+        "demographic",
+        "demographics",
+        "gender",
+        "income",
+        "respondent",
+        "respondents",
+        "supplement",
+        "supplementary",
+    }
+)
+
+SUBSTANTIVE_EVIDENCE_PHRASES: tuple[str, ...] = ()
+
+NON_SUBSTANTIVE_EVIDENCE_PHRASES = (
+    "sample characteristics",
+    "participant characteristics",
+    "respondent characteristics",
+)
+
+REFERENCE_HEADING_PATTERN = re.compile(
+    r"^\s*(?:---\s*page\s+\d+\s*---\s*)?(?:references|bibliography)\b",
+    re.IGNORECASE,
+)
+REFERENCE_YEAR_PATTERN = re.compile(r"\((?:19|20)\d{2}[a-z]?\)", re.IGNORECASE)
+REFERENCE_VENUE_PATTERN = re.compile(r"\bjournal(?:\s+of)?\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -41,11 +109,163 @@ class AdjudicationPacket:
     legacy_disposition: str
 
 
-def _candidate_sort_key(candidate: Dict[str, Any]) -> tuple[int, float, str]:
+def _candidate_context_text(candidate: Dict[str, Any]) -> str:
+    fields = (
+        candidate.get("evidence_scope"),
+        candidate.get("match_reason"),
+        candidate.get("resolver_tier"),
+        candidate.get("artifact_path"),
+        candidate.get("text_excerpt"),
+        candidate.get("caption_excerpt"),
+    )
+    return " ".join(str(field or "").lower() for field in fields)
+
+
+def _contains_marker(context: str, *, words: frozenset[str], phrases: tuple[str, ...]) -> bool:
+    if any(phrase in context for phrase in phrases):
+        return True
+    tokens = set(re.findall(r"[a-z][a-z0-9_-]*", context))
+    return bool(tokens.intersection(words))
+
+
+def _candidate_is_reference_like(candidate: Dict[str, Any]) -> bool:
+    metadata = " ".join(
+        str(candidate.get(field) or "").lower()
+        for field in ("evidence_scope", "match_reason", "resolver_tier")
+    )
+    if re.search(r"\b(?:reference_page|references|bibliography)\b", metadata):
+        return True
+    excerpt = str(candidate.get("text_excerpt") or candidate.get("caption_excerpt") or "")
+    if REFERENCE_HEADING_PATTERN.search(excerpt):
+        return True
+    return (
+        len(REFERENCE_YEAR_PATTERN.findall(excerpt)) >= 2
+        and len(REFERENCE_VENUE_PATTERN.findall(excerpt)) >= 2
+    )
+
+
+def _candidate_evidence_position_rank(candidate: Dict[str, Any]) -> int:
+    if _candidate_is_reference_like(candidate):
+        return 4
+    context = _candidate_context_text(candidate)
+    if _contains_marker(
+        context,
+        words=NON_SUBSTANTIVE_EVIDENCE_MARKERS,
+        phrases=NON_SUBSTANTIVE_EVIDENCE_PHRASES,
+    ):
+        return 3
+    if _contains_marker(
+        context,
+        words=frozenset(),
+        phrases=PRIORITY_EVIDENCE_PHRASES,
+    ):
+        return -1
+    if _contains_marker(
+        context,
+        words=SUBSTANTIVE_EVIDENCE_MARKERS,
+        phrases=SUBSTANTIVE_EVIDENCE_PHRASES,
+    ):
+        return 0
+    return 1
+
+
+def _candidate_dedupe_key(candidate: Dict[str, Any]) -> tuple[Any, ...]:
+    text = re.sub(r"\s+", " ", str(candidate.get("text_excerpt") or "")).strip().casefold()
+    caption = re.sub(r"\s+", " ", str(candidate.get("caption_excerpt") or "")).strip().casefold()
+    if text or caption:
+        return ("excerpt", text, caption)
+    return (
+        "locator",
+        candidate.get("resolver_tier"),
+        candidate.get("match_reason"),
+        tuple(candidate.get("page_span") or []),
+        tuple(candidate.get("chunk_ids") or []),
+    )
+
+
+def _normalized_excerpt(candidate: Dict[str, Any]) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        str(candidate.get("text_excerpt") or candidate.get("caption_excerpt") or ""),
+    ).strip().casefold()
+
+
+def _excerpts_are_near_duplicates(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if min(len(left), len(right)) < 80:
+        return False
+    return SequenceMatcher(None, left, right).ratio() >= 0.93
+
+
+def _candidate_location_key(candidate: Dict[str, Any]) -> tuple[Any, ...]:
+    pages = tuple(candidate.get("page_span") or [])
+    if pages:
+        return ("pages", pages)
+    chunks = tuple(candidate.get("chunk_ids") or [])
+    if chunks:
+        return ("chunks", chunks)
+    return ("window", candidate.get("resolver_tier"), candidate.get("window_rank"))
+
+
+def _select_diverse_candidates(
+    candidates: List[Dict[str, Any]],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    deferred_location: List[Dict[str, Any]] = []
+    deferred_duplicates: List[Dict[str, Any]] = []
+    location_counts: Dict[tuple[Any, ...], int] = {}
+
+    for candidate in candidates:
+        excerpt = _normalized_excerpt(candidate)
+        if any(
+            _excerpts_are_near_duplicates(excerpt, _normalized_excerpt(item))
+            for item in selected
+        ):
+            deferred_duplicates.append(candidate)
+            continue
+        location = _candidate_location_key(candidate)
+        if location_counts.get(location, 0) >= 2:
+            deferred_location.append(candidate)
+            continue
+        selected.append(candidate)
+        location_counts[location] = location_counts.get(location, 0) + 1
+        if len(selected) >= limit:
+            return selected
+
+    for candidate in deferred_location:
+        excerpt = _normalized_excerpt(candidate)
+        if any(
+            _excerpts_are_near_duplicates(excerpt, _normalized_excerpt(item))
+            for item in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= limit:
+            return selected
+
+    for candidate in deferred_duplicates:
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _candidate_sort_key(candidate: Dict[str, Any]) -> tuple[int, int, float, str]:
     source_grounded = bool(candidate.get("source_grounded"))
     confidence = float(candidate.get("confidence") or 0.0)
     resolver_tier = str(candidate.get("resolver_tier") or "")
-    return (0 if source_grounded else 1, -confidence, resolver_tier)
+    return (
+        0 if source_grounded else 1,
+        _candidate_evidence_position_rank(candidate),
+        -confidence,
+        resolver_tier,
+    )
 
 
 def _trim_candidates_for_stage(
@@ -58,14 +278,7 @@ def _trim_candidates_for_stage(
     deduped: List[Dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
     for candidate in sorted(candidates, key=_candidate_sort_key):
-        key = (
-            candidate.get("resolver_tier"),
-            candidate.get("match_reason"),
-            candidate.get("text_excerpt"),
-            tuple(candidate.get("page_span") or []),
-            tuple(candidate.get("chunk_ids") or []),
-            candidate.get("caption_excerpt"),
-        )
+        key = _candidate_dedupe_key(candidate)
         if key in seen:
             continue
         seen.add(key)
@@ -82,7 +295,9 @@ def _trim_candidates_for_stage(
 
     selected: List[Dict[str, Any]] = []
     if source_grounded:
-        selected.extend(source_grounded[:max_candidates])
+        selected.extend(
+            _select_diverse_candidates(source_grounded, limit=max_candidates)
+        )
     else:
         selected.extend(others[:max_candidates])
 
@@ -133,18 +348,35 @@ def build_adjudication_packet(result: Any, *, stage: str = "primary") -> Adjudic
         per_paper_packets[paper_id] = trimmed_by_claim
 
     evidence_excerpt_list: List[str] = []
-    for claim_packets in per_paper_packets.values():
-        for packets in claim_packets.values():
-            for candidate in packets:
-                excerpt = str(candidate.get("text_excerpt") or candidate.get("caption_excerpt") or "").strip()
-                if excerpt and excerpt not in evidence_excerpt_list:
-                    evidence_excerpt_list.append(excerpt)
-                if len(evidence_excerpt_list) >= (12 if stage == "stronger" else 8):
-                    break
-            if len(evidence_excerpt_list) >= (12 if stage == "stronger" else 8):
+    excerpt_groups = [
+        packets
+        for claim_packets in per_paper_packets.values()
+        for packets in claim_packets.values()
+    ]
+    max_excerpts = 12 if stage == "stronger" else 8
+    group_index = 0
+    while len(evidence_excerpt_list) < max_excerpts and any(
+        group_index < len(group) for group in excerpt_groups
+    ):
+        for group in excerpt_groups:
+            if group_index >= len(group):
+                continue
+            candidate = group[group_index]
+            excerpt = str(
+                candidate.get("text_excerpt") or candidate.get("caption_excerpt") or ""
+            ).strip()
+            normalized = re.sub(r"\s+", " ", excerpt).strip().casefold()
+            if excerpt and not any(
+                _excerpts_are_near_duplicates(
+                    normalized,
+                    re.sub(r"\s+", " ", existing).strip().casefold(),
+                )
+                for existing in evidence_excerpt_list
+            ):
+                evidence_excerpt_list.append(excerpt)
+            if len(evidence_excerpt_list) >= max_excerpts:
                 break
-        if len(evidence_excerpt_list) >= (12 if stage == "stronger" else 8):
-            break
+        group_index += 1
 
     return AdjudicationPacket(
         citation_set_key=str(getattr(result, "citation_set_key", "") or result.details.get("citation_set_key") or ""),

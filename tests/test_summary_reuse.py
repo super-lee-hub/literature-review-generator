@@ -12,6 +12,7 @@ from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.audit_record import AuditRecordV1
 from services.job_workspace import JobWorkspace
 from services.summary_reuse import (
+    SummaryCatalog,
     SummarySource,
     SummarySourceError,
     collect_summary_sources,
@@ -104,6 +105,122 @@ def _make_generator(tmp_path: Path, output_root: Path, *, project_name: str = "c
 def test_normalize_doi_canonicalizes_url_prefix_and_case() -> None:
     assert normalize_doi("https://doi.org/10.1000/ABC") == "10.1000/abc"
     assert normalize_doi("DOI:10.1000/ABC.") == "10.1000/abc"
+
+
+def test_summary_catalog_prefers_pdf_sha256_over_doi(tmp_path: Path) -> None:
+    source_path = tmp_path / "summaries.json"
+    matching_pdf = "a" * 64
+    source_path.write_text(
+        json.dumps(
+            [
+                {
+                    **_make_summary(
+                        title="Wrong PDF Version",
+                        authors=["Alice Example"],
+                        year="2024",
+                        doi="10.1000/shared",
+                    ),
+                    "paper_info": {
+                        "title": "Wrong PDF Version",
+                        "authors": ["Alice Example"],
+                        "year": "2024",
+                        "doi": "10.1000/shared",
+                        "source_pdf_fingerprint": "b" * 64,
+                    },
+                },
+                {
+                    **_make_summary(
+                        title="Exact PDF",
+                        authors=["Alice Example"],
+                        year="2024",
+                    ),
+                    "paper_info": {
+                        "title": "Exact PDF",
+                        "authors": ["Alice Example"],
+                        "year": "2024",
+                        "doi": "",
+                        "source_pdf_fingerprint": matching_pdf,
+                    },
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    catalog = SummaryCatalog.from_sources(
+        [
+            SummarySource(
+                path=str(source_path),
+                source_type="explicit",
+                priority=0,
+                label="fixture",
+            )
+        ]
+    )
+
+    match = catalog.resolve_for_paper(
+        {
+            "title": "Current Paper",
+            "authors": ["Alice Example"],
+            "year": "2024",
+            "doi": "10.1000/shared",
+            "pdf_sha256": matching_pdf,
+        }
+    )
+
+    assert match is not None
+    assert match.match_type == "pdf_sha256_exact"
+    assert match.winner is not None
+    assert match.winner.title == "Exact PDF"
+
+
+def test_summary_catalog_reuses_blank_doi_by_zotero_parent_key(tmp_path: Path) -> None:
+    source_path = tmp_path / "summaries.json"
+    source_path.write_text(
+        json.dumps(
+            [
+                {
+                    **_make_summary(
+                        title="Historical Title",
+                        authors=["Alice Example"],
+                        year="2024",
+                    ),
+                    "paper_info": {
+                        "title": "Historical Title",
+                        "authors": ["Alice Example"],
+                        "year": "2024",
+                        "doi": "",
+                        "source_pdf": str(tmp_path / "JS4CLN3C__historical.pdf"),
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    catalog = SummaryCatalog.from_sources(
+        [
+            SummarySource(
+                path=str(source_path),
+                source_type="explicit",
+                priority=0,
+                label="fixture",
+            )
+        ]
+    )
+
+    match = catalog.resolve_for_paper(
+        {
+            "title": "Current Metadata Title",
+            "authors": ["Different Author"],
+            "year": "2025",
+            "doi": "",
+            "zotero_parent_key": "JS4CLN3C",
+        }
+    )
+
+    assert match is not None
+    assert match.match_type == "zotero_parent_key_exact"
+    assert match.winner is not None
+    assert match.winner.zotero_parent_key == "JS4CLN3C"
 
 
 def test_apply_stage1_cross_run_reuse_uses_global_catalog_and_skips_non_matches(tmp_path: Path, monkeypatch) -> None:
@@ -240,7 +357,7 @@ def test_apply_stage1_cross_run_reuse_uses_multiple_historical_projects_and_non_
     assert reuse_report is not None
     assert {item["match_type"] for item in reuse_report["reused_papers"]} == {
         "doi_exact",
-        "canonical_paper_key_exact",
+        "title_author_year_exact",
     }
     winner_paths = {item["winner_source"]["path"] for item in reuse_report["reused_papers"]}
     assert any(path.endswith("first_summaries.json") for path in winner_paths)

@@ -494,13 +494,14 @@ def _run_adjudication_stage_checkpointed(
         stage=stage,
         route_hash=sanitized_route_hash(api_config),
     )
-    cached = store.load(key)
-    if cached is not None:
-        return cached
-    report = run_adjudication_stage(generator_instance, api_config, packet)
-    if isinstance(report, dict):
-        store.save(key, report)
-    return report
+    with store.single_flight(key):
+        cached = store.load(key)
+        if cached is not None:
+            return cached
+        report = run_adjudication_stage(generator_instance, api_config, packet)
+        if isinstance(report, dict):
+            store.save(key, report)
+        return report
 
 
 def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:

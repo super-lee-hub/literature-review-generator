@@ -1,5 +1,7 @@
 import io
 import json
+import sys
+from types import SimpleNamespace
 import zipfile
 from pathlib import Path
 
@@ -29,6 +31,56 @@ def _make_text_pdf(path: Path) -> None:
     page.insert_text((72, 72), "This is a test paper.\n" * 80)
     doc.save(path)
     doc.close()
+
+
+def test_pymupdf4llm_respects_configured_ocr_mode(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_to_markdown(_path: str, **kwargs: object) -> str:
+        calls.append(kwargs)
+        return "# Extracted"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pymupdf4llm",
+        SimpleNamespace(to_markdown=fake_to_markdown),
+    )
+
+    off_manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "enabled": "true",
+                "ocr_mode": "off",
+                "ocr_languages": "eng",
+            }
+        },
+        logger=None,
+    )
+    always_manager = PreprocessManager(
+        config={
+            "Preprocess": {
+                "enabled": "true",
+                "ocr_mode": "always",
+                "ocr_languages": "eng+chi_sim",
+            }
+        },
+        logger=None,
+    )
+
+    assert off_manager._extract_with_pymupdf4llm("paper.pdf") == "# Extracted"
+    assert always_manager._extract_with_pymupdf4llm("paper.pdf") == "# Extracted"
+    assert calls == [
+        {
+            "use_ocr": False,
+            "force_ocr": False,
+            "ocr_language": "eng",
+        },
+        {
+            "use_ocr": True,
+            "force_ocr": True,
+            "ocr_language": "eng+chi_sim",
+        },
+    ]
 
 
 def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monkeypatch) -> None:

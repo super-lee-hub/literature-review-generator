@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 from services.source_identity import (
@@ -174,3 +175,48 @@ def test_pdf_inspection_uses_first_page_author_and_year_without_doi_or_metadata(
     assert result.canonical_ready is True
     assert result.observed["authors"] == ["Alice Smith"]
     assert result.observed["year"] == "2024"
+
+
+def test_pdf_inspection_accepts_explicit_pinned_source_sha256(tmp_path) -> None:
+    pdf_path = tmp_path / "pinned-source.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n% deterministic frozen source\n")
+    source_hash = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+
+    result = inspect_pdf_identity(
+        _paper(
+            source_identity_policy="frozen-source-sha256-v1",
+            source_pdf_sha256=source_hash,
+        ),
+        str(pdf_path),
+    )
+
+    assert result.identity_verdict == "match"
+    assert result.canonical_ready is True
+    assert result.reasons == ("pinned_source_sha256_match",)
+    assert result.expected["source_pdf_sha256"] == source_hash
+
+
+def test_pdf_inspection_rejects_pinned_source_sha256_mismatch(tmp_path) -> None:
+    import fitz  # type: ignore
+
+    pdf_path = tmp_path / "wrong-pinned-source.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "Trust and Consumer Choice\nAlice Smith\nDOI 10.1234/trust.2024",
+    )
+    document.save(pdf_path)
+    document.close()
+
+    result = inspect_pdf_identity(
+        _paper(
+            source_identity_policy="frozen-source-sha256-v1",
+            source_pdf_sha256="f" * 64,
+        ),
+        str(pdf_path),
+    )
+
+    assert result.identity_verdict == "mismatch"
+    assert result.canonical_ready is False
+    assert result.reasons == ("pinned_source_sha256_mismatch",)

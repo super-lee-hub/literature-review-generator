@@ -742,12 +742,38 @@ def normalize_arbitration_output(
     return ArbitrationReport(
         source_candidates=[str(item) for item in raw_output.get("source_candidates", candidate_ids)],
         source_critiques=[str(item) for item in raw_output.get("source_critiques", critique_ids)],
-        candidate_scores={str(key): float(value) for key, value in scores.items()},
+        candidate_scores={
+            str(key): _normalize_candidate_score_value(value, candidate_id=str(key))
+            for key, value in scores.items()
+        },
         accepted_points=accepted,
         rejected_points=rejected,
         merged_strategy=str(raw_output.get("merged_strategy") or "provider_arbitration"),
         final_decision=final_decision,
         arbitrator_model=arbitrator_model,
+    )
+
+
+def _normalize_candidate_score_value(value: Any, *, candidate_id: str) -> float:
+    """Normalize provider candidate score scalars while failing closed on ambiguity."""
+    if isinstance(value, bool):
+        raise ValueError(f"candidate_scores[{candidate_id}] is bool, expected numeric score")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        return float(value)
+    if isinstance(value, dict):
+        for score_key in ("score", "value", "overall", "total", "final_score"):
+            if score_key in value:
+                return _normalize_candidate_score_value(
+                    value[score_key],
+                    candidate_id=f"{candidate_id}.{score_key}",
+                )
+        raise ValueError(
+            f"candidate_scores[{candidate_id}] is an object without an explicit numeric score"
+        )
+    raise ValueError(
+        f"candidate_scores[{candidate_id}] has unsupported type {type(value).__name__}"
     )
 
 

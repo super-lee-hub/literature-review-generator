@@ -5,6 +5,7 @@ from pathlib import Path
 
 import main
 from runtime.stage_contracts import SourceBundle
+from services.artifact_registry import ArtifactRegistry
 from services.job_runner import (
     JobRunRequest,
     JobRunResult,
@@ -12,6 +13,7 @@ from services.job_runner import (
     build_job_request_from_mapping,
     validate_job_request_options,
 )
+from services.job_workspace import JobWorkspace
 from services.queue_service import CancelToken
 
 
@@ -74,6 +76,27 @@ class _DummyGenerator:
 
     def load_existing_summaries(self):
         return True
+
+
+def test_artifact_tracking_uses_unregistered_operational_workspace_log(
+    tmp_path: Path,
+) -> None:
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    log_path = Path(workspace.log_path("job.log"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("operational log\n", encoding="utf-8")
+
+    produced, tracked_log, reports = JobRunner()._collect_artifact_tracking_info(
+        registry,
+        workspace,
+        None,
+    )
+
+    assert produced == []
+    assert tracked_log == str(log_path)
+    assert reports == []
+    assert registry.get("job_log") is None
 
 
 def test_job_runner_creates_workspace_and_pointer(tmp_path, monkeypatch) -> None:

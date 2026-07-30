@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
-from typing import Any, Callable, Dict, Iterable, Mapping, Sequence
+from typing import Any, Callable, Dict, Mapping
 
 
 OUTLINE_STAGE_HEALTH_TYPE = "outline_stage_health"
@@ -19,7 +19,12 @@ _FALLBACK_PROVENANCE = {"deterministic_fallback", "deterministic_topup"}
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def content_hash(value: Any) -> str:
@@ -46,6 +51,9 @@ class StageHealthEntryV1:
     fallback_provenance: str = "provider"
     degraded_reason: str = ""
     prompt_budget: Mapping[str, Any] = field(default_factory=dict)
+    prompt_context_present: bool = False
+    prompt_context_sha256: str = ""
+    requests: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
 
     @property
     def degraded(self) -> bool:
@@ -74,6 +82,9 @@ class StageHealthEntryV1:
             "degraded_reason": self.degraded_reason,
             "adoption_eligible": self.adoption_eligible,
             "prompt_budget": dict(self.prompt_budget),
+            "prompt_context_present": self.prompt_context_present,
+            "prompt_context_sha256": self.prompt_context_sha256,
+            "requests": [dict(item) for item in self.requests],
         }
 
     @classmethod
@@ -89,6 +100,13 @@ class StageHealthEntryV1:
             fallback_provenance=str(value.get("fallback_provenance") or "provider"),
             degraded_reason=str(value.get("degraded_reason") or ""),
             prompt_budget=dict(value.get("prompt_budget") or {}),
+            prompt_context_present=bool(value.get("prompt_context_present")),
+            prompt_context_sha256=str(value.get("prompt_context_sha256") or ""),
+            requests=tuple(
+                dict(item)
+                for item in value.get("requests") or ()
+                if isinstance(item, Mapping)
+            ),
         )
 
 
@@ -115,7 +133,7 @@ class OutlineStageHealthV1:
     def adoptable(self) -> bool:
         if not self.stages:
             return False
-        if self.execution_mode not in {"production", "test_dev"}:
+        if self.execution_mode not in {"production", "test_dev", "subagent_replay"}:
             return False
         return all(entry.adoption_eligible for entry in self.stages)
 
@@ -142,13 +160,19 @@ class OutlineStageHealthV1:
         result = cls(
             job_id=str(value.get("job_id") or ""),
             execution_mode=str(value.get("execution_mode") or ""),
-            stages=tuple(StageHealthEntryV1.from_dict(item) for item in value.get("stages") or ()),
+            stages=tuple(
+                StageHealthEntryV1.from_dict(item) for item in value.get("stages") or ()
+            ),
             source_final_outline_hash=str(value.get("source_final_outline_hash") or ""),
-            source_coverage_audit_hash=str(value.get("source_coverage_audit_hash") or ""),
+            source_coverage_audit_hash=str(
+                value.get("source_coverage_audit_hash") or ""
+            ),
             created_at=str(value.get("created_at") or ""),
         )
         if bool(value.get("adoptable")) != result.adoptable:
-            raise ValueError("outline_stage_health adoptable projection is inconsistent")
+            raise ValueError(
+                "outline_stage_health adoptable projection is inconsistent"
+            )
         return result
 
 
@@ -169,18 +193,59 @@ class StageHealthCollector:
             "status": "failed",
             "reason": "",
             "prompt_budget": dict(metadata.get("prompt_budget") or {}),
+            "prompt_context_present": bool(metadata.get("prompt_context_present")),
+            "prompt_context_sha256": str(metadata.get("prompt_context_sha256") or ""),
+            "configured_model": "",
+            "response_model": "",
+            "provider_response_id": "",
+            "request_started_at": "",
+            "request_completed_at": "",
+            "transport_status": "",
         }
         self._calls.append(call)
+
+        def capture_request_metadata() -> None:
+            call.update(
+                {
+                    "route": str(metadata.get("provider_route") or route),
+                    "configured_model": str(metadata.get("configured_model") or ""),
+                    "response_model": str(metadata.get("response_model") or ""),
+                    "provider_response_id": str(
+                        metadata.get("provider_response_id") or ""
+                    ),
+                    "request_started_at": str(metadata.get("request_started_at") or ""),
+                    "request_completed_at": str(
+                        metadata.get("request_completed_at") or ""
+                    ),
+                    "transport_status": str(metadata.get("transport_status") or ""),
+                    "attempt_count": int(metadata.get("attempt_count") or 0),
+                    "http_attempt_count": int(metadata.get("http_attempt_count") or 0),
+                    "http_status": metadata.get("http_status"),
+                    "error_kind": str(metadata.get("error_kind") or ""),
+                }
+            )
+
         if self._model_caller is None:
             call["reason"] = "model_caller_missing"
             raise RuntimeError(f"Outline stage {stage} requires a model caller")
         try:
             result = self._model_caller(route, prompt, metadata)
+            capture_request_metadata()
             call["output_hash"] = content_hash(result)
+            if result is None:
+                call["reason"] = "provider_returned_json_null"
+                raise ValueError(f"Outline stage {stage} returned null provider output")
+            if call["transport_status"] and call["transport_status"] != "success":
+                call["reason"] = f"provider_transport_status:{call['transport_status']}"
+                raise RuntimeError(
+                    f"Outline stage {stage} provider transport did not succeed"
+                )
             call["status"] = "succeeded"
             return result
         except BaseException as exc:
-            call["reason"] = f"{type(exc).__name__}:{exc}"
+            capture_request_metadata()
+            if not call["reason"]:
+                call["reason"] = f"{type(exc).__name__}:{exc}"
             raise
 
     def entry(
@@ -193,9 +258,21 @@ class StageHealthCollector:
         degraded_reason: str = "",
     ) -> StageHealthEntryV1:
         calls = [item for item in self._calls if item["stage"] == stage_name]
-        status = "succeeded" if calls and all(item["status"] == "succeeded" for item in calls) else "failed"
+        status = (
+            "succeeded"
+            if calls and all(item["status"] == "succeeded" for item in calls)
+            else "failed"
+        )
         reasons = [str(item["reason"]) for item in calls if item["reason"]]
         budget = calls[-1]["prompt_budget"] if calls else {}
+        context_presence = {bool(item["prompt_context_present"]) for item in calls}
+        context_hashes = {
+            str(item["prompt_context_sha256"])
+            for item in calls
+            if str(item["prompt_context_sha256"])
+        }
+        if len(context_presence) > 1 or len(context_hashes) > 1:
+            reasons.append("prompt_context_inconsistent")
         return StageHealthEntryV1(
             stage_name=stage_name,
             provider_route=route,
@@ -203,10 +280,41 @@ class StageHealthCollector:
             schema_valid=schema_valid,
             attempts=len(calls),
             input_hashes=tuple(str(item["input_hash"]) for item in calls),
-            output_hashes=tuple(str(item["output_hash"]) for item in calls if item["output_hash"]),
+            output_hashes=tuple(
+                str(item["output_hash"]) for item in calls if item["output_hash"]
+            ),
             fallback_provenance=fallback_provenance,
             degraded_reason=degraded_reason or ";".join(reasons),
             prompt_budget=budget,
+            prompt_context_present=bool(calls and context_presence == {True}),
+            prompt_context_sha256=(
+                next(iter(context_hashes)) if len(context_hashes) == 1 else ""
+            ),
+            requests=tuple(
+                {
+                    "stage_name": stage_name,
+                    "provider_route": str(item["route"]),
+                    "status": str(item["status"]),
+                    "configured_model": str(item.get("configured_model") or ""),
+                    "response_model": str(item.get("response_model") or ""),
+                    "provider_response_id": str(item.get("provider_response_id") or ""),
+                    "request_started_at": str(item.get("request_started_at") or ""),
+                    "request_completed_at": str(item.get("request_completed_at") or ""),
+                    "input_hash": str(item["input_hash"]),
+                    "output_hash": str(item["output_hash"]),
+                    "prompt_context_present": bool(item.get("prompt_context_present")),
+                    "prompt_context_sha256": str(
+                        item.get("prompt_context_sha256") or ""
+                    ),
+                    "transport_status": str(item.get("transport_status") or ""),
+                    "attempt_count": int(item.get("attempt_count") or 0),
+                    "http_attempt_count": int(item.get("http_attempt_count") or 0),
+                    "http_status": item.get("http_status"),
+                    "error_kind": str(item.get("error_kind") or ""),
+                    "failure_reason": str(item.get("reason") or ""),
+                }
+                for item in calls
+            ),
         )
 
     def has_calls(self, stage_name: str) -> bool:

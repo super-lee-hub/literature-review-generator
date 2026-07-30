@@ -39,6 +39,30 @@ def test_stage_health_round_trip_and_test_double_is_adoptable():
     assert verify_adoption_prerequisites(final, audit, restored) == (True, "")
 
 
+def test_hash_bound_subagent_replay_health_is_adoptable():
+    final, audit = _final_audit()
+    entry = StageHealthEntryV1(
+        stage_name="outline_candidates",
+        provider_route="Outline_API",
+        execution_status="succeeded",
+        schema_valid=True,
+        attempts=1,
+        input_hashes=("prompt-hash",),
+        output_hashes=("response-hash",),
+        fallback_provenance="codex_native_subagent",
+    )
+    health = OutlineStageHealthV1(
+        job_id="job-health",
+        execution_mode="subagent_replay",
+        stages=(entry,),
+        source_final_outline_hash=compute_content_hash(final.to_dict()),
+        source_coverage_audit_hash=compute_content_hash(audit.to_dict()),
+    )
+
+    assert health.adoptable is True
+    assert verify_adoption_prerequisites(final, audit, health) == (True, "")
+
+
 def test_missing_stale_and_production_fallback_health_fail_closed():
     final, audit = _final_audit()
     assert verify_adoption_prerequisites(final, audit, None)[0] is False
@@ -68,6 +92,40 @@ def test_missing_stale_and_production_fallback_health_fail_closed():
     ok, reason = verify_adoption_prerequisites(final, audit, degraded)
     assert ok is False
     assert "degraded" in reason.lower()
+
+
+def test_explicit_arbitration_fallback_adoption_can_pass_when_upstream_is_clean():
+    final, audit = _final_audit()
+    clean = make_test_double_entry("outline_candidates", "Outline_API", {}, {})
+    fallback = StageHealthEntryV1(
+        stage_name="outline_arbitration",
+        provider_route="Outline_API",
+        execution_status="succeeded",
+        schema_valid=True,
+        attempts=1,
+        input_hashes=("in",),
+        output_hashes=("out",),
+        fallback_provenance="deterministic_fallback",
+        degraded_reason="provider_arbitration_failed:ValueError:Unexpected arbitration output type: NoneType",
+    )
+    health = OutlineStageHealthV1(
+        job_id="job-health",
+        execution_mode="production",
+        stages=(clean, fallback),
+        source_final_outline_hash=compute_content_hash(final.to_dict()),
+        source_coverage_audit_hash=compute_content_hash(audit.to_dict()),
+    )
+
+    assert verify_adoption_prerequisites(final, audit, health)[0] is False
+    assert (
+        verify_adoption_prerequisites(
+            final,
+            audit,
+            health,
+            allow_arbitration_fallback=True,
+        )
+        == (True, "")
+    )
 
 
 def test_pipeline_persists_independent_health_sidecar_without_versioning_old_artifacts(tmp_path):

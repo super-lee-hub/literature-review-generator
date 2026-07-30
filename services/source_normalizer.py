@@ -6,14 +6,23 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Mapping, cast
 
 from models import PaperInfo
-from services.paper_identity import build_paper_key, normalize_doi
+from services.paper_identity import (
+    build_canonical_paper_key,
+    build_paper_key,
+    normalize_doi,
+)
 
 
 def _safe_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _paper_key_from_metadata(paper: Mapping[str, Any]) -> str:
+def _paper_key_from_metadata(
+    source_mode: str,
+    paper: Mapping[str, Any],
+) -> str:
+    if source_mode == "zotero":
+        return build_canonical_paper_key(paper)
     return build_paper_key(paper)
 
 
@@ -50,7 +59,7 @@ def normalize_source_papers(source_mode: str, papers: Iterable[Mapping[str, Any]
     normalized: List[SourcePaperDescriptor] = []
     for index, paper in enumerate(papers):
         pdf_path = _safe_text(paper.get("pdf_path"))
-        canonical_key = _paper_key_from_metadata(paper)
+        canonical_key = _paper_key_from_metadata(source_mode, paper)
         aliases = [canonical_key]
         title = _safe_text(paper.get("title"))
         doi = normalize_doi(paper.get("doi"))

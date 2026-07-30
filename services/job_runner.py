@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import glob
@@ -10,7 +11,7 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Optional, cast
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.source_inventory import (
     SourceInventoryDiagnosticV1,
@@ -204,6 +205,8 @@ def validate_job_request_options(request: Any) -> Optional[str]:
     reuse_stage1 = bool(getattr(request, "reuse_stage1", False))
     reuse_summary_files = getattr(request, "reuse_summary_files", ()) or ()
     action = str(getattr(request, "action", "analyze") or "analyze")
+    free_mode_profile = str(getattr(request, "free_mode_profile", "") or "").strip()
+    free_mode_idea = str(getattr(request, "free_mode_idea", "") or "").strip()
 
     if summary_file and action not in {"generate_outline", "generate_review", "generate_section", "validate_review"}:
         return "--summary-file can only be used with generate-outline, generate-review, generate-section, or validate-review"
@@ -217,6 +220,10 @@ def validate_job_request_options(request: Any) -> Optional[str]:
         return "--reuse-stage1 can only be used with stage1 analysis or --run-all"
     if reuse_summary_files and not reuse_stage1:
         return "--reuse-summary-file requires --reuse-stage1"
+    if free_mode_profile and free_mode_idea:
+        return "--free-mode-profile and --free-mode-idea are mutually exclusive"
+    if free_mode_profile and not os.path.isfile(os.path.abspath(free_mode_profile)):
+        return f"--free-mode-profile does not exist: {os.path.abspath(free_mode_profile)}"
     return None
 
 
@@ -551,6 +558,13 @@ class JobRunner:
         return produced_artifacts, log_path, report_paths
 
     def _request_snapshot(self, request: JobRunRequest) -> dict[str, Any]:
+        profile_path = (
+            os.path.abspath(request.free_mode_profile)
+            if request.free_mode_profile
+            else ""
+        )
+        profile_hash = file_sha256(profile_path) if profile_path and os.path.isfile(profile_path) else ""
+        idea_text = str(request.free_mode_idea or "")
         return {
             "action": request.action,
             "project_name": request.project_name or "",
@@ -562,6 +576,13 @@ class JobRunner:
             "generate_section": request.generate_section,
             "retry_failed": request.retry_failed,
             "concept": request.concept or "",
+            "free_mode_profile": profile_path,
+            "free_mode_profile_sha256": profile_hash,
+            "free_mode_idea_sha256": (
+                hashlib.sha256(idea_text.encode("utf-8")).hexdigest()
+                if idea_text
+                else ""
+            ),
             "gui": bool(request.gui),
             "requested_stages": list(request.requested_stages) if request.requested_stages is not None else None,
             "validation_required": request.validation_required,

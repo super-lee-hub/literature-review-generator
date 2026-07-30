@@ -1151,7 +1151,12 @@ class PreprocessManager:
             try:
                 # 使用线程锁确保同一时间只有一个线程使用 PyMuPDF4LLM
                 with self._pymupdf4llm_lock:
-                    markdown_output = pymupdf4llm.to_markdown(pdf_path)
+                    markdown_output = pymupdf4llm.to_markdown(
+                        pdf_path,
+                        use_ocr=self.ocr_mode != "off",
+                        force_ocr=self.ocr_mode == "always",
+                        ocr_language=self.ocr_languages,
+                    )
                     if isinstance(markdown_output, str):
                         return markdown_output
                     if isinstance(markdown_output, list):

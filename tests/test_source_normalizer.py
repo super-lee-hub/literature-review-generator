@@ -41,3 +41,23 @@ def test_source_normalizer_aligns_zotero_inputs() -> None:
     assert descriptors[0].canonical_paper_key == "10.1000/demo"
     assert "10.1000/demo" in descriptors[0].paper_key_aliases
     assert descriptors[0].metadata_confidence == "high"
+
+
+def test_source_normalizer_uses_canonical_title_author_year_for_zotero() -> None:
+    descriptors = normalize_source_papers(
+        "zotero",
+        [
+            {
+                "title": "Paper Without DOI",
+                "authors": ["Alice Smith", "Bob Jones"],
+                "year": "2024",
+                "doi": "",
+                "pdf_path": "D:/library/paper-without-doi.pdf",
+            }
+        ],
+    )
+
+    assert (
+        descriptors[0].canonical_paper_key
+        == "paper without doi|smith|2024"
+    )

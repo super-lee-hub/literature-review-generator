@@ -18,7 +18,9 @@ IdentityVerdict = Literal["match", "ambiguous", "mismatch"]
 ArtifactStatus = Literal["ready", "quarantined", "invalid"]
 
 IDENTITY_POLICY_VERSION = "source-identity-v1"
+PINNED_SOURCE_HASH_POLICY = "frozen-source-sha256-v1"
 _DOI_SEARCH = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9&]+", re.IGNORECASE)
+_SHA256 = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 
 
 def _stable_hash(payload: Mapping[str, Any]) -> str:
@@ -294,13 +296,84 @@ def inspect_pdf_identity(
             "first_page_text": first_page_text,
         }
     )
-    return evaluate_source_identity(
+    result = evaluate_source_identity(
         expected,
         observed,
         source_path=str(path),
         candidate_hash=candidate_hash,
         evidence_hash=evidence_hash,
         diagnostics=tuple(diagnostics),
+    )
+    policy = str(expected.get("source_identity_policy") or "").strip()
+    if not policy:
+        return result
+
+    expected_hash = str(expected.get("source_pdf_sha256") or "").strip().casefold()
+    expected_payload = dict(result.expected)
+    expected_payload.update(
+        {
+            "source_identity_policy": policy,
+            "source_pdf_sha256": expected_hash,
+        }
+    )
+    if policy != PINNED_SOURCE_HASH_POLICY:
+        return SourceIdentityResultV1(
+            identity_verdict="mismatch",
+            artifact_status="invalid",
+            expected=expected_payload,
+            observed=result.observed,
+            reasons=("unsupported_source_identity_policy",),
+            diagnostics=result.diagnostics,
+            source_path=result.source_path,
+            candidate_hash=candidate_hash,
+            evidence_hash=evidence_hash,
+        )
+    if _SHA256.fullmatch(expected_hash) is None:
+        return SourceIdentityResultV1(
+            identity_verdict="mismatch",
+            artifact_status="invalid",
+            expected=expected_payload,
+            observed=result.observed,
+            reasons=("invalid_pinned_source_sha256",),
+            diagnostics=result.diagnostics,
+            source_path=result.source_path,
+            candidate_hash=candidate_hash,
+            evidence_hash=evidence_hash,
+        )
+    if not candidate_hash:
+        return SourceIdentityResultV1(
+            identity_verdict="ambiguous",
+            artifact_status="quarantined",
+            expected=expected_payload,
+            observed=result.observed,
+            reasons=("candidate_sha256_unavailable",),
+            diagnostics=result.diagnostics,
+            source_path=result.source_path,
+            candidate_hash=candidate_hash,
+            evidence_hash=evidence_hash,
+        )
+    if candidate_hash != expected_hash:
+        return SourceIdentityResultV1(
+            identity_verdict="mismatch",
+            artifact_status="quarantined",
+            expected=expected_payload,
+            observed=result.observed,
+            reasons=("pinned_source_sha256_mismatch",),
+            diagnostics=result.diagnostics,
+            source_path=result.source_path,
+            candidate_hash=candidate_hash,
+            evidence_hash=evidence_hash,
+        )
+    return SourceIdentityResultV1(
+        identity_verdict="match",
+        artifact_status="ready",
+        expected=expected_payload,
+        observed=result.observed,
+        reasons=("pinned_source_sha256_match",),
+        diagnostics=result.diagnostics,
+        source_path=result.source_path,
+        candidate_hash=candidate_hash,
+        evidence_hash=evidence_hash,
     )
 
 

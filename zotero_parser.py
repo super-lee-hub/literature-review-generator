@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import logging
-import os
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, cast
@@ -241,6 +240,8 @@ _FIELD_ALIASES: Dict[str, str] = {
     "期刊": "journal",
     "刊名": "publication_title",
     "doi": "doi",
+    "source pdf sha256": "source_pdf_sha256",
+    "source identity policy": "source_identity_policy",
     "issue": "issue",
     "期号": "issue",
     "issn": "issn",

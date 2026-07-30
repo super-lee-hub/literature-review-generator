@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import cast
 
 import main
@@ -46,6 +47,49 @@ def _resume_report(workspace: JobWorkspace) -> ResumeStateReport:
         checkpoint_file=workspace.checkpoint_path(f"{workspace.project_name}_checkpoint.json"),
         fingerprint_bundle={"request": "demo"},
     )
+
+
+def test_workspace_log_remains_operational_and_outside_immutable_registry(
+    tmp_path,
+) -> None:
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "demo")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    config = ConfigDict(
+        {
+            "Paths": {"output_path": str(tmp_path / "output")},
+            "Validation": {"stage1_enabled": "false", "stage2_enabled": "false"},
+        }
+    )
+    compat_view = CompatConfigView.from_config(config)
+    logger = logging.getLogger(f"workspace-log-{workspace.job_id}")
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+
+    generator = main.LiteratureReviewGenerator(
+        project_name="demo",
+        pdf_folder=str(tmp_path),
+    )
+    generator.logger = cast(main.CustomLogger, logger)
+    generator.config = config
+    generator.bind_job_workspace(
+        workspace=workspace,
+        artifact_registry=registry,
+        compat_config=compat_view,
+        fingerprint_bundle={"request": "demo"},
+        resume_state_report=_resume_report(workspace),
+    )
+    logger.info("late workspace log entry")
+    assert generator._workspace_log_handler is not None
+    generator._workspace_log_handler.flush()
+
+    assert registry.get("job_log") is None
+    with open(generator.workspace_log_path, "r", encoding="utf-8") as handle:
+        log_text = handle.read()
+    assert "late workspace log entry" in log_text
+    logger.removeHandler(generator._workspace_log_handler)
+    generator._workspace_log_handler.close()
+    generator._workspace_log_handler = None
 
 
 def test_save_summaries_writes_progress_snapshot_and_registry_record(tmp_path) -> None:

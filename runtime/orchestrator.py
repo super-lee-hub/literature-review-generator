@@ -434,6 +434,187 @@ class AgentRuntimeBridge:
             metadata={"outline_path": outline_path},
         )
 
+    def persist_outline_v2_replay(
+        self,
+        session: AgentRuntimeSession,
+        *,
+        response_manifest_path: str,
+        adopted_by: str,
+        adoption_reason: str,
+        producer: str = "runtime.orchestrator.AgentRuntimeBridge.persist_outline_v2_replay",
+    ) -> StageResult:
+        """Run Outline v2 from hash-bound subagent responses and adopt it locally."""
+
+        from dataclasses import replace
+
+        from outline.pipeline import V2Pipeline
+        from runtime.outline_v2_replay import (
+            OutlineV2ReplayCaller,
+            OutlineV2ReplayError,
+        )
+
+        generator = session.generator
+        if not generator._outline_v2_enabled():
+            raise RuntimeError("Outline v2 replay requires Outline Intelligence v2")
+
+        replay = OutlineV2ReplayCaller(response_manifest_path)
+        replay.verify_artifacts()
+        replay_dependencies: list[ArtifactDependencyRef] = []
+        for binding in replay.artifact_bindings:
+            if file_sha256(binding.path) != binding.content_hash:
+                raise OutlineV2ReplayError(
+                    "Outline v2 replay evidence is missing or stale: "
+                    f"{binding.artifact_kind} {binding.call_index}"
+                )
+            record = session.context.registry.register_file(
+                artifact_role=f"outline_v2_subagent_{binding.artifact_kind}",
+                artifact_type=f"outline_v2_subagent_{binding.artifact_kind}",
+                artifact_version="v1",
+                path=binding.path,
+                producer=producer,
+                artifact_id=(
+                    f"outline_v2_subagent_{binding.artifact_kind}:"
+                    f"{binding.call_index:03d}"
+                ),
+                metadata={"call_index": binding.call_index},
+            )
+            replay_dependencies.append(
+                ArtifactDependencyRef(
+                    artifact_type=record.artifact_type,
+                    path=record.path,
+                    content_hash=record.content_hash,
+                    dependency_kind="local_job",
+                    job_id=record.job_id,
+                    artifact_id=record.artifact_id,
+                )
+            )
+
+        replay_manifest = session.context.registry.register_file(
+            artifact_role="outline_v2_subagent_response_manifest",
+            artifact_type="outline_v2_subagent_response_manifest",
+            artifact_version="v1",
+            path=replay.manifest_path,
+            producer=producer,
+            artifact_id="outline_v2_subagent_response_manifest",
+            depends_on=replay_dependencies,
+            metadata={
+                "expected_call_count": replay.expected_call_count,
+                "subagent_run_ids": list(replay.subagent_run_ids),
+            },
+        )
+        replay_manifest_dependency = ArtifactDependencyRef(
+            artifact_type=replay_manifest.artifact_type,
+            path=replay_manifest.path,
+            content_hash=replay_manifest.content_hash,
+            dependency_kind="local_job",
+            job_id=replay_manifest.job_id,
+            artifact_id=replay_manifest.artifact_id,
+        )
+
+        compat = generator._ensure_compat_config()
+        config_errors = compat.validate_outline_v2_config()
+        if config_errors:
+            raise RuntimeError(
+                "Outline v2 replay configuration is invalid: "
+                + "; ".join(str(error) for error in config_errors)
+            )
+        pipeline = V2Pipeline(
+            job_id=session.context.workspace.job_id,
+            summaries=[dict(summary) for summary in generator.summaries],
+            config_view=compat,
+            artifact_registry=session.context.registry,
+            workspace=session.context.workspace,
+            output_dir=generator.output_dir or "",
+            project_name=generator.project_name or "review",
+            model_caller=replay,
+            model_dependencies=[replay_manifest_dependency],
+            logger=generator.logger,
+        )
+        result = pipeline.run(
+            candidate_count=compat.outline_candidate_count(),
+            test_dev_mode=False,
+            generator_model=compat.outline_model(),
+            structure_critic=compat.structure_critic_model(),
+            coverage_critic=compat.coverage_critic_model(),
+            arbitrator_model=compat.arbitrator_model(),
+            paper_artifacts=generator._load_paper_artifacts_for_outline_v2(),
+        )
+        replay.assert_consumed()
+        if not result.ok:
+            raise RuntimeError(
+                "Outline v2 replay failed: " + "; ".join(str(error) for error in result.errors)
+            )
+        if result.stage_health is None:
+            raise RuntimeError("Outline v2 replay produced no stage health evidence")
+        result.stage_health = replace(
+            result.stage_health,
+            execution_mode="subagent_replay",
+            stages=tuple(
+                replace(
+                    entry,
+                    fallback_provenance=(
+                        "codex_native_subagent"
+                        if entry.fallback_provenance == "provider"
+                        else entry.fallback_provenance
+                    ),
+                )
+                for entry in result.stage_health.stages
+            ),
+        )
+
+        pipeline.persist_artifacts(result)
+        adopted, adopted_path, adoption_message = pipeline.adopt(
+            result,
+            adopted_by=adopted_by,
+        )
+        if adopted is None or not adopted_path:
+            raise RuntimeError(
+                "Outline v2 replay explicit adoption failed: " + adoption_message
+            )
+        adopted_record = session.context.registry.get("adopted_final_outline")
+        if adopted_record is None or adopted_record.status != "ready":
+            raise RuntimeError("Outline v2 replay did not register an adopted outline")
+
+        manifest_run_id = (
+            "outline-v2-replay:" + replay_manifest.content_hash[:16]
+        )
+        self._append_stage_trace_entries(
+            session,
+            self._build_generation_trace_entries(
+                stage_name="stage2_outline",
+                producer=producer,
+                subagent_run_id=manifest_run_id,
+                subagent_step_name="subagent_outline_v2_responses_complete",
+                local_step_name="persist_and_adopt_outline_v2_replay",
+                subagent_metadata={
+                    "model_call_count": replay.expected_call_count,
+                    "subagent_run_ids": list(replay.subagent_run_ids),
+                },
+                local_metadata={
+                    "adopted_outline_path": adopted_path,
+                    "adopted_by": adopted_by,
+                    "adoption_reason": adoption_reason,
+                    "response_manifest_hash": replay_manifest.content_hash,
+                },
+            ),
+        )
+        return StageResult(
+            stage_name="stage2_outline",
+            success=True,
+            artifacts=[
+                self._artifact_ref_from_record(adopted_record),
+                self._artifact_ref_from_record(replay_manifest),
+            ],
+            metadata={
+                "outline_mode": "v2_subagent_replay",
+                "stage_health_artifact_id": "outline_stage_health",
+                "model_call_count": replay.expected_call_count,
+                "response_manifest_path": replay_manifest.path,
+                "response_manifest_hash": replay_manifest.content_hash,
+                "adoption_message": adoption_message,
+            },
+        )
+
     def persist_review_chain(
         self,
         session: AgentRuntimeSession,

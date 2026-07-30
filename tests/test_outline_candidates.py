@@ -164,6 +164,211 @@ class TestProductionCandidateGeneration:
         assert candidates.candidate_count == 2
         assert calls == [("Outline_API", "outline_candidates"), ("Outline_API", "outline_candidates")]
 
+    def test_production_retries_single_strategy_when_sections_are_missing(self):
+        lit_map = build_literature_map(_sample_summaries(), "job-semantic-retry")
+        flow = build_synthesis_flow(lit_map, "job-semantic-retry")
+        flow_steps = [step.flow_step_id for step in flow.flow_steps if not step.placeholder_flow]
+        paper_keys = [node.paper_key for node in lit_map.paper_nodes]
+        valid_sections = _valid_provider_sections(flow_steps, paper_keys)
+        calls = []
+
+        def fake_caller(route, prompt, metadata):
+            candidate_index = int(metadata["candidate_index"])
+            semantic_retry = int(metadata.get("semantic_retry") or 0)
+            calls.append((candidate_index, semantic_retry))
+            if candidate_index in {2, 3} and semantic_retry == 0:
+                return {"candidates": [{"candidate_id": f"candidate_{candidate_index}"}]}
+            return {
+                "candidates": [
+                    {
+                        "candidate_id": f"candidate_{candidate_index}",
+                        "sections": valid_sections,
+                    }
+                ]
+            }
+
+        candidates, report = generate_candidates_production_with_report(
+            lit_map,
+            flow,
+            3,
+            "Outline_API",
+            fake_caller,
+        )
+
+        assert candidates.candidate_count == 3
+        assert [candidate.candidate_id for candidate in candidates.candidates] == [
+            "candidate_1",
+            "candidate_2",
+            "candidate_3",
+        ]
+        assert calls == [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1)]
+        assert report["provider_valid"] == 3
+        assert report["fallback_triggered"] is False
+        assert report["provider_strategy_errors"][0]["recovered_by_semantic_retry"] is True
+        assert all(
+            validate_candidate(candidate, lit_map, flow, strict=True) == []
+            for candidate in candidates.candidates
+        )
+
+    def test_production_semantic_retry_can_continue_with_two_valid_candidates(self):
+        lit_map = build_literature_map(_sample_summaries(), "job-semantic-retry-two-valid")
+        flow = build_synthesis_flow(lit_map, "job-semantic-retry-two-valid")
+        flow_steps = [step.flow_step_id for step in flow.flow_steps if not step.placeholder_flow]
+        paper_keys = [node.paper_key for node in lit_map.paper_nodes]
+        valid_sections = _valid_provider_sections(flow_steps, paper_keys)
+        calls = []
+
+        def fake_caller(route, prompt, metadata):
+            candidate_index = int(metadata["candidate_index"])
+            semantic_retry = int(metadata.get("semantic_retry") or 0)
+            calls.append((candidate_index, semantic_retry))
+            if candidate_index == 1:
+                return {
+                    "candidates": [
+                        {
+                            "candidate_id": "provider_should_be_forced_to_candidate_1",
+                            "sections": valid_sections,
+                        }
+                    ]
+                }
+            if candidate_index == 2 and semantic_retry == 1:
+                return {
+                    "candidates": [
+                        {
+                            "candidate_id": "provider_should_be_forced_to_candidate_2",
+                            "sections": valid_sections,
+                        }
+                    ]
+                }
+            return {"candidates": [{"candidate_id": f"candidate_{candidate_index}", "sections": []}]}
+
+        candidates, report = generate_candidates_production_with_report(
+            lit_map,
+            flow,
+            3,
+            "Outline_API",
+            fake_caller,
+        )
+
+        assert calls == [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1)]
+        assert report["minimum_viable_count"] == 2
+        assert report["provider_valid"] == 2
+        assert report["fallback_triggered"] is False
+        assert report["fallback_valid"] == 0
+        assert report["final_valid_count"] == 2
+        assert report["pipeline_continued"] is True
+        assert [
+            (item["candidate_index"], item["recovered_by_semantic_retry"])
+            for item in report["provider_strategy_errors"]
+        ] == [(2, True), (3, False)]
+        assert [candidate.candidate_id for candidate in candidates.candidates] == [
+            "candidate_1",
+            "candidate_2",
+        ]
+        assert all(
+            validate_candidate(candidate, lit_map, flow, strict=True) == []
+            for candidate in candidates.candidates
+        )
+
+    def test_production_semantic_retry_fails_closed_when_below_minimum_viable(self):
+        lit_map = build_literature_map(_sample_summaries(), "job-semantic-retry-below-minimum")
+        flow = build_synthesis_flow(lit_map, "job-semantic-retry-below-minimum")
+        flow_steps = [step.flow_step_id for step in flow.flow_steps if not step.placeholder_flow]
+        paper_keys = [node.paper_key for node in lit_map.paper_nodes]
+        valid_sections = _valid_provider_sections(flow_steps, paper_keys)
+        calls = []
+
+        def fake_caller(route, prompt, metadata):
+            candidate_index = int(metadata["candidate_index"])
+            semantic_retry = int(metadata.get("semantic_retry") or 0)
+            calls.append((candidate_index, semantic_retry))
+            if candidate_index == 1:
+                return {
+                    "candidates": [
+                        {
+                            "candidate_id": "provider_should_be_forced_to_candidate_1",
+                            "sections": valid_sections,
+                        }
+                    ]
+                }
+            return {"candidates": [{"candidate_id": f"candidate_{candidate_index}", "sections": []}]}
+
+        with pytest.raises(CandidateGenerationError) as excinfo:
+            generate_candidates_production_with_report(
+                lit_map,
+                flow,
+                3,
+                "Outline_API",
+                fake_caller,
+            )
+
+        report = excinfo.value.report
+        assert calls == [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1)]
+        assert report["minimum_viable_count"] == 2
+        assert report["provider_valid"] == 1
+        assert report["fallback_triggered"] is False
+        assert report["fallback_valid"] == 0
+        assert report["final_valid_count"] == 1
+        assert report["pipeline_continued"] is False
+        assert [
+            (item["candidate_index"], item["recovered_by_semantic_retry"])
+            for item in report["provider_strategy_errors"]
+        ] == [(2, False), (3, False)]
+        assert "minimum viable 2" in str(excinfo.value)
+
+    def test_production_unparseable_single_strategy_does_not_semantic_retry(self):
+        lit_map = build_literature_map(_sample_summaries(), "job-semantic-no-retry-parse")
+        flow = build_synthesis_flow(lit_map, "job-semantic-no-retry-parse")
+        flow_steps = [step.flow_step_id for step in flow.flow_steps if not step.placeholder_flow]
+        paper_keys = [node.paper_key for node in lit_map.paper_nodes]
+        valid_sections = _valid_provider_sections(flow_steps, paper_keys)
+        calls = []
+
+        def fake_caller(route, prompt, metadata):
+            candidate_index = int(metadata["candidate_index"])
+            semantic_retry = int(metadata.get("semantic_retry") or 0)
+            calls.append((candidate_index, semantic_retry))
+            if candidate_index == 1 and semantic_retry == 0:
+                return None
+            if candidate_index == 1:
+                raise AssertionError("unparseable provider output must not trigger semantic retry")
+            return {
+                "candidates": [
+                    {
+                        "candidate_id": f"provider_should_be_forced_to_candidate_{candidate_index}",
+                        "sections": valid_sections,
+                    }
+                ]
+            }
+
+        candidates, report = generate_candidates_production_with_report(
+            lit_map,
+            flow,
+            3,
+            "Outline_API",
+            fake_caller,
+        )
+
+        assert calls == [(1, 0), (2, 0), (3, 0)]
+        assert report["minimum_viable_count"] == 2
+        assert report["provider_valid"] == 2
+        assert report["fallback_triggered"] is False
+        assert report["final_valid_count"] == 2
+        assert report["pipeline_continued"] is True
+        assert report["provider_strategy_errors"][0]["candidate_index"] == 1
+        assert report["provider_strategy_errors"][0]["recovered_by_semantic_retry"] is False
+        assert report["provider_strategy_errors"][0]["attempts"] == [
+            {
+                "attempt": 1,
+                "top_level_keys": "NoneType",
+                "reason": "Unexpected candidate output type: NoneType",
+            }
+        ]
+        assert [candidate.candidate_id for candidate in candidates.candidates] == [
+            "candidate_2",
+            "candidate_3",
+        ]
+
     def test_normalizes_wrapped_outline_candidate_aliases(self):
         lit_map = build_literature_map(_sample_summaries(), "job-001")
         flow = build_synthesis_flow(lit_map, "job-001")

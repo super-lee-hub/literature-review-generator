@@ -4,6 +4,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 from services.paper_identity import (
@@ -34,13 +35,22 @@ class SummaryRecord:
     source: SummarySource
     record_index: int
     title: str
+    pdf_sha256: str
     doi: str
+    zotero_parent_key: str
     canonical_paper_key: str
     title_author_year_key: str
 
     @property
     def unique_identity(self) -> str:
-        return self.doi or self.canonical_paper_key or self.title_author_year_key or f"{self.source.path}#{self.record_index}"
+        return (
+            self.pdf_sha256
+            or self.doi
+            or self.zotero_parent_key
+            or self.canonical_paper_key
+            or self.title_author_year_key
+            or f"{self.source.path}#{self.record_index}"
+        )
 
 
 @dataclass(frozen=True)
@@ -178,6 +188,91 @@ def _summary_paper_info(summary: Mapping[str, Any]) -> Mapping[str, Any]:
         if isinstance(paper_metadata, Mapping):
             return paper_metadata
     return {}
+
+
+def normalize_pdf_sha256(value: Any) -> str:
+    candidate = str(value or "").strip().casefold()
+    if re.fullmatch(r"[0-9a-f]{64}", candidate):
+        return candidate
+    return ""
+
+
+def normalize_zotero_parent_key(value: Any) -> str:
+    candidate = str(value or "").strip().upper()
+    if re.fullmatch(r"[A-Z0-9]{8}", candidate):
+        return candidate
+    return ""
+
+
+def paper_pdf_sha256(paper: Mapping[str, Any]) -> str:
+    descriptor = paper.get("source_descriptor")
+    descriptor = descriptor if isinstance(descriptor, Mapping) else {}
+    for value in (
+        paper.get("pdf_sha256"),
+        paper.get("source_pdf_sha256"),
+        paper.get("source_pdf_fingerprint"),
+        descriptor.get("source_pdf_sha256"),
+        descriptor.get("source_pdf_fingerprint"),
+    ):
+        normalized = normalize_pdf_sha256(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def summary_pdf_sha256(summary: Mapping[str, Any]) -> str:
+    paper_info = _summary_paper_info(summary)
+    for value in (
+        paper_pdf_sha256(paper_info),
+        summary.get("source_pdf_sha256"),
+        summary.get("source_pdf_fingerprint"),
+    ):
+        normalized = normalize_pdf_sha256(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def paper_zotero_parent_key(paper: Mapping[str, Any]) -> str:
+    descriptor = paper.get("source_descriptor")
+    descriptor = descriptor if isinstance(descriptor, Mapping) else {}
+    for value in (
+        paper.get("zotero_parent_key"),
+        paper.get("zotero_key"),
+        paper.get("paper_id"),
+        descriptor.get("zotero_parent_key"),
+        descriptor.get("zotero_key"),
+    ):
+        normalized = normalize_zotero_parent_key(value)
+        if normalized:
+            return normalized
+
+    for value in (
+        paper.get("source_pdf"),
+        paper.get("pdf_path"),
+        paper.get("source_paper_id"),
+        descriptor.get("source_pdf"),
+    ):
+        filename = Path(str(value or "")).name
+        match = re.match(r"^([A-Z0-9]{8})__", filename, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    return ""
+
+
+def summary_zotero_parent_key(summary: Mapping[str, Any]) -> str:
+    paper_info = _summary_paper_info(summary)
+    direct = paper_zotero_parent_key(paper_info)
+    if direct:
+        return direct
+    for value in (
+        summary.get("zotero_parent_key"),
+        summary.get("zotero_key"),
+    ):
+        normalized = normalize_zotero_parent_key(value)
+        if normalized:
+            return normalized
+    return ""
 
 
 def summary_success(summary: Mapping[str, Any]) -> bool:
@@ -396,13 +491,19 @@ class SummaryCatalog:
         self.sources = list(sources)
         self.records = list(records)
         self.rejected_candidates = list(rejected_candidates)
+        self._by_pdf_sha256: dict[str, list[SummaryRecord]] = defaultdict(list)
         self._by_doi: dict[str, list[SummaryRecord]] = defaultdict(list)
+        self._by_zotero_parent_key: dict[str, list[SummaryRecord]] = defaultdict(list)
         self._by_paper_key: dict[str, list[SummaryRecord]] = defaultdict(list)
         self._by_title_author_year: dict[str, list[SummaryRecord]] = defaultdict(list)
 
         for record in self.records:
+            if record.pdf_sha256:
+                self._by_pdf_sha256[record.pdf_sha256].append(record)
             if record.doi:
                 self._by_doi[record.doi].append(record)
+            if record.zotero_parent_key:
+                self._by_zotero_parent_key[record.zotero_parent_key].append(record)
             if record.canonical_paper_key:
                 self._by_paper_key[record.canonical_paper_key].append(record)
             if record.title_author_year_key:
@@ -466,7 +567,9 @@ class SummaryCatalog:
                         source=source,
                         record_index=index,
                         title=summary_title(summary),
+                        pdf_sha256=summary_pdf_sha256(summary),
                         doi=summary_canonical_doi(summary),
+                        zotero_parent_key=summary_zotero_parent_key(summary),
                         canonical_paper_key=summary_canonical_paper_key(summary),
                         title_author_year_key=summary_title_author_year_key(summary),
                     )
@@ -489,9 +592,19 @@ class SummaryCatalog:
 
     def resolve_for_paper(self, paper: Mapping[str, Any]) -> Optional[SummaryMatch]:
         matchers = [
+            ("pdf_sha256_exact", paper_pdf_sha256(paper), self._by_pdf_sha256),
             ("doi_exact", normalize_doi(paper.get("doi")), self._by_doi),
-            ("canonical_paper_key_exact", paper_canonical_paper_key(paper), self._by_paper_key),
+            (
+                "zotero_parent_key_exact",
+                paper_zotero_parent_key(paper),
+                self._by_zotero_parent_key,
+            ),
             ("title_author_year_exact", title_author_year_key_from_paper(paper), self._by_title_author_year),
+            (
+                "canonical_paper_key_exact",
+                paper_canonical_paper_key(paper),
+                self._by_paper_key,
+            ),
         ]
         for match_type, key, index in matchers:
             if not key:

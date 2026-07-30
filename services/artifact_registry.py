@@ -440,10 +440,19 @@ class ArtifactRegistry:
                     and (not ref.artifact_type or record.artifact_type == ref.artifact_type)
                 ]
                 if len(candidates) > 1:
-                    raise UnverifiedDependency(
-                        "dependency path resolves to multiple Registry records: "
-                        f"{normalized_path}"
-                    )
+                    canonical_candidates = [
+                        record
+                        for record in candidates
+                        if record.artifact_id
+                        != _legacy_dependency_id(record.artifact_type, record.path)
+                    ]
+                    if len(canonical_candidates) == 1:
+                        candidates = canonical_candidates
+                    else:
+                        raise UnverifiedDependency(
+                            "dependency path resolves to multiple Registry records: "
+                            f"{normalized_path}"
+                        )
                 registered = candidates[0] if candidates else None
             artifact_type = ref.artifact_type or (registered.artifact_type if registered else "unknown")
             path = ref.path or (registered.path if registered else "")

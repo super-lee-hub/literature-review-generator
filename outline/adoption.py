@@ -30,6 +30,8 @@ def verify_adoption_prerequisites(
     final_outline: FinalOutline,
     audit: CoverageAudit,
     stage_health: OutlineStageHealthV1 | None = None,
+    *,
+    allow_arbitration_fallback: bool = False,
 ) -> Tuple[bool, str]:
     """Verify prerequisites for adoption.
 
@@ -41,7 +43,13 @@ def verify_adoption_prerequisites(
     if stage_health.job_id != final_outline.created_from_job_id:
         return False, "Outline stage health belongs to a different job; adoption is blocked"
 
-    if not stage_health.adoptable:
+    if not stage_health.adoptable and not (
+        allow_arbitration_fallback
+        and _is_safe_arbitration_fallback(stage_health)
+        and audit.passed
+        and final_outline.review_status != "blocked"
+        and not final_outline.blocking_critique_ids
+    ):
         reasons = "; ".join(stage_health.degradation_reasons) or "stage health is not adoptable"
         return False, f"Outline provider chain is degraded; adoption is blocked: {reasons}"
 
@@ -70,19 +78,43 @@ def verify_adoption_prerequisites(
     return True, ""
 
 
+def _is_safe_arbitration_fallback(stage_health: OutlineStageHealthV1) -> bool:
+    """Allow only validated arbitration fallback; all upstream provider stages must be clean."""
+    if not stage_health.stages:
+        return False
+    degraded = [entry for entry in stage_health.stages if entry.degraded]
+    if len(degraded) != 1:
+        return False
+    entry = degraded[0]
+    return (
+        entry.stage_name == "outline_arbitration"
+        and entry.execution_status == "succeeded"
+        and entry.schema_valid
+        and entry.fallback_provenance == "deterministic_fallback"
+        and "provider_arbitration_failed" in entry.degraded_reason
+    )
+
+
 def adopt_final_outline(
     final_outline: FinalOutline,
     audit: CoverageAudit,
     job_id: str,
     adopted_by: str,
     stage_health: OutlineStageHealthV1 | None = None,
+    *,
+    allow_arbitration_fallback: bool = False,
 ) -> Tuple[Optional[AdoptedFinalOutline], str]:
     """Adopt a final outline after passing audit.
 
     Returns (adopted_outline_or_none, status_message).
     Does NOT overwrite legacy Markdown or reviewed_outline.json.
     """
-    ok, err = verify_adoption_prerequisites(final_outline, audit, stage_health)
+    ok, err = verify_adoption_prerequisites(
+        final_outline,
+        audit,
+        stage_health,
+        allow_arbitration_fallback=allow_arbitration_fallback,
+    )
     if not ok:
         return None, err
 
