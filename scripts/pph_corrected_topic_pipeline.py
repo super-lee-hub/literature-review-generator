@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
@@ -26,13 +26,44 @@ OUTPUT_ROOT = REPO_ROOT / "output"
 CONFIG_PATH = REPO_ROOT / "config.ini"
 QUEUE_PATH = OUTPUT_ROOT / "_queue" / "queue.json"
 TOPIC_ORDER = ("S01", "S02", "S03", "S04", "S05")
+
+import configparser  # noqa: E402
+
+
+def _load_config():
+    config = configparser.ConfigParser()
+    # Strip BOM if present, then read
+    raw = CONFIG_PATH.read_text(encoding="utf-8-sig")
+    config.read_string(raw)
+    return config
+
+
+def _outline_route_snapshot() -> dict[str, Any]:
+    """Read Outline stage routes from the single config truth source."""
+    config = _load_config()
+    outline_models = (
+        dict(config.items("OutlineModels"))
+        if config.has_section("OutlineModels")
+        else {}
+    )
+    return {
+        "outline_candidates": outline_models.get("outline_model", "Outline_API"),
+        "structure_critique": outline_models.get("structure_critic_model", "Outline_API"),
+        "coverage_critique": outline_models.get("coverage_critic_model", "Primary_Reader_API"),
+        "outline_arbitration": outline_models.get("arbitrator_model", "Outline_API"),
+    }
+
+
+def _model_name_for_route(route: str) -> str:
+    """Get the model name for a given API route from config."""
+    config = _load_config()
+    if config.has_section(route):
+        return config.get(route, "model", fallback="")
+    return ""
+
+
 JSON_NULL_SHA256 = "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
-OUTLINE_STAGE_ROUTES = {
-    "outline_candidates": "Outline_API",
-    "structure_critique": "Outline_API",
-    "coverage_critique": "Primary_Reader_API",
-    "outline_arbitration": "Writer_API",
-}
+OUTLINE_STAGE_ROUTES = _outline_route_snapshot()
 
 
 def _utc_now() -> str:
@@ -237,6 +268,7 @@ def initialize() -> dict[str, Any]:
         "writer_model": "gpt-5.6-sol",
         "reader_model": "deepseek-v4-pro",
         "validator_model": "deepseek-v4-flash",
+        "outline_route_snapshot": _outline_route_snapshot(),
         "topic_order": list(TOPIC_ORDER),
         "topics": state_topics,
     }
@@ -278,12 +310,18 @@ def _prepare_outline_attempt(state: dict[str, Any], topic_id: str) -> dict[str, 
         else []
     )
     if not prior_outline_artifacts:
-        # Stale workspace from an interrupted run — clean it up so the
-        # bootstrap path can create a fresh workspace for this job_id.
+        # Workspace exists but has no outline artifacts.
+        # Never delete workspaces; mark as interrupted and preserve permanently.
         if workspace.is_dir():
-            import shutil
-
-            shutil.rmtree(str(workspace), ignore_errors=True)
+            history = list(topic.get("attempt_history") or [])
+            history.append({
+                "job_id": str(topic["job_id"]),
+                "workspace_path": str(workspace),
+                "recorded_at": _utc_now(),
+                "reason": "interrupted_before_outline_artifacts",
+                "outline_artifact_count": 0,
+            })
+            topic["attempt_history"] = history
         return topic
 
     history = list(topic.get("attempt_history") or [])
@@ -374,12 +412,23 @@ def verify_outline_contract_provenance(topic_id: str) -> dict[str, Any]:
         raise ValueError(f"{topic_id} stage-health is not adoptable")
 
     expected_stages = set(OUTLINE_STAGE_ROUTES)
-    expected_models = {
-        "outline_candidates": str(state.get("outline_model") or ""),
-        "structure_critique": str(state.get("outline_model") or ""),
-        "coverage_critique": str(state.get("reader_model") or ""),
-        "outline_arbitration": str(state.get("writer_model") or ""),
-    }
+    outline_routes = state.get("outline_route_snapshot") or {}
+    expected_models = {}
+    for stage_name in expected_stages:
+        route = OUTLINE_STAGE_ROUTES[stage_name]
+        model_from_config = _model_name_for_route(route)
+        # Fallback for tests/states without outline_route_snapshot:
+        # use state model fields keyed by the old convention
+        if not model_from_config:
+            if "structure" in stage_name or "candidate" in stage_name:
+                model_from_config = str(state.get("outline_model") or "")
+            elif "coverage" in stage_name:
+                model_from_config = str(state.get("reader_model") or "")
+            elif "arbitration" in stage_name:
+                model_from_config = str(state.get("outline_model") or "")
+            else:
+                model_from_config = str(state.get("outline_model") or "")
+        expected_models[stage_name] = model_from_config
     stages = {
         str(item.get("stage_name") or ""): item
         for item in stage_health.get("stages", [])
@@ -912,6 +961,52 @@ def run_topic(topic_id: str) -> dict[str, Any]:
     return {"topic_id": normalized, "success": True, "stages": stages}
 
 
+
+def _run_all_topics() -> dict[str, Any]:
+    """Run all five topics with independent try/except per topic.
+
+    S01 failure does not block S02-S05. Failed topics are recorded and
+    revisited after the first pass.
+    """
+    results: dict[str, Any] = {}
+    failed: list[str] = []
+
+    for topic_id in TOPIC_ORDER:
+        try:
+            results[topic_id] = run_topic(topic_id)
+        except BaseException as exc:
+            import traceback
+            failed.append(topic_id)
+            results[topic_id] = {
+                "topic_id": topic_id,
+                "success": False,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            continue
+
+    # First pass complete ? revisit failed topics once
+    if failed:
+        for topic_id in list(failed):
+            try:
+                retry_result = run_topic(topic_id)
+                if retry_result.get("success"):
+                    results[topic_id] = retry_result
+                    failed.remove(topic_id)
+            except BaseException:
+                # Already recorded; keep the original failure entry
+                pass
+
+    results["_meta"] = {
+        "total_topics": len(TOPIC_ORDER),
+        "succeeded_first_pass": len(TOPIC_ORDER) - len(failed),
+        "failed_after_retry": failed,
+    }
+    return results
+
+
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run corrected S01-S05 PPH jobs from the canonical 84-paper Stage-1 corpus."
@@ -952,7 +1047,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.command == "run-topic":
         payload = run_topic(args.topic)
     else:
-        payload = {topic_id: run_topic(topic_id) for topic_id in TOPIC_ORDER}
+        payload = _run_all_topics()
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 

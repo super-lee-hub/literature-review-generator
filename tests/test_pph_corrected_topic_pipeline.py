@@ -92,7 +92,7 @@ def _valid_outline_provenance_fixture(
     artifacts.mkdir(parents=True)
     route_models = {
         "outline_candidates": ("Outline_API", "claude-fable-5"),
-        "structure_critique": ("Writer_API", "gpt-5.6-sol"),
+        "structure_critique": ("Outline_API", "claude-fable-5"),
         "coverage_critique": ("Primary_Reader_API", "deepseek-v4-pro"),
         "outline_arbitration": ("Outline_API", "claude-fable-5"),
     }
