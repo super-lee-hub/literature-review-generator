@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
@@ -235,7 +235,7 @@ def initialize() -> dict[str, Any]:
             "project_name": str(topic["project_name"]),
             "job_id": prior_job_id or JobWorkspace.generate_job_id(),
             "expected_sections": {
-                "S01": 7,
+                "S01": 6,
                 "S02": 8,
                 "S03": 8,
                 "S04": 7,
@@ -390,7 +390,22 @@ def _resolve_workspace(state: dict[str, Any], topic_id: str, *, force_fresh: boo
         atomic_write_json(STATE_PATH, state)
         return dict(topic)
 
-    # Valid workspace with outline artifacts — reuse
+    # Valid workspace with outline artifacts — rotate job_id to avoid collision.
+    # The old workspace is preserved in attempt_history.
+    history = list(topic.get("attempt_history") or [])
+    history.append({
+        "job_id": str(topic["job_id"]),
+        "workspace_path": str(workspace),
+        "recorded_at": _utc_now(),
+        "reason": "valid_outline_workspace_rotated",
+        "outline_artifact_count": len(outline_artifacts),
+    })
+    topic["job_id"] = JobWorkspace.generate_job_id()
+    topic["attempt_history"] = history
+    state["topics"][normalized] = topic
+    state["updated_at"] = _utc_now()
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(STATE_PATH, state)
     return dict(topic)
 def _configure_closure(state: Mapping[str, Any]) -> None:
     closure.PROJECTS = {

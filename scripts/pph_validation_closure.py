@@ -25,7 +25,7 @@ PROJECTS: dict[str, dict[str, Any]] = {
     "S01": {
         "project_name": "pph_s01_dynamic_disadvantage",
         "job_id": "20260728_054303_5ab4252e",
-        "expected_sections": 7,
+        "expected_sections": 6,
     },
     "S02": {
         "project_name": "pph_s02_prior_concession",

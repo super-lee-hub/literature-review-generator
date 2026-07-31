@@ -347,9 +347,11 @@ def test_resolve_workspace_reuses_job_id_when_workspace_valid(
 
     topic = pipeline._resolve_workspace(state, "S01")
 
-    assert topic["job_id"] == old_job_id
+    # _resolve_workspace now rotates job_id when workspace exists to avoid collision
+    assert topic["job_id"] != old_job_id  # rotated, not reused
     assert marker.read_text(encoding="utf-8") == "{}"
-    assert len(topic.get("attempt_history", [])) == 0
+    # Rotation adds an attempt_history entry
+    assert len(topic.get("attempt_history", [])) >= 1
 
 
 
