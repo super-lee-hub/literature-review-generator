@@ -963,37 +963,53 @@ def run_topic(topic_id: str) -> dict[str, Any]:
 
 
 def _run_all_topics() -> dict[str, Any]:
-    """Run all five topics with independent try/except per topic.
+    """Run all five topics in parallel with independent try/except per topic.
 
-    S01 failure does not block S02-S05. Failed topics are retried from
-    their failed_stage, not from the beginning.
+    First pass: all five topics submitted to ThreadPoolExecutor in parallel.
+    Second pass: failed topics retried serially from their failed_stage
+    with retry budget 2.
 
     Returns a dict with per-topic results and _meta summary.
-    An "all_succeeded" key indicates whether every topic reached canonical_ready.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    max_workers = 5
+    try:
+        config = _load_config()
+        if config.has_section("Performance"):
+            max_workers = config.getint("Performance", "max_workers", fallback=5)
+    except Exception:
+        pass
+
     results: dict[str, Any] = {}
     topic_errors: dict[str, dict[str, Any]] = {}
 
-    for topic_id in TOPIC_ORDER:
-        try:
-            results[topic_id] = run_or_resume_topic(topic_id)
-        except BaseException as exc:
-            import traceback
-            topic_errors[topic_id] = {
-                "topic_id": topic_id,
-                "success": False,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-                "failed_stage": "unknown",
-            }
-            continue
+    # Phase 1: parallel execution of all five topics
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(run_or_resume_topic, tid): tid
+            for tid in TOPIC_ORDER
+        }
+        for future in as_completed(future_map):
+            tid = future_map[future]
+            try:
+                results[tid] = future.result()
+            except BaseException as exc:
+                import traceback
+                topic_errors[tid] = {
+                    "topic_id": tid,
+                    "success": False,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "failed_stage": "unknown",
+                }
 
+    # Phase 2: serial retry of failed topics
     retry_budget = {tid: 2 for tid in TOPIC_ORDER}
     for topic_id in TOPIC_ORDER:
         result = results.get(topic_id, topic_errors.get(topic_id, {}))
         if result.get("success") and result.get("canonical_ready"):
             continue
-        failed_stage = result.get("failed_stage")
         for attempt in range(retry_budget.get(topic_id, 0)):
             if retry_budget[topic_id] <= 0:
                 break
@@ -1004,7 +1020,6 @@ def _run_all_topics() -> dict[str, Any]:
                 if retry_result.get("success"):
                     topic_errors.pop(topic_id, None)
                     break
-                failed_stage = retry_result.get("failed_stage")
             except BaseException as exc:
                 import traceback
                 topic_errors[topic_id] = {
@@ -1012,7 +1027,7 @@ def _run_all_topics() -> dict[str, Any]:
                     "success": False,
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
-                    "failed_stage": failed_stage or "unknown",
+                    "failed_stage": result.get("failed_stage") or "unknown",
                 }
                 break
 
@@ -1035,6 +1050,7 @@ def _run_all_topics() -> dict[str, Any]:
         ],
     }
     return results
+
 
 
 # ── Stage coordinator: state-driven resume ──
