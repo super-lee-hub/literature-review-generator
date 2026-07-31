@@ -1210,6 +1210,17 @@ def inspect_topic_progress(topic_id: str) -> TopicProgress:
     if validation and validation.status == "ready":
         progress.completed_stages.append("validate")
 
+    # Check DOCX on disk (citation_manifest_v3 may not be registered but DOCX exists)
+    workspace_path_obj = Path(progress.workspace_path)
+    docx_pattern = f"{progress.project_name}_literature_review.docx"
+    docx_candidates = list(workspace_path_obj.rglob(docx_pattern)) if workspace_path_obj.is_dir() else []
+    if docx_candidates:
+        # DOCX exists — infer that manifest and docx stages are complete
+        if "manifest" not in progress.completed_stages:
+            progress.completed_stages.append("manifest")
+        if "docx" not in progress.completed_stages:
+            progress.completed_stages.append("docx")
+
     # Determine next stage
     for stage in STAGE_ORDER:
         if stage == "repair" or stage == "revalidate":
