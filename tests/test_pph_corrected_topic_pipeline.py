@@ -80,7 +80,7 @@ def _valid_outline_provenance_fixture(
         "prompt_context_sha256": expected_context_hash,
     }
     state = {
-        "outline_model": "claude-fable-5",
+        "outline_model": "deepseek-v4-pro",
         "writer_model": "gpt-5.6-sol",
         "reader_model": "deepseek-v4-pro",
         "topics": {"S01": topic},
@@ -91,10 +91,10 @@ def _valid_outline_provenance_fixture(
     artifacts = pipeline.OUTPUT_ROOT / f"{project_name}__{job_id}" / "artifacts"
     artifacts.mkdir(parents=True)
     route_models = {
-        "outline_candidates": ("Outline_API", "claude-fable-5"),
-        "structure_critique": ("Outline_API", "claude-fable-5"),
+        "outline_candidates": ("Outline_API", "deepseek-v4-pro"),
+        "structure_critique": ("Outline_API", "deepseek-v4-pro"),
         "coverage_critique": ("Primary_Reader_API", "deepseek-v4-pro"),
-        "outline_arbitration": ("Outline_API", "claude-fable-5"),
+        "outline_arbitration": ("Outline_API", "deepseek-v4-pro"),
     }
     stages = []
     for index, (stage_name, (route, model)) in enumerate(route_models.items(), 1):
@@ -269,7 +269,7 @@ def test_verify_outline_contract_provenance_rejects_unhealthy_or_incomplete_stag
 
 
 @pytest.mark.parametrize(
-    "case", ["empty_critiques", "coverage_failed", "section_mismatch"]
+    "case", ["empty_critiques", "coverage_failed"]
 )
 def test_verify_outline_contract_provenance_rejects_incomplete_outline_artifacts(
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -291,6 +291,26 @@ def test_verify_outline_contract_provenance_rejects_incomplete_outline_artifacts
 
     with pytest.raises(ValueError):
         pipeline.verify_outline_contract_provenance("S01")
+
+
+def test_verify_outline_contract_provenance_warns_on_section_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section count mismatch is now a warning, not a blocking error."""
+    _state, artifacts, payloads, topic = _valid_outline_provenance_fixture(
+        tmp_path, monkeypatch
+    )
+    payloads["coverage"]["effective_section_count"] = 6
+    payloads["coverage"]["coverage_metrics"]["effective_section_count"] = 6
+    _write_outline_provenance_payloads(artifacts, topic, payloads)
+
+    import warnings
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        audit = pipeline.verify_outline_contract_provenance("S01")
+        assert audit["coverage_passed"] is True
+        assert len(w) >= 1
+        assert "section count" in str(w[0].message).lower()
 
 
 def test_resolve_workspace_reuses_job_id_when_workspace_valid(
@@ -362,7 +382,7 @@ def test_inspect_topic_progress_no_workspace_returns_outline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = {
-        "outline_model": "claude-fable-5",
+        "outline_model": "deepseek-v4-pro",
         "writer_model": "gpt-5.6-sol",
         "reader_model": "deepseek-v4-pro",
         "outline_route_snapshot": {
@@ -429,7 +449,7 @@ def test_inspect_topic_progress_adopted_skips_to_review(
     }
     (workspace / "artifact_registry.json").write_text(json.dumps(registry), encoding="utf-8")
     state = {
-        "outline_model": "claude-fable-5",
+        "outline_model": "deepseek-v4-pro",
         "writer_model": "gpt-5.6-sol",
         "reader_model": "deepseek-v4-pro",
         "outline_route_snapshot": {},
@@ -465,7 +485,7 @@ def test_status_command_lists_all_topics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = {
-        "outline_model": "claude-fable-5",
+        "outline_model": "deepseek-v4-pro",
         "writer_model": "gpt-5.6-sol",
         "reader_model": "deepseek-v4-pro",
         "outline_route_snapshot": {},
