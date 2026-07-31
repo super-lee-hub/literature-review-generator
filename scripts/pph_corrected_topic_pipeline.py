@@ -364,7 +364,33 @@ def _resolve_workspace(state: dict[str, Any], topic_id: str, *, force_fresh: boo
         atomic_write_json(STATE_PATH, state)
         return dict(topic)
 
-    # Workspace exists, inputs match, Registry is valid — reuse
+    # Workspace exists, inputs match, Registry is valid.
+    # But if the workspace has no meaningful outline artifacts (just summaries
+    # and source inventory from a failed bootstrap), generate a new job_id so
+    # the next run doesn not collide with the stale shell.
+    outline_artifacts = []
+    if artifacts_dir.is_dir():
+        outline_artifacts = sorted(
+            artifacts_dir.glob(f"{topic['project_name']}_outline*.json")
+        )
+    if not outline_artifacts:
+        history = list(topic.get("attempt_history") or [])
+        history.append({
+            "job_id": str(topic["job_id"]),
+            "workspace_path": str(workspace),
+            "recorded_at": _utc_now(),
+            "reason": "empty_shell_no_outline_artifacts",
+            "outline_artifact_count": 0,
+        })
+        topic["job_id"] = JobWorkspace.generate_job_id()
+        topic["attempt_history"] = history
+        state["topics"][normalized] = topic
+        state["updated_at"] = _utc_now()
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(STATE_PATH, state)
+        return dict(topic)
+
+    # Valid workspace with outline artifacts — reuse
     return dict(topic)
 def _configure_closure(state: Mapping[str, Any]) -> None:
     closure.PROJECTS = {
@@ -998,11 +1024,37 @@ def _run_all_topics() -> dict[str, Any]:
     # Pre-initialize state in main thread (avoids parallel file-write conflicts)
     _load_state()
 
-    # Phase 1: parallel execution of all five topics
+    # Filter: skip topics that are already canonical-ready or have no
+    # provider-required stages pending (manifest/docx/audit can be run
+    # later; they do not justify re-entering the topic at all).
+    active_topics: list[str] = []
+    for tid in TOPIC_ORDER:
+        progress = inspect_topic_progress(tid)
+        if progress.canonical_ready:
+            results[tid] = {
+                "topic_id": tid,
+                "success": True,
+                "canonical_ready": True,
+                "skipped": True,
+                "reason": "already_canonical_ready",
+            }
+            continue
+        if progress.next_stage is None:
+            results[tid] = {
+                "topic_id": tid,
+                "success": True,
+                "canonical_ready": False,
+                "skipped": True,
+                "reason": "no_pending_stage",
+            }
+            continue
+        active_topics.append(tid)
+
+    # Phase 1: parallel execution of all active topics
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(run_or_resume_topic, tid): tid
-            for tid in TOPIC_ORDER
+            for tid in active_topics
         }
         for future in as_completed(future_map):
             tid = future_map[future]
@@ -1019,8 +1071,8 @@ def _run_all_topics() -> dict[str, Any]:
                 }
 
     # Phase 2: serial retry of failed topics
-    retry_budget = {tid: 2 for tid in TOPIC_ORDER}
-    for topic_id in TOPIC_ORDER:
+    retry_budget = {tid: 2 for tid in active_topics}
+    for topic_id in active_topics:
         result = results.get(topic_id, topic_errors.get(topic_id, {}))
         if result.get("success") and result.get("canonical_ready"):
             continue
