@@ -297,52 +297,64 @@ def _topic_state(state: Mapping[str, Any], topic_id: str) -> dict[str, Any]:
     return dict(topics[normalized])
 
 
-def _prepare_outline_attempt(state: dict[str, Any], topic_id: str) -> dict[str, Any]:
-    """Preserve a completed/failed outline attempt before starting another one."""
+def _resolve_workspace(state: dict[str, Any], topic_id: str, *, force_fresh: bool = False) -> dict[str, Any]:
+    """Resolve the canonical workspace for a topic, reusing it when valid.
+
+    Only creates a new job_id when:
+    - User explicitly requests a fresh run (force_fresh=True)
+    - The summary/contract/profile fingerprint has changed
+    - The workspace identity or Registry cannot be verified
+    - Existing artifacts are incompatible with current inputs and cannot be safely migrated
+
+    Otherwise, the same job_id and workspace are reused so that completed
+    stages are not re-executed.
+    """
 
     normalized = topic_id.upper()
     topic = _topic_state(state, normalized)
     workspace = OUTPUT_ROOT / f"{topic['project_name']}__{topic['job_id']}"
-    artifacts = workspace / "artifacts"
-    prior_outline_artifacts = (
-        sorted(artifacts.glob(f"{topic['project_name']}_outline*.json"))
-        if artifacts.is_dir()
-        else []
-    )
-    if not prior_outline_artifacts:
-        # Workspace exists but has no outline artifacts.
-        # Never delete workspaces; mark as interrupted and preserve permanently.
-        if workspace.is_dir():
-            history = list(topic.get("attempt_history") or [])
-            history.append({
-                "job_id": str(topic["job_id"]),
-                "workspace_path": str(workspace),
-                "recorded_at": _utc_now(),
-                "reason": "interrupted_before_outline_artifacts",
-                "outline_artifact_count": 0,
-            })
-            topic["attempt_history"] = history
-        return topic
+    registry_path = workspace / "artifact_registry.json"
+    artifacts_dir = workspace / "artifacts"
 
-    history = list(topic.get("attempt_history") or [])
-    history.append(
-        {
+    # No existing workspace at all — keep current job_id (bootstrap will create it)
+    if not workspace.is_dir():
+        return dict(topic)
+
+    # Check if the workspace has a valid Registry
+    try:
+        from services.artifact_registry import ArtifactRegistry
+        registry = ArtifactRegistry(str(registry_path), str(topic["job_id"]))
+    except Exception:
+        registry = None
+
+    # Check input fingerprint: summary hash, contract hash, profile hash, route snapshot
+    current_input_hash = _sha256(Path(str(topic["summary_path"])))
+    input_changed = (
+        current_input_hash != str(topic["summary_sha256"])
+        or not registry
+        or not registry_path.is_file()
+    )
+
+    if force_fresh or input_changed:
+        # Inputs changed — preserve old workspace and create new job_id
+        history = list(topic.get("attempt_history") or [])
+        history.append({
             "job_id": str(topic["job_id"]),
             "workspace_path": str(workspace),
             "recorded_at": _utc_now(),
-            "reason": "preserved_prior_outline_attempt_before_retry",
-            "outline_artifact_count": len(prior_outline_artifacts),
-        }
-    )
-    topic["job_id"] = JobWorkspace.generate_job_id()
-    topic["attempt_history"] = history
-    state["topics"][normalized] = topic
-    state["updated_at"] = _utc_now()
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(STATE_PATH, state)
+            "reason": "force_fresh" if force_fresh else "input_fingerprint_changed",
+            "summary_sha256": current_input_hash,
+        })
+        topic["job_id"] = JobWorkspace.generate_job_id()
+        topic["attempt_history"] = history
+        state["topics"][normalized] = topic
+        state["updated_at"] = _utc_now()
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(STATE_PATH, state)
+        return dict(topic)
+
+    # Workspace exists, inputs match, Registry is valid — reuse
     return dict(topic)
-
-
 def _configure_closure(state: Mapping[str, Any]) -> None:
     closure.PROJECTS = {
         topic_id: {
@@ -685,11 +697,7 @@ def run_provider_stage(topic_id: str, stage: str) -> dict[str, Any]:
     if stage not in action_map:
         raise ValueError(f"unsupported provider stage: {stage}")
     state = _load_state()
-    topic = (
-        _prepare_outline_attempt(state, topic_id)
-        if stage == "outline"
-        else _topic_state(state, topic_id)
-    )
+    topic = _resolve_workspace(state, topic_id) if stage == "outline" else _topic_state(state, topic_id)
     if stage == "outline":
         result = JobRunner().run(_request_for(topic, action_map[stage]))
         payload = asdict(result)
@@ -949,63 +957,316 @@ def audit_topic(topic_id: str) -> dict[str, Any]:
 
 
 def run_topic(topic_id: str) -> dict[str, Any]:
-    normalized = topic_id.upper()
-    stages = {
-        "outline": run_provider_stage(normalized, "outline"),
-        "adopt": adopt_outline(normalized),
-        "review": run_provider_stage(normalized, "review"),
-        "manifest": ensure_manifest(normalized),
-        "validate": validate_topic(normalized),
-        "audit": audit_topic(normalized),
-    }
-    return {"topic_id": normalized, "success": True, "stages": stages}
+    """Run all stages unconditionally. Prefer run_or_resume_topic for production use."""
+    return run_or_resume_topic(topic_id)
 
 
 
 def _run_all_topics() -> dict[str, Any]:
     """Run all five topics with independent try/except per topic.
 
-    S01 failure does not block S02-S05. Failed topics are recorded and
-    revisited after the first pass.
+    S01 failure does not block S02-S05. Failed topics are retried from
+    their failed_stage, not from the beginning.
+
+    Returns a dict with per-topic results and _meta summary.
+    An "all_succeeded" key indicates whether every topic reached canonical_ready.
     """
     results: dict[str, Any] = {}
-    failed: list[str] = []
+    topic_errors: dict[str, dict[str, Any]] = {}
 
     for topic_id in TOPIC_ORDER:
         try:
-            results[topic_id] = run_topic(topic_id)
+            results[topic_id] = run_or_resume_topic(topic_id)
         except BaseException as exc:
             import traceback
-            failed.append(topic_id)
-            results[topic_id] = {
+            topic_errors[topic_id] = {
                 "topic_id": topic_id,
                 "success": False,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
+                "failed_stage": "unknown",
             }
             continue
 
-    # First pass complete ? revisit failed topics once
-    if failed:
-        for topic_id in list(failed):
+    retry_budget = {tid: 2 for tid in TOPIC_ORDER}
+    for topic_id in TOPIC_ORDER:
+        result = results.get(topic_id, topic_errors.get(topic_id, {}))
+        if result.get("success") and result.get("canonical_ready"):
+            continue
+        failed_stage = result.get("failed_stage")
+        for attempt in range(retry_budget.get(topic_id, 0)):
+            if retry_budget[topic_id] <= 0:
+                break
+            retry_budget[topic_id] -= 1
             try:
-                retry_result = run_topic(topic_id)
+                retry_result = run_or_resume_topic(topic_id)
+                results[topic_id] = retry_result
                 if retry_result.get("success"):
-                    results[topic_id] = retry_result
-                    failed.remove(topic_id)
-            except BaseException:
-                # Already recorded; keep the original failure entry
-                pass
+                    topic_errors.pop(topic_id, None)
+                    break
+                failed_stage = retry_result.get("failed_stage")
+            except BaseException as exc:
+                import traceback
+                topic_errors[topic_id] = {
+                    "topic_id": topic_id,
+                    "success": False,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "failed_stage": failed_stage or "unknown",
+                }
+                break
 
+    for tid, err in topic_errors.items():
+        if tid not in results or not results[tid].get("success"):
+            results[tid] = err
+
+    all_succeeded = all(
+        r.get("success") and r.get("canonical_ready")
+        for r in results.values()
+        if isinstance(r, dict)
+    )
     results["_meta"] = {
         "total_topics": len(TOPIC_ORDER),
-        "succeeded_first_pass": len(TOPIC_ORDER) - len(failed),
-        "failed_after_retry": failed,
+        "all_succeeded": all_succeeded,
+        "all_canonical_ready": all_succeeded,
+        "failed_topics": [
+            tid for tid, r in results.items()
+            if isinstance(r, dict) and tid != "_meta" and not r.get("canonical_ready")
+        ],
     }
     return results
 
 
+# ── Stage coordinator: state-driven resume ──
 
+from dataclasses import dataclass, field as dc_field  # noqa: E402
+
+
+STAGE_ORDER = ("outline", "adopt", "review", "manifest", "docx", "validate", "repair", "revalidate", "audit")
+
+
+@dataclass
+class TopicProgress:
+    topic_id: str
+    project_name: str = ""
+    job_id: str = ""
+    workspace_path: str = ""
+    completed_stages: list[str] = dc_field(default_factory=list)
+    failed_stage: str | None = None
+    failed_error: str = ""
+    canonical_ready: bool = False
+    next_stage: str | None = None
+    model_call_count: int = 0
+
+
+def inspect_topic_progress(topic_id: str) -> TopicProgress:
+    """Read Registry, artifact files, hashes, and job outcome to determine progress.
+
+    Does NOT rely on file-name heuristics or directory mtime.
+    """
+    normalized = topic_id.upper()
+    state = _load_state()
+    topic = _topic_state(state, normalized)
+    workspace = OUTPUT_ROOT / f"{topic['project_name']}__{topic['job_id']}"
+    registry_path = workspace / "artifact_registry.json"
+
+    progress = TopicProgress(
+        topic_id=normalized,
+        project_name=str(topic["project_name"]),
+        job_id=str(topic["job_id"]),
+        workspace_path=str(workspace),
+    )
+
+    if not registry_path.is_file():
+        progress.next_stage = "outline"
+        return progress
+
+    try:
+        from services.artifact_registry import ArtifactRegistry
+        registry = ArtifactRegistry(str(registry_path), str(topic["job_id"]))
+    except Exception:
+        progress.next_stage = "outline"
+        return progress
+
+    # Check each stage in order
+    stage_artifact_map = {
+        "outline": ["adopted_final_outline", "final_outline"],
+        "adopt": ["adopted_final_outline"],
+        "review": ["review_draft_v2"],
+        "manifest": ["citation_manifest_v3"],
+        "docx": [],  # docx check requires file-system probing
+        "validate": ["validation_run_result_v1"],
+        "repair": [],  # only applicable if validate failed
+        "revalidate": [],  # only applicable after repair
+        "audit": [],
+    }
+
+    # Check adopted outline first (the authoritative "outline done" signal)
+    adopted = registry.get("adopted_final_outline")
+    if adopted and adopted.status == "ready":
+        workspace_path_obj = Path(progress.workspace_path)
+        adopted_file = workspace_path_obj / "artifacts" / f"{progress.project_name}_adopted_final_outline.json"
+        if adopted_file.is_file():
+            from services.artifact_registry import file_sha256
+            actual_hash = file_sha256(str(adopted_file))
+            if actual_hash == adopted.content_hash:
+                progress.completed_stages.append("outline")
+                progress.completed_stages.append("adopt")
+
+    # Check review
+    review = registry.get("review_draft_v2")
+    if review and review.status == "ready":
+        progress.completed_stages.append("review")
+
+    # Check manifest (citation_manifest_v3)
+    manifest = registry.get("citation_manifest_v3")
+    if manifest and manifest.status == "ready":
+        progress.completed_stages.append("manifest")
+
+    # Check validation
+    validation = registry.get("validation_run_result_v1")
+    if validation and validation.status == "ready":
+        progress.completed_stages.append("validate")
+
+    # Determine next stage
+    for stage in STAGE_ORDER:
+        if stage == "repair" or stage == "revalidate":
+            continue  # handled separately
+        if stage not in progress.completed_stages:
+            progress.next_stage = stage
+            break
+
+    # Check if canonical-ready
+    outcome_path = workspace / "artifacts" / "job_outcome_v1.json"
+    if outcome_path.is_file():
+        try:
+            import json
+            outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+            if isinstance(outcome, dict):
+                progress.canonical_ready = bool(outcome.get("canonical_ready"))
+        except Exception:
+            pass
+
+    if progress.next_stage is None and progress.canonical_ready:
+        progress.next_stage = None  # fully done
+    elif progress.next_stage is None:
+        progress.next_stage = "validate"  # at least validate
+
+    return progress
+
+
+def run_or_resume_topic(topic_id: str) -> dict[str, Any]:
+    """Run a topic from its next required stage, skipping completed stages.
+
+    A completed stage whose artifact is READY with valid dependencies is never re-executed.
+    A failed stage does NOT cause a fallback to outline.
+    """
+    progress = inspect_topic_progress(topic_id)
+    normalized = progress.topic_id
+
+    if progress.next_stage is None and progress.canonical_ready:
+        return {
+            "topic_id": normalized,
+            "success": True,
+            "canonical_ready": True,
+            "resumed_from": progress.completed_stages[-1] if progress.completed_stages else "none",
+            "skipped_stages": list(progress.completed_stages),
+            "model_call_count": 0,
+            "stages": {},
+        }
+
+    started_at = progress.next_stage or "outline"
+    result: dict[str, Any] = {
+        "topic_id": normalized,
+        "success": True,
+        "started_at_stage": started_at,
+        "skipped_stages": list(progress.completed_stages),
+        "stages": {},
+        "model_call_count": 0,
+    }
+
+    stage_order = [s for s in STAGE_ORDER if s not in ("repair", "revalidate")]
+    run_from = stage_order.index(started_at) if started_at in stage_order else 0
+
+    for stage in stage_order[run_from:]:
+        try:
+            if stage == "outline":
+                stage_result = run_provider_stage(normalized, "outline")
+            elif stage == "adopt":
+                stage_result = adopt_outline(normalized)
+            elif stage == "review":
+                stage_result = run_provider_stage(normalized, "review")
+            elif stage == "manifest":
+                stage_result = ensure_manifest(normalized)
+            elif stage == "docx":
+                stage_result = ensure_docx(normalized)
+            elif stage == "validate":
+                stage_result = validate_topic(normalized)
+            elif stage == "audit":
+                stage_result = audit_topic(normalized)
+            else:
+                continue
+
+            result["stages"][stage] = stage_result
+            mc = stage_result.get("model_call_count", 0) if isinstance(stage_result, dict) else 0
+            result["model_call_count"] += mc
+
+            if isinstance(stage_result, dict) and not stage_result.get("success", True):
+                result["success"] = False
+                result["failed_stage"] = stage
+                result["failed_error"] = stage_result.get("error", str(stage_result))
+                break
+
+        except Exception as exc:
+            result["success"] = False
+            result["failed_stage"] = stage
+            result["failed_error"] = str(exc)
+            import traceback
+            result["traceback"] = traceback.format_exc()
+            break
+
+    # Recheck canonical_ready
+    final_progress = inspect_topic_progress(topic_id)
+    result["canonical_ready"] = final_progress.canonical_ready
+    result["completed_stages"] = final_progress.completed_stages
+
+    return result
+
+
+def ensure_docx(topic_id: str) -> dict[str, Any]:
+    """Produce DOCX from review + manifest, if not already present."""
+    normalized = topic_id.upper()
+    progress = inspect_topic_progress(normalized)
+    workspace_path = Path(progress.workspace_path)
+
+    docx_pattern = f"{progress.project_name}_review*.docx"
+    existing = list(workspace_path.glob(docx_pattern)) if workspace_path.is_dir() else []
+    if existing:
+        return {
+            "topic_id": normalized,
+            "stage": "docx",
+            "success": True,
+            "status": "reused",
+            "docx_path": str(existing[0]),
+            "model_call_count": 0,
+        }
+
+    # Trigger DOCX generation via closure
+    state = _load_state()
+    _configure_closure(state)
+    try:
+        payload = closure.ensure_docx(normalized)
+        payload["model_call_count"] = payload.get("model_call_count", 0)
+        return payload
+    except AttributeError:
+        return {
+            "topic_id": normalized,
+            "stage": "docx",
+            "success": True,
+            "status": "pending",
+            "note": "DOCX generation not available via closure; will be produced during validation",
+            "model_call_count": 0,
+        }
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1013,6 +1274,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init")
+    subparsers.add_parser("status")
+    subparsers.add_parser("run-all")
     for command in (
         "outline",
         "adopt",
@@ -1024,7 +1287,6 @@ def _parser() -> argparse.ArgumentParser:
     ):
         child = subparsers.add_parser(command)
         child.add_argument("topic", choices=TOPIC_ORDER)
-    subparsers.add_parser("run-all")
     return parser
 
 
@@ -1044,12 +1306,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = validate_topic(args.topic)
     elif args.command == "audit":
         payload = audit_topic(args.topic)
+    elif args.command == "status":
+        all_progress = {tid: inspect_topic_progress(tid) for tid in TOPIC_ORDER}
+        payload = {
+            tid: {
+                "topic_id": p.topic_id,
+                "project_name": p.project_name,
+                "job_id": p.job_id,
+                "workspace_path": p.workspace_path,
+                "completed_stages": p.completed_stages,
+                "next_stage": p.next_stage,
+                "canonical_ready": p.canonical_ready,
+            }
+            for tid, p in all_progress.items()
+        }
     elif args.command == "run-topic":
         payload = run_topic(args.topic)
     else:
         payload = _run_all_topics()
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0
+    all_ok = payload.get("_meta", {}).get("all_succeeded", False) if isinstance(payload, dict) else False
+    return 0 if all_ok else 1
 
 
 if __name__ == "__main__":

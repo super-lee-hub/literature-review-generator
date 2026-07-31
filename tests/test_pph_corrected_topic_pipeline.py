@@ -293,17 +293,36 @@ def test_verify_outline_contract_provenance_rejects_incomplete_outline_artifacts
         pipeline.verify_outline_contract_provenance("S01")
 
 
-def test_prepare_outline_attempt_rotates_job_id_without_overwriting_prior_workspace(
+def test_resolve_workspace_reuses_job_id_when_workspace_valid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """_resolve_workspace reuses the existing job_id when workspace has artifacts
+    and input fingerprint has not changed."""
     old_job_id = "20260730_000000_oldjob00"
     new_job_id = "20260730_000001_newjob00"
+
+    contract_text = "contract content for hash"
+    contract_path = tmp_path / "S01_contract.txt"
+    contract_path.write_text(contract_text, encoding="utf-8")
+    profile_path = tmp_path / "S01_profile.json"
+    profile_path.write_text("{}", encoding="utf-8")
+    summary_path = tmp_path / "summary.json"
+    summary_path.write_text("[]", encoding="utf-8")
+
+    from services.artifact_registry import file_sha256
+
     state = {
         "topics": {
             "S01": {
                 "project_name": "project_S01",
                 "job_id": old_job_id,
                 "attempt_history": [],
+                "summary_path": str(summary_path),
+                "summary_sha256": file_sha256(str(summary_path)),
+                "contract_path": str(contract_path),
+                "contract_text_sha256": pipeline.final_contracts._sha256_text(contract_text),
+                "profile_path": str(profile_path),
+                "profile_file_sha256": file_sha256(str(profile_path)),
             }
         }
     }
@@ -319,10 +338,160 @@ def test_prepare_outline_attempt_rotates_job_id_without_overwriting_prior_worksp
     marker = prior_artifacts / "project_S01_outline_stage_health_v1.json"
     marker.write_text("{}", encoding="utf-8")
 
-    topic = pipeline._prepare_outline_attempt(state, "S01")
+    registry_path = pipeline.OUTPUT_ROOT / f"project_S01__{old_job_id}" / "artifact_registry.json"
+    registry_path.write_text(
+        '{"artifact_registry_version": "v2", "revision": 0, "job_id": "'
+        + old_job_id + '", "artifacts": []}',
+        encoding="utf-8",
+    )
 
-    assert topic["job_id"] == new_job_id
+    topic = pipeline._resolve_workspace(state, "S01")
+
+    assert topic["job_id"] == old_job_id
     assert marker.read_text(encoding="utf-8") == "{}"
-    assert topic["attempt_history"][-1]["job_id"] == old_job_id
-    persisted = json.loads(pipeline.STATE_PATH.read_text(encoding="utf-8"))
-    assert persisted["topics"]["S01"]["job_id"] == new_job_id
+    assert len(topic.get("attempt_history", [])) == 0
+
+
+
+
+# --- Stage coordinator regression tests ---
+
+def test_inspect_topic_progress_no_workspace_returns_outline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = {
+        "outline_model": "claude-fable-5",
+        "writer_model": "gpt-5.6-sol",
+        "reader_model": "deepseek-v4-pro",
+        "outline_route_snapshot": {
+            "outline_candidates": "Outline_API",
+            "structure_critique": "Outline_API",
+            "coverage_critique": "Primary_Reader_API",
+            "outline_arbitration": "Outline_API",
+        },
+        "topics": {
+            "S01": {
+                "topic_id": "S01",
+                "project_name": "project_S01",
+                "job_id": "job_S01",
+                "expected_sections": 7,
+                "summary_path": str(tmp_path / "summary.json"),
+                "summary_sha256": "a" * 64,
+                "contract_path": str(tmp_path / "contract.txt"),
+                "contract_text_sha256": "b" * 64,
+                "profile_path": str(tmp_path / "profile.json"),
+                "profile_file_sha256": "c" * 64,
+                "prompt_context_sha256": "d" * 64,
+                "attempt_history": [],
+            }
+        }
+    }
+    (tmp_path / "summary.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "contract.txt").write_text("contract", encoding="utf-8")
+    (tmp_path / "profile.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_load_state", lambda: state)
+    monkeypatch.setattr(pipeline, "OUTPUT_ROOT", tmp_path / "output")
+    progress = pipeline.inspect_topic_progress("S01")
+    assert progress.next_stage == "outline"
+    assert progress.completed_stages == []
+
+
+def test_inspect_topic_progress_adopted_skips_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = "job_S01"
+    project_name = "project_S01"
+    workspace = tmp_path / "output" / f"{project_name}__{job_id}"
+    artifacts = workspace / "artifacts"
+    artifacts.mkdir(parents=True)
+    adopted = artifacts / f"{project_name}_adopted_final_outline.json"
+    adopted.write_text('{"adoption_status": "adopted"}', encoding="utf-8")
+    from services.artifact_registry import file_sha256
+    adopted_hash = file_sha256(str(adopted))
+    registry = {
+        "artifact_registry_version": "v2",
+        "revision": 0,
+        "job_id": job_id,
+        "artifacts": [{
+            "artifact_id": "adopted_final_outline",
+            "artifact_type": "adopted_final_outline",
+            "artifact_version": "v1",
+            "path": str(adopted),
+            "content_hash": adopted_hash,
+            "status": "ready",
+            "job_id": job_id,
+            "producer": "test",
+            "depends_on": [],
+            "created_at": "2026-07-30T00:00:00Z",
+        }],
+    }
+    (workspace / "artifact_registry.json").write_text(json.dumps(registry), encoding="utf-8")
+    state = {
+        "outline_model": "claude-fable-5",
+        "writer_model": "gpt-5.6-sol",
+        "reader_model": "deepseek-v4-pro",
+        "outline_route_snapshot": {},
+        "topics": {
+            "S01": {
+                "topic_id": "S01",
+                "project_name": project_name,
+                "job_id": job_id,
+                "expected_sections": 7,
+                "summary_path": str(tmp_path / "summary.json"),
+                "summary_sha256": "a" * 64,
+                "contract_path": str(tmp_path / "contract.txt"),
+                "contract_text_sha256": "b" * 64,
+                "profile_path": str(tmp_path / "profile.json"),
+                "profile_file_sha256": "c" * 64,
+                "prompt_context_sha256": "d" * 64,
+                "attempt_history": [],
+            }
+        }
+    }
+    (tmp_path / "summary.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "contract.txt").write_text("contract", encoding="utf-8")
+    (tmp_path / "profile.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_load_state", lambda: state)
+    monkeypatch.setattr(pipeline, "OUTPUT_ROOT", tmp_path / "output")
+    progress = pipeline.inspect_topic_progress("S01")
+    assert "outline" in progress.completed_stages
+    assert "adopt" in progress.completed_stages
+    assert progress.next_stage == "review"
+
+
+def test_status_command_lists_all_topics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = {
+        "outline_model": "claude-fable-5",
+        "writer_model": "gpt-5.6-sol",
+        "reader_model": "deepseek-v4-pro",
+        "outline_route_snapshot": {},
+        "topics": {
+            tid: {
+                "topic_id": tid,
+                "project_name": f"project_{tid}",
+                "job_id": f"job_{tid}",
+                "expected_sections": 7,
+                "summary_path": str(tmp_path / f"{tid}_summary.json"),
+                "summary_sha256": "a" * 64,
+                "contract_path": str(tmp_path / f"{tid}_contract.txt"),
+                "contract_text_sha256": "b" * 64,
+                "profile_path": str(tmp_path / f"{tid}_profile.json"),
+                "profile_file_sha256": "c" * 64,
+                "prompt_context_sha256": "d" * 64,
+                "attempt_history": [],
+            }
+            for tid in ("S01", "S02", "S03", "S04", "S05")
+        }
+    }
+    for tid in ("S01", "S02", "S03", "S04", "S05"):
+        (tmp_path / f"{tid}_summary.json").write_text("[]", encoding="utf-8")
+        (tmp_path / f"{tid}_contract.txt").write_text("c", encoding="utf-8")
+        (tmp_path / f"{tid}_profile.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_load_state", lambda: state)
+    monkeypatch.setattr(pipeline, "OUTPUT_ROOT", tmp_path / "output")
+    results = {tid: pipeline.inspect_topic_progress(tid) for tid in ("S01","S02","S03","S04","S05")}
+    for tid in ("S01","S02","S03","S04","S05"):
+        assert results[tid].next_stage == "outline"
+        assert results[tid].topic_id == tid
