@@ -28,6 +28,11 @@ QUEUE_PATH = OUTPUT_ROOT / "_queue" / "queue.json"
 TOPIC_ORDER = ("S01", "S02", "S03", "S04", "S05")
 
 import configparser  # noqa: E402
+import threading  # noqa: E402
+
+_STATE_LOCK = threading.Lock()
+_STATE_CACHE: dict[str, Any] | None = None
+
 
 
 def _load_config():
@@ -277,7 +282,13 @@ def initialize() -> dict[str, Any]:
 
 
 def _load_state() -> dict[str, Any]:
-    state = initialize()
+    global _STATE_CACHE
+    with _STATE_LOCK:
+        if _STATE_CACHE is not None:
+            state = _STATE_CACHE
+        else:
+            state = initialize()
+            _STATE_CACHE = state
     if str(state.get("validator_model")) != "deepseek-v4-flash":
         raise ValueError(
             "corrected topic state must pin deepseek-v4-flash for validation"
@@ -983,6 +994,9 @@ def _run_all_topics() -> dict[str, Any]:
 
     results: dict[str, Any] = {}
     topic_errors: dict[str, dict[str, Any]] = {}
+
+    # Pre-initialize state in main thread (avoids parallel file-write conflicts)
+    _load_state()
 
     # Phase 1: parallel execution of all five topics
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
