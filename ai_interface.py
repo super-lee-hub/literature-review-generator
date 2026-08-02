@@ -502,13 +502,13 @@ def _load_api_runtime_settings() -> Tuple[int, int]:
         return timeout_seconds, retry_attempts
 
     api_parameters = config.get("API_Parameters", {}) or {}
-    performance = config.get("Performance", {}) or {}
+    runtime = config.get("Runtime", {}) or {}
     timeout_seconds = _coerce_positive_int(
         api_parameters.get("timeout_seconds", timeout_seconds),
         timeout_seconds,
     )
     retry_attempts = _coerce_positive_int(
-        performance.get("api_retry_attempts", retry_attempts),
+        runtime.get("transport_retries", retry_attempts),
         retry_attempts,
     )
     return timeout_seconds, retry_attempts

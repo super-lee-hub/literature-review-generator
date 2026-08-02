@@ -253,7 +253,8 @@ def create_outline_v3_node_dag(job_id: str, *, candidate_count: int = 5) -> Outl
         _node("global_corpus_ledger", ["outline_evidence_views"]),
         _node("multi_view_matrix", ["outline_evidence_views", "global_corpus_ledger"]),
         _node("relation_candidates", ["multi_view_matrix"]),
-        _node("global_relation_map", ["relation_candidates", "multi_view_matrix"]),
+        _node("relation_adjudication", ["relation_candidates"]),
+        _node("global_relation_map", ["relation_adjudication", "relation_candidates", "multi_view_matrix"]),
         _node("review_intent"),
         _node("coverage_contract", ["global_corpus_ledger", "review_intent"]),
         _node(

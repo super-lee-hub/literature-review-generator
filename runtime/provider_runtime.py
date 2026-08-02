@@ -22,7 +22,7 @@ from services.job_workspace import utc_now_iso
 
 
 PROVIDER_RECEIPT_ARTIFACT_TYPE = "provider_call_receipt"
-PROVIDER_RECEIPT_ARTIFACT_VERSION = "v1"
+PROVIDER_RECEIPT_ARTIFACT_VERSION = "v2"
 PROVIDER_RECEIPT_LEDGER_VERSION = "provider-receipt-ledger-v1"
 
 ProviderErrorKind = Literal[
@@ -219,6 +219,20 @@ class ProviderCallReceiptV1:
     finished_at: str
     budget: Mapping[str, Any]
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    node_id: str = ""
+    call_id: str = ""
+    endpoint_type: str = ""
+    estimated_input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    finish_reason: str = ""
+    incomplete_reason: str = ""
+    fallback_or_payload_mutations: tuple[str, ...] = ()
+    first_token_at: str = ""
+    first_token_latency_ms: float | None = None
+    total_latency_ms: float | None = None
+    timeout_kind: str = ""
+    usage_status: str = "unreported"
 
     def __post_init__(self) -> None:
         if self.artifact_type != PROVIDER_RECEIPT_ARTIFACT_TYPE:
@@ -253,8 +267,17 @@ class ProviderCallReceiptV1:
             raise ProviderRuntimeContractError("total_tokens cannot be negative")
         if not self.started_at or not self.finished_at:
             raise ProviderRuntimeContractError("receipt timestamps are required")
+        for name in (
+            "estimated_input_tokens",
+            "cached_input_tokens",
+            "reasoning_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and int(value) < 0:
+                raise ProviderRuntimeContractError(f"{name} cannot be negative")
         object.__setattr__(self, "budget", dict(self.budget))
         object.__setattr__(self, "metadata", _redact_mapping(dict(self.metadata)))
+        object.__setattr__(self, "fallback_or_payload_mutations", tuple(str(item) for item in self.fallback_or_payload_mutations))
 
     @classmethod
     def from_result(
@@ -277,6 +300,8 @@ class ProviderCallReceiptV1:
         started_at: str,
         finished_at: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        node_id: str = "",
+        call_id: str = "",
     ) -> "ProviderCallReceiptV1":
         status = "success" if result.get("status") == "success" else "failed"
         candidate_error_kind = str(result.get("error_kind") or "invalid_response")
@@ -320,6 +345,20 @@ class ProviderCallReceiptV1:
             finished_at=finished_at or utc_now_iso(),
             budget=budget.to_dict(),
             metadata=metadata or {},
+            node_id=node_id,
+            call_id=call_id or f"call-{admission.sequence}",
+            endpoint_type=str(result.get("endpoint_type") or ""),
+            estimated_input_tokens=admission.estimated_tokens,
+            cached_input_tokens=_optional_nonnegative_int(result.get("cached_input_tokens")),
+            reasoning_tokens=_optional_nonnegative_int(result.get("reasoning_tokens")),
+            finish_reason=str(result.get("finish_reason") or ""),
+            incomplete_reason=str(result.get("incomplete_reason") or ""),
+            fallback_or_payload_mutations=tuple(str(item) for item in result.get("fallback_or_payload_mutations") or ()),
+            first_token_at=str(result.get("first_token_at") or ""),
+            first_token_latency_ms=_optional_float(result.get("first_token_latency_ms")),
+            total_latency_ms=_optional_float(result.get("total_latency_ms")),
+            timeout_kind=str(result.get("timeout_kind") or ""),
+            usage_status=str(result.get("usage_status") or ("reported" if result.get("input_tokens") is not None or result.get("output_tokens") is not None else "unreported")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -368,6 +407,20 @@ class ProviderCallReceiptV1:
             finished_at=str(payload.get("finished_at") or ""),
             budget=budget,
             metadata=metadata,
+            node_id=str(payload.get("node_id") or ""),
+            call_id=str(payload.get("call_id") or ""),
+            endpoint_type=str(payload.get("endpoint_type") or ""),
+            estimated_input_tokens=_optional_nonnegative_int(payload.get("estimated_input_tokens")),
+            cached_input_tokens=_optional_nonnegative_int(payload.get("cached_input_tokens")),
+            reasoning_tokens=_optional_nonnegative_int(payload.get("reasoning_tokens")),
+            finish_reason=str(payload.get("finish_reason") or ""),
+            incomplete_reason=str(payload.get("incomplete_reason") or ""),
+            fallback_or_payload_mutations=tuple(str(item) for item in payload.get("fallback_or_payload_mutations") or ()),
+            first_token_at=str(payload.get("first_token_at") or ""),
+            first_token_latency_ms=_optional_float(payload.get("first_token_latency_ms")),
+            total_latency_ms=_optional_float(payload.get("total_latency_ms")),
+            timeout_kind=str(payload.get("timeout_kind") or ""),
+            usage_status=str(payload.get("usage_status") or "unreported"),
         )
 
 
@@ -393,6 +446,16 @@ def _optional_http_status(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 100 else None
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 class ProviderRuntimeLedger:
@@ -455,6 +518,7 @@ class ProviderRuntime:
         stage_name: str = "",
         route: str = "",
         schema_hash: str | None = None,
+        node_id: str = "",
     ) -> None:
         self.budget = budget or ProviderBudgetV1()
         self.ledger = ledger
@@ -462,6 +526,7 @@ class ProviderRuntime:
         self.attempt_id = attempt_id
         self.stage_name = stage_name
         self.route = route
+        self.node_id = node_id
         self.schema_hash = schema_hash or hash_text("provider-runtime-default-schema-v1")
         self.started_monotonic = time.monotonic()
         self.started_at = utc_now_iso()
@@ -550,6 +615,8 @@ class ProviderRuntime:
             budget=self.budget,
             started_at=admission.admitted_at,
             metadata=metadata,
+            node_id=self.node_id,
+            call_id=str((metadata or {}).get("call_id") or ""),
         )
         with self._lock:
             if self.ledger is not None:

@@ -6,11 +6,11 @@ import os
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, cast
 
 from services.artifact_registry import ArtifactRegistry
-from services.config_compat import CompatConfigView
 from services.job_fingerprint import FingerprintInputs, build_fingerprint_bundle, sanitize_config_for_fingerprint
 from services.job_outcome import JobDisposition, JobOutcomeV1, JobStatus
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.progress_state import determine_resume_state
+from services.settings import ApplicationSettings
 from services.source_inventory import SourceInventoryV1
 
 
@@ -26,7 +26,7 @@ class BootstrappedRuntimeContext:
     pointer_path: str
     workspace: JobWorkspace
     registry: ArtifactRegistry
-    compat_view: CompatConfigView
+    settings: ApplicationSettings
     summary_path: str
     progress_path: str
     checkpoint_path: str
@@ -144,7 +144,7 @@ def bootstrap_job_runtime(
     publish_running_state: bool = True,
 ) -> BootstrappedRuntimeContext:
     generator_config = cast(MutableMapping[str, Dict[str, str]], generator.config)
-    compat_view = CompatConfigView.from_config(generator_config)
+    settings = ApplicationSettings.from_config(generator_config)
     output_base_dir = generator_config.get("Paths", {}).get("output_path", "./output")
 
     inventory = _coerce_inventory(source_inventory)
@@ -266,7 +266,7 @@ def bootstrap_job_runtime(
     generator.bind_job_workspace(
         workspace=workspace,
         artifact_registry=registry,
-        compat_config=compat_view,
+        settings=settings,
         fingerprint_bundle=fingerprint_bundle_dict,
         resume_state_report=resume_report,
     )
@@ -278,7 +278,7 @@ def bootstrap_job_runtime(
         pointer_path=pointer_path,
         workspace=workspace,
         registry=registry,
-        compat_view=compat_view,
+        settings=settings,
         summary_path=summary_path,
         progress_path=progress_path,
         checkpoint_path=checkpoint_path,

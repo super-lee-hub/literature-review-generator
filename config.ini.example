@@ -88,59 +88,45 @@ model = gemini-2.5-pro
 api_base = https://api.videocaptioner.cn/v1
 proxy_mode = environment
 
-[Performance]
+[Application]
+config_schema = 3
+
+[Runtime]
 # 并发处理的最大工作线程数
-# 推荐值为2-3，以平衡吞吐、Provider配额和网络稳定性
-# 并发度只影响本地工作量；Provider节流、重试和配额由runtime统一处理
+# 并发度只影响本地工作量；Provider 重试由共享 runtime 统一处理
 max_workers = 3
-# API调用失败时的重试次数（增强到5次）
-api_retry_attempts = 5
-# 启用/禁用验证模块 (true/false) - 重要：影响处理速度和准确性
-# 第一阶段验证：在单篇文献分析后进行交叉验证，增加准确度但会显著减慢处理速度
-#   true: 启用验证，增加准确度但速度变慢（每篇论文额外1-2分钟）
-#   false: 跳过验证，速度更快（推荐用于大批量处理）
-enable_stage1_validation = false
-
-# 第二阶段验证：对生成的整体文献综述进行引用准确性和一致性验证
-#   true: 启用综述级验证，检查引用准确性和逻辑一致性
-#   false: 跳过综述级验证（推荐）
-enable_stage2_validation = true
-
-# 📝 速度 vs 准确性权衡建议：
-# - 大批量文献分析（>50篇）：建议都设为 false（速度优先）
-# - 少量高质量文献（<20篇）：建议启用第一阶段验证（准确性优先）
+transport_retries = 2
+node_retry_limit = 2
+total_job_deadline_seconds = 0
 
 [Validation]
-# Week 1 起，Validation 段作为验证与 checkpoint 保留策略的真值层。
 stage1_enabled = false
-stage2_enabled = true
-keep_checkpoints_after_completion = false
-# Repair defaults to report-only. Explicit unsafe AI rewrite is only enabled by
-# full_auto_experimental.
-# Options: report_only / manual_confirm / auto_safe / full_auto_experimental
+review_enabled = true
 repair_policy = report_only
-# Optional override for review validation parallelism.
-# Leave commented to reuse [Performance].max_workers.
-# max_workers = 3
+evidence_resolver_enabled = true
+visual_refs_enabled = true
+review_drift_threshold = 0.3
+summary_drift_threshold = 0.2
 
 [Outline]
-enable_outline_intelligence_v2 = false
-enable_literature_map = true
-enable_synthesis_flow = true
-candidate_count = 3
-enable_multi_model_critique = true
-enable_coverage_audit = true
-require_explicit_adopt = true
+candidate_count = 5
+relation_adjudication_enabled = true
+structure_critique_enabled = true
+coverage_critique_enabled = true
+evidence_critique_enabled = true
+require_explicit_adoption = true
+technical_shard_target_tokens = 0
 allow_bibliometric_provider = false
+test_dev_fixture_mode = false
 
 [OutlineModels]
 outline_model = Outline_API
 structure_critic_model = Writer_API
 coverage_critic_model = Primary_Reader_API
+evidence_critic_model = Primary_Reader_API
 arbitrator_model = Outline_API
 
 [OutlineCostControl]
-max_candidate_count = 3
 max_critique_models = 2
 max_summary_refs_per_prompt = 80
 max_outline_retry_count = 2

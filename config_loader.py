@@ -5,11 +5,7 @@ from typing import Dict, List, Optional
 
 from config_validator import validate_all_config
 from dotenv import load_dotenv  # type: ignore
-from services.config_compat import (
-    apply_validation_compat_sections,
-    read_validation_settings,
-    remove_legacy_rate_limit_settings,
-)
+from services.settings import ApplicationSettings, validate_config_keys
 
 
 logger = logging.getLogger(__name__)
@@ -57,7 +53,18 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
     except UnicodeDecodeError as exc:
         raise configparser.Error(f"配置文件编码错误，请使用 UTF-8 编码: {exc}")
 
-    required_sections: List[str] = ["Paths", "Primary_Reader_API", "Backup_Reader_API", "Writer_API"]
+    required_sections: List[str] = [
+        "Application",
+        "Paths",
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Runtime",
+        "Validation",
+        "Outline",
+        "OutlineModels",
+        "OutlineCostControl",
+    ]
     missing_sections = [section for section in required_sections if section not in config.sections()]
     if missing_sections:
         raise configparser.Error(f"配置文件缺少必需的段: {', '.join(missing_sections)}")
@@ -74,16 +81,14 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
             continue
         config_dict["Paths"][key] = os.path.abspath(os.path.join(config_origin, value))
 
-    remove_legacy_rate_limit_settings(config_dict, warn=logger.warning)
-    config_dict = apply_validation_compat_sections(config_dict)
-    validation_settings = read_validation_settings(config_dict)
-    stage1_enabled = validation_settings.stage1_enabled
-    stage2_enabled = validation_settings.stage2_enabled
-    if stage1_enabled or stage2_enabled:
+    schema_errors = validate_config_keys(config_dict)
+    if schema_errors:
+        raise configparser.Error("配置文件包含不支持的字段: " + "; ".join(schema_errors))
+    settings = ApplicationSettings.from_mutable_config(config_dict)
+    if settings.validation.stage1_enabled or settings.validation.review_enabled:
         if "Validator_API" not in config.sections():
             raise configparser.Error(
-                "配置文件错误：当启用验证功能 "
-                "(enable_stage1_validation 或 enable_stage2_validation) 时，必须提供 [Validator_API] 配置段。"
+                "配置文件错误：当启用验证功能时，必须提供 [Validator_API] 配置段。"
             )
 
     # 加载 .env 文件，使用项目根目录作为基础路径
@@ -116,11 +121,15 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
             logger.warning(f"环境变量 {env_var} 对应的配置段 [{section_name}] 不存在")
 
     try:
-        _, warnings_list = validate_all_config(config_dict)
-        for warning in warnings_list:
-            logger.warning(warning)
+        valid, messages = validate_all_config(config_dict)
+        if not valid:
+            raise configparser.Error("配置文件验证失败: " + "; ".join(messages))
+        for message in messages:
+            logger.warning(message)
+    except configparser.Error:
+        raise
     except Exception as exc:
-        logger.warning(f"配置验证过程中发现问题: {exc}")
+        raise configparser.Error(f"配置验证失败: {exc}") from exc
 
     return ConfigDict(config_dict)
 

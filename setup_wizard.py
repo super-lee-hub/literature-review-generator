@@ -367,24 +367,20 @@ def _collect_validation_section(
     api_keys: Dict[str, str],
     existing_env: Mapping[str, str],
 ) -> None:
-    performance = sections["Performance"]
     validation = sections["Validation"]
     print("\n[验证设置]")
     stage1_validation = _prompt_yes_no(
         "启用阶段一验证",
-        _parse_bool(validation.get("stage1_enabled", performance["enable_stage1_validation"])),
+        _parse_bool(validation.get("stage1_enabled", "false")),
     )
-    stage2_validation = _prompt_yes_no(
-        "启用阶段二验证",
-        _parse_bool(validation.get("stage2_enabled", performance["enable_stage2_validation"])),
+    review_validation = _prompt_yes_no(
+        "启用综述验证",
+        _parse_bool(validation.get("review_enabled", "true")),
     )
-    # 同时更新两个段，保持一致性
-    performance["enable_stage1_validation"] = "true" if stage1_validation else "false"
-    performance["enable_stage2_validation"] = "true" if stage2_validation else "false"
     validation["stage1_enabled"] = "true" if stage1_validation else "false"
-    validation["stage2_enabled"] = "true" if stage2_validation else "false"
+    validation["review_enabled"] = "true" if review_validation else "false"
 
-    if stage1_validation or stage2_validation:
+    if stage1_validation or review_validation:
         _collect_api_section(
             sections,
             api_keys,
@@ -461,11 +457,13 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
     _collect_api_section(sections, api_keys, "Free_Mode_API", "自由模式对话引擎", "videocaptioner")
 
     _collect_simple_fields(
-        sections["Performance"],
-        "性能与速率限制",
+        sections["Runtime"],
+        "运行设置",
         (
             ("max_workers", "最大并发数"),
-            ("api_retry_attempts", "单次 API 调用重试次数"),
+            ("transport_retries", "传输层重试次数"),
+            ("node_retry_limit", "节点重试上限"),
+            ("total_job_deadline_seconds", "任务总时限（秒，0 表示不限制）"),
         ),
     )
     _collect_retry_section(sections["Retry_Settings"], "阶段一失败论文自动重试")

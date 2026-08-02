@@ -8,9 +8,19 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Mapping, MutableMapping
 
-from outline.v2_config import OUTLINE_QUALITY_GATE_DEFAULTS
 from config_validator import test_api_connection
-from services.config_compat import apply_validation_compat_sections, remove_legacy_rate_limit_settings
+from services.settings import ApplicationSettings, CONFIG_SCHEMA_VERSION, validate_config_keys
+
+
+OUTLINE_QUALITY_GATE_DEFAULTS: Dict[str, str] = {
+    "coverage_scope": "full",
+    "min_canonical_coverage_full": "0.50",
+    "min_canonical_coverage_local": "0.25",
+    "min_effective_sections": "3",
+    "max_duplicate_assignments": "0",
+    "block_placeholder_sections": "true",
+    "block_empty_research_streams": "true",
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,9 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
     """Return a config layout that includes all new sections."""
 
     return {
+        "Application": {
+            "config_schema": str(CONFIG_SCHEMA_VERSION),
+        },
         "Paths": {
             "zotero_report": "",
             "library_path": "",
@@ -114,11 +127,12 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "api_base": "",
             "proxy_mode": "environment",
         },
-        "Performance": {
+        "Runtime": {
             "max_workers": "3",
-            "api_retry_attempts": "5",
-            "enable_stage1_validation": "false",
-            "enable_stage2_validation": "true",
+            "transport_retries": "2",
+            "node_retry_limit": "2",
+            "total_job_deadline_seconds": "0",
+            "retain_checkpoints_after_completion": "false",
         },
         "Preprocess": {
             "enabled": "true",
@@ -192,33 +206,32 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Validation": {
             "stage1_enabled": "false",
-            "stage2_enabled": "true",
-            "keep_checkpoints_after_completion": "false",
+            "review_enabled": "true",
             "repair_policy": "report_only",
-            "legacy_citation_policy": "report_only",
             "evidence_resolver_enabled": "true",
             "visual_refs_enabled": "true",
             "review_drift_threshold": "0.3",
             "summary_drift_threshold": "0.2",
         },
         "Outline": {
-            "enable_outline_intelligence_v2": "false",
-            "enable_literature_map": "true",
-            "enable_synthesis_flow": "true",
-            "candidate_count": "3",
-            "enable_multi_model_critique": "true",
-            "enable_coverage_audit": "true",
-            "require_explicit_adopt": "true",
+            "candidate_count": "5",
+            "relation_adjudication_enabled": "true",
+            "structure_critique_enabled": "true",
+            "coverage_critique_enabled": "true",
+            "evidence_critique_enabled": "true",
+            "require_explicit_adoption": "true",
+            "technical_shard_target_tokens": "0",
             "allow_bibliometric_provider": "false",
+            "test_dev_fixture_mode": "false",
         },
         "OutlineModels": {
             "outline_model": "Outline_API",
             "structure_critic_model": "Writer_API",
             "coverage_critic_model": "Primary_Reader_API",
+            "evidence_critic_model": "Primary_Reader_API",
             "arbitrator_model": "Outline_API",
         },
         "OutlineCostControl": {
-            "max_candidate_count": "3",
             "max_critique_models": "2",
             "max_summary_refs_per_prompt": "80",
             "max_outline_retry_count": "2",
@@ -254,17 +267,23 @@ def normalize_api_base(raw_value: str, provider: str = "custom") -> str:
 def ensure_config_sections(
     existing: Mapping[str, Mapping[str, str]] | None = None,
 ) -> Dict[str, Dict[str, str]]:
-    """Merge defaults with an existing config-like mapping."""
+    """Merge current defaults with an existing config-like mapping.
+
+    Unknown sections and keys are rejected instead of being silently carried
+    forward into a new file.
+    """
 
     merged = default_config_sections()
     if not existing:
-        return apply_validation_compat_sections(merged)
+        return merged
+
+    key_errors = validate_config_keys(existing)
+    if key_errors:
+        raise ValueError("; ".join(key_errors))
 
     for section, values in existing.items():
         merged.setdefault(section, {})
         merged[section].update({key: str(value) for key, value in values.items()})
-
-    remove_legacy_rate_limit_settings(merged)
 
     # Outline API should inherit writer defaults if still blank.
     if not merged["Outline_API"].get("model"):
@@ -276,7 +295,8 @@ def ensure_config_sections(
     if not merged["Free_Mode_API"].get("api_base"):
         merged["Free_Mode_API"]["api_base"] = merged["Outline_API"].get("api_base", "")
 
-    return apply_validation_compat_sections(merged)
+    ApplicationSettings.from_mutable_config(merged)
+    return merged
 
 
 def read_env_file(env_path: str = ".env") -> Dict[str, str]:
@@ -404,8 +424,6 @@ def save_config_and_env(
 
 def normalize_for_save(config_sections: MutableMapping[str, Dict[str, str]]) -> None:
     """Normalize API base URLs in-place before writing config."""
-
-    remove_legacy_rate_limit_settings(config_sections)
 
     for section_name in API_ENV_MAPPING:
         section = config_sections.get(section_name)

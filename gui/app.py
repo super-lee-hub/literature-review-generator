@@ -25,7 +25,7 @@ from services.configuration_service import (
     save_config_and_env,
     test_api_endpoint,
 )
-from services.config_compat import apply_validation_compat_sections, read_validation_settings
+from services.settings import ApplicationSettings
 from services.environment_service import (
     RuntimeEnvironment,
     detect_runtime_environment,
@@ -66,7 +66,7 @@ NAV_GROUPS = [
         "items": [
             ("环境与路径", "/setup", "基础路径与输出目录", "settings_suggest"),
             ("API 与模型", "/setup/api", "阅读、写作、大纲、自由模式与验证模型", "hub"),
-            ("性能与预处理", "/setup/processing", "并发、OCR、缓存、RAG 与可选验证", "tune"),
+            ("运行与预处理", "/setup/processing", "并发、OCR、缓存、RAG 与可选验证", "tune"),
         ],
     },
 ]
@@ -89,7 +89,7 @@ SEARCH_ITEMS = [
     },
     {
         "route": "/setup/processing",
-        "label": "性能与预处理",
+        "label": "运行与预处理",
         "keywords": ["ocr", "preprocess", "rag", "cache", "缓存", "预处理", "并发", "validation"],
     },
     {
@@ -1145,7 +1145,7 @@ class WorkspaceController:
         self.free_mode_ready_to_apply = False
         self.free_mode_busy = False
         self.status_message = self.t("工作台已就绪。先完成设置，再按“输入来源 → 运行方式 → 主流程”开始第一轮。")
-        validation_settings = read_validation_settings(self.sections)
+        current_settings = ApplicationSettings.from_config(self.sections)
         mineru_base_url = self.env_values.get("MINERU_BASE_URL", DEFAULT_MINERU_BASE_URL)
         mineru_model_version = self.env_values.get("MINERU_MODEL_VERSION", "vlm") or "vlm"
         allow_local_parse_fallback = str(
@@ -1158,10 +1158,12 @@ class WorkspaceController:
                 "library_path": self.sections["Paths"].get("library_path", ""),
                 "output_path": self.sections["Paths"].get("output_path", "./output"),
             },
-            "performance": {
-                "max_workers": self.sections["Performance"].get("max_workers", "3"),
-                "api_retry_attempts": self.sections["Performance"].get("api_retry_attempts", "5"),
-                "enable_stage2_validation": validation_settings.stage2_enabled,
+            "runtime": {
+                "max_workers": self.sections["Runtime"].get("max_workers", "3"),
+                "transport_retries": self.sections["Runtime"].get("transport_retries", "2"),
+                "node_retry_limit": self.sections["Runtime"].get("node_retry_limit", "2"),
+                "total_job_deadline_seconds": self.sections["Runtime"].get("total_job_deadline_seconds", "0"),
+                "review_validation_enabled": current_settings.validation.review_enabled,
             },
             "stage2_retry": {
                 "enabled": self.sections.get("Stage2_Retry", {}).get("enabled", "true") == "true",
@@ -1936,20 +1938,21 @@ class WorkspaceController:
                 "output_path": self.state["paths"]["output_path"],
             }
         )
-        updated_sections["Performance"].update(
+        updated_sections["Runtime"].update(
             {
-                "max_workers": str(self.state["performance"]["max_workers"]),
-                "api_retry_attempts": str(self.state["performance"]["api_retry_attempts"]),
+                "max_workers": str(self.state["runtime"]["max_workers"]),
+                "transport_retries": str(self.state["runtime"]["transport_retries"]),
+                "node_retry_limit": str(self.state["runtime"]["node_retry_limit"]),
+                "total_job_deadline_seconds": str(self.state["runtime"]["total_job_deadline_seconds"]),
             }
         )
         updated_sections.setdefault("Validation", {})
         updated_sections["Validation"].update(
             {
                 "stage1_enabled": "false",
-                "stage2_enabled": "true" if self.state["performance"]["enable_stage2_validation"] else "false",
+                "review_enabled": "true" if self.state["runtime"]["review_validation_enabled"] else "false",
             }
         )
-        updated_sections = apply_validation_compat_sections(updated_sections)
         updated_sections["Stage2_Retry"].update(
             {
                 "enabled": "true" if self.state["stage2_retry"]["enabled"] else "false",
@@ -3090,7 +3093,7 @@ def _render_mineru_api_card(controller: WorkspaceController) -> None:
     with ui.card().classes("ag-card ag-card-strong p-5 w-full"):
         ui.label(t("MinerU 远程解析")).classes("ag-section-title")
         ui.label(
-            t("这是 PDF 预处理使用的远程解析后端，不属于 LLM 模型卡。是否真的调用，还取决于“性能与预处理”页里的解析策略。"),
+            t("这是 PDF 预处理使用的远程解析后端，不属于 LLM 模型卡。是否真的调用，还取决于“运行与预处理”页里的解析策略。"),
         ).classes("ag-subtle")
         with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
             ui.input("Base URL", value=mineru["base_url"]).bind_value(mineru, "base_url")
@@ -3112,7 +3115,7 @@ def _render_mineru_api_card(controller: WorkspaceController) -> None:
         token_input.on("update:model-value", lambda _: refresh_mineru_notes())
         token_input.on("blur", lambda _: refresh_mineru_notes())
         with ui.row().classes("gap-2 q-mt-sm"):
-            ui.button(t("前往性能与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
+            ui.button(t("前往运行与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
 
 
 def _render_processing_mineru_card(controller: WorkspaceController) -> None:
@@ -3381,10 +3384,10 @@ def launch_gui(
                     ui.label(t("2. 再去“API 与模型”页补模型、API Base 和 API Key。")).classes("ag-subtle")
                     ui.label(t("3. 如果 API Base 填错格式，保存时会自动规范化。")).classes("ag-subtle")
                     ui.label(t("4. 配置保存后，API Key 会写入 `.env`，不用手改文本文件。")).classes("ag-subtle")
-                    ui.label(t("5. MinerU token 在“API 与模型”页填写；真正是否调用，要到“性能与预处理”页选择解析策略。")).classes("ag-subtle")
+                    ui.label(t("5. MinerU token 在“API 与模型”页填写；真正是否调用，要到“运行与预处理”页选择解析策略。")).classes("ag-subtle")
                     with ui.row().classes("gap-2 q-mt-md"):
                         ui.button(t("前往 API 与模型"), on_click=lambda: ui.navigate.to("/setup/api")).props("outline")
-                        ui.button(t("前往性能与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
+                        ui.button(t("前往运行与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
 
     @ui.page("/setup/api")
     def api_page() -> None:
@@ -3408,7 +3411,7 @@ def launch_gui(
         t = controller.t
         with _page_shell(
             controller,
-            "性能与预处理",
+            "运行与预处理",
             "这一页专门控制并发、解析策略、PDF 预处理、OCR 和本地 RAG。MinerU 是否真正启用，也在这里决定。",
             "/setup/processing",
         ):
@@ -3416,8 +3419,10 @@ def launch_gui(
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("运行参数")).classes("ag-section-title")
                     with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                        ui.input(t("最大并发"), value=controller.state["performance"]["max_workers"]).bind_value(controller.state["performance"], "max_workers")
-                        ui.input(t("API 重试次数"), value=controller.state["performance"]["api_retry_attempts"]).bind_value(controller.state["performance"], "api_retry_attempts")
+                        ui.input(t("最大并发"), value=controller.state["runtime"]["max_workers"]).bind_value(controller.state["runtime"], "max_workers")
+                        ui.input(t("传输层重试次数"), value=controller.state["runtime"]["transport_retries"]).bind_value(controller.state["runtime"], "transport_retries")
+                        ui.input(t("节点重试上限"), value=controller.state["runtime"]["node_retry_limit"]).bind_value(controller.state["runtime"], "node_retry_limit")
+                        ui.input(t("任务总时限（秒）"), value=controller.state["runtime"]["total_job_deadline_seconds"]).bind_value(controller.state["runtime"], "total_job_deadline_seconds")
 
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("阶段二重试")).classes("ag-section-title")
@@ -3456,7 +3461,7 @@ def launch_gui(
                     ui.label(t("这里只保留仍然建议用户直接控制的高级项。综述验证是可选增强步骤，默认不改变主流程。")).classes("ag-subtle")
                     with ui.expansion(t("高级 / 可选功能"), icon="science").classes("w-full q-mt-md"):
                         with ui.column().classes("gap-2 q-pa-sm"):
-                            ui.switch(t("启用综述验证"), value=controller.state["performance"]["enable_stage2_validation"]).bind_value(controller.state["performance"], "enable_stage2_validation")
+                            ui.switch(t("启用综述验证"), value=controller.state["runtime"]["review_validation_enabled"]).bind_value(controller.state["runtime"], "review_validation_enabled")
 
     @ui.page("/logs")
     def logs_page() -> None:
