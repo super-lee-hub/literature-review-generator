@@ -5,6 +5,7 @@ from pathlib import Path
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.validation_adapter import RuntimeValidationAdapter
+from tests.test_runtime_bridge_helpers import current_config
 
 
 def test_validation_adapter_satisfies_run_review_validation_contract(tmp_path: Path) -> None:
@@ -20,6 +21,7 @@ def test_validation_adapter_satisfies_run_review_validation_contract(tmp_path: P
             project_name="demo-ai",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(queue_file),
         )
     )

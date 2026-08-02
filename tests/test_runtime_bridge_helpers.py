@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 from typing import Any
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
@@ -32,6 +33,12 @@ def write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def current_config(tmp_path: Path) -> Path:
+    target = tmp_path / "config.ini"
+    shutil.copyfile(Path(__file__).resolve().parents[1] / "config.ini.example", target)
+    return target
+
+
 def make_bridge_session(tmp_path: Path, *, action: str = "run_all") -> tuple[AgentRuntimeBridge, Any, Path, Path]:
     pdf_dir = tmp_path / "papers"
     pdf_dir.mkdir()
@@ -46,6 +53,7 @@ def make_bridge_session(tmp_path: Path, *, action: str = "run_all") -> tuple[Age
             project_name="demo-ai",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action=action,
+            config=str(current_config(tmp_path)),
             queue_file=str(queue_file),
         )
     )

@@ -14,7 +14,7 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_workspace import JobWorkspace
-from tests.test_runtime_bridge_helpers import write_json
+from tests.test_runtime_bridge_helpers import current_config, write_json
 from validation.run_result import (
     ValidationExecutionStatus,
     ValidationInputArtifactsV1,
@@ -37,6 +37,7 @@ def test_runtime_validation_bridge_registers_reports(
             project_name="demo-ai",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(queue_file),
         )
     )
@@ -240,6 +241,7 @@ def test_runtime_validation_bridge_rejects_legacy_report_as_verified(
             project_name="legacy-validation",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(queue_file),
         )
     )
@@ -270,6 +272,7 @@ def test_runtime_validation_bridge_rejects_success_without_canonical_file(
             project_name="missing-canonical-validation",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(tmp_path / "queue.json"),
         )
     )
@@ -319,6 +322,7 @@ def test_runtime_validation_bridge_rejects_canonical_identity_mismatch(
             project_name="identity-validation",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(tmp_path / "queue.json"),
         )
     )

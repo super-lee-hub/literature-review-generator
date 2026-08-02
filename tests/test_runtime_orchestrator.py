@@ -5,6 +5,7 @@ from pathlib import Path
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
+from tests.test_runtime_bridge_helpers import current_config
 
 
 def test_agent_runtime_bridge_bootstrap_and_trace(tmp_path: Path) -> None:
@@ -19,6 +20,7 @@ def test_agent_runtime_bridge_bootstrap_and_trace(tmp_path: Path) -> None:
             project_name="demo-ai",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="run_all",
+            config=str(current_config(tmp_path)),
             queue_file=str(skill_output),
         )
     )

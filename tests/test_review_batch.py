@@ -2840,6 +2840,7 @@ def test_runtime_bridge_exposes_downstream_only_batch_derivation(
             project_name="derived-child",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="generate_review",
+            config=str(_current_config(tmp_path)),
             queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
         )
     )
