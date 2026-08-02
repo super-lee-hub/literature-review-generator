@@ -45,6 +45,25 @@ from outline.legacy_adapter import (
 )
 
 from outline.runtime_resolver import OutlineRuntimeResolver, ResolveResult
+from outline.v3_evidence import (
+    build_coverage_contract,
+    build_global_corpus_ledger,
+    build_multi_view_matrix,
+    build_outline_evidence_views,
+    build_review_intent,
+    merge_outline_evidence_shards,
+    shard_outline_evidence_views,
+)
+from outline.v3_models import (
+    CoverageContract,
+    GlobalCorpusLedger,
+    GlobalCorpusLedgerEntry,
+    MultiViewMatrix,
+    MultiViewMatrixRow,
+    OutlineEvidenceView,
+    OutlineEvidenceViews,
+    ReviewIntent,
+)
 
 if TYPE_CHECKING:
     from outline.pipeline import V2Pipeline, V2PipelineResult
@@ -95,4 +114,20 @@ __all__ = [
     "ResolveResult",
     "V2Pipeline",
     "V2PipelineResult",
+    # V3 deterministic evidence layer
+    "OutlineEvidenceView",
+    "OutlineEvidenceViews",
+    "GlobalCorpusLedgerEntry",
+    "GlobalCorpusLedger",
+    "MultiViewMatrixRow",
+    "MultiViewMatrix",
+    "ReviewIntent",
+    "CoverageContract",
+    "build_outline_evidence_views",
+    "build_global_corpus_ledger",
+    "build_multi_view_matrix",
+    "build_review_intent",
+    "build_coverage_contract",
+    "shard_outline_evidence_views",
+    "merge_outline_evidence_shards",
 ]
