@@ -26,6 +26,8 @@ from config_loader import load_config
 from config_validator import validate_all_config
 from models import APIConfig
 from runtime.job_spec import RuntimeJobSpec, load_runtime_job_spec
+from runtime.outline_v3_dag import OutlineNodeStore
+from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.stage_terminal import StageTerminalStore
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry, RegistryError, file_sha256
@@ -276,7 +278,8 @@ class ReviewControlPlane:
             terminal_issues.append(str(exc))
 
         receipts = self._read_provider_receipts(workspace_obj, records)
-        issues = [*registry_issues, *terminal_issues]
+        outline_v3, outline_issues = self._read_outline_v3_state(workspace_obj, registry)
+        issues = [*registry_issues, *terminal_issues, *outline_issues]
         if not Path(registry.registry_path).is_file():
             issues.append("artifact_registry.json is missing")
         return {
@@ -289,6 +292,7 @@ class ReviewControlPlane:
             "integrity": integrity,
             "stage_terminals": terminals,
             "provider_receipts": receipts,
+            "outline_v3": outline_v3,
             "issues": issues,
             "read_only": True,
             "canonical_evidence_hash": _canonical_hash(
@@ -299,9 +303,52 @@ class ReviewControlPlane:
                     "integrity": integrity,
                     "stage_terminals": terminals,
                     "provider_receipts": receipts,
+                    "outline_v3": outline_v3,
                 }
             ),
         }
+
+    @staticmethod
+    def _read_outline_v3_state(
+        workspace: JobWorkspace,
+        registry: ArtifactRegistry,
+    ) -> tuple[dict[str, Any], list[str]]:
+        """Read the v3 DAG/replay projections without creating Registry locks."""
+
+        issues: list[str] = []
+        replay_store = ModelCallReplayStore(workspace)
+        try:
+            dag = OutlineNodeStore(workspace, registry).load()
+        except (OSError, ValueError, TypeError) as exc:
+            dag = None
+            issues.append(f"outline_v3_node_dag: {exc}")
+        try:
+            replay_records = replay_store._read_records()
+        except (OSError, ValueError, TypeError) as exc:
+            replay_records = []
+            issues.append(f"outline_v3_replay: {exc}")
+        if dag is None:
+            return {
+                "available": False,
+                "failed_node_ids": [],
+                "completed_node_ids": [],
+                "replay": {
+                    "path": str(replay_store.path),
+                    "count": len(replay_records),
+                },
+            }, issues
+        return {
+            "available": True,
+            "dag": dag.to_dict(),
+            "content_hash": dag.content_hash,
+            "snapshot_sequence": dag.snapshot_sequence,
+            "failed_node_ids": dag.failed_node_ids,
+            "completed_node_ids": dag.completed_node_ids,
+            "replay": {
+                "path": str(replay_store.path),
+                "count": len(replay_records),
+            },
+        }, issues
 
     @staticmethod
     def _read_provider_receipts(
@@ -349,7 +396,9 @@ class ReviewControlPlane:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         status = inspection["status"]
         completion_status = str(status.get("completion_status") or "blocked")
-        failed_node = str(status.get("failed_stage") or "") or None
+        outline_v3 = inspection.get("outline_v3") or {}
+        outline_failed = [str(item) for item in outline_v3.get("failed_node_ids") or () if str(item)]
+        failed_node = outline_failed[0] if outline_failed else (str(status.get("failed_stage") or "") or None)
         integrity_issues = list(inspection.get("issues") or [])
         provider_receipts = inspection.get("provider_receipts") or {}
         receipt_entries = provider_receipts.get("entries") or []
@@ -365,8 +414,12 @@ class ReviewControlPlane:
             and completion_status in {"failed", "blocked"}
             and not integrity_issues
             and str(status.get("compatibility_status") or "native") == "native"
+            and (bool(outline_v3.get("available")) or not outline_failed)
         )
-        completed = [str(stage) for stage in status.get("completed_stages") or ()]
+        completed = [
+            *[str(stage) for stage in status.get("completed_stages") or ()],
+            *[str(node_id) for node_id in outline_v3.get("completed_node_ids") or ()],
+        ]
         if safe_to_retry:
             recommended = {
                 "command": "reviewctl retry-node",
@@ -489,13 +542,25 @@ class ReviewControlPlane:
         spec_path = Path(resolved) / "artifacts" / "runtime_job_spec_v1.json"
         if not spec_path.is_file():
             raise ControlPlaneError(f"persisted runtime spec is missing: {spec_path}")
-        return self._run_spec(
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(resolved)
+        outline_resume_plan: dict[str, Any] | None = None
+        try:
+            node_store = OutlineNodeStore(workspace_obj, registry)
+            dag = node_store.load()
+            if dag is not None and dag.failed_node_ids:
+                _updated, plan = node_store.resume()
+                outline_resume_plan = plan.to_dict()
+        except (OSError, ValueError, TypeError, RegistryError) as exc:
+            raise ControlPlaneError(f"Outline v3 resume planning is blocked: {exc}") from exc
+        payload = self._run_spec(
             spec_path,
             resume=True,
             job_id=Path(resolved).name.rsplit("__", 1)[-1],
             stage_handler=stage_handler,
             validator_module=validator_module,
         )
+        payload["outline_v3_resume_plan"] = outline_resume_plan
+        return payload
 
     def retry_node(
         self,
@@ -505,6 +570,36 @@ class ReviewControlPlane:
         node_id: str,
     ) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
+        resolved = str(inspection["workspace_path"])
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(resolved)
+        outline_state = inspection.get("outline_v3") or {}
+        if bool(outline_state.get("available")):
+            try:
+                updated, plan = OutlineNodeStore(workspace_obj, registry).retry_node(node_id)
+            except (OSError, ValueError, TypeError, RegistryError) as exc:
+                return {
+                    "status": "blocked",
+                    "job_id": inspection["job_id"],
+                    "node_id": node_id,
+                    "safe_to_retry": False,
+                    "reason": str(exc),
+                    "forbidden_actions": list(FORBIDDEN_ACTIONS),
+                    "read_only": True,
+                }
+            return {
+                "status": "planned",
+                "job_id": inspection["job_id"],
+                "workspace_path": resolved,
+                "node_id": node_id,
+                "safe_to_retry": True,
+                "mutation_performed": True,
+                "resume_required": True,
+                "resume_plan": plan.to_dict(),
+                "preserved_nodes": plan.preserved_node_ids,
+                "dag_content_hash": updated.content_hash,
+                "forbidden_actions": list(FORBIDDEN_ACTIONS),
+                "read_only": False,
+            }
         failed_nodes = {
             str(item.get("stage_name") or "")
             for item in inspection.get("stage_terminals") or ()

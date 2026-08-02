@@ -6,6 +6,9 @@ from pathlib import Path
 from reviewctl import main as reviewctl_main
 from runtime.control_plane import FORBIDDEN_ACTIONS, ReviewControlPlane
 from runtime.runner import AgentRuntimeRunner
+from runtime.outline_v3_dag import OutlineNodeStore
+from services.artifact_registry import ArtifactRegistry
+from services.job_workspace import JobWorkspace
 from tests.test_runtime_bridge_helpers import build_legacy_main, build_success_summary
 
 
@@ -115,3 +118,23 @@ def test_unavailable_node_replay_is_explicitly_blocked(tmp_path: Path) -> None:
     assert response["status"] == "blocked"
     assert response["safe_to_retry"] is False
     assert response["read_only"] is True
+
+
+def test_control_plane_retry_node_uses_persisted_outline_v3_scope(tmp_path: Path) -> None:
+    workspace = JobWorkspace.create(str(tmp_path), "review", "job-v3-control")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    store = OutlineNodeStore(workspace, registry)
+    store.ensure(workspace.job_id, candidate_count=3)
+    store.record_node("structure_critique", status="failed", diagnostics=["synthetic_failure"])
+
+    response = ReviewControlPlane(repo_root=tmp_path, workspace_roots=[tmp_path]).retry_node(
+        workspace=workspace.root_dir,
+        node_id="structure_critique",
+    )
+
+    assert response["status"] == "planned"
+    assert response["mutation_performed"] is True
+    assert response["resume_required"] is True
+    assert "structure_critique" in response["resume_plan"]["rerun_node_ids"]
+    assert "candidate_1" not in response["resume_plan"]["rerun_node_ids"]
+    assert response["read_only"] is False

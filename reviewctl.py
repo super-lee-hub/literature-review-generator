@@ -72,7 +72,7 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
     if command in {"status", "next-action", "reconcile", "repair-plan", "validate", "attest", "export"}:
         return 0
     if command in {"retry-node", "repair-apply", "adopt"}:
-        return 0 if payload.get("status") in {"available", "complete", "succeeded"} else 1
+        return 0 if payload.get("status") in {"available", "complete", "succeeded", "planned"} else 1
     if command in {"run", "resume"}:
         return 0 if payload.get("job_status") == "completed" and payload.get("completion_status") == "complete" else 1
     return 0
