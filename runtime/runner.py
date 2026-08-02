@@ -101,6 +101,13 @@ def _evaluate_runtime_completion(
         for record in registry.list_records():
             if record.status != "ready":
                 continue
+            # The workspace log is intentionally append-only operational
+            # output: its registered hash is the creation hash, not a frozen
+            # canonical artifact hash.  It must not make an otherwise valid
+            # completion fail merely because later lifecycle messages were
+            # appended.
+            if record.artifact_role == "log" or record.artifact_type == "job_log":
+                continue
             ArtifactRegistry._verify_ready_artifact(record)
             ready_job_outcome = ready_job_outcome or record.artifact_id == "job_outcome"
             validation_record = validation_record or record.artifact_type == "validation_run_result"

@@ -308,7 +308,7 @@ class ProviderCallReceiptV1:
             schema_hash=schema_hash,
             status=status,  # type: ignore[arg-type]
             error_kind=error_kind,
-            http_status=result.get("http_status"),
+            http_status=_optional_http_status(result.get("http_status")),
             provider_code=str(result.get("provider_code") or "") or None,
             attempts=max(1, int(result.get("attempts") or 1)),
             retry_after_seconds=retry_after_value,
@@ -379,6 +379,20 @@ def _optional_nonnegative_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 0 else None
+
+
+def _optional_http_status(value: Any) -> int | None:
+    """Normalize transport metadata without trusting mock or foreign values."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, str)):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 100 else None
 
 
 class ProviderRuntimeLedger:
