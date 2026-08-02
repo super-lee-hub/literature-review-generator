@@ -56,3 +56,13 @@ Each multi-variant derivation reserves a durable monotonic `projection_generatio
 `SystemExit` and other `BaseException` paths persist a durable terminal state before re-raising the original exception. Resume reconstructs Validation disposition from the canonical terminal artifact and never infers it from human-readable projections.
 
 Relative paths are resolved from their owning spec/config/summary file, never silently from the process CWD.
+
+## Outline v3 and control-plane projections
+
+Outline Intelligence v3 adds registered, deterministic `outline_evidence_views`, `global_corpus_ledger`, `multi_view_matrix`, `review_intent`, `coverage_contract`, relation-map, candidate-plan, node-DAG, and model-call replay artifacts. They are derived from canonical Stage 1 summaries and bind their source summary hashes; they do not replace `summary_v2_lite` or silently become `adopted_final_outline`.
+
+`reviewctl` is the Agent control plane. `status`, `next-action`, `validate`, `inspect`, and `attest` are provider-free evidence reads; `resume`, `retry-node`, `cancel`, `repair-plan`, `adopt`, and `export` are explicit state transitions with Registry-backed records. Cancellation is cooperative and cannot publish a completed queue state after a request.
+
+Validation closure requires the current Registry-verified review draft v2, citation manifest v3, and `ValidationRunResultV1` input IDs/hashes to match. Citation mapping, semantic disposition, render policy, and repair state are reported together. Repair defaults to `report_only`; an explicit auto-safe transaction creates only quarantined derived draft/manifest/apply artifacts. Adoption requires the existing final-outline, coverage-audit, stage-health, and canonical completion gates.
+
+Export bundles are declarative and contain verified files plus provenance, checksums, completion, and validation-closure evidence. `canonical_verified`, `manual_repaired_legacy`, and `untrusted` are attestation labels, not aliases for job success. A DOCX alone is never an export or completion proof.

@@ -41,3 +41,12 @@ review、citation 与 evidence 输入 hash 均必须是 64 位小写 SHA-256。�
 `AgentRuntimeRunner` 复用现有 `AgentRuntimeBridge`：`run` 启动新任务，`resume` 创建新 attempt，`status` 只读，`reconcile` 只修复持久化投影且绝不调用 provider。相对路径按其所属 spec/config/summary 文件目录解析，不静默回退 CWD。
 
 `SystemExit` 与其他 `BaseException` 路径会先持久化终态，再原样抛出异常。resume 从规范 terminal artifact 恢复 Validation disposition，不解析人类可读投影。
+## Outline v3 control plane evidence
+
+Outline Intelligence v3 adds registered deterministic evidence views, global corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, node DAG, and model-call replay artifacts. These artifacts are derived from canonical Stage 1 summaries and bind source summary hashes; they do not replace `summary_v2_lite` or silently become `adopted_final_outline`.
+
+`reviewctl` is the Agent control plane. `status`, `next-action`, `validate`, `inspect`, and `attest` are provider-free evidence reads; `resume`, `retry-node`, `cancel`, `repair-plan`, `adopt`, and `export` are explicit Registry-backed transitions. Cancellation is cooperative and a cancelled queue job cannot be published as completed.
+
+Validation closure requires the current Registry-verified review draft v2, citation manifest v3, and `ValidationRunResultV1` input IDs and hashes to match. It reports citation mapping, semantic disposition, render policy, and repair state together. Repair defaults to `report_only`; an explicit auto-safe transaction creates only quarantined derived draft, manifest, and apply artifacts. Adoption requires final-outline, coverage-audit, stage-health, and canonical completion gates.
+
+Export bundles contain verified files, provenance, checksums, completion evidence, and validation-closure evidence. `canonical_verified`, `manual_repaired_legacy`, and `untrusted` are forensic labels, not aliases for job success; a DOCX alone is never proof of completion.
