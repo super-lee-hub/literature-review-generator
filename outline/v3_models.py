@@ -574,6 +574,261 @@ class CoverageContract:
         )
 
 
+@dataclass(frozen=True)
+class RelationCandidate:
+    """A deterministic, evidence-linked relation candidate between papers."""
+
+    relation_id: str
+    relation_type: str
+    paper_keys: List[str] = field(default_factory=list)
+    dimension: str = ""
+    evidence_fields: Dict[str, List[str]] = field(default_factory=dict)
+    confidence: str = "low"
+    source_fields: Dict[str, List[str]] = field(default_factory=dict)
+    supporting_labels: List[str] = field(default_factory=list)
+    source_paper_key: str = ""
+    target_paper_key: str = ""
+    diagnostics: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        keys = _stable_unique(self.paper_keys)
+        source_key = self.source_paper_key or (keys[0] if keys else "")
+        target_key = self.target_paper_key or (keys[1] if len(keys) > 1 else "")
+        return {
+            "relation_id": self.relation_id,
+            "relation_type": self.relation_type,
+            "paper_keys": keys,
+            "source_paper_key": source_key,
+            "target_paper_key": target_key,
+            "dimension": self.dimension,
+            "evidence_fields": _stable_mapping({
+                key: _stable_unique(value)
+                for key, value in self.evidence_fields.items()
+            }),
+            "confidence": self.confidence,
+            "source_fields": _stable_mapping({
+                key: _stable_unique(value)
+                for key, value in self.source_fields.items()
+            }),
+            "supporting_labels": _stable_unique(self.supporting_labels),
+            "diagnostics": _stable_unique(self.diagnostics),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RelationCandidate":
+        def field_map(value: Any) -> Dict[str, List[str]]:
+            return {
+                str(key): _stable_unique(
+                    item if isinstance(item, Sequence) and not isinstance(item, (str, bytes)) else [item]
+                )
+                for key, item in _stable_mapping(value).items()
+            }
+
+        keys = _stable_unique(data.get("paper_keys") or [])
+        return cls(
+            relation_id=str(data.get("relation_id") or ""),
+            relation_type=str(data.get("relation_type") or ""),
+            paper_keys=keys,
+            source_paper_key=str(data.get("source_paper_key") or (keys[0] if keys else "")),
+            target_paper_key=str(data.get("target_paper_key") or (keys[1] if len(keys) > 1 else "")),
+            dimension=str(data.get("dimension") or ""),
+            evidence_fields=field_map(data.get("evidence_fields")),
+            confidence=str(data.get("confidence") or "low"),
+            source_fields=field_map(data.get("source_fields")),
+            supporting_labels=_stable_unique(data.get("supporting_labels") or []),
+            diagnostics=_stable_unique(data.get("diagnostics") or []),
+        )
+
+
+@dataclass(frozen=True)
+class GlobalRelationMap:
+    artifact_type: str = "global_relation_map"
+    artifact_version: str = OUTLINE_V3_VERSION
+    relations: List[RelationCandidate] = field(default_factory=list)
+    paper_keys: List[str] = field(default_factory=list)
+    source_artifact_hashes: Dict[str, str] = field(default_factory=dict)
+    blocking_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def relation_candidates(self) -> List[RelationCandidate]:
+        return self.relations
+
+    def canonical_payload(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": self.artifact_type,
+            "artifact_version": self.artifact_version,
+            "relations": [
+                relation.to_dict()
+                for relation in sorted(self.relations, key=lambda item: item.relation_id)
+            ],
+            "paper_keys": _stable_unique(self.paper_keys),
+            "source_artifact_hashes": {
+                str(key): str(value)
+                for key, value in sorted(self.source_artifact_hashes.items(), key=lambda item: str(item[0]))
+            },
+            "blocking_diagnostics": _list_of_dicts(sorted(
+                self.blocking_diagnostics,
+                key=lambda item: compute_v3_hash(item),
+            )),
+        }
+
+    @property
+    def content_hash(self) -> str:
+        return compute_v3_hash(self.canonical_payload())
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = self.canonical_payload()
+        payload["content_hash"] = self.content_hash
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "GlobalRelationMap":
+        return cls(
+            artifact_type=str(data.get("artifact_type") or "global_relation_map"),
+            artifact_version=str(data.get("artifact_version") or OUTLINE_V3_VERSION),
+            relations=[RelationCandidate.from_dict(item) for item in data.get("relations", []) if isinstance(item, Mapping)],
+            paper_keys=_stable_unique(data.get("paper_keys") or []),
+            source_artifact_hashes={
+                str(key): str(value)
+                for key, value in _stable_mapping(data.get("source_artifact_hashes")).items()
+            },
+            blocking_diagnostics=_list_of_dicts(data.get("blocking_diagnostics")),
+        )
+
+
+@dataclass(frozen=True)
+class OrganizingAxis:
+    axis_id: str
+    organizing_logic: str
+    label: str
+    rationale: str = ""
+    preferred_dimensions: List[str] = field(default_factory=list)
+    preferred_relation_types: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "axis_id": self.axis_id,
+            "organizing_logic": self.organizing_logic,
+            "label": self.label,
+            "rationale": self.rationale,
+            "preferred_dimensions": _stable_unique(self.preferred_dimensions),
+            "preferred_relation_types": _stable_unique(self.preferred_relation_types),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "OrganizingAxis":
+        return cls(
+            axis_id=str(data.get("axis_id") or ""),
+            organizing_logic=str(data.get("organizing_logic") or ""),
+            label=str(data.get("label") or ""),
+            rationale=str(data.get("rationale") or ""),
+            preferred_dimensions=_stable_unique(data.get("preferred_dimensions") or []),
+            preferred_relation_types=_stable_unique(data.get("preferred_relation_types") or []),
+        )
+
+
+@dataclass(frozen=True)
+class OutlineCandidatePlan:
+    candidate_id: str
+    organizing_logic: str
+    axis_id: str
+    shared_artifact_hashes: Dict[str, str] = field(default_factory=dict)
+    required_node_ids: List[str] = field(default_factory=list)
+    provider_generation_node_id: str = ""
+    status: str = "planned"
+    diagnostics: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "organizing_logic": self.organizing_logic,
+            "axis_id": self.axis_id,
+            "shared_artifact_hashes": {
+                str(key): str(value)
+                for key, value in sorted(self.shared_artifact_hashes.items(), key=lambda item: str(item[0]))
+            },
+            "required_node_ids": _stable_unique(self.required_node_ids),
+            "provider_generation_node_id": self.provider_generation_node_id,
+            "provider_generation_is_separate": True,
+            "status": self.status,
+            "diagnostics": _stable_unique(self.diagnostics),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "OutlineCandidatePlan":
+        return cls(
+            candidate_id=str(data.get("candidate_id") or ""),
+            organizing_logic=str(data.get("organizing_logic") or ""),
+            axis_id=str(data.get("axis_id") or ""),
+            shared_artifact_hashes={
+                str(key): str(value)
+                for key, value in _stable_mapping(data.get("shared_artifact_hashes")).items()
+            },
+            required_node_ids=_stable_unique(data.get("required_node_ids") or []),
+            provider_generation_node_id=str(data.get("provider_generation_node_id") or ""),
+            status=str(data.get("status") or "planned"),
+            diagnostics=_stable_unique(data.get("diagnostics") or []),
+        )
+
+
+@dataclass(frozen=True)
+class OutlineCandidatePlans:
+    artifact_type: str = "organizing_axes_and_candidate_plans"
+    artifact_version: str = OUTLINE_V3_VERSION
+    axes: List[OrganizingAxis] = field(default_factory=list)
+    candidates: List[OutlineCandidatePlan] = field(default_factory=list)
+    shared_artifact_hashes: Dict[str, str] = field(default_factory=dict)
+    review_intent_hash: str = ""
+    coverage_contract_hash: str = ""
+    blocking_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
+
+    def canonical_payload(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": self.artifact_type,
+            "artifact_version": self.artifact_version,
+            "axes": [axis.to_dict() for axis in sorted(self.axes, key=lambda item: item.axis_id)],
+            "candidates": [
+                candidate.to_dict()
+                for candidate in sorted(self.candidates, key=lambda item: item.candidate_id)
+            ],
+            "shared_artifact_hashes": {
+                str(key): str(value)
+                for key, value in sorted(self.shared_artifact_hashes.items(), key=lambda item: str(item[0]))
+            },
+            "review_intent_hash": self.review_intent_hash,
+            "coverage_contract_hash": self.coverage_contract_hash,
+            "blocking_diagnostics": _list_of_dicts(sorted(
+                self.blocking_diagnostics,
+                key=lambda item: compute_v3_hash(item),
+            )),
+        }
+
+    @property
+    def content_hash(self) -> str:
+        return compute_v3_hash(self.canonical_payload())
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = self.canonical_payload()
+        payload["content_hash"] = self.content_hash
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "OutlineCandidatePlans":
+        return cls(
+            artifact_type=str(data.get("artifact_type") or "organizing_axes_and_candidate_plans"),
+            artifact_version=str(data.get("artifact_version") or OUTLINE_V3_VERSION),
+            axes=[OrganizingAxis.from_dict(item) for item in data.get("axes", []) if isinstance(item, Mapping)],
+            candidates=[OutlineCandidatePlan.from_dict(item) for item in data.get("candidates", []) if isinstance(item, Mapping)],
+            shared_artifact_hashes={
+                str(key): str(value)
+                for key, value in _stable_mapping(data.get("shared_artifact_hashes")).items()
+            },
+            review_intent_hash=str(data.get("review_intent_hash") or ""),
+            coverage_contract_hash=str(data.get("coverage_contract_hash") or ""),
+            blocking_diagnostics=_list_of_dicts(data.get("blocking_diagnostics")),
+        )
+
+
 # Names without the explicit version suffix are the public v3 vocabulary.
 OutlineEvidenceViewV1 = OutlineEvidenceView
 OutlineEvidenceViewsV1 = OutlineEvidenceViews
@@ -581,6 +836,11 @@ GlobalCorpusLedgerV1 = GlobalCorpusLedger
 MultiViewMatrixV1 = MultiViewMatrix
 ReviewIntentV1 = ReviewIntent
 CoverageContractV1 = CoverageContract
+RelationCandidateV1 = RelationCandidate
+GlobalRelationMapV1 = GlobalRelationMap
+OrganizingAxisV1 = OrganizingAxis
+OutlineCandidatePlanV1 = OutlineCandidatePlan
+OutlineCandidatePlansV1 = OutlineCandidatePlans
 
 
 __all__ = [
@@ -606,4 +866,14 @@ __all__ = [
     "MultiViewMatrixV1",
     "ReviewIntentV1",
     "CoverageContractV1",
+    "RelationCandidate",
+    "GlobalRelationMap",
+    "OrganizingAxis",
+    "OutlineCandidatePlan",
+    "OutlineCandidatePlans",
+    "RelationCandidateV1",
+    "GlobalRelationMapV1",
+    "OrganizingAxisV1",
+    "OutlineCandidatePlanV1",
+    "OutlineCandidatePlansV1",
 ]

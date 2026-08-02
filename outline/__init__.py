@@ -64,6 +64,11 @@ from outline.v3_models import (
     OutlineEvidenceViews,
     ReviewIntent,
 )
+from outline.v3_relations import (
+    build_global_relation_map,
+    build_organizing_axes,
+    build_outline_candidate_plans,
+)
 
 if TYPE_CHECKING:
     from outline.pipeline import V2Pipeline, V2PipelineResult
@@ -130,4 +135,7 @@ __all__ = [
     "build_coverage_contract",
     "shard_outline_evidence_views",
     "merge_outline_evidence_shards",
+    "build_global_relation_map",
+    "build_organizing_axes",
+    "build_outline_candidate_plans",
 ]
