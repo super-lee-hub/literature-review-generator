@@ -14,7 +14,7 @@ from validation.summary_recheck import (
     SummaryRechecker,
     WHITELISTED_FIELDS,
 )
-from validator import run_week3_review_validation, run_week3_summary_recheck
+from validator import recheck_current_summary_artifacts, validate_current_review_artifacts
 
 
 def test_evidence_candidate_creation():
@@ -120,11 +120,11 @@ def test_validator_compatibility_entrypoints():
     citation_manifest = {"citations": []}
     paper_artifacts = []
 
-    val_result = run_week3_review_validation(review_draft, citation_manifest, paper_artifacts)
-    assert val_result["week3_validation"] is True
+    val_result = validate_current_review_artifacts(review_draft, citation_manifest, paper_artifacts)
+    assert val_result["validation"] is True
 
-    recheck_result = run_week3_summary_recheck(paper_artifacts)
-    assert recheck_result["week3_recheck"] is True
+    recheck_result = recheck_current_summary_artifacts(paper_artifacts)
+    assert recheck_result["recheck"] is True
 
 
 def test_visual_understanding_gap_separation():
@@ -160,13 +160,24 @@ def test_visual_understanding_gap_separation():
     assert citation_result is not None
 
 
-def test_review_draft_v2_citation_manifest_integration():
-    """Test that review_draft_v2 and citation manifest are properly integrated."""
-    from services.review_draft import build_review_draft_v2
-    from services.citation_manifest import build_citation_manifest_v1
+def test_review_draft_v3_citation_manifest_integration():
+    """The current review draft and citation manifest share structured refs."""
+    from services.review_draft import build_review_draft
+    from services.citation_manifest import build_citation_manifest_from_review_draft
+    from services.citation_ref_catalog import build_document_ref_catalog
 
-    # Build review_draft_v2
-    review_draft = build_review_draft_v2(
+    summaries = [
+        {
+            "paper_info": {
+                "title": "Test Paper",
+                "authors": ["Author A"],
+                "year": "2024",
+                "canonical_paper_key": "paper-1",
+            }
+        }
+    ]
+    catalog = build_document_ref_catalog(summaries, project_name="test-project", job_id="test-job")
+    review_draft = build_review_draft(
         job_id="test-job",
         project_name="test-project",
         draft_id="test-draft",
@@ -178,15 +189,16 @@ def test_review_draft_v2_citation_manifest_integration():
             {
                 "section_number": 1,
                 "section_title": "Introduction",
-                "content": "This is the introduction section.\n\nIt has multiple paragraphs.",
+            "content": "This is the introduction section [[cite_ref:R001]].\n\nIt has multiple paragraphs.",
             }
         ],
         references=["Author, A. (2024). Test reference."],
         generation_mode="full_review",
+        paper_summaries=summaries,
+        citation_ref_catalog=catalog,
     )
 
-    # Verify review_draft_v2 has blocks
-    assert review_draft.artifact_version == "v2"
+    assert review_draft.artifact_version == "v3"
     assert "sections" in review_draft.content
     sections = review_draft.content["sections"]
     assert len(sections) > 0
@@ -195,85 +207,23 @@ def test_review_draft_v2_citation_manifest_integration():
     assert "blocks" in sections_dict[0]
     assert len(sections_dict[0]["blocks"]) > 0
 
-    # Build citation manifest linked to review_draft_v2
-    citations = [
-        {
-            "citation_id": "cite_1",
-            "paper_id": "paper_1",
-            "text": "Test citation",
-            "context": "Test context",
-            "section_number": 1,
-            "section_title": "Introduction",
-            "block_id": "s1_b1",
-            "block_order": 1,
-            "review_draft_version": "v2",
-        }
-    ]
-
-    citation_manifest = build_citation_manifest_v1(
+    citation_manifest = build_citation_manifest_from_review_draft(
         job_id="test-job",
         project_name="test-project",
         manifest_id="test-manifest",
-        review_draft_path="/test/review_draft_v2.json",
+        review_draft_path="/test/review_draft.json",
         review_word_path="/test/review.docx",
-        citations=citations,
+        review_draft=review_draft.to_dict(),
+        paper_summaries=summaries,
+        citation_ref_catalog=catalog,
     )
 
-    # Verify citation manifest is linked to review_draft_v2
     assert citation_manifest.artifact_type == "citation_manifest"
-    assert citation_manifest.review_reference["review_draft_path"] == "/test/review_draft_v2.json"
-    assert len(citation_manifest.citations) == 1
-    assert citation_manifest.citations[0]["review_draft_version"] == "v2"
-    assert citation_manifest.citations[0]["block_id"] == "s1_b1"
-    assert citation_manifest.citations[0]["block_order"] == 1
-
-
-def test_citation_manifest_is_block_aware():
-    """Test that citation manifest entries carry block information."""
-    from services.citation_manifest import build_citation_manifest_v1
-
-    citations = [
-        {
-            "citation_id": "cite_1",
-            "paper_id": "paper_1",
-            "text": "First citation",
-            "context": "Context 1",
-            "section_number": 1,
-            "section_title": "Section 1",
-            "block_id": "s1_b1",
-            "block_order": 1,
-            "review_draft_version": "v2",
-        },
-        {
-            "citation_id": "cite_2",
-            "paper_id": "paper_2",
-            "text": "Second citation",
-            "context": "Context 2",
-            "section_number": 1,
-            "section_title": "Section 1",
-            "block_id": "s1_b2",
-            "block_order": 2,
-            "review_draft_version": "v2",
-        },
-    ]
-
-    manifest = build_citation_manifest_v1(
-        job_id="test-job",
-        project_name="test-project",
-        manifest_id="test-manifest",
-        review_draft_path="/test/review_draft_v2.json",
-        review_word_path="/test/review.docx",
-        citations=citations,
-    )
-
-    # Verify all citations have block information
-    for citation in manifest.citations:
-        assert "block_id" in citation
-        assert "block_order" in citation
-        assert "section_number" in citation
-        assert "section_title" in citation
-        assert "review_draft_version" in citation
-        assert citation["review_draft_version"] == "v2"
+    assert citation_manifest.artifact_version == "v3"
+    assert citation_manifest.review_reference["review_draft_path"] == "/test/review_draft.json"
+    assert len(citation_manifest.occurrences) == 1
+    assert citation_manifest.occurrences[0].ref_id == "R001"
+    assert citation_manifest.occurrences[0].paper_id == "paper-1"
 
 
 def test_validator_reads_from_artifacts_not_docx():
@@ -468,57 +418,6 @@ def test_evidence_candidate_has_required_fields():
     assert candidate.evidence_scope
 
 
-def test_citation_manifest_uses_real_paper_ids():
-    """Test that citation manifest uses real paper IDs that match actual paper artifacts."""
-    from services.citation_manifest import build_citation_manifest_v1
-    from services.paper_artifact import build_paper_artifact_v1
-    
-    # Create a real paper artifact with canonical paper key
-    paper_artifact = build_paper_artifact_v1(
-        job_id="test-job",
-        paper={
-            "title": "Test Paper",
-            "authors": ["Author1", "Author2"],
-            "year": "2024",
-        },
-        result={
-            "status": "success",
-            "ai_summary": {"summary": "Test summary"},
-        },
-        paper_key="test_paper_key_2024",
-    )
-    
-    real_paper_id = paper_artifact.paper_identity["canonical_paper_key"]
-    
-    # Create citation manifest with real paper ID
-    citations = [
-        {
-            "citation_id": "cite_1",
-            "paper_id": real_paper_id,
-            "text": "Test citation",
-            "context": "Test context",
-            "section_number": 1,
-            "section_title": "Introduction",
-            "block_id": "s1_b1",
-            "block_order": 1,
-            "review_draft_version": "v2",
-        }
-    ]
-    
-    citation_manifest = build_citation_manifest_v1(
-        job_id="test-job",
-        project_name="test-project",
-        manifest_id="test-manifest",
-        review_draft_path="/test/review_draft_v2.json",
-        review_word_path="/test/review.docx",
-        citations=citations,
-    )
-    
-    # Verify citation uses real paper ID
-    assert citation_manifest.citations[0]["paper_id"] == real_paper_id
-    assert citation_manifest.citations[0]["paper_id"] != "paper_1"  # Not a placeholder
-
-
 def test_evidence_resolver_receives_preprocess_and_visual_inputs():
     """Test that evidence resolver receives preprocess/visual inputs in Week 3 path."""
     from validation.evidence_resolver import build_evidence_resolver_context
@@ -637,7 +536,7 @@ def test_validator_loads_real_paper_artifacts():
     import json
     import os
     import tempfile
-    from validator import run_week3_review_validation
+    from validator import validate_current_review_artifacts
 
     # Create a mock paper artifact file on disk
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -736,8 +635,8 @@ def test_validator_loads_real_paper_artifacts():
         }
         
         # Run validation with the loaded artifact
-        result = run_week3_review_validation(review_draft, citation_manifest, [loaded_artifact])
-        assert result["week3_validation"] is True
+        result = validate_current_review_artifacts(review_draft, citation_manifest, [loaded_artifact])
+        assert result["validation"] is True
 
 
 def test_end_to_end_week3_validation_with_real_artifacts():
@@ -785,7 +684,14 @@ def test_end_to_end_week3_validation_with_real_artifacts():
                             "block_id": "s1_b1",
                             "block_kind": "paragraph",
                             "block_order": 1,
-                            "text": "The study found important findings (Author, 2024).",
+                            "text": "The study found important findings [[cite_ref:R001]].",
+                            "citations": [
+                                {
+                                    "citation_token": "[[cite_ref:R001]]",
+                                    "ref_id": "R001",
+                                    "source_type": "structured_ref",
+                                }
+                            ],
                         }
                     ],
                 }
@@ -794,14 +700,35 @@ def test_end_to_end_week3_validation_with_real_artifacts():
     }
     
     citation_manifest = {
-        "citations": [
+        "citation_sets": [
             {
-                "citation_id": "cite_1",
-                "paper_id": "test_paper_key_2024",
-                "text": "important findings",
-                "context": "The study found important findings",
+                "bundle_id": "bundle_1",
+                "citation_set_key": "test_paper_key_2024",
+                "paper_ids": ["test_paper_key_2024"],
+                "paper_keys": ["test_paper_key_2024"],
+                "occurrence_ids": ["occ_1"],
+                "block_ids": ["s1_b1"],
+                "section_numbers": [1],
+                "section_titles": ["Introduction"],
+                "claim_texts": ["The study found important findings."],
+                "citation_tokens": ["[[cite_ref:R001]]"],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_1",
+                        "citation_set_key": "test_paper_key_2024",
+                        "paper_ids": ["test_paper_key_2024"],
+                        "supporting_paper_ids": ["test_paper_key_2024"],
+                        "pooled_paper_ids": ["test_paper_key_2024"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
+                        "block_id": "s1_b1",
+                        "sentence_index": 1,
+                        "claim_text": "The study found important findings.",
+                        "citation_tokens": ["[[cite_ref:R001]]"],
+                    }
+                ],
             }
-        ],
+        ]
     }
     
     # Run validation
@@ -1051,6 +978,10 @@ def test_validator_prefers_claim_units_over_full_block_text():
                         "claim_text": "This study scraped Booking.com hotel data and used the difference between value-for-money and overall ratings as a fairness proxy.",
                         "citation_tokens": ["[[cite:paper_1|mode=parenthetical]]"],
                         "block_anchor_hash": "deadbeef",
+                        "paper_ids": ["paper_1"],
+                        "supporting_paper_ids": ["paper_1"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
                     }
                 ],
                 "citation_tokens": ["[[cite:paper_1|mode=parenthetical]]"],
@@ -1199,6 +1130,17 @@ def test_review_validator_uses_markdown_path_for_normalized_text(tmp_path):
                 "claim_texts": ["Booking.com fairness proxy"],
                 "block_ids": [],
                 "section_titles": ["Methods"],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_markdown",
+                        "citation_set_key": "paper_1",
+                        "paper_ids": ["paper_1"],
+                        "supporting_paper_ids": ["paper_1"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
+                        "claim_text": "Booking.com fairness proxy",
+                    }
+                ],
             }
         ]
     }
@@ -1257,6 +1199,17 @@ def test_fallback_claim_unit_ids_are_deterministic():
                 "claim_texts": ["Booking.com hotel data was used to model price fairness."],
                 "block_ids": ["s1_b1"],
                 "section_titles": ["Methods"],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_1",
+                        "citation_set_key": "paper_1",
+                        "paper_ids": ["paper_1"],
+                        "supporting_paper_ids": ["paper_1"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
+                        "claim_text": "Booking.com hotel data was used to model price fairness.",
+                    }
+                ],
                 "citation_tokens": [],
             }
         ]
@@ -1334,6 +1287,11 @@ def test_multi_paper_set_allows_clause_level_support_across_papers():
                         "claim_text": claim_text,
                         "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]", "[[cite:paper_b|mode=parenthetical]]"],
                         "block_anchor_hash": "multi123",
+                        "paper_ids": ["paper_a", "paper_b"],
+                        "supporting_paper_ids": ["paper_a", "paper_b"],
+                        "pooled_paper_ids": ["paper_a", "paper_b"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
                     }
                 ],
                 "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]", "[[cite:paper_b|mode=parenthetical]]"],
@@ -1413,6 +1371,20 @@ def test_multi_paper_set_with_partial_clause_coverage_does_not_drop_to_unsupport
                 "section_numbers": [1],
                 "section_titles": ["Synthesis"],
                 "claim_texts": [claim_text],
+                "claim_units": [
+                    {
+                        "claim_unit_id": "cu_multi_gap",
+                        "citation_set_key": "paper_a+paper_b",
+                        "paper_ids": ["paper_a", "paper_b"],
+                        "supporting_paper_ids": ["paper_a", "paper_b"],
+                        "pooled_paper_ids": ["paper_a", "paper_b"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
+                        "block_id": "s1_b1",
+                        "sentence_index": 1,
+                        "claim_text": claim_text,
+                    }
+                ],
                 "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]", "[[cite:paper_b|mode=parenthetical]]"],
             }
         ]
@@ -1614,6 +1586,10 @@ def test_per_paper_evidence_packets_preserve_multiple_claim_units():
                         "claim_text": "Paper A shows complaint behavior increases under unfair pricing.",
                         "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],
                         "block_anchor_hash": "multi-cu",
+                        "paper_ids": ["paper_a"],
+                        "supporting_paper_ids": ["paper_a"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
                     },
                     {
                         "claim_unit_id": "cu_a_2",
@@ -1625,6 +1601,10 @@ def test_per_paper_evidence_packets_preserve_multiple_claim_units():
                         "claim_text": "Paper A also shows loyalty intensifies betrayal responses.",
                         "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],
                         "block_anchor_hash": "multi-cu",
+                        "paper_ids": ["paper_a"],
+                        "supporting_paper_ids": ["paper_a"],
+                        "alignment_status": "explicit",
+                        "alignment_confidence": 1.0,
                     },
                 ],
                 "citation_tokens": ["[[cite:paper_a|mode=parenthetical]]"],

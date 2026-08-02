@@ -134,10 +134,10 @@ def test_validator_populates_verified_input_artifact_contract(tmp_path: Path) ->
         job_id="job-input-contract",
     )
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    review_path = workspace.artifact_path("review_draft_v2.json")
+    review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
     evidence_path = workspace.artifact_path("paper_artifacts/paper-a.evidence_manifest_v1.json")
-    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v2"})
+    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v3"})
     atomic_write_json(
         citation_path,
         {
@@ -149,10 +149,10 @@ def test_validator_populates_verified_input_artifact_contract(tmp_path: Path) ->
     )
     atomic_write_json(evidence_path, {"artifact_type": "evidence_manifest", "artifact_version": "v1"})
     review_record = registry.register_file(
-        artifact_id="review:v2",
+        artifact_id="review:v3",
         artifact_role="review_draft",
         artifact_type="review_draft",
-        artifact_version="v2",
+        artifact_version="v3",
         path=review_path,
         producer="tests",
     )
@@ -175,7 +175,7 @@ def test_validator_populates_verified_input_artifact_contract(tmp_path: Path) ->
     generator = SimpleNamespace(
         job_workspace=workspace,
         artifact_registry=registry,
-        _review_draft_v2_path=lambda: review_path,
+        _review_draft_path=lambda: review_path,
         _citation_manifest_path=lambda: citation_path,
     )
     paper_artifact = {
@@ -260,18 +260,18 @@ def test_validator_registers_external_evidence_only_with_verified_identity(
 
     workspace = JobWorkspace.create(str(tmp_path), "child", job_id="job-child")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    review_path = workspace.artifact_path("review_draft_v2.json")
+    review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
-    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v2"})
+    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v3"})
     atomic_write_json(
         citation_path,
         {"artifact_type": "citation_manifest", "artifact_version": "v3"},
     )
     review_record = registry.register_file(
-        artifact_id="review:v2",
+        artifact_id="review:v3",
         artifact_role="review_draft",
         artifact_type="review_draft",
-        artifact_version="v2",
+        artifact_version="v3",
         path=review_path,
         producer="tests",
     )
@@ -370,11 +370,11 @@ def test_validator_does_not_treat_cited_draft_with_empty_manifest_as_citation_fr
 ) -> None:
     workspace = JobWorkspace.create(str(tmp_path), "cited-empty-manifest", job_id="job-empty")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    review_path = workspace.artifact_path("review_draft_v2.json")
+    review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
     review_draft = {
         "artifact_type": "review_draft",
-        "artifact_version": "v2",
+        "artifact_version": "v3",
         "content": {
             "sections": [
                 {
@@ -398,21 +398,21 @@ def test_validator_does_not_treat_cited_draft_with_empty_manifest_as_citation_fr
     atomic_write_json(review_path, review_draft)
     atomic_write_json(citation_path, citation_manifest)
     for artifact_id, artifact_type, path in (
-        ("review:v2", "review_draft", review_path),
+        ("review:v3", "review_draft", review_path),
         ("citation:v3", "citation_manifest", citation_path),
     ):
         registry.register_file(
             artifact_id=artifact_id,
             artifact_role=artifact_type,
             artifact_type=artifact_type,
-            artifact_version="v2" if artifact_type == "review_draft" else "v3",
+            artifact_version="v3",
             path=path,
             producer="tests",
         )
     generator = SimpleNamespace(
         job_workspace=workspace,
         artifact_registry=registry,
-        _review_draft_v2_path=lambda: review_path,
+        _review_draft_path=lambda: review_path,
         _citation_manifest_path=lambda: citation_path,
     )
 

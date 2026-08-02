@@ -2,15 +2,14 @@
 
 The control plane is deliberately thin.  It resolves an existing workspace,
 projects the canonical runner status, and exposes safe next actions without
-inventing a second completion contract.  Commands which require a future
-Outline v3 node store or a validation/repair transaction return an explicit
+inventing a second completion contract.  Commands which require an unavailable
+validation/repair transaction return an explicit
 blocked result instead of mutating canonical artifacts or pretending that the
 operation completed.
 """
 
 from __future__ import annotations
 
-import configparser
 from dataclasses import asdict
 import hashlib
 import importlib
@@ -31,7 +30,6 @@ from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.stage_terminal import StageTerminalStore
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry, RegistryError, file_sha256
-from services.config_compat import LEGACY_RATE_LIMIT_KEYS
 from services.model_capabilities import resolve_model_capability
 from services.job_workspace import JobWorkspace
 from runtime.cancellation import CancellationRequestStore
@@ -418,7 +416,6 @@ class ReviewControlPlane:
             failed_node
             and completion_status in {"failed", "blocked"}
             and not integrity_issues
-            and str(status.get("compatibility_status") or "native") == "native"
             and (bool(outline_v3.get("available")) or not outline_failed)
         )
         completed = [
@@ -483,40 +480,19 @@ class ReviewControlPlane:
         }
         return payload
 
-    @staticmethod
-    def _load_symbol(reference: str) -> Any:
-        module_name, separator, attribute = reference.partition(":")
-        if not separator or not module_name or not attribute:
-            raise ControlPlaneError("symbol reference must use module:attribute")
-        module = importlib.import_module(module_name)
-        try:
-            return getattr(module, attribute)
-        except AttributeError as exc:
-            raise ControlPlaneError(f"symbol not found: {reference}") from exc
-
     def _run_spec(
         self,
         spec_path: str | Path,
         *,
         resume: bool = False,
         job_id: str = "",
-        stage_handler: str = "",
-        validator_module: str = "",
     ) -> dict[str, Any]:
         spec = _load_spec_path(spec_path)
         if job_id:
             from dataclasses import replace
 
             spec = replace(spec, job_id=job_id)
-        legacy_main = importlib.import_module("main")
-        handler = self._load_symbol(stage_handler) if stage_handler else None
-        validator = importlib.import_module(validator_module) if validator_module else None
-        runner = AgentRuntimeRunner(
-            spec,
-            legacy_main=legacy_main,
-            stage_handler=handler,
-            validator_module=validator,
-        )
+        runner = AgentRuntimeRunner(spec)
         result = runner.resume() if resume else runner.run()
         return self._status_payload(result)
 
@@ -525,23 +501,14 @@ class ReviewControlPlane:
         spec_path: str | Path,
         *,
         job_id: str = "",
-        stage_handler: str = "",
-        validator_module: str = "",
     ) -> dict[str, Any]:
-        return self._run_spec(
-            spec_path,
-            job_id=job_id,
-            stage_handler=stage_handler,
-            validator_module=validator_module,
-        )
+        return self._run_spec(spec_path, job_id=job_id)
 
     def resume(
         self,
         *,
         job_id: str | None = None,
         workspace: str | Path | None = None,
-        stage_handler: str = "",
-        validator_module: str = "",
     ) -> dict[str, Any]:
         resolved = self.resolve_workspace(job_id=job_id, workspace=workspace)
         spec_path = Path(resolved) / "artifacts" / "runtime_job_spec_v1.json"
@@ -567,8 +534,6 @@ class ReviewControlPlane:
             spec_path,
             resume=True,
             job_id=Path(resolved).name.rsplit("__", 1)[-1],
-            stage_handler=stage_handler,
-            validator_module=validator_module,
         )
         payload["outline_v3_resume_plan"] = outline_resume_plan
         return payload
@@ -888,7 +853,7 @@ class ReviewControlPlane:
                 "scope": "registry_file_hashes_dependency_graph_validation_closure",
                 "closure": closure.to_dict(),
                 "read_only": False,
-                "next_step": "full forensic closure is required before trusting a legacy workspace"
+                "next_step": "full closure is required before trusting the inspected workspace"
                 if result.status == "untrusted"
                 else "no further forensic action is required for the inspected scope",
             }
@@ -956,32 +921,13 @@ class ReviewControlPlane:
             {"providers": provider_details, "missing_required_api_keys": missing_keys, "network_probe": False},
         )
 
-        raw_legacy: list[str] = []
-        if target_config.is_file():
-            parser = configparser.ConfigParser()
-            try:
-                parser.read(target_config, encoding="utf-8")
-                raw_legacy = sorted(
-                    key
-                    for key in parser.defaults()
-                    if key.lower() in LEGACY_RATE_LIMIT_KEYS
-                )
-                raw_legacy.extend(
-                    sorted(
-                        key
-                        for key, _value in parser.items("Performance")
-                        if key.lower() in LEGACY_RATE_LIMIT_KEYS
-                    )
-                    if parser.has_section("Performance")
-                    else []
-                )
-            except (configparser.Error, OSError, UnicodeError):
-                raw_legacy = ["unreadable"]
-        raw_legacy = sorted(set(raw_legacy))
         add(
-            "legacy_token_pool",
-            "warn" if raw_legacy else "pass",
-            {"remaining_keys": raw_legacy, "runtime_uses_client_pool": False},
+            "current_settings",
+            "pass" if normalized_config else "warn",
+            {
+                "typed_sections": sorted(normalized_config),
+                "runtime_source": "services.settings.ApplicationSettings",
+            },
         )
 
         add(

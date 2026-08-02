@@ -1,52 +1,96 @@
-# 运行时真相源与数据契约
+# 运行时真相源与契约
 
-本文列出当前运行时的规范持久化事实。未列为规范真相源的文件，只能视为投影、导出、缓存或兼容输入。
+本文列出当前运行时使用的持久化事实。未列为规范真相源的文件只能作为
+投影、导出、缓存或诊断，不能满足 readiness 或 completion gate。
 
 ## Job 与来源身份
 
-- `source_inventory_v1.json`：Zotero 报告、PDF、显式 summary 和分类文件的内容级来源身份真相。
-- 没有 DOI 时，规范来源身份必须同时满足规范化标题匹配，以及真实首作者或年份至少一项匹配；只有标题证据时仍须 quarantine。
-- `artifact_registry.json` v2：artifact 与依赖图；采用工作区写锁、revision 事务、原子替换和损坏时 fail-closed。每个 READY 依赖在提交前都必须核对持久化 Registry 身份、状态、路径和内容 hash。
-- `job_outcome_v1.json`：当前 job head，记录生命周期、disposition、readiness policy、必需/完成阶段与 `canonical_ready`。
-- `artifacts/job_attempts/snapshot-*.json`：append-only attempt 历史；陈旧 running attempt 终结为 `interrupted`，不会被下一次恢复改写。
-- `runtime_stage_terminals/*/*.json`：只有文件、Registry、hash、schema、依赖和终态记录全部有效时，才能证明阶段完成。
+- `source_inventory_v1.json` 是 Zotero 报告、PDF、显式 summary 和分类文件
+  的内容哈希来源身份真相。
+- 没有 DOI 时，规范来源身份必须同时满足规范化标题匹配，以及真实首作者
+  或年份匹配。只有标题的观察必须 quarantine。
+- `artifact_registry.json` 是 artifact/dependency 图。Registry 写入使用
+  workspace lease、revisioned transaction、原子替换和损坏时 fail-closed。
+- `job_outcome_v1.json` 是 job head 投影，记录生命周期、disposition、
+  readiness policy、必需/完成阶段和 `canonical_ready`。
+- `artifacts/job_attempts/snapshot-*.json` 是 append-only attempt history。
+  过期的 running attempt 变为 `interrupted`，不会被下一次运行改写。
+- `runtime_stage_terminals/*/*.json` 只有在 output、hash、schema、dependency
+  和 terminal record 全部通过校验时，才证明阶段完成。
 
-旧 `success` 仅投影 `canonical_ready`；Queue 生命周期只读取 `job_status`。
+Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是真相源。
 
 ## 各阶段规范真相源
 
 | 阶段 | 规范真相源 | 投影/导出 |
 |---|---|---|
-| 来源接入 | `source_inventory_v1.json`、`source_bundle.json` | 旧 `List[PaperInfo]` |
-| Stage 1 | 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest；READY summary 依赖已注册 `source_bundle`，后者再依赖来源 PDF | Excel 与旧 summary 结构 |
-| Outline v2 | literature map、synthesis flow、candidates、critiques、arbitration、`final_outline`、coverage audit，以及独立 `outline_stage_health_v1.json`；v2 开启时下游只消费已注册 `adopted_final_outline` | 仅在显式关闭 v2 时使用旧 Markdown outline |
-| Review | `*_review_draft_v2.json`、`*_citation_manifest_v3.json`、citation-ref catalog | review draft v1 与 DOCX |
-| Validation | `validation_run_result_v1.json`（`ValidationRunResultV1`）及其精确 Registry `depends_on` 闭包：review draft、citation manifest、全部已声明 evidence manifest | 从规范 JSON 投影的 TXT、manual-review、alignment audit 和 completion report |
-| Repair | 与 validation-run artifact 绑定的 repair plan 与 apply result | 人类可读修复摘要 |
+| Source intake | `source_inventory_v1.json`、`source_bundle.json` | parser 诊断和只读 paper view |
+| Stage 1 | 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest 和来源链 | Excel 与显示用 summary |
+| Outline Intelligence v3 | 已注册 evidence views、corpus ledger、multi-view matrix、review intent、coverage contract、relation map、candidate plan、node DAG、receipts、final outline、stage health 和 adoption record | Markdown 或人类可读 outline 展示 |
+| Review | `review_draft.json`（`artifact_version=v3`）、`citation_manifest_v3.json` 和 citation-reference catalog | DOCX 与文本报告 |
+| Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包 | TXT、manual-review JSON、alignment audit 和 completion projection |
+| Repair | 与 validation-run artifact 绑定的已注册 repair plan 和 apply result | 人类可读 repair 摘要 |
 
-`claim_verdict` 为：`supported | partial_support | evidence_gap | unsupported | contradicted | wrong_source | needs_review`。没有足够证据只能是 `evidence_gap`，不能自动写成 `unsupported`。
+## 公开状态
 
-身份为 `ambiguous/mismatch` 时，job 可以完成诊断，但必须 quarantine，且 `canonical_ready=false`。
+`job_status` 为 `pending | running | completed | failed | cancelled`。
 
-零 claim 的 Validation 结果只有在综述被显式声明为 citation-free 时才能为 clean；否则 claim completeness 为 false，不能发布 clean disposition。Validation 成功还必须在规范 JSON 回读后确认 job ID、attempt ID 与内容 hash 一致。
+`job_disposition` 为 `clean | findings | needs_review | unvalidated`。
 
-review、citation 与 evidence 输入 hash 均必须是 64 位小写 SHA-256。规范 payload 中声明的 artifact ID/type/hash 多重集合必须与 Registry `depends_on` 多重集合完全一致；缺失、额外、重复、类型错误、job-kind 错误、路径错误或 hash 错误都必须 fail closed。ReviewBatch child 可以继续使用 `external_job` evidence 依赖，但必须唯一解析并递归校验。evidence manifest 被删除、篡改、quarantine 或标记 invalid 后，Validation terminal 立即失效，`resume` 不得复用该 Validation 结果。
+`claim_verdict` 为 `supported | partial_support | evidence_gap | unsupported |
+contradicted | wrong_source | needs_review`。
 
-## 派生综述与 AI-native 运行时
+缺少证据只能得到 `evidence_gap`，不会自动变成 `unsupported`。身份
+`ambiguous/mismatch` 时可以完成诊断，但必须 quarantine，并保持
+`canonical_ready=false`。
 
-`SummarySelectionSpecV1` 固定父 job、父 artifact ID/hash、有序 paper keys、分类文件 hash、选择策略和 selection hash；child 使用 `external_job` 依赖，禁止调用 Stage 1 provider。
+零 claim 的 Validation 只有在 review 明确声明 citation-free 时才可 clean。
+成功 Validation 必须在规范 JSON 回读后确认 job ID、attempt ID 和 content hash。
+规范 payload 的 artifact ID/type/hash 多重集合必须与 Registry `depends_on`
+完全一致；缺失、额外、重复、类型错误、job-kind 错误、路径错误或 hash 错误
+均 fail-closed。
 
-每个多 variant derivation 在 child 或 manifest 写入前持久化预留单调 `projection_generation`。per-derivation lease 与 coordinator lease 串行化所有权和 projection 发布。Registry 中通过完整校验、且 generation 唯一最大的 immutable manifest 是 coordinator head；`review_batch_manifest.json` 只是该 head 的可修复投影。`review-batch-projection-generation-v1` reservation 与 `review-batch-projection-receipt-v2` receipt 记录持久化顺序，以及 `projected` 或 `superseded` 的 head 身份、generation 和 hash；排序不依赖 mtime 或系统时钟。
+## 派生 review batch
 
-`AgentRuntimeRunner` 复用现有 `AgentRuntimeBridge`：`run` 启动新任务，`resume` 创建新 attempt，`status` 只读，`reconcile` 只修复持久化投影且绝不调用 provider。相对路径按其所属 spec/config/summary 文件目录解析，不静默回退 CWD。
+`SummarySelectionSpecV1` 固定 parent job、parent artifact ID/hash、有序 paper
+key、可选分类文件 hash、selection policy 和 selection hash。child artifact
+使用 `external_job` 依赖，不能跨越 Stage 1 provider 边界。
 
-`SystemExit` 与其他 `BaseException` 路径会先持久化终态，再原样抛出异常。resume 从规范 terminal artifact 恢复 Validation disposition，不解析人类可读投影。
-## Outline v3 control plane evidence
+每次派生在写 child 或 manifest 前预留持久化单调递增的
+`projection_generation`。lease 串行化所有权与发布；经过完整校验且 generation
+唯一最大的 Registry manifest 是 coordinator head，人类可读 manifest 只是可修复投影。
 
-Outline Intelligence v3 adds registered deterministic evidence views, global corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, node DAG, and model-call replay artifacts. These artifacts are derived from canonical Stage 1 summaries and bind source summary hashes; they do not replace `summary_v2_lite` or silently become `adopted_final_outline`.
+## AI-native 运行时
 
-`reviewctl` is the Agent control plane. `status`, `next-action`, `validate`, `inspect`, and `attest` are provider-free evidence reads; `resume`, `retry-node`, `cancel`, `repair-plan`, `adopt`, and `export` are explicit Registry-backed transitions. Cancellation is cooperative and a cancelled queue job cannot be published as completed.
+`RuntimeJobSpec` 与 `AgentRuntimeRunner` 在内部 `AgentRuntimeBridge` 之上提供
+公开执行契约：
 
-Validation closure requires the current Registry-verified review draft v2, citation manifest v3, and `ValidationRunResultV1` input IDs and hashes to match. It reports citation mapping, semantic disposition, render policy, and repair state together. Repair defaults to `report_only`; an explicit auto-safe transaction creates only quarantined derived draft, manifest, and apply artifacts. Adoption requires final-outline, coverage-audit, stage-health, and canonical completion gates.
+- `run`：新 job 与 attempt；
+- `resume`：新 append-only attempt，只复用已证明持久化的阶段；
+- `status`：只读 job head；
+- `reconcile`：无 provider 调用地修复 Registry、pointer 和 terminal 投影。
 
-Export bundles contain verified files, provenance, checksums, completion evidence, and validation-closure evidence. `canonical_verified`, `manual_repaired_legacy`, and `untrusted` are forensic labels, not aliases for job success; a DOCX alone is never proof of completion.
+每次 provider 调用都通过 typed context profile 绑定 job、attempt、stage 和
+node，并生成去除敏感信息的 receipt，记录 request identity、retry/timeout、
+response hash 和 completion-evaluator 结果。相对路径从所属 spec、config 或
+summary 文件解析；reconcile 不调用 provider。
+
+## Outline v3 与控制面
+
+Outline Intelligence v3 是确定性的已注册 DAG。node output 绑定来源 summary
+hash，保留 replay receipt，并且 resume 只重跑失败节点的依赖闭包。final outline
+只有在 coverage、stage-health、identity 和 canonical-completion gate 全部通过后
+才可 adoption。
+
+`reviewctl` 是唯一控制面。`status`、`next-action`、`validate`、`inspect`、
+`attest` 是无 provider 的读取；`run`、`resume`、`retry-node`、`cancel`、
+`repair-plan`、`repair-apply`、`adopt`、`export` 是显式的 Registry-backed 状态
+迁移。cancel 是 cooperative 的，被取消 job 不得发布为 completed。
+
+Validation closure 要求当前 review draft、citation manifest 与
+`ValidationRunResultV1` 的输入 ID/hash 一致。Repair 默认 `report_only`；显式
+安全事务只创建 quarantine 的派生产物。Adoption 不会静默提升中间 candidate。
+
+Export bundle 包含已验证文件、provenance、checksum、completion evidence 和
+validation-closure evidence。`canonical_verified`、`manual_repaired`、
+`untrusted` 是 attestation 标签，不是 job 成功别名；只有 DOCX 不能证明完成。

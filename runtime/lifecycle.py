@@ -148,18 +148,13 @@ def bootstrap_job_runtime(
     output_base_dir = generator_config.get("Paths", {}).get("output_path", "./output")
 
     inventory = _coerce_inventory(source_inventory)
-    inventory_payload = inventory.to_dict() if inventory is not None else {}
-    fingerprint_source_snapshot = (
-        {
-            "source_inventory_hash": inventory.fingerprint(),
-            "source_inventory": inventory.fingerprint_payload(),
-        }
-        if inventory is not None
-        else {
-            "compatibility_status": "legacy_unverified",
-            "legacy_source_snapshot": dict(source_snapshot),
-        }
-    )
+    if inventory is None:
+        raise RuntimeError("current runtime requires a verified source inventory")
+    inventory_payload = inventory.to_dict()
+    fingerprint_source_snapshot = {
+        "source_inventory_hash": inventory.fingerprint(),
+        "source_inventory": inventory.fingerprint_payload(),
+    }
     fingerprint_bundle = build_fingerprint_bundle(
         FingerprintInputs(
             config_snapshot=sanitize_config_for_fingerprint(generator_config),

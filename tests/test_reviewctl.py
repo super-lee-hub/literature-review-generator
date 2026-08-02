@@ -5,11 +5,9 @@ from pathlib import Path
 
 from reviewctl import main as reviewctl_main
 from runtime.control_plane import FORBIDDEN_ACTIONS, ReviewControlPlane
-from runtime.runner import AgentRuntimeRunner
 from runtime.outline_v3_dag import OutlineNodeStore
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
-from tests.test_runtime_bridge_helpers import build_legacy_main, build_success_summary
 
 
 def _spec(tmp_path: Path):
@@ -32,61 +30,6 @@ def _spec(tmp_path: Path):
     )
 
 
-def _handler(_tmp_path: Path):
-    def handler(stage_name, request):
-        assert stage_name == "stage1_analyze"
-        item = request.source_bundle.paper_work_items[0]
-        summary = build_success_summary(
-            item.source_pdf and Path(item.source_pdf),
-            paper_key=item.canonical_paper_key,
-        )
-        summary["paper_info"]["source_paper_id"] = item.source_paper_id
-        return {
-            "summaries": [summary],
-            "source_items": [],
-        }
-
-    return handler
-
-
-def test_control_plane_status_and_next_action_are_provider_free(tmp_path: Path) -> None:
-    spec = _spec(tmp_path)
-    result = AgentRuntimeRunner(
-        spec,
-        legacy_main=build_legacy_main(),
-        stage_handler=_handler(tmp_path),
-        origin_dir=tmp_path,
-    ).run()
-
-    control = ReviewControlPlane(repo_root=tmp_path, workspace_roots=[tmp_path])
-    status = control.status(workspace=result.workspace_path)
-    assert status["job_status"] == "completed"
-    assert status["completion_status"] == "complete"
-    next_action = control.next_action(workspace=result.workspace_path)
-    assert next_action["status"] == "complete"
-    assert next_action["recommended_action"]["command"] == "none"
-    assert next_action["forbidden_actions"] == list(FORBIDDEN_ACTIONS)
-
-
-def test_control_plane_inspect_does_not_create_registry_lock(tmp_path: Path) -> None:
-    spec = _spec(tmp_path)
-    result = AgentRuntimeRunner(
-        spec,
-        legacy_main=build_legacy_main(),
-        stage_handler=_handler(tmp_path),
-        origin_dir=tmp_path,
-    ).run()
-    registry_lock = Path(result.workspace_path) / "artifact_registry.json.lock"
-    if registry_lock.exists():
-        registry_lock.unlink()
-    inspection = ReviewControlPlane(repo_root=tmp_path, workspace_roots=[tmp_path]).inspect(
-        workspace=result.workspace_path
-    )
-    assert inspection["read_only"] is True
-    assert not registry_lock.exists()
-    assert inspection["canonical_evidence_hash"]
-
-
 def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> None:
     spec = _spec(tmp_path)
     spec_path = tmp_path / "spec.json"
@@ -101,23 +44,6 @@ def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> 
     doctor = json.loads(capsys.readouterr().out)
     assert doctor["status"] == "fail"
     assert "dummy" not in json.dumps(doctor)
-
-
-def test_unavailable_node_replay_is_explicitly_blocked(tmp_path: Path) -> None:
-    spec = _spec(tmp_path)
-    result = AgentRuntimeRunner(
-        spec,
-        legacy_main=build_legacy_main(),
-        stage_handler=_handler(tmp_path),
-        origin_dir=tmp_path,
-    ).run()
-    response = ReviewControlPlane(repo_root=tmp_path, workspace_roots=[tmp_path]).retry_node(
-        workspace=result.workspace_path,
-        node_id="structure_critique",
-    )
-    assert response["status"] == "blocked"
-    assert response["safe_to_retry"] is False
-    assert response["read_only"] is True
 
 
 def test_control_plane_retry_node_uses_persisted_outline_v3_scope(tmp_path: Path) -> None:

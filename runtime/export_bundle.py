@@ -35,7 +35,7 @@ class ExportBundleSpecV1:
     include_artifact_types: tuple[str, ...] = ()
     include_artifact_roles: tuple[str, ...] = ()
     include_unready_descriptors: bool = True
-    label_manual_repaired_legacy: bool = True
+    export_allowlisted_only: bool = True
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "ExportBundleSpecV1":
@@ -45,7 +45,7 @@ class ExportBundleSpecV1:
             include_artifact_types=tuple(str(item) for item in (value.get("include_artifact_types") or ()) if str(item)),
             include_artifact_roles=tuple(str(item) for item in (value.get("include_artifact_roles") or ()) if str(item)),
             include_unready_descriptors=bool(value.get("include_unready_descriptors", True)),
-            label_manual_repaired_legacy=bool(value.get("label_manual_repaired_legacy", True)),
+            export_allowlisted_only=bool(value.get("export_allowlisted_only", True)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,6 +101,28 @@ def _matches(record: ArtifactRecord, spec: ExportBundleSpecV1) -> bool:
     return True
 
 
+_EXPORT_ALLOWLIST = frozenset(
+    {
+        "job_outcome",
+        "runtime_job_spec",
+        "source_bundle",
+        "source_inventory",
+        "summary",
+        "summary_file",
+        "summary_source_manifest",
+        "outline_v3_node_output",
+        "review_draft",
+        "citation_manifest",
+        "validation_run_result",
+        "validation_projection",
+        "review_docx",
+        "repair_plan",
+        "repair_report",
+        "repair_apply_result",
+    }
+)
+
+
 class ExportBundleService:
     """Export verified Registry artifacts without inferring state from DOCX."""
 
@@ -116,11 +138,21 @@ class ExportBundleService:
         closure: Mapping[str, Any] | None = None,
     ) -> ExportBundleResultV1:
         export_spec = spec if isinstance(spec, ExportBundleSpecV1) else ExportBundleSpecV1.from_mapping(spec)
-        records = [record for record in self.registry.list_records() if _matches(record, export_spec)]
+        records = [
+            record
+            for record in self.registry.list_records()
+            if _matches(record, export_spec)
+            and (
+                not export_spec.export_allowlisted_only
+                or record.artifact_role in _EXPORT_ALLOWLIST
+                or record.artifact_type in _EXPORT_ALLOWLIST
+            )
+        ]
         records.sort(key=lambda item: (item.artifact_type, item.artifact_id))
         issues: list[str] = []
         file_entries: list[dict[str, Any]] = []
         ready_records: list[ArtifactRecord] = []
+        ready_payloads: dict[str, bytes] = {}
         for record in records:
             entry = {
                 "artifact_id": record.artifact_id,
@@ -142,7 +174,14 @@ class ExportBundleService:
                     issues.append(f"{record.artifact_id}: {exc}")
                 else:
                     entry["integrity"] = "verified"
-                    ready_records.append(record)
+                    try:
+                        ready_payloads[record.artifact_id] = Path(record.path).read_bytes()
+                    except OSError as exc:
+                        entry["integrity"] = "untrusted"
+                        entry["error"] = str(exc)
+                        issues.append(f"{record.artifact_id}: export read failed: {exc}")
+                    else:
+                        ready_records.append(record)
             elif not export_spec.include_unready_descriptors:
                 continue
             else:
@@ -161,7 +200,7 @@ class ExportBundleService:
             and completion_status == "complete"
             and closure_status == "clean"
             and not manual_modified
-        ) else ("manual_repaired_legacy" if not issues and manual_modified else "untrusted")
+        ) else ("manual_repaired" if not issues and manual_modified else "untrusted")
         bundle_id = "export:" + _hash(
             {
                 "job_id": self.workspace.job_id,
@@ -171,7 +210,11 @@ class ExportBundleService:
                 "closure": closure or {},
             }
         )[:24]
-        bundle_path = Path(self.workspace.report_path(f"export_bundles/{bundle_id}.zip"))
+        # ``bundle_id`` is a logical identifier and uses ``:`` as its
+        # namespace separator.  Keep the identifier stable, but use a
+        # Windows-safe filename for the materialized ZIP.
+        bundle_filename = f"{_safe_name(bundle_id)}.zip"
+        bundle_path = Path(self.workspace.report_path(f"export_bundles/{bundle_filename}"))
         manifest = {
             "artifact_type": EXPORT_BUNDLE_ARTIFACT_TYPE,
             "artifact_version": EXPORT_BUNDLE_ARTIFACT_VERSION,
@@ -183,21 +226,19 @@ class ExportBundleService:
             "records": file_entries,
             "completion_manifest": dict(completion or {}),
             "validation_closure": dict(closure or {}),
-            "manual_repaired_legacy": bool(manual_modified),
+            "manual_repaired": bool(manual_modified),
             "issues": sorted(set(issues)),
         }
         checksums: dict[str, str] = {}
         bundle_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        temp_bundle_path = bundle_path.with_name(bundle_path.name + ".tmp")
+        with zipfile.ZipFile(temp_bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for record in ready_records:
-                try:
-                    data = Path(record.path).read_bytes()
-                except OSError as exc:
-                    issues.append(f"{record.artifact_id}: export read failed: {exc}")
-                    continue
+                data = ready_payloads[record.artifact_id]
                 arcname = f"artifacts/{_safe_name(record.artifact_id)}"
                 archive.writestr(arcname, data)
                 checksums[arcname] = hashlib.sha256(data).hexdigest()
+            manifest["issues"] = sorted(set(issues))
             archive.writestr("provenance_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             archive.writestr("checksums.json", json.dumps(checksums, ensure_ascii=False, indent=2, sort_keys=True))
             archive.writestr(
@@ -209,6 +250,13 @@ class ExportBundleService:
                 json.dumps(dict(closure or {}), ensure_ascii=False, indent=2),
             )
             archive.writestr("EXPORT_STATUS.txt", bundle_status + "\n")
+        if not zipfile.is_zipfile(temp_bundle_path):
+            try:
+                temp_bundle_path.unlink()
+            except OSError:
+                pass
+            raise RegistryError("temporary export bundle failed ZIP verification")
+        temp_bundle_path.replace(bundle_path)
 
         artifact_id = f"export_bundle:{bundle_id}"
         registration_error = ""
@@ -283,7 +331,7 @@ class ForensicAttestationService:
         if issues:
             status = "untrusted"
         elif manual:
-            status = "manual_repaired_legacy"
+            status = "manual_repaired"
         elif completion_status == "complete" and closure_status == "clean":
             status = "canonical_verified"
         else:

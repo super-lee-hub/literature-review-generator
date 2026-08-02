@@ -14,7 +14,6 @@ from services.job_workspace import utc_now_iso
 AUDIT_SCHEMA_VERSION = "v1"
 AuditType = Literal[
     "identity_override",
-    "legacy_reuse",
     "outline_manual_adoption",
     "dependency_force_delete",
     "artifact_quarantine_release",
@@ -23,7 +22,6 @@ AuditType = Literal[
 _AUDIT_TYPES = frozenset(
     {
         "identity_override",
-        "legacy_reuse",
         "outline_manual_adoption",
         "dependency_force_delete",
         "artifact_quarantine_release",

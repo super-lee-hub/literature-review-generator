@@ -83,6 +83,7 @@ def test_persistence_across_restarts(tmp_path: Path) -> None:
         job_type="review",
         project_name="proj2",
     ))
+    service1.update_job_state(job_id1, QueueState.RUNNING)
     service1.update_job_state(job_id1, QueueState.COMPLETED)
     
     service2 = PersistentQueueService(queue_file)
@@ -135,7 +136,9 @@ def test_retry_failed_jobs(tmp_path: Path) -> None:
     service.add_job(QueueJobSpec(job_id=job_id1, job_type="t1", project_name="p"))
     service.add_job(QueueJobSpec(job_id=job_id2, job_type="t2", project_name="p"))
     
+    service.update_job_state(job_id1, QueueState.RUNNING)
     service.update_job_state(job_id1, QueueState.FAILED)
+    service.update_job_state(job_id2, QueueState.RUNNING)
     service.update_job_state(job_id2, QueueState.COMPLETED)
     
     failed_jobs = service.get_failed_jobs()
@@ -161,7 +164,9 @@ def test_list_jobs_by_state(tmp_path: Path) -> None:
     
     for job_id, state in zip(job_ids, states):
         service.add_job(QueueJobSpec(job_id=job_id, job_type="test", project_name="p"))
-        service.update_job_state(job_id, state)
+        if state is not QueueState.PENDING:
+            service.update_job_state(job_id, QueueState.RUNNING)
+            service.update_job_state(job_id, state)
     
     pending = service.list_jobs_by_state(QueueState.PENDING)
     assert len(pending) == 1

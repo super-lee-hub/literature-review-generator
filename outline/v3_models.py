@@ -1,9 +1,9 @@
 """Outline Intelligence v3 artifact models.
 
-The v3 layer is deliberately additive to the existing Outline v2 models.  It
-stores deterministic, paper-level projections and the global artifacts that
-are shared by every later outline candidate.  No model in this module makes a
-semantic claim that is not present in the canonical Stage 1 summary.
+The current Outline v3 model stores deterministic, paper-level projections and
+the global artifacts shared by every later outline candidate.  No model in
+this module makes a semantic claim that is not present in the canonical Stage
+1 summary.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-from services.workflow_facade import build_args, build_job_request, run_dispatch
+from services.workflow_facade import build_args, build_job_request
 
 
 def test_build_args_supports_free_mode_and_gui_flags() -> None:
@@ -76,18 +76,3 @@ def test_build_job_request_maps_legacy_args_to_shared_request() -> None:
     assert request.free_mode_idea == 'Focus on mechanism differences.'
     assert request.progress_tracker is tracker
     assert request.gui is True
-
-
-def test_run_dispatch_accepts_queue_cancel_token(monkeypatch) -> None:
-    captured = {}
-    queue_token = object()
-
-    def _fake_dispatch(args):
-        captured["cancel_token"] = getattr(args, "_cancel_token", None)
-
-    monkeypatch.setattr("main.dispatch_command", _fake_dispatch)
-
-    result = run_dispatch(build_args(project_name="demo"), cancel_token=queue_token)
-
-    assert result.success is True
-    assert captured["cancel_token"] is queue_token

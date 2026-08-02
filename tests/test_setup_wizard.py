@@ -47,6 +47,8 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
             "free-key",
             "5",
             "7",
+            "2",
+            "0",
             "3",
             "45",
             "180",
@@ -151,8 +153,10 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert parser["Preprocess"]["enable_local_rag"] == "true"
     assert parser["Preprocess"]["rag_backend"] == "chroma"
 
-    assert parser["Performance"]["enable_stage1_validation"] == "true"
-    assert parser["Performance"]["enable_stage2_validation"] == "false"
+    assert parser["Validation"]["stage1_enabled"] == "true"
+    assert parser["Validation"]["review_enabled"] == "false"
+    assert parser["Runtime"]["node_retry_limit"] == "2"
+    assert parser["Runtime"]["total_job_deadline_seconds"] == "0"
     assert parser["GUI"]["language"] == "en"
     assert parser["Styling"]["font_name"] == "Calibri"
     assert parser["API_Parameters"]["timeout_seconds"] == "900"

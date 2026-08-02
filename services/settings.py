@@ -2,8 +2,7 @@
 
 The settings model is intentionally strict.  It is the only place that
 defines the accepted configuration surface; callers receive typed sections
-instead of a compatibility projection assembled from multiple historical
-locations.
+from one current schema.
 """
 
 from __future__ import annotations

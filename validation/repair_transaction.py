@@ -173,7 +173,7 @@ class RepairTransactionService:
                 default=None,
             )
         return (
-            choose("review_draft", "v2", "review_draft_v2:full_review"),
+            choose("review_draft", "v3", "review_draft"),
             choose("citation_manifest", "v3", "citation_manifest:v3"),
             choose("validation_run_result", "v1", ""),
         )

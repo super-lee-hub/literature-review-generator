@@ -5,7 +5,6 @@ from pathlib import Path
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.validation_adapter import RuntimeValidationAdapter
-from tests.test_runtime_bridge_helpers import build_legacy_main
 
 
 def test_validation_adapter_satisfies_run_review_validation_contract(tmp_path: Path) -> None:
@@ -24,7 +23,7 @@ def test_validation_adapter_satisfies_run_review_validation_contract(tmp_path: P
             queue_file=str(queue_file),
         )
     )
-    session = bridge.bootstrap(build_legacy_main())
+    session = bridge.bootstrap()
 
     def external_registry_resolver(_job_id: str) -> None:
         return None
@@ -40,7 +39,7 @@ def test_validation_adapter_satisfies_run_review_validation_contract(tmp_path: P
     assert hasattr(adapter, "artifact_registry")
     assert hasattr(adapter, "job_workspace")
     assert adapter.validation_external_registry_resolver is external_registry_resolver
-    assert callable(adapter._review_draft_v2_path)
+    assert callable(adapter._review_draft_path)
     assert callable(adapter._citation_manifest_path)
     assert callable(adapter._get_review_word_file_path)
     assert callable(adapter._persist_citation_manifest)

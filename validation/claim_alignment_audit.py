@@ -28,8 +28,8 @@ def _result_values(report: Any) -> List[Any]:
         projected: List[Any] = []
         for claim in canonical:
             details = dict(claim.get("details") or {})
-            compatibility = dict(claim.get("compatibility") or {})
             verdict = str(claim.get("verdict") or "needs_review")
+            disposition = str(details.get("disposition") or "")
             projected.append(
                 SimpleNamespace(
                     citation_set_key=str(claim.get("citation_set_key") or claim.get("claim_result_id") or ""),
@@ -41,9 +41,9 @@ def _result_values(report: Any) -> List[Any]:
                     block_context=str(details.get("block_context") or ""),
                     claim_units=list(details.get("claim_units") or []),
                     details=details,
-                    conclusion=compatibility.get("legacy_conclusion") or verdict.upper(),
+                    conclusion=verdict.upper(),
                     evidence_status=verdict,
-                    disposition=compatibility.get("legacy_repair_disposition") or "",
+                    disposition=disposition,
                     claim_verdict=verdict,
                 )
             )

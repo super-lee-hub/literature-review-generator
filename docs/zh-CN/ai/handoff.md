@@ -73,7 +73,7 @@
 - partial rerun / failed retry
 - preprocess cache + OCR fallback
 - free mode profile / idea
-- review_draft_v2 + citation_manifest_v3
+- review_draft（artifact_version=v3）+ citation_manifest_v3
 - optional validation / repair
 - optional local RAG
 - AI-native runtime bridge + `source_bundle.json` / `runtime_stage_trace.json`
@@ -84,7 +84,7 @@
 
 - 一个以 job workspace / artifact / GUI 后台队列为底层支撑的本地 AI 文献分析 / 综述写作工作台
 - 入口上既有 `main.py` CLI、`launch_gui.py` + `gui/app.py` GUI，也有 repo-local Codex skill
-- 阶段一主真相是 canonical summaries，阶段三主真相已经前移到 `review_draft_v2 + citation_manifest_v3`
+- 阶段一主真相是 canonical summaries，阶段三主真相是当前 `review_draft（artifact_version=v3）+ citation_manifest_v3`
 - `README.md` 现在只是路由页；用户细节看 `README.zh-CN.md` / `README.en.md`
 - 如果需要更底层的 artifact / compatibility 说明，请继续看 `docs/zh-CN/runtime/`
 

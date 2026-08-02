@@ -106,11 +106,6 @@ def _resolve_candidate_paper_ids(citation: CitationValidationResult) -> List[str
         if bundle_pids:
             return [str(p) for p in bundle_pids if str(p).strip()]
 
-    # Legacy fallback: paper_id, but skip synthetic/multi-paper composite keys
-    legacy = str(citation.paper_id or "").strip()
-    if legacy and "+" not in legacy:
-        return [legacy]
-
     return []
 
 
@@ -140,11 +135,6 @@ def _resolve_target_block_id(citation: CitationValidationResult) -> str:
         if dtcu_block:
             return dtcu_block
 
-    # Legacy: details.block_id
-    legacy_block = str(citation.details.get("block_id", "") or "").strip()
-    if legacy_block:
-        return legacy_block
-
     return ""
 
 
@@ -168,13 +158,9 @@ def _find_block_for_citation(
                 if block.get("block_id") == target_block_id:
                     return block
 
-    # Text-based fallback
     for section in sections:
         for block in section.get("blocks", []):
-            if citation.details.get("block_id") == block.get("block_id"):
-                return block
-            block_text = block.get("text", "")
-            if citation.citation_id in block_text or citation.details.get("cited_text", "") in block_text:
+            if block.get("block_id") == target_block_id:
                 return block
 
     return None
@@ -207,12 +193,6 @@ def _create_patch_proposal(
 
     # Resolve candidate paper IDs using v3 priority
     candidate_paper_ids = _resolve_candidate_paper_ids(citation_result)
-    if not candidate_paper_ids:
-        # Legacy fallback: single paper_id (reject synthetic composite keys)
-        legacy_pid = str(citation_result.paper_id or "").strip()
-        if legacy_pid and "+" not in legacy_pid:
-            candidate_paper_ids = [legacy_pid]
-
     # Find all matching paper artifacts
     resolved_artifacts: List[Dict[str, Any]] = []
     paper_index = {pa.get("paper_identity", {}).get("canonical_paper_key", ""): pa for pa in paper_artifacts}
@@ -224,7 +204,7 @@ def _create_patch_proposal(
     if not resolved_artifacts:
         return None
 
-    # Use the first resolved artifact as the primary for legacy compat
+    # Use the first resolved artifact as the primary dependency anchor.
     paper_artifact = resolved_artifacts[0]
 
     # Build composite dependency bundle from all resolved artifacts.
@@ -295,7 +275,6 @@ def _create_patch_proposal(
     ).strip()
 
     metadata = {
-        "paper_id": citation_result.paper_id,  # legacy
         "paper_ids": candidate_paper_ids,  # v3
         "citation_set_key": citation_set_key,
         "validation_bundle_id": validation_bundle_id or citation_set_key,

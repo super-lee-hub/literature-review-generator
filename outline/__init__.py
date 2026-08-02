@@ -1,50 +1,28 @@
-"""Outline module — Week 5 + Outline Intelligence v2 Complete Vertical Slice.
-
-JSON-first outline representation with critique and arbitration.
-V2 adds full literature map -> synthesis flow -> multi-candidate ->
-critique -> arbitration -> audit -> adoption pipeline.
-"""
+"""Current Outline Intelligence V3 public surface."""
 
 from typing import TYPE_CHECKING
 
-from outline.models import (
-    ArbitrationDecision,
-    CritiqueArbitration,
-    CritiqueCategory,
-    OutlineArbitrationResult,
-    OutlineCritique,
-    OutlineDocument,
-    OutlineSection,
-    ReviewStatus,
-    ReviewedOutlineDocument,
-)
-from outline.generator import (
-    OutlineGenerator,
-    create_outline_from_markdown,
-    create_outline_from_sections,
-    run_outline_generation,
-)
-from outline.arbitration import (
-    OutlineArbitrator,
-    adopt_outline,
-    apply_accepted_critiques,
-    arbitrate_critique,
-    create_critique,
-    run_arbitration,
-    run_outline_adopt,
-    run_outline_arbitration,
-    run_outline_critique,
-    run_peer_critique,
-)
-from outline.legacy_adapter import (
-    OutlineLegacyAdapter,
-    get_outline_markdown_for_downstream,
-    is_reviewed_outline_adopted,
-    outline_document_to_markdown,
-    reviewed_outline_to_markdown,
-)
+if TYPE_CHECKING:
+    from outline.v3_executor import OutlineV3ExecutionResult, OutlineV3Executor
 
-from outline.runtime_resolver import OutlineRuntimeResolver, ResolveResult
+from outline.v3_artifacts import (
+    AdoptedOutline,
+    ArbitrationDecision,
+    ConfirmedGlobalRelationMap,
+    CoverageAudit,
+    CoverageCritique,
+    EvidenceCritique,
+    FinalOutline,
+    OutlineArtifact,
+    OutlineCandidate,
+    OutlineStageHealth,
+    RelationAdjudicationResult,
+    SectionEvidencePacket,
+    SectionEvidencePacketSet,
+    SelectedOutlineCandidate,
+    StabilityAudit,
+    StructureCritique,
+)
 from outline.v3_evidence import (
     build_coverage_contract,
     build_global_corpus_ledger,
@@ -70,56 +48,25 @@ from outline.v3_relations import (
     build_outline_candidate_plans,
 )
 
-if TYPE_CHECKING:
-    from outline.pipeline import V2Pipeline, V2PipelineResult
-
-
-def __getattr__(name):
-    if name in {"V2Pipeline", "V2PipelineResult"}:
-        from outline.pipeline import V2Pipeline, V2PipelineResult
-
-        return {"V2Pipeline": V2Pipeline, "V2PipelineResult": V2PipelineResult}[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 __all__ = [
-    # Models
+    "OutlineArtifact",
+    "RelationAdjudicationResult",
+    "ConfirmedGlobalRelationMap",
+    "OutlineCandidate",
+    "StructureCritique",
+    "CoverageCritique",
+    "EvidenceCritique",
     "ArbitrationDecision",
-    "CritiqueArbitration",
-    "CritiqueCategory",
-    "OutlineArbitrationResult",
-    "OutlineCritique",
-    "OutlineDocument",
-    "OutlineSection",
-    "ReviewStatus",
-    "ReviewedOutlineDocument",
-    # Generator
-    "OutlineGenerator",
-    "create_outline_from_markdown",
-    "create_outline_from_sections",
-    "run_outline_generation",
-    # Arbitration
-    "OutlineArbitrator",
-    "adopt_outline",
-    "apply_accepted_critiques",
-    "arbitrate_critique",
-    "create_critique",
-    "run_arbitration",
-    "run_outline_adopt",
-    "run_outline_arbitration",
-    "run_outline_critique",
-    "run_peer_critique",
-    # Legacy Adapter
-    "OutlineLegacyAdapter",
-    "get_outline_markdown_for_downstream",
-    "is_reviewed_outline_adopted",
-    "outline_document_to_markdown",
-    "reviewed_outline_to_markdown",
-    # V2
-    "OutlineRuntimeResolver",
-    "ResolveResult",
-    "V2Pipeline",
-    "V2PipelineResult",
-    # V3 deterministic evidence layer
+    "SelectedOutlineCandidate",
+    "SectionEvidencePacket",
+    "SectionEvidencePacketSet",
+    "FinalOutline",
+    "CoverageAudit",
+    "StabilityAudit",
+    "OutlineStageHealth",
+    "AdoptedOutline",
+    "OutlineV3ExecutionResult",
+    "OutlineV3Executor",
     "OutlineEvidenceView",
     "OutlineEvidenceViews",
     "GlobalCorpusLedgerEntry",
@@ -139,3 +86,16 @@ __all__ = [
     "build_organizing_axes",
     "build_outline_candidate_plans",
 ]
+
+
+def __getattr__(name: str):
+    """Load the executor lazily so DAG/model imports stay acyclic."""
+
+    if name in {"OutlineV3ExecutionResult", "OutlineV3Executor"}:
+        from outline.v3_executor import OutlineV3ExecutionResult, OutlineV3Executor
+
+        return {
+            "OutlineV3ExecutionResult": OutlineV3ExecutionResult,
+            "OutlineV3Executor": OutlineV3Executor,
+        }[name]
+    raise AttributeError(name)

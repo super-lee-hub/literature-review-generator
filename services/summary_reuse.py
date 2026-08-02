@@ -154,16 +154,6 @@ def collect_summary_sources(
                     label=summary_path.parent.parent.name,
                 )
 
-            legacy_paths = _sorted_existing_paths(output_dir.glob("*/*_summaries.json"))
-            legacy_priority = len(sources)
-            for offset, summary_path in enumerate(legacy_paths, start=legacy_priority):
-                _append_source(
-                    summary_path,
-                    source_type="legacy_output",
-                    priority=offset,
-                    label=summary_path.parent.name,
-                )
-
     return sources
 
 

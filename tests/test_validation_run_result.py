@@ -450,7 +450,7 @@ def test_evidence_manifest_artifact_ids_must_be_unique() -> None:
         ).validate()
 
 
-def test_pre_extension_v1_payload_is_readable_but_unverified() -> None:
+def test_incomplete_current_payload_is_rejected() -> None:
     claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
     payload = ValidationRunResultV1.create(
         job_id="job-1",
@@ -470,18 +470,12 @@ def test_pre_extension_v1_payload_is_readable_but_unverified() -> None:
     ):
         payload.pop(key)
 
-    restored = ValidationRunResultV1.from_dict(payload)
-
-    assert restored.execution_status is ValidationExecutionStatus.SUCCEEDED
-    assert restored.validation_disposition is ValidationRunDisposition.UNVALIDATED
-    assert restored.review_cleanliness is ValidationRunDisposition.UNVALIDATED
-    assert restored.compatibility_status == "legacy_unverified"
-    assert "legacy_validation_run_result_contract_incomplete" in restored.degradation_reasons
-    assert restored.contract_satisfied is False
+    with pytest.raises(ValidationRunResultError, match="missing current fields"):
+        ValidationRunResultV1.from_dict(payload)
 
 
-def test_legacy_report_reader_is_explicitly_unverified() -> None:
-    legacy = {
+def test_non_current_report_payload_is_rejected() -> None:
+    non_current = {
         "report_id": "legacy-report",
         "created_at": "2026-07-13T00:00:00Z",
         "total_citations": 1,
@@ -498,9 +492,5 @@ def test_legacy_report_reader_is_explicitly_unverified() -> None:
         ],
     }
 
-    restored = ValidationRunResultV1.from_dict(legacy)
-
-    assert restored.compatibility_status == "legacy_unverified"
-    assert restored.execution_status is ValidationExecutionStatus.SKIPPED
-    assert restored.validation_disposition is ValidationRunDisposition.UNVALIDATED
-    assert restored.contract_satisfied is False
+    with pytest.raises(ValidationRunResultError, match="unexpected artifact_type"):
+        ValidationRunResultV1.from_dict(non_current)

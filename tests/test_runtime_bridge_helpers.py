@@ -2,35 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
-import main
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
-from config_loader import ConfigDict
 from services.progress_state import ResumeStateReport
 from summary_schema import normalize_ai_summary
-
-
-class DummyLogger:
-    def info(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def warning(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def error(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def success(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def debug(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
-
-    def warn(self, *_args: Any, **_kwargs: Any) -> None:
-        pass
 
 
 def make_resume_report(workspace: Any) -> ResumeStateReport:
@@ -48,60 +25,6 @@ def make_resume_report(workspace: Any) -> ResumeStateReport:
         checkpoint_file=workspace.checkpoint_path(f"{workspace.project_name}_checkpoint.json"),
         fingerprint_bundle={"request": "demo"},
     )
-
-
-class BootstrapGenerator(main.LiteratureReviewGenerator):
-    def __init__(
-        self,
-        config_file: str,
-        project_name: str,
-        pdf_folder: str | None,
-        queue_file: str,
-        zotero_report: str | None,
-        library_path: str | None,
-    ) -> None:
-        super().__init__(config_file, project_name, pdf_folder, queue_file, zotero_report, library_path)
-        self.logger = cast(main.CustomLogger, DummyLogger())
-
-    def load_configuration(self) -> bool:
-        output_dir = str(Path(self.queue_file).resolve().parent.parent.parent / "output")
-        self.config = ConfigDict(
-            {
-                "Paths": {"output_path": output_dir},
-                "Writer_API": {
-                    "api_key": "writer-key",
-                    "model": "writer-model",
-                    "api_base": "https://example.com/v1",
-                },
-                "Outline_API": {
-                    "api_key": "outline-key",
-                    "model": "outline-model",
-                    "api_base": "https://example.com/v1",
-                },
-                "Validator_API": {
-                    "api_key": "validator-key",
-                    "model": "validator-model",
-                    "api_base": "https://example.com/v1",
-                },
-                "Validation": {"stage1_enabled": "false", "stage2_enabled": "true"},
-                "Performance": {"enable_stage2_validation": "true"},
-                "Styling": {
-                    "font_name": "Times New Roman",
-                    "font_size_body": "12",
-                    "font_size_heading1": "16",
-                    "font_size_heading2": "14",
-                },
-                "API_Parameters": {
-                    "validator_max_tokens": "512",
-                    "validator_temperature": "0.0",
-                },
-            }
-        )
-        return True
-
-
-def build_legacy_main() -> Any:
-    return SimpleNamespace(LiteratureReviewGenerator=BootstrapGenerator)
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -126,7 +49,7 @@ def make_bridge_session(tmp_path: Path, *, action: str = "run_all") -> tuple[Age
             queue_file=str(queue_file),
         )
     )
-    return bridge, bridge.bootstrap(build_legacy_main()), pdf_dir, pdf_path
+    return bridge, bridge.bootstrap(), pdf_dir, pdf_path
 
 
 def build_success_summary(pdf_path: Path, *, paper_key: str = "paper_a") -> dict[str, Any]:

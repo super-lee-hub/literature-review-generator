@@ -40,8 +40,7 @@ class CompletionEvidenceV1:
     validation_required: bool = False
     require_clean_validation: bool = False
     validation_status: str = "missing"
-    provider_receipts_complete: bool = True
-    compatibility_status: str = "native"
+    provider_receipts_complete: bool = False
     declared_canonical_ready: bool | None = None
     degradation_reasons: tuple[str, ...] = ()
     evidence_sources: tuple[str, ...] = ()
@@ -76,8 +75,7 @@ class CompletionEvidenceV1:
             validation_required=bool(payload.get("validation_required", False)),
             require_clean_validation=bool(payload.get("require_clean_validation", False)),
             validation_status=str(payload.get("validation_status") or "missing"),
-            provider_receipts_complete=bool(payload.get("provider_receipts_complete", True)),
-            compatibility_status=str(payload.get("compatibility_status") or "native"),
+            provider_receipts_complete=bool(payload.get("provider_receipts_complete", False)),
             declared_canonical_ready=(
                 bool(payload["declared_canonical_ready"])
                 if "declared_canonical_ready" in payload
@@ -127,8 +125,6 @@ class CanonicalCompletionEvaluator:
         snapshot = evidence if isinstance(evidence, CompletionEvidenceV1) else CompletionEvidenceV1.from_mapping(evidence)
         reasons: list[str] = []
 
-        if snapshot.compatibility_status != "native":
-            reasons.append(f"compatibility:{snapshot.compatibility_status}")
         if snapshot.declared_canonical_ready is False:
             reasons.append("declared_canonical_ready:false")
         if snapshot.failed_stage:
@@ -159,7 +155,7 @@ class CanonicalCompletionEvaluator:
 
         if snapshot.job_status in {"failed", "cancelled"} or snapshot.failed_stage:
             status: CompletionStatus = "failed"
-        elif any(reason.startswith(("compatibility:", "declared_canonical_ready:", "artifact_registry_", "canonical_artifact_", "provider_receipts_", "validation_", "degradation:")) for reason in reasons):
+        elif any(reason.startswith(("declared_canonical_ready:", "artifact_registry_", "canonical_artifact_", "provider_receipts_", "validation_", "degradation:")) for reason in reasons):
             status = "blocked"
         elif reasons:
             status = "incomplete"
@@ -186,7 +182,7 @@ class CanonicalCompletionEvaluator:
         artifact_registry_verified: bool,
         canonical_artifacts: Mapping[str, bool] | None = None,
         validation_status: str = "clean",
-        provider_receipts_complete: bool = True,
+        provider_receipts_complete: bool = False,
     ) -> CompletionEvaluationV1:
         typed = outcome if isinstance(outcome, JobOutcomeV1) else JobOutcomeV1.from_dict(outcome)
         policy = dict(typed.readiness_policy_snapshot)
@@ -203,7 +199,6 @@ class CanonicalCompletionEvaluator:
                 require_clean_validation=bool(policy.get("require_clean_validation", False)),
                 validation_status=validation_status,
                 provider_receipts_complete=provider_receipts_complete,
-                compatibility_status=typed.compatibility_status,
                 declared_canonical_ready=typed.canonical_ready,
                 degradation_reasons=typed.degradation_reasons,
                 evidence_sources=("job_outcome_v1", "artifact_registry"),

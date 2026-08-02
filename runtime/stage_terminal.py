@@ -24,8 +24,8 @@ _STAGE_OUTPUT_CONTRACTS: Mapping[str, tuple[frozenset[str], ...]] = {
     "analyze": (frozenset({"summary_file"}),),
     "derive_review_batch": (frozenset({"review_batch_manifest"}),),
     "outline": (
-        frozenset({"adopted_final_outline"}),
-        frozenset({"literature_review_outline"}),
+        frozenset({"final_outline", "coverage_audit", "stability_audit", "outline_stage_health"}),
+        frozenset({"adopted_outline"}),
     ),
     "review": (
         frozenset({"review_draft", "citation_manifest", "review_docx"}),

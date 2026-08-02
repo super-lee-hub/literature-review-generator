@@ -13,8 +13,8 @@ from ai_interface import _normalize_type_specific_details
 
 def _runtime_config(retries: str = "3", timeout: str = "600"):
     return {
-        "Performance": {
-            "api_retry_attempts": retries,
+        "Runtime": {
+            "transport_retries": retries,
         },
         "API_Parameters": {
             "timeout_seconds": timeout,
@@ -570,57 +570,6 @@ class TestAIIinterface:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-
-def test_normalize_type_specific_details_projects_review_route_fields() -> None:
-    normalized = _normalize_type_specific_details(
-        {
-            "paper_type": "systematic review",
-            "review_details": {
-                "review_type": "systematic review",
-                "search_databases": ["Scopus", "Web of Science"],
-                "main_themes": ["trust", "adoption"],
-            },
-            "future_research_directions": ["test more longitudinal designs"],
-        }
-    )
-
-    assert normalized["paper_type"] == "review"
-    assert normalized["paper_subtype"] == "systematic review"
-    assert normalized["review_details"]["review_type"] == "systematic review"
-    assert normalized["future_research_directions"] == ["test more longitudinal designs"]
-
-
-def test_normalize_type_specific_details_infers_empirical_route_from_branch_content() -> None:
-    normalized = _normalize_type_specific_details(
-        {
-            "paper_type": "",
-            "route_confidence": "",
-            "classification_rationale": "",
-            "empirical_details": {
-                "data_source_and_size": "survey, n=420",
-                "analysis_technique": "SEM",
-                "core_variables": {
-                    "independent": ["trust"],
-                    "dependent": ["adoption"],
-                },
-            },
-        }
-    )
-
-    assert normalized["paper_type"] == "empirical"
-    assert normalized["paper_subtype"] == ""
-    assert normalized["route_confidence"] == "low"
-    assert normalized["data_source_and_size"] == "survey, n=420"
-    assert normalized["analysis_technique"] == "SEM"
-
-
-def test_normalize_type_specific_details_marks_uncertain_when_no_route_evidence() -> None:
-    normalized = _normalize_type_specific_details({"paper_type": "", "paper_subtype": ""})
-
-    assert normalized["paper_type"] == "uncertain"
-    assert normalized["paper_subtype"] == ""
-    assert normalized["classification_rationale"] == "insufficient evidence to assign a stable primary type"
 
 
 def test_stage1_reader_scheduler_alternates_transient_failures(monkeypatch) -> None:

@@ -18,6 +18,8 @@ class JobCancelledError(RuntimeError):
 class QueueState(Enum):
     PENDING = "pending"
     RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCEL_ACKNOWLEDGED = "cancel_acknowledged"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -251,7 +253,64 @@ class PersistentQueueService:
 
     def get_job_runtime(self, job_id: str) -> Optional[QueueJobRuntime]:
         with self._lock:
-            return self._runtimes.get(job_id)
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return None
+            return replace(
+                runtime,
+                result_summary=dict(runtime.result_summary) if runtime.result_summary else None,
+                produced_artifacts=list(runtime.produced_artifacts),
+                progress_snapshot=dict(runtime.progress_snapshot),
+            )
+
+    def list_job_runtimes(self) -> List[QueueJobRuntime]:
+        """Return runtime snapshots for read-only observers."""
+
+        with self._lock:
+            return [
+                replace(
+                    runtime,
+                    result_summary=dict(runtime.result_summary) if runtime.result_summary else None,
+                    produced_artifacts=list(runtime.produced_artifacts),
+                    progress_snapshot=dict(runtime.progress_snapshot),
+                )
+                for runtime in self._runtimes.values()
+            ]
+
+    def update_job_stage(self, job_id: str, stage: str) -> bool:
+        with self._lock:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return False
+            runtime.current_stage = str(stage or "")
+            self._save()
+            return True
+
+    def update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> bool:
+        with self._lock:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return False
+            if "workspace_path" in info:
+                runtime.workspace_path = str(info["workspace_path"] or "")
+            if "log_path" in info:
+                runtime.log_path = str(info["log_path"] or "")
+            if "produced_artifacts" in info:
+                runtime.produced_artifacts = [str(item) for item in info["produced_artifacts"] or []]
+            self._save()
+            return True
+
+    def update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> bool:
+        with self._lock:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return False
+            runtime.progress_snapshot = dict(snapshot)
+            stage = str(snapshot.get("stage") or "").strip()
+            if stage:
+                runtime.current_stage = stage
+            self._save()
+            return True
 
     def list_jobs(self) -> List[QueueJobSpec]:
         with self._lock:
@@ -270,14 +329,23 @@ class PersistentQueueService:
             if job_id not in self._runtimes:
                 return False
             runtime = self._runtimes[job_id]
-            if state == QueueState.COMPLETED and runtime.cancel_requested:
-                # A late worker result must not overwrite durable cancellation
-                # evidence with a false completed state.
+            allowed = {
+                QueueState.PENDING: {QueueState.RUNNING, QueueState.CANCEL_REQUESTED, QueueState.CANCELLED},
+                QueueState.RUNNING: {QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCEL_REQUESTED, QueueState.CANCELLED},
+                QueueState.CANCEL_REQUESTED: {QueueState.CANCEL_ACKNOWLEDGED, QueueState.CANCELLED},
+                QueueState.CANCEL_ACKNOWLEDGED: {QueueState.CANCELLED},
+                QueueState.COMPLETED: set(),
+                QueueState.FAILED: set(),
+                QueueState.CANCELLED: set(),
+            }
+            if state != runtime.state and state not in allowed.get(runtime.state, set()):
+                return False
+            if state in {QueueState.COMPLETED, QueueState.FAILED} and runtime.cancel_requested:
                 return False
             runtime.state = state
             if state == QueueState.RUNNING and not runtime.started_at:
                 runtime.started_at = self._utc_now()
-            if state in (QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCELLED):
+            if state in (QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCEL_ACKNOWLEDGED, QueueState.CANCELLED):
                 runtime.completed_at = self._utc_now()
             self._save()
         return True
@@ -326,13 +394,26 @@ class PersistentQueueService:
             if runtime is None or runtime.state in (
                 QueueState.COMPLETED,
                 QueueState.FAILED,
+                QueueState.CANCEL_ACKNOWLEDGED,
                 QueueState.CANCELLED,
             ):
                 return False
             runtime.cancel_requested = True
             runtime.cancel_requested_at = self._utc_now()
             runtime.cancel_reason = reason
-            runtime.state = QueueState.CANCELLED
+            runtime.state = QueueState.CANCEL_REQUESTED
+            self._save()
+        return True
+
+    def acknowledge_cancel(self, job_id: str, *, worker: str = "queue-worker") -> bool:
+        """Record that the worker observed and stopped at a safe checkpoint."""
+
+        with self._lock:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state != QueueState.CANCEL_REQUESTED:
+                return False
+            runtime.state = QueueState.CANCEL_ACKNOWLEDGED
+            runtime.error_message = f"cancellation acknowledged by {worker}"
             runtime.completed_at = self._utc_now()
             self._save()
         return True
@@ -626,34 +707,15 @@ class QueueRunner:
     
     def _update_job_stage(self, job_id: str, stage: str) -> None:
         """更新任务的当前阶段"""
-        with self._lock:
-            if job_id in self.queue_service._runtimes:
-                self.queue_service._runtimes[job_id].current_stage = stage
-                self.queue_service._save()
+        self.queue_service.update_job_stage(job_id, stage)
     
     def _update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> None:
         """更新任务的运行时信息"""
-        with self._lock:
-            if job_id in self.queue_service._runtimes:
-                runtime = self.queue_service._runtimes[job_id]
-                if 'workspace_path' in info:
-                    runtime.workspace_path = info['workspace_path']
-                if 'log_path' in info:
-                    runtime.log_path = info['log_path']
-                if 'produced_artifacts' in info:
-                    runtime.produced_artifacts = info['produced_artifacts']
-                self.queue_service._save()
+        self.queue_service.update_job_runtime_info(job_id, info)
 
     def _update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> None:
         """Persist the latest workflow progress snapshot for GUI queue inspection."""
-        with self._lock:
-            if job_id in self.queue_service._runtimes:
-                runtime = self.queue_service._runtimes[job_id]
-                runtime.progress_snapshot = dict(snapshot)
-                stage = str(snapshot.get("stage") or "").strip()
-                if stage:
-                    runtime.current_stage = stage
-                self.queue_service._save()
+        self.queue_service.update_job_progress_snapshot(job_id, snapshot)
 
     def run(self) -> None:
         with self._lock:
@@ -663,7 +725,7 @@ class QueueRunner:
 
         try:
             processed_ids: set = set()
-            max_passes = len(self.queue_service._jobs) * 2 + 10  # safety bound
+            max_passes = len(self.queue_service.list_jobs()) * 2 + 10  # safety bound
             passes = 0
             while passes < max_passes:
                 passes += 1

@@ -52,8 +52,8 @@ class RuntimeValidationAdapter:
     def _stage2_validation_enabled(self) -> bool:
         return bool(self._generator._stage2_validation_enabled())
 
-    def _review_draft_v2_path(self) -> str:
-        return str(self._generator._review_draft_v2_path())
+    def _review_draft_path(self) -> str:
+        return str(self._generator._review_draft_path())
 
     def _citation_manifest_path(self) -> str:
         return str(self._generator._citation_manifest_path())

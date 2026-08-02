@@ -1,5 +1,6 @@
-"""Tests for DOCX bibliography rendering behavior."""
+"""Tests for the current structured-citation DOCX contract."""
 
+from __future__ import annotations
 
 import pytest
 
@@ -13,169 +14,12 @@ from docx_writer import (
 
 
 class MockGenerator:
-    """模拟 LiteratureReviewGenerator 类"""
-    def __init__(self, summaries=None):
-        self.summaries = summaries or []
-        self.config = {}
-        self.log_messages = []
-        
-        # 模拟 logger
-        log_messages = self.log_messages
-        class MockLogger:
-            def info(self, msg):
-                log_messages.append(("info", msg))
-            def warning(self, msg):
-                log_messages.append(("warning", msg))
-            def error(self, msg):
-                log_messages.append(("error", msg))
-            def success(self, msg):
-                log_messages.append(("success", msg))
-        
-        self.logger = MockLogger()
+    def __init__(self) -> None:
+        self.logger = type("Logger", (), {"error": lambda _self, _message: None})()
 
 
-def test_manifest_first_bibliography():
-    """测试 bibliography 按 manifest-first 解析"""
-    # 模拟 v2 manifest 数据
-    citation_manifest = {
-        'bibliography': [
-            {
-                'entry_id': 'bib_0',
-                'paper_id': 'test_paper_1',
-                'paper_key': 'test_paper_1',
-                'citation_text': 'Author A, B. (2023). Test Paper 1. Journal of Testing.',
-                'is_cited': True
-            }
-        ]
-    }
-    
-    # 模拟生成器实例
-    generator = MockGenerator()
-    
-    # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
-    
-    # 验证结果
-    assert len(references) == 1
-    assert 'Author A, B. (2023). Test Paper 1. Journal of Testing.' in references
-
-
-def test_v2_bibliography_cited_only():
-    """测试 v2 bibliography cited-only 输出"""
-    # 模拟 v2 manifest 数据（包含未被引用的条目）
-    citation_manifest = {
-        'bibliography': [
-            {
-                'entry_id': 'bib_0',
-                'paper_id': 'test_paper_1',
-                'paper_key': 'test_paper_1',
-                'citation_text': 'Author A, B. (2023). Test Paper 1. Journal of Testing.',
-                'is_cited': True
-            },
-            {
-                'entry_id': 'bib_1',
-                'paper_id': 'test_paper_2',
-                'paper_key': 'test_paper_2',
-                'citation_text': 'Author C. (2024). Test Paper 2. Journal of Testing.',
-                'is_cited': False  # 未被引用
-            }
-        ]
-    }
-    
-    # 模拟生成器实例
-    generator = MockGenerator()
-    
-    # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
-    
-    # 验证结果（只包含被引用的条目）
-    assert len(references) == 1
-    assert 'Author A, B. (2023). Test Paper 1. Journal of Testing.' in references
-    assert 'Author C. (2024). Test Paper 2. Journal of Testing.' not in references
-
-
-def test_rendered_docx_uses_manifest_ref_id_and_exact_bibliography(tmp_path):
-    generator = MockGenerator()
-    review_draft = {
-        "content": {
-            "sections": [
-                {
-                    "section_number": 1,
-                    "section_title": "Intro",
-                    "blocks": [{"text": "Structured claim [[cite_ref:R001]]. Legacy mention [[cite:paper_2]]."}],
-                }
-            ]
-        }
-    }
-    manifest = {
-        "paper_entries": [
-            {
-                "paper_id": "paper_1",
-                "paper_key": "paper_1",
-                "title": "Structured Paper",
-                "authors": ["Alice Smith"],
-                "year": "2024",
-            },
-            {
-                "paper_id": "paper_2",
-                "paper_key": "paper_2",
-                "title": "Uncited Paper",
-                "authors": ["Bob Jones"],
-                "year": "2025",
-            },
-        ],
-        "occurrences": [{"ref_id": "R001", "paper_id": "paper_1", "paper_key": "paper_1"}],
-        "bibliography": [
-            {
-                "entry_id": "bib_001",
-                "paper_id": "paper_1",
-                "paper_key": "paper_1",
-                "citation_text": "Alice Smith (2024). Structured Paper.",
-                "is_cited": True,
-            }
-        ],
-    }
-
-    output = tmp_path / "review.docx"
-
-    with pytest.raises(ValueError):
-        rebuild_review_docx_from_structured_artifacts(
-            generator,
-            review_draft,
-            manifest,
-            str(output),
-        )
-
-    review_draft["content"]["sections"][0]["blocks"][0]["text"] = "Structured claim [[cite_ref:R001]]."
-    rebuild_review_docx_from_structured_artifacts(
-        generator,
-        review_draft,
-        manifest,
-        str(output),
-    )
-
-    from docx import Document
-
-    text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
-    assert "(Smith, 2024)" in text
-    assert "Alice Smith (2024). Structured Paper" in text
-    assert "Uncited Paper" not in text
-
-
-def test_rendered_docx_resolves_combined_cite_ref_token(tmp_path):
-    generator = MockGenerator()
-    review_draft = {
-        "content": {
-            "sections": [
-                {
-                    "section_number": 1,
-                    "section_title": "Intro",
-                    "blocks": [{"text": "Combined support [[cite_ref:R001, R002]]."}],
-                }
-            ]
-        }
-    }
-    manifest = {
+def _manifest() -> dict[str, object]:
+    return {
         "paper_entries": [
             {
                 "paper_id": "paper_1",
@@ -214,232 +58,117 @@ def test_rendered_docx_resolves_combined_cite_ref_token(tmp_path):
         ],
     }
 
-    output = tmp_path / "review.docx"
-    rebuild_review_docx_from_structured_artifacts(
-        generator,
-        review_draft,
-        manifest,
-        str(output),
-    )
 
-    from docx import Document
-
-    text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
-    assert "[[cite_ref:" not in text
-    assert "(Smith, 2024; Jones, 2025)" in text
-
-
-def test_final_docx_rebuild_scan_and_manifest_only_references(tmp_path):
-    generator = MockGenerator()
-    review_draft = {
-        "content": {
-            "sections": [
+def test_manifest_first_bibliography() -> None:
+    references = generate_apa_references_from_manifest(
+        {
+            "bibliography": [
                 {
-                    "section_number": 1,
-                    "section_title": "Intro",
-                    "blocks": [{"text": "Claim one [[cite_ref:R001]]. Claim two [[cite_ref:R001, R002]]."}],
-                },
-                {
-                    "section_number": 2,
-                    "section_title": "Second",
-                    "blocks": [{"text": "Claim three [[cite_ref:R002]]."}],
-                },
+                    "citation_text": "Author A, B. (2023). Test Paper 1.",
+                    "is_cited": True,
+                }
             ]
-        }
-    }
-    manifest = {
-        "paper_entries": [
-            {"paper_id": "paper_1", "paper_key": "paper_1", "title": "Paper One", "authors": ["Alice Smith"], "year": "2024"},
-            {"paper_id": "paper_2", "paper_key": "paper_2", "title": "Paper Two", "authors": ["Bob Jones"], "year": "2025"},
-            {"paper_id": "paper_3", "paper_key": "paper_3", "title": "Never Cited", "authors": ["Casey Roe"], "year": "2026"},
-        ],
-        "occurrences": [
-            {"ref_id": "R001", "paper_id": "paper_1", "paper_key": "paper_1"},
-            {"ref_id": "R002", "paper_id": "paper_2", "paper_key": "paper_2"},
-        ],
-        "clusters": [
-            {"paper_id": "paper_1", "paper_key": "paper_1"},
-            {"paper_id": "paper_2", "paper_key": "paper_2"},
-        ],
-        "bibliography": [
-            {"paper_id": "paper_1", "paper_key": "paper_1", "citation_text": "Alice Smith (2024). Paper One.", "is_cited": True},
-            {"paper_id": "paper_2", "paper_key": "paper_2", "citation_text": "Bob Jones (2025). Paper Two.", "is_cited": True},
-            {"paper_id": "paper_3", "paper_key": "paper_3", "citation_text": "Casey Roe (2026). Never Cited.", "is_cited": False},
-        ],
-    }
-    output = tmp_path / "final.docx"
-    scan_path = tmp_path / "scan.json"
-
-    scan = rebuild_final_docx_from_manifest(generator, review_draft, manifest, str(output), scan_report_path=str(scan_path))
-
-    assert scan["passed"] is True
-    assert scan_path.exists()
-    rescanned = scan_docx_for_unresolved_citation_tokens(str(output), manifest)
-    assert rescanned["unresolved_tokens"] == []
-    assert rescanned["bare_ref_ids"] == []
-
-    from docx import Document
-
-    text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
-    assert "[[cite_ref:" not in text
-    assert "[[cite:" not in text
-    assert "Paper One" in text
-    assert "Paper Two" in text
-    assert "Never Cited" not in text
-
-
-def test_recoverable_docx_logs_raw_tokens_as_info(tmp_path):
-    generator = MockGenerator()
-    output = tmp_path / "recoverable.docx"
-
-    appended = append_section_to_word_document(
-        generator,
-        1,
-        "Recoverable",
-        "Draft claim [[cite_ref:R001]].",
-        str(output),
-        citation_manifest={"paper_entries": [], "occurrences": []},
-        allow_compat_fallback=True,
+        },
+        MockGenerator(),
     )
 
-    assert appended is True
-    assert any(level == "info" and "DRAFT_DOCX_RAW_TOKEN_PRESENT" in message for level, message in generator.log_messages)
-    assert not any(level == "warning" and "citation token" in message for level, message in generator.log_messages)
+    assert references == ["Author A, B. (2023). Test Paper 1."]
 
 
-def test_manifest_not_available_fallback():
-    """测试 manifest 不可用时 legacy fallback 仍可工作"""
-    # 模拟 summaries 数据
-    summaries = [
-        {
-            'status': 'success',
-            'paper_info': {
-                'title': 'Test Paper 1',
-                'authors': ['Author A', 'Author B'],
-                'year': '2023',
-                'journal': 'Journal of Testing'
-            }
-        }
+def test_manifest_bibliography_contains_only_cited_entries() -> None:
+    manifest = _manifest()
+    manifest["bibliography"] = [
+        manifest["bibliography"][0],
+        {**manifest["bibliography"][1], "is_cited": False},
     ]
-    
-    # 模拟生成器实例
-    generator = MockGenerator(summaries=summaries)
-    
-    # 调用函数（citation_manifest 为 None）
-    references = generate_apa_references_from_manifest(None, generator, allow_compat_fallback=True)
-    
-    # 验证结果
-    assert len(references) == 1
-    assert 'Author A, Author B' in references[0]
-    assert '2023' in references[0]
-    assert 'Test Paper 1' in references[0]
+
+    references = generate_apa_references_from_manifest(manifest, MockGenerator())
+
+    assert references == ["Alice Smith (2024). Structured Paper One."]
 
 
-def test_v1_manifest_fallback():
-    """测试只有 v1 manifest 时回退到旧方法"""
-    # 模拟 v1 manifest 数据
-    citation_manifest = {
-        'citations': [
-            {
-                'citation_id': 'cit1',
-                'paper_id': 'test_paper_1',
-                'text': '(Author A, 2023)',
-                'context': 'Test context',
-                'section_number': 1,
-                'section_title': 'Introduction',
-                'block_id': 's1_b1',
-                'block_order': 1
-            }
-        ]
-    }
-    
-    # 模拟 summaries 数据
-    summaries = [
-        {
-            'status': 'success',
-            'paper_info': {
-                'title': 'Test Paper 1',
-                'authors': ['Author A', 'Author B'],
-                'year': '2023',
-                'journal': 'Journal of Testing'
-            }
-        }
-    ]
-    
-    # 模拟生成器实例
-    generator = MockGenerator(summaries=summaries)
-    
-    # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
-    
-    # 验证结果（应该回退到使用 summaries 生成）
-    assert len(references) == 1
-    assert 'Author A, Author B' in references[0]
-    assert '2023' in references[0]
-    assert 'Test Paper 1' in references[0]
-
-
-def test_empty_bibliography_fallback():
-    """测试 v2 manifest 存在但 bibliography 为空时回退到旧方法"""
-    # 模拟 v2 manifest 数据（空 bibliography）
-    citation_manifest = {
-        'bibliography': []
-    }
-    
-    # 模拟 summaries 数据
-    summaries = [
-        {
-            'status': 'success',
-            'paper_info': {
-                'title': 'Test Paper 1',
-                'authors': ['Author A', 'Author B'],
-                'year': '2023',
-                'journal': 'Journal of Testing'
-            }
-        }
-    ]
-    
-    # 模拟生成器实例
-    generator = MockGenerator(summaries=summaries)
-    
-    # 调用函数
-    references = generate_apa_references_from_manifest(citation_manifest, generator, allow_compat_fallback=True)
-    
-    # 验证结果（应该回退到使用 summaries 生成）
-    assert len(references) == 1
-    assert 'Author A, Author B' in references[0]
-    assert '2023' in references[0]
-    assert 'Test Paper 1' in references[0]
-
-
-def test_manifest_not_available_raises_without_compat_flag():
-    generator = MockGenerator()
-    with pytest.raises(ValueError):
-        generate_apa_references_from_manifest(None, generator)
-
-
-def test_rebuild_review_docx_raises_when_section_append_fails(tmp_path, monkeypatch):
-    generator = MockGenerator()
-    review_draft = {
+def test_rebuild_review_docx_requires_current_structured_citations(tmp_path) -> None:
+    draft = {
         "content": {
             "sections": [
                 {
                     "section_number": 1,
                     "section_title": "Intro",
-                    "blocks": [{"text": "Claim [[cite:missing]]."}],
+                    "blocks": [{"text": "Structured claim [[cite_ref:R001]]."}],
                 }
             ]
         }
     }
-    manifest = {"paper_entries": [], "bibliography": []}
+    output = tmp_path / "review.docx"
+    rebuild_review_docx_from_structured_artifacts(
+        MockGenerator(), draft, _manifest(), str(output)
+    )
 
-    monkeypatch.setattr("docx_writer._initialize_review_document", lambda *_args, **_kwargs: None)
+    from docx import Document
+
+    text = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
+    assert "(Smith, 2024)" in text
+    assert "Alice Smith (2024). Structured Paper One." in text
+
+    draft["content"]["sections"][0]["blocks"][0]["text"] = (
+        "Legacy mention [[cite:paper_1]]."
+    )
+    with pytest.raises(ValueError, match="section DOCX rendering failed"):
+        rebuild_review_docx_from_structured_artifacts(
+            MockGenerator(), draft, _manifest(), str(tmp_path / "legacy.docx")
+        )
+
+
+def test_final_docx_rebuild_scan_has_no_unresolved_tokens(tmp_path) -> None:
+    draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Intro",
+                    "blocks": [
+                        {
+                            "text": (
+                                "Claim one [[cite_ref:R001]]. "
+                                "Claim two [[cite_ref:R001, R002]]."
+                            )
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    output = tmp_path / "final.docx"
+    scan_path = tmp_path / "scan.json"
+
+    scan = rebuild_final_docx_from_manifest(
+        MockGenerator(), draft, _manifest(), str(output), scan_report_path=str(scan_path)
+    )
+
+    assert scan["passed"] is True
+    assert scan_path.exists()
+    assert scan_docx_for_unresolved_citation_tokens(str(output), _manifest())[
+        "unresolved_tokens"
+    ] == []
+
+
+def test_rebuild_review_docx_raises_when_section_append_fails(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("docx_writer.append_section_to_word_document", lambda *_args, **_kwargs: False)
 
-    with pytest.raises(ValueError, match="section append failed"):
+    with pytest.raises(ValueError, match="section DOCX rendering failed"):
         rebuild_review_docx_from_structured_artifacts(
-            generator,
-            review_draft,
-            manifest,
+            MockGenerator(),
+            {
+                "content": {
+                    "sections": [
+                        {
+                            "section_number": 1,
+                            "section_title": "Intro",
+                            "blocks": [{"text": "Claim [[cite_ref:R001]]."}],
+                        }
+                    ]
+                }
+            },
+            _manifest(),
             str(tmp_path / "review.docx"),
         )

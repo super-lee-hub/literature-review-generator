@@ -15,7 +15,6 @@ JOB_OUTCOME_ARTIFACT_VERSION = "v1"
 ATTEMPT_ARTIFACT_TYPE = "job_attempt"
 ATTEMPT_ARTIFACT_VERSION = "v1"
 DEFAULT_READINESS_POLICY_VERSION = "readiness-policy-v1"
-LEGACY_READINESS_POLICY_VERSION = "legacy-unverified-v1"
 
 JobStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
 JobDisposition = Literal["clean", "findings", "needs_review", "unvalidated"]
@@ -28,7 +27,6 @@ AttemptStatus = Literal[
     "blocked",
     "interrupted",
 ]
-CompatibilityStatus = Literal["native", "legacy_unverified"]
 
 _JOB_STATUSES = frozenset({"pending", "running", "completed", "failed", "cancelled"})
 _JOB_DISPOSITIONS = frozenset({"clean", "findings", "needs_review", "unvalidated"})
@@ -138,7 +136,6 @@ class JobOutcomeV1:
     completed_stages: Tuple[str, ...]
     failed_stage: str | None
     degradation_reasons: Tuple[str, ...]
-    compatibility_status: CompatibilityStatus = "native"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "readiness_policy_snapshot", _freeze_json(self.readiness_policy_snapshot))
@@ -150,7 +147,7 @@ class JobOutcomeV1:
 
     @property
     def success(self) -> bool:
-        """Legacy projection. Queue lifecycle must use ``job_status`` instead."""
+        """Return whether the canonical outcome is ready for downstream use."""
 
         return self.canonical_ready
 
@@ -170,8 +167,6 @@ class JobOutcomeV1:
             raise JobOutcomeContractError(f"unsupported job_status: {self.job_status}")
         if self.job_disposition not in _JOB_DISPOSITIONS:
             raise JobOutcomeContractError(f"unsupported job_disposition: {self.job_disposition}")
-        if self.compatibility_status not in {"native", "legacy_unverified"}:
-            raise JobOutcomeContractError(f"unsupported compatibility_status: {self.compatibility_status}")
         if not self.created_at or not self.updated_at:
             raise JobOutcomeContractError("created_at and updated_at are required")
         if self.outcome_revision < 1:
@@ -197,11 +192,6 @@ class JobOutcomeV1:
             )
         if self.failed_stage and self.failed_stage in self.completed_stages:
             raise JobOutcomeContractError("failed_stage cannot also be completed")
-        if self.compatibility_status == "legacy_unverified":
-            if self.canonical_ready:
-                raise JobOutcomeContractError("legacy-unverified outcomes must fail closed")
-            if self.job_disposition != "unvalidated":
-                raise JobOutcomeContractError("legacy-unverified outcomes must be unvalidated")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,7 +215,6 @@ class JobOutcomeV1:
             "completed_stages": list(self.completed_stages),
             "failed_stage": self.failed_stage,
             "degradation_reasons": list(self.degradation_reasons),
-            "compatibility_status": self.compatibility_status,
         }
 
     @classmethod
@@ -283,7 +272,7 @@ class JobOutcomeV1:
             "readiness_policy_snapshot",
         }
         if not native_keys.issubset(payload.keys()):
-            return cls._from_legacy_dict(payload)
+            raise JobOutcomeContractError("job outcome is missing the current readiness contract")
 
         policy_version = str(payload.get("readiness_policy_version") or DEFAULT_READINESS_POLICY_VERSION)
         policy_snapshot = dict(payload.get("readiness_policy_snapshot") or {})
@@ -310,93 +299,6 @@ class JobOutcomeV1:
             completed_stages=tuple(payload.get("completed_stages") or ()),
             failed_stage=str(payload.get("failed_stage") or "") or None,
             degradation_reasons=tuple(payload.get("degradation_reasons") or ()),
-            compatibility_status=cast(
-                CompatibilityStatus,
-                str(payload.get("compatibility_status") or "native"),
-            ),
-        )
-
-    @classmethod
-    def _from_legacy_dict(cls, payload: Mapping[str, Any]) -> "JobOutcomeV1":
-        legacy_status = str(payload.get("job_status") or payload.get("status") or "pending").lower()
-        status_map: Mapping[str, JobStatus] = {
-            "pending": "pending",
-            "queued": "pending",
-            "running": "running",
-            "completed": "completed",
-            "succeeded": "completed",
-            "success": "completed",
-            "failed": "failed",
-            "error": "failed",
-            "cancelled": "cancelled",
-            "canceled": "cancelled",
-        }
-        job_status = status_map.get(legacy_status, "failed")
-        now = str(payload.get("updated_at") or payload.get("created_at") or utc_now_iso())
-        snapshot = MappingProxyType({"compatibility_mode": "legacy_unverified"})
-        policy_hash = build_readiness_policy_hash(LEGACY_READINESS_POLICY_VERSION, snapshot)
-        legacy_reasons = [str(item) for item in (payload.get("degradation_reasons") or []) if str(item)]
-        if "legacy_unverified" not in legacy_reasons:
-            legacy_reasons.append("legacy_unverified")
-        return cls(
-            artifact_type=JOB_OUTCOME_ARTIFACT_TYPE,
-            artifact_version=JOB_OUTCOME_ARTIFACT_VERSION,
-            job_id=str(payload.get("job_id") or "legacy-unknown"),
-            attempt_number=max(int(payload.get("attempt_number") or 1), 1),
-            resumed_from_attempt=_optional_int(payload.get("resumed_from_attempt")),
-            job_status=job_status,
-            job_disposition="unvalidated",
-            canonical_ready=False,
-            requires_attention=True,
-            created_at=str(payload.get("created_at") or now),
-            updated_at=now,
-            outcome_revision=max(int(payload.get("outcome_revision") or 1), 1),
-            readiness_policy_version=LEGACY_READINESS_POLICY_VERSION,
-            readiness_policy_snapshot=snapshot,
-            readiness_policy_hash=policy_hash,
-            required_stages=tuple(payload.get("required_stages") or ()),
-            completed_stages=tuple(payload.get("completed_stages") or ()),
-            failed_stage=str(payload.get("failed_stage") or "") or None,
-            degradation_reasons=tuple(legacy_reasons),
-            compatibility_status="legacy_unverified",
-        )
-
-    @classmethod
-    def legacy_unverified(
-        cls,
-        *,
-        job_id: str,
-        job_status: JobStatus = "completed",
-        required_stages: Sequence[str] = (),
-        completed_stages: Sequence[str] = (),
-        degradation_reasons: Sequence[str] = (),
-    ) -> "JobOutcomeV1":
-        snapshot = MappingProxyType({"compatibility_mode": "legacy_unverified"})
-        policy_hash = build_readiness_policy_hash(LEGACY_READINESS_POLICY_VERSION, snapshot)
-        now = utc_now_iso()
-        return cls(
-            artifact_type=JOB_OUTCOME_ARTIFACT_TYPE,
-            artifact_version=JOB_OUTCOME_ARTIFACT_VERSION,
-            job_id=job_id,
-            attempt_number=1,
-            resumed_from_attempt=None,
-            job_status=job_status,
-            job_disposition="unvalidated",
-            canonical_ready=False,
-            requires_attention=True,
-            created_at=now,
-            updated_at=now,
-            outcome_revision=1,
-            readiness_policy_version=LEGACY_READINESS_POLICY_VERSION,
-            readiness_policy_snapshot=snapshot,
-            readiness_policy_hash=policy_hash,
-            required_stages=tuple(required_stages),
-            completed_stages=tuple(completed_stages),
-            failed_stage=None,
-            degradation_reasons=tuple(
-                dict.fromkeys(("legacy_unverified", *degradation_reasons))
-            ),
-            compatibility_status="legacy_unverified",
         )
 
 
@@ -554,7 +456,7 @@ class AttemptV1:
             attempt_number=int(payload.get("attempt_number") or 1),
             resumed_from_attempt=_optional_int(payload.get("resumed_from_attempt")),
             status=status,
-            producer=str(payload.get("producer") or "legacy_reader"),
+            producer=str(payload.get("producer") or "runtime"),
             created_at=created_at,
             updated_at=str(payload.get("updated_at") or created_at),
             started_at=started_at,

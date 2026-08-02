@@ -117,23 +117,16 @@ def test_job_outcome_rejects_hash_tampering_and_unsafe_ready_states() -> None:
         )
 
 
-def test_legacy_outcome_reader_fails_closed_even_when_success_is_true() -> None:
-    restored = JobOutcomeV1.from_dict(
+def test_non_current_outcome_payload_is_rejected_even_when_success_is_true() -> None:
+    with pytest.raises(JobOutcomeContractError, match="missing the current readiness contract"):
+        JobOutcomeV1.from_dict(
         {
             "job_id": "legacy-job",
             "status": "completed",
             "success": True,
             "created_at": "2026-07-13T00:00:00Z",
         }
-    )
-
-    assert restored.job_status == "completed"
-    assert restored.job_disposition == "unvalidated"
-    assert restored.compatibility_status == "legacy_unverified"
-    assert restored.canonical_ready is False
-    assert restored.success is False
-    assert restored.requires_attention is True
-    assert "legacy_unverified" in restored.degradation_reasons
+        )
 
 
 def test_native_outcome_reader_rejects_invalid_resume_number_instead_of_correcting_it() -> None:

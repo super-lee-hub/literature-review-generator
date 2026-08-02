@@ -314,7 +314,7 @@ class TestLoadRepairPlan:
                 confidence=0.85,
                 fix_strategy="manifest_fix_rerender",
                 dependency_bundle=bundle,
-                metadata={"paper_id": "paper-001"},
+                metadata={"paper_ids": ["paper-001"]},
             )
             
             original_plan = RepairPlan(
@@ -344,7 +344,7 @@ class TestLoadRepairPlan:
             assert loaded_proposal.target.span_start == 10
             assert loaded_proposal.target.span_end == 50
             assert loaded_proposal.dependency_bundle.summary_hash == "abc123"
-            assert loaded_proposal.metadata.get("paper_id") == "paper-001"
+            assert loaded_proposal.metadata.get("paper_ids") == ["paper-001"]
 
 
 class TestRepairPipelineIntegration:
@@ -363,12 +363,14 @@ class TestRepairPipelineIntegration:
                 conclusion=ValidationConclusion.WRONG_SOURCE,
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
-                details={"block_id": "s1_b1"},
+                details={"block_ids": ["s1_b1"]},
                 claim_text="Test claim",
                 claim_context="Test context",
                 evidence_excerpt_list=[],
                 reasoning_summary="Test reasoning",
                 repair_hint="Test repair hint",
+                paper_ids=["paper-001"],
+                block_ids=["s1_b1"],
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",
@@ -442,12 +444,14 @@ class TestRepairPipelineIntegration:
                 conclusion=ValidationConclusion.WRONG_SOURCE,
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
-                details={"block_id": "s1_b1"},
+                details={"block_ids": ["s1_b1"]},
                 claim_text="Test claim",
                 claim_context="Test context",
                 evidence_excerpt_list=[],
                 reasoning_summary="Test reasoning",
                 repair_hint="Test repair hint",
+                paper_ids=["paper-001"],
+                block_ids=["s1_b1"],
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",
@@ -518,12 +522,14 @@ class TestRepairPipelineIntegration:
                 conclusion=ValidationConclusion.WRONG_SOURCE,
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
-                details={"block_id": "s1_b1"},
+                details={"block_ids": ["s1_b1"]},
                 claim_text="Test claim",
                 claim_context="Test context",
                 evidence_excerpt_list=[],
                 reasoning_summary="Test reasoning",
                 repair_hint="Test repair hint",
+                paper_ids=["paper-001"],
+                block_ids=["s1_b1"],
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",
@@ -649,7 +655,7 @@ class TestRepairPipelineIntegration:
             )
             review_draft = {
                 "artifact_type": "review_draft",
-                "artifact_version": "v2",
+                "artifact_version": "v3",
                 "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": block_text}]}]},
             }
             paper_artifact = {

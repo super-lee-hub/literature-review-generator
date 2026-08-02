@@ -21,7 +21,7 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
         Path(workspace.artifact_path("review_drafts/review.json")),
         {
             "artifact_type": "review_draft",
-            "artifact_version": "v2",
+            "artifact_version": "v3",
             "content": {
                 "sections": [
                     {
@@ -40,10 +40,10 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
         },
     )
     draft = registry.register_file(
-        artifact_id="review_draft_v2:full_review",
-        artifact_role="review_draft_v2",
+        artifact_id="review_draft",
+        artifact_role="review_draft",
         artifact_type="review_draft",
-        artifact_version="v2",
+        artifact_version="v3",
         path=draft_path,
         producer="tests",
     )
@@ -52,7 +52,6 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
         "artifact_version": "v3",
         "occurrences": [],
         "bibliography": [],
-        "migration_report": {"fallback_counters": {"unresolved_occurrences": 0}},
     }
     if render_policy:
         manifest_payload["render_policy"] = {
@@ -142,7 +141,7 @@ def test_validation_closure_blocks_missing_render_policy(tmp_path: Path) -> None
 
 def test_validation_closure_detects_draft_tampering_without_promoting_clean(tmp_path: Path) -> None:
     workspace, registry = _bundle(tmp_path)
-    draft = registry.get("review_draft_v2:full_review")
+    draft = registry.get("review_draft")
     assert draft is not None
     Path(draft.path).write_text(json.dumps({"tampered": True}), encoding="utf-8")
     result = ValidationClosureService(workspace, registry).inspect()

@@ -15,7 +15,7 @@
 1. `services.job_runner.JobRunRequest` 保持为规范请求模型
 2. CLI 和 GUI 保持为一等人类接口；不要替代它们
 3. AI 模式是加法面，MVP 阶段不进入队列，但必须保持 workspace 兼容
-4. 规范下游产物保持不变：summaries、markdown outline、`review_draft_v2`、`citation_manifest_v3`、docx、validation/repair 产物
+4. 规范下游产物为 summaries、已注册 Outline v3 产物、当前 `review_draft`（artifact_version=v3）、`citation_manifest_v3`、docx、validation/repair 产物
 
 ## 主要运行时辅助模块
 
@@ -42,5 +42,5 @@
 - 不要把 `python main.py ...` 作为规范 AI 运行时
 - 不要引入第二个平行的请求模型
 - 不要绕过 latest-pointer / artifact-registry / resume-state 行为
-- 不要用替代规范 schema 替换 `review_draft_v2` / `citation_manifest_v3`
+- 不要用替代 schema 替换当前 `review_draft` / `citation_manifest_v3` 契约
 - 当更丰富的产物证据存在时，不要把仅摘要级别的证据当作验证真相

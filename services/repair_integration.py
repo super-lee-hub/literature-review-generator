@@ -142,7 +142,7 @@ def persist_patched_citation_manifest(
     job_id: str,
 ) -> str:
     """Persist the manifest mutated by auto-safe structural repair."""
-    artifact_version = str(citation_manifest.get("artifact_version") or "v1")
+    artifact_version = str(citation_manifest.get("artifact_version") or "v3")
     manifest_path = workspace.artifact_path(f"citation_manifests/repaired_citation_manifest_{job_id}.json")
 
     atomic_write_json(manifest_path, citation_manifest)
@@ -303,11 +303,9 @@ def run_repair_pipeline(
             # Generate new review docx
             docx_path = workspace.artifact_path(f"review_{job_id}_repaired.docx")
             create_word_document(
+                None,
+                "# Repaired Literature Review\n\nThe repaired review is represented by the canonical structured artifacts.",
                 docx_path,
-                "Repaired Literature Review",
-                ["Introduction", "Methodology", "Results", "Discussion", "Conclusion"],
-                "",
-                []
             )
             
             # Generate APA references from new citation manifest
@@ -330,12 +328,11 @@ def run_repair_pipeline(
                 def __init__(self, workspace):
                     self.logger = MockLogger()
                     self.config = {
-                        'Performance': {'enable_stage2_validation': 'True'},
+                        'Validation': {'review_enabled': 'True', 'repair_policy': 'apply'},
                         'Paths': {'output_path': workspace.base_output_dir},
                         'Primary_Reader_API': {'api_key': 'mock_key'},
                         'Writer_API': {'api_key': 'mock_key'}
                     }
-                    self.compat_config = None
                     self.output_dir = workspace.base_output_dir
                     self.project_name = "repair"
                     self.summaries = []
@@ -375,7 +372,6 @@ def run_repair_pipeline(
             generate_apa_references_from_manifest(
                 patched_citation_manifest,
                 mock_generator,
-                allow_compat_fallback=True,
             )
             
             # Step 6: Run review recheck

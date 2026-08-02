@@ -56,6 +56,6 @@ def test_forensic_attestation_does_not_call_untrusted_workspace_canonical(tmp_pa
         completion={"completion_status": "complete"},
         closure={"status": "clean"},
     )
-    assert result.status == "manual_repaired_legacy"
+    assert result.status == "manual_repaired"
     assert result.manual_modified_artifact_ids == ("draft",)
     assert Path(result.report_path).exists()

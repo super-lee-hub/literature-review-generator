@@ -837,8 +837,7 @@ def _candidate_job_logs(
         if workspace_path:
             append(Path(workspace_path) / "logs" / "job.log")
 
-    runtimes = getattr(queue_service, "_runtimes", {}) if queue_service is not None else {}
-    runtime_items = list(runtimes.values()) if isinstance(runtimes, dict) else []
+    runtime_items = queue_service.list_job_runtimes() if queue_service is not None else []
     runtime_items.sort(key=lambda item: str(getattr(item, "completed_at", None) or getattr(item, "started_at", None) or ""), reverse=True)
     for runtime in runtime_items:
         append(getattr(runtime, "log_path", ""))
@@ -866,7 +865,7 @@ def _workspace_primary_artifacts(workspace_path: str, project_name: str) -> list
 
     artifact_candidates: list[tuple[str, Path]] = [
         ("结构化摘要", workspace / "artifacts" / f"{project_name}_summaries.json"),
-        ("综述大纲", workspace / "artifacts" / f"{project_name}_literature_review_outline.md"),
+        ("综述大纲", workspace / "artifacts" / "outline_v3" / "artifacts" / "final_outline.json"),
         ("注册表", workspace / "artifact_registry.json"),
     ]
 
@@ -2168,9 +2167,7 @@ class WorkspaceController:
     def _latest_queue_progress_snapshot(self) -> Dict[str, Any] | None:
         if not self._queue_service:
             return None
-        runtimes = getattr(self._queue_service, "_runtimes", {})
-        if not isinstance(runtimes, dict):
-            return None
+        runtimes = self._queue_service.list_job_runtimes()
         running = [
             runtime
             for runtime in runtimes.values()

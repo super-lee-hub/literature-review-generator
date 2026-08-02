@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import validator
+import pytest
 
 
 class _DummyConfig:
@@ -41,10 +42,8 @@ def test_validator_api_config_carries_deepseek_reasoning_options() -> None:
     assert api_config.get("force_highest_reasoning") == "true"
 
 
-def test_validator_text_truncation_uses_token_budget() -> None:
+def test_validator_text_budget_rejects_partial_evidence() -> None:
     text = "中" * 20
 
-    truncated = validator._truncate_text_to_token_budget(text, 5)
-
-    assert validator.estimate_tokens(truncated) <= 5
-    assert truncated == "中" * 5
+    with pytest.raises(validator.ValidationContextBudgetError, match="requires"):
+        validator._ensure_text_within_token_budget(text, 5)

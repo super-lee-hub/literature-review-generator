@@ -70,17 +70,12 @@ def _check_dependency_bundle(
     """Check if dependencies are still valid.
 
     Returns False if any dependency is missing or stale.
-    Supports multi-paper proposals via metadata.paper_ids (v3) with
-    fallback to metadata.paper_id (legacy).
+    Supports multi-paper proposals via the current metadata.paper_ids contract.
     """
     bundle = proposal.dependency_bundle
 
-    # Resolve target paper IDs: prefer paper_ids (plural, v3), then legacy paper_id
+    # Current repair proposals always carry the plural paper identity list.
     target_paper_ids: List[str] = list(proposal.metadata.get("paper_ids", []))
-    if not target_paper_ids:
-        legacy_paper_id = proposal.metadata.get("paper_id", "")
-        if legacy_paper_id:
-            target_paper_ids = [legacy_paper_id]
 
     if not target_paper_ids:
         return False
@@ -130,12 +125,11 @@ def _check_dependency_bundle(
 
 
 def infer_expected_review_draft_version(review_draft: Dict[str, Any]) -> str:
-    """Return artifact_version from review_draft, defaulting to 'v2'.
-
-    The v2/v3 chain is now canonical; v1 is a compatibility fallback only.
-    """
+    """Return the required current review-draft artifact version."""
     version = str(review_draft.get("artifact_version", "") or "").strip()
-    return version if version else "v2"
+    if version != "v3":
+        raise ValueError("current review_draft artifact_version must be v3")
+    return version
 
 
 def check_apply_guards(
@@ -143,7 +137,7 @@ def check_apply_guards(
     review_draft: Dict[str, Any],
     paper_artifacts: Sequence[Dict[str, Any]],
     visual_manifest: Optional[Dict[str, Any]] = None,
-    expected_artifact_version: str = "v2",
+    expected_artifact_version: str = "v3",
     require_auto_safe: bool = False,
 ) -> ApplyGuardResult:
     """Check all guards before applying a patch.

@@ -57,7 +57,6 @@ def _record(*, audit_id: str = "audit-1", reason: str = "selected exact candidat
     "audit_type",
     [
         "identity_override",
-        "legacy_reuse",
         "outline_manual_adoption",
         "dependency_force_delete",
         "artifact_quarantine_release",
@@ -137,12 +136,12 @@ def test_audit_id_collision_detection_allows_idempotent_duplicate_only() -> None
 def test_audit_record_rejects_secret_material(policy_snapshot: dict[str, object]) -> None:
     with pytest.raises(AuditSecretDetected):
         AuditRecordV1.create(
-            audit_type="legacy_reuse",
+            audit_type="outline_manual_adoption",
             job_id="job-123",
             attempt_id="attempt-1",
             producer="runtime",
             actor="operator",
-            reason="explicit legacy artifact reuse",
+            reason="explicit current artifact adoption",
             scope={"artifact": "summary"},
             target_artifacts=[AuditArtifactRefV1("summary", HASH_A)],
             policy_snapshot=policy_snapshot,
@@ -152,12 +151,12 @@ def test_audit_record_rejects_secret_material(policy_snapshot: dict[str, object]
 
 def test_audit_record_allows_boolean_secret_presence_flags_without_secret_value() -> None:
     record = AuditRecordV1.create(
-        audit_type="legacy_reuse",
+        audit_type="outline_manual_adoption",
         job_id="job-123",
         attempt_id="attempt-1",
         producer="runtime",
         actor="operator",
-        reason="explicit legacy artifact reuse",
+        reason="explicit current artifact adoption",
         scope={"artifact": "summary"},
         target_artifacts=[AuditArtifactRefV1("summary", HASH_A)],
         policy_snapshot={"api_key_present": True},
@@ -184,7 +183,7 @@ def test_audit_record_rejects_embedded_claim_level_conclusions() -> None:
             audit_type="outline_manual_adoption",
             job_id="job-123",
             attempt_id="attempt-1",
-            producer="outline.adoption",
+            producer="outline.adoption_transaction",
             actor="operator",
             reason="manual review completed",
             scope={"claim_results": [{"claim_verdict": "unsupported"}]},

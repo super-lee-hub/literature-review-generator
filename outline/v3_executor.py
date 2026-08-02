@@ -246,6 +246,8 @@ class OutlineV3Executor:
 
     def _load_node(self, node_id: str) -> dict[str, Any] | None:
         node = self._dag.get(node_id)
+        if node is None:
+            return None
         path = self._node_path(node_id)
         if node.status != "succeeded" or not Path(path).is_file():
             return None
@@ -359,6 +361,20 @@ class OutlineV3Executor:
     def _run_provider_node(self, node_id: str, request: Mapping[str, Any], cls: type[OutlineArtifact], deps: Mapping[str, str], *, minimum_output: int = 2) -> tuple[OutlineArtifact, Sequence[str], str, str]:
         content = self._provider_call(node_id, request, expect_json=True)
         return self._artifact(cls, content, deps), tuple(deps), self.profile.model, self.profile.provider
+
+    def _register_receipt_ledger(self) -> None:
+        path = self._receipt_ledger.path
+        if not path.is_file():
+            return
+        self.registry.register_file(
+            artifact_role="provider_receipts",
+            artifact_type="provider_receipt_ledger",
+            artifact_version="v1",
+            path=str(path),
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id="provider_receipts",
+            metadata={"receipt_count": len(self._receipt_ledger.list_receipts())},
+        )
 
     def run(self) -> OutlineV3ExecutionResult:
         try:
@@ -504,13 +520,22 @@ class OutlineV3Executor:
                 adopted = adoption.get("status") == "adopted"
             else:
                 adopted = False
-            self._dag = self._node_store.load()
+            self._register_receipt_ledger()
+            loaded_dag = self._node_store.load()
+            if loaded_dag is not None:
+                self._dag = loaded_dag
             status = "complete" if adopted and not self._dag.failed_node_ids else "blocked"
             return OutlineV3ExecutionResult(self.job_id, status, adopted, dict(self.artifact_paths), tuple(node.node_id for node in self._dag.nodes if node.status == "succeeded"), tuple(self.receipts), tuple(self.diagnostics), self._dag)
         except Exception as exc:
             self.diagnostics.append(str(exc))
             try:
-                self._dag = self._node_store.load()
+                self._register_receipt_ledger()
+            except Exception as ledger_error:
+                self.diagnostics.append(f"provider receipt ledger registration failed: {ledger_error}")
+            try:
+                loaded_dag = self._node_store.load()
+                if loaded_dag is not None:
+                    self._dag = loaded_dag
             except Exception:
                 pass
             return OutlineV3ExecutionResult(self.job_id, "blocked", False, dict(self.artifact_paths), tuple(node.node_id for node in self._dag.nodes if node.status == "succeeded"), tuple(self.receipts), tuple(self.diagnostics), self._dag)

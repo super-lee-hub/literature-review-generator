@@ -42,27 +42,3 @@ def test_architecture_gate_scan_reports_forbidden_patterns(tmp_path: Path) -> No
     findings = scan_paths_for_forbidden_patterns([bad_file])
 
     assert findings == [(str(bad_file), "legacy_cli_dispatch")]
-
-
-def test_architecture_gate_scan_reports_runtime_legacy_generation_coupling(tmp_path: Path) -> None:
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir()
-    bad_file = runtime_dir / "bridge.py"
-    bad_file.write_text(
-        "\n".join(
-            (
-                "runner._execute_legacy_action(legacy_main, generator, args, request)",
-                "legacy_main.handle_generate_outline_mode(generator, args)",
-                "generator.generate_full_review_from_outline()",
-            )
-        ),
-        encoding="utf-8",
-    )
-
-    findings = scan_paths_for_forbidden_patterns([bad_file])
-
-    assert set(findings) == {
-        (str(bad_file), "job_runner_legacy_execution"),
-        (str(bad_file), "legacy_handle_outline"),
-        (str(bad_file), "legacy_review_generation"),
-    }

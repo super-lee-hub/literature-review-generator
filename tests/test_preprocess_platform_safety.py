@@ -3,15 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
-from typing import cast
 
 import pytest
 import requests
 
-from config_loader import ConfigDict
-import main
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
 from preprocess.service import PreprocessManager
+from summary_schema import normalize_ai_summary
 
 
 class _Response:
@@ -227,111 +225,19 @@ def test_ocr_runs_through_bounded_json_subprocess(
     assert manager._ocr_page(_Page()) == "OCR 文本"
 
 
-def test_metadata_only_quality_failure_does_not_reprocess_with_docling_or_ocr(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    generator = main.LiteratureReviewGenerator(project_name="demo", pdf_folder=str(tmp_path))
-    generator.logger = cast(main.CustomLogger, _SilentLogger())
-    generator.config = ConfigDict(
+def test_metadata_only_summary_is_marked_for_manual_review_by_current_schema() -> None:
+    summary = normalize_ai_summary(
         {
-            "Primary_Reader_API": {
-                "api_key": "primary",
-                "model": "m1",
-                "api_base": "https://example.test/v1",
-            },
-            "Backup_Reader_API": {
-                "api_key": "",
-                "model": "",
-                "api_base": "https://example.test/v1",
-            },
-        }
-    )
-
-    pdf_path = tmp_path / "metadata-only.pdf"
-    pdf_path.write_bytes(b"synthetic pdf")
-    manager = PreprocessManager(config={})
-    prepare_calls: list[str] = []
-    docling_calls: list[str] = []
-    ocr_calls: list[object] = []
-
-    def fake_docling(_self, path, *_args):
-        docling_calls.append(str(path))
-        return {
-            "markdown_text": "# Extracted paper",
-            "plain_text": "Extracted paper body. " * 80,
-            "structured_payload": {},
-            "extractor_used": "docling",
-        }
-
-    def fake_ocr(_self, page):
-        ocr_calls.append(page)
-        return "OCR fallback text. " * 80
-
-    def prepare_stage1_input(path, preprocess_strategy="hybrid"):
-        prepare_calls.append(preprocess_strategy)
-        if preprocess_strategy == "hybrid":
-            extracted = manager._extract_with_docling(path, [], [], [])
-            assert extracted is not None
-            return extracted["plain_text"], {
-                "analysis_input_kind": "text",
-                "extractor_used": "docling",
+            "paper_metadata": {
+                "title": "Metadata Only Paper",
+                "authors": ["Alice Example"],
+                "year": None,
+                "journal": None,
+                "doi": None,
             }
-        return manager._ocr_page(object()), {
-            "analysis_input_kind": "text",
-            "extractor_used": "ocr",
         }
-
-    ai_summary = {
-        "paper_metadata": {
-            "title": "Metadata Only Paper",
-            "authors": ["Alice Example"],
-            "year": None,
-            "journal": None,
-            "doi": None,
-        }
-    }
-
-    monkeypatch.setattr(PreprocessManager, "_extract_with_docling", fake_docling)
-    monkeypatch.setattr(PreprocessManager, "_ocr_page", fake_ocr)
-    monkeypatch.setattr(generator, "_stage1_preprocess_strategies", lambda: ["hybrid", "ocr"])
-    monkeypatch.setattr(generator, "_prepare_stage1_input", prepare_stage1_input)
-    monkeypatch.setattr(
-        generator,
-        "_build_stage1_model_input",
-        lambda **_kwargs: {"prompt_text": "analyze", "user_message_content": None},
-    )
-    monkeypatch.setattr(
-        generator,
-        "_call_stage1_reader_with_scheduler",
-        lambda *_args, **_kwargs: {"content": ai_summary, "engine_type": "primary"},
-    )
-    monkeypatch.setattr(
-        main,
-        "validate_summary_quality",
-        lambda _result: (False, "year metadata missing; journal metadata missing"),
-    )
-    monkeypatch.setattr(generator, "_persist_paper_artifact", lambda _result: True)
-
-    result = generator.process_paper(
-        {
-            "title": "Metadata Only Paper",
-            "authors": ["Alice Example"],
-            "year": "unknown",
-            "journal": "unknown",
-            "doi": "",
-            "pdf_path": str(pdf_path),
-        },
-        0,
-        None,
-        1,
     )
 
-    assert result is not None
-    assert result["status"] == "success"
-    result_summary = result.get("ai_summary")
-    assert isinstance(result_summary, dict)
-    assert result_summary["quality_audit"]["needs_manual_review"] is True
-    assert prepare_calls == ["hybrid"]
-    assert docling_calls == [str(pdf_path)]
-    assert ocr_calls == []
+    quality = summary["quality_audit"]
+    assert quality["needs_manual_review"] is True
+    assert "core_analysis.summary" in quality["missing_critical_fields"]

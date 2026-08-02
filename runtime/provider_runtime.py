@@ -550,10 +550,10 @@ class ProviderRuntime:
     def max_attempts_for_call(self, requested_attempts: int) -> int:
         """Return the transport loop limit imposed by this runtime.
 
-        The legacy adapter parameter is a total-attempt limit.  The formal
-        runtime budget is expressed as retries, so one initial attempt is
-        added when the retry dimension is bounded.  A zero budget remains
-        unlimited for compatibility with older callers.
+        The caller-facing limit is a total-attempt limit.  The formal runtime
+        budget is expressed as retries, so one initial attempt is added when
+        the retry dimension is bounded.  A zero budget means the caller's
+        requested limit remains in force.
         """
 
         requested = max(1, int(requested_attempts))

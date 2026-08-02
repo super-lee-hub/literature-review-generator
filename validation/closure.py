@@ -4,8 +4,8 @@ The validator and repair modules pre-date the runtime control plane and expose
 useful, lower-level contracts.  This module is the small deterministic join
 between those contracts and the durable :class:`ArtifactRegistry`: it verifies
 the current draft/manifest identities, checks citation object coverage, and
-projects a registered ``ValidationRunResultV1`` without treating a DOCX or a
-legacy report as a source of truth.
+projects a registered ``ValidationRunResultV1`` without treating a DOCX as a
+source of truth.
 
 The service is deliberately read-only by default.  A caller may persist the
 result as a new derived artifact, but it never edits a READY input artifact.
@@ -176,8 +176,8 @@ class ValidationClosureService:
         draft = _choose_record(
             records,
             artifact_type="review_draft",
-            version="v2",
-            preferred_ids=("review_draft_v2:full_review",),
+            version="v3",
+            preferred_ids=("review_draft",),
         )
         manifest = _choose_record(
             records,
@@ -191,7 +191,7 @@ class ValidationClosureService:
             version="v1",
         )
         if draft is None:
-            blocking.append("canonical_review_draft_v2_missing")
+            blocking.append("canonical_review_draft_missing")
         if manifest is None:
             blocking.append("canonical_citation_manifest_v3_missing")
         if validation is None:
@@ -225,7 +225,7 @@ class ValidationClosureService:
             blocking.append("validation_json_unreadable")
 
         if draft is not None:
-            if draft.get("artifact_type") != "review_draft" or draft.get("artifact_version") != "v2":
+            if draft.get("artifact_type") != "review_draft" or draft.get("artifact_version") != "v3":
                 blocking.append("review_draft_schema_mismatch")
         if manifest is not None:
             if manifest.get("artifact_type") != "citation_manifest" or manifest.get("artifact_version") != "v3":
@@ -278,13 +278,16 @@ class ValidationClosureService:
             if not occurrence.get("spans"):
                 findings.append(f"citation_span_missing:{occurrence_id or 'unknown'}")
 
-        migration = manifest.get("migration_report") if isinstance(manifest, Mapping) else {}
-        fallback = migration.get("fallback_counters") if isinstance(migration, Mapping) else {}
-        if isinstance(fallback, Mapping):
-            try:
-                unresolved_occurrences = int(fallback.get("unresolved_occurrences") or 0)
-            except (TypeError, ValueError):
-                unresolved_occurrences = 0
+        unresolved_occurrences = sum(
+            1
+            for occurrence in occurrences
+            if isinstance(occurrence, Mapping)
+            and (
+                not str(occurrence.get("ref_id") or "").strip()
+                or not str(occurrence.get("paper_id") or occurrence.get("paper_key") or "").strip()
+                or str(occurrence.get("paper_id") or "").strip() == "unknown"
+            )
+        )
         if unresolved_occurrences:
             findings.append(f"unresolved_citation_occurrences:{unresolved_occurrences}")
 

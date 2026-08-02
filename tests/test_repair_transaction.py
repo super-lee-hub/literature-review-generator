@@ -16,7 +16,7 @@ from validation.run_result import (
 
 def test_report_first_plan_persists_hash_bound_transaction(tmp_path: Path) -> None:
     workspace, registry = _bundle(tmp_path)
-    draft = registry.get("review_draft_v2:full_review")
+    draft = registry.get("review_draft")
     manifest = registry.get("citation_manifest:v3")
     assert draft is not None and manifest is not None
     claim = ClaimValidationResultV1(
@@ -38,7 +38,6 @@ def test_report_first_plan_persists_hash_bound_transaction(tmp_path: Path) -> No
         low_confidence=True,
         details={},
         evidence_candidates=(),
-        compatibility={},
     )
     validation = ValidationRunResultV1.create(
         job_id=workspace.job_id,

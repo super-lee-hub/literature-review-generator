@@ -74,7 +74,7 @@ PDF 预处理
         ↓
 
 阶段三：生成综述正文
-├─ review_draft_v2.json
+├─ review_draft.json（artifact_version=v3）
 ├─ citation_manifest_v3.json
 └─ *_literature_review.docx
 
@@ -366,7 +366,7 @@ output/<project_name>__<job_id>/
 - `reports/*_analyzed_papers.xlsx`
 - `reports/*_literature_review.docx`
 - `reports/*_failed_papers_report.txt`
-- `artifacts/review_drafts/*_review_draft_v2.json`
+- `artifacts/review_drafts/*_review_draft.json`（artifact_version=v3）
 - `artifacts/citation_manifests/*_citation_manifest_v3.json`
 
 兼容目录：

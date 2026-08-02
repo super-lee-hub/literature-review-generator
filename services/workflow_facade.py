@@ -46,7 +46,7 @@ def build_args(
     library_path: Optional[str] = None,
     queue_file: str = "output/_queue/queue.json",
 ) -> argparse.Namespace:
-    """Create a Namespace compatible with main.dispatch_command."""
+    """Create a Namespace for the shared current workflow facade."""
 
     namespace = argparse.Namespace(
         config=config,
@@ -80,32 +80,27 @@ def build_args(
     return namespace
 
 
-def run_dispatch(args: argparse.Namespace, cancel_token: Optional[Any] = None) -> WorkflowResult:
-    """Run the existing CLI dispatcher without killing the GUI process."""
-
-    from main import dispatch_command  # Local import avoids circular startup issues.
+def run_workflow(args: argparse.Namespace, cancel_token: Optional[Any] = None) -> WorkflowResult:
+    """Run a GUI request through the same current JobRunner as the CLI."""
 
     if cancel_token is not None and getattr(args, "_cancel_token", None) is None:
         setattr(args, "_cancel_token", cancel_token)
     progress_tracker = getattr(args, "_progress_tracker", None)
     try:
-        dispatch_command(args)
-    except SystemExit as exc:  # pragma: no cover - integration safeguard.
-        code = int(exc.code or 0)
+        request = build_job_request(args)
+        from services.job_runner import JobRunner
+
+        result = JobRunner().run(request, cancel_token=cancel_token)
         if progress_tracker is not None:
-            progress_tracker.finish(success=code == 0, message=f"Exited with code {code}")
-        return WorkflowResult(success=code == 0, exit_code=code, message=f"Exited with code {code}")
+            progress_tracker.finish(success=result.success, message=result.message)
+        return WorkflowResult(success=result.success, exit_code=result.exit_code, message=result.message)
     except Exception as exc:  # pragma: no cover - surfaced to GUI.
         if progress_tracker is not None:
             progress_tracker.finish(success=False, message=str(exc))
         return WorkflowResult(success=False, exit_code=1, message=str(exc))
 
-    if progress_tracker is not None:
-        progress_tracker.finish(success=True)
-    return WorkflowResult(success=True)
-
 
 def build_job_request(args: argparse.Namespace) -> JobRunRequest:
-    """Translate legacy CLI/GUI args into the shared Week-1 job request."""
+    """Translate GUI arguments into the shared typed job request."""
 
     return build_job_request_from_args(args)

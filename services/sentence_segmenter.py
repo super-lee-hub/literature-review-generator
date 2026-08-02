@@ -41,7 +41,9 @@ class SentenceSpanV1:
         payload: Dict[str, Any] = asdict(self)
         if sentence_index is not None:
             payload["sentence_index"] = sentence_index
-        # Additive compatibility projection for Review Draft v2 readers.
+        # Keep the short text field in the current sentence-span envelope so
+        # citation occurrence builders and human-readable exports share one
+        # representation.
         payload["text"] = self.display_text
         return payload
 

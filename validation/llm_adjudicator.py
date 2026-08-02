@@ -37,8 +37,8 @@ class AdjudicationPacket:
     per_paper_evidence_packets: Dict[str, Dict[str, List[Dict[str, Any]]]]
     evidence_excerpt_list: List[str]
     trimmed_candidate_counts: Dict[str, int]
-    legacy_evidence_status: str
-    legacy_disposition: str
+    evidence_status: str
+    disposition: str
 
 
 def _candidate_sort_key(candidate: Dict[str, Any]) -> tuple[int, float, str]:
@@ -163,8 +163,8 @@ def build_adjudication_packet(result: Any, *, stage: str = "primary") -> Adjudic
         per_paper_evidence_packets=per_paper_packets,
         evidence_excerpt_list=evidence_excerpt_list,
         trimmed_candidate_counts=trimmed_candidate_counts,
-        legacy_evidence_status=str(getattr(result, "evidence_status", "") or result.details.get("evidence_status") or ""),
-        legacy_disposition=str(getattr(result, "disposition", "") or result.details.get("disposition") or ""),
+        evidence_status=str(getattr(result, "evidence_status", "") or result.details.get("evidence_status") or ""),
+        disposition=str(getattr(result, "disposition", "") or result.details.get("disposition") or ""),
     )
 
 
@@ -248,5 +248,5 @@ def run_adjudication_stage(
     report.setdefault("claim_type", packet.claim_type)
     report.setdefault("claim_type_confidence", packet.claim_type_confidence)
     report.setdefault("claim_type_rationale", packet.claim_type_rationale)
-    report.setdefault("adjudication_status", str(report.get("status") or packet.legacy_evidence_status or "evidence_gap"))
+    report.setdefault("adjudication_status", str(report.get("status") or packet.evidence_status or "evidence_gap"))
     return report

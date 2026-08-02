@@ -22,4 +22,4 @@ python -m reviewctl attest --job <job_id>
 
 `adopt --artifact <final_outline_id> --actor <actor>` 是显式采用操作，要求 final outline、coverage audit、stage health、哈希和 blocking critique 门禁全部通过；Outline v3 candidate plan 不会被静默提升。`export` 和 `attest` 会生成 provenance、checksum、completion、validation closure 与依赖图证据。
 
-信任状态只有 `canonical_verified`、`manual_repaired_legacy` 和 `untrusted`。不能因为磁盘上有 DOCX、报告文本或手工编辑过的 Registry/Stage Health 就宣称完成。
+信任状态只有 `canonical_verified`、`manual_repaired` 和 `untrusted`。不能因为磁盘上有 DOCX、报告文本或手工编辑过的 Registry/Stage Health 就宣称完成。

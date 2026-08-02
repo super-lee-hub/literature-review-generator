@@ -22,7 +22,6 @@ from summary_schema import (
     default_ai_summary,
     get_ai_summary,
     normalize_ai_summary,
-    project_legacy_ai_summary,
 )
 
 _DEFAULT_TIMEOUT_SECONDS = 600
@@ -453,16 +452,18 @@ def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any)
 
 
 def _default_core_variables() -> Dict[str, List[str]]:
-    return project_legacy_ai_summary(default_ai_summary())["type_specific_details"]["core_variables"]
+    specialized = default_ai_summary()["specialized_details"]
+    empirical = specialized.get("empirical") or {}
+    return dict(empirical.get("core_variables") or {})
 
 
 def _default_type_specific_details() -> Dict[str, Any]:
-    return project_legacy_ai_summary(default_ai_summary())["type_specific_details"]
+    return dict(default_ai_summary()["specialized_details"])
 
 
 def _normalize_type_specific_details(payload: Any) -> Dict[str, Any]:
-    canonical = normalize_ai_summary({"type_specific_details": payload})
-    return project_legacy_ai_summary(canonical)["type_specific_details"]
+    canonical = normalize_ai_summary({"specialized_details": payload})
+    return dict(canonical["specialized_details"])
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:

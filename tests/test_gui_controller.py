@@ -522,6 +522,8 @@ def test_clear_completed_jobs_keeps_failed_and_cancelled(gui_app_module, tmp_pat
     }
     for job_id, state in states.items():
         service.add_job(QueueJobSpec(job_id=job_id, job_type="analyze", project_name=job_id))
+        if state is not gui_app_module.QueueState.PENDING:
+            service.update_job_state(job_id, gui_app_module.QueueState.RUNNING)
         service.update_job_state(job_id, state)
 
     controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))

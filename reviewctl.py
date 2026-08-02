@@ -33,8 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--spec", required=True)
         subparser.add_argument("--job-id", default="")
-        subparser.add_argument("--stage-handler", default="")
-        subparser.add_argument("--validator-module", default="")
 
     for command in ("status", "inspect", "next-action", "resume", "retry-node", "reconcile", "repair-plan", "repair-apply", "validate", "cancel", "adopt"):
         subparser = subparsers.add_parser(command)
@@ -51,10 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument("--actor", default="reviewctl")
         if command == "cancel":
             subparser.add_argument("--reason", default="user_requested")
-        if command == "resume":
-            subparser.add_argument("--stage-handler", default="")
-            subparser.add_argument("--validator-module", default="")
-        subparser.add_argument("--json", action="store_true", help="kept for agent compatibility; output is always JSON")
+        subparser.add_argument("--json", action="store_true", help="Emit JSON output (the default format)")
 
     export = subparsers.add_parser("export")
     export.add_argument("--batch", default="")
@@ -98,8 +93,6 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.run(
                 args.spec,
                 job_id=args.job_id,
-                stage_handler=args.stage_handler,
-                validator_module=args.validator_module,
             )
         elif args.command == "status":
             payload = control.status(job_id=args.job or None, workspace=args.workspace or None)
@@ -111,8 +104,6 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.resume(
                 job_id=args.job or None,
                 workspace=args.workspace or None,
-                stage_handler=args.stage_handler,
-                validator_module=args.validator_module,
             )
         elif args.command == "retry-node":
             payload = control.retry_node(

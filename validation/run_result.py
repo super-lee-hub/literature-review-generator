@@ -50,6 +50,7 @@ _EXTENDED_CONTRACT_FIELDS = frozenset(
         "validated_claim_count",
         "review_has_citations",
         "evidence_complete",
+        "validation_disposition",
         "review_cleanliness",
         "repair_status",
         "recheck_status",
@@ -111,7 +112,7 @@ def _optional_boolean(value: Any, field_name: str) -> bool | None:
     return _boolean(value, field_name)
 
 
-def _legacy_conclusion(value: Any) -> str:
+def _conclusion_text(value: Any) -> str:
     conclusion = _field(value, "conclusion", "")
     return str(getattr(conclusion, "value", conclusion) or "")
 
@@ -139,7 +140,7 @@ def _canonical_status(value: Any) -> str:
 
 
 def claim_verdict_for_result(value: Any) -> ClaimVerdict:
-    """Project legacy validator axes into the sole public claim verdict.
+    """Project validator evidence into the sole public claim verdict.
 
     The projection is deliberately fail-closed: an unknown status or ambiguous
     claim-paper alignment becomes ``needs_review``.  In particular, absence of
@@ -152,7 +153,7 @@ def claim_verdict_for_result(value: Any) -> ClaimVerdict:
     disposition = str(
         _field(value, "disposition", "") or details.get("disposition") or ""
     ).strip().lower()
-    conclusion = _legacy_conclusion(value).strip().upper()
+    conclusion = _conclusion_text(value).strip().upper()
     low_confidence = bool(_field(value, "low_confidence", False))
     claim_unit_results = details.get("claim_unit_results") or []
     ambiguous_alignment = any(
@@ -186,8 +187,8 @@ def claim_verdict_for_result(value: Any) -> ClaimVerdict:
             return ClaimVerdict.PARTIAL_SUPPORT
         if conclusion == "NEEDS_REVIEW":
             return ClaimVerdict.NEEDS_REVIEW
-        # Legacy UNSUPPORTED without an explicit source-grounded status is not
-        # strong enough to establish the new unsupported contract.
+        # An unqualified UNSUPPORTED conclusion is not strong enough to
+        # establish the source-grounded unsupported contract.
         if conclusion == "UNSUPPORTED":
             return ClaimVerdict.NEEDS_REVIEW
     return ClaimVerdict.NEEDS_REVIEW
@@ -348,7 +349,6 @@ class ClaimValidationResultV1:
     low_confidence: bool
     details: Mapping[str, Any]
     evidence_candidates: Tuple[Mapping[str, Any], ...]
-    compatibility: Mapping[str, Any]
 
     @classmethod
     def from_validation_result(cls, result: Any) -> "ClaimValidationResultV1":
@@ -409,13 +409,6 @@ class ClaimValidationResultV1:
             low_confidence=bool(_field(result, "low_confidence", False)),
             details=_json_value(details),
             evidence_candidates=serialized_candidates,
-            compatibility={
-                "legacy_conclusion": _legacy_conclusion(result),
-                "legacy_evidence_status": _canonical_status(result),
-                "legacy_repair_disposition": str(
-                    _field(result, "disposition", "") or details.get("disposition") or ""
-                ),
-            },
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -438,7 +431,6 @@ class ClaimValidationResultV1:
             "low_confidence": self.low_confidence,
             "details": _json_value(self.details),
             "evidence_candidates": _json_value(self.evidence_candidates),
-            "compatibility": _json_value(self.compatibility),
         }
 
     @classmethod
@@ -464,7 +456,6 @@ class ClaimValidationResultV1:
             evidence_candidates=tuple(
                 dict(item) for item in (payload.get("evidence_candidates") or []) if isinstance(item, Mapping)
             ),
-            compatibility=dict(payload.get("compatibility") or {}),
         )
 
 
@@ -499,7 +490,6 @@ class ValidationRunResultV1:
     repair_status: str = "not_requested"
     recheck_status: str = "not_required"
     degradation_reasons: Tuple[str, ...] = ()
-    compatibility_status: str = "verified"
 
     def validate(self) -> None:
         if self.artifact_type != VALIDATION_RUN_ARTIFACT_TYPE:
@@ -550,21 +540,13 @@ class ValidationRunResultV1:
             recheck_status=self.recheck_status,
             degradation_reasons=self.degradation_reasons,
         )
-        if self.compatibility_status == "verified":
-            if self.validation_disposition is not expected_disposition:
-                raise ValidationRunResultError(
-                    "validation_disposition does not match execution status and completeness"
-                )
-            if self.review_cleanliness is not expected_disposition:
-                raise ValidationRunResultError(
-                    "review_cleanliness does not match validation disposition"
-                )
-        elif (
-            self.validation_disposition is not ValidationRunDisposition.UNVALIDATED
-            or self.review_cleanliness is not ValidationRunDisposition.UNVALIDATED
-        ):
+        if self.validation_disposition is not expected_disposition:
             raise ValidationRunResultError(
-                "unverified validation results must remain unvalidated"
+                "validation_disposition does not match execution status and completeness"
+            )
+        if self.review_cleanliness is not expected_disposition:
+            raise ValidationRunResultError(
+                "review_cleanliness does not match validation disposition"
             )
 
     @classmethod
@@ -587,7 +569,6 @@ class ValidationRunResultV1:
         repair_status: str = "not_requested",
         recheck_status: str = "not_required",
         degradation_reasons: Sequence[str] = (),
-        compatibility_status: str = "verified",
         validation_run_id: str = "",
         created_at: str = "",
     ) -> "ValidationRunResultV1":
@@ -648,20 +629,16 @@ class ValidationRunResultV1:
         run_id = validation_run_id or report_id or (
             "validation-run:" + hashlib.sha256(f"{job_id}|{attempt_id}|{now}".encode("utf-8")).hexdigest()[:24]
         )
-        disposition = (
-            ValidationRunDisposition.UNVALIDATED
-            if compatibility_status != "verified"
-            else reduce_validation_disposition(
-                execution,
-                (item.verdict for item in results),
-                expected_claim_count=expected_count,
-                validated_claim_count=actual_validated_count,
-                review_has_citations=has_citations,
-                evidence_complete=complete,
-                repair_status=normalized_repair_status,
-                recheck_status=normalized_recheck_status,
-                degradation_reasons=normalized_degradation,
-            )
+        disposition = reduce_validation_disposition(
+            execution,
+            (item.verdict for item in results),
+            expected_claim_count=expected_count,
+            validated_claim_count=actual_validated_count,
+            review_has_citations=has_citations,
+            evidence_complete=complete,
+            repair_status=normalized_repair_status,
+            recheck_status=normalized_recheck_status,
+            degradation_reasons=normalized_degradation,
         )
         instance = cls(
             artifact_type=VALIDATION_RUN_ARTIFACT_TYPE,
@@ -691,7 +668,6 @@ class ValidationRunResultV1:
             repair_status=normalized_repair_status,
             recheck_status=normalized_recheck_status,
             degradation_reasons=normalized_degradation,
-            compatibility_status=compatibility_status,
         )
         instance.validate()
         return instance
@@ -751,31 +727,6 @@ class ValidationRunResultV1:
             created_at=str(_field(report, "created_at", "") or ""),
         )
 
-    @classmethod
-    def from_legacy_report(cls, payload: Mapping[str, Any], *, job_id: str = "") -> "ValidationRunResultV1":
-        results = tuple(
-            ClaimValidationResultV1.from_validation_result(item)
-            for item in (payload.get("citation_results") or [])
-            if isinstance(item, Mapping)
-        )
-        return cls.create(
-            job_id=job_id or str(payload.get("job_id") or "legacy-unknown"),
-            execution_status=ValidationExecutionStatus.SKIPPED,
-            claim_results=results,
-            report_id=str(payload.get("report_id") or "legacy-validation-report"),
-            repair_policy=str(payload.get("repair_policy") or "legacy_unknown"),
-            diagnostics=("legacy_validation_report_unverified",),
-            failure_reason="legacy validation artifact does not satisfy ValidationRunResultV1",
-            expected_claim_count=int(payload.get("total_citations") or len(results)),
-            review_has_citations=bool(payload.get("total_citations") or results),
-            evidence_complete=False,
-            repair_status="legacy_unknown",
-            recheck_status="legacy_unknown",
-            degradation_reasons=("legacy_validation_report_unverified",),
-            compatibility_status="legacy_unverified",
-            created_at=str(payload.get("created_at") or "") or _utc_now_iso(),
-        )
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             "artifact_type": self.artifact_type,
@@ -805,51 +756,39 @@ class ValidationRunResultV1:
             "repair_status": self.repair_status,
             "recheck_status": self.recheck_status,
             "degradation_reasons": list(self.degradation_reasons),
-            "compatibility_status": self.compatibility_status,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ValidationRunResultV1":
         if str(payload.get("artifact_type") or "") != VALIDATION_RUN_ARTIFACT_TYPE:
-            return cls.from_legacy_report(payload)
-        has_extended_contract = _EXTENDED_CONTRACT_FIELDS.issubset(payload)
-        compatibility_status = str(payload.get("compatibility_status") or "verified")
-        degradation_reasons = _string_list(payload.get("degradation_reasons") or ())
-        if not has_extended_contract:
-            compatibility_status = "legacy_unverified"
-            degradation_reasons = _string_list(
-                (*degradation_reasons, "legacy_validation_run_result_contract_incomplete")
+            raise ValidationRunResultError(
+                "unexpected artifact_type for ValidationRunResultV1"
             )
+        missing_fields = sorted(_EXTENDED_CONTRACT_FIELDS.difference(payload))
+        if missing_fields:
+            raise ValidationRunResultError(
+                "validation run result is missing current fields: "
+                + ", ".join(missing_fields)
+            )
+        degradation_reasons = _string_list(payload.get("degradation_reasons") or ())
         claim_results = tuple(
             ClaimValidationResultV1.from_dict(item)
             for item in (payload.get("claim_results") or [])
             if isinstance(item, Mapping)
         )
-        validated_claim_count = (
-            _nonnegative_int(
-                payload.get("validated_claim_count"),
-                "validated_claim_count",
-            )
-            if has_extended_contract
-            else len(claim_results)
+        validated_claim_count = _nonnegative_int(
+            payload.get("validated_claim_count"),
+            "validated_claim_count",
         )
-        expected_claim_count = (
-            _nonnegative_int(
-                payload.get("expected_claim_count"),
-                "expected_claim_count",
-            )
-            if has_extended_contract
-            else int(payload.get("total_claims") or len(claim_results))
+        expected_claim_count = _nonnegative_int(
+            payload.get("expected_claim_count"),
+            "expected_claim_count",
         )
-        validation_disposition = (
-            ValidationRunDisposition(str(payload.get("validation_disposition") or "unvalidated"))
-            if has_extended_contract and compatibility_status == "verified"
-            else ValidationRunDisposition.UNVALIDATED
+        validation_disposition = ValidationRunDisposition(
+            str(payload.get("validation_disposition") or "unvalidated")
         )
-        review_cleanliness = (
-            ValidationRunDisposition(str(payload.get("review_cleanliness") or "unvalidated"))
-            if has_extended_contract and compatibility_status == "verified"
-            else ValidationRunDisposition.UNVALIDATED
+        review_cleanliness = ValidationRunDisposition(
+            str(payload.get("review_cleanliness") or "unvalidated")
         )
         instance = cls(
             artifact_type=str(payload.get("artifact_type") or ""),
@@ -873,37 +812,18 @@ class ValidationRunResultV1:
             total_claims=int(payload.get("total_claims") or 0),
             diagnostics=_string_list(payload.get("diagnostics") or []),
             failure_reason=str(payload.get("failure_reason") or ""),
-            input_artifacts=ValidationInputArtifactsV1.from_value(
-                payload.get("input_artifacts") if has_extended_contract else None
-            ),
+            input_artifacts=ValidationInputArtifactsV1.from_value(payload.get("input_artifacts")),
             expected_claim_count=expected_claim_count,
             validated_claim_count=validated_claim_count,
-            review_has_citations=(
-                _optional_boolean(
-                    payload.get("review_has_citations"),
-                    "review_has_citations",
-                )
-                if has_extended_contract
-                else expected_claim_count > 0
+            review_has_citations=_optional_boolean(
+                payload.get("review_has_citations"),
+                "review_has_citations",
             ),
-            evidence_complete=(
-                _boolean(payload.get("evidence_complete"), "evidence_complete")
-                if has_extended_contract
-                else False
-            ),
+            evidence_complete=_boolean(payload.get("evidence_complete"), "evidence_complete"),
             review_cleanliness=review_cleanliness,
-            repair_status=(
-                str(payload.get("repair_status") or "")
-                if has_extended_contract
-                else "legacy_unknown"
-            ),
-            recheck_status=(
-                str(payload.get("recheck_status") or "")
-                if has_extended_contract
-                else "legacy_unknown"
-            ),
+            repair_status=str(payload.get("repair_status") or ""),
+            recheck_status=str(payload.get("recheck_status") or ""),
             degradation_reasons=degradation_reasons,
-            compatibility_status=compatibility_status,
         )
         instance.validate()
         return instance
@@ -923,8 +843,7 @@ class ValidationRunResultV1:
             or bool(self.input_artifacts.evidence_manifest_ids)
         )
         return (
-            self.compatibility_status == "verified"
-            and self.execution_status is ValidationExecutionStatus.SUCCEEDED
+            self.execution_status is ValidationExecutionStatus.SUCCEEDED
             and self.evidence_complete
             and self.expected_claim_count == self.validated_claim_count
             and primary_inputs_verified

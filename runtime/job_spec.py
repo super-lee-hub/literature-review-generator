@@ -66,7 +66,6 @@ class RuntimeJobSpec:
     reuse_summary_files: tuple[str, ...] = ()
     generate_section: int | None = None
     queue_file: str = "output/_queue/queue.json"
-    keep_legacy_projections: bool = True
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -254,12 +253,6 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            keep_legacy_projections=bool(
-                _optional_bool(
-                    payload.get("keep_legacy_projections", True),
-                    field_name="keep_legacy_projections",
-                )
-            ),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -302,12 +295,6 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            keep_legacy_projections=bool(
-                _optional_bool(
-                    payload.get("keep_legacy_projections", True),
-                    field_name="keep_legacy_projections",
-                )
-            ),
             metadata=dict(payload.get("metadata") or {}),
         )
 

@@ -279,7 +279,7 @@ It should not be your first assumption for where the real outputs live.
 - `reports/*_literature_review.docx`
 - `reports/*_failed_papers_report.txt`
 - `checkpoints/*_review_checkpoint.json`
-- `artifacts/review_drafts/*_review_draft_v2.json`
+- `artifacts/review_drafts/*_review_draft.json` (`artifact_version=v3`)
 - `artifacts/citation_manifests/*_citation_manifest_v3.json`
 
 ### 8.4 Preprocess cache
