@@ -508,10 +508,11 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         
 
 
-        # 验证速率限制（允许0值，用于适应性速率控制）
+        # The client-side TPM/RPM token bucket is retired. Direct validation
+        # callers are warned, but these values never control runtime pacing.
 
 
-        rate_limit_keys = ['primary_tpm_limit', 'primary_rpm_limit', 'backup_tpm_limit', 'backup_rpm_limit']
+        rate_limit_keys = ('primary_tpm_limit', 'primary_rpm_limit', 'backup_tpm_limit', 'backup_rpm_limit')
 
 
         for key in rate_limit_keys:
@@ -520,13 +521,10 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
             if key in perf_config:
 
 
-                valid, error = validate_positive_number_or_zero(perf_config[key])
-
-
-                if not valid:
-
-
-                    warnings.append(f"[Performance] {key} {error}")
+                warnings.append(
+                    f"[Performance] {key} is deprecated and ignored; "
+                    "remove it from the saved configuration."
+                )
 
     if 'Outline_API' in config_dict and any(str(v).strip() for v in config_dict['Outline_API'].values()):
         valid, error = validate_config_section(config_dict, 'Outline_API', ['api_key', 'model', 'api_base'])

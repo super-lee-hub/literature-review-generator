@@ -1,13 +1,54 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, MutableMapping
+from typing import Any, Callable, Dict, Mapping, MutableMapping
 
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 
 LEGACY_CITATION_POLICIES = {"report_only", "warn_and_resolve", "fatal"}
 DEFAULT_LEGACY_CITATION_POLICY = "report_only"
+
+# These keys belonged to the retired client-side TPM/RPM token bucket. They
+# remain recognizable for one-way migration diagnostics, but must never reach
+# runtime configuration or be emitted by a new config writer.
+LEGACY_RATE_LIMIT_KEYS = frozenset(
+    {
+        "primary_tpm_limit",
+        "primary_rpm_limit",
+        "backup_tpm_limit",
+        "backup_rpm_limit",
+    }
+)
+
+
+def remove_legacy_rate_limit_settings(
+    sections: MutableMapping[str, Dict[str, str]] | None,
+    *,
+    warn: Callable[[str], None] | None = None,
+) -> tuple[str, ...]:
+    """Remove retired client-side rate-limit keys using one-way migration."""
+
+    if not sections:
+        return ()
+
+    performance = sections.get("Performance")
+    if not isinstance(performance, MutableMapping):
+        return ()
+
+    removed: list[str] = []
+    for key in sorted(LEGACY_RATE_LIMIT_KEYS):
+        if key not in performance:
+            continue
+        performance.pop(key, None)
+        removed.append(key)
+        if warn is not None:
+            warn(
+                f"[Performance].{key} is deprecated and ignored; "
+                "provider-side limits, Retry-After, concurrency, and retry policy "
+                "control request pacing."
+            )
+    return tuple(removed)
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:

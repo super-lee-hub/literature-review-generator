@@ -4,7 +4,6 @@ import json
 import mimetypes
 import os
 import time
-import threading
 import re
 import requests  # type: ignore
 from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set
@@ -1294,299 +1293,6 @@ class ContextLengthExceededError(Exception):
     pass
 
 
-class RateLimiter:
-    """
-    双引擎令牌桶流量控制器
-    实现主引擎和备用引擎的独立TPM/RPM管理
-    """
-
-    def __init__(self, primary_tpm_limit: int = 900000, primary_rpm_limit: int = 9000,
-                 backup_tpm_limit: int = 2000000, backup_rpm_limit: int = 9000) -> None:
-        """
-        初始化双引擎令牌桶限速器
-
-        Args:
-            primary_tpm_limit: 主引擎每分钟令牌数限制（0表示被动模式）
-            primary_rpm_limit: 主引擎每分钟请求数限制（0表示被动模式）
-            backup_tpm_limit: 备用引擎每分钟令牌数限制（0表示被动模式）
-            backup_rpm_limit: 备用引擎每分钟请求数限制（0表示被动模式）
-        """
-        # 适应性混合速率控制 - 判断引擎模式
-        # 主动模式（proactive）：使用令牌桶进行主动速率控制
-        # 被动模式（reactive）：跳过令牌桶控制，依赖API的429错误处理
-        
-        # 主引擎模式判断
-        if primary_tpm_limit > 0 and primary_rpm_limit > 0:
-            self.primary_mode = 'proactive'
-            # 主引擎配置
-            self.primary_tpm_limit = primary_tpm_limit
-            self.primary_rpm_limit = primary_rpm_limit
-            self.primary_tpm_tokens = primary_tpm_limit
-            self.primary_tpm_capacity = primary_tpm_limit
-            self.primary_tpm_last_refill = time.time()
-            self.primary_tpm_refill_rate = primary_tpm_limit / 60.0
-            self.primary_rpm_tokens = primary_rpm_limit
-            self.primary_rpm_capacity = primary_rpm_limit
-            self.primary_rpm_last_refill = time.time()
-            self.primary_rpm_refill_rate = primary_rpm_limit / 60.0
-        else:
-            self.primary_mode = 'reactive'
-            # 被动模式：设置最小值，避免除零错误
-            self.primary_tpm_limit = 1
-            self.primary_rpm_limit = 1
-            self.primary_tpm_tokens = 1
-            self.primary_tpm_capacity = 1
-            self.primary_tpm_last_refill = time.time()
-            self.primary_tpm_refill_rate = 1.0 / 60.0
-            self.primary_rpm_tokens = 1
-            self.primary_rpm_capacity = 1
-            self.primary_rpm_last_refill = time.time()
-            self.primary_rpm_refill_rate = 1.0 / 60.0
-
-        # 备用引擎模式判断
-        if backup_tpm_limit > 0 and backup_rpm_limit > 0:
-            self.backup_mode = 'proactive'
-            # 备用引擎配置
-            self.backup_tpm_limit = backup_tpm_limit
-            self.backup_rpm_limit = backup_rpm_limit
-            self.backup_tpm_tokens = backup_tpm_limit
-            self.backup_tpm_capacity = backup_tpm_limit
-            self.backup_tpm_last_refill = time.time()
-            self.backup_tpm_refill_rate = backup_tpm_limit / 60.0
-            self.backup_rpm_tokens = backup_rpm_limit
-            self.backup_rpm_capacity = backup_rpm_limit
-            self.backup_rpm_last_refill = time.time()
-            self.backup_rpm_refill_rate = backup_rpm_limit / 60.0
-        else:
-            self.backup_mode = 'reactive'
-            # 被动模式：设置最小值，避免除零错误
-            self.backup_tpm_limit = 1
-            self.backup_rpm_limit = 1
-            self.backup_tpm_tokens = 1
-            self.backup_tpm_capacity = 1
-            self.backup_tpm_last_refill = time.time()
-            self.backup_tpm_refill_rate = 1.0 / 60.0
-            self.backup_rpm_tokens = 1
-            self.backup_rpm_capacity = 1
-            self.backup_rpm_last_refill = time.time()
-            self.backup_rpm_refill_rate = 1.0 / 60.0
-
-        # 线程安全锁
-        self.lock = threading.Lock()
-
-        # 记录器将通过set_logger方法设置
-        self.logger = None
-
-    def set_logger(self, logger: Any) -> None:
-        """设置记录器"""
-        self.logger = logger
-
-    def _log(self, level: str, message: str) -> None:
-        """内部日志方法"""
-        if self.logger:
-            getattr(self.logger, level)(message)
-
-    def _refill_primary(self):
-        """补充主引擎令牌桶"""
-        current_time = time.time()
-        time_passed = current_time - self.primary_tpm_last_refill
-
-        if time_passed > 0:
-            # 补充主引擎TPM令牌
-            new_tokens = time_passed * self.primary_tpm_refill_rate
-            self.primary_tpm_tokens = min(self.primary_tpm_capacity, self.primary_tpm_tokens + new_tokens)
-            self.primary_tpm_last_refill = current_time
-
-            # 补充主引擎RPM令牌
-            new_requests = time_passed * self.primary_rpm_refill_rate
-            self.primary_rpm_tokens = min(self.primary_rpm_capacity, self.primary_rpm_tokens + new_requests)
-            self.primary_rpm_last_refill = current_time
-
-    def _refill_backup(self):
-        """补充备用引擎令牌桶"""
-        current_time = time.time()
-        time_passed = current_time - self.backup_tpm_last_refill
-
-        if time_passed > 0:
-            # 补充备用引擎TPM令牌
-            new_tokens = time_passed * self.backup_tpm_refill_rate
-            self.backup_tpm_tokens = min(self.backup_tpm_capacity, self.backup_tpm_tokens + new_tokens)
-            self.backup_tpm_last_refill = current_time
-
-            # 补充备用引擎RPM令牌
-            new_requests = time_passed * self.backup_rpm_refill_rate
-            self.backup_rpm_tokens = min(self.backup_rpm_capacity, self.backup_rpm_tokens + new_requests)
-            self.backup_rpm_last_refill = current_time
-
-    def consume(self, tokens_needed: int, requests_needed: int = 1, engine_type: str = 'primary') -> Union[bool, str, float]:
-        """
-        尝试消耗指定引擎的令牌（欧米茄协议：适应性混合速率控制）
-        增强线程安全性，避免竞态条件
-
-        Args:
-            tokens_needed: 需要消耗的令牌数
-            requests_needed: 需要消耗的请求数（默认为1）
-            engine_type: 引擎类型 ('primary' 或 'backup')
-
-        Returns:
-            bool: 如果令牌充足返回True
-            str: 特殊信号如 "SWITCH_TO_BACKUP" 或 "TOKEN_LIMIT_EXCEEDED"
-            float: 如果需要等待，返回等待时间（秒）
-        """
-        # 输入验证
-        if tokens_needed <= 0:
-            raise ValueError(f"tokens_needed必须大于0，当前值: {tokens_needed}")
-        if requests_needed <= 0:
-            raise ValueError(f"requests_needed必须大于0，当前值: {requests_needed}")
-        if engine_type not in ['primary', 'backup']:
-            raise ValueError(f"未知的引擎类型: {engine_type}，必须是 'primary' 或 'backup'")
-
-        # 适应性混合速率控制：支持主动和被动两种模式
-        # 检查当前引擎模式（这部分无需锁保护，因为是读取操作）
-        if engine_type == 'primary' and self.primary_mode == 'reactive':
-            self._log('info', "主引擎被动模式：放行，依赖API层429错误处理")
-            return True
-        elif engine_type == 'backup' and self.backup_mode == 'reactive':
-            self._log('info', "备用引擎被动模式：放行，依赖API层429错误处理")
-            return True
-
-        # 主动模式：执行传统的令牌桶控制逻辑
-        # 使用更大的锁范围确保原子性操作
-        with self.lock:
-            if engine_type == 'primary':
-                # 首先补充主引擎令牌
-                self._refill_primary_internal()
-
-                # 尺寸预检：检查是否超过主引擎容量
-                if tokens_needed > self.primary_tpm_capacity:
-                    self._log('info', "论文过长，主引擎无法处理，建议切换到备用引擎")
-                    return "SWITCH_TO_BACKUP"
-
-                # 检查主引擎令牌是否充足
-                if self.primary_tpm_tokens >= tokens_needed and self.primary_rpm_tokens >= requests_needed:
-                    # 原子性消耗主引擎令牌
-                    self.primary_tpm_tokens -= tokens_needed
-                    self.primary_rpm_tokens -= requests_needed
-
-                    self._log('debug', f"主引擎主动模式消耗成功 - TPM: {tokens_needed}/{int(self.primary_tpm_tokens)}, RPM: {requests_needed}/{int(self.primary_rpm_tokens)}")
-                    return True
-                else:
-                    # 计算需要等待的时间（使用更安全的方式避免除零错误）
-                    tpm_wait = 0.0
-                    rpm_wait = 0.0
-
-                    if self.primary_tpm_refill_rate > 0 and self.primary_tpm_tokens < tokens_needed:
-                        tpm_wait = (tokens_needed - self.primary_tpm_tokens) / self.primary_tpm_refill_rate
-
-                    if self.primary_rpm_refill_rate > 0 and self.primary_rpm_tokens < requests_needed:
-                        rpm_wait = (requests_needed - self.primary_rpm_tokens) / self.primary_rpm_refill_rate
-
-                    wait_time = max(tpm_wait, rpm_wait)
-
-                    self._log('info', f"主引擎主动模式令牌不足，需要等待: {wait_time:.2f}秒")
-                    return wait_time
-
-            elif engine_type == 'backup':
-                # 首先补充备用引擎令牌
-                self._refill_backup_internal()
-
-                # 尺寸预检：检查是否超过备用引擎容量
-                if tokens_needed > self.backup_tpm_capacity:
-                    self._log('info', "论文过长，备用引擎也无法处理")
-                    return "TOKEN_LIMIT_EXCEEDED"
-
-                # 检查备用引擎令牌是否充足
-                if self.backup_tpm_tokens >= tokens_needed and self.backup_rpm_tokens >= requests_needed:
-                    # 原子性消耗备用引擎令牌
-                    self.backup_tpm_tokens -= tokens_needed
-                    self.backup_rpm_tokens -= requests_needed
-
-                    self._log('debug', f"备用引擎主动模式消耗成功 - TPM: {tokens_needed}/{int(self.backup_tpm_tokens)}, RPM: {requests_needed}/{int(self.backup_rpm_tokens)}")
-                    return True
-                else:
-                    # 计算需要等待的时间（使用更安全的方式避免除零错误）
-                    tpm_wait = 0.0
-                    rpm_wait = 0.0
-
-                    if self.backup_tpm_refill_rate > 0 and self.backup_tpm_tokens < tokens_needed:
-                        tpm_wait = (tokens_needed - self.backup_tpm_tokens) / self.backup_tpm_refill_rate
-
-                    if self.backup_rpm_refill_rate > 0 and self.backup_rpm_tokens < requests_needed:
-                        rpm_wait = (requests_needed - self.backup_rpm_tokens) / self.backup_rpm_refill_rate
-
-                    wait_time = max(tpm_wait, rpm_wait)
-
-                    self._log('info', f"备用引擎主动模式令牌不足，需要等待: {wait_time:.2f}秒")
-                    return wait_time
-            else:
-                # 这个分支理论上不会执行，因为前面已经验证过了
-                raise ValueError(f"未知的引擎类型: {engine_type}")
-
-    def _refill_primary_internal(self) -> None:
-        """内部方法：在锁保护下补充主引擎令牌桶"""
-        current_time = time.time()
-        time_passed = current_time - self.primary_tpm_last_refill
-
-        if time_passed > 0:
-            # 补充主引擎TPM令牌
-            new_tokens = time_passed * self.primary_tpm_refill_rate
-            self.primary_tpm_tokens = min(self.primary_tpm_capacity, self.primary_tpm_tokens + new_tokens)
-            self.primary_tpm_last_refill = current_time
-
-            # 补充主引擎RPM令牌
-            new_requests = time_passed * self.primary_rpm_refill_rate
-            self.primary_rpm_tokens = min(self.primary_rpm_capacity, self.primary_rpm_tokens + new_requests)
-            self.primary_rpm_last_refill = current_time
-
-    def _refill_backup_internal(self) -> None:
-        """内部方法：在锁保护下补充备用引擎令牌桶"""
-        current_time = time.time()
-        time_passed = current_time - self.backup_tpm_last_refill
-
-        if time_passed > 0:
-            # 补充备用引擎TPM令牌
-            new_tokens = time_passed * self.backup_tpm_refill_rate
-            self.backup_tpm_tokens = min(self.backup_tpm_capacity, self.backup_tpm_tokens + new_tokens)
-            self.backup_tpm_last_refill = current_time
-
-            # 补充备用引擎RPM令牌
-            new_requests = time_passed * self.backup_rpm_refill_rate
-            self.backup_rpm_tokens = min(self.backup_rpm_capacity, self.backup_rpm_tokens + new_requests)
-            self.backup_rpm_last_refill = current_time
-
-    def get_status(self, engine_type: str = 'all') -> Dict[str, float]:
-        """获取指定引擎的令牌桶状态"""
-        with self.lock:
-            self._refill_primary()
-            self._refill_backup()
-
-            if engine_type == 'primary':
-                return {
-                    'tpm_tokens': self.primary_tpm_tokens,
-                    'tpm_capacity': self.primary_tpm_capacity,
-                    'tpm_usage_percent': (self.primary_tpm_capacity - self.primary_tpm_tokens) / self.primary_tpm_capacity * 100,
-                    'rpm_tokens': self.primary_rpm_tokens,
-                    'rpm_capacity': self.primary_rpm_capacity,
-                    'rpm_usage_percent': (self.primary_rpm_capacity - self.primary_rpm_tokens) / self.primary_rpm_capacity * 100
-                }
-            elif engine_type == 'backup':
-                return {
-                    'tpm_tokens': self.backup_tpm_tokens,
-                    'tpm_capacity': self.backup_tpm_capacity,
-                    'tpm_usage_percent': (self.backup_tpm_capacity - self.backup_tpm_tokens) / self.backup_tpm_capacity * 100,
-                    'rpm_tokens': self.backup_rpm_tokens,
-                    'rpm_capacity': self.backup_rpm_capacity,
-                    'rpm_usage_percent': (self.backup_rpm_capacity - self.backup_rpm_tokens) / self.backup_rpm_capacity * 100
-                }
-            else:  # 'all'
-                return {
-                    'primary_tpm_usage_percent': (self.primary_tpm_capacity - self.primary_tpm_tokens) / self.primary_tpm_capacity * 100,
-                    'backup_tpm_usage_percent': (self.backup_tpm_capacity - self.backup_tpm_tokens) / self.backup_tpm_capacity * 100,
-                    'primary_rpm_usage_percent': (self.primary_rpm_capacity - self.primary_rpm_tokens) / self.primary_rpm_capacity * 100,
-                    'backup_rpm_usage_percent': (self.backup_rpm_capacity - self.backup_rpm_tokens) / self.backup_rpm_capacity * 100
-                }
-
-
 # 引擎映射表，统一引擎名称和日志术语
 engine_map = {
     'primary': {
@@ -1599,44 +1305,6 @@ engine_map = {
     }
 }
 
-# 全局双引擎令牌桶实例 - 在模块加载时初始化（只初始化一次）
-try:
-    _config = load_config('config.ini')
-    
-    # 辅助函数：安全地将字符串转换为整数，处理空值和空白
-    def safe_int_convert(value_str: Any, default_value: int) -> int:
-        """安全地将字符串转换为整数，处理空值和空白"""
-        if value_str is None:
-            return default_value
-        
-        # 转换为字符串并去除前后空白
-        str_value = str(value_str).strip()
-        
-        # 如果字符串为空或仅包含空白，返回默认值0
-        if not str_value:
-            return 0
-        
-        # 尝试转换为整数
-        try:
-            return int(str_value)
-        except ValueError:
-            # 转换失败，返回默认值
-            # 注意：模块初始化时没有logger，所以不打印
-            return default_value
-
-    # 支持0值，表示被动模式
-    _primary_tpm_limit = safe_int_convert(_config.get('Performance', {}).get('primary_tpm_limit', 900000), 900000)
-    _primary_rpm_limit = safe_int_convert(_config.get('Performance', {}).get('primary_rpm_limit', 9000), 9000)
-    _backup_tpm_limit = safe_int_convert(_config.get('Performance', {}).get('backup_tpm_limit', 2000000), 2000000)
-    _backup_rpm_limit = safe_int_convert(_config.get('Performance', {}).get('backup_rpm_limit', 9000), 9000)
-    rate_limiter = RateLimiter(_primary_tpm_limit, _primary_rpm_limit, _backup_tpm_limit, _backup_rpm_limit)
-
-    # 注意：模块初始化时没有logger，所以不打印初始化信息
-except Exception as e:
-    # 注意：模块初始化时没有logger，所以不打印
-    rate_limiter = RateLimiter(900000, 9000, 2000000, 9000)
-
-
 def get_summary_from_ai_detailed(
     prompt_text: str,
     primary_api_config: APIConfig,
@@ -1646,7 +1314,6 @@ def get_summary_from_ai_detailed(
     config: Optional[Dict[str, Any]] = None,
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
-    allow_rate_limiter_switch: bool = True,
 ) -> Dict[str, Any]:
     """Stage-1 reader call that preserves API failure classification."""
     if ('dummy' in (primary_api_config.get('api_key') or '') or
@@ -1685,9 +1352,6 @@ def get_summary_from_ai_detailed(
                 }
             ),
         )
-
-    if logger:
-        rate_limiter.set_logger(logger)
 
     if not prompt_text or not prompt_text.strip():
         return _api_result(
@@ -1768,66 +1432,6 @@ def get_summary_from_ai_detailed(
             "and return a structured JSON summary."
         )
 
-    estimated_tokens = len(prompt_text) + 3000
-    rate_limit_result = rate_limiter.consume(
-        tokens_needed=estimated_tokens,
-        requests_needed=1,
-        engine_type=engine_type,
-    )
-
-    if rate_limit_result is True:
-        pass
-    elif isinstance(rate_limit_result, float):
-        wait_time = rate_limit_result
-        if logger:
-            logger.info(f"{engine_name} token bucket wait: {wait_time:.2f}s")
-        time.sleep(wait_time)
-        retry_result = rate_limiter.consume(
-            tokens_needed=estimated_tokens,
-            requests_needed=1,
-            engine_type=engine_type,
-        )
-        if retry_result is not True:
-            return _api_result(
-                status="failed",
-                error_kind="retryable_http",
-                message=f"{engine_name} local token bucket still unavailable",
-                engine_type=engine_type,
-            )
-    elif rate_limit_result == "SWITCH_TO_BACKUP":
-        if allow_rate_limiter_switch and engine_type == 'primary':
-            return get_summary_from_ai_detailed(
-                prompt_text,
-                primary_api_config,
-                backup_api_config,
-                engine_type='backup',
-                logger=logger,
-                config=config,
-                user_content=user_content,
-                retry_attempts=retry_attempts,
-                allow_rate_limiter_switch=allow_rate_limiter_switch,
-            )
-        return _api_result(
-            status="failed",
-            error_kind="retryable_http",
-            message=f"{engine_name} local token bucket suggests switching engine",
-            engine_type=engine_type,
-        )
-    elif rate_limit_result == "TOKEN_LIMIT_EXCEEDED":
-        return _api_result(
-            status="failed",
-            error_kind="fatal_config_or_auth",
-            message=f"{engine_name} token limit exceeded",
-            engine_type=engine_type,
-        )
-    else:
-        return _api_result(
-            status="failed",
-            error_kind="retryable_http",
-            message=f"{engine_name} local token bucket returned {rate_limit_result}",
-            engine_type=engine_type,
-        )
-
     request_api_config: APIConfig = {
         **api_config,
         'api_key': api_key,
@@ -1854,9 +1458,6 @@ def get_summary_from_ai_detailed(
     ai_response = detailed.get("content")
     if isinstance(ai_response, dict):
         detailed["content"] = normalize_ai_summary(ai_response)
-        if logger:
-            status = rate_limiter.get_status(engine_type)
-            logger.debug(f"令牌桶状态: {status}")
         return detailed
     if ai_response:
         if logger:
@@ -1921,7 +1522,6 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                 config=config,
                 user_content=user_content,
                 retry_attempts=1,
-                allow_rate_limiter_switch=False,
             )
             last_result = result
             if result.get("status") == "success":
@@ -1957,8 +1557,6 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
                        config: Optional[Dict[str, Any]] = None, user_content: Any = None) -> Optional[Dict[str, Any]]:
     """
     调用AI API并返回结构化摘要（带重试机制和429错误处理）
-
-    集成了Rate limiting (令牌桶流量控制) 功能，确保API调用符合速率限制
 
     Args:
         prompt_text: 完整的提示词文本
@@ -2006,10 +1604,6 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
                 },
             }
         )
-
-    # 设置RateLimiter的logger
-    if logger:
-        rate_limiter.set_logger(logger)
 
     # 增强的输入验证
     if not prompt_text or not prompt_text.strip():
@@ -2080,67 +1674,6 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
             logger.warning(f"无法加载系统提示词文件，使用默认提示词: {e}")
         system_prompt = """你是一个学术文献分析专家。请对提供的学术文本进行深度分析，并返回一个结构化摘要。请严格按照JSON格式返回结果，包含title、authors、year、journal、summary、key_points、methodology、findings、conclusions、relevance、limitations等字段。"""
 
-    # ==================== Rate Limiting (令牌桶流量控制) ====================
-    # 估算token消耗量（提示词 + 预期响应）
-    estimated_tokens = len(prompt_text) + 3000  # 预留3000 tokens给响应
-
-    # 调用令牌桶控制器
-    rate_limit_result = rate_limiter.consume(
-        tokens_needed=estimated_tokens,
-        requests_needed=1,
-        engine_type=engine_type
-    )
-
-    # 处理速率限制结果
-    if rate_limit_result is True:
-        # 令牌充足，继续处理
-        if logger:
-            logger.debug(f"令牌桶检查通过，继续处理")
-    elif isinstance(rate_limit_result, float):
-        # 需要等待
-        wait_time = rate_limit_result
-        if logger:
-            logger.info(f"令牌不足，等待 {wait_time:.2f}秒")
-        time.sleep(wait_time)
-        # 等待后重新检查令牌
-        retry_result = rate_limiter.consume(
-            tokens_needed=estimated_tokens,
-            requests_needed=1,
-            engine_type=engine_type
-        )
-        if retry_result is not True:
-            if logger:
-                logger.warning("等待后令牌检查仍未通过，跳过此论文")
-            return None
-    elif rate_limit_result == "SWITCH_TO_BACKUP":
-        # 建议切换到备用引擎
-        if engine_type == 'primary':
-            if logger:
-                logger.info("主引擎令牌不足，切换到备用引擎")
-            return get_summary_from_ai(
-                prompt_text,
-                primary_api_config,
-                backup_api_config,
-                'backup',
-                logger=logger,
-                user_content=user_content,
-            )
-        else:
-            if logger:
-                logger.error("备用引擎令牌不足，无法处理此论文")
-            return None
-    elif rate_limit_result == "TOKEN_LIMIT_EXCEEDED":
-        # 超出所有引擎限制
-        if logger:
-            logger.error("所有引擎令牌都不足，无法处理此论文")
-        return None
-    else:
-        # 其他未知结果
-        if logger:
-            logger.error(f"令牌桶检查返回未知结果: {rate_limit_result}")
-        return None
-    # ======================================================================
-
     # 使用统一的API调用函数
     ai_response = _call_ai_api(
         prompt_text,
@@ -2157,9 +1690,6 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         return None
     if isinstance(ai_response, dict):  # type: ignore
         structured_summary = normalize_ai_summary(ai_response)
-        if logger:
-            status = rate_limiter.get_status(engine_type)
-            logger.debug(f"令牌桶状态: {status}")
         return structured_summary
     if logger:
         logger.warning("AI返回非字典格式，尝试手动解析")
@@ -2212,11 +1742,6 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
             structured_summary['type_specific_details'] = _default_type_specific_details()
         else:
             structured_summary['type_specific_details'] = _normalize_type_specific_details(structured_summary['type_specific_details'])
-
-        if logger:
-            # 显示令牌桶状态
-            status = rate_limiter.get_status(engine_type)
-            logger.debug(f"令牌桶状态: {status}")
 
         return structured_summary
     else:
@@ -2412,12 +1937,6 @@ if __name__ == "__main__":
 
     test_logger.info("AI接口测试")
     test_logger.info("=" * 50)
-
-    # 测试令牌桶状态
-    status = rate_limiter.get_status()
-    test_logger.info("令牌桶状态:")
-    for key, value in status.items():
-        test_logger.info(f"  {key}: {value:.2f}")
 
     test_logger.info("\n注意：要进行完整测试，请提供有效的API配置")
     test_logger.info("使用方法：")

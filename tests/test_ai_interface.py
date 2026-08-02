@@ -5,7 +5,6 @@
 """
 
 import pytest
-import threading
 from unittest.mock import Mock, patch
 from requests.exceptions import Timeout, ConnectionError, HTTPError  # type: ignore
 import ai_interface
@@ -23,67 +22,6 @@ def _runtime_config(retries: str = "3", timeout: str = "600"):
     }
 
 
-class TestRateLimiter:
-    """RateLimiter类测试"""
-
-    def test_rate_limiter_initialization(self):
-        """测试RateLimiter初始化"""
-        # 导入RateLimiter
-        ai_interface = __import__('ai_interface', fromlist=['RateLimiter'])
-        RateLimiter = ai_interface.RateLimiter
-
-        # 创建实例
-        limiter = RateLimiter(1000, 100, 2000, 200)
-
-        # 验证属性
-        assert limiter.primary_tpm_capacity == 1000
-        assert limiter.primary_rpm_capacity == 100
-        assert limiter.backup_tpm_capacity == 2000
-        assert limiter.backup_rpm_capacity == 200
-
-    def test_consume_primary_tokens(self):
-        """测试消耗主要令牌"""
-        ai_interface = __import__('ai_interface', fromlist=['RateLimiter'])
-        RateLimiter = ai_interface.RateLimiter
-
-        limiter = RateLimiter(1000, 100, 2000, 200)
-
-        # 消耗令牌 (tokens_needed, requests_needed, engine_type)
-        limiter.consume(100, 1, 'primary')
-
-        # 验证状态
-        status = limiter.get_status('primary')
-        assert 'tpm_tokens' in status
-        assert 'tpm_capacity' in status
-
-    def test_rate_limiter_thread_safety(self):
-        """测试RateLimiter线程安全性"""
-        ai_interface = __import__('ai_interface', fromlist=['RateLimiter'])
-        RateLimiter = ai_interface.RateLimiter
-
-        limiter = RateLimiter(10000, 1000, 20000, 2000)
-        results = []
-
-        def consume_tokens():
-            for _ in range(10):
-                limiter.consume(10, 1, 'primary')
-                results.append(True)
-
-        # 创建多个线程
-        threads = [threading.Thread(target=consume_tokens) for _ in range(5)]
-
-        # 启动所有线程
-        for thread in threads:
-            thread.start()
-
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join()
-
-        # 验证所有操作都成功
-        assert len(results) == 50
-
-
 class TestAIIinterface:
     """AI接口测试"""
 
@@ -92,7 +30,6 @@ class TestAIIinterface:
         self.ai_interface = __import__('ai_interface', fromlist=[
             'get_summary_from_ai',
             '_call_ai_api',
-            'RateLimiter'
         ])
 
     @patch('ai_interface.requests.post')

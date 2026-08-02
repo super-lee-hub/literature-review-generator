@@ -1,5 +1,57 @@
-from services.config_compat import CompatConfigView, apply_validation_compat_sections, read_validation_settings
+from services.config_compat import (
+    CompatConfigView,
+    apply_validation_compat_sections,
+    read_validation_settings,
+    remove_legacy_rate_limit_settings,
+)
 from services.repair_policy import ValidationRepairPolicy, parse_repair_policy
+
+
+def test_legacy_rate_limit_keys_are_removed_without_reenabling_runtime() -> None:
+    config = {
+        "Performance": {
+            "primary_tpm_limit": "1000",
+            "primary_rpm_limit": "100",
+            "backup_tpm_limit": "2000",
+            "backup_rpm_limit": "200",
+            "api_retry_attempts": "3",
+        }
+    }
+
+    removed = remove_legacy_rate_limit_settings(config)
+
+    assert removed == (
+        "backup_rpm_limit",
+        "backup_tpm_limit",
+        "primary_rpm_limit",
+        "primary_tpm_limit",
+    )
+    assert config["Performance"] == {"api_retry_attempts": "3"}
+
+
+def test_legacy_rate_limit_keys_warn_but_do_not_fail_direct_validation() -> None:
+    from config_validator import validate_all_config
+
+    api_section = {
+        "api_key": "k" * 20,
+        "model": "test-model",
+        "api_base": "https://example.com/v1",
+    }
+    config = {
+        "Paths": {"output_path": "."},
+        "Primary_Reader_API": dict(api_section),
+        "Backup_Reader_API": dict(api_section),
+        "Writer_API": dict(api_section),
+        "Performance": {
+            "primary_tpm_limit": "not-a-number",
+            "primary_rpm_limit": "0",
+        },
+    }
+
+    valid, warnings = validate_all_config(config)
+
+    assert valid is True
+    assert any("primary_tpm_limit" in warning and "deprecated" in warning for warning in warnings)
 
 
 def test_read_validation_settings_prefers_validation_section() -> None:

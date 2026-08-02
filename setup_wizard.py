@@ -466,10 +466,6 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
         (
             ("max_workers", "最大并发数"),
             ("api_retry_attempts", "单次 API 调用重试次数"),
-            ("primary_tpm_limit", "主阅读引擎 TPM 限额"),
-            ("primary_rpm_limit", "主阅读引擎 RPM 限额"),
-            ("backup_tpm_limit", "备用阅读引擎 TPM 限额"),
-            ("backup_rpm_limit", "备用阅读引擎 RPM 限额"),
         ),
     )
     _collect_retry_section(sections["Retry_Settings"], "阶段一失败论文自动重试")

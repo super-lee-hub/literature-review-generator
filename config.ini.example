@@ -95,17 +95,6 @@ proxy_mode = environment
 max_workers = 3
 # API调用失败时的重试次数（增强到5次）
 api_retry_attempts = 5
-# 主阅读引擎速率限制配置（可选，设置为API限制的90%，留出安全边际）
-# 如果您的API服务商未提供此信息，请设置为0或留空，系统将自动切换到忍者模式
-# TPM: Tokens Per Minute，每分钟令牌数限制
-primary_tpm_limit = 900000
-# RPM: Requests Per Minute，每分钟请求数限制
-primary_rpm_limit = 9000
-# 备用阅读引擎速率限制配置（可选，通常比主引擎更高，处理超长论文）
-# 如果您的API服务商未提供此信息，请设置为0或留空，系统将自动切换到忍者模式
-backup_tpm_limit = 2000000
-# RPM: Requests Per Minute，每分钟请求数限制
-backup_rpm_limit = 9000
 # 启用/禁用验证模块 (true/false) - 重要：影响处理速度和准确性
 # 第一阶段验证：在单篇文献分析后进行交叉验证，增加准确度但会显著减慢处理速度
 #   true: 启用验证，增加准确度但速度变慢（每篇论文额外1-2分钟）

@@ -10,7 +10,7 @@ from typing import Dict, Mapping, MutableMapping
 
 from outline.v2_config import OUTLINE_QUALITY_GATE_DEFAULTS
 from config_validator import test_api_connection
-from services.config_compat import apply_validation_compat_sections
+from services.config_compat import apply_validation_compat_sections, remove_legacy_rate_limit_settings
 
 
 @dataclass(frozen=True)
@@ -117,10 +117,6 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         "Performance": {
             "max_workers": "3",
             "api_retry_attempts": "5",
-            "primary_tpm_limit": "900000",
-            "primary_rpm_limit": "9000",
-            "backup_tpm_limit": "2000000",
-            "backup_rpm_limit": "9000",
             "enable_stage1_validation": "false",
             "enable_stage2_validation": "true",
         },
@@ -268,6 +264,8 @@ def ensure_config_sections(
         merged.setdefault(section, {})
         merged[section].update({key: str(value) for key, value in values.items()})
 
+    remove_legacy_rate_limit_settings(merged)
+
     # Outline API should inherit writer defaults if still blank.
     if not merged["Outline_API"].get("model"):
         merged["Outline_API"]["model"] = merged["Writer_API"].get("model", "")
@@ -406,6 +404,8 @@ def save_config_and_env(
 
 def normalize_for_save(config_sections: MutableMapping[str, Dict[str, str]]) -> None:
     """Normalize API base URLs in-place before writing config."""
+
+    remove_legacy_rate_limit_settings(config_sections)
 
     for section_name in API_ENV_MAPPING:
         section = config_sections.get(section_name)

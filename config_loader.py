@@ -5,7 +5,11 @@ from typing import Dict, List, Optional
 
 from config_validator import validate_all_config
 from dotenv import load_dotenv  # type: ignore
-from services.config_compat import apply_validation_compat_sections, read_validation_settings
+from services.config_compat import (
+    apply_validation_compat_sections,
+    read_validation_settings,
+    remove_legacy_rate_limit_settings,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +74,7 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
             continue
         config_dict["Paths"][key] = os.path.abspath(os.path.join(config_origin, value))
 
+    remove_legacy_rate_limit_settings(config_dict, warn=logger.warning)
     config_dict = apply_validation_compat_sections(config_dict)
     validation_settings = read_validation_settings(config_dict)
     stage1_enabled = validation_settings.stage1_enabled
