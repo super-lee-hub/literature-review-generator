@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Provider-call budgets, redacted receipts, and fail-closed error taxonomy.
 
-This module is deliberately transport-neutral.  The HTTP adapter may decide how
-to retry a request, while this runtime records the durable facts needed to audit
-that decision.  Secrets and raw prompts never belong in a receipt.
+This module is deliberately transport-neutral.  The HTTP adapter performs the
+request, while this runtime owns the retry ceiling and records the durable
+facts needed to audit that decision.  Secrets and raw prompts never belong in
+a receipt.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -466,6 +467,20 @@ class ProviderRuntime:
     @property
     def receipts(self) -> tuple[ProviderCallReceiptV1, ...]:
         return tuple(self._receipts)
+
+    def max_attempts_for_call(self, requested_attempts: int) -> int:
+        """Return the transport loop limit imposed by this runtime.
+
+        The legacy adapter parameter is a total-attempt limit.  The formal
+        runtime budget is expressed as retries, so one initial attempt is
+        added when the retry dimension is bounded.  A zero budget remains
+        unlimited for compatibility with older callers.
+        """
+
+        requested = max(1, int(requested_attempts))
+        if not self.budget.max_retries_per_call:
+            return requested
+        return min(requested, self.budget.max_retries_per_call + 1)
 
     def admit(self, *, estimated_tokens: int = 0) -> ProviderCallAdmissionV1:
         estimated = max(0, int(estimated_tokens))

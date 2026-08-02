@@ -108,3 +108,29 @@ def test_ai_detailed_call_blocks_before_transport_when_budget_is_exhausted(monke
     assert result["status"] == "failed"
     assert result["error_kind"] == "budget_exhausted"
     assert result["provider_receipt"]["status"] == "failed"
+
+
+def test_ai_detailed_call_enforces_retry_budget_and_records_attempts(monkeypatch) -> None:
+    calls = 0
+
+    def fail_transport(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise ai_interface.requests.exceptions.ConnectionError("temporary network failure")
+
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", fail_transport)
+    monkeypatch.setattr(ai_interface, "load_config", lambda: {"Performance": {"api_retry_attempts": "5"}})
+    runtime = ProviderRuntime(budget=ProviderBudgetV1(max_retries_per_call=1))
+
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        {"api_key": "secret", "model": "test-model", "api_base": "https://provider.example/v1"},
+        "system",
+        provider_runtime=runtime,
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_kind"] == "transient_network"
+    assert calls == 2
+    assert result["attempts"] == 2
+    assert result["provider_receipt"]["attempts"] == 2

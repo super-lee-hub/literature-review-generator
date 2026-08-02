@@ -624,8 +624,16 @@ def _call_ai_api_detailed_uninstrumented(
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
+    max_retries_per_call: int = 0,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
+    attempts_used = 0
+
+    def finish(result: Dict[str, Any]) -> Dict[str, Any]:
+        enriched = dict(result)
+        enriched["attempts"] = max(1, attempts_used)
+        return enriched
+
     try:
         api_key = api_config.get('api_key') or ''
         model_name = api_config.get('model') or ''
@@ -636,7 +644,7 @@ def _call_ai_api_detailed_uninstrumented(
             message = "API config is missing api_key or model"
             if logger:
                 logger.error(message)
-            return _api_result(status="failed", error_kind="fatal_config_or_auth", message=message)
+            return finish(_api_result(status="failed", error_kind="fatal_config_or_auth", message=message))
 
         configured_timeout_seconds, configured_retries = _load_api_runtime_settings()
         request_timeout_seconds = (
@@ -649,6 +657,8 @@ def _call_ai_api_detailed_uninstrumented(
             if retry_attempts is not None
             else configured_retries
         )
+        if max_retries_per_call:
+            max_retries = min(max_retries, max(1, int(max_retries_per_call)) + 1)
         endpoint_suffix = "responses" if capability.endpoint_type == "responses" else "chat/completions"
         api_url = f"{api_base.rstrip('/')}/{endpoint_suffix}"
         headers = {
@@ -685,9 +695,17 @@ def _call_ai_api_detailed_uninstrumented(
         response = None
         last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
         attempt = 0
+        strict_retry_budget = bool(max_retries_per_call)
+
+        def can_start_attempt() -> bool:
+            if strict_retry_budget:
+                return attempts_used < max_retries
+            return attempt < max_retries
+
         removed_compat_params: Set[Any] = set()
-        while attempt < max_retries:
+        while can_start_attempt():
             attempt += 1
+            attempts_used += 1
             try:
                 final_payload = copy.deepcopy(payload)
                 if 'aihubmix.com' in api_base.lower() and logger:
@@ -709,19 +727,19 @@ def _call_ai_api_detailed_uninstrumented(
                     message = f"Malformed API response: {exc}"
                     if logger:
                         logger.error(message)
-                    return _api_result(
+                    return finish(_api_result(
                         status="failed",
                         error_kind="invalid_response",
                         http_status=getattr(response, "status_code", None),
                         message=message,
-                    )
+                    ))
 
                 formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
                 if (
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"
                     and response_format == "json"
-                    and attempt < max_retries
+                    and can_start_attempt()
                 ):
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
@@ -732,7 +750,7 @@ def _call_ai_api_detailed_uninstrumented(
                     last_failure = formatted
                     continue
 
-                return formatted
+                return finish(formatted)
 
             except requests.exceptions.HTTPError:
                 error_kind, http_status, provider_code, message = _classify_http_error(response)
@@ -750,7 +768,8 @@ def _call_ai_api_detailed_uninstrumented(
                     and remove_payload_path(payload, ("reasoning", "display"))
                 ):
                     removed_compat_params.add(("reasoning", "display"))
-                    attempt -= 1
+                    if not strict_retry_budget:
+                        attempt -= 1
                     if logger:
                         logger.warning("API rejected reasoning.display, retrying once without it.")
                     continue
@@ -766,7 +785,8 @@ def _call_ai_api_detailed_uninstrumented(
                 ):
                     removed_compat_params.add("reasoning_effort:max_to_high")
                     payload["reasoning_effort"] = "high"
-                    attempt -= 1
+                    if not strict_retry_budget:
+                        attempt -= 1
                     if logger:
                         logger.warning("API rejected reasoning_effort=max, retrying once with high.")
                     continue
@@ -790,7 +810,8 @@ def _call_ai_api_detailed_uninstrumented(
                     ):
                         removed_compat_params.add(payload_key)
                         payload.pop(payload_key, None)
-                        attempt -= 1
+                        if not strict_retry_budget:
+                            attempt -= 1
                         if logger:
                             logger.warning(
                                 f"API rejected payload parameter '{payload_key}', retrying once without it."
@@ -805,9 +826,9 @@ def _call_ai_api_detailed_uninstrumented(
                 if error_kind in {"quota_exhausted", "fatal_config_or_auth"}:
                     if logger:
                         logger.error(f"API调用不可重试失败 ({error_kind}): {last_failure['message']}")
-                    return last_failure
+                    return finish(last_failure)
 
-                if attempt < max_retries:
+                if can_start_attempt():
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
                         logger.warning(f"{_response_error_details(response, limit=200)}，{wait_time:.1f}秒后重试...")
@@ -816,7 +837,7 @@ def _call_ai_api_detailed_uninstrumented(
 
                 if logger:
                     logger.error(f"API调用最终失败: {last_failure['message']}")
-                return last_failure
+                return finish(last_failure)
 
             except Exception as exc:
                 response_status = getattr(response, "status_code", None)
@@ -837,9 +858,9 @@ def _call_ai_api_detailed_uninstrumented(
                 if error_kind in {"quota_exhausted", "fatal_config_or_auth", "invalid_response"}:
                     if logger:
                         logger.error(f"API调用不可重试失败 ({error_kind}): {message}")
-                    return last_failure
+                    return finish(last_failure)
 
-                if attempt < max_retries:
+                if can_start_attempt():
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
                         logger.warning(f"API调用失败 ({error_kind}): {message}，{wait_time:.1f}秒后重试...")
@@ -848,15 +869,15 @@ def _call_ai_api_detailed_uninstrumented(
 
                 if logger:
                     logger.error(f"API调用最终失败 ({error_kind}): {message}")
-                return last_failure
+                return finish(last_failure)
 
-        return last_failure
+        return finish(last_failure)
 
     except Exception as exc:
         if logger:
             logger.error(f"调用API失败: {exc}")
         error_kind, message = _classify_exception(exc)
-        return _api_result(status="failed", error_kind=error_kind, message=message)
+        return finish(_api_result(status="failed", error_kind=error_kind, message=message))
 
 
 def _call_ai_api_detailed(
@@ -909,6 +930,7 @@ def _call_ai_api_detailed(
         user_content=user_content,
         retry_attempts=retry_attempts,
         timeout_seconds=timeout_seconds,
+        max_retries_per_call=runtime.budget.max_retries_per_call,
     )
     receipt = runtime.complete(
         admission=admission,
