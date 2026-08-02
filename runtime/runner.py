@@ -10,6 +10,7 @@ from runtime.attempt_store import (
     AttemptExecutionLease,
     AttemptStore,
 )
+from runtime.completion_evaluator import CanonicalCompletionEvaluator, CompletionEvaluationV1
 from runtime.job_spec import RuntimeJobSpec
 from runtime.lifecycle import finalize_job_runtime
 from runtime.lifecycle import publish_running_job_runtime
@@ -76,12 +77,59 @@ class RuntimeExecutionResult:
     job_outcome_path: str
     compatibility_status: str = "native"
     message: str = ""
+    completion_status: str = ""
+    completion_reasons: tuple[str, ...] = ()
+    completion_evidence_hash: str = ""
 
     @property
     def success(self) -> bool:
         """Legacy readiness projection; Queue must use job_status."""
 
         return self.canonical_ready
+
+
+def _evaluate_runtime_completion(
+    outcome: JobOutcomeV1,
+    registry: ArtifactRegistry,
+) -> CompletionEvaluationV1:
+    """Read and verify the durable evidence used by status projections."""
+
+    registry_verified = True
+    ready_job_outcome = False
+    validation_record = False
+    try:
+        for record in registry.list_records():
+            if record.status != "ready":
+                continue
+            ArtifactRegistry._verify_ready_artifact(record)
+            ready_job_outcome = ready_job_outcome or record.artifact_id == "job_outcome"
+            validation_record = validation_record or record.artifact_type == "validation_run_result"
+    except (OSError, RegistryError, TypeError, ValueError):
+        registry_verified = False
+
+    policy = dict(outcome.readiness_policy_snapshot)
+    validation_status = "clean" if outcome.job_disposition == "clean" and validation_record else (
+        "findings" if outcome.job_disposition == "findings" else "missing"
+    )
+    return CanonicalCompletionEvaluator.evaluate(
+        {
+            "job_id": outcome.job_id,
+            "job_status": outcome.job_status,
+            "required_stages": outcome.required_stages,
+            "completed_stages": outcome.completed_stages,
+            "failed_stage": outcome.failed_stage,
+            "artifact_registry_verified": registry_verified,
+            "canonical_artifacts": {"job_outcome": ready_job_outcome},
+            "validation_required": bool(policy.get("validation_required", False)),
+            "require_clean_validation": bool(policy.get("require_clean_validation", False)),
+            "validation_status": validation_status,
+            "provider_receipts_complete": True,
+            "compatibility_status": outcome.compatibility_status,
+            "declared_canonical_ready": outcome.canonical_ready,
+            "degradation_reasons": outcome.degradation_reasons,
+            "evidence_sources": ("job_outcome_v1", "artifact_registry"),
+        }
+    )
 
 
 class AgentRuntimeRunner:
@@ -943,13 +991,14 @@ class AgentRuntimeRunner:
         )
         payload = json.loads(Path(session.context.job_outcome_path).read_text(encoding="utf-8"))
         outcome = JobOutcomeV1.from_dict(payload)
+        evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
             workspace_path=session.context.workspace.root_dir,
             job_status=outcome.job_status,
             job_disposition=outcome.job_disposition,
-            canonical_ready=outcome.canonical_ready,
-            requires_attention=outcome.requires_attention,
+            canonical_ready=outcome.canonical_ready and evaluation.canonical_ready,
+            requires_attention=outcome.requires_attention or evaluation.requires_attention,
             attempt_number=outcome.attempt_number,
             resumed_from_attempt=outcome.resumed_from_attempt,
             completed_stages=outcome.completed_stages,
@@ -957,6 +1006,9 @@ class AgentRuntimeRunner:
             job_outcome_path=session.context.job_outcome_path,
             compatibility_status=outcome.compatibility_status,
             message=message,
+            completion_status=evaluation.status,
+            completion_reasons=evaluation.reasons,
+            completion_evidence_hash=evaluation.evidence_hash,
         )
 
     @staticmethod
@@ -1037,13 +1089,14 @@ class AgentRuntimeRunner:
             outcome = JobOutcomeV1.from_dict(payload)
         if outcome.job_id != workspace.job_id:
             raise RuntimeRunnerError("job outcome belongs to another workspace")
+        evaluation = _evaluate_runtime_completion(outcome, _registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
             workspace_path=workspace.root_dir,
             job_status=outcome.job_status,
             job_disposition=outcome.job_disposition,
-            canonical_ready=outcome.canonical_ready,
-            requires_attention=outcome.requires_attention,
+            canonical_ready=outcome.canonical_ready and evaluation.canonical_ready,
+            requires_attention=outcome.requires_attention or evaluation.requires_attention,
             attempt_number=outcome.attempt_number,
             resumed_from_attempt=outcome.resumed_from_attempt,
             completed_stages=outcome.completed_stages,
@@ -1055,6 +1108,9 @@ class AgentRuntimeRunner:
                 if outcome.compatibility_status == "legacy_unverified"
                 else ""
             ),
+            completion_status=evaluation.status,
+            completion_reasons=evaluation.reasons,
+            completion_evidence_hash=evaluation.evidence_hash,
         )
 
     @classmethod

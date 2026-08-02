@@ -17,6 +17,7 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
+from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
 from summary_schema import (
     default_ai_summary,
     get_ai_summary,
@@ -612,7 +613,7 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
     return normalized
 
 
-def _call_ai_api_detailed(
+def _call_ai_api_detailed_uninstrumented(
     prompt: str,
     api_config: APIConfig,
     system_prompt: str,
@@ -858,10 +859,74 @@ def _call_ai_api_detailed(
         return _api_result(status="failed", error_kind=error_kind, message=message)
 
 
+def _call_ai_api_detailed(
+    prompt: str,
+    api_config: APIConfig,
+    system_prompt: str,
+    max_tokens: int = 4000,
+    temperature: float = 0.3,
+    response_format: str = "json",
+    logger: Any = None,
+    user_content: Any = None,
+    retry_attempts: Optional[int] = None,
+    timeout_seconds: Optional[int] = None,
+    provider_runtime: Optional[ProviderRuntime] = None,
+) -> Dict[str, Any]:
+    """Call the transport and attach a redacted provider receipt.
+
+    ``provider_runtime`` is optional for compatibility.  An ephemeral runtime
+    still attaches a receipt to the detailed result; callers that need durable
+    audit evidence pass a job/attempt/stage-bound runtime with a ledger.
+    """
+
+    runtime = provider_runtime or ProviderRuntime()
+    estimated_tokens = max(0, len(prompt) + max(0, int(max_tokens)))
+    try:
+        admission = runtime.admit(estimated_tokens=estimated_tokens)
+    except ProviderBudgetExceeded as exc:
+        receipt = runtime.blocked_receipt(
+            prompt=prompt,
+            input_payload=user_content,
+            api_config=api_config,
+            message=str(exc),
+        )
+        blocked = _api_result(
+            status="failed",
+            error_kind="budget_exhausted",
+            message=str(exc),
+        )
+        blocked["provider_receipt"] = receipt.to_dict()
+        return blocked
+
+    result = _call_ai_api_detailed_uninstrumented(
+        prompt,
+        api_config,
+        system_prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        response_format=response_format,
+        logger=logger,
+        user_content=user_content,
+        retry_attempts=retry_attempts,
+        timeout_seconds=timeout_seconds,
+    )
+    receipt = runtime.complete(
+        admission=admission,
+        prompt=prompt,
+        input_payload=user_content,
+        api_config=api_config,
+        result=result,
+    )
+    enriched = dict(result)
+    enriched["provider_receipt"] = receipt.to_dict()
+    return enriched
+
+
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,
                  temperature: float = 0.3, response_format: str = "json", logger: Any = None,
                  user_content: Any = None, retry_attempts: Optional[int] = None,
-                 timeout_seconds: Optional[int] = None) -> Optional[Dict[str, Any]]:
+                 timeout_seconds: Optional[int] = None,
+                 provider_runtime: Optional[ProviderRuntime] = None) -> Optional[Dict[str, Any]]:
     """
     Backward-compatible wrapper: existing callers receive parsed content only.
     Use _call_ai_api_detailed when transport failure kind is needed.
@@ -877,6 +942,7 @@ def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tok
         user_content=user_content,
         retry_attempts=retry_attempts,
         timeout_seconds=timeout_seconds,
+        provider_runtime=provider_runtime,
     )
     if result.get("status") == "success":
         return result.get("content")
@@ -893,6 +959,7 @@ def _call_ai_api_text_detailed(
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
+    provider_runtime: Optional[ProviderRuntime] = None,
 ) -> Dict[str, Any]:
     """Call the chat-completions API for text content and return full metadata.
 
@@ -910,12 +977,14 @@ def _call_ai_api_text_detailed(
         user_content=user_content,
         retry_attempts=retry_attempts,
         timeout_seconds=timeout_seconds,
+        provider_runtime=provider_runtime,
     )
     if result.get("status") == "success":
         return {
             "content": result.get("content", ""),
             "finish_reason": result.get("finish_reason", "stop"),
             "http_status": result.get("http_status"),
+            "provider_receipt": result.get("provider_receipt"),
         }
     return {
         "content": None,
@@ -923,6 +992,7 @@ def _call_ai_api_text_detailed(
         "http_status": result.get("http_status"),
         "error_kind": result.get("error_kind"),
         "message": result.get("message", ""),
+        "provider_receipt": result.get("provider_receipt"),
     }
 
 
@@ -1314,6 +1384,7 @@ def get_summary_from_ai_detailed(
     config: Optional[Dict[str, Any]] = None,
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
+    provider_runtime: Optional[ProviderRuntime] = None,
 ) -> Dict[str, Any]:
     """Stage-1 reader call that preserves API failure classification."""
     if ('dummy' in (primary_api_config.get('api_key') or '') or
@@ -1449,6 +1520,7 @@ def get_summary_from_ai_detailed(
         logger=logger,
         user_content=user_content,
         retry_attempts=retry_attempts,
+        provider_runtime=provider_runtime,
     )
     detailed["engine_type"] = engine_type
 
@@ -1477,7 +1549,8 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                                       user_content: Any = None, return_detailed: bool = False,
                                       disable_engine_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
                                       is_engine_disabled_callback: Optional[Callable[[str], bool]] = None,
-                                      skip_engines: Optional[Set[str]] = None) -> Optional[Dict[str, Any]]:
+                                      skip_engines: Optional[Set[str]] = None,
+                                      provider_runtime: Optional[ProviderRuntime] = None) -> Optional[Dict[str, Any]]:
     """
     Stage-1 reader scheduler. Transient failures alternate engines:
     primary#1 -> backup#1 -> primary#2 -> backup#2. Quota/balance failures
@@ -1522,6 +1595,7 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                 config=config,
                 user_content=user_content,
                 retry_attempts=1,
+                provider_runtime=provider_runtime,
             )
             last_result = result
             if result.get("status") == "success":
