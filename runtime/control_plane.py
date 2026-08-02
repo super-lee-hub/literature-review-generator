@@ -34,6 +34,11 @@ from services.artifact_registry import ArtifactRecord, ArtifactRegistry, Registr
 from services.config_compat import LEGACY_RATE_LIMIT_KEYS
 from services.model_capabilities import resolve_model_capability
 from services.job_workspace import JobWorkspace
+from runtime.cancellation import CancellationRequestStore
+from runtime.export_bundle import ExportBundleService, ExportBundleSpecV1, ForensicAttestationService
+from outline.adoption_transaction import OutlineAdoptionTransaction
+from validation.closure import ValidationClosureService
+from validation.repair_transaction import RepairTransactionService
 
 
 CONTROL_PLANE_VERSION = "reviewctl-v1"
@@ -552,6 +557,12 @@ class ReviewControlPlane:
                 outline_resume_plan = plan.to_dict()
         except (OSError, ValueError, TypeError, RegistryError) as exc:
             raise ControlPlaneError(f"Outline v3 resume planning is blocked: {exc}") from exc
+        try:
+            cancel_store = CancellationRequestStore(workspace_obj, registry)
+            if cancel_store.is_requested():
+                cancel_store.clear(cleared_by="reviewctl", reason="resume_requested")
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            raise ControlPlaneError(f"resume cancellation state is invalid: {exc}") from exc
         payload = self._run_spec(
             spec_path,
             resume=True,
@@ -678,12 +689,17 @@ class ReviewControlPlane:
                 "plans": plans,
                 "read_only": True,
             }
-        return {
-            "status": "blocked",
-            "job_id": inspection["job_id"],
-            "reason": "no registered validation evidence is available to build a repair plan",
-            "read_only": True,
-        }
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        try:
+            return RepairTransactionService(workspace_obj, registry).create_report_only_plan()
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "reason": str(exc),
+                "mutation_performed": False,
+                "read_only": True,
+            }
 
     def repair_apply(
         self,
@@ -697,7 +713,7 @@ class ReviewControlPlane:
             (
                 record
                 for record in inspection.get("artifacts") or []
-                if str(record.get("artifact_id") or "") == plan_id
+                if str(record.get("artifact_id") or "") in {plan_id, f"repair_plan:{plan_id}"}
                 and str(record.get("artifact_type") or "") == "repair_plan"
                 and str(record.get("status") or "") == "ready"
             ),
@@ -711,31 +727,73 @@ class ReviewControlPlane:
                 "reason": "repair plan is missing or not a verified ready artifact",
                 "mutation_performed": False,
             }
-        return {
-            "status": "blocked",
-            "job_id": inspection["job_id"],
-            "plan_id": plan_id,
-            "reason": "repair apply requires an explicit validation-bound transaction adapter",
-            "mutation_performed": False,
-            "forbidden_actions": list(FORBIDDEN_ACTIONS),
-        }
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        try:
+            return RepairTransactionService(workspace_obj, registry).apply_plan(plan_id)
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "plan_id": plan_id,
+                "reason": str(exc),
+                "mutation_performed": False,
+            }
 
     def validate(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
-        validation = [
-            record
-            for record in inspection.get("artifacts") or []
-            if str(record.get("artifact_type") or "") in {"validation_run_result", "validation_report"}
-            and str(record.get("status") or "") == "ready"
-        ]
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        try:
+            closure = ValidationClosureService(workspace_obj, registry).inspect()
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "reason": str(exc),
+                "mutation_performed": False,
+                "read_only": True,
+            }
         return {
-            "status": "available" if validation else "blocked",
+            "status": closure.status,
             "job_id": inspection["job_id"],
-            "validation_artifacts": validation,
-            "reason": "validation is provider-free but no registered validation result exists"
-            if not validation
-            else "registered validation evidence is available",
+            "closure": closure.to_dict(),
+            "validation_artifact": closure.validation_artifact,
+            "reason": "canonical validation closure inspected without mutation",
+            "mutation_performed": False,
             "read_only": True,
+        }
+
+    def cancel(
+        self,
+        *,
+        job_id: str | None = None,
+        workspace: str | Path | None = None,
+        requested_by: str = "reviewctl",
+        reason: str = "user_requested",
+    ) -> dict[str, Any]:
+        inspection = self.inspect(job_id=job_id, workspace=workspace)
+        current_status = str((inspection.get("status") or {}).get("job_status") or "")
+        if current_status in {"completed", "failed", "cancelled"}:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "reason": f"job is already terminal: {current_status}",
+                "mutation_performed": False,
+                "read_only": True,
+            }
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        try:
+            request = CancellationRequestStore(workspace_obj, registry).request(
+                requested_by=requested_by,
+                reason=reason,
+            )
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            raise ControlPlaneError(f"cannot persist cancellation request: {exc}") from exc
+        return {
+            "status": "requested",
+            "job_id": inspection["job_id"],
+            "request": request.to_dict(),
+            "mutation_performed": True,
+            "read_only": False,
         }
 
     def adopt(
@@ -744,6 +802,7 @@ class ReviewControlPlane:
         job_id: str | None = None,
         workspace: str | Path | None = None,
         artifact_id: str,
+        adopted_by: str = "reviewctl",
     ) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         artifact = next(
@@ -762,63 +821,79 @@ class ReviewControlPlane:
                 "reason": "adoption target is not a verified ready Registry artifact",
                 "mutation_performed": False,
             }
-        return {
-            "status": "blocked",
-            "job_id": inspection["job_id"],
-            "artifact_id": artifact_id,
-            "reason": "adoption requires the Outline v3 adoption transaction and audit actor",
-            "mutation_performed": False,
-            "forbidden_actions": list(FORBIDDEN_ACTIONS),
-        }
+        if not str(adopted_by or "").strip():
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "artifact_id": artifact_id,
+                "reason": "adoption actor is required for the immutable audit record",
+                "mutation_performed": False,
+            }
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        try:
+            result = OutlineAdoptionTransaction(workspace_obj, registry).adopt(
+                source_artifact_id=artifact_id,
+                adopted_by=adopted_by,
+            )
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "artifact_id": artifact_id,
+                "reason": str(exc),
+                "mutation_performed": False,
+            }
+        payload = result.to_dict()
+        payload["artifact_id"] = artifact_id
+        payload["forbidden_actions"] = list(FORBIDDEN_ACTIONS)
+        return payload
 
     def export(self, *, batch_id: str | None = None, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         if not job_id and not workspace:
             raise ControlPlaneError("export requires --batch/--job or --workspace")
         inspection = self.inspect(job_id=job_id or batch_id, workspace=workspace)
-        return {
-            "status": "available",
-            "batch_id": batch_id or inspection["job_id"],
-            "job_id": inspection["job_id"],
-            "workspace_path": inspection["workspace_path"],
-            "export_scope": "read_only_control_plane_manifest",
-            "manifest": inspection,
-            "read_only": True,
-        }
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        closure = ValidationClosureService(workspace_obj, registry).inspect()
+        result = ExportBundleService(workspace_obj, registry).export(
+            spec=ExportBundleSpecV1(),
+            completion=inspection.get("status") or {},
+            closure=closure.to_dict(),
+        )
+        payload = result.to_dict()
+        payload.update(
+            {
+                "batch_id": batch_id or inspection["job_id"],
+                "workspace_path": inspection["workspace_path"],
+                "export_scope": "verified_registry_artifacts_and_forensic_provenance",
+                "inspection": inspection,
+                "closure": closure.to_dict(),
+                "read_only": False,
+            }
+        )
+        return payload
 
     def attest(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
-        status = inspection["status"]
-        integrity = inspection.get("integrity") or []
-        verified = bool(
-            status.get("completion_status") == "complete"
-            and integrity
-            and all(item.get("status") == "verified" for item in integrity)
-            and not inspection.get("issues")
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        closure = ValidationClosureService(workspace_obj, registry).inspect()
+        result = ForensicAttestationService(workspace_obj, registry).attest(
+            completion=inspection.get("status") or {},
+            closure=closure.to_dict(),
+            persist=True,
         )
-        return {
-            "status": "canonical_verified" if verified else "untrusted",
-            "job_id": inspection["job_id"],
-            "workspace_path": inspection["workspace_path"],
-            "scope": "registry_file_hashes_and_runtime_terminals",
-            "manual_modified_nodes": [
-                record["artifact_id"]
-                for record in inspection.get("artifacts") or []
-                if bool((record.get("metadata") or {}).get("manual_modified"))
-            ],
-            "dependency_graph": {
-                record["artifact_id"]: [
-                    dependency.get("artifact_id")
-                    for dependency in record.get("depends_on") or []
-                    if dependency.get("artifact_id")
-                ]
-                for record in inspection.get("artifacts") or []
-            },
-            "evidence_hash": inspection["canonical_evidence_hash"],
-            "read_only": True,
-            "next_step": "full forensic closure is required before trusting a legacy workspace"
-            if not verified
-            else "no further forensic action is required for the inspected scope",
-        }
+        payload = result.to_dict()
+        payload.update(
+            {
+                "workspace_path": inspection["workspace_path"],
+                "scope": "registry_file_hashes_dependency_graph_validation_closure",
+                "closure": closure.to_dict(),
+                "read_only": False,
+                "next_step": "full forensic closure is required before trusting a legacy workspace"
+                if result.status == "untrusted"
+                else "no further forensic action is required for the inspected scope",
+            }
+        )
+        return payload
 
     def doctor(self, *, config_path: str | Path | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         checks: list[dict[str, Any]] = []

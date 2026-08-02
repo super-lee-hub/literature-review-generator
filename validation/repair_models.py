@@ -49,6 +49,13 @@ class DependencyHashBundle:
     paper_artifact_hash: str
     visual_manifest_hash: str
     selected_visual_refs_hash: str
+    # These fields are optional for compatibility with the original Week 4
+    # bundle.  New repair transactions must carry them whenever the
+    # corresponding artifact is in scope; an empty value means that the
+    # artifact was not available to the planner, not that it was verified.
+    review_draft_hash: str = ""
+    citation_manifest_hash: str = ""
+    outline_hash: str = ""
     
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
@@ -60,6 +67,9 @@ class DependencyHashBundle:
             paper_artifact_hash=data.get("paper_artifact_hash", ""),
             visual_manifest_hash=data.get("visual_manifest_hash", ""),
             selected_visual_refs_hash=data.get("selected_visual_refs_hash", ""),
+            review_draft_hash=data.get("review_draft_hash", ""),
+            citation_manifest_hash=data.get("citation_manifest_hash", ""),
+            outline_hash=data.get("outline_hash", ""),
         )
 
 
@@ -127,9 +137,10 @@ class RepairPlan:
     policy: RepairPolicy
     artifact_type: str = "repair_plan"
     artifact_version: str = "v1"
+    dependency_hash_bundle: Optional[DependencyHashBundle] = None
     
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "artifact_type": self.artifact_type,
             "artifact_version": self.artifact_version,
             "plan_id": self.plan_id,
@@ -139,6 +150,9 @@ class RepairPlan:
             "policy": self.policy.value,
             "proposals": [p.to_dict() for p in self.proposals],
         }
+        if self.dependency_hash_bundle is not None:
+            payload["dependency_hash_bundle"] = self.dependency_hash_bundle.to_dict()
+        return payload
     
     def get_mapping_first_proposals(self) -> List[PatchProposal]:
         """Get proposals for citation_mapping_error (highest priority)."""

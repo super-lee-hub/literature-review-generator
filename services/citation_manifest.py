@@ -18,6 +18,16 @@ from services.job_workspace import utc_now_iso
 from services.sentence_segmenter import segment_sentences
 
 
+DEFAULT_RENDER_POLICY: Dict[str, str] = {
+    "citation_style": "APA7",
+    "citation_locale": "en-US",
+    "citation_render_mode": "structured_refs",
+    "style_engine_version": "auto-generate-render-v1",
+    "bibliography_sort_policy": "manifest_order",
+    "narrative_parenthetical_policy": "preserve_source_refs",
+}
+
+
 @dataclass(frozen=True)
 class CitationSpan:
     span_id: str
@@ -284,6 +294,7 @@ class CitationManifestV3:
     )
     review_draft_version: str = "v2"
     dependencies: Dict[str, Any] = field(default_factory=dict)
+    render_policy: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_RENDER_POLICY))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -301,6 +312,7 @@ class CitationManifestV3:
             "migration_report": self.migration_report.to_dict(),
             "review_draft_version": self.review_draft_version,
             "dependencies": self.dependencies,
+            "render_policy": self.render_policy,
         }
 
 
@@ -1249,6 +1261,7 @@ def build_citation_manifest_v3_from_review_draft(
     citation_ref_catalog_path: str = "",
     citation_ref_catalog_hash: str = "",
     legacy_citation_policy: str | LegacyCitationPolicy = LegacyCitationPolicy.REPORT_ONLY,
+    render_policy: Optional[Mapping[str, Any]] = None,
 ) -> CitationManifestV3:
     legacy_manifest = build_citation_manifest_v2_from_review_draft(
         job_id=job_id,
@@ -1346,5 +1359,9 @@ def build_citation_manifest_v3_from_review_draft(
         dependencies={
             "citation_ref_catalog_path": citation_ref_catalog_path,
             "citation_ref_catalog_hash": citation_ref_catalog_hash,
+        },
+        render_policy={
+            **DEFAULT_RENDER_POLICY,
+            **dict(render_policy or {}),
         },
     )

@@ -92,6 +92,9 @@ class QueueJobRuntime:
     log_path: str = ""
     produced_artifacts: List[str] = field(default_factory=list)
     progress_snapshot: Dict[str, Any] = field(default_factory=dict)
+    cancel_requested: bool = False
+    cancel_requested_at: Optional[str] = None
+    cancel_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -107,6 +110,9 @@ class QueueJobRuntime:
             "log_path": self.log_path,
             "produced_artifacts": self.produced_artifacts,
             "progress_snapshot": self.progress_snapshot,
+            "cancel_requested": self.cancel_requested,
+            "cancel_requested_at": self.cancel_requested_at,
+            "cancel_reason": self.cancel_reason,
         }
 
     @classmethod
@@ -124,6 +130,9 @@ class QueueJobRuntime:
             log_path=data.get("log_path", ""),
             produced_artifacts=data.get("produced_artifacts", []),
             progress_snapshot=data.get("progress_snapshot", {}),
+            cancel_requested=bool(data.get("cancel_requested", False)),
+            cancel_requested_at=data.get("cancel_requested_at"),
+            cancel_reason=data.get("cancel_reason"),
         )
 
 
@@ -261,6 +270,10 @@ class PersistentQueueService:
             if job_id not in self._runtimes:
                 return False
             runtime = self._runtimes[job_id]
+            if state == QueueState.COMPLETED and runtime.cancel_requested:
+                # A late worker result must not overwrite durable cancellation
+                # evidence with a false completed state.
+                return False
             runtime.state = state
             if state == QueueState.RUNNING and not runtime.started_at:
                 runtime.started_at = self._utc_now()
@@ -297,9 +310,48 @@ class PersistentQueueService:
         with self._lock:
             if job_id not in self._runtimes:
                 return False
-            self._runtimes[job_id] = QueueJobRuntime(job_id=job_id)
+            previous = self._runtimes[job_id]
+            self._runtimes[job_id] = QueueJobRuntime(
+                job_id=job_id,
+                retry_count=previous.retry_count,
+            )
             self._save()
         return True
+
+    def request_cancel(self, job_id: str, *, reason: str = "user_requested") -> bool:
+        """Persist a cooperative cancellation request for a live job."""
+
+        with self._lock:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state in (
+                QueueState.COMPLETED,
+                QueueState.FAILED,
+                QueueState.CANCELLED,
+            ):
+                return False
+            runtime.cancel_requested = True
+            runtime.cancel_requested_at = self._utc_now()
+            runtime.cancel_reason = reason
+            runtime.state = QueueState.CANCELLED
+            runtime.completed_at = self._utc_now()
+            self._save()
+        return True
+
+    def clear_cancel_request(self, job_id: str) -> bool:
+        with self._lock:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return False
+            runtime.cancel_requested = False
+            runtime.cancel_requested_at = None
+            runtime.cancel_reason = None
+            self._save()
+        return True
+
+    def is_cancel_requested(self, job_id: str) -> bool:
+        with self._lock:
+            runtime = self._runtimes.get(job_id)
+            return bool(runtime and runtime.cancel_requested)
 
     def remove_job(self, job_id: str) -> bool:
         with self._lock:
@@ -393,13 +445,59 @@ class QueueRunner:
                 self._workspace_locks[workspace_path] = threading.Lock()
             return self._workspace_locks[workspace_path]
 
+    @staticmethod
+    def _external_cancel_requested(job_spec: QueueJobSpec) -> bool:
+        """Read a cross-process cancellation marker without mutating state."""
+
+        import os
+        from runtime.cancellation import CancellationRequestStore
+        from services.job_workspace import JobWorkspace
+
+        runtime_workspace = str(job_spec.workspace_path or "").strip()
+        if runtime_workspace:
+            workspace_path = Path(runtime_workspace).expanduser().resolve()
+            project_name = workspace_path.name.rsplit("__", 1)[0]
+            workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
+        else:
+            project_name = str(job_spec.parameters.get("project_name") or job_spec.project_name or "project")
+            base_output_dir = str(job_spec.parameters.get("output_dir") or os.path.join(os.getcwd(), "output"))
+            workspace = JobWorkspace(base_output_dir, project_name, job_spec.job_id)
+        return CancellationRequestStore(workspace).is_requested()
+
+    @staticmethod
+    def _clear_external_cancel(job_spec: QueueJobSpec) -> None:
+        import os
+        from runtime.cancellation import CancellationRequestStore
+        from services.job_workspace import JobWorkspace
+
+        runtime_workspace = str(job_spec.workspace_path or "").strip()
+        if runtime_workspace:
+            workspace_path = Path(runtime_workspace).expanduser().resolve()
+            project_name = workspace_path.name.rsplit("__", 1)[0]
+            workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
+        else:
+            project_name = str(job_spec.parameters.get("project_name") or job_spec.project_name or "project")
+            base_output_dir = str(job_spec.parameters.get("output_dir") or os.path.join(os.getcwd(), "output"))
+            workspace = JobWorkspace(base_output_dir, project_name, job_spec.job_id)
+        store = CancellationRequestStore(workspace)
+        if store.read() is not None:
+            store.clear(cleared_by="queue_runner", reason="retry")
+
     def _process_job(self, job_spec: QueueJobSpec) -> None:
         cancel_token = CancelToken()
         with self._lock:
             self._cancel_tokens[job_spec.job_id] = cancel_token
 
         try:
+            if self._external_cancel_requested(job_spec):
+                cancel_token.request_cancel()
+                self.queue_service.request_cancel(job_spec.job_id, reason="external_cancel_request")
+                return
             # 检查任务是否已经被取消
+            if self.queue_service.is_cancel_requested(job_spec.job_id):
+                cancel_token.request_cancel()
+                self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+                return
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and runtime.state == QueueState.CANCELLED:
                 return
@@ -441,7 +539,8 @@ class QueueRunner:
             
             # 再次检查任务状态，确保没有被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                cancel_token.request_cancel()
                 return
             
             # 更新当前阶段
@@ -477,7 +576,7 @@ class QueueRunner:
             
             # 最后检查一次任务状态
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 return
             
             # 更新当前阶段
@@ -620,12 +719,11 @@ class QueueRunner:
         Returns:
             是否成功取消
         """
-        # 先标记任务状态为CANCELLED
         runtime = self.queue_service.get_job_runtime(job_id)
-        if not runtime or runtime.state != QueueState.RUNNING:
+        if not runtime or runtime.state not in (QueueState.PENDING, QueueState.RUNNING):
             return False
-        
-        self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
+
+        self.queue_service.request_cancel(job_id, reason="queue_runner_cancel")
         
         # 如果任务正在运行，请求取消令牌
         with self._lock:
@@ -640,10 +738,12 @@ class QueueRunner:
             return False
         
         runtime = self.queue_service.get_job_runtime(job_id)
-        if not runtime or runtime.state not in (QueueState.PENDING, QueueState.FAILED):
+        if not runtime or runtime.state not in (QueueState.PENDING, QueueState.FAILED, QueueState.CANCELLED):
             return False
         
         # 重置任务状态
         self.queue_service.reset_job(job_id)
+        self.queue_service.clear_cancel_request(job_id)
+        self._clear_external_cancel(job)
         self._process_job(job)
         return True

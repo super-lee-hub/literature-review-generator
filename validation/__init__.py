@@ -56,6 +56,19 @@ from validation.run_result import (
     claim_verdict_for_result,
     reduce_validation_disposition,
 )
+from validation.closure import (
+    VALIDATION_CLOSURE_ARTIFACT_TYPE,
+    VALIDATION_CLOSURE_ARTIFACT_VERSION,
+    ValidationClosureResult,
+    ValidationClosureService,
+    persist_validation_closure,
+)
+from validation.repair_transaction import (
+    REPAIR_TRANSACTION_ARTIFACT_TYPE,
+    REPAIR_TRANSACTION_ARTIFACT_VERSION,
+    RepairTransactionRecord,
+    RepairTransactionService,
+)
 
 __all__ = [
     # Week 3 validation
@@ -102,4 +115,14 @@ __all__ = [
     "ValidationRunResultV1",
     "claim_verdict_for_result",
     "reduce_validation_disposition",
+    # Canonical review-chain closure
+    "VALIDATION_CLOSURE_ARTIFACT_TYPE",
+    "VALIDATION_CLOSURE_ARTIFACT_VERSION",
+    "ValidationClosureResult",
+    "ValidationClosureService",
+    "persist_validation_closure",
+    "REPAIR_TRANSACTION_ARTIFACT_TYPE",
+    "REPAIR_TRANSACTION_ARTIFACT_VERSION",
+    "RepairTransactionRecord",
+    "RepairTransactionService",
 ]

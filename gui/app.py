@@ -1380,8 +1380,8 @@ class WorkspaceController:
                 else:
                     # 如果queue_runner不存在，只标记状态
                     runtime = self._queue_service.get_job_runtime(job_id)
-                    if runtime and runtime.state == QueueState.RUNNING:
-                        self._queue_service.update_job_state(job_id, QueueState.CANCELLED)
+                    if runtime and runtime.state in (QueueState.PENDING, QueueState.RUNNING):
+                        self._queue_service.request_cancel(job_id, reason="gui_cancel")
                         ui.notify(self.tf("任务已标记为取消: {job_id}", job_id=job_id), type="positive")
                     else:
                         ui.notify(self.t("只能取消运行中的任务"), type="warning")

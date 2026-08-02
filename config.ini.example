@@ -90,8 +90,8 @@ proxy_mode = environment
 
 [Performance]
 # 并发处理的最大工作线程数
-# 推荐值为2-3，以平衡速度和API的TPM限制
-# 建议不要超过3，以避免触发API频率限制
+# 推荐值为2-3，以平衡吞吐、Provider配额和网络稳定性
+# 并发度只影响本地工作量；Provider节流、重试和配额由runtime统一处理
 max_workers = 3
 # API调用失败时的重试次数（增强到5次）
 api_retry_attempts = 5
