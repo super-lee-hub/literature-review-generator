@@ -84,6 +84,7 @@ def _evaluate_runtime_completion(
     required_provider_stages = {"outline", "review"}.intersection(outcome.required_stages)
     provider_receipts_complete = not required_provider_stages
     provider_receipt_closures: list[Mapping[str, Any]] = []
+    provider_receipt_closure: Mapping[str, Any] | None = None
     try:
         for record in registry.list_records():
             if record.status != "ready":
@@ -110,7 +111,6 @@ def _evaluate_runtime_completion(
             provider_receipts_complete = bool(provider_receipt_closures) and all(
                 bool(candidate.get("complete")) for candidate in provider_receipt_closures
             )
-        provider_receipt_closure: Mapping[str, Any] | None = None
         if provider_receipt_closures:
             provider_receipt_closure = {
                 "complete": provider_receipts_complete,
@@ -172,27 +172,27 @@ class AgentRuntimeRunner:
     @classmethod
     def _schema_validators(cls) -> dict[str, Callable[[ArtifactRecord, Path], None]]:
         from runtime.reconcile import DEFAULT_SCHEMA_VALIDATORS
+        from runtime.artifact_validators import make_outline_schema_validators
 
         validators = dict(DEFAULT_SCHEMA_VALIDATORS)
+        for artifact_type, current_validator in make_outline_schema_validators().items():
+            fallback_validator = validators.get(artifact_type)
 
-        def validate_v3_or_current(record: ArtifactRecord, path: Path) -> None:
-            if record.artifact_version == "v3" or record.artifact_type in cls._OUTLINE_V3_ARTIFACT_TYPES:
-                try:
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                    raise ValueError(f"Outline v3 artifact is not valid JSON: {path}") from exc
-                if not isinstance(payload, Mapping):
-                    raise ValueError(f"Outline v3 artifact must be a JSON object: {path}")
-                return
-            current = DEFAULT_SCHEMA_VALIDATORS.get(record.artifact_type)
-            if current is None:
-                raise ValueError(f"no schema validator is registered for artifact type {record.artifact_type!r}")
-            current(record, path)
+            def dispatch(
+                record: ArtifactRecord,
+                path: Path,
+                *,
+                current_validator: Callable[[ArtifactRecord, Path], None] = current_validator,
+                fallback_validator: Callable[[ArtifactRecord, Path], None] | None = fallback_validator,
+            ) -> None:
+                if record.artifact_version == "v3":
+                    current_validator(record, path)
+                elif fallback_validator is not None:
+                    fallback_validator(record, path)
+                else:
+                    raise ValueError(f"no validator is registered for artifact type {record.artifact_type!r}")
 
-        for artifact_type in cls._OUTLINE_V3_ARTIFACT_TYPES:
-            validators[artifact_type] = validate_v3_or_current
-        validators["final_outline"] = validate_v3_or_current
-        validators["outline_stage_health"] = validate_v3_or_current
+            validators[artifact_type] = dispatch
         return validators
 
     def __init__(

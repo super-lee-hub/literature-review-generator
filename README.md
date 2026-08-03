@@ -52,6 +52,7 @@ Main capabilities:
 - PDF folder mode and Zotero report + library mode
 - Local GUI workbench with setup, workflow, logs, guide, and serial background queue
 - Direct CLI for batch/repeatable runs
+- `reviewctl` queue operations with cross-process leases, heartbeat, expiry recovery, and read-only validation status
 - Repo-local Codex/OMX skill: `auto-generate-orchestrator`
 - Stage-1 summary reuse, summary merging, partial reruns, and failed-paper/failed-section retry
 - PDF preprocessing cache with `normalized.md`, page index, diagnostics, structured artifacts, OCR fallback, and optional local RAG

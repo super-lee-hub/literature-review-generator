@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import hashlib
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from ai_interface import _call_ai_api
 from models import APIConfig
-from runtime.provider_runtime import ProviderBudgetExceeded
+from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
 
 
 SOURCE_GROUNDED_TIERS = frozenset(
@@ -228,13 +228,15 @@ def run_adjudication_stage(
         temperature = base_temperature
 
     prompt, system_prompt = _build_prompts(packet)
-    provider_runtime = None
-    runtime_factory = getattr(generator_instance, "new_provider_runtime", None)
+    packet_payload: Dict[str, Any]
+    try:
+        packet_payload = asdict(packet)
+    except TypeError:
+        packet_payload = dict(getattr(packet, "__dict__", {}) or {})
+
+    provider_runtime: Optional[ProviderRuntime] = None
+    runtime_factory: Any = getattr(generator_instance, "new_provider_runtime", None)
     if callable(runtime_factory):
-        try:
-            packet_payload = asdict(packet)
-        except TypeError:
-            packet_payload = dict(getattr(packet, "__dict__", {}) or {})
         packet_hash = hashlib.sha256(
             json.dumps(
                 packet_payload,
@@ -245,21 +247,38 @@ def run_adjudication_stage(
             ).encode("utf-8")
         ).hexdigest()[:24]
         citation_key = str(packet.citation_set_key or "validation").strip()
-        provider_runtime = runtime_factory(
+        provider_runtime = cast(ProviderRuntime, runtime_factory(
             stage_name="stage4_validate",
             route="Validator_API",
             node_id=f"{packet.stage}:{citation_key}",
             call_id=f"validation:{packet.stage}:{packet_hash}",
             api_config=api_config,
-        )
+        ))
     call_kwargs: Dict[str, Any] = {
         "max_tokens": max_tokens,
         "temperature": temperature,
         "response_format": "json",
         "logger": getattr(generator_instance, "logger", None),
     }
+    request_payload: Dict[str, Any] = {
+        "system": system_prompt,
+        "user": prompt,
+        "user_content": None,
+        "response_format": "json",
+        "max_output_tokens": int(max_tokens),
+        "temperature": temperature,
+    }
     if provider_runtime is not None:
         call_kwargs["provider_runtime"] = provider_runtime
+        bind_call = getattr(generator_instance, "bind_provider_call", None)
+        if callable(bind_call):
+            bind_call(
+                call_id=str(provider_runtime.call_id),
+                prompt=prompt,
+                input_payload=request_payload,
+                api_config=api_config,
+                schema_hash=str(provider_runtime.schema_hash or ""),
+            )
     try:
         report = _call_ai_api(
             prompt,
@@ -283,7 +302,7 @@ def run_adjudication_stage(
             provider_runtime.complete(
                 admission=admission,
                 prompt=prompt,
-                input_payload={"packet": packet_payload},
+                input_payload=request_payload,
                 api_config=api_config,
                 result={
                     "status": "success" if isinstance(report, dict) else "failed",
@@ -297,13 +316,16 @@ def run_adjudication_stage(
         except ProviderBudgetExceeded:
             provider_runtime.blocked_receipt(
                 prompt=prompt,
-                input_payload={"packet": packet_payload},
+                input_payload=request_payload,
                 api_config=api_config,
                 message="validation adjudicator did not produce a provider receipt before its budget closed",
             )
 
     if not isinstance(report, dict):
         return None
+    bind_output = getattr(generator_instance, "bind_provider_output", None)
+    if provider_runtime is not None and callable(bind_output):
+        bind_output(call_id=str(provider_runtime.call_id), content=report)
     report.setdefault("adjudication_stage", packet.stage)
     report.setdefault("claim_type", packet.claim_type)
     report.setdefault("claim_type_confidence", packet.claim_type_confidence)

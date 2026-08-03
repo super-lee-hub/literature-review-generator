@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from ai_interface import _call_ai_api
 from free_mode.profile_manager import normalize_profile, save_profile
+from models import APIConfig
 from runtime.provider_runtime import ProviderBudgetV1, ProviderBudgetExceeded, ProviderRuntime, ProviderRuntimeLedger
 from services.model_selection import get_free_mode_api_config
 
@@ -99,7 +100,7 @@ def _normalize_planner_response(response: Dict[str, Any]) -> Dict[str, Any]:
 
 def _new_free_mode_provider_runtime(
     *,
-    api_config: Dict[str, Any],
+    api_config: APIConfig,
     output_dir: Optional[str],
     project_name: str,
     stage_name: str,
@@ -109,10 +110,11 @@ def _new_free_mode_provider_runtime(
 ) -> Optional[ProviderRuntime]:
     if provider_runtime is not None:
         return provider_runtime
-    if not str(output_dir or "").strip():
+    resolved_output_dir = str(output_dir or "").strip()
+    if not resolved_output_dir:
         return None
     safe_project = str(project_name or "free_mode").strip() or "free_mode"
-    ledger_path = Path(output_dir).expanduser().resolve() / f"{safe_project}_free_mode_provider_receipts.jsonl"
+    ledger_path = Path(resolved_output_dir).expanduser().resolve() / f"{safe_project}_free_mode_provider_receipts.jsonl"
     try:
         retry_limit = max(0, int(str((config or {}).get("Runtime", {}).get("node_retry_limit", 2)).strip()))
     except (TypeError, ValueError):
@@ -136,7 +138,7 @@ def _complete_injected_free_mode_runtime(
     provider_runtime: Optional[ProviderRuntime],
     *,
     prompt: str,
-    api_config: Dict[str, Any],
+    api_config: APIConfig,
     response: Any,
 ) -> None:
     if provider_runtime is None or provider_runtime.receipts:
@@ -170,7 +172,7 @@ def _complete_injected_free_mode_runtime(
 def _call_free_mode_api(
     *,
     prompt: str,
-    api_config: Dict[str, Any],
+    api_config: APIConfig,
     system_prompt: str,
     max_tokens: int,
     temperature: float,

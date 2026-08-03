@@ -17,6 +17,7 @@ AuditType = Literal[
     "outline_manual_adoption",
     "dependency_force_delete",
     "artifact_quarantine_release",
+    "repair_promotion",
 ]
 
 _AUDIT_TYPES = frozenset(
@@ -25,6 +26,7 @@ _AUDIT_TYPES = frozenset(
         "outline_manual_adoption",
         "dependency_force_delete",
         "artifact_quarantine_release",
+        "repair_promotion",
     }
 )
 _SHA256_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")

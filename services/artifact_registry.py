@@ -546,6 +546,15 @@ class ArtifactRegistry:
             raise UnverifiedArtifact(
                 f"artifact content hash changed: {record.artifact_id}"
             )
+        try:
+            from runtime.artifact_validators import OUTLINE_V3_ARTIFACT_TYPES, validate_current_outline_artifact
+
+            if record.artifact_type in OUTLINE_V3_ARTIFACT_TYPES and record.artifact_version == "v3":
+                validate_current_outline_artifact(record, artifact_path)
+        except ValueError as exc:
+            raise UnverifiedArtifact(
+                f"artifact schema is invalid: {record.artifact_id}: {exc}"
+            ) from exc
 
     @staticmethod
     def _copy_record(record: ArtifactRecord) -> ArtifactRecord:

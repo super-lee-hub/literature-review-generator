@@ -34,6 +34,7 @@ from outline.v3_evidence import (
 )
 from outline.v3_models import (
     CoverageContract,
+    OutlineQualityGate,
     GlobalCorpusLedger,
     GlobalCorpusLedgerEntry,
     MultiViewMatrix,
@@ -75,6 +76,7 @@ __all__ = [
     "MultiViewMatrix",
     "ReviewIntent",
     "CoverageContract",
+    "OutlineQualityGate",
     "build_outline_evidence_views",
     "build_global_corpus_ledger",
     "build_multi_view_matrix",

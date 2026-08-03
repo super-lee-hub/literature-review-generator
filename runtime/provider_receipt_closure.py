@@ -33,6 +33,10 @@ class ExpectedProviderCall:
     config_hash: str = ""
     schema_hash: str = ""
     output_hash: str = ""
+    normalized_output_hash: str = ""
+    registered_artifact_hash: str = ""
+    replay_output_hash: str = ""
+    node_output_hash: str = ""
     max_attempts: int = 0
     usage_required: bool = False
 
@@ -49,6 +53,10 @@ class ExpectedProviderCall:
             config_hash=str(payload.get("config_hash") or ""),
             schema_hash=str(payload.get("schema_hash") or ""),
             output_hash=str(payload.get("output_hash") or ""),
+            normalized_output_hash=str(payload.get("normalized_output_hash") or ""),
+            registered_artifact_hash=str(payload.get("registered_artifact_hash") or ""),
+            replay_output_hash=str(payload.get("replay_output_hash") or ""),
+            node_output_hash=str(payload.get("node_output_hash") or ""),
             max_attempts=max(0, int(payload.get("max_attempts") or 0)),
             usage_required=bool(payload.get("usage_required", False)),
         )
@@ -155,9 +163,39 @@ class ProviderReceiptClosure:
                 failed.append(call_id)
             if current.status == "success" and (current.incomplete_reason or current.finish_reason == "length"):
                 incomplete.append(call_id)
-            if contract.output_hash and current.response_hash != contract.output_hash:
-                mismatches.setdefault(call_id, tuple())
-                mismatches[call_id] = tuple(sorted(set((*mismatches[call_id], "response_hash"))))
+            if current.status == "success":
+                mismatch_fields = set(mismatches.get(call_id, ()))
+                response_hash = str(current.response_hash or "")
+                output_hash = str(contract.output_hash or "")
+                normalized_hash = str(contract.normalized_output_hash or "")
+                registered_hash = str(contract.registered_artifact_hash or "")
+                node_hash = str(contract.node_output_hash or "")
+                replay_hash = str(contract.replay_output_hash or "")
+                if not response_hash:
+                    mismatch_fields.add("response_hash_missing")
+                if not output_hash:
+                    mismatch_fields.add("output_hash_missing")
+                elif response_hash != output_hash:
+                    mismatch_fields.add("response_hash")
+                if not normalized_hash:
+                    mismatch_fields.add("normalized_output_hash_missing")
+                else:
+                    if output_hash and normalized_hash != output_hash:
+                        mismatch_fields.add("output_normalized_hash")
+                    if response_hash != normalized_hash:
+                        mismatch_fields.add("normalized_output_hash")
+                if registered_hash and node_hash and registered_hash != node_hash:
+                    mismatch_fields.add("node_artifact_hash")
+                elif registered_hash and not node_hash:
+                    mismatch_fields.add("node_output_hash_missing")
+                elif node_hash and not registered_hash:
+                    mismatch_fields.add("registered_artifact_hash_missing")
+                if replay_hash and normalized_hash and replay_hash != normalized_hash:
+                    mismatch_fields.add("replay_output_hash")
+                if mismatch_fields:
+                    mismatches[call_id] = tuple(sorted(mismatch_fields))
+                else:
+                    mismatches.pop(call_id, None)
             if contract.max_attempts and current.attempts > contract.max_attempts:
                 retry_exceeded.append(call_id)
             if contract.usage_required and current.usage_status not in {"reported", "provider_not_supported"}:

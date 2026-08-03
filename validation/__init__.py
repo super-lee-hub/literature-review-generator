@@ -26,6 +26,7 @@ from validation.summary_recheck import (
 )
 from validation.repair_models import (
     AppliedPatchRecord,
+    AutoSafePatch,
     ApplyGuardResult,
     DependencyHashBundle,
     PatchGranularity,
@@ -35,7 +36,10 @@ from validation.repair_models import (
     RepairPlan,
     RepairPolicy,
     RepairReport,
+    RepairIssue,
     RepairRootCause,
+    RepairStructuralClosure,
+    ManualReviewAction,
 )
 from validation.repair_planner import (
     RepairPlanner,
@@ -67,6 +71,7 @@ from validation.repair_transaction import (
     REPAIR_TRANSACTION_ARTIFACT_TYPE,
     REPAIR_TRANSACTION_ARTIFACT_VERSION,
     RepairTransactionRecord,
+    RepairPromotionTransaction,
     RepairTransactionService,
 )
 
@@ -91,6 +96,7 @@ __all__ = [
     "run_summary_rechecks",
     # Week 4 repair pipeline
     "AppliedPatchRecord",
+    "AutoSafePatch",
     "ApplyGuardResult",
     "DependencyHashBundle",
     "PatchGranularity",
@@ -100,7 +106,10 @@ __all__ = [
     "RepairPlan",
     "RepairPolicy",
     "RepairReport",
+    "RepairIssue",
     "RepairRootCause",
+    "RepairStructuralClosure",
+    "ManualReviewAction",
     "RepairPlanner",
     "run_repair_planning",
     "RepairApplier",
@@ -124,5 +133,6 @@ __all__ = [
     "REPAIR_TRANSACTION_ARTIFACT_TYPE",
     "REPAIR_TRANSACTION_ARTIFACT_VERSION",
     "RepairTransactionRecord",
+    "RepairPromotionTransaction",
     "RepairTransactionService",
 ]

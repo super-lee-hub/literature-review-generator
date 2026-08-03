@@ -198,9 +198,23 @@ Meaning:
 
 ### 6.5 GUI background queue
 
-Queueing is now a **GUI-first** interaction model. On the Workflow page, buttons such as "Analyze only", "Generate outline", "Generate review", and "Run all" submit jobs into the GUI's internal persistent serial queue. The queue drains in the background, and the form remains editable so you can configure the next job immediately.
+Queueing remains a **GUI-first** interaction model. On the Workflow page,
+buttons such as "Analyze only", "Generate outline", "Generate review", and
+"Run all" submit jobs into the GUI's persistent serial queue. Queue state is
+stored with atomic cross-process snapshots and worker leases, so heartbeats,
+expiry, and crash recovery are explicit rather than inferred from a UI flag.
 
-The CLI no longer exposes public queue commands. Command-line usage is direct-run only, e.g. `--analyze-only`, `--generate-outline`, `--generate-review`, and `--run-all`. The AI-native Codex / OMX skill also runs directly and stays out of the GUI queue.
+The CLI also exposes read/write queue operations through `reviewctl`:
+`queue-list`, `queue-add`, `queue-run`, `queue-retry`, `queue-cancel`,
+`queue-remove`, `queue-export`, and `queue-import`. Direct `main.py` usage is
+still available for `--analyze-only`, `--generate-outline`,
+`--generate-review`, and `--run-all`; the AI-native Codex / OMX skill runs
+directly and stays out of the GUI queue.
+
+Outline v3 outputs are reusable only with an exact execution binding and closed
+provider receipt chain. Explicit adoption creates a versioned adoption identity
+and a current pointer; validation and repair remain separate, registry-backed
+gates.
 
 ## 7. Advanced capabilities
 

@@ -575,6 +575,67 @@ class CoverageContract:
 
 
 @dataclass(frozen=True)
+class OutlineQualityGate:
+    """Typed adoption gate shared by coverage, stability, and health.
+
+    The thresholds are persisted in every downstream binding.  Changing a
+    gate therefore invalidates the audits and health decision instead of
+    silently reusing a result calculated under another policy.
+    """
+
+    coverage_scope: str = "full"
+    min_canonical_coverage_full: float = 1.0
+    min_canonical_coverage_local: float = 1.0
+    min_effective_sections: int = 1
+    max_duplicate_assignments: int = 0
+    block_placeholder_sections: bool = True
+    block_empty_research_streams: bool = True
+
+    def __post_init__(self) -> None:
+        if self.coverage_scope not in {"full", "local"}:
+            raise ValueError("coverage_scope must be 'full' or 'local'")
+        for name in ("min_canonical_coverage_full", "min_canonical_coverage_local"):
+            value = float(getattr(self, name))
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+            object.__setattr__(self, name, value)
+        if int(self.min_effective_sections) < 1:
+            raise ValueError("min_effective_sections must be positive")
+        if int(self.max_duplicate_assignments) < 0:
+            raise ValueError("max_duplicate_assignments must be non-negative")
+        object.__setattr__(self, "min_effective_sections", int(self.min_effective_sections))
+        object.__setattr__(self, "max_duplicate_assignments", int(self.max_duplicate_assignments))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "coverage_scope": self.coverage_scope,
+            "min_canonical_coverage_full": self.min_canonical_coverage_full,
+            "min_canonical_coverage_local": self.min_canonical_coverage_local,
+            "min_effective_sections": self.min_effective_sections,
+            "max_duplicate_assignments": self.max_duplicate_assignments,
+            "block_placeholder_sections": self.block_placeholder_sections,
+            "block_empty_research_streams": self.block_empty_research_streams,
+        }
+
+    @property
+    def content_hash(self) -> str:
+        return compute_v3_hash(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "OutlineQualityGate":
+        source = value or {}
+        return cls(
+            coverage_scope=str(source.get("coverage_scope") or "full"),
+            min_canonical_coverage_full=float(source.get("min_canonical_coverage_full", 1.0)),
+            min_canonical_coverage_local=float(source.get("min_canonical_coverage_local", 1.0)),
+            min_effective_sections=int(source.get("min_effective_sections", 1)),
+            max_duplicate_assignments=int(source.get("max_duplicate_assignments", 0)),
+            block_placeholder_sections=bool(source.get("block_placeholder_sections", True)),
+            block_empty_research_streams=bool(source.get("block_empty_research_streams", True)),
+        )
+
+
+@dataclass(frozen=True)
 class RelationCandidate:
     """A deterministic, evidence-linked relation candidate between papers."""
 
@@ -836,6 +897,7 @@ GlobalCorpusLedgerV1 = GlobalCorpusLedger
 MultiViewMatrixV1 = MultiViewMatrix
 ReviewIntentV1 = ReviewIntent
 CoverageContractV1 = CoverageContract
+OutlineQualityGateV1 = OutlineQualityGate
 RelationCandidateV1 = RelationCandidate
 GlobalRelationMapV1 = GlobalRelationMap
 OrganizingAxisV1 = OrganizingAxis
@@ -860,12 +922,14 @@ __all__ = [
     "MultiViewMatrix",
     "ReviewIntent",
     "CoverageContract",
+    "OutlineQualityGate",
     "OutlineEvidenceViewV1",
     "OutlineEvidenceViewsV1",
     "GlobalCorpusLedgerV1",
     "MultiViewMatrixV1",
     "ReviewIntentV1",
     "CoverageContractV1",
+    "OutlineQualityGateV1",
     "RelationCandidate",
     "GlobalRelationMap",
     "OrganizingAxis",

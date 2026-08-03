@@ -72,6 +72,7 @@ class OutlineNodeRecord:
     completed_at: str = ""
     depends_on: List[str] = field(default_factory=list)
     diagnostics: List[str] = field(default_factory=list)
+    execution_binding: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not _safe_text(self.node_id):
@@ -115,6 +116,7 @@ class OutlineNodeRecord:
             "idempotency_key": self.idempotency_key,
             "depends_on": _stable_unique(self.depends_on),
             "diagnostics": _stable_unique(self.diagnostics),
+            "execution_binding": _stable_mapping(self.execution_binding),
         }
 
     @property
@@ -156,6 +158,7 @@ class OutlineNodeRecord:
             completed_at=str(data.get("completed_at") or ""),
             depends_on=_stable_unique(data.get("depends_on") or []),
             diagnostics=_stable_unique(data.get("diagnostics") or []),
+            execution_binding=_stable_mapping(data.get("execution_binding")),
         )
 
 
@@ -457,6 +460,11 @@ class OutlineNodeStore:
         if current is not None:
             if current.job_id != job_id:
                 raise ValueError("existing Outline v3 node DAG belongs to another job")
+            expected = create_outline_v3_node_dag(job_id, candidate_count=candidate_count)
+            if {node.node_id for node in current.nodes} != {node.node_id for node in expected.nodes}:
+                current_by_id = current.node_map()
+                merged = [current_by_id.get(node.node_id, node) for node in expected.nodes]
+                current, _record = self.save(replace(current, nodes=merged, updated_at=_utc_now_iso()))
             return current
         current, _record = self.save(create_outline_v3_node_dag(job_id, candidate_count=candidate_count))
         return current
@@ -479,6 +487,7 @@ class OutlineNodeStore:
         receipt_ids: Sequence[str] = (),
         attempt_ids: Sequence[str] = (),
         diagnostics: Sequence[str] = (),
+        execution_binding: Optional[Mapping[str, Any]] = None,
     ) -> OutlineNodeDAG:
         dag = self.load()
         if dag is None:
@@ -507,6 +516,7 @@ class OutlineNodeStore:
             attempt_ids=_stable_unique([*current.attempt_ids, *attempt_ids]),
             completed_at=_utc_now_iso() if status in {"succeeded", "failed", "blocked", "cancelled", "stale"} else "",
             diagnostics=_stable_unique([*current.diagnostics, *diagnostics]),
+            execution_binding=_stable_mapping(execution_binding) if execution_binding is not None else current.execution_binding,
         )
         nodes = [updated if node.node_id == node_id else node for node in dag.nodes]
         updated_dag, _record = self.save(replace(dag, nodes=nodes))
@@ -519,6 +529,38 @@ class OutlineNodeStore:
         plan = plan_outline_v3_resume(dag, node_id)
         updated, _record = self.save(apply_outline_v3_resume(dag, plan))
         return updated, plan
+
+    def invalidate_subgraph(self, node_id: str, *, reason: str) -> OutlineNodeDAG:
+        """Mark a changed node stale and its descendants pending.
+
+        A binding change is a semantic invalidation, not a diagnostic-only
+        replay miss.  Unrelated upstream nodes remain untouched so a resume
+        can still reuse their exact, verified artifacts.
+        """
+
+        dag = self.load()
+        if dag is None:
+            raise ValueError("Outline v3 node DAG has not been initialized")
+        if node_id not in dag.node_map():
+            raise KeyError(f"unknown Outline v3 node: {node_id}")
+        affected = {node_id, *_descendants(dag, node_id)}
+        nodes: List[OutlineNodeRecord] = []
+        for node in dag.nodes:
+            if node.node_id not in affected:
+                nodes.append(node)
+                continue
+            next_status: NodeStatus = "stale" if node.node_id == node_id else "pending"
+            nodes.append(replace(
+                node,
+                status=next_status,
+                input_hash="" if next_status == "pending" else node.input_hash,
+                output_hash="" if next_status == "pending" else node.output_hash,
+                output_artifact_ids=[] if next_status == "pending" else node.output_artifact_ids,
+                completed_at="",
+                diagnostics=_stable_unique([*node.diagnostics, f"binding_invalidated:{reason}"]),
+            ))
+        updated, _record = self.save(replace(dag, nodes=nodes))
+        return updated
 
     def resume(self) -> Tuple[OutlineNodeDAG, ResumePlan]:
         dag = self.load()

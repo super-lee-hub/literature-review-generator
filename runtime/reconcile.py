@@ -24,7 +24,11 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_outcome import JobOutcomeV1
-from services.job_workspace import atomic_write_json
+from runtime.artifact_validators import (
+    ArtifactSchemaError,
+    OUTLINE_V3_ARTIFACT_TYPES as CURRENT_OUTLINE_V3_ARTIFACT_TYPES,
+    validate_current_outline_artifact,
+)
 from summary_schema import (
     ROUTE_CONFIDENCE_VALUES,
     is_canonical_ai_summary,
@@ -400,10 +404,12 @@ _OUTLINE_V3_ARTIFACT_TYPES = frozenset(
         "evidence_critique",
         "arbitration_decision",
         "selected_outline_candidate",
+        "section_evidence_packet",
         "section_evidence_packet_set",
         "final_outline",
         "coverage_audit",
         "stability_audit",
+        "provider_receipt_closure",
         "outline_stage_health",
         "adopted_outline",
     }
@@ -411,21 +417,13 @@ _OUTLINE_V3_ARTIFACT_TYPES = frozenset(
 
 
 def _validate_outline_v3_artifact(record: ArtifactRecord, path: Path) -> None:
-    payload = _read_json_object(path)
-    artifact_type = str(payload.get("artifact_type") or "")
-    if record.artifact_type not in _OUTLINE_V3_ARTIFACT_TYPES or artifact_type != record.artifact_type:
-        raise ReconcileValidationError(f"Outline v3 artifact type is inconsistent: {record.artifact_id}")
-    _require_contract_header(
-        record,
-        payload,
-        artifact_type=artifact_type,
-        versions=("v3",),
-    )
-    _require_owned_job(record, payload, field="job_id")
-    _require_mapping(payload.get("payload"), label=f"{artifact_type} payload")
-    _require_nonempty_string(payload.get("content_hash"), label=f"{artifact_type} content_hash")
-    if str(payload.get("status") or "") not in {"ready", "blocked"}:
-        raise ReconcileValidationError(f"{artifact_type} status is invalid")
+    if record.artifact_version != "v3":
+        _validate_provider_receipt_closure(record, path)
+        return
+    try:
+        validate_current_outline_artifact(record, path)
+    except ArtifactSchemaError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_final_outline(record: ArtifactRecord, path: Path) -> None:
@@ -434,6 +432,56 @@ def _validate_final_outline(record: ArtifactRecord, path: Path) -> None:
 
 def _validate_outline_stage_health(record: ArtifactRecord, path: Path) -> None:
     _validate_outline_v3_artifact(record, path)
+
+
+def _validate_provider_receipt_closure(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    if not str(payload.get("job_id") or "") or str(payload.get("job_id")) != record.job_id:
+        raise ReconcileValidationError("provider receipt closure job_id mismatch")
+    closure = payload.get("payload")
+    if not isinstance(closure, Mapping):
+        raise ReconcileValidationError("provider receipt closure payload must be an object")
+    _require_fields(closure, ("expected_call_ids", "observed_call_ids", "complete"), label="provider receipt closure")
+    if not isinstance(closure.get("expected_call_ids"), list) or not isinstance(closure.get("observed_call_ids"), list):
+        raise ReconcileValidationError("provider receipt closure call ids must be arrays")
+    if not isinstance(closure.get("complete"), bool):
+        raise ReconcileValidationError("provider receipt closure complete must be boolean")
+
+
+def _validate_outline_adoption_pointer(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    _require_fields(
+        payload,
+        (
+            "artifact_type",
+            "artifact_version",
+            "job_id",
+            "role",
+            "current_adoption_artifact_id",
+            "current_adoption_hash",
+            "adoption_identity",
+        ),
+        label="outline adoption pointer",
+    )
+    if payload.get("artifact_type") != "outline_adoption_pointer" or payload.get("artifact_version") != "v1":
+        raise ReconcileValidationError("outline adoption pointer contract header is invalid")
+    _require_owned_job(record, payload, field="job_id")
+    if payload.get("role") != "current":
+        raise ReconcileValidationError("outline adoption pointer role must be current")
+    target_id = _require_nonempty_string(
+        payload.get("current_adoption_artifact_id"),
+        label="outline adoption pointer target",
+    )
+    target_hash = _require_nonempty_string(
+        payload.get("current_adoption_hash"),
+        label="outline adoption pointer target hash",
+    )
+    if not target_id.startswith("outline-v3:adoption:"):
+        raise ReconcileValidationError("outline adoption pointer target must be versioned")
+    if len(target_hash) != 64 or any(char not in "0123456789abcdef" for char in target_hash.lower()):
+        raise ReconcileValidationError("outline adoption pointer target hash must be SHA-256")
+    if payload.get("adoption_identity") != target_id:
+        raise ReconcileValidationError("outline adoption pointer identity does not match target")
 
 
 def _validate_evidence_manifest(record: ArtifactRecord, path: Path) -> None:
@@ -1429,6 +1477,7 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "citation_manifest": _validate_citation_manifest,
     "citation_ref_catalog": _validate_citation_ref_catalog,
     "provider_receipt_ledger": _validate_provider_receipt_ledger,
+    "provider_receipt_closure": _validate_provider_receipt_closure,
     "stage1_canonical_summaries": _validate_json_object,
     "audit_record": _validate_audit_record,
     "validation_report_projection": _validate_nonempty_text,
@@ -1437,7 +1486,17 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "claim_alignment_audit_projection": _validate_json_object,
     "final_outline": _validate_final_outline,
     "outline_stage_health": _validate_outline_stage_health,
+    "outline_adoption_pointer": _validate_outline_adoption_pointer,
 }
+
+for _current_outline_artifact_type in CURRENT_OUTLINE_V3_ARTIFACT_TYPES:
+    if _current_outline_artifact_type in {"stage1_canonical_summaries", "outline_v3_node_dag"}:
+        continue
+    if _current_outline_artifact_type in _OUTLINE_V3_ARTIFACT_TYPES:
+        continue
+    DEFAULT_SCHEMA_VALIDATORS[_current_outline_artifact_type] = validate_current_outline_artifact
+DEFAULT_SCHEMA_VALIDATORS["stage1_canonical_summaries"] = validate_current_outline_artifact
+DEFAULT_SCHEMA_VALIDATORS["outline_v3_node_dag"] = validate_current_outline_artifact
 
 for _outline_artifact_type in _OUTLINE_V3_ARTIFACT_TYPES:
     DEFAULT_SCHEMA_VALIDATORS[_outline_artifact_type] = _validate_outline_v3_artifact

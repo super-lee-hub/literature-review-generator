@@ -16,20 +16,30 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRecord,
+    ArtifactRegistry,
+)
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from services.audit_record import AuditArtifactRefV1, AuditRecordV1
 from validation.closure import ValidationClosureResult, ValidationClosureService
 from validation.repair_apply import run_repair_apply
 from validation.repair_models import (
+    AutoSafePatch,
     DependencyHashBundle,
+    ManualReviewAction,
     PatchGranularity,
     PatchProposal,
     PatchTargetSignature,
     RepairPlan,
+    RepairIssue,
     RepairPolicy,
     RepairRootCause,
+    RepairStructuralClosure,
     NOT_APPLICABLE,
 )
 from validation.semantic_revalidation import run_semantic_revalidation
@@ -191,7 +201,7 @@ def _targeted_revalidate(
         else:
             mapped_count += 1
 
-    return {
+    result = {
         "passed": not diagnostics,
         "diagnostics": sorted(set(diagnostics)),
         "section_count": len(sections) if isinstance(sections, list) else 0,
@@ -200,6 +210,8 @@ def _targeted_revalidate(
         "mapped_occurrence_count": mapped_count,
         "unresolved_occurrence_count": unresolved_count,
     }
+    result["evidence_hash"] = _hash(result)
+    return result
 
 
 def _root_cause(values: Sequence[Any]) -> RepairRootCause:
@@ -289,6 +301,40 @@ class RepairTransactionRecord:
         return payload
 
 
+@dataclass(frozen=True)
+class RepairPromotionTransaction:
+    """Immutable record for versioned repair outputs.
+
+    Promotion creates new identities for the draft, manifest, DOCX, audit, and
+    lineage.  It never overwrites a canonical path and never exports a
+    quarantined artifact as if it were canonical.
+    """
+
+    transaction_id: str
+    job_id: str
+    source_transaction_id: str
+    status: str
+    actor: str
+    reason: str
+    canonical_version: str
+    review_draft_artifact_id: str
+    citation_manifest_artifact_id: str
+    review_docx_artifact_id: str
+    audit_artifact_id: str
+    lineage_artifact_id: str
+    canonical_input_hashes: Mapping[str, str]
+    output_hashes: Mapping[str, str]
+    created_at: str
+    artifact_type: str = "repair_promotion_transaction"
+    artifact_version: str = "v1"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["canonical_input_hashes"] = dict(self.canonical_input_hashes)
+        payload["output_hashes"] = dict(self.output_hashes)
+        return payload
+
+
 class RepairTransactionService:
     def __init__(self, workspace: JobWorkspace, registry: ArtifactRegistry) -> None:
         self.workspace = workspace
@@ -320,7 +366,6 @@ class RepairTransactionService:
         inputs = closure.input_artifacts
         draft = inputs.get("review_draft") if isinstance(inputs, Mapping) else {}
         manifest = inputs.get("citation_manifest") if isinstance(inputs, Mapping) else {}
-        validation = closure.validation_artifact or {}
 
         def load(record: ArtifactRecord | None) -> dict[str, Any] | list[Any]:
             if record is None:
@@ -335,7 +380,6 @@ class RepairTransactionService:
             candidates = [item for item in records if item.artifact_type in artifact_types]
             return max(candidates, key=lambda item: (item.created_at, item.artifact_id), default=None)
 
-        summary_record = choose("summary_file", "stage1_canonical_summaries")
         paper_records = [
             item for item in records
             if item.artifact_type in {"paper_artifact", "stage1_paper_artifact"}
@@ -369,7 +413,8 @@ class RepairTransactionService:
         outline_record = next(
             (
                 item for item in records
-                if item.artifact_id in {"outline-v3:final_outline", "outline-v3:adoption"}
+                if item.artifact_id == "outline-v3:final_outline"
+                or item.artifact_type == "adopted_outline"
             ),
             None,
         )
@@ -411,7 +456,7 @@ class RepairTransactionService:
                 "paper_artifact",
                 "stage1_paper_artifact",
                 "visual_manifest",
-            } or record.artifact_id in {"outline-v3:final_outline", "outline-v3:adoption"}:
+            } or record.artifact_id == "outline-v3:final_outline" or record.artifact_type == "adopted_outline":
                 records.append(record)
         return records
 
@@ -425,18 +470,66 @@ class RepairTransactionService:
         if not isinstance(claims, list):
             return None
         proposals: list[PatchProposal] = []
+        issues: list[RepairIssue] = []
+        manual_review_actions: list[ManualReviewAction] = []
+        auto_safe_patches: list[AutoSafePatch] = []
         for claim in claims:
             if not isinstance(claim, Mapping):
                 continue
             verdict = str(claim.get("verdict") or "needs_review")
             if verdict == "supported":
                 continue
+            claim_id = str(claim.get("claim_result_id") or "").strip()
+            issue_id = "repair-issue:" + _hash(
+                {
+                    "validation": validation_record.artifact_id if validation_record else "",
+                    "claim_result_id": claim_id,
+                    "block_ids": claim.get("block_ids") or [],
+                }
+            )[:24]
             block_ids = [str(item) for item in (claim.get("block_ids") or []) if str(item)]
             block_id = block_ids[0] if block_ids else ""
             block = _find_block(draft, block_id) if block_id else None
+            root_cause = _root_cause(claim.get("root_causes") or [])
+            evidence = [
+                dict(item)
+                for item in claim.get("evidence_candidates") or []
+                if isinstance(item, Mapping)
+            ]
+            issues.append(
+                RepairIssue(
+                    issue_id=issue_id,
+                    issue_type=root_cause.value,
+                    severity="high" if bool(claim.get("low_confidence")) else "medium",
+                    message=str(
+                        claim.get("reasoning_summary")
+                        or claim.get("repair_hint")
+                        or "validation finding requires repair review"
+                    ),
+                    artifact_id=validation_record.artifact_id if validation_record else "",
+                    citation_id=str(claim.get("citation_set_key") or claim_id),
+                    block_id=block_id,
+                    location={
+                        "span_start": claim.get("span_start"),
+                        "span_end": claim.get("span_end"),
+                    },
+                    evidence=evidence,
+                    repairability="manual_review",
+                    metadata={"verdict": verdict, "root_cause": root_cause.value},
+                )
+            )
             if block is None:
                 # Keep the issue in the plan metadata rather than inventing a
                 # target.  An ungrounded patch must never become applicable.
+                manual_review_actions.append(
+                    ManualReviewAction(
+                        action_id=f"manual-review:{issue_id}",
+                        issue_id=issue_id,
+                        action="resolve_target_block_and_evidence",
+                        rationale="the validation finding has no registered review block target",
+                        required_inputs=["review_draft", "citation_manifest", "paper_artifacts"],
+                    )
+                )
                 continue
             block_text = str(block.get("text") or "")
             proposal_id = "patch:" + _hash(
@@ -446,7 +539,6 @@ class RepairTransactionService:
                     "draft_hash": draft_record.content_hash if draft_record else "",
                 }
             )[:24]
-            root_cause = _root_cause(claim.get("root_causes") or [])
             proposals.append(
                 PatchProposal(
                     proposal_id=proposal_id,
@@ -468,11 +560,21 @@ class RepairTransactionService:
                     fix_strategy="manual_review_mapping_first",
                     dependency_bundle=self._dependency_bundle(closure),
                     metadata={
+                        "issue_id": issue_id,
                         "validation_result_id": validation_record.artifact_id if validation_record else "",
                         "claim_result_id": str(claim.get("claim_result_id") or ""),
                         "verdict": verdict,
                         "report_only": True,
                     },
+                )
+            )
+            manual_review_actions.append(
+                ManualReviewAction(
+                    action_id=f"manual-review:{issue_id}",
+                    issue_id=issue_id,
+                    action="confirm_mapping_or_propose_structural_patch",
+                    rationale="report-first plans never turn a validation finding into an automatic rewrite",
+                    required_inputs=["review_draft", "citation_manifest", "paper_artifacts"],
                 )
             )
         proposals.sort(
@@ -496,6 +598,9 @@ class RepairTransactionService:
             proposals=proposals,
             policy=RepairPolicy.REPORT_FIRST,
             dependency_hash_bundle=self._dependency_bundle(closure),
+            issues=issues,
+            manual_review_actions=manual_review_actions,
+            auto_safe_patches=auto_safe_patches,
         )
 
     def create_report_only_plan(self, closure: ValidationClosureResult | None = None) -> dict[str, Any]:
@@ -719,18 +824,33 @@ class RepairTransactionService:
             paper_artifacts,
             citation_ref_catalog=citation_ref_catalog,
         )
-        if not semantic_revalidation.passed:
+        structural_closure = RepairStructuralClosure.from_results(
+            targeted_revalidation,
+            semantic_revalidation.to_dict(),
+            canonical_input_hashes={
+                record.artifact_id: record.content_hash
+                for record in (draft_record, manifest_record, validation_record)
+                if record is not None
+            },
+            derived_output_hashes={
+                "review_draft_repaired": _hash(patched_draft),
+                "citation_manifest_repaired": _hash(patched_manifest),
+            },
+        )
+        if not structural_closure.passed:
             return {
                 "status": "blocked",
-                "reason": "semantic revalidation failed; derived repair artifacts were not persisted",
+                "reason": "repair structural closure failed; derived repair artifacts were not persisted",
                 "plan_id": plan_id,
                 "apply_result": apply_result,
                 "targeted_revalidation": targeted_revalidation,
                 "semantic_revalidation": semantic_revalidation.to_dict(),
+                "repair_structural_closure": structural_closure.to_dict(),
                 "mutation_performed": False,
             }
         apply_payload["targeted_revalidation"] = targeted_revalidation
         apply_payload["semantic_revalidation"] = semantic_revalidation.to_dict()
+        apply_payload["repair_structural_closure"] = structural_closure.to_dict()
         derived_draft_path = tx_dir / "review_draft_repaired.json"
         derived_manifest_path = tx_dir / "citation_manifest_repaired.json"
         apply_result_path = tx_dir / "repair_apply_result.json"
@@ -837,14 +957,425 @@ class RepairTransactionService:
             "applied_artifact_ids": list(transaction.applied_artifact_ids),
             "applied_patch_ids": list(transaction.applied_patch_ids),
             "apply_result": apply_result,
+            "repair_structural_closure": structural_closure.to_dict(),
             "mutation_performed": True,
             "canonical_replacement": False,
         }
+
+    def promote_transaction(
+        self,
+        transaction_id: str,
+        *,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Create versioned canonical-shaped outputs from a quarantined repair.
+
+        This is an explicit, auditable transaction.  The existing canonical
+        draft, manifest, and DOCX paths are never written, renamed, deleted,
+        or replaced.  If any structural or semantic check fails, no output is
+        registered as a promoted artifact.
+        """
+
+        actor = str(actor or "").strip()
+        reason = str(reason or "").strip()
+        if not actor or not reason:
+            return {
+                "status": "blocked",
+                "reason": "promotion actor and reason are required",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+        source_record = self.registry.get(transaction_id) or self.registry.get(
+            f"repair-tx:{transaction_id}"
+        )
+        if source_record is None or source_record.artifact_type != REPAIR_TRANSACTION_ARTIFACT_TYPE:
+            return {
+                "status": "blocked",
+                "reason": "source repair transaction is not registered",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+        source_payload = _load_json(source_record)
+        if source_payload is None or source_record.status != "quarantined":
+            return {
+                "status": "blocked",
+                "reason": "promotion requires a quarantined repair transaction",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+
+        source_hash_prefix = source_record.content_hash[:16]
+        promotion_id = f"repair-promotion:{source_hash_prefix}"
+        existing_promotions = [
+            item
+            for item in self.registry.list_records()
+            if item.artifact_id == promotion_id
+            and item.status == "ready"
+            and item.artifact_type == "repair_promotion_transaction"
+        ]
+        if existing_promotions:
+            return {
+                "status": "already_promoted",
+                "transaction_id": transaction_id,
+                "promotion_transaction_id": promotion_id,
+                "mutation_performed": False,
+            }
+
+        applied_ids = [str(item) for item in source_payload.get("applied_artifact_ids") or ()]
+        derived_records = [
+            self.registry.get(item)
+            for item in applied_ids
+            if self.registry.get(item) is not None
+        ]
+        derived_draft_record = next(
+            (item for item in derived_records if item is not None and item.artifact_type == "review_draft_repaired"),
+            None,
+        )
+        derived_manifest_record = next(
+            (item for item in derived_records if item is not None and item.artifact_type == "citation_manifest_repaired"),
+            None,
+        )
+        draft_payload = _load_json(derived_draft_record)
+        manifest_payload = _load_json(derived_manifest_record)
+        if draft_payload is None or manifest_payload is None:
+            return {
+                "status": "blocked",
+                "reason": "repair transaction does not contain derived draft and manifest",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+
+        draft_record, manifest_record, validation_record = self._canonical_inputs()
+        if draft_record is None or manifest_record is None:
+            return {
+                "status": "blocked",
+                "reason": "canonical draft and manifest are required for promotion lineage",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+        paper_artifacts = [
+            payload
+            for record in self.registry.list_records()
+            if record.status == "ready"
+            and record.artifact_type in {"paper_artifact", "stage1_paper_artifact"}
+            for payload in [_load_json(record)]
+            if payload is not None
+        ]
+        catalog_payload: dict[str, Any] = {}
+        catalog_record = self.registry.get("citation_ref_catalog")
+        if catalog_record is not None and catalog_record.status == "ready":
+            loaded_catalog = _load_json(catalog_record)
+            if loaded_catalog is not None:
+                catalog_payload = loaded_catalog
+        targeted = _targeted_revalidate(
+            draft_payload,
+            manifest_payload,
+            paper_artifacts,
+            catalog_payload,
+        )
+        semantic = run_semantic_revalidation(
+            draft_payload,
+            manifest_payload,
+            paper_artifacts,
+            citation_ref_catalog=catalog_payload,
+        )
+        structural = RepairStructuralClosure.from_results(
+            targeted,
+            semantic.to_dict(),
+            canonical_input_hashes={
+                item.artifact_id: item.content_hash
+                for item in (draft_record, manifest_record, validation_record)
+                if item is not None
+            },
+        )
+        if not structural.passed:
+            return {
+                "status": "blocked",
+                "reason": "repair structural closure failed during promotion",
+                "transaction_id": transaction_id,
+                "repair_structural_closure": structural.to_dict(),
+                "mutation_performed": False,
+            }
+
+        versioned_suffix = source_hash_prefix
+        versioned_draft_id = f"review_draft:v3:repair:{versioned_suffix}"
+        versioned_manifest_id = f"citation_manifest:v3:repair:{versioned_suffix}"
+        versioned_docx_id = f"review_docx:v1:repair:{versioned_suffix}"
+        promotion_dir = Path(
+            self.workspace.artifact_path(
+                f"repair_promotions/{promotion_id.replace(':', '-') }"
+            )
+        )
+        promotion_dir.mkdir(parents=True, exist_ok=True)
+        promoted_draft_path = promotion_dir / "review_draft_v3.json"
+        promoted_manifest_path = promotion_dir / "citation_manifest_v3.json"
+        promoted_docx_path = promotion_dir / "review.docx"
+
+        promoted_draft = copy.deepcopy(draft_payload)
+        draft_identity = dict(promoted_draft.get("draft_identity") or {})
+        draft_identity.update(
+            {
+                "draft_id": versioned_draft_id,
+                "versioned_from_artifact_id": draft_record.artifact_id,
+                "repair_promotion_transaction_id": promotion_id,
+            }
+        )
+        promoted_draft["draft_identity"] = draft_identity
+        generation_context = dict(promoted_draft.get("generation_context") or {})
+        generation_context["repair_promotion_transaction_id"] = promotion_id
+        promoted_draft["generation_context"] = generation_context
+        projections = dict(promoted_draft.get("projections") or {})
+        projections["repair_promotion_transaction_id"] = promotion_id
+        projections["docx_path"] = str(promoted_docx_path)
+        promoted_draft["projections"] = projections
+
+        promoted_manifest = copy.deepcopy(manifest_payload)
+        manifest_identity = dict(promoted_manifest.get("manifest_identity") or {})
+        manifest_identity.update(
+            {
+                "manifest_id": versioned_manifest_id,
+                "versioned_from_artifact_id": manifest_record.artifact_id,
+                "repair_promotion_transaction_id": promotion_id,
+            }
+        )
+        promoted_manifest["manifest_identity"] = manifest_identity
+        review_reference = dict(promoted_manifest.get("review_reference") or {})
+        review_reference["review_draft_path"] = str(promoted_draft_path)
+        review_reference["review_word_path"] = str(promoted_docx_path)
+        promoted_manifest["review_reference"] = review_reference
+        manifest_dependencies = dict(promoted_manifest.get("dependencies") or {})
+        manifest_dependencies["repair_promotion_transaction_id"] = promotion_id
+        manifest_dependencies["versioned_review_draft_id"] = versioned_draft_id
+        promoted_manifest["dependencies"] = manifest_dependencies
+
+        try:
+            atomic_write_json(str(promoted_draft_path), promoted_draft)
+            atomic_write_json(str(promoted_manifest_path), promoted_manifest)
+            from docx_writer import rebuild_review_docx_from_structured_artifacts
+
+            rebuild_review_docx_from_structured_artifacts(
+                SimpleNamespace(logger=None),
+                promoted_draft,
+                promoted_manifest,
+                str(promoted_docx_path),
+            )
+        except (OSError, TypeError, ValueError, KeyError, RuntimeError) as exc:
+            return {
+                "status": "blocked",
+                "reason": f"versioned repair output build failed: {exc}",
+                "transaction_id": transaction_id,
+                "repair_structural_closure": structural.to_dict(),
+                "mutation_performed": False,
+            }
+
+        base_dependencies = [
+            ArtifactDependencyRefV2.from_record(item)
+            for item in (draft_record, manifest_record, validation_record)
+            if item is not None
+        ]
+        promoted_draft_record = self.registry.register_file(
+            artifact_id=versioned_draft_id,
+            artifact_role="repair_promotion_review_draft",
+            artifact_type="review_draft",
+            artifact_version="v3",
+            path=promoted_draft_path,
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            depends_on=base_dependencies,
+            metadata={
+                "versioned": True,
+                "canonical_replacement": False,
+                "promotion_transaction_id": promotion_id,
+            },
+        )
+        promoted_manifest_record = self.registry.register_file(
+            artifact_id=versioned_manifest_id,
+            artifact_role="repair_promotion_citation_manifest",
+            artifact_type="citation_manifest",
+            artifact_version="v3",
+            path=promoted_manifest_path,
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            depends_on=[*base_dependencies, ArtifactDependencyRefV2.from_record(promoted_draft_record)],
+            metadata={
+                "versioned": True,
+                "canonical_replacement": False,
+                "promotion_transaction_id": promotion_id,
+            },
+        )
+        promoted_docx_record = self.registry.register_file(
+            artifact_id=versioned_docx_id,
+            artifact_role="repair_promotion_review_docx",
+            artifact_type="review_docx",
+            artifact_version="v1",
+            path=promoted_docx_path,
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            depends_on=[
+                ArtifactDependencyRefV2.from_record(promoted_draft_record),
+                ArtifactDependencyRefV2.from_record(promoted_manifest_record),
+            ],
+            metadata={
+                "versioned": True,
+                "canonical_replacement": False,
+                "promotion_transaction_id": promotion_id,
+            },
+        )
+
+        output_records = [promoted_draft_record, promoted_manifest_record, promoted_docx_record]
+        output_refs = [
+            AuditArtifactRefV1(
+                artifact_id=item.artifact_id,
+                artifact_type=item.artifact_type,
+                job_id=item.job_id,
+                content_hash=item.content_hash,
+            )
+            for item in output_records
+        ]
+        input_records = [item for item in (draft_record, manifest_record, validation_record) if item is not None]
+        input_refs = [
+            AuditArtifactRefV1(
+                artifact_id=item.artifact_id,
+                artifact_type=item.artifact_type,
+                job_id=item.job_id,
+                content_hash=item.content_hash,
+            )
+            for item in input_records
+        ]
+        audit_id = f"repair-promotion-audit:{versioned_suffix}"
+        audit = AuditRecordV1.create(
+            audit_type="repair_promotion",
+            job_id=self.workspace.job_id,
+            attempt_id=promotion_id,
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            actor=actor,
+            reason=reason,
+            scope={
+                "source_transaction_id": transaction_id,
+                "canonical_replacement": False,
+                "quarantined_export": False,
+            },
+            target_artifacts=output_refs,
+            input_artifact_refs=input_refs,
+            output_artifact_refs=output_refs,
+            input_hashes={item.artifact_id: item.content_hash for item in input_records},
+            policy_snapshot={
+                "versioned_outputs_only": True,
+                "overwrite_canonical": False,
+                "delete_canonical": False,
+                "export_quarantined": False,
+                "require_structural_closure": True,
+            },
+            disposition="promoted_versioned",
+            audit_id=audit_id,
+        )
+        audit_path = promotion_dir / "repair_promotion_audit.json"
+        atomic_write_json(str(audit_path), audit.to_dict())
+        audit_record = self.registry.register_file(
+            artifact_id=audit_id,
+            artifact_role="repair_promotion_audit",
+            artifact_type="audit_record",
+            artifact_version="v1",
+            path=audit_path,
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            depends_on=[
+                *base_dependencies,
+                *(ArtifactDependencyRefV2.from_record(item) for item in output_records),
+            ],
+        )
+
+        lineage_id = f"repair-lineage:{versioned_suffix}"
+        lineage_path = promotion_dir / "repair_lineage.json"
+        lineage_payload = {
+            "artifact_type": "repair_lineage",
+            "artifact_version": "v1",
+            "job_id": self.workspace.job_id,
+            "lineage_id": lineage_id,
+            "source_transaction_id": transaction_id,
+            "canonical_inputs": {item.artifact_id: item.content_hash for item in input_records},
+            "derived_repair_inputs": {
+                item.artifact_id: item.content_hash
+                for item in derived_records
+                if item is not None
+            },
+            "versioned_outputs": {item.artifact_id: item.content_hash for item in output_records},
+            "structural_closure": structural.to_dict(),
+            "canonical_replacement": False,
+        }
+        atomic_write_json(str(lineage_path), lineage_payload)
+        lineage_record = self.registry.register_file(
+            artifact_id=lineage_id,
+            artifact_role="repair_lineage",
+            artifact_type="repair_lineage",
+            artifact_version="v1",
+            path=lineage_path,
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            depends_on=[
+                ArtifactDependencyRefV2.from_record(audit_record),
+                *(ArtifactDependencyRefV2.from_record(item) for item in output_records),
+            ],
+        )
+
+        promotion = RepairPromotionTransaction(
+            transaction_id=promotion_id,
+            job_id=self.workspace.job_id,
+            source_transaction_id=transaction_id,
+            status="promoted",
+            actor=actor,
+            reason=reason,
+            canonical_version="repair-v3",
+            review_draft_artifact_id=promoted_draft_record.artifact_id,
+            citation_manifest_artifact_id=promoted_manifest_record.artifact_id,
+            review_docx_artifact_id=promoted_docx_record.artifact_id,
+            audit_artifact_id=audit_record.artifact_id,
+            lineage_artifact_id=lineage_record.artifact_id,
+            canonical_input_hashes={item.artifact_id: item.content_hash for item in input_records},
+            output_hashes={item.artifact_id: item.content_hash for item in output_records},
+            created_at=utc_now_iso(),
+        )
+        promotion_path = promotion_dir / "repair_promotion_transaction.json"
+        atomic_write_json(str(promotion_path), promotion.to_dict())
+        promotion_record = self.registry.register_file(
+            artifact_id=promotion_id,
+            artifact_role="repair_promotion_transaction",
+            artifact_type=promotion.artifact_type,
+            artifact_version=promotion.artifact_version,
+            path=promotion_path,
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            depends_on=[
+                ArtifactDependencyRefV2.from_record(audit_record),
+                ArtifactDependencyRefV2.from_record(lineage_record),
+                *(ArtifactDependencyRefV2.from_record(item) for item in output_records),
+            ],
+            metadata={
+                "status": promotion.status,
+                "canonical_replacement": False,
+                "quarantined_export": False,
+            },
+        )
+        return {
+            "status": "promoted",
+            "job_id": self.workspace.job_id,
+            "transaction_id": transaction_id,
+            "promotion_transaction_id": promotion_record.artifact_id,
+            "versioned_artifact_ids": [item.artifact_id for item in output_records],
+            "audit_artifact_id": audit_record.artifact_id,
+            "lineage_artifact_id": lineage_record.artifact_id,
+            "repair_structural_closure": structural.to_dict(),
+            "canonical_replacement": False,
+            "canonical_paths_unchanged": True,
+            "quarantined_export": False,
+            "mutation_performed": True,
+        }
+
+    def promote(self, transaction_id: str, *, actor: str, reason: str) -> dict[str, Any]:
+        """Compatibility alias for the explicit promotion boundary."""
+
+        return self.promote_transaction(transaction_id, actor=actor, reason=reason)
 
 
 __all__ = [
     "REPAIR_TRANSACTION_ARTIFACT_TYPE",
     "REPAIR_TRANSACTION_ARTIFACT_VERSION",
+    "RepairPromotionTransaction",
     "RepairTransactionRecord",
     "RepairTransactionService",
 ]

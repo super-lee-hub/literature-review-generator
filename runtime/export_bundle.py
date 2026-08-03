@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 import zipfile
 
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry, RegistryError
@@ -189,18 +189,20 @@ def _derive_current_evidence(
         record.status == "ready" and record.artifact_type == "final_outline"
         for record in registry.list_records()
     )
-    adoption_records = [
-        record
-        for record in registry.list_records()
-        if record.status == "ready" and record.artifact_type == "adopted_outline"
-    ]
-    adoption_payload = _json_payload(adoption_records[-1]) if adoption_records else None
+    from outline.adoption_transaction import current_adoption_record
+
+    current_adoption = current_adoption_record(registry)
+    adoption_payload = _json_payload(current_adoption) if current_adoption is not None else None
     adoption = {
         "status": "adopted" if adoption_payload is not None else "not_adopted",
-        "artifact_id": adoption_records[-1].artifact_id if adoption_records else "",
+        "artifact_id": current_adoption.artifact_id if current_adoption is not None else "",
         "actor": str((adoption_payload or {}).get("actor") or ""),
         "reason": str((adoption_payload or {}).get("reason") or ""),
         "expected_hash": str((adoption_payload or {}).get("expected_hash") or ""),
+        "adoption_identity": str((adoption_payload or {}).get("adoption_identity") or ""),
+        "current_pointer_artifact_id": str(
+            (adoption_payload or {}).get("current_pointer_artifact_id") or ""
+        ),
     }
     if ready_final_outline and adoption_payload is None:
         issues.append("outline_adoption_missing")
@@ -243,6 +245,8 @@ _EXPORT_ALLOWLIST = frozenset(
         "outline_v3_node_output",
         "provider_receipt_closure",
         "adopted_outline",
+        "outline_adoption_pointer",
+        "outline_v3_adoption_current",
         "review_draft",
         "citation_manifest",
         "validation_run_result",

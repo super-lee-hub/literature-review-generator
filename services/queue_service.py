@@ -1,14 +1,28 @@
 from __future__ import annotations
 
+import configparser
 import json
+import os
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
 
 T = TypeVar("T")
+
+_QUEUE_PROCESS_LOCKS_GUARD = threading.Lock()
+_QUEUE_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _queue_process_lock(path: Path) -> threading.RLock:
+    key = os.path.normcase(str(path.resolve()))
+    with _QUEUE_PROCESS_LOCKS_GUARD:
+        return _QUEUE_PROCESS_LOCKS.setdefault(key, threading.RLock())
 
 
 class JobCancelledError(RuntimeError):
@@ -100,6 +114,11 @@ class QueueJobRuntime:
     cancel_requested: bool = False
     cancel_requested_at: Optional[str] = None
     cancel_reason: Optional[str] = None
+    lease_id: str = ""
+    worker_id: str = ""
+    lease_expires_at: Optional[str] = None
+    heartbeat_at: Optional[str] = None
+    revision: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -119,6 +138,11 @@ class QueueJobRuntime:
             "cancel_requested": self.cancel_requested,
             "cancel_requested_at": self.cancel_requested_at,
             "cancel_reason": self.cancel_reason,
+            "lease_id": self.lease_id,
+            "worker_id": self.worker_id,
+            "lease_expires_at": self.lease_expires_at,
+            "heartbeat_at": self.heartbeat_at,
+            "revision": self.revision,
         }
 
     @classmethod
@@ -140,7 +164,23 @@ class QueueJobRuntime:
             cancel_requested=bool(data.get("cancel_requested", False)),
             cancel_requested_at=data.get("cancel_requested_at"),
             cancel_reason=data.get("cancel_reason"),
+            lease_id=str(data.get("lease_id") or ""),
+            worker_id=str(data.get("worker_id") or ""),
+            lease_expires_at=data.get("lease_expires_at"),
+            heartbeat_at=data.get("heartbeat_at"),
+            revision=max(0, int(data.get("revision") or 0)),
         )
+
+
+@dataclass(frozen=True)
+class QueueLease:
+    """Cross-process claim returned by the queue's compare-and-swap boundary."""
+
+    job_id: str
+    lease_id: str
+    worker_id: str
+    expires_at: str
+    revision: int
 
 
 @dataclass
@@ -216,9 +256,57 @@ class PersistentQueueService:
         self._lock = threading.Lock()
         self._jobs: Dict[str, QueueJobSpec] = {}
         self._runtimes: Dict[str, QueueJobRuntime] = {}
+        self._revision = 0
+        self._lock_path = self.queue_file_path.with_name(self.queue_file_path.name + ".lock")
         self._load()
 
+    @contextmanager
+    def _store_lock(self):
+        """Hold the process and OS lock for one read/modify/write transaction."""
+
+        self.queue_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            with _queue_process_lock(self._lock_path):
+                with self._lock_path.open("a+b") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"persistent queue lock\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        acquired = False
+                        while not acquired:
+                            try:
+                                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                                acquired = True
+                            except OSError:
+                                time.sleep(0.01)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        self._load_unlocked()
+                        yield
+                    finally:
+                        handle.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _load(self) -> None:
+        with self._store_lock():
+            return
+
+    def _load_unlocked(self) -> None:
         if self.queue_file_path.exists():
             try:
                 data = json.loads(self.queue_file_path.read_text(encoding="utf-8"))
@@ -230,10 +318,16 @@ class PersistentQueueService:
                     job_id: QueueJobRuntime.from_dict(runtime_data)
                     for job_id, runtime_data in data.get("runtimes", {}).items()
                 }
+                self._revision = max(0, int(data.get("revision") or 0))
                 self._normalize_loaded_jobs()
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 self._jobs = {}
                 self._runtimes = {}
+                self._revision = 0
+        else:
+            self._jobs = {}
+            self._runtimes = {}
+            self._revision = 0
 
     def _resolve_path(self, raw_path: Any, *, base: Path | None = None) -> str:
         value = str(raw_path or "").strip()
@@ -252,8 +346,6 @@ class PersistentQueueService:
         if not config_path.is_file():
             return ""
         try:
-            import configparser
-
             parser = configparser.ConfigParser()
             parser.read(config_path, encoding="utf-8")
             raw_output = parser.get("Paths", "output_path", fallback="").strip()
@@ -313,10 +405,15 @@ class PersistentQueueService:
                 runtime.log_path = runtime.log_path or job.log_path
 
     def _save(self) -> None:
+        """Write the already-locked in-memory snapshot atomically."""
+
         self.queue_file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._revision += 1
         data = {
             "jobs": {job_id: job.to_dict() for job_id, job in self._jobs.items()},
             "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
+            "schema_version": "queue-v2",
+            "revision": self._revision,
             "last_updated": self._utc_now(),
         }
         temp_path = self.queue_file_path.with_suffix(".tmp")
@@ -324,12 +421,33 @@ class PersistentQueueService:
         temp_path.replace(self.queue_file_path)
 
     @staticmethod
+    def _now_datetime() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @classmethod
+    def _lease_expiry(cls, lease_seconds: int) -> str:
+        return (cls._now_datetime() + timedelta(seconds=max(1, int(lease_seconds)))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    @classmethod
+    def _lease_is_expired(cls, expires_at: str | None) -> bool:
+        if not expires_at:
+            return True
+        try:
+            raw = str(expires_at).replace("Z", "+00:00")
+            expiry = datetime.fromisoformat(raw)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return expiry <= cls._now_datetime()
+        except (TypeError, ValueError):
+            return True
+
+    @staticmethod
     def _utc_now() -> str:
         from services.job_workspace import utc_now_iso
         return utc_now_iso()
 
     def add_job(self, job_spec: QueueJobSpec) -> str:
-        with self._lock:
+        with self._store_lock():
             normalized = self._normalize_job_spec(job_spec)
             self._jobs[normalized.job_id] = normalized
             if normalized.job_id not in self._runtimes:
@@ -348,11 +466,11 @@ class PersistentQueueService:
         return normalized.job_id
 
     def get_job(self, job_id: str) -> Optional[QueueJobSpec]:
-        with self._lock:
+        with self._store_lock():
             return self._jobs.get(job_id)
 
     def get_job_runtime(self, job_id: str) -> Optional[QueueJobRuntime]:
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             if runtime is None:
                 return None
@@ -366,7 +484,7 @@ class PersistentQueueService:
     def list_job_runtimes(self) -> List[QueueJobRuntime]:
         """Return runtime snapshots for read-only observers."""
 
-        with self._lock:
+        with self._store_lock():
             return [
                 replace(
                     runtime,
@@ -378,16 +496,17 @@ class PersistentQueueService:
             ]
 
     def update_job_stage(self, job_id: str, stage: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             if runtime is None:
                 return False
             runtime.current_stage = str(stage or "")
+            runtime.revision += 1
             self._save()
             return True
 
     def update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> bool:
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             if runtime is None:
                 return False
@@ -399,11 +518,12 @@ class PersistentQueueService:
                 runtime.log_path = str(info["log_path"] or "")
             if "produced_artifacts" in info:
                 runtime.produced_artifacts = [str(item) for item in info["produced_artifacts"] or []]
+            runtime.revision += 1
             self._save()
             return True
 
     def update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> bool:
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             if runtime is None:
                 return False
@@ -411,15 +531,16 @@ class PersistentQueueService:
             stage = str(snapshot.get("stage") or "").strip()
             if stage:
                 runtime.current_stage = stage
+            runtime.revision += 1
             self._save()
             return True
 
     def list_jobs(self) -> List[QueueJobSpec]:
-        with self._lock:
+        with self._store_lock():
             return list(self._jobs.values())
 
     def list_jobs_by_state(self, state: QueueState) -> List[QueueJobSpec]:
-        with self._lock:
+        with self._store_lock():
             return [
                 job
                 for job_id, job in self._jobs.items()
@@ -427,7 +548,7 @@ class PersistentQueueService:
             ]
 
     def update_job_state(self, job_id: str, state: QueueState) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return False
             runtime = self._runtimes[job_id]
@@ -449,35 +570,165 @@ class PersistentQueueService:
                 runtime.started_at = self._utc_now()
             if state in (QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCEL_ACKNOWLEDGED, QueueState.CANCELLED):
                 runtime.completed_at = self._utc_now()
+                runtime.lease_id = ""
+                runtime.worker_id = ""
+                runtime.lease_expires_at = None
+                runtime.heartbeat_at = None
+            runtime.revision += 1
             self._save()
         return True
 
+    def claim_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> QueueLease | None:
+        """Atomically claim a pending job or recover an expired worker lease."""
+
+        resolved_worker = str(worker_id or "").strip()
+        if not resolved_worker:
+            raise ValueError("worker_id is required for a queue claim")
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state in {
+                QueueState.COMPLETED,
+                QueueState.FAILED,
+                QueueState.CANCELLED,
+                QueueState.CANCEL_ACKNOWLEDGED,
+                QueueState.CANCEL_REQUESTED,
+            }:
+                return None
+            if runtime.state == QueueState.RUNNING and not self._lease_is_expired(runtime.lease_expires_at):
+                return None
+            if runtime.state == QueueState.RUNNING:
+                runtime.state = QueueState.PENDING
+                runtime.error_message = "worker lease expired; job reclaimed"
+                runtime.lease_id = ""
+                runtime.worker_id = ""
+                runtime.lease_expires_at = None
+                runtime.heartbeat_at = None
+            if runtime.state != QueueState.PENDING or runtime.cancel_requested:
+                return None
+            lease_id = f"{resolved_worker}:{uuid.uuid4().hex}"
+            expires_at = self._lease_expiry(lease_seconds)
+            now = self._utc_now()
+            runtime.state = QueueState.RUNNING
+            runtime.started_at = runtime.started_at or now
+            runtime.worker_id = resolved_worker
+            runtime.lease_id = lease_id
+            runtime.lease_expires_at = expires_at
+            runtime.heartbeat_at = now
+            runtime.revision += 1
+            self._save()
+            return QueueLease(job_id, lease_id, resolved_worker, expires_at, runtime.revision)
+
+    def heartbeat(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> bool:
+        """Extend a claim only when its worker/lease pair still owns it."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state != QueueState.RUNNING:
+                return False
+            if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
+                return False
+            if self._lease_is_expired(runtime.lease_expires_at):
+                return False
+            runtime.heartbeat_at = self._utc_now()
+            runtime.lease_expires_at = self._lease_expiry(lease_seconds)
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def release_lease(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        state: QueueState,
+        error_message: str | None = None,
+    ) -> bool:
+        """CAS-release a worker lease and persist the terminal queue state."""
+
+        if state not in {QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCELLED}:
+            raise ValueError("lease release requires a terminal queue state")
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return False
+            if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
+                return False
+            if state in {QueueState.COMPLETED, QueueState.FAILED} and runtime.cancel_requested:
+                return False
+            runtime.state = state
+            runtime.completed_at = self._utc_now()
+            runtime.error_message = error_message if error_message is not None else runtime.error_message
+            runtime.lease_id = ""
+            runtime.worker_id = ""
+            runtime.lease_expires_at = None
+            runtime.heartbeat_at = None
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def recover_expired_leases(self) -> list[str]:
+        """Move crashed workers' expired RUNNING jobs back to PENDING."""
+
+        recovered: list[str] = []
+        with self._store_lock():
+            for job_id, runtime in self._runtimes.items():
+                if runtime.state != QueueState.RUNNING or not self._lease_is_expired(runtime.lease_expires_at):
+                    continue
+                runtime.state = QueueState.PENDING
+                runtime.error_message = "worker lease expired; job available for recovery"
+                runtime.lease_id = ""
+                runtime.worker_id = ""
+                runtime.lease_expires_at = None
+                runtime.heartbeat_at = None
+                runtime.revision += 1
+                recovered.append(job_id)
+            if recovered:
+                self._save()
+        return recovered
+
     def set_job_error(self, job_id: str, error_message: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return False
             self._runtimes[job_id].error_message = error_message
+            self._runtimes[job_id].revision += 1
             self._save()
         return True
 
     def set_job_result(self, job_id: str, result_summary: Dict[str, Any]) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return False
             self._runtimes[job_id].result_summary = result_summary
+            self._runtimes[job_id].revision += 1
             self._save()
         return True
 
     def increment_retry_count(self, job_id: str) -> int:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return 0
             self._runtimes[job_id].retry_count += 1
+            self._runtimes[job_id].revision += 1
             self._save()
             return self._runtimes[job_id].retry_count
 
     def reset_job(self, job_id: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return False
             previous = self._runtimes[job_id]
@@ -496,7 +747,7 @@ class PersistentQueueService:
     def request_cancel(self, job_id: str, *, reason: str = "user_requested") -> bool:
         """Persist a cooperative cancellation request for a live job."""
 
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             if runtime is None or runtime.state in (
                 QueueState.COMPLETED,
@@ -516,40 +767,47 @@ class PersistentQueueService:
                 runtime.completed_at = self._utc_now()
             else:
                 runtime.state = QueueState.CANCEL_REQUESTED
+            runtime.revision += 1
             self._save()
         return True
 
     def acknowledge_cancel(self, job_id: str, *, worker: str = "queue-worker") -> bool:
         """Record that the worker observed and stopped at a safe checkpoint."""
 
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             if runtime is None or runtime.state != QueueState.CANCEL_REQUESTED:
                 return False
             runtime.state = QueueState.CANCEL_ACKNOWLEDGED
             runtime.error_message = f"cancellation acknowledged by {worker}"
             runtime.completed_at = self._utc_now()
+            runtime.lease_id = ""
+            runtime.worker_id = ""
+            runtime.lease_expires_at = None
+            runtime.heartbeat_at = None
+            runtime.revision += 1
             self._save()
         return True
 
     def clear_cancel_request(self, job_id: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             if runtime is None:
                 return False
             runtime.cancel_requested = False
             runtime.cancel_requested_at = None
             runtime.cancel_reason = None
+            runtime.revision += 1
             self._save()
         return True
 
     def is_cancel_requested(self, job_id: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             runtime = self._runtimes.get(job_id)
             return bool(runtime and runtime.cancel_requested)
 
     def remove_job(self, job_id: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id in self._jobs:
                 del self._jobs[job_id]
             if job_id in self._runtimes:
@@ -572,15 +830,18 @@ class PersistentQueueService:
     def save_queue(self, file_path: str | Path) -> None:
         """保存队列到文件"""
         save_path = Path(file_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "jobs": {job_id: job.to_dict() for job_id, job in self._jobs.items()},
-            "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
-            "last_updated": self._utc_now(),
-        }
-        temp_path = save_path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(save_path)
+        with self._store_lock():
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "schema_version": "queue-v2",
+                "revision": self._revision,
+                "jobs": {job_id: job.to_dict() for job_id, job in self._jobs.items()},
+                "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
+                "last_updated": self._utc_now(),
+            }
+            temp_path = save_path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(save_path)
 
     def load_queue(self, file_path: str | Path) -> None:
         """从文件加载队列"""
@@ -588,22 +849,25 @@ class PersistentQueueService:
         if load_path.exists():
             try:
                 data = json.loads(load_path.read_text(encoding="utf-8"))
-                with self._lock:
+                if not isinstance(data, dict):
+                    raise ValueError("queue export must be an object")
+                with self._store_lock():
                     # 加载任务
                     for job_id, job_data in data.get("jobs", {}).items():
                         self._jobs[job_id] = QueueJobSpec.from_dict(job_data)
                     # 加载运行时信息
                     for job_id, runtime_data in data.get("runtimes", {}).items():
                         self._runtimes[job_id] = QueueJobRuntime.from_dict(runtime_data)
+                    self._normalize_loaded_jobs()
                     # 保存到当前队列文件
                     self._save()
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 pass
 
     def reorder_jobs(self, job_ids: List[str]) -> None:
         """重排任务顺序"""
         # 按指定顺序重新排列任务
-        with self._lock:
+        with self._store_lock():
             ordered_jobs = {}
             for job_id in job_ids:
                 if job_id in self._jobs:
@@ -628,6 +892,8 @@ class QueueRunner:
         self._lock = threading.Lock()
         self._cancel_tokens: Dict[str, CancelToken] = {}
         self._workspace_locks: Dict[str, threading.Lock] = {}
+        self._worker_id = f"queue-runner:{uuid.uuid4().hex}"
+        self._leases: Dict[str, QueueLease] = {}
 
     def is_running(self) -> bool:
         with self._lock:
@@ -674,6 +940,15 @@ class QueueRunner:
         runtime = self.queue_service.get_job_runtime(job_id)
         if runtime is None:
             return
+        lease = self._leases.get(job_id)
+        if lease is not None and runtime.state in {QueueState.CANCEL_REQUESTED, QueueState.RUNNING}:
+            if self.queue_service.release_lease(
+                job_id,
+                lease_id=lease.lease_id,
+                worker_id=lease.worker_id,
+                state=QueueState.CANCELLED,
+            ):
+                return
         if runtime.state == QueueState.CANCEL_REQUESTED:
             self.queue_service.acknowledge_cancel(job_id)
             self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
@@ -734,7 +1009,15 @@ class QueueRunner:
                     return
             
             # 更新任务状态为运行中
-            self.queue_service.update_job_state(job_spec.job_id, QueueState.RUNNING)
+            lease = self.queue_service.claim_job(
+                job_spec.job_id,
+                worker_id=self._worker_id,
+                lease_seconds=120,
+            )
+            if lease is None:
+                return
+            with self._lock:
+                self._leases[job_spec.job_id] = lease
             
             # 再次检查任务状态，确保没有被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
@@ -752,7 +1035,6 @@ class QueueRunner:
             params.setdefault("job_id", job_spec.job_id)
             params["workspace_path"] = job_spec.workspace_path
             params["queue_file"] = str(self.queue_service.queue_file_path)
-            project_name = params.get("project_name")
             # Build JobRunRequest from queued parameters
             from services.job_runner import build_job_request_from_mapping
             request = build_job_request_from_mapping(params)
@@ -794,7 +1076,7 @@ class QueueRunner:
             job_status = str(getattr(result, "job_status", "failed") or "failed")
             if job_status == "completed":
                 # 更新任务状态为完成
-                self.queue_service.update_job_state(job_spec.job_id, QueueState.COMPLETED)
+                self._release_job(job_spec.job_id, QueueState.COMPLETED)
                 
                 # 更新任务结果和工件信息
                 result_summary = {
@@ -810,10 +1092,13 @@ class QueueRunner:
                 # Queue lifecycle follows canonical execution status.  The
                 # legacy success projection describes canonical readiness.
                 if job_status == "cancelled":
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+                    self._release_job(job_spec.job_id, QueueState.CANCELLED)
                 else:
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                    self.queue_service.set_job_error(job_spec.job_id, result.message)
+                    self._release_job(
+                        job_spec.job_id,
+                        QueueState.FAILED,
+                        error_message=str(getattr(result, "message", "") or ""),
+                    )
         except JobCancelledError:
             self._acknowledge_cancelled(job_spec.job_id)
         except Exception as e:
@@ -822,16 +1107,51 @@ class QueueRunner:
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 self._acknowledge_cancelled(job_spec.job_id)
                 return
-            self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-            self.queue_service.set_job_error(job_spec.job_id, str(e))
+            self._release_job(job_spec.job_id, QueueState.FAILED, error_message=str(e))
         finally:
             with self._lock:
                 if job_spec.job_id in self._cancel_tokens:
                     del self._cancel_tokens[job_spec.job_id]
+                self._leases.pop(job_spec.job_id, None)
     
     def _update_job_stage(self, job_id: str, stage: str) -> None:
         """更新任务的当前阶段"""
+        self._heartbeat(job_id)
         self.queue_service.update_job_stage(job_id, stage)
+
+    def _heartbeat(self, job_id: str) -> None:
+        lease = self._leases.get(job_id)
+        if lease is None:
+            return
+        if not self.queue_service.heartbeat(
+            job_id,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_seconds=120,
+        ):
+            raise RuntimeError(f"queue lease lost for job {job_id}")
+
+    def _release_job(
+        self,
+        job_id: str,
+        state: QueueState,
+        *,
+        error_message: str | None = None,
+    ) -> None:
+        lease = self._leases.get(job_id)
+        if lease is None:
+            self.queue_service.update_job_state(job_id, state)
+            if error_message:
+                self.queue_service.set_job_error(job_id, error_message)
+            return
+        if not self.queue_service.release_lease(
+            job_id,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            state=state,
+            error_message=error_message,
+        ):
+            raise RuntimeError(f"queue lease release lost for job {job_id}")
     
     def _update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> None:
         """更新任务的运行时信息"""
@@ -848,6 +1168,7 @@ class QueueRunner:
             self._running = True
 
         try:
+            self.queue_service.recover_expired_leases()
             processed_ids: set = set()
             max_passes = len(self.queue_service.list_jobs()) * 2 + 10  # safety bound
             passes = 0

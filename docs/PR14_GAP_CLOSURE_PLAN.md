@@ -8,7 +8,9 @@ Branch: `codex/platform-hardening-outline-v3`
 
 Base: `origin/main` at `ecac15976ebb3b6ee754fe5c0dfe44efacd72e9a`
 
-Reviewed head: `2158faa1d392acdc2250d147b26ed8ca367203d6` (baseline audit snapshot)
+Reviewed head: baseline audit snapshot before the current remediation; the
+historical SHA is intentionally omitted so this plan cannot be mistaken for
+the final delivery head.
 
 This is a fact audit at the current PR head. It is intentionally separate
 from implementation work. The audit used the current production call graph

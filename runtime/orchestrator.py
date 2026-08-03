@@ -17,6 +17,7 @@ from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_entry, stage_policy_for
 from validation.execution_service import ValidationExecutionService
 from outline.v3_executor import OutlineV3Executor
+from outline.adoption_transaction import current_adoption_record
 from services.model_capabilities import resolve_model_capability
 from services.model_selection import get_outline_api_config
 from services.settings import ApplicationSettings
@@ -711,7 +712,7 @@ class InternalStageExecutorRegistry:
         # setting remains part of the configuration surface for compatibility,
         # but a current Outline v3 review can never implicitly promote a
         # ready-for-adoption outline.
-        adoption_record = session.context.registry.get("outline-v3:adoption")
+        adoption_record = current_adoption_record(session.context.registry)
         if adoption_record is None or adoption_record.status != "ready":
             raise RuntimeError("stage3 requires an explicitly adopted Outline v3 final outline")
         try:
@@ -823,7 +824,10 @@ class InternalStageExecutorRegistry:
                 results=results,
                 attempt_id=attempt_id,
             ),
-            "validate": lambda: (self.bridge.run_validation(session), 0),
+            "validate": lambda: (
+                self.bridge.run_validation(session, attempt_id=attempt_id),
+                0,
+            ),
         }
         executor = executors.get(stage)
         if executor is None:
@@ -1095,9 +1099,36 @@ class AgentRuntimeBridge:
         attempt_id: str = "",
         external_registry_resolver: Any | None = None,
     ) -> ValidationExecutionService:
+        registry = session.context.registry
+        paper_records = tuple(
+            record
+            for record in registry.list_records()
+            if record.status == "ready" and record.artifact_type == "paper_artifact"
+        )
+        visual_records = tuple(
+            record
+            for record in registry.list_records()
+            if record.status == "ready"
+            and record.artifact_type in {"visual_manifest", "visual_bundle", "visual_ref", "visual_artifact"}
+        )
         return ValidationExecutionService(
-            session.stage_host,
-            validation_attempt_id=attempt_id,
+            job_id=session.context.workspace.job_id,
+            attempt_id=str(attempt_id or "validation"),
+            workspace=session.context.workspace,
+            artifact_registry=registry,
+            settings=session.stage_host.settings,
+            summaries=list(session.stage_host.summaries),
+            review_draft_record=registry.get("review_draft"),
+            citation_manifest_record=(
+                registry.get(session.stage_host.CITATION_MANIFEST_ARTIFACT_ID)
+                or registry.get("citation_manifest")
+            ),
+            paper_artifact_records=paper_records,
+            visual_artifact_records=visual_records,
+            provider_factory=None,
+            cancellation_checker=session.stage_host.check_cancelled,
+            logger=session.stage_host.logger,
+            runtime_config=session.stage_host.config,
             validation_external_registry_resolver=external_registry_resolver,
         )
 
@@ -1390,15 +1421,13 @@ class AgentRuntimeBridge:
         external_registry_resolver: Any | None = None,
         producer: str = "runtime.orchestrator.AgentRuntimeBridge.run_validation",
     ) -> StageResult:
-        import validator as builtin_validator  # type: ignore
-
         validation_service = self.build_validation_service(
             session,
             attempt_id=attempt_id,
             external_registry_resolver=external_registry_resolver,
         )
         try:
-            result = dict(builtin_validator.run_review_validation(validation_service) or {})
+            result = validation_service.run_review_validation()
         finally:
             validation_provider_receipts = validation_service.finalize_provider_receipts()
 

@@ -31,10 +31,10 @@ source of truth.
 |---|---|---|
 | Source intake | `source_inventory_v1.json`, `source_bundle.json` | parser diagnostics and read-only paper views |
 | Stage 1 | canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, and source lineage | Excel and display summaries |
-| Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, node DAG, receipts, final outline, stage health, and adoption record | Markdown or human-readable outline displays |
+| Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, typed quality gate, exact execution bindings, node DAG, receipts, full-decision stability audit, final outline, stage health, versioned adoption record, and current adoption pointer | Markdown or human-readable outline displays |
 | Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog | DOCX and text reports |
 | Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests | TXT report, manual-review JSON, alignment audit, and completion projection |
-| Repair | registered repair plan and apply result bound to the validation-run artifact | human-readable repair summaries |
+| Repair | typed repair issues/actions/patches, registered repair plan and apply result bound to the validation-run artifact, structural closure, and explicit versioned promotion transaction | human-readable repair summaries |
 
 ## Public outcomes
 
@@ -91,21 +91,35 @@ persist a durable result before re-raising the original exception.
 
 ## Outline v3 and control-plane projections
 
-Outline Intelligence v3 is a deterministic, registered DAG. Its node outputs
-bind their source summary hashes, retain replay receipts, and resume only the
-failed dependency closure. A final outline is adoptable only after the
-coverage, stage-health, identity, and canonical-completion gates pass.
+Outline Intelligence v3 is a deterministic, registered DAG. Each node persists
+an exact execution binding covering node/schema versions, dependency and
+summary hashes, review intent, coverage contract, quality gate, route/model,
+prompt payload, context profile, and relevant runtime configuration. Replay is
+reusable only when that binding, the provider receipt, normalized output,
+registered artifact, node output, and expected graph all close exactly. A
+binding change marks the node stale and descendants pending while preserving
+unaffected upstream nodes. A final outline is adoptable only after the
+coverage, quality, stability, stage-health, identity, and canonical-completion
+gates pass; adoption writes a versioned identity and a current-pointer record.
 
-`reviewctl` is the single control plane. `status`, `next-action`, `validate`,
-`inspect`, and `attest` are provider-free reads. `run`, `resume`, `retry-node`,
-`cancel`, `repair-plan`, `repair-apply`, `adopt`, and `export` are explicit
-Registry-backed transitions. Cancellation is cooperative and a cancelled job
-cannot publish a completed queue state.
+`reviewctl` is the single control plane. `status`, `next-action`,
+`validation-status`, `inspect`, and `attest` are provider-free reads.
+`run`, `resume`, `retry-node`, `validate`, `cancel`, `repair-plan`,
+`repair-apply`, `adopt`, `export`, and the queue list/add/run/retry/cancel/
+remove/import/export commands are explicit Registry- or queue-backed
+transitions. Queue workers claim a job with a cross-process lease and must
+heartbeat or lose the claim; expired claims are recoverable. Cancellation is
+cooperative and a cancelled job cannot publish a completed queue state.
 
 Validation closure requires the current review draft, citation manifest, and
-`ValidationRunResultV1` input IDs and hashes to match. Repair defaults to
-`report_only`; an explicit safe transaction creates only quarantined derived
-artifacts. Adoption never silently promotes an intermediate candidate.
+`ValidationRunResultV1` input IDs and hashes to match. The production path
+constructs an explicit `ValidationExecutionService` and records validation
+request identity before transport and normalized/output artifact identity after
+transport. Repair defaults to `report_only`; an explicit safe transaction
+creates only derived versioned artifacts, and promotion writes a
+`RepairPromotionTransaction` with structural revalidation, audit, and lineage
+without replacing canonical READY files. Adoption never silently promotes an
+intermediate candidate.
 
 Export bundles contain verified files, provenance, checksums, completion
 evidence, and validation-closure evidence. `canonical_verified`,

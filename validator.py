@@ -187,7 +187,27 @@ def _call_validation_api(
     }
     if provider_runtime is not None:
         call_kwargs["provider_runtime"] = provider_runtime
-    return _call_ai_api(prompt, api_config, system_prompt, **call_kwargs)  # type: ignore[arg-type]
+    bind_call = getattr(generator_instance, "bind_provider_call", None)
+    if callable(bind_call) and provider_runtime is not None:
+        bind_call(
+            call_id=str(call_id),
+            prompt=prompt,
+            input_payload={
+                "system": system_prompt,
+                "user": prompt,
+                "user_content": None,
+                "response_format": response_format,
+                "max_output_tokens": int(max_tokens),
+                "temperature": temperature,
+            },
+            api_config=api_config,
+            schema_hash=str(getattr(provider_runtime, "schema_hash", "") or ""),
+        )
+    content = _call_ai_api(prompt, api_config, system_prompt, **call_kwargs)  # type: ignore[arg-type]
+    bind_output = getattr(generator_instance, "bind_provider_output", None)
+    if callable(bind_output) and content is not None:
+        bind_output(call_id=str(call_id), content=content)
+    return content
 
 
 def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: Dict[str, Any],
@@ -218,7 +238,6 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
     content_hash: Optional[str] = None
     cache_file_path: Optional[str] = None
     if use_cache:
-        import hashlib
         paper_info: Any = ai_result.get('paper_info') or {}  # type: ignore
         content_str = pdf_text[:1000] + str(paper_info.get('title', '')) + str(paper_info.get('authors', []))  # type: ignore
         content_hash = hashlib.md5(content_str.encode('utf-8')).hexdigest()
@@ -467,8 +486,8 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
 def _validate_claims_for_single_paper(
     source_summary: dict,
     sentences: List[str],
-    api_config: dict,
-    config: dict = None,
+    api_config: APIConfig,
+    config: Optional[Dict[str, Any]] = None,
     *,
     provider_runtime: Any = None,
 ) -> Optional[dict]:  # type: ignore

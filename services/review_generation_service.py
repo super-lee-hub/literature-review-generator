@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Evidence-bound Writer Review v3 execution."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
@@ -16,6 +16,9 @@ from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderRuntime,
     ProviderRuntimeLedger,
+    _redact_mapping,
+    hash_json,
+    hash_text,
 )
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
@@ -108,14 +111,25 @@ class ReviewGenerationService:
                 sections.append(persisted)
                 continue
             runtime = self._new_runtime(section_id)
-            self._expected_provider_calls[f"review:{section_id}"] = ExpectedProviderCall(
-                call_id=f"review:{section_id}",
+            call_id = f"review:{section_id}"
+            self._expected_provider_calls[call_id] = ExpectedProviderCall(
+                call_id=call_id,
                 job_id=self.job_id,
                 attempt_id=self.attempt_id,
                 stage_name="stage3_review",
                 node_id=section_id,
                 max_attempts=max(1, self.settings.runtime.node_retry_limit + 1),
                 usage_required=False,
+            )
+            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
+            request_payload = self._writer_request_payload(prompt)
+            writer_config = dict(self.settings.section("Writer_API"))
+            self._expected_provider_calls[call_id] = replace(
+                self._expected_provider_calls[call_id],
+                prompt_hash=hash_text(prompt),
+                input_hash=hash_json(request_payload),
+                config_hash=hash_json(_redact_mapping(writer_config)),
+                schema_hash=runtime.schema_hash,
             )
             provider_result = self._call_writer(
                 section_number=number,
@@ -127,8 +141,8 @@ class ReviewGenerationService:
             )
             self._ensure_receipt(
                 runtime,
-                prompt=self._prompt(raw_section, packet, catalog, allowed_ref_ids),
-                input_payload={"section": dict(raw_section), "packet": dict(packet)},
+                prompt=prompt,
+                input_payload=request_payload,
                 result=provider_result,
             )
             blocks = self._normalize_blocks(
@@ -156,13 +170,13 @@ class ReviewGenerationService:
             sections.append(section_payload)
             if runtime.receipts:
                 receipt = runtime.receipts[-1]
+                section_record = self.registry.get(f"review-section:{section_id}")
                 self._expected_provider_calls[f"review:{section_id}"] = replace(
                     self._expected_provider_calls[f"review:{section_id}"],
-                    prompt_hash=receipt.prompt_hash,
-                    input_hash=receipt.input_hash,
-                    config_hash=receipt.config_hash,
-                    schema_hash=receipt.schema_hash,
                     output_hash=receipt.response_hash or "",
+                    normalized_output_hash=receipt.response_hash or "",
+                    registered_artifact_hash=(section_record.content_hash if section_record else ""),
+                    node_output_hash=(section_record.content_hash if section_record else ""),
                 )
 
         if not sections:
@@ -630,6 +644,18 @@ class ReviewGenerationService:
             return max(256, int(raw))
         except (TypeError, ValueError):
             return 32000
+
+    def _writer_request_payload(self, prompt: str) -> dict[str, Any]:
+        """Build the exact payload hashed by the bound provider runtime."""
+
+        return {
+            "system": self._system_prompt(),
+            "user": prompt,
+            "user_content": None,
+            "response_format": "json",
+            "max_output_tokens": self._max_output_tokens(),
+            "temperature": 0.2,
+        }
 
     @staticmethod
     def _system_prompt() -> str:

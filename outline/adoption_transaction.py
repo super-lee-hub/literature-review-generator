@@ -13,6 +13,12 @@ from services.audit_record import AuditArtifactRefV1, AuditRecordV1
 from services.job_workspace import JobWorkspace, atomic_write_json
 
 
+ADOPTION_POINTER_ARTIFACT_ID = "outline-v3:adoption:current"
+ADOPTION_POINTER_ARTIFACT_TYPE = "outline_adoption_pointer"
+ADOPTION_POINTER_ARTIFACT_VERSION = "v1"
+ADOPTION_POINTER_ARTIFACT_ROLE = "outline_v3_adoption_current"
+
+
 def _load_json(record: ArtifactRecord) -> dict[str, Any]:
     try:
         payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
@@ -44,6 +50,81 @@ def _dependency(record: ArtifactRecord) -> ArtifactDependencyRefV2:
     )
 
 
+def current_adoption_record(registry: ArtifactRegistry) -> ArtifactRecord | None:
+    """Resolve the versioned adoption selected by the durable current pointer.
+
+    The pointer is the only current-state selector.  The legacy fixed identity
+    is accepted as a read-only compatibility fallback so existing workspaces
+    can be migrated without silently losing their adoption evidence.
+    """
+
+    pointer = registry.get(ADOPTION_POINTER_ARTIFACT_ID)
+    if pointer is not None and pointer.status == "ready":
+        try:
+            pointer_payload = _load_json(pointer)
+        except ValueError:
+            pointer_payload = {}
+        target_id = str(pointer_payload.get("current_adoption_artifact_id") or "").strip()
+        target_hash = str(pointer_payload.get("current_adoption_hash") or "").strip()
+        target = registry.get(target_id) if target_id else None
+        if (
+            target is not None
+            and target.status == "ready"
+            and target.artifact_type == "adopted_outline"
+            and target.artifact_version == "v3"
+            and (not target_hash or target.content_hash == target_hash)
+        ):
+            return target
+
+    legacy = registry.get("outline-v3:adoption")
+    if legacy is not None and legacy.status == "ready":
+        return legacy
+
+    candidates = [
+        record
+        for record in registry.list_records()
+        if record.status == "ready"
+        and record.artifact_type == "adopted_outline"
+        and record.artifact_version == "v3"
+    ]
+    return max(candidates, key=lambda item: (item.created_at, item.artifact_id), default=None)
+
+
+def _write_current_pointer(
+    workspace: JobWorkspace,
+    registry: ArtifactRegistry,
+    adopted_record: ArtifactRecord,
+) -> ArtifactRecord:
+    pointer_path = Path(workspace.artifact_path("outline_v3_adoption_current.json"))
+    atomic_write_json(
+        str(pointer_path),
+        {
+            "artifact_type": ADOPTION_POINTER_ARTIFACT_TYPE,
+            "artifact_version": ADOPTION_POINTER_ARTIFACT_VERSION,
+            "job_id": workspace.job_id,
+            "role": "current",
+            "current_adoption_artifact_id": adopted_record.artifact_id,
+            "current_adoption_hash": adopted_record.content_hash,
+            "adoption_identity": adopted_record.artifact_id,
+            "updated_at": adopted_record.created_at,
+        },
+    )
+    return registry.register_file(
+        artifact_id=ADOPTION_POINTER_ARTIFACT_ID,
+        artifact_role=ADOPTION_POINTER_ARTIFACT_ROLE,
+        artifact_type=ADOPTION_POINTER_ARTIFACT_TYPE,
+        artifact_version=ADOPTION_POINTER_ARTIFACT_VERSION,
+        path=pointer_path,
+        producer="outline.adoption_transaction.OutlineAdoptionTransaction",
+        depends_on=[_dependency(adopted_record)],
+        metadata={
+            "role": "current",
+            "current_adoption_artifact_id": adopted_record.artifact_id,
+            "current_adoption_hash": adopted_record.content_hash,
+        },
+    )
+
+
 @dataclass(frozen=True)
 class AdoptionTransactionResult:
     status: str
@@ -57,6 +138,7 @@ class AdoptionTransactionResult:
     expected_hash: str = ""
     mutation_performed: bool = False
     read_only: bool = False
+    current_pointer_artifact_id: str = ADOPTION_POINTER_ARTIFACT_ID
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +153,7 @@ class AdoptionTransactionResult:
             "expected_hash": self.expected_hash,
             "mutation_performed": self.mutation_performed,
             "read_only": self.read_only,
+            "current_pointer_artifact_id": self.current_pointer_artifact_id,
         }
 
 
@@ -199,9 +282,10 @@ class OutlineAdoptionTransaction:
                 expected_hash=expected_hash,
             )
 
-        adopted_id = "outline-v3:adoption"
+        adopted_id = f"outline-v3:adoption:{source.content_hash[:16]}"
         existing = self.registry.get(adopted_id)
         if existing is not None and existing.status == "ready":
+            _write_current_pointer(self.workspace, self.registry, existing)
             return AdoptionTransactionResult(
                 status="already_adopted",
                 job_id=self.workspace.job_id,
@@ -211,6 +295,7 @@ class OutlineAdoptionTransaction:
                 reason="the current outline is already adopted",
                 actor=actor,
                 expected_hash=expected_hash,
+                current_pointer_artifact_id=ADOPTION_POINTER_ARTIFACT_ID,
             )
 
         dependency_records = (source, coverage, stability, receipt_closure, health)
@@ -220,6 +305,10 @@ class OutlineAdoptionTransaction:
             dependency_hashes=dependency_hashes,
             payload={
                 "status": "adopted",
+                "adoption_id": adopted_id,
+                "adoption_identity": adopted_id,
+                "current_pointer_artifact_id": ADOPTION_POINTER_ARTIFACT_ID,
+                "current_pointer_role": "current",
                 "actor": actor,
                 "reason": reason,
                 "expected_hash": expected_hash,
@@ -243,6 +332,7 @@ class OutlineAdoptionTransaction:
             depends_on=[_dependency(record) for record in dependency_records],
             metadata={"actor": actor, "reason": reason, "expected_hash": expected_hash},
         )
+        _write_current_pointer(self.workspace, self.registry, adopted_record)
 
         refs = [
             AuditArtifactRefV1(
@@ -304,7 +394,16 @@ class OutlineAdoptionTransaction:
             actor=actor,
             expected_hash=expected_hash,
             mutation_performed=True,
+            current_pointer_artifact_id=ADOPTION_POINTER_ARTIFACT_ID,
         )
 
 
-__all__ = ["AdoptionTransactionResult", "OutlineAdoptionTransaction"]
+__all__ = [
+    "ADOPTION_POINTER_ARTIFACT_ID",
+    "ADOPTION_POINTER_ARTIFACT_ROLE",
+    "ADOPTION_POINTER_ARTIFACT_TYPE",
+    "ADOPTION_POINTER_ARTIFACT_VERSION",
+    "AdoptionTransactionResult",
+    "OutlineAdoptionTransaction",
+    "current_adoption_record",
+]

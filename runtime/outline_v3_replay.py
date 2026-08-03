@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
-from runtime.attempt_store import _write_json_exclusive
 from services.job_workspace import utc_now_iso
 
 from outline.v3_models import compute_v3_hash
@@ -52,6 +51,7 @@ class ModelCallReplayKey:
     prompt_payload_hash: str
     input_artifact_hashes: List[str] = field(default_factory=list)
     config_hash: str = ""
+    execution_binding_hash: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +65,7 @@ class ModelCallReplayKey:
             "prompt_payload_hash": self.prompt_payload_hash,
             "input_artifact_hashes": _stable_unique(self.input_artifact_hashes),
             "config_hash": self.config_hash,
+            "execution_binding_hash": self.execution_binding_hash,
         }
 
     @property
@@ -84,6 +85,7 @@ class ModelCallReplayKey:
             prompt_payload_hash=str(data.get("prompt_payload_hash") or ""),
             input_artifact_hashes=_stable_unique(data.get("input_artifact_hashes") or []),
             config_hash=str(data.get("config_hash") or ""),
+            execution_binding_hash=str(data.get("execution_binding_hash") or ""),
         )
 
 
@@ -93,6 +95,9 @@ class ModelCallReplayRecord:
     key: ModelCallReplayKey
     status: str = "succeeded"
     output_hash: str = ""
+    normalized_output_hash: str = ""
+    registered_artifact_hash: str = ""
+    node_output_hash: str = ""
     output_artifact_ids: List[str] = field(default_factory=list)
     receipt_ids: List[str] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now_iso)
@@ -105,6 +110,9 @@ class ModelCallReplayRecord:
             "key": self.key.to_dict(),
             "status": self.status,
             "output_hash": self.output_hash,
+            "normalized_output_hash": self.normalized_output_hash or self.output_hash,
+            "registered_artifact_hash": self.registered_artifact_hash,
+            "node_output_hash": self.node_output_hash,
             "output_artifact_ids": _stable_unique(self.output_artifact_ids),
             "receipt_ids": _stable_unique(self.receipt_ids),
             "created_at": self.created_at,
@@ -118,6 +126,9 @@ class ModelCallReplayRecord:
             key=ModelCallReplayKey.from_dict(key_payload if isinstance(key_payload, Mapping) else {}),
             status=str(data.get("status") or "succeeded"),
             output_hash=str(data.get("output_hash") or ""),
+            normalized_output_hash=str(data.get("normalized_output_hash") or data.get("output_hash") or ""),
+            registered_artifact_hash=str(data.get("registered_artifact_hash") or ""),
+            node_output_hash=str(data.get("node_output_hash") or ""),
             output_artifact_ids=_stable_unique(data.get("output_artifact_ids") or []),
             receipt_ids=_stable_unique(data.get("receipt_ids") or []),
             created_at=str(data.get("created_at") or utc_now_iso()),
@@ -154,6 +165,7 @@ def _key_mismatch_reasons(expected: ModelCallReplayKey, actual: ModelCallReplayK
         ("prompt_payload_hash", "prompt_payload_changed"),
         ("input_artifact_hashes", "input_artifacts_changed"),
         ("config_hash", "config_changed"),
+        ("execution_binding_hash", "execution_binding_changed"),
     )
     return [reason for field, reason in comparisons if getattr(expected, field) != getattr(actual, field)]
 
@@ -210,6 +222,9 @@ class ModelCallReplayStore:
         output_hash: str,
         output_artifact_ids: Sequence[str] = (),
         receipt_ids: Sequence[str] = (),
+        normalized_output_hash: str = "",
+        registered_artifact_hash: str = "",
+        node_output_hash: str = "",
     ) -> ModelCallReplayRecord:
         if not output_hash:
             raise ValueError("a replay record requires output_hash")
@@ -217,6 +232,9 @@ class ModelCallReplayStore:
             replay_id=f"replay:{key.key_hash}",
             key=key,
             output_hash=output_hash,
+            normalized_output_hash=normalized_output_hash or output_hash,
+            registered_artifact_hash=registered_artifact_hash,
+            node_output_hash=node_output_hash,
             output_artifact_ids=_stable_unique(output_artifact_ids),
             receipt_ids=_stable_unique(receipt_ids),
         )

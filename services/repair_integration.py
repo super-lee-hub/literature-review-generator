@@ -201,7 +201,7 @@ def run_repair_pipeline(
     from validation.repair_planner import RepairPlanner
     from services.citation_manifest import unresolved_occurrences
     from docx_writer import create_word_document, generate_apa_references_from_manifest
-    from validator import run_review_validation
+    from validation.review_validation_pipeline import run_current_review_validation
     
     # 检查 citation manifest 是否完整
     if citation_manifest:
@@ -298,7 +298,6 @@ def run_repair_pipeline(
         
         # Step 5: Persist repaired manifest and regenerate downstream artifacts.
         if apply_result.get("patched_review_draft"):
-            patched_review_draft = apply_result["patched_review_draft"]
             patched_citation_manifest = apply_result.get("patched_citation_manifest") or citation_manifest
             manifest_path = persist_patched_citation_manifest(
                 patched_citation_manifest,
@@ -385,7 +384,7 @@ def run_repair_pipeline(
             
             # Step 6: Run review recheck
             try:
-                recheck_result = run_review_validation(mock_generator)
+                recheck_result = run_current_review_validation(mock_generator)
                 result["recheck_result"] = recheck_result
                 result["recheck_success"] = recheck_result.get("success", False)
             except Exception as recheck_error:
