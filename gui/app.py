@@ -2170,7 +2170,7 @@ class WorkspaceController:
         runtimes = self._queue_service.list_job_runtimes()
         running = [
             runtime
-            for runtime in runtimes.values()
+            for runtime in runtimes
             if getattr(runtime, "state", None) == QueueState.RUNNING and getattr(runtime, "progress_snapshot", None)
         ]
         running.sort(key=lambda item: str(getattr(item, "started_at", "") or ""), reverse=True)

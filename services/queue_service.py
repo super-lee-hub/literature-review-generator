@@ -401,7 +401,14 @@ class PersistentQueueService:
             runtime.cancel_requested = True
             runtime.cancel_requested_at = self._utc_now()
             runtime.cancel_reason = reason
-            runtime.state = QueueState.CANCEL_REQUESTED
+            if runtime.state == QueueState.PENDING:
+                # A pending job has no worker checkpoint to wait for.  Mark it
+                # cancelled atomically so it cannot become runnable after the
+                # request is persisted.
+                runtime.state = QueueState.CANCELLED
+                runtime.completed_at = self._utc_now()
+            else:
+                runtime.state = QueueState.CANCEL_REQUESTED
             self._save()
         return True
 
@@ -564,6 +571,16 @@ class QueueRunner:
         if store.read() is not None:
             store.clear(cleared_by="queue_runner", reason="retry")
 
+    def _acknowledge_cancelled(self, job_id: str) -> None:
+        runtime = self.queue_service.get_job_runtime(job_id)
+        if runtime is None:
+            return
+        if runtime.state == QueueState.CANCEL_REQUESTED:
+            self.queue_service.acknowledge_cancel(job_id)
+            self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
+        elif runtime.state == QueueState.PENDING:
+            self.queue_service.request_cancel(job_id, reason="queue_runner_checkpoint")
+
     def _process_job(self, job_spec: QueueJobSpec) -> None:
         cancel_token = CancelToken()
         with self._lock:
@@ -573,14 +590,16 @@ class QueueRunner:
             if self._external_cancel_requested(job_spec):
                 cancel_token.request_cancel()
                 self.queue_service.request_cancel(job_spec.job_id, reason="external_cancel_request")
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
             # 检查任务是否已经被取消
             if self.queue_service.is_cancel_requested(job_spec.job_id):
                 cancel_token.request_cancel()
-                self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
 
             # 检查依赖任务状态 — 严格优先级: missing → failed → cancelled → not-completed → completed
@@ -622,6 +641,7 @@ class QueueRunner:
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 cancel_token.request_cancel()
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
             
             # 更新当前阶段
@@ -658,6 +678,7 @@ class QueueRunner:
             # 最后检查一次任务状态
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
             
             # 更新当前阶段
@@ -692,11 +713,12 @@ class QueueRunner:
                     self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
                     self.queue_service.set_job_error(job_spec.job_id, result.message)
         except JobCancelledError:
-            self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+            self._acknowledge_cancelled(job_spec.job_id)
         except Exception as e:
             # 检查是否是因为取消而导致的异常
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
             self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
             self.queue_service.set_job_error(job_spec.job_id, str(e))
