@@ -29,6 +29,7 @@ from services.artifact_registry import (
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.queue_service import CancelToken
+from services.stage1_analysis_service import Stage1AnalysisService
 
 
 class _RuntimeStageHost:
@@ -142,8 +143,70 @@ class _RuntimeStageHost:
         paper = result.get("paper_info")
         if not isinstance(paper, Mapping):
             return False
+        from services.paper_artifact import build_paper_artifact_v1
+
         path = self._paper_artifact_path(paper)
-        atomic_write_json(path, dict(result))
+        paper_key = self.get_paper_key(paper)
+        artifact = build_paper_artifact_v1(
+            job_id=registry.job_id,
+            paper=paper,
+            result=result,
+            paper_key=paper_key,
+        )
+        atomic_write_json(path, artifact.to_dict())
+        dependency_paths = {
+            str(paper.get("source_pdf") or "").strip(),
+        }
+        preprocess = result.get("preprocess")
+        if isinstance(preprocess, Mapping):
+            dependency_paths.update(
+                str(value).strip()
+                for key, value in preprocess.items()
+                if str(key).endswith("_path") and str(value).strip()
+            )
+        stage1_input = result.get("stage1_input")
+        if isinstance(stage1_input, Mapping):
+            dependency_paths.update(
+                str(stage1_input.get(key) or "").strip()
+                for key in ("visual_manifest_path", "visual_bundle_path")
+            )
+            dependency_paths.update(
+                str(item.get("image_path") or "").strip()
+                for item in (stage1_input.get("selected_visual_refs") or [])
+                if isinstance(item, Mapping)
+            )
+        dependencies: list[ArtifactDependencyRefV2] = []
+        for record in registry.list_records():
+            if record.status != "ready" or not record.path:
+                continue
+            if str(Path(record.path).resolve()) not in {
+                str(Path(value).expanduser().resolve())
+                for value in dependency_paths
+                if value
+            }:
+                continue
+            dependencies.append(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=record.job_id,
+                    artifact_id=record.artifact_id,
+                    artifact_type=record.artifact_type,
+                    path=record.path,
+                    content_hash=record.content_hash,
+                )
+            )
+        provider_record = registry.get("provider_receipts")
+        if provider_record is not None and provider_record.status == "ready":
+            dependencies.append(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=provider_record.job_id,
+                    artifact_id=provider_record.artifact_id,
+                    artifact_type=provider_record.artifact_type,
+                    path=provider_record.path,
+                    content_hash=provider_record.content_hash,
+                )
+            )
         registry.register_file(
             artifact_role=self.PAPER_ARTIFACT_ROLE,
             artifact_type=self.PAPER_ARTIFACT_TYPE,
@@ -151,6 +214,7 @@ class _RuntimeStageHost:
             path=path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id=self._paper_artifact_id(paper),
+            depends_on=dependencies,
         )
         return True
 
@@ -387,12 +451,39 @@ class InternalStageExecutorRegistry:
         session: AgentRuntimeSession,
         bundle: SourceBundle,
         results: Mapping[str, StageResult],
+        attempt_id: str,
     ) -> tuple[StageResult, int]:
         summaries = self._load_summary_payloads(session, results)
-        if not summaries:
-            raise RuntimeError(
-                "stage1 is not registered for provider generation; provide a canonical summary source"
+        if bundle.paper_work_items:
+            generation = Stage1AnalysisService(
+                job_id=session.context.workspace.job_id,
+                attempt_id=attempt_id,
+                workspace=session.context.workspace,
+                artifact_registry=session.context.registry,
+                config=session.stage_host.config,
+                settings=session.context.settings,
+                cancellation_checker=session.stage_host.check_cancelled,
+                logger=session.stage_host.logger,
+            ).run(bundle, existing_summaries=summaries)
+            normalized = self._validate_summary_identity(generation.summaries, bundle)
+            return (
+                self.bridge.persist_stage1_results(
+                    session,
+                    normalized,
+                    source_kind=(
+                        "provider_generated"
+                        if generation.generated_count
+                        else "runtime_summary_source"
+                    ),
+                    source_items=[dict(item) for item in generation.source_items],
+                    provider_receipt_ids=list(generation.receipt_ids),
+                    generated_count=generation.generated_count,
+                    reused_count=generation.reused_count,
+                ),
+                len(generation.receipt_ids),
             )
+        if not summaries:
+            raise RuntimeError("Stage 1 requires a source work item or a canonical summary source")
         normalized = self._validate_summary_identity(summaries, bundle)
         return (
             self.bridge.persist_stage1_results(
@@ -587,9 +678,14 @@ class InternalStageExecutorRegistry:
         attempt_id: str,
         external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
-        del spec, attempt_id, external_registry_resolver
+        del spec, external_registry_resolver
         executors: dict[str, Callable[[], tuple[StageResult, int]]] = {
-            "analyze": lambda: self._execute_analyze(session=session, bundle=bundle, results=results),
+            "analyze": lambda: self._execute_analyze(
+                session=session,
+                bundle=bundle,
+                results=results,
+                attempt_id=attempt_id,
+            ),
             "outline": lambda: self._execute_outline(session=session, results=results),
             "review": lambda: self._execute_review(session=session, results=results),
             "validate": lambda: (self.bridge.run_validation(session), 0),
@@ -878,6 +974,9 @@ class AgentRuntimeBridge:
         rejected_candidates: list[dict[str, Any]] | None = None,
         write_excel_report: bool = False,
         subagent_run_id: str | None = None,
+        provider_receipt_ids: list[str] | None = None,
+        generated_count: int = 0,
+        reused_count: int = 0,
     ) -> StageResult:
         host = session.stage_host
         if write_excel_report:
@@ -899,6 +998,18 @@ class AgentRuntimeBridge:
                 content_hash=source_bundle_record.content_hash,
             )
         ]
+        provider_record = session.context.registry.get("provider_receipts")
+        if provider_record is not None and provider_record.status == "ready":
+            source_dependencies.append(
+                ArtifactDependencyRef(
+                    dependency_kind="local_job",
+                    job_id=provider_record.job_id,
+                    artifact_id=provider_record.artifact_id,
+                    artifact_type=provider_record.artifact_type,
+                    path=provider_record.path,
+                    content_hash=provider_record.content_hash,
+                )
+            )
         host.summaries = normalized_summaries
         host._checkpoint_processed_papers = set()
         host._checkpoint_failed_papers = set()
@@ -983,6 +1094,9 @@ class AgentRuntimeBridge:
                 )
             )
 
+        if provider_record is not None and provider_record.status == "ready":
+            artifact_refs.append(self._artifact_ref_from_record(provider_record))
+
         self._append_stage_trace_entries(
             session,
             self._build_generation_trace_entries(
@@ -1007,6 +1121,9 @@ class AgentRuntimeBridge:
                 "summary_count": len(normalized_summaries),
                 "processed_count": len(host._checkpoint_processed_papers),
                 "failed_count": len(host._checkpoint_failed_papers),
+                "generated_count": int(generated_count),
+                "reused_count": int(reused_count),
+                "provider_receipt_ids": list(provider_receipt_ids or []),
             },
         )
 

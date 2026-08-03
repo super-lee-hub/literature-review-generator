@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Mapping
+
+import fitz  # type: ignore
+
+from runtime.stage_contracts import build_source_bundle
+from services.artifact_registry import ArtifactRegistry
+from services.job_workspace import JobWorkspace
+from services.settings import ApplicationSettings
+from services.stage1_analysis_service import Stage1AnalysisService
+from summary_schema import normalize_ai_summary
+
+
+def _summary() -> dict[str, Any]:
+    return normalize_ai_summary(
+        {
+            "common_core": {
+                "title": "Visual evidence study",
+                "summary": "A study with a figure-supported empirical result.",
+                "methodology": "Experiment with N=80 observations.",
+                "findings": "The figure reports a 20 percent improvement (p < 0.05).",
+                "conclusions": "The result is consistent with the proposed mechanism.",
+            },
+            "type_specific_details": {
+                "paper_type": "empirical",
+                "data_source_and_size": "Experiment, N=80.",
+                "analysis_technique": "Regression analysis.",
+            },
+        }
+    )
+
+
+def test_current_stage1_visual_bundle_is_traceable_and_passed_to_reader(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "visual-paper.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Figure 1. Treatment effect\nResults: 20 percent improvement.")
+    page.draw_rect(fitz.Rect(72, 100, 260, 220), color=(0, 0, 1), fill=(0.8, 0.8, 1))
+    document.save(pdf_path)
+    document.close()
+
+    config = {
+        "Preprocess": {"enabled": "true", "cache_dir": str(tmp_path / "cache")},
+        "Stage1_Visual": {"enabled": "true"},
+        "Stage1_Input": {"send_extracted_text": "true", "send_selected_visuals": "true", "send_original_pdf": "never"},
+        "Multimodal": {"enabled": "true"},
+        "Primary_Reader_API": {
+            "api_key": "reader",
+            "model": "vision-reader",
+            "api_base": "https://reader.test/v1",
+            "endpoint_type": "responses",
+            "supports_image_input": "true",
+        },
+        "Backup_Reader_API": {"api_key": "backup", "model": "backup-reader", "api_base": "https://backup.test/v1"},
+    }
+    workspace = JobWorkspace.create(str(tmp_path / "output"), "current", job_id="visual-job")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    registry.register_file(
+        artifact_role="source_pdf", artifact_type="source_pdf", artifact_version="v1",
+        path=pdf_path, producer="test", artifact_id=f"source_pdf:{pdf_path.name}",
+    )
+    settings = ApplicationSettings.from_config(config)
+    observed: list[Mapping[str, Any]] = []
+
+    def reader(**kwargs: Any) -> Mapping[str, Any]:
+        observed.append(kwargs)
+        return {"status": "success", "content": _summary()}
+
+    service = Stage1AnalysisService(
+        job_id=workspace.job_id,
+        attempt_id="attempt-1",
+        workspace=workspace,
+        artifact_registry=registry,
+        config=config,
+        settings=settings,
+        reader=reader,
+    )
+    bundle = build_source_bundle(
+        source_mode="direct", project_name="current",
+        papers=[{"title": "Visual evidence study", "pdf_path": str(pdf_path), "source_paper_id": "visual-1"}],
+    )
+    result = service.run(bundle)
+
+    assert observed
+    assert result.summaries[0]["stage1_input"]["visual_manifest_path"]
+    assert result.summaries[0]["stage1_input"]["visual_bundle_path"]
+    assert result.summaries[0]["stage1_input"]["selected_visual_refs"]
+    assert any(record.artifact_type == "visual_manifest" for record in registry.list_records())
+    assert any(record.artifact_type == "stage1_visual_bundle" for record in registry.list_records())
