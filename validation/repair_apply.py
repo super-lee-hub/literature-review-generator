@@ -88,6 +88,14 @@ def _check_dependency_bundle(
             return False
         resolved_artifacts.append(artifact)
 
+    resolved_artifacts.sort(
+        key=lambda artifact: str(
+            artifact.get("paper_identity", {}).get("canonical_paper_key")
+            if isinstance(artifact.get("paper_identity"), dict)
+            else ""
+        )
+    )
+
     primary = resolved_artifacts[0]
 
     # Check aggregate summary hash across all papers

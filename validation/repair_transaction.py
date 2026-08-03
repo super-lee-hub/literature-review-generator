@@ -65,6 +65,141 @@ def _find_block(review_draft: Mapping[str, Any], block_id: str) -> Mapping[str, 
     return None
 
 
+def _targeted_revalidate(
+    review_draft: Mapping[str, Any],
+    citation_manifest: Mapping[str, Any],
+    paper_artifacts: Sequence[Mapping[str, Any]],
+    citation_ref_catalog: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Recheck the structural closure of a derived repair result.
+
+    Repair application is deliberately separate from the full semantic
+    validator.  This small, deterministic check is the final boundary before
+    a derived result is persisted: every section/block must remain addressable
+    and every citation occurrence must resolve to a real block, ref, and paper.
+    """
+
+    diagnostics: list[str] = []
+    content = review_draft.get("content")
+    sections = content.get("sections") if isinstance(content, Mapping) else None
+    if not isinstance(sections, list) or not sections:
+        diagnostics.append("review_draft_sections_missing")
+
+    block_ids: set[str] = set()
+    block_count = 0
+    if isinstance(sections, list):
+        for section_index, section in enumerate(sections, start=1):
+            if not isinstance(section, Mapping):
+                diagnostics.append(f"section_not_object:{section_index}")
+                continue
+            blocks = section.get("blocks")
+            if not isinstance(blocks, list) or not blocks:
+                diagnostics.append(f"section_blocks_missing:{section_index}")
+                continue
+            for block_index, block in enumerate(blocks, start=1):
+                if not isinstance(block, Mapping):
+                    diagnostics.append(f"block_not_object:{section_index}:{block_index}")
+                    continue
+                block_id = str(block.get("block_id") or "").strip()
+                if not block_id:
+                    diagnostics.append(f"block_id_missing:{section_index}:{block_index}")
+                elif block_id in block_ids:
+                    diagnostics.append(f"duplicate_block_id:{block_id}")
+                else:
+                    block_ids.add(block_id)
+                if not str(block.get("text") or "").strip():
+                    diagnostics.append(f"block_text_empty:{block_id or f'{section_index}:{block_index}'}")
+                block_count += 1
+
+    manifest_occurrences = citation_manifest.get("occurrences")
+    occurrences = manifest_occurrences if isinstance(manifest_occurrences, list) else []
+    if manifest_occurrences is None:
+        diagnostics.append("citation_occurrences_missing")
+    occurrence_ids: set[str] = set()
+    active_ref_ids = {
+        str(entry.get("ref_id") or "").strip()
+        for entry in (citation_ref_catalog or {}).get("entries", [])
+        if isinstance(entry, Mapping)
+        and entry.get("status") == "active"
+        and str(entry.get("ref_id") or "").strip()
+    }
+    known_paper_ids: set[str] = set()
+    for artifact in paper_artifacts:
+        identity = artifact.get("paper_identity")
+        if isinstance(identity, Mapping):
+            known_paper_ids.update(
+                str(identity.get(key) or "").strip()
+                for key in ("canonical_paper_key", "source_paper_id")
+                if str(identity.get(key) or "").strip()
+            )
+    for entry in (citation_ref_catalog or {}).get("entries", []):
+        if isinstance(entry, Mapping) and entry.get("status") == "active":
+            known_paper_ids.update(
+                str(entry.get(key) or "").strip()
+                for key in ("paper_id", "canonical_paper_key")
+                if str(entry.get(key) or "").strip()
+            )
+    for field_name in ("paper_entries", "bibliography"):
+        for entry in citation_manifest.get(field_name, []) or []:
+            if isinstance(entry, Mapping):
+                known_paper_ids.update(
+                    str(entry.get(key) or "").strip()
+                    for key in ("paper_id", "paper_key")
+                    if str(entry.get(key) or "").strip()
+                )
+
+    unresolved_count = 0
+    mapped_count = 0
+    for index, occurrence in enumerate(occurrences, start=1):
+        if not isinstance(occurrence, Mapping):
+            diagnostics.append(f"citation_occurrence_not_object:{index}")
+            unresolved_count += 1
+            continue
+        occurrence_id = str(occurrence.get("occurrence_id") or "").strip()
+        if not occurrence_id:
+            diagnostics.append(f"citation_occurrence_id_missing:{index}")
+        elif occurrence_id in occurrence_ids:
+            diagnostics.append(f"duplicate_citation_occurrence:{occurrence_id}")
+        else:
+            occurrence_ids.add(occurrence_id)
+        block_id = str(occurrence.get("block_id") or "").strip()
+        ref_id = str(occurrence.get("ref_id") or "").strip()
+        paper_id = str(occurrence.get("paper_id") or occurrence.get("paper_key") or "").strip()
+        unresolved = (
+            not block_id
+            or block_id not in block_ids
+            or not ref_id
+            or not paper_id
+            or paper_id.lower() == "unknown"
+            or (bool(active_ref_ids) and ref_id not in active_ref_ids)
+            or (bool(known_paper_ids) and paper_id not in known_paper_ids)
+        )
+        if not block_id or block_id not in block_ids:
+            diagnostics.append(f"citation_block_mapping_error:{occurrence_id or index}")
+        if not ref_id:
+            diagnostics.append(f"citation_ref_id_missing:{occurrence_id or index}")
+        elif active_ref_ids and ref_id not in active_ref_ids:
+            diagnostics.append(f"citation_ref_id_unresolved:{ref_id}")
+        if not paper_id or paper_id.lower() == "unknown":
+            diagnostics.append(f"citation_paper_id_unresolved:{occurrence_id or index}")
+        elif known_paper_ids and paper_id not in known_paper_ids:
+            diagnostics.append(f"citation_paper_id_unknown:{paper_id}")
+        if unresolved:
+            unresolved_count += 1
+        else:
+            mapped_count += 1
+
+    return {
+        "passed": not diagnostics,
+        "diagnostics": sorted(set(diagnostics)),
+        "section_count": len(sections) if isinstance(sections, list) else 0,
+        "block_count": block_count,
+        "occurrence_count": len(occurrences),
+        "mapped_occurrence_count": mapped_count,
+        "unresolved_occurrence_count": unresolved_count,
+    }
+
+
 def _root_cause(values: Sequence[Any]) -> RepairRootCause:
     allowed = {item.value: item for item in RepairRootCause}
     for value in values:
@@ -179,24 +314,96 @@ class RepairTransactionService:
         )
 
     def _dependency_bundle(self, closure: ValidationClosureResult) -> DependencyHashBundle:
+        records = [record for record in self.registry.list_records() if record.status == "ready"]
         inputs = closure.input_artifacts
         draft = inputs.get("review_draft") if isinstance(inputs, Mapping) else {}
         manifest = inputs.get("citation_manifest") if isinstance(inputs, Mapping) else {}
         validation = closure.validation_artifact or {}
-        outline_hash = ""
-        for record in self.registry.list_records():
-            if record.status == "ready" and record.artifact_type in {"outline", "reviewed_outline", "adopted_final_outline"}:
-                outline_hash = record.content_hash
-                break
+
+        def load(record: ArtifactRecord | None) -> dict[str, Any] | list[Any]:
+            if record is None:
+                return {}
+            try:
+                value = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return {}
+            return value if isinstance(value, (dict, list)) else {}
+
+        def choose(*artifact_types: str) -> ArtifactRecord | None:
+            candidates = [item for item in records if item.artifact_type in artifact_types]
+            return max(candidates, key=lambda item: (item.created_at, item.artifact_id), default=None)
+
+        summary_record = choose("summary_file", "stage1_canonical_summaries")
+        paper_records = [
+            item for item in records
+            if item.artifact_type in {"paper_artifact", "stage1_paper_artifact"}
+        ]
+
+        def paper_sort_key(record: ArtifactRecord) -> str:
+            value = load(record)
+            if isinstance(value, Mapping):
+                identity = value.get("paper_identity")
+                if isinstance(identity, Mapping):
+                    canonical_key = str(identity.get("canonical_paper_key") or "").strip()
+                    if canonical_key:
+                        return canonical_key
+            return record.artifact_id
+
+        paper_payloads = [
+            value for value in (
+                load(item) for item in sorted(
+                    paper_records,
+                    key=paper_sort_key,
+                )
+            )
+            if isinstance(value, Mapping)
+        ]
+        aggregate_summary: dict[str, Any] = {}
+        for paper_payload in paper_payloads:
+            analysis = paper_payload.get("analysis")
+            if isinstance(analysis, Mapping) and isinstance(analysis.get("ai_summary"), Mapping):
+                aggregate_summary.update(dict(analysis["ai_summary"]))
+        visual_record = choose("visual_manifest")
+        outline_record = next(
+            (
+                item for item in records
+                if item.artifact_id in {"outline-v3:final_outline", "outline-v3:adoption"}
+            ),
+            None,
+        )
+        primary_paper = paper_payloads[0] if paper_payloads else {}
+        visual_payload = load(visual_record)
         return DependencyHashBundle(
-            summary_hash="",
-            paper_artifact_hash="",
-            visual_manifest_hash="",
-            selected_visual_refs_hash="",
+            summary_hash=_hash(aggregate_summary) if aggregate_summary else "",
+            paper_artifact_hash=_hash(paper_payloads) if paper_payloads else "",
+            visual_manifest_hash=_hash(visual_payload) if visual_record is not None else "",
+            selected_visual_refs_hash=_hash(
+                primary_paper.get("stage1_inputs", {}).get("selected_visual_refs", [])
+                if isinstance(primary_paper.get("stage1_inputs"), Mapping)
+                else []
+            ) if primary_paper else "",
             review_draft_hash=str(draft.get("content_hash") or "") if isinstance(draft, Mapping) else "",
             citation_manifest_hash=str(manifest.get("content_hash") or "") if isinstance(manifest, Mapping) else "",
-            outline_hash=outline_hash,
+            outline_hash=outline_record.content_hash if outline_record is not None else "",
         )
+
+    def _dependency_records(self) -> list[ArtifactRecord]:
+        records = []
+        for record in self.registry.list_records():
+            if record.status != "ready":
+                continue
+            if record.artifact_type in {
+                "review_draft",
+                "citation_manifest",
+                "validation_run_result",
+                "summary_file",
+                "stage1_canonical_summaries",
+                "paper_artifact",
+                "stage1_paper_artifact",
+                "visual_manifest",
+            } or record.artifact_id in {"outline-v3:final_outline", "outline-v3:adoption"}:
+                records.append(record)
+        return records
 
     def _build_plan(self, closure: ValidationClosureResult) -> RepairPlan | None:
         draft_record, _manifest_record, validation_record = self._canonical_inputs()
@@ -244,9 +451,9 @@ class RepairTransactionService:
                         span_end=claim.get("span_end") if isinstance(claim.get("span_end"), int) else None,
                     ),
                     original_text=str(claim.get("claim_text") or block_text),
-                    # Report-first plans describe a candidate but do not
-                    # propose an unverified rewrite.
-                    proposed_text=str(claim.get("claim_text") or block_text),
+                    # Report-first plans describe an affected span but do not
+                    # pretend that an unverified rewrite is ready to apply.
+                    proposed_text="",
                     confidence=0.0 if bool(claim.get("low_confidence")) else 0.5,
                     fix_strategy="manual_review_mapping_first",
                     dependency_bundle=self._dependency_bundle(closure),
@@ -258,6 +465,12 @@ class RepairTransactionService:
                     },
                 )
             )
+        proposals.sort(
+            key=lambda item: (
+                0 if item.root_cause is RepairRootCause.CITATION_MAPPING_ERROR else 1,
+                item.proposal_id,
+            )
+        )
         plan_id = "repair-plan:" + _hash(
             {
                 "job_id": self.workspace.job_id,
@@ -300,7 +513,7 @@ class RepairTransactionService:
         )
         atomic_write_json(str(path), plan.to_dict())
         dependencies: list[dict[str, Any]] = []
-        previous_records = [item for item in self._canonical_inputs() if item is not None]
+        previous_records = self._dependency_records()
         for record in previous_records:
             if record.status == "ready":
                 dependencies.append(
@@ -424,6 +637,23 @@ class RepairTransactionService:
             for payload in [_load_json(record)]
             if payload is not None
         ]
+        visual_manifest: dict[str, Any] = {}
+        for record in self.registry.list_records():
+            if record.status != "ready" or record.artifact_type != "visual_manifest":
+                continue
+            try:
+                payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, Mapping):
+                visual_manifest = dict(payload)
+                break
+        citation_ref_catalog: dict[str, Any] = {}
+        catalog_record = self.registry.get("citation_ref_catalog")
+        if catalog_record is not None and catalog_record.status == "ready":
+            catalog_payload = _load_json(catalog_record)
+            if isinstance(catalog_payload, Mapping):
+                citation_ref_catalog = dict(catalog_payload)
         try:
             apply_payload = run_repair_apply(
                 repair_plan=plan,
@@ -433,6 +663,7 @@ class RepairTransactionService:
                 job_id=self.workspace.job_id,
                 dry_run=False,
                 require_auto_safe=True,
+                visual_manifest=visual_manifest,
             )
         except (OSError, TypeError, ValueError, KeyError) as exc:
             return {
@@ -469,6 +700,22 @@ class RepairTransactionService:
                 "plan_id": plan_id,
                 "mutation_performed": False,
             }
+        targeted_revalidation = _targeted_revalidate(
+            patched_draft,
+            patched_manifest,
+            paper_artifacts,
+            citation_ref_catalog,
+        )
+        if not targeted_revalidation["passed"]:
+            return {
+                "status": "blocked",
+                "reason": "targeted revalidation failed; derived repair artifacts were not persisted",
+                "plan_id": plan_id,
+                "apply_result": apply_result,
+                "targeted_revalidation": targeted_revalidation,
+                "mutation_performed": False,
+            }
+        apply_payload["targeted_revalidation"] = targeted_revalidation
         derived_draft_path = tx_dir / "review_draft_repaired.json"
         derived_manifest_path = tx_dir / "citation_manifest_repaired.json"
         apply_result_path = tx_dir / "repair_apply_result.json"
@@ -536,7 +783,7 @@ class RepairTransactionService:
             ],
             metadata={"transaction_id": transaction_id, "canonical_replacement": False},
         )
-        previous_records = [item for item in (draft_record, manifest_record, validation_record) if item is not None]
+        previous_records = self._dependency_records()
         transaction = RepairTransactionRecord(
             transaction_id=transaction_id,
             job_id=self.workspace.job_id,
