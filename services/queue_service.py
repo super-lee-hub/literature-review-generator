@@ -894,6 +894,12 @@ class QueueRunner:
         self._workspace_locks: Dict[str, threading.Lock] = {}
         self._worker_id = f"queue-runner:{uuid.uuid4().hex}"
         self._leases: Dict[str, QueueLease] = {}
+        self._heartbeat_stops: Dict[str, threading.Event] = {}
+        self._heartbeat_threads: Dict[str, threading.Thread] = {}
+        self._lease_lost: Dict[str, threading.Event] = {}
+        # The durable lease is 120 seconds; keep the cross-process heartbeat
+        # comfortably below that window even while a provider call is quiet.
+        self._heartbeat_interval_seconds = 30.0
 
     def is_running(self) -> bool:
         with self._lock:
@@ -940,6 +946,8 @@ class QueueRunner:
         runtime = self.queue_service.get_job_runtime(job_id)
         if runtime is None:
             return
+        if self._lease_is_lost(job_id):
+            return
         lease = self._leases.get(job_id)
         if lease is not None and runtime.state in {QueueState.CANCEL_REQUESTED, QueueState.RUNNING}:
             if self.queue_service.release_lease(
@@ -954,6 +962,72 @@ class QueueRunner:
             self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
         elif runtime.state == QueueState.PENDING:
             self.queue_service.request_cancel(job_id, reason="queue_runner_checkpoint")
+
+    def _mark_lease_lost(self, job_id: str) -> None:
+        with self._lock:
+            event = self._lease_lost.get(job_id)
+            if event is None:
+                event = threading.Event()
+                self._lease_lost[job_id] = event
+            event.set()
+            cancel_token = self._cancel_tokens.get(job_id)
+        if cancel_token is not None:
+            cancel_token.request_cancel()
+
+    def _lease_is_lost(self, job_id: str) -> bool:
+        with self._lock:
+            event = self._lease_lost.get(job_id)
+            return bool(event and event.is_set())
+
+    def _start_heartbeat(self, job_id: str, lease: QueueLease, cancel_token: CancelToken) -> None:
+        stop_event = threading.Event()
+        lost_event = threading.Event()
+        interval = max(
+            0.1,
+            min(float(self._heartbeat_interval_seconds), 120.0 / 3.0),
+        )
+        with self._lock:
+            self._heartbeat_stops[job_id] = stop_event
+            self._lease_lost[job_id] = lost_event
+
+        def heartbeat_loop() -> None:
+            while not stop_event.wait(interval):
+                if self.queue_service.heartbeat(
+                    job_id,
+                    lease_id=lease.lease_id,
+                    worker_id=lease.worker_id,
+                    lease_seconds=120,
+                ):
+                    continue
+                self._mark_lease_lost(job_id)
+                cancel_token.request_cancel()
+                return
+
+        thread = threading.Thread(
+            target=heartbeat_loop,
+            name=f"queue-heartbeat:{job_id}",
+            daemon=True,
+        )
+        with self._lock:
+            self._heartbeat_threads[job_id] = thread
+        thread.start()
+
+    def _stop_heartbeat(self, job_id: str) -> bool:
+        with self._lock:
+            stop_event = self._heartbeat_stops.get(job_id)
+            thread = self._heartbeat_threads.get(job_id)
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        return self._lease_is_lost(job_id)
+
+    def _clear_heartbeat(self, job_id: str) -> None:
+        self._stop_heartbeat(job_id)
+        with self._lock:
+            self._heartbeat_stops.pop(job_id, None)
+            self._heartbeat_threads.pop(job_id, None)
+            self._lease_lost.pop(job_id, None)
 
     def _process_job(self, job_spec: QueueJobSpec) -> None:
         cancel_token = CancelToken()
@@ -1018,6 +1092,7 @@ class QueueRunner:
                 return
             with self._lock:
                 self._leases[job_spec.job_id] = lease
+            self._start_heartbeat(job_spec.job_id, lease, cancel_token)
             
             # 再次检查任务状态，确保没有被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
@@ -1059,6 +1134,8 @@ class QueueRunner:
                 result = self.job_runner.run(request, cancel_token=cancel_token)
             
             # 最后检查一次任务状态
+            if self._lease_is_lost(job_spec.job_id):
+                raise RuntimeError(f"queue lease lost for job {job_spec.job_id}")
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
                 self._acknowledge_cancelled(job_spec.job_id)
@@ -1102,6 +1179,11 @@ class QueueRunner:
         except JobCancelledError:
             self._acknowledge_cancelled(job_spec.job_id)
         except Exception as e:
+            if self._lease_is_lost(job_spec.job_id):
+                # The old worker no longer owns the durable lease.  Leaving
+                # the runtime RUNNING lets another process recover it after
+                # expiry; this worker must not release or complete it.
+                return
             # 检查是否是因为取消而导致的异常
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
             if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
@@ -1109,6 +1191,7 @@ class QueueRunner:
                 return
             self._release_job(job_spec.job_id, QueueState.FAILED, error_message=str(e))
         finally:
+            self._clear_heartbeat(job_spec.job_id)
             with self._lock:
                 if job_spec.job_id in self._cancel_tokens:
                     del self._cancel_tokens[job_spec.job_id]
@@ -1120,6 +1203,8 @@ class QueueRunner:
         self.queue_service.update_job_stage(job_id, stage)
 
     def _heartbeat(self, job_id: str) -> None:
+        if self._lease_is_lost(job_id):
+            raise RuntimeError(f"queue lease lost for job {job_id}")
         lease = self._leases.get(job_id)
         if lease is None:
             return
@@ -1129,6 +1214,7 @@ class QueueRunner:
             worker_id=lease.worker_id,
             lease_seconds=120,
         ):
+            self._mark_lease_lost(job_id)
             raise RuntimeError(f"queue lease lost for job {job_id}")
 
     def _release_job(
@@ -1138,6 +1224,9 @@ class QueueRunner:
         *,
         error_message: str | None = None,
     ) -> None:
+        lease_lost = self._stop_heartbeat(job_id)
+        if lease_lost:
+            raise RuntimeError(f"queue lease lost for job {job_id}")
         lease = self._leases.get(job_id)
         if lease is None:
             self.queue_service.update_job_state(job_id, state)
@@ -1216,6 +1305,9 @@ class QueueRunner:
     def stop(self) -> None:
         with self._lock:
             self._running = False
+            heartbeat_stops = list(self._heartbeat_stops.values())
+        for stop_event in heartbeat_stops:
+            stop_event.set()
 
     def cancel_job(self, job_id: str) -> bool:
         """取消指定的任务

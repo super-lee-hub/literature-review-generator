@@ -338,6 +338,26 @@ class ApplicationSettings:
     def outline_block_empty_research_streams(self) -> bool:
         return _bool(self.section("OutlineQualityGate").get("block_empty_research_streams"), True)
 
+    def outline_quality_gate(self) -> Any:
+        """Return the complete typed Outline v3 quality gate.
+
+        The import is intentionally local: ``outline.v3_models`` also owns
+        model-facing hashes and must not become an import-time dependency of
+        the settings loader.
+        """
+
+        from outline.v3_models import OutlineQualityGate
+
+        return OutlineQualityGate(
+            coverage_scope=self.outline_quality_gate_coverage_scope(),
+            min_canonical_coverage_full=self.outline_min_canonical_coverage_full(),
+            min_canonical_coverage_local=self.outline_min_canonical_coverage_local(),
+            min_effective_sections=self.outline_min_effective_sections(),
+            max_duplicate_assignments=self.outline_max_duplicate_assignments(),
+            block_placeholder_sections=self.outline_block_placeholder_sections(),
+            block_empty_research_streams=self.outline_block_empty_research_streams(),
+        )
+
     def outline_model(self) -> str:
         return str(self.section("OutlineModels").get("outline_model", "Outline_API")).strip()
 

@@ -1,9 +1,8 @@
-"""Explicit validation-stage service and provider receipt boundary.
+"""Explicit current validation-stage service and provider boundary.
 
-The runtime constructs this service from current durable records.  The old
-validator module remains a compatibility pipeline for existing callers, but
-it receives only the private adapter below; production orchestration does not
-pass a generator-shaped object through its public boundary.
+The service is reconstructed from durable Registry records and owns the
+validation sequence.  The historical ``validator`` module is deliberately
+not imported here; it remains an external compatibility shim only.
 """
 
 from __future__ import annotations
@@ -233,17 +232,75 @@ class ValidationExecutionService:
         if expected is None:
             raise RuntimeError(f"provider output has no expected call: {call_id}")
         normalized_hash = hash_json(content)
+        safe_call_id = "".join(
+            char if char.isalnum() or char in {"-", "_"} else "_"
+            for char in str(call_id)
+        )
+        output_path = self.workspace.artifact_path(
+            f"validation_provider_outputs/{safe_call_id}.json"
+        )
+        atomic_write_json(
+            output_path,
+            {
+                "artifact_type": "validation_provider_output",
+                "artifact_version": "v1",
+                "job_id": self.job_id,
+                "attempt_id": self.attempt_id,
+                "stage_name": expected.stage_name,
+                "call_id": str(call_id),
+                "content_hash": normalized_hash,
+                "payload": content,
+            },
+        )
+        output_record = self.artifact_registry.register_file(
+            artifact_role="validation_provider_output",
+            artifact_type="validation_provider_output",
+            artifact_version="v1",
+            path=output_path,
+            producer="validation.execution_service.ValidationExecutionService",
+            artifact_id=f"validation-provider-output:{safe_call_id}",
+        )
         self._expected_provider_calls[str(call_id)] = replace(
             expected,
+            provider_response_hash=normalized_hash,
             output_hash=normalized_hash,
             normalized_output_hash=normalized_hash,
+            artifact_payload_hash=normalized_hash,
+            artifact_content_hash=normalized_hash,
+            registry_file_hash=output_record.content_hash,
+            artifact_path=output_record.path,
             registered_artifact_hash=normalized_hash,
             node_output_hash=normalized_hash,
         )
 
     def persist_summaries(self) -> bool:
-        path = self.workspace.artifact_path(f"{self.project_name}_summaries.json")
-        atomic_write_json(path, self.summaries)
+        summary_set_hash = hash_json(self.summaries)
+        path = self.workspace.artifact_path(
+            f"stage1/inputs/stage1_summaries_{summary_set_hash[:24]}.json"
+        )
+        if Path(path).is_file():
+            try:
+                existing = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"current Stage 1 summary artifact is unreadable: {path}") from exc
+            if hash_json(existing) != summary_set_hash:
+                raise RuntimeError(f"content-addressed Stage 1 summary artifact has drifted: {path}")
+        else:
+            atomic_write_json(path, self.summaries)
+        immutable_id = f"summary_file:{summary_set_hash}"
+        immutable_record = self.artifact_registry.register_file(
+            artifact_role="summary",
+            artifact_type="summary_file",
+            artifact_version="v1",
+            path=path,
+            producer="validation.execution_service.ValidationExecutionService",
+            artifact_id=immutable_id,
+            metadata={
+                "immutable": True,
+                "summary_set_hash": summary_set_hash,
+                "versioned_artifact_id": immutable_id,
+            },
+        )
         self.artifact_registry.register_file(
             artifact_role="summary",
             artifact_type="summary_file",
@@ -251,6 +308,12 @@ class ValidationExecutionService:
             path=path,
             producer="validation.execution_service.ValidationExecutionService",
             artifact_id="summary_file",
+            depends_on=[ArtifactDependencyRefV2.from_record(immutable_record)],
+            metadata={
+                "pointer_role": "current",
+                "current_version_artifact_id": immutable_id,
+                "summary_set_hash": summary_set_hash,
+            },
         )
         return True
 
@@ -330,21 +393,99 @@ class ValidationExecutionService:
         from docx_writer import rebuild_review_docx_from_structured_artifacts
 
         rebuild_review_docx_from_structured_artifacts(
-            _LegacyValidationHost(self),
+            self,
             dict(review_draft),
             dict(citation_manifest),
             output_path,
         )
 
-    def finalize_provider_receipts(self) -> dict[str, Any]:
+    def revalidate_review_artifacts(
+        self,
+        *,
+        review_draft_record: ArtifactRecord,
+        citation_manifest_record: ArtifactRecord,
+        output_dir: str,
+        result_artifact_id: str,
+        paper_artifact_records: Sequence[ArtifactRecord] | None = None,
+    ) -> dict[str, Any]:
+        """Run the current validator against explicit repaired artifacts.
+
+        The repaired records remain quarantined.  The revalidation result is
+        therefore also quarantined even when its semantic disposition is clean;
+        promotion must consume this exact result and decide whether to move a
+        current pointer.  No legacy validator or in-memory-only success flag is
+        involved.
+        """
+
+        import json
+
+        def load(record: ArtifactRecord) -> dict[str, Any]:
+            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError(f"revalidation input is not a JSON object: {record.artifact_id}")
+            return dict(payload)
+
+        from validation.current_validation import run_current_validation
+
+        paper_payloads: list[dict[str, Any]] = []
+        for record in paper_artifact_records or self.paper_artifact_records:
+            if record.status != "ready":
+                continue
+            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            if isinstance(payload, Mapping):
+                paper_payloads.append(dict(payload))
+        result: dict[str, Any] | None = None
+        try:
+            result = run_current_validation(
+                self,
+                review_draft_override=load(review_draft_record),
+                citation_manifest_override=load(citation_manifest_record),
+                paper_artifacts_override=paper_payloads,
+                review_draft_record_override=review_draft_record,
+                citation_manifest_record_override=citation_manifest_record,
+                output_dir=output_dir,
+                result_artifact_id=result_artifact_id,
+                result_artifact_type="validation_run_result_repaired",
+                result_artifact_role="validation_run_result_repaired",
+            )
+        finally:
+            closure = self.finalize_provider_receipts(
+                artifact_id=f"validation:provider_receipt_closure:repaired:{result_artifact_id}",
+                ledger_artifact_id=f"validation_provider_receipts:repaired:{result_artifact_id}",
+                closure_path=str(Path(output_dir) / "provider_receipt_closure.json"),
+            )
+        if result is None:
+            raise RuntimeError("current repair revalidation did not produce a result")
+        result["provider_receipt_closure"] = closure["closure"].to_dict()
+        result["provider_receipt_closure_record_id"] = closure["closure_record"].artifact_id
+        return result
+
+    def finalize_provider_receipts(
+        self,
+        *,
+        artifact_id: str = "validation:provider_receipt_closure",
+        ledger_artifact_id: str = "validation_provider_receipts",
+        closure_path: str | None = None,
+    ) -> dict[str, Any]:
         """Persist receipt ledger and evaluate against pre-transport expectations."""
 
         receipts = list(self.provider_receipt_ledger.list_receipts())
         expected_calls = list(self._expected_provider_calls.values())
-        expected_ids = {item.call_id for item in expected_calls}
+        all_receipts = list(self.provider_receipt_ledger.list_receipts())
+        current_receipts = [
+            receipt
+            for receipt in all_receipts
+            if receipt.job_id == self.job_id
+            and receipt.stage_name == "stage4_validate"
+            and receipt.attempt_id == self.attempt_id
+        ]
+        out_of_scope_receipts = [
+            receipt for receipt in all_receipts if receipt not in current_receipts
+        ]
         closure: ReceiptClosureResult = ProviderReceiptClosure.evaluate(
             expected_calls,
-            [receipt for receipt in receipts if receipt.call_id in expected_ids],
+            current_receipts,
+            out_of_scope=out_of_scope_receipts,
         )
         ledger_record = None
         ledger_path = self.provider_receipt_ledger.path
@@ -355,10 +496,12 @@ class ValidationExecutionService:
                 artifact_version="v1",
                 path=str(ledger_path),
                 producer="validation.execution_service.ValidationExecutionService",
-                artifact_id="validation_provider_receipts",
+                artifact_id=ledger_artifact_id,
                 metadata={"receipt_count": len(receipts)},
             )
-        closure_path = self.workspace.artifact_path("validation_provider_receipt_closure.json")
+        closure_path = closure_path or self.workspace.artifact_path(
+            "validation_provider_receipt_closure.json"
+        )
         atomic_write_json(
             closure_path,
             {
@@ -376,7 +519,7 @@ class ValidationExecutionService:
             artifact_version="v1",
             path=closure_path,
             producer="validation.execution_service.ValidationExecutionService",
-            artifact_id="validation:provider_receipt_closure",
+            artifact_id=artifact_id,
             depends_on=dependencies,
             metadata={"closure_hash": closure.closure_hash, "complete": closure.complete},
         )
@@ -384,68 +527,15 @@ class ValidationExecutionService:
             "ledger": ledger_record,
             "closure": closure,
             "closure_record": closure_record,
-            "expected_call_ids": tuple(sorted(expected_ids)),
+            "expected_call_ids": tuple(sorted(expected.call_id for expected in expected_calls)),
         }
 
     def run_review_validation(self) -> dict[str, Any]:
-        """Run the current validation pipeline through the explicit service."""
+        """Run the current validation sequence from durable records."""
 
-        from validation.review_validation_pipeline import run_current_review_validation
+        from validation.current_validation import run_current_validation
 
-        return run_current_review_validation(_LegacyValidationHost(self))
-
-
-class _LegacyValidationHost:
-    """Private compatibility surface for the still-large validation engine."""
-
-    def __init__(self, service: ValidationExecutionService) -> None:
-        self._service = service
-        self.logger = service.logger
-        self.config = service.runtime_config
-        self.settings = service.settings
-        self.project_name = service.project_name
-        self.output_dir = service.workspace.base_output_dir
-        self.job_workspace = service.workspace
-        self.artifact_registry = service.artifact_registry
-        self.summaries = service.summaries
-        self.validation_attempt_id = service.attempt_id
-        self.validation_external_registry_resolver = service.validation_external_registry_resolver
-
-    def _review_draft_path(self) -> str:
-        return self._service.review_draft_path
-
-    def _citation_manifest_path(self) -> str:
-        return self._service.citation_manifest_path
-
-    def _get_review_word_file_path(self) -> str:
-        return self._service.review_word_path
-
-    def _stage2_validation_enabled(self) -> bool:
-        return self._service.stage2_validation_enabled()
-
-    def _persist_citation_manifest(self, *args: Any, **kwargs: Any) -> bool:
-        return self._service.persist_citation_manifest(*args, **kwargs)
-
-    def save_summaries(self) -> bool:
-        return self._service.persist_summaries()
-
-    def _persist_paper_artifact(self, result: Mapping[str, Any]) -> bool:
-        return self._service.persist_paper_artifact(result)
-
-    def get_paper_key(self, paper: Mapping[str, Any]) -> str:
-        return self._service.get_paper_key(paper)
-
-    def new_provider_runtime(self, **kwargs: Any) -> ProviderRuntime:
-        return self._service.new_provider_runtime(**kwargs)
-
-    def bind_provider_call(self, **kwargs: Any) -> None:
-        self._service.bind_provider_call(**kwargs)
-
-    def bind_provider_output(self, **kwargs: Any) -> None:
-        self._service.bind_provider_output(**kwargs)
-
-    def finalize_provider_receipts(self) -> dict[str, Any]:
-        return self._service.finalize_provider_receipts()
+        return run_current_validation(self)
 
 
 __all__ = ["ValidationExecutionService"]

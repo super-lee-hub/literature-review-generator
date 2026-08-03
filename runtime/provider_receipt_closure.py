@@ -9,9 +9,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from runtime.provider_runtime import ProviderCallReceiptV1
+from runtime.provider_runtime import ProviderCallReceiptV1, hash_json
+from services.artifact_registry import file_sha256
 
 
 def _hash(value: Any) -> str:
@@ -33,7 +35,12 @@ class ExpectedProviderCall:
     config_hash: str = ""
     schema_hash: str = ""
     output_hash: str = ""
+    provider_response_hash: str = ""
     normalized_output_hash: str = ""
+    artifact_payload_hash: str = ""
+    artifact_content_hash: str = ""
+    registry_file_hash: str = ""
+    artifact_path: str = ""
     registered_artifact_hash: str = ""
     replay_output_hash: str = ""
     node_output_hash: str = ""
@@ -53,7 +60,12 @@ class ExpectedProviderCall:
             config_hash=str(payload.get("config_hash") or ""),
             schema_hash=str(payload.get("schema_hash") or ""),
             output_hash=str(payload.get("output_hash") or ""),
+            provider_response_hash=str(payload.get("provider_response_hash") or ""),
             normalized_output_hash=str(payload.get("normalized_output_hash") or ""),
+            artifact_payload_hash=str(payload.get("artifact_payload_hash") or ""),
+            artifact_content_hash=str(payload.get("artifact_content_hash") or ""),
+            registry_file_hash=str(payload.get("registry_file_hash") or ""),
+            artifact_path=str(payload.get("artifact_path") or ""),
             registered_artifact_hash=str(payload.get("registered_artifact_hash") or ""),
             replay_output_hash=str(payload.get("replay_output_hash") or ""),
             node_output_hash=str(payload.get("node_output_hash") or ""),
@@ -78,6 +90,7 @@ class ReceiptClosureResult:
     incomplete_call_ids: tuple[str, ...] = ()
     hash_mismatches: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     unexpected_receipts: tuple[str, ...] = ()
+    out_of_scope_receipts: tuple[str, ...] = ()
     retry_exceeded_call_ids: tuple[str, ...] = ()
     usage_incomplete_call_ids: tuple[str, ...] = ()
     complete: bool = False
@@ -92,6 +105,7 @@ class ReceiptClosureResult:
             "failed_call_ids",
             "incomplete_call_ids",
             "unexpected_receipts",
+            "out_of_scope_receipts",
             "retry_exceeded_call_ids",
             "usage_incomplete_call_ids",
         ):
@@ -111,6 +125,7 @@ class ReceiptClosureResult:
             "failed_call_ids",
             "incomplete_call_ids",
             "unexpected_receipts",
+            "out_of_scope_receipts",
             "retry_exceeded_call_ids",
             "usage_incomplete_call_ids",
         ):
@@ -127,9 +142,15 @@ class ProviderReceiptClosure:
         cls,
         expected: Iterable[ExpectedProviderCall | Mapping[str, Any]],
         observed: Iterable[ProviderCallReceiptV1 | Mapping[str, Any]],
+        *,
+        out_of_scope: Iterable[ProviderCallReceiptV1 | Mapping[str, Any]] = (),
     ) -> ReceiptClosureResult:
         expected_items = [item if isinstance(item, ExpectedProviderCall) else ExpectedProviderCall.from_mapping(item) for item in expected]
         receipts = [item if isinstance(item, ProviderCallReceiptV1) else ProviderCallReceiptV1.from_dict(item) for item in observed]
+        out_of_scope_receipts = [
+            item if isinstance(item, ProviderCallReceiptV1) else ProviderCallReceiptV1.from_dict(item)
+            for item in out_of_scope
+        ]
         expected_by_id = {item.call_id: item for item in expected_items}
         receipts_by_id: dict[str, list[ProviderCallReceiptV1]] = {}
         for receipt in receipts:
@@ -166,31 +187,65 @@ class ProviderReceiptClosure:
             if current.status == "success":
                 mismatch_fields = set(mismatches.get(call_id, ()))
                 response_hash = str(current.response_hash or "")
-                output_hash = str(contract.output_hash or "")
+                expected_response_hash = str(contract.provider_response_hash or contract.output_hash or "")
                 normalized_hash = str(contract.normalized_output_hash or "")
-                registered_hash = str(contract.registered_artifact_hash or "")
+                payload_hash = str(contract.artifact_payload_hash or "")
+                content_hash = str(contract.artifact_content_hash or contract.registered_artifact_hash or "")
+                registry_hash = str(contract.registry_file_hash or "")
                 node_hash = str(contract.node_output_hash or "")
                 replay_hash = str(contract.replay_output_hash or "")
                 if not response_hash:
                     mismatch_fields.add("response_hash_missing")
-                if not output_hash:
-                    mismatch_fields.add("output_hash_missing")
-                elif response_hash != output_hash:
-                    mismatch_fields.add("response_hash")
+                if expected_response_hash and response_hash != expected_response_hash:
+                    mismatch_fields.add("provider_response_hash")
                 if not normalized_hash:
                     mismatch_fields.add("normalized_output_hash_missing")
-                else:
-                    if output_hash and normalized_hash != output_hash:
-                        mismatch_fields.add("output_normalized_hash")
-                    if response_hash != normalized_hash:
-                        mismatch_fields.add("normalized_output_hash")
-                if registered_hash and node_hash and registered_hash != node_hash:
+                elif response_hash != normalized_hash:
+                    mismatch_fields.add("normalized_output_hash")
+                if not payload_hash:
+                    mismatch_fields.add("artifact_payload_hash_missing")
+                # The provider response and the persisted artifact payload are
+                # intentionally different hash domains.  A writer may add
+                # citation spans, receipt IDs, or other durable metadata while
+                # normalizing a successful response; the artifact envelope
+                # check below validates the payload hash independently.
+                if not content_hash:
+                    mismatch_fields.add("artifact_content_hash_missing")
+                if not registry_hash:
+                    mismatch_fields.add("registry_file_hash_missing")
+                elif current.metadata.get("registry_file_hash") and str(current.metadata.get("registry_file_hash")) != registry_hash:
+                    mismatch_fields.add("registry_file_hash")
+                registry_path = str(contract.artifact_path or current.metadata.get("registry_file_path") or "")
+                if registry_hash and registry_path:
+                    try:
+                        if file_sha256(registry_path) != registry_hash:
+                            mismatch_fields.add("registered_file_hash")
+                    except (OSError, TypeError, ValueError):
+                        mismatch_fields.add("registered_file_unreadable")
+                if content_hash and registry_path:
+                    try:
+                        envelope = json.loads(Path(registry_path).read_text(encoding="utf-8"))
+                        if isinstance(envelope, Mapping):
+                            if str(envelope.get("content_hash") or "") != content_hash:
+                                mismatch_fields.add("artifact_content_hash")
+                            payload = envelope.get("payload")
+                            if payload is None:
+                                payload = envelope.get("section")
+                            if payload_hash and hash_json(payload) != payload_hash:
+                                mismatch_fields.add("artifact_payload_hash")
+                    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                        mismatch_fields.add("artifact_unreadable")
+                if not normalized_hash:
+                    mismatch_fields.add("normalized_output_hash_missing")
+                if content_hash and node_hash and content_hash != node_hash:
                     mismatch_fields.add("node_artifact_hash")
-                elif registered_hash and not node_hash:
+                elif content_hash and not node_hash:
                     mismatch_fields.add("node_output_hash_missing")
-                elif node_hash and not registered_hash:
-                    mismatch_fields.add("registered_artifact_hash_missing")
+                elif node_hash and not content_hash:
+                    mismatch_fields.add("artifact_content_hash_missing")
                 if replay_hash and normalized_hash and replay_hash != normalized_hash:
+                    mismatch_fields.add("replay_output_hash")
+                if replay_hash and current.metadata.get("replay_output_hash") and str(current.metadata.get("replay_output_hash")) != replay_hash:
                     mismatch_fields.add("replay_output_hash")
                 if mismatch_fields:
                     mismatches[call_id] = tuple(sorted(mismatch_fields))
@@ -202,7 +257,22 @@ class ProviderReceiptClosure:
                 usage_incomplete.append(call_id)
 
         unexpected = tuple(sorted(set(observed_ids) - set(expected_ids)))
-        complete = not any((missing, stale, failed, incomplete, mismatches, unexpected, retry_exceeded, usage_incomplete))
+        out_of_scope_ids = tuple(
+            sorted({str(item.call_id) for item in out_of_scope_receipts if str(item.call_id)})
+        )
+        complete = not any(
+            (
+                missing,
+                stale,
+                failed,
+                incomplete,
+                mismatches,
+                unexpected,
+                out_of_scope_ids,
+                retry_exceeded,
+                usage_incomplete,
+            )
+        )
         payload = {
             "expected_call_ids": expected_ids,
             "observed_call_ids": observed_ids,
@@ -212,6 +282,7 @@ class ProviderReceiptClosure:
             "incomplete_call_ids": tuple(sorted(incomplete)),
             "hash_mismatches": mismatches,
             "unexpected_receipts": unexpected,
+            "out_of_scope_receipts": out_of_scope_ids,
             "retry_exceeded_call_ids": tuple(sorted(retry_exceeded)),
             "usage_incomplete_call_ids": tuple(sorted(usage_incomplete)),
             "complete": complete,

@@ -1,25 +1,22 @@
-"""Current validation-stage execution seam.
+"""Compatibility wrapper for the explicit current validation service.
 
-The durable runtime owns the explicit service contract.  The historical
-validator implementation is loaded only behind this narrow compatibility
-seam so callers cannot pass a generator-shaped object through the production
-orchestration layer.
+This module intentionally has no import path to the historical ``validator``
+module.  Callers must provide the current execution service, which owns the
+durable inputs, provider ledger, and report registration.
 """
 
 from __future__ import annotations
 
-import importlib
 from typing import Any, Mapping
 
 
 def run_current_review_validation(adapter: Any) -> dict[str, Any]:
-    """Run the existing claim engine through the current service adapter."""
+    """Run the explicit current service without reviving a generator adapter."""
 
-    module = importlib.import_module("validator")
-    runner = getattr(module, "run_review_validation", None)
+    runner = getattr(adapter, "run_review_validation", None)
     if not callable(runner):
-        raise RuntimeError("current review validation runner is unavailable")
-    result = runner(adapter)
+        raise TypeError("current validation requires ValidationExecutionService")
+    result = runner()
     return dict(result) if isinstance(result, Mapping) else {}
 
 

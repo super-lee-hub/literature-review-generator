@@ -145,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--spec", required=True)
         subparser.add_argument("--job-id", default="")
 
-    for command in ("status", "inspect", "next-action", "resume", "retry-node", "reconcile", "repair-plan", "repair-apply", "validate", "validation-status", "cancel", "adopt"):
+    for command in ("status", "inspect", "next-action", "resume", "retry-node", "reconcile", "repair-plan", "repair-apply", "repair-promote", "validate", "validation-status", "cancel", "adopt"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--job", default="")
         subparser.add_argument("--workspace", default="")
@@ -155,6 +155,10 @@ def build_parser() -> argparse.ArgumentParser:
             subparser.add_argument("--dry-run", action="store_true")
         if command == "repair-apply":
             subparser.add_argument("--plan", required=True)
+        if command == "repair-promote":
+            subparser.add_argument("--transaction", required=True)
+            subparser.add_argument("--actor", required=True)
+            subparser.add_argument("--reason", required=True)
         if command == "adopt":
             subparser.add_argument("--artifact", required=True)
             subparser.add_argument("--actor", required=True)
@@ -219,8 +223,8 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
         return 0 if bool(payload.get("ok")) else 1
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
-    if command in {"retry-node", "repair-apply", "cancel", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
-        return 0 if payload.get("status") in {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "completed", "removed", "exported", "imported"} else 1
+    if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
+        return 0 if payload.get("status") in {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "completed", "removed", "exported", "imported", "promoted", "already_promoted"} else 1
     if command in {"run", "resume"}:
         return 0 if payload.get("job_status") == "completed" and payload.get("completion_status") == "complete" else 1
     return 0
@@ -276,6 +280,14 @@ def main(argv: list[str] | None = None) -> int:
                 job_id=args.job or None,
                 workspace=args.workspace or None,
                 plan_id=args.plan,
+            )
+        elif args.command == "repair-promote":
+            payload = control.repair_promote(
+                job_id=args.job or None,
+                workspace=args.workspace or None,
+                transaction_id=args.transaction,
+                actor=args.actor,
+                reason=args.reason,
             )
         elif args.command == "validate":
             payload = control.validate(job_id=args.job or None, workspace=args.workspace or None)

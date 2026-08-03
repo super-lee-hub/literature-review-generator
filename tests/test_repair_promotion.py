@@ -6,6 +6,12 @@ from pathlib import Path
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace, atomic_write_json
 from validation.repair_transaction import RepairTransactionService
+from validation.run_result import (
+    ClaimValidationResultV1,
+    ClaimVerdict,
+    ValidationInputArtifactsV1,
+    ValidationRunResultV1,
+)
 
 
 def _write(path: Path, payload: dict) -> Path:
@@ -120,14 +126,73 @@ def test_repair_promotion_creates_versioned_outputs_without_replacing_canonical(
         status="quarantined",
     )
 
+    revalidation = ValidationRunResultV1.create(
+        job_id=workspace.job_id,
+        execution_status="succeeded",
+        claim_results=(
+            ClaimValidationResultV1(
+                claim_result_id="claim:repair",
+                claim_unit_ids=(),
+                citation_set_key="",
+                paper_ids=(),
+                block_ids=("b1",),
+                claim_text="A grounded claim.",
+                claim_context="",
+                verdict=ClaimVerdict.SUPPORTED,
+                reasoning_summary="the repaired artifact is structurally grounded",
+                repair_hint="",
+                root_causes=(),
+                span_start=0,
+                span_end=18,
+                alignment_status="aligned",
+                alignment_confidence=1.0,
+                low_confidence=False,
+                details={"evidence_status": "clean_supported"},
+                evidence_candidates=(),
+            ),
+        ),
+        attempt_id="repair-revalidation",
+        input_artifacts=ValidationInputArtifactsV1(
+            review_draft_id=derived_draft.artifact_id,
+            review_draft_hash=derived_draft.content_hash,
+            citation_manifest_id=derived_manifest.artifact_id,
+            citation_manifest_hash=derived_manifest.content_hash,
+        ),
+        expected_claim_count=1,
+        review_has_citations=False,
+        evidence_complete=True,
+    )
+    revalidation_path = _write(
+        Path(workspace.artifact_path("repair_revalidation/validation.json")),
+        revalidation.to_dict(),
+    )
+    revalidation_record = registry.register_file(
+        artifact_id="validation_run_result_repaired:repair-tx:source",
+        artifact_role="validation_run_result_repaired",
+        artifact_type="validation_run_result_repaired",
+        artifact_version="v1",
+        path=revalidation_path,
+        producer="tests",
+        status="quarantined",
+        depends_on=[
+            ArtifactDependencyRefV2.from_record(derived_draft),
+            ArtifactDependencyRefV2.from_record(derived_manifest),
+        ],
+    )
+
     result = RepairTransactionService(workspace, registry).promote(
         source.artifact_id,
         actor="researcher",
         reason="explicit human promotion test",
+        validation_result={
+            "validation_run_result_payload": revalidation.to_dict(),
+            "provider_receipt_closure": {"complete": True},
+        },
+        validation_record=revalidation_record,
     )
 
     assert result["status"] == "promoted", result
-    assert result["canonical_replacement"] is False
+    assert result["canonical_replacement"] is True
     assert result["canonical_paths_unchanged"] is True
     assert registry.get("review_draft").path == str(draft_path.resolve())  # type: ignore[union-attr]
     assert registry.get("citation_manifest:v3").path == str(manifest_path.resolve())  # type: ignore[union-attr]
@@ -137,3 +202,7 @@ def test_repair_promotion_creates_versioned_outputs_without_replacing_canonical(
     promotion = registry.get(result["promotion_transaction_id"])
     assert promotion is not None and promotion.status == "ready"
     assert json.loads(Path(promotion.path).read_text(encoding="utf-8"))["status"] == "promoted"
+    assert registry.get("review_draft:current").status == "ready"  # type: ignore[union-attr]
+    assert registry.get("citation_manifest:current").status == "ready"  # type: ignore[union-attr]
+    assert registry.get("review_docx:current").status == "ready"  # type: ignore[union-attr]
+    assert registry.get("validation_run_result:current").status == "ready"  # type: ignore[union-attr]

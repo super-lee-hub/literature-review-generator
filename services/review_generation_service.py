@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Callable, Mapping, Sequence, cast
 
 from models import APIConfig
@@ -21,7 +22,7 @@ from runtime.provider_runtime import (
     hash_text,
 )
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
 from services.citation_ref_catalog import (
     build_document_ref_catalog,
     extract_ref_ids_from_token,
@@ -101,36 +102,44 @@ class ReviewGenerationService:
                 raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
             self._require_nonempty_packet(packet, section_id)
             allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
+            runtime = self._new_runtime(section_id)
+            call_id = f"review:{section_id}"
+            writer_config = dict(self.settings.section("Writer_API"))
+            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
+            request_payload = self._writer_request_payload(prompt)
+            binding = self._section_binding(
+                section_id=section_id,
+                raw_section=raw_section,
+                packet=packet,
+                catalog=catalog,
+                request_payload=request_payload,
+                runtime=runtime,
+                writer_config=writer_config,
+            )
+            self._expected_provider_calls[call_id] = ExpectedProviderCall(
+                call_id=call_id,
+                job_id=self.job_id,
+                attempt_id=runtime.attempt_id,
+                stage_name=runtime.stage_name,
+                node_id=section_id,
+                prompt_hash=str(binding["prompt_hash"]),
+                input_hash=str(binding["prompt_payload_hash"]),
+                config_hash=str(binding["writer_config_hash"]),
+                schema_hash=runtime.schema_hash,
+                max_attempts=max(1, self.settings.runtime.node_retry_limit + 1),
+                usage_required=str(writer_config.get("endpoint_type") or "responses")
+                not in {"internal", "fixture"},
+            )
             persisted = self._load_section(
                 section_id,
                 raw_section=raw_section,
                 packet=packet,
                 catalog=catalog,
+                binding=binding,
             )
             if persisted is not None:
                 sections.append(persisted)
                 continue
-            runtime = self._new_runtime(section_id)
-            call_id = f"review:{section_id}"
-            self._expected_provider_calls[call_id] = ExpectedProviderCall(
-                call_id=call_id,
-                job_id=self.job_id,
-                attempt_id=self.attempt_id,
-                stage_name="stage3_review",
-                node_id=section_id,
-                max_attempts=max(1, self.settings.runtime.node_retry_limit + 1),
-                usage_required=False,
-            )
-            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
-            request_payload = self._writer_request_payload(prompt)
-            writer_config = dict(self.settings.section("Writer_API"))
-            self._expected_provider_calls[call_id] = replace(
-                self._expected_provider_calls[call_id],
-                prompt_hash=hash_text(prompt),
-                input_hash=hash_json(request_payload),
-                config_hash=hash_json(_redact_mapping(writer_config)),
-                schema_hash=runtime.schema_hash,
-            )
             provider_result = self._call_writer(
                 section_number=number,
                 section=raw_section,
@@ -160,23 +169,37 @@ class ReviewGenerationService:
                     "evidence_packet_id": section_id,
                     "provider_receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
                 }
-            self._persist_section(
+            section_record = self._persist_section(
                 section_id,
                 section_payload,
                 raw_section=raw_section,
                 packet=packet,
                 catalog=catalog,
+                binding=binding,
             )
             sections.append(section_payload)
             if runtime.receipts:
                 receipt = runtime.receipts[-1]
-                section_record = self.registry.get(f"review-section:{section_id}")
+                logical_hash = hash_json(section_payload)
                 self._expected_provider_calls[f"review:{section_id}"] = replace(
                     self._expected_provider_calls[f"review:{section_id}"],
+                    provider_response_hash=receipt.response_hash or "",
                     output_hash=receipt.response_hash or "",
                     normalized_output_hash=receipt.response_hash or "",
-                    registered_artifact_hash=(section_record.content_hash if section_record else ""),
-                    node_output_hash=(section_record.content_hash if section_record else ""),
+                    artifact_payload_hash=logical_hash,
+                    artifact_content_hash=logical_hash,
+                    registry_file_hash=section_record.content_hash,
+                    artifact_path=section_record.path,
+                    registered_artifact_hash=logical_hash,
+                    node_output_hash=logical_hash,
+                )
+                self._persist_review_replay(
+                    section_id=section_id,
+                    binding=binding,
+                    section_record=section_record,
+                    section_hash=logical_hash,
+                    receipt_id=receipt.receipt_id,
+                    normalized_output_hash=receipt.response_hash or "",
                 )
 
         if not sections:
@@ -235,9 +258,143 @@ class ReviewGenerationService:
         )
         return catalog, path
 
-    def _section_path(self, section_id: str) -> Path:
+    def _section_path(self, section_id: str, binding_hash: str = "") -> Path:
         safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in section_id)
-        return Path(self.workspace.artifact_path(f"review_sections/{safe}.json"))
+        suffix = f"_{binding_hash[:24]}" if binding_hash else ""
+        return Path(self.workspace.artifact_path(f"review_sections/{safe}{suffix}.json"))
+
+    def _review_replay_path(self) -> Path:
+        return Path(self.workspace.artifact_path("review/review_replay.jsonl"))
+
+    def _current_adoption_binding(self) -> dict[str, str]:
+        try:
+            from outline.adoption_transaction import current_adoption_record
+
+            adoption = current_adoption_record(self.registry)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+            adoption = None
+        final = self.registry.get("outline-v3:final_outline")
+        return {
+            "adoption_artifact_id": adoption.artifact_id if adoption is not None else "",
+            "adoption_artifact_hash": adoption.content_hash if adoption is not None else "",
+            "final_outline_hash": final.content_hash if final is not None and final.status == "ready" else "",
+        }
+
+    def _section_binding(
+        self,
+        *,
+        section_id: str,
+        raw_section: Mapping[str, Any],
+        packet: Mapping[str, Any],
+        catalog: Mapping[str, Any],
+        request_payload: Mapping[str, Any],
+        runtime: ProviderRuntime,
+        writer_config: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        profile = self._provider_context_profile()
+        adoption = self._current_adoption_binding()
+        return {
+            "binding_version": "review-section-binding-v1",
+            "stage_name": runtime.stage_name,
+            "section_id": section_id,
+            "adoption_artifact_id": adoption["adoption_artifact_id"],
+            "adoption_artifact_hash": adoption["adoption_artifact_hash"],
+            "final_outline_hash": adoption["final_outline_hash"],
+            "outline_section_hash": self._input_hash(raw_section),
+            "evidence_packet_hash": self._input_hash(packet),
+            "source_summary_hashes": sorted(
+                str(item).strip()
+                for item in (packet.get("source_summary_hashes") or ())
+                if str(item).strip()
+            ),
+            "citation_catalog_hash": str(catalog.get("catalog_hash") or ""),
+            "writer_provider": str(writer_config.get("provider_family") or "configured"),
+            "writer_model": str(writer_config.get("model") or ""),
+            "writer_endpoint": str(writer_config.get("endpoint_type") or "responses"),
+            "writer_config_hash": hash_json(_redact_mapping(dict(writer_config))),
+            "system_prompt_hash": hash_text(self._system_prompt()),
+            "prompt_template_hash": hash_text("review-writer-v3:section-json-v1"),
+            "prompt_hash": hash_text(str(request_payload.get("user") or "")),
+            "prompt_payload_hash": hash_json(request_payload),
+            "output_schema_hash": runtime.schema_hash,
+            "context_profile_hash": hash_json(
+                {
+                    "provider": profile.provider,
+                    "model": profile.model,
+                    "endpoint_type": profile.endpoint_type,
+                    "model_context_limit": profile.model_context_limit,
+                    "verified_context_limit": profile.verified_context_limit,
+                    "input_budget": profile.input_budget,
+                    "max_output_tokens": profile.max_output_tokens,
+                    "reasoning_reserve": profile.reasoning_reserve,
+                    "safety_margin": profile.safety_margin,
+                    "tokenizer_strategy": profile.tokenizer_strategy,
+                }
+            ),
+            "application_schema_version": str(self.settings.config_schema),
+        }
+
+    def _load_review_replay(self, *, section_id: str, binding: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        path = self._review_replay_path()
+        if not path.is_file():
+            return None
+        binding_hash = hash_json(binding)
+        found: Mapping[str, Any] | None = None
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, Mapping):
+                    continue
+                if (
+                    str(payload.get("section_id") or "") == section_id
+                    and str(payload.get("binding_hash") or "") == binding_hash
+                ):
+                    found = dict(payload)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return found
+
+    def _persist_review_replay(
+        self,
+        *,
+        section_id: str,
+        binding: Mapping[str, Any],
+        section_record: Any,
+        section_hash: str,
+        receipt_id: str,
+        normalized_output_hash: str,
+    ) -> None:
+        path = self._review_replay_path()
+        binding_hash = hash_json(binding)
+        existing = self._load_review_replay(section_id=section_id, binding=binding)
+        payload = {
+            "replay_version": "review-section-replay-v1",
+            "section_id": section_id,
+            "binding_hash": binding_hash,
+            "artifact_id": section_record.artifact_id,
+            "artifact_path": section_record.path,
+            "artifact_content_hash": section_hash,
+            "registry_file_hash": section_record.content_hash,
+            "receipt_id": receipt_id,
+            "normalized_output_hash": normalized_output_hash,
+        }
+        if existing == payload:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+        self.registry.register_file(
+            artifact_role="review_replay",
+            artifact_type="review_replay_ledger",
+            artifact_version="v1",
+            path=str(path),
+            producer="services.review_generation_service.ReviewGenerationService",
+            artifact_id="review_replay",
+            metadata={"binding_version": "review-section-binding-v1"},
+        )
 
     def _load_section(
         self,
@@ -246,9 +403,10 @@ class ReviewGenerationService:
         raw_section: Mapping[str, Any],
         packet: Mapping[str, Any],
         catalog: Mapping[str, Any],
+        binding: Mapping[str, Any],
     ) -> dict[str, Any] | None:
         record = self.registry.get(f"review-section:{section_id}")
-        path = self._section_path(section_id)
+        path = Path(record.path) if record is not None else self._section_path(section_id)
         if record is None or record.status != "ready" or not path.is_file():
             return None
         try:
@@ -257,18 +415,65 @@ class ReviewGenerationService:
             return None
         if not isinstance(envelope, Mapping) or envelope.get("status") != "ready":
             return None
-        if envelope.get("outline_section_hash") != hashlib.sha256(
-            json.dumps(dict(raw_section), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest():
-            return None
-        if envelope.get("evidence_packet_hash") != hashlib.sha256(
-            json.dumps(dict(packet), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest():
-            return None
-        if envelope.get("catalog_hash") != str(catalog.get("catalog_hash") or ""):
-            return None
         payload = envelope.get("section")
-        return dict(payload) if isinstance(payload, Mapping) else None
+        if not isinstance(payload, Mapping):
+            return None
+        expected_binding_hash = hash_json(binding)
+        if envelope.get("binding_hash") != expected_binding_hash:
+            return None
+        if envelope.get("binding") != dict(binding):
+            return None
+        section_hash = hash_json(payload)
+        if envelope.get("content_hash") != section_hash:
+            return None
+        try:
+            if record.content_hash != file_sha256(path):
+                return None
+        except OSError:
+            return None
+        replay = self._load_review_replay(section_id=section_id, binding=binding)
+        if replay is None:
+            return None
+        receipt_id = str(replay.get("receipt_id") or "")
+        receipt = next(
+            (item for item in self.receipt_ledger.list_receipts() if item.receipt_id == receipt_id),
+            None,
+        )
+        expected = self._expected_provider_calls.get(f"review:{section_id}")
+        if expected is None or receipt is None or receipt.status != "success":
+            return None
+        if (
+            receipt.job_id != self.job_id
+            or receipt.attempt_id != expected.attempt_id
+            or receipt.stage_name != expected.stage_name
+            or receipt.node_id != expected.node_id
+            or receipt.call_id != expected.call_id
+            or receipt.prompt_hash != expected.prompt_hash
+            or receipt.input_hash != expected.input_hash
+            or receipt.config_hash != expected.config_hash
+            or receipt.schema_hash != expected.schema_hash
+            or receipt.response_hash != str(replay.get("normalized_output_hash") or "")
+            or str(replay.get("artifact_path") or "") != str(path)
+            or str(replay.get("artifact_content_hash") or "") != section_hash
+            or str(replay.get("registry_file_hash") or "") != record.content_hash
+        ):
+            return None
+        if expected.usage_required and receipt.usage_status not in {"reported", "provider_not_supported"}:
+            return None
+        self._expected_provider_calls[expected.call_id] = replace(
+            expected,
+            provider_response_hash=receipt.response_hash or "",
+            output_hash=receipt.response_hash or "",
+            normalized_output_hash=receipt.response_hash or "",
+            artifact_payload_hash=section_hash,
+            artifact_content_hash=section_hash,
+            registry_file_hash=record.content_hash,
+            artifact_path=str(path),
+            registered_artifact_hash=section_hash,
+            replay_output_hash=receipt.response_hash or "",
+            node_output_hash=section_hash,
+        )
+        return dict(payload)
 
     @staticmethod
     def _input_hash(value: Mapping[str, Any]) -> str:
@@ -284,25 +489,49 @@ class ReviewGenerationService:
         raw_section: Mapping[str, Any],
         packet: Mapping[str, Any],
         catalog: Mapping[str, Any],
-    ) -> None:
-        path = self._section_path(section_id)
+        binding: Mapping[str, Any],
+    ) -> Any:
+        section_hash = hash_json(section)
+        binding_hash = hash_json(binding)
+        path = self._section_path(section_id, binding_hash)
         atomic_write_json(
             str(path),
             {
                 "status": "ready",
                 "job_id": self.job_id,
                 "section_id": section_id,
-                "outline_section_hash": self._input_hash(raw_section),
-                "evidence_packet_hash": self._input_hash(packet),
-                "catalog_hash": str(catalog.get("catalog_hash") or ""),
+                "binding_hash": binding_hash,
+                "binding": dict(binding),
+                "content_hash": section_hash,
                 "section": dict(section),
             },
         )
         dependencies: list[ArtifactDependencyRefV2] = []
-        for artifact_id in ("outline-v3:section_evidence_packets", "citation_ref_catalog"):
+        for artifact_id in (
+            "outline-v3:section_evidence_packets",
+            "citation_ref_catalog",
+            "outline-v3:final_outline",
+            "outline-v3:adoption:current",
+        ):
             record = self.registry.get(artifact_id)
             if record is not None and record.status == "ready":
                 dependencies.append(ArtifactDependencyRefV2.from_record(record))
+        immutable_record = self.registry.register_file(
+            artifact_role="review_section",
+            artifact_type="review_section",
+            artifact_version="v3",
+            path=str(path),
+            producer="services.review_generation_service.ReviewGenerationService",
+            artifact_id=f"review-section:{section_id}:{binding_hash[:24]}",
+            depends_on=dependencies,
+            metadata={
+                "immutable": True,
+                "section_id": section_id,
+                "binding_hash": binding_hash,
+                "section_content_hash": section_hash,
+                "versioned_artifact_id": f"review-section:{section_id}:{binding_hash[:24]}",
+            },
+        )
         self.registry.register_file(
             artifact_role="review_section",
             artifact_type="review_section",
@@ -310,19 +539,29 @@ class ReviewGenerationService:
             path=str(path),
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id=f"review-section:{section_id}",
-            depends_on=dependencies,
-            metadata={"section_id": section_id, "catalog_hash": str(catalog.get("catalog_hash") or "")},
+            depends_on=dependencies + [ArtifactDependencyRefV2.from_record(immutable_record)],
+            metadata={
+                "pointer_role": "current",
+                "section_id": section_id,
+                "binding_hash": binding_hash,
+                "current_version_artifact_id": immutable_record.artifact_id,
+                "section_content_hash": section_hash,
+            },
         )
+        return immutable_record
 
     def _persist_receipt_closure(self) -> None:
-        expected_call_ids = set(self._expected_provider_calls)
+        all_receipts = list(self.receipt_ledger.list_receipts())
+        scoped_receipts = [
+            receipt
+            for receipt in all_receipts
+            if receipt.job_id == self.job_id and receipt.stage_name == "stage3_review"
+        ]
+        out_of_scope_receipts = [receipt for receipt in all_receipts if receipt not in scoped_receipts]
         closure = ProviderReceiptClosure.evaluate(
             self._expected_provider_calls.values(),
-            [
-                receipt
-                for receipt in self.receipt_ledger.list_receipts()
-                if receipt.call_id in expected_call_ids
-            ],
+            scoped_receipts,
+            out_of_scope=out_of_scope_receipts,
         )
         path = Path(self.workspace.artifact_path("review_provider_receipt_closure.json"))
         atomic_write_json(str(path), {"job_id": self.job_id, "payload": closure.to_dict()})
@@ -395,7 +634,13 @@ class ReviewGenerationService:
         content = completion.content
         if not isinstance(content, Mapping):
             raise RuntimeError("Writer output must be a JSON object")
-        return {"status": "success", "content": dict(content)}
+        # Preserve transport usage/finish metadata for the durable receipt;
+        # only the normalized JSON content is replaced by the completion
+        # evaluator's validated object.
+        normalized_result = dict(result)
+        normalized_result["status"] = "success"
+        normalized_result["content"] = dict(content)
+        return normalized_result
 
     def _normalize_blocks(
         self,
@@ -448,21 +693,33 @@ class ReviewGenerationService:
                 raise RuntimeError(
                     f"Writer block {section_number}:{order} has unresolved citation refs: {unresolved}"
                 )
-            token = f"[[cite_ref:{', '.join(ref_ids)}]]"
-            token_start = text.find(token)
-            token_end = token_start + len(token) if token_start >= 0 else None
-            citations = [
-                {
-                    "local_ref_id": f"s{section_number}_b{order}_cite_{index}",
-                    "citation_token": token,
-                    "ref_id": ref_id,
-                    "raw_text": token,
-                    "mode": "parenthetical",
-                    "span_start": token_start if token_start >= 0 else None,
-                    "span_end": token_end,
-                }
-                for index, ref_id in enumerate(ref_ids, start=1)
-            ]
+            citations: list[dict[str, Any]] = []
+            for token_index, match in enumerate(
+                re.finditer(r"\[\[cite_ref:[^\]]+\]\]", text),
+                start=1,
+            ):
+                token = match.group(0)
+                cluster_start, cluster_end = match.span()
+                for occurrence_index, ref_id in enumerate(
+                    extract_ref_ids_from_token(token),
+                    start=1,
+                ):
+                    citations.append(
+                        {
+                            "local_ref_id": (
+                                f"s{section_number}_b{order}_cite_"
+                                f"{token_index}_{occurrence_index}"
+                            ),
+                            "citation_token": token,
+                            "ref_id": ref_id,
+                            "raw_text": token,
+                            "mode": "parenthetical",
+                            "span_start": cluster_start,
+                            "span_end": cluster_end,
+                            "cluster_index": token_index,
+                            "occurrence_index": occurrence_index,
+                        }
+                    )
             blocks.append(
                 {
                     "block_id": f"s{section_number}_b{order}",
@@ -505,8 +762,8 @@ class ReviewGenerationService:
     @staticmethod
     def _token_refs(text: str) -> list[str]:
         refs: list[str] = []
-        for token in __import__("re").findall(r"\[\[cite_ref:[^\]]+\]\]", text):
-            refs.extend(extract_ref_ids_from_token(token))
+        for match in re.finditer(r"\[\[cite_ref:[^\]]+\]\]", text):
+            refs.extend(extract_ref_ids_from_token(match.group(0)))
         return list(dict.fromkeys(refs))
 
     @staticmethod
@@ -584,7 +841,9 @@ class ReviewGenerationService:
             ),
             ledger=self.receipt_ledger,
             job_id=self.job_id,
-            attempt_id=self.attempt_id,
+            # Section calls use a stable node attempt identity so an exact
+            # durable section replay remains reusable across job resumes.
+            attempt_id=f"review:{section_id}",
             stage_name="stage3_review",
             route="Writer_API",
             node_id=section_id,
@@ -604,7 +863,12 @@ class ReviewGenerationService:
         if runtime.receipts:
             return
         try:
-            admission = runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+            request = dict(input_payload)
+            profile = self._provider_context_profile()
+            estimate = profile.estimate_request(request)
+            admission = runtime.admit(
+                estimated_tokens=max(1, int(estimate["estimated_input_tokens"]))
+            )
             runtime.complete(
                 admission=admission,
                 prompt=prompt,
@@ -620,6 +884,26 @@ class ReviewGenerationService:
                 api_config=dict(self.settings.section("Writer_API")),
                 message="Writer did not produce a provider receipt before its budget closed",
             )
+
+    def _provider_context_profile(self) -> Any:
+        from runtime.provider_context import ProviderContextProfile
+
+        config = dict(self.settings.section("Writer_API"))
+        try:
+            context_limit = max(1, int(config.get("max_context_tokens") or 128_000))
+        except (TypeError, ValueError):
+            context_limit = 128_000
+        try:
+            output_tokens = max(1, int(config.get("max_output_tokens") or self._max_output_tokens()))
+        except (TypeError, ValueError):
+            output_tokens = self._max_output_tokens()
+        return ProviderContextProfile.conservative(
+            provider=str(config.get("provider_family") or "configured"),
+            model=str(config.get("model") or "writer"),
+            endpoint_type=str(config.get("endpoint_type") or "responses"),
+            model_context_limit=context_limit,
+            max_output_tokens=output_tokens,
+        )
 
     def _register_receipt_ledger(self) -> None:
         if not self.receipt_ledger.path.is_file():

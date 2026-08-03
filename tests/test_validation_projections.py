@@ -12,7 +12,7 @@ from services.artifact_registry import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.repair_policy import ValidationRepairPolicy
-from validation.run_result import ValidationRunResultV1
+from validation.run_result import ClaimValidationResultV1, ValidationRunResultV1
 
 
 def _legacy_claim(*, key: str, status: str) -> SimpleNamespace:
@@ -320,12 +320,17 @@ def test_validator_registers_external_evidence_only_with_verified_identity(
         "evidence_manifest_ids": [evidence_record.artifact_id],
         "evidence_manifest_hashes": [evidence_record.content_hash],
     }
+    claim = ClaimValidationResultV1.from_validation_result(
+        _legacy_claim(key="external", status="supported")
+    )
     canonical = ValidationRunResultV1.create(
         job_id=workspace.job_id,
         report_id="validation-external-evidence",
         execution_status="succeeded",
         input_artifacts=inputs,
-        review_has_citations=False,
+        claim_results=(claim,),
+        expected_claim_count=1,
+        review_has_citations=True,
         evidence_complete=True,
     )
 
@@ -348,7 +353,9 @@ def test_validator_registers_external_evidence_only_with_verified_identity(
         report_id=canonical.validation_run_id,
         execution_status="succeeded",
         input_artifacts=mismatched_inputs,
-        review_has_citations=False,
+        claim_results=(claim,),
+        expected_claim_count=1,
+        review_has_citations=True,
         evidence_complete=True,
     )
     validator._write_validation_reports(

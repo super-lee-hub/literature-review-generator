@@ -221,7 +221,10 @@ def reduce_validation_disposition(
     if expected_claim_count is not None and validated_claim_count is not None:
         if expected_claim_count != validated_claim_count:
             return ValidationRunDisposition.NEEDS_REVIEW
-    if effective_validated_count == 0 and review_has_citations is not False:
+    # A successful run with no validated claim context is never evidence of a
+    # clean review.  This includes citation-free reviews: the absence of
+    # claims is an unresolved validation condition, not a vacuous pass.
+    if effective_validated_count == 0:
         return ValidationRunDisposition.NEEDS_REVIEW
     if not evidence_complete:
         return ValidationRunDisposition.NEEDS_REVIEW
@@ -519,7 +522,7 @@ class ValidationRunResultV1:
             raise ValidationRunResultError("contradicted_count does not match claim_verdict_counts")
         count_complete = self.expected_claim_count == self.validated_claim_count
         zero_claim_failure = (
-            self.validated_claim_count == 0 and self.review_has_citations is not False
+            self.validated_claim_count == 0
         )
         if self.evidence_complete and (not count_complete or zero_claim_failure):
             raise ValidationRunResultError(
@@ -599,7 +602,6 @@ class ValidationRunResultV1:
         zero_claim_failure = (
             run_completed
             and actual_validated_count == 0
-            and has_citations is not False
         )
         complete = (
             run_completed and count_complete and not zero_claim_failure

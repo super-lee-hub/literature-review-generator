@@ -197,7 +197,7 @@ def test_run_disposition_reducer(
     assert reduce_validation_disposition(ValidationExecutionStatus.SUCCEEDED, verdicts) is expected
 
 
-def test_run_disposition_reducer_treats_zero_claim_context_as_unknown() -> None:
+def test_run_disposition_reducer_never_treats_zero_claim_context_as_clean() -> None:
     assert (
         reduce_validation_disposition(ValidationExecutionStatus.SUCCEEDED, ())
         is ValidationRunDisposition.NEEDS_REVIEW
@@ -210,7 +210,7 @@ def test_run_disposition_reducer_treats_zero_claim_context_as_unknown() -> None:
             validated_claim_count=0,
             review_has_citations=False,
         )
-        is ValidationRunDisposition.CLEAN
+        is ValidationRunDisposition.NEEDS_REVIEW
     )
 
 
@@ -292,10 +292,10 @@ def test_empty_report_projection_requires_explicit_citation_free_declaration() -
     )
 
     assert unknown.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
-    assert citation_free.validation_disposition is ValidationRunDisposition.CLEAN
+    assert citation_free.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
 
 
-def test_explicit_citation_free_review_can_be_clean_with_zero_claims() -> None:
+def test_explicit_citation_free_review_is_not_clean_with_zero_claims() -> None:
     result = ValidationRunResultV1.create(
         job_id="job-1",
         execution_status="succeeded",
@@ -310,9 +310,9 @@ def test_explicit_citation_free_review_can_be_clean_with_zero_claims() -> None:
         evidence_complete=True,
     )
 
-    assert result.validation_disposition is ValidationRunDisposition.CLEAN
-    assert result.review_cleanliness is ValidationRunDisposition.CLEAN
-    assert result.contract_satisfied is True
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert result.review_cleanliness is ValidationRunDisposition.NEEDS_REVIEW
+    assert result.contract_satisfied is False
 
 
 def test_clean_run_without_verified_input_identities_does_not_satisfy_contract() -> None:
@@ -324,7 +324,7 @@ def test_clean_run_without_verified_input_identities_does_not_satisfy_contract()
         evidence_complete=True,
     )
 
-    assert result.validation_disposition is ValidationRunDisposition.CLEAN
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
     assert result.contract_satisfied is False
 
 

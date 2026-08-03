@@ -693,6 +693,7 @@ class ReviewControlPlane:
                 "reason": "repair plan is missing or not a verified ready artifact",
                 "mutation_performed": False,
             }
+
         workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
         try:
             return RepairTransactionService(workspace_obj, registry).apply_plan(plan_id)
@@ -705,6 +706,114 @@ class ReviewControlPlane:
                 "mutation_performed": False,
             }
 
+    def repair_promote(
+        self,
+        *,
+        job_id: str | None = None,
+        workspace: str | Path | None = None,
+        transaction_id: str,
+        actor: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Revalidate a quarantined repair, then advance current pointers."""
+
+        inspection = self.inspect(job_id=job_id, workspace=workspace)
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
+        source_record = registry.get(transaction_id) or registry.get(f"repair-tx:{transaction_id}")
+        if source_record is None:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "transaction_id": transaction_id,
+                "reason": "repair transaction is missing from the current Registry",
+                "mutation_performed": False,
+            }
+        source_payload = _json_object(Path(source_record.path))
+        if source_payload is None:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "transaction_id": transaction_id,
+                "reason": "repair transaction payload is unreadable",
+                "mutation_performed": False,
+            }
+        applied_ids = [str(item) for item in source_payload.get("applied_artifact_ids") or ()]
+        derived_draft = None
+        derived_manifest = None
+        for item in applied_ids:
+            record = registry.get(item)
+            if record is None:
+                continue
+            if record.artifact_type == "review_draft_repaired":
+                derived_draft = record
+            elif record.artifact_type == "citation_manifest_repaired":
+                derived_manifest = record
+        if derived_draft is None or derived_manifest is None:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "transaction_id": transaction_id,
+                "reason": "repair transaction has no quarantined draft/manifest to revalidate",
+                "mutation_performed": False,
+            }
+        spec_path = Path(str(inspection["workspace_path"])) / "artifacts" / "runtime_job_spec_v1.json"
+        if not spec_path.is_file():
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "transaction_id": transaction_id,
+                "reason": "runtime job spec is required for current-service repair revalidation",
+                "mutation_performed": False,
+            }
+        try:
+            spec = load_runtime_job_spec(spec_path)
+            bridge = AgentRuntimeBridge(spec)
+            session = bridge.bootstrap(
+                resume_requested=True,
+                claim_latest_pointer=False,
+                publish_running_state=False,
+            )
+            revalidation_id = f"validation_run_result_repaired:{source_record.content_hash[:16]}"
+            revalidation_dir = workspace_obj.artifact_path(
+                f"repair_revalidation/{source_record.content_hash[:16]}"
+            )
+            validation_service = bridge.build_validation_service(
+                session,
+                attempt_id=f"repair-revalidation:{source_record.content_hash[:16]}:{time.time_ns()}",
+            )
+            revalidation = validation_service.revalidate_review_artifacts(
+                review_draft_record=derived_draft,
+                citation_manifest_record=derived_manifest,
+                output_dir=revalidation_dir,
+                result_artifact_id=revalidation_id,
+            )
+            session.context.registry.reload()
+            revalidation_record = session.context.registry.get(revalidation_id)
+            if revalidation_record is None:
+                raise ControlPlaneError("current repair revalidation did not register its result")
+            result = RepairTransactionService(
+                session.context.workspace,
+                session.context.registry,
+            ).promote_transaction(
+                source_record.artifact_id,
+                actor=actor,
+                reason=reason,
+                validation_result=revalidation,
+                validation_record=revalidation_record,
+                receipt_closure=revalidation.get("provider_receipt_closure"),
+            )
+            result["revalidation_artifact_id"] = revalidation_record.artifact_id
+            result["revalidation_disposition"] = revalidation.get("validation_disposition", "")
+            result["revalidation_execution_status"] = revalidation.get("execution_status", "")
+            return result
+        except (OSError, RegistryError, RuntimeRunnerError, ValueError, TypeError, ControlPlaneError) as exc:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "transaction_id": transaction_id,
+                "reason": str(exc),
+                "mutation_performed": False,
+            }
     def validation_status(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])

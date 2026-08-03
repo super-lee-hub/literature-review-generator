@@ -179,7 +179,7 @@ class OutlineV3Executor:
         return str(root / name)
 
     def _node_path(self, node_id: str) -> str:
-        safe = node_id.replace("/", "_").replace("\\", "_")
+        safe = node_id.replace("/", "_").replace("\\", "_").replace(":", "_")
         return self._path(f"outline_v3/artifacts/{safe}.json")
 
     def _provider_node_ids(self) -> tuple[str, ...]:
@@ -511,6 +511,11 @@ class OutlineV3Executor:
         if expected is not None:
             expected = replace(
                 expected,
+                provider_response_hash=expected.provider_response_hash or expected.normalized_output_hash,
+                artifact_payload_hash=hash_json(artifact.payload),
+                artifact_content_hash=artifact.content_hash,
+                registry_file_hash=record.content_hash,
+                artifact_path=record.path,
                 registered_artifact_hash=artifact.content_hash,
                 node_output_hash=artifact.content_hash,
             )
@@ -588,8 +593,13 @@ class OutlineV3Executor:
             call_id = self._register_expected_from_binding(node_id, binding)
             self._expected_provider_calls[call_id] = replace(
                 self._expected_provider_calls[call_id],
+                provider_response_hash=normalized_hash,
                 output_hash=normalized_hash,
                 normalized_output_hash=normalized_hash,
+                artifact_payload_hash=hash_json(payload),
+                artifact_content_hash=node.output_hash,
+                registry_file_hash=record.content_hash,
+                artifact_path=record.path,
                 registered_artifact_hash=node.output_hash,
                 replay_output_hash=replay.record.output_hash,
                 node_output_hash=node.output_hash,
@@ -658,16 +668,80 @@ class OutlineV3Executor:
             return {"status": "success", "content": {"node_id": node_id, "passed": True, "blocking_diagnostics": [], "recommendations": [], "score": 1.0}}
         if node_id == "arbitration":
             candidate_ids = list(payload.get("candidate_ids") or ["candidate_1"])
-            selected = str(candidate_ids[0])
+            selected = sorted(str(item) for item in candidate_ids)[0]
             return {"status": "success", "content": {
                 "selected_candidate_id": selected,
-                "selection_reasons": ["fixture selected the first candidate after receiving all candidate content"],
+                "selection_reasons": ["fixture selected the lexicographically stable candidate after receiving all candidate content"],
                 "candidate_comparison": {str(item): {"coverage": "available", "evidence": "available", "structure": "available"} for item in candidate_ids},
                 "accepted_recommendations": [],
                 "rejected_recommendations": [],
                 "unresolved_risks": [],
             }}
         return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
+
+    def _persist_stability_output(
+        self,
+        node_id: str,
+        payload: Mapping[str, Any],
+        *,
+        dependency_hashes: Mapping[str, str],
+        binding: Mapping[str, Any],
+    ) -> None:
+        """Persist a stability provider output without adding a DAG node.
+
+        Stability reruns are an execution audit over the canonical DAG.  They
+        still need immutable Registry and replay identities, but must not
+        masquerade as normal outline nodes or mutate the dependency graph.
+        """
+
+        artifact = self._artifact(OutlineArtifact, payload, dependency_hashes)
+        path = self._node_path(node_id)
+        atomic_write_json(path, artifact.to_dict())
+        artifact_id = f"outline-v3:stability:{hash_text(node_id)[:24]}"
+        record = self.registry.register_file(
+            artifact_role="outline_v3_stability_provider_output",
+            artifact_type="outline_stability_provider_output",
+            artifact_version="v1",
+            path=path,
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=artifact_id,
+            metadata={
+                "job_id": self.job_id,
+                "node_id": node_id,
+                "content_hash": artifact.content_hash,
+            },
+        )
+        self.artifact_paths[node_id] = record.path
+        self.artifact_records[node_id] = record
+        self._payloads[node_id] = dict(payload)
+        expected = self._expected_provider_calls.get(f"outline:{node_id}")
+        if expected is not None:
+            expected = replace(
+                expected,
+                artifact_payload_hash=hash_json(payload),
+                artifact_content_hash=artifact.content_hash,
+                registry_file_hash=record.content_hash,
+                artifact_path=record.path,
+                registered_artifact_hash=artifact.content_hash,
+                node_output_hash=artifact.content_hash,
+            )
+            self._expected_provider_calls[expected.call_id] = expected
+            pending = self._pending_replays.pop(node_id, None)
+            if pending is not None and expected.normalized_output_hash:
+                replay_key, normalized_hash, receipt_id = pending
+                self._replay_store.append(
+                    replay_key,
+                    output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                    registered_artifact_hash=artifact.content_hash,
+                    node_output_hash=artifact.content_hash,
+                    output_artifact_ids=(artifact_id,),
+                    receipt_ids=(receipt_id,),
+                )
+                self._expected_provider_calls[expected.call_id] = replace(
+                    self._expected_provider_calls[expected.call_id],
+                    replay_output_hash=normalized_hash,
+                )
 
     def _provider_call(
         self,
@@ -676,6 +750,7 @@ class OutlineV3Executor:
         *,
         expect_json: bool = True,
         input_artifact_hashes: Sequence[str] = (),
+        transport_node_id: str | None = None,
     ) -> dict[str, Any]:
         budget = self.profile.estimate_request(request)
         api_config = {
@@ -722,8 +797,13 @@ class OutlineV3Executor:
                     self.receipts.extend(replay_lookup.record.receipt_ids)
                     self._expected_provider_calls[call_id] = replace(
                         self._expected_provider_calls[call_id],
+                        provider_response_hash=normalized_hash,
                         output_hash=normalized_hash,
                         normalized_output_hash=normalized_hash,
+                        artifact_payload_hash=hash_json(payload),
+                        artifact_content_hash=(replay_lookup.record.registered_artifact_hash or replay_record.content_hash),
+                        registry_file_hash=replay_record.content_hash,
+                        artifact_path=replay_record.path,
                         registered_artifact_hash=replay_lookup.record.registered_artifact_hash or replay_record.content_hash,
                         replay_output_hash=replay_lookup.record.output_hash,
                         node_output_hash=replay_lookup.record.node_output_hash or replay_record.content_hash,
@@ -750,9 +830,19 @@ class OutlineV3Executor:
             self.receipts.append(receipt.receipt_id)
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
         admission = runtime.admit(estimated_tokens=int(budget["estimated_input_tokens"]))
-        raw = self._fixture_response(node_id, request) if self.provider is None else (
-            self.provider(node_id, request) if callable(self.provider) else self.provider.call(node_id, request)
-        )
+        if self.provider is None:
+            if node_id.startswith("stability:"):
+                raise OutlineV3ExecutionError(
+                    "stability audit requires a configured provider; fixture responses are not admissible"
+                )
+            raw = self._fixture_response(node_id, request)
+        else:
+            provider_node_id = str(transport_node_id or node_id)
+            raw = (
+                self.provider(provider_node_id, request)
+                if callable(self.provider)
+                else self.provider.call(provider_node_id, request)
+            )
         response = _provider_result(raw)
         completion = ProviderCompletionEvaluator.evaluate(response, minimum_output=2, expect_json=expect_json)
         result = dict(response)
@@ -780,6 +870,7 @@ class OutlineV3Executor:
         normalized_hash = hash_json(completion.content) if completion.status == "complete" else ""
         self._expected_provider_calls[call_id] = replace(
             self._expected_provider_calls[call_id],
+            provider_response_hash=normalized_hash,
             output_hash=normalized_hash,
             normalized_output_hash=normalized_hash,
         )
@@ -789,6 +880,19 @@ class OutlineV3Executor:
             self._pending_replays[node_id] = (replay_key, normalized_hash, receipt.receipt_id)
         if completion.status != "complete":
             raise OutlineV3ExecutionError(f"provider output for {node_id} is {completion.status}")
+        if node_id.startswith("stability:"):
+            # Stability calls are real provider calls too.  Persist their
+            # output immediately so the exact-replay variant can resolve the
+            # same ModelCallReplayStore record on its second execution.
+            self._persist_stability_output(
+                node_id,
+                _as_dict(completion.content),
+                dependency_hashes={
+                    f"input_{index}": value
+                    for index, value in enumerate(input_artifact_hashes)
+                },
+                binding=binding,
+            )
         return _as_dict(completion.content)
 
     def _artifact(self, cls: type[OutlineArtifact], payload: Mapping[str, Any], deps: Mapping[str, str] | None = None, diagnostics: Sequence[Mapping[str, Any]] = ()) -> OutlineArtifact:
@@ -876,19 +980,66 @@ class OutlineV3Executor:
 
     def run(self) -> OutlineV3ExecutionResult:
         try:
-            summaries_path = self._path("stage1_summaries.json")
-            if not Path(summaries_path).is_file():
-                atomic_write_json(summaries_path, {"job_id": self.job_id, "summaries": self.summaries})
-                self.registry.register_file(
-                    artifact_role="stage1_input",
-                    artifact_type="stage1_canonical_summaries",
-                    artifact_version="v1",
-                    path=summaries_path,
-                    producer="outline.v3_executor.OutlineV3Executor",
-                    artifact_id="stage1_summaries",
+            summary_set_hash = hash_json(self.summaries)
+            summaries_path = self._path(
+                f"outline_v3/inputs/stage1_summaries_{summary_set_hash[:24]}.json"
+            )
+            if Path(summaries_path).is_file():
+                try:
+                    existing = json.loads(Path(summaries_path).read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise OutlineV3ExecutionError(
+                        f"content-addressed Stage 1 summary artifact is unreadable: {summaries_path}"
+                    ) from exc
+                existing_summaries = (
+                    existing.get("summaries")
+                    if isinstance(existing, Mapping)
+                    else existing
                 )
-            stage1 = self.registry.get("stage1_summaries")
-            stage1_hash = stage1.content_hash if stage1 else _hash_payload(self.summaries)
+                if hash_json(existing_summaries) != summary_set_hash:
+                    raise OutlineV3ExecutionError(
+                        f"content-addressed Stage 1 summary artifact has drifted: {summaries_path}"
+                    )
+            else:
+                atomic_write_json(
+                    summaries_path,
+                    {
+                        "artifact_type": "stage1_canonical_summaries",
+                        "artifact_version": "v1",
+                        "job_id": self.job_id,
+                        "summary_set_hash": summary_set_hash,
+                        "summaries": self.summaries,
+                    },
+                )
+            immutable_id = f"outline-v3:stage1-summaries:{summary_set_hash}"
+            immutable_record = self.registry.register_file(
+                artifact_role="stage1_input",
+                artifact_type="stage1_canonical_summaries",
+                artifact_version="v1",
+                path=summaries_path,
+                producer="outline.v3_executor.OutlineV3Executor",
+                artifact_id=immutable_id,
+                metadata={
+                    "immutable": True,
+                    "summary_set_hash": summary_set_hash,
+                    "versioned_artifact_id": immutable_id,
+                },
+            )
+            stage1 = self.registry.register_file(
+                artifact_role="stage1_input",
+                artifact_type="stage1_canonical_summaries",
+                artifact_version="v1",
+                path=summaries_path,
+                producer="outline.v3_executor.OutlineV3Executor",
+                artifact_id="stage1_summaries",
+                depends_on=[ArtifactDependencyRefV2.from_record(immutable_record)],
+                metadata={
+                    "pointer_role": "current",
+                    "current_version_artifact_id": immutable_id,
+                    "summary_set_hash": summary_set_hash,
+                },
+            )
+            stage1_hash = stage1.content_hash
 
             evidence = self._run_node("outline_evidence_views", lambda: (
                 self._artifact(OutlineArtifact, build_outline_evidence_views(self.summaries, self.job_id).to_dict(), {"stage1_summaries": stage1_hash}),
@@ -1337,7 +1488,11 @@ class OutlineV3Executor:
                 for packet in packets
             )
 
-            def _variant_decision(variant_summaries: Sequence[Mapping[str, Any]], candidate_order: Sequence[str]) -> dict[str, Any]:
+            def _variant_decision(
+                variant_name: str,
+                variant_summaries: Sequence[Mapping[str, Any]],
+                candidate_order: Sequence[str],
+            ) -> dict[str, Any]:
                 variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
                 variant_ledger = build_global_corpus_ledger(variant_evidence)
                 variant_matrix = build_multi_view_matrix(variant_evidence)
@@ -1355,6 +1510,10 @@ class OutlineV3Executor:
                     variant_ledger, variant_matrix, variant_relation_map, variant_intent, variant_contract,
                     candidate_count=self.candidate_count,
                 )
+                if self.provider is None:
+                    raise OutlineV3ExecutionError(
+                        "stability audit cannot execute without a configured provider"
+                    )
                 plans_by_id = {item.candidate_id: item for item in variant_plans.candidates}
                 ordered_ids = [item for item in candidate_order if item in plans_by_id]
                 ordered_ids.extend(item.candidate_id for item in variant_plans.candidates if item.candidate_id not in ordered_ids)
@@ -1371,9 +1530,61 @@ class OutlineV3Executor:
                         "evidence": [view.to_dict() for view in variant_evidence.views],
                         "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                     }
-                    fixture = self._fixture_response(f"{candidate_id}_provider_generation", request)
-                    variant_contents[candidate_id] = _as_dict(fixture.get("content"))
-                selected_variant_id = sorted(variant_contents)[0] if variant_contents else ""
+                    stability_key_hash = hash_json(
+                        {"variant": variant_name, "candidate": candidate_id}
+                    )[:16]
+                    stability_node_id = (
+                        f"stability:{stability_key_hash}:{candidate_id}_provider_generation"
+                    )
+                    generated = self._provider_call(
+                        stability_node_id,
+                        request,
+                        expect_json=True,
+                        input_artifact_hashes=(
+                            *sorted(variant_evidence.source_summary_hashes),
+                            variant_contract.content_hash,
+                        ),
+                        transport_node_id=f"{candidate_id}_provider_generation",
+                    )
+                    self._validate_candidate_payload(
+                        candidate_id,
+                        generated,
+                        allowed_paper_keys=paper_keys,
+                        allowed_relation_ids=[item.relation_id for item in variant_relation_map.relations],
+                    )
+                    variant_contents[candidate_id] = generated
+                arbitration_request = {
+                    "candidate_ids": list(variant_contents),
+                    "candidates": [
+                        {
+                            "candidate_id": candidate_id,
+                            "content": variant_contents[candidate_id],
+                        }
+                        for candidate_id in variant_contents
+                    ],
+                    "review_intent": variant_intent.to_dict(),
+                    "coverage_contract_hash": variant_contract.content_hash,
+                }
+                arbitration_key_hash = hash_json(
+                    {"variant": variant_name, "role": "arbitration"}
+                )[:16]
+                arbitration_raw = self._provider_call(
+                    f"stability:{arbitration_key_hash}:arbitration",
+                    arbitration_request,
+                    expect_json=True,
+                    input_artifact_hashes=(
+                        variant_contract.content_hash,
+                        *(hash_json(variant_contents[item]) for item in variant_contents),
+                    ),
+                    transport_node_id="arbitration",
+                )
+                selected_variant_id = str(
+                    arbitration_raw.get("selected_candidate_id") or ""
+                ).strip()
+                if selected_variant_id not in variant_contents:
+                    raise OutlineV3ExecutionError(
+                        f"stability arbitration selected unknown candidate: {selected_variant_id or '<empty>'}"
+                    )
                 selected_variant = variant_contents.get(selected_variant_id, {})
                 variant_views = {view.paper_key: view for view in variant_evidence.views}
                 variant_relations = {item.relation_id: item for item in variant_relation_map.relations}
@@ -1452,9 +1663,25 @@ class OutlineV3Executor:
             for variant_name, variant_summaries, candidate_order, definition in variants:
                 variant_definitions[variant_name] = definition
                 variant_input_hashes[variant_name] = hash_json({"summaries": variant_summaries, "definition": definition})
-                rerun_replay_node_ids[variant_name] = list(self._provider_node_ids()) if definition.get("resume") == "exact_replay" else []
+                rerun_replay_node_ids[variant_name] = []
                 try:
-                    decision = _variant_decision(variant_summaries, candidate_order)
+                    decision = _variant_decision(variant_name, variant_summaries, candidate_order)
+                    if definition.get("resume") == "exact_replay":
+                        replay_decision = _variant_decision(
+                            variant_name,
+                            variant_summaries,
+                            candidate_order,
+                        )
+                        if hash_json(decision["final_outline"]) != hash_json(replay_decision["final_outline"]):
+                            raise OutlineV3ExecutionError(
+                                "exact replay produced a different final outline"
+                            )
+                        decision = replay_decision
+                        rerun_replay_node_ids[variant_name] = [
+                            call_id.removeprefix("outline:")
+                            for call_id in sorted(self._expected_provider_calls)
+                            if call_id.startswith("outline:stability:")
+                        ]
                     variant_signatures[variant_name] = decision["signature"]
                     variant_output_hashes[variant_name] = hash_json(decision["final_outline"])
                     variant_evidence = decision["evidence"]
@@ -1520,14 +1747,19 @@ class OutlineV3Executor:
                 ("coverage_audit", "final_outline"), "deterministic", "local",
             ))
             self._register_receipt_ledger()
-            expected_call_ids = set(self._expected_provider_calls)
+            all_receipts = list(self._receipt_ledger.list_receipts())
+            current_receipts = [
+                receipt
+                for receipt in all_receipts
+                if receipt.job_id == self.job_id and receipt.stage_name == "outline_v3"
+            ]
+            out_of_scope_receipts = [
+                receipt for receipt in all_receipts if receipt not in current_receipts
+            ]
             closure = ProviderReceiptClosure.evaluate(
                 self._expected_provider_calls.values(),
-                [
-                    receipt
-                    for receipt in self._receipt_ledger.list_receipts()
-                    if receipt.call_id in expected_call_ids
-                ],
+                current_receipts,
+                out_of_scope=out_of_scope_receipts,
             )
             self._check("provider_receipt_closure")
             closure_payload = self._persist(

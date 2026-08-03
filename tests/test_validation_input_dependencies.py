@@ -23,7 +23,12 @@ from validation.input_dependencies import (
     ValidationInputDependencyError,
     resolve_validation_input_dependencies,
 )
-from validation.run_result import ValidationInputArtifactsV1, ValidationRunResultV1
+from validation.run_result import (
+    ClaimValidationResultV1,
+    ClaimVerdict,
+    ValidationInputArtifactsV1,
+    ValidationRunResultV1,
+)
 
 
 def _dependency(record: ArtifactRecord, *, dependency_kind: str = "local_job") -> ArtifactDependencyRefV2:
@@ -72,6 +77,26 @@ def _validation_graph(
             )
         )
     review, citation, evidence = records
+    claim = ClaimValidationResultV1(
+        claim_result_id="claim:contract",
+        claim_unit_ids=("claim-unit:contract",),
+        citation_set_key="citation:v3",
+        paper_ids=("paper-a",),
+        block_ids=("block:1",),
+        claim_text="The evidence supports the bounded claim.",
+        claim_context="A current validation dependency contract test.",
+        verdict=ClaimVerdict.SUPPORTED,
+        reasoning_summary="The evidence is explicitly bound to the validation input.",
+        repair_hint="",
+        root_causes=(),
+        span_start=0,
+        span_end=40,
+        alignment_status="supported",
+        alignment_confidence=1.0,
+        low_confidence=False,
+        details={"evidence_status": "supported"},
+        evidence_candidates=(),
+    )
     validation = ValidationRunResultV1.create(
         job_id=workspace.job_id,
         attempt_id="attempt-validation",
@@ -85,8 +110,9 @@ def _validation_graph(
             evidence_manifest_ids=(evidence.artifact_id,),
             evidence_manifest_hashes=(evidence.content_hash,),
         ),
-        expected_claim_count=0,
-        review_has_citations=False,
+        claim_results=(claim,),
+        expected_claim_count=1,
+        review_has_citations=True,
         evidence_complete=True,
     )
     validation_path = Path(workspace.artifact_path("validation_run_result_v1.json"))

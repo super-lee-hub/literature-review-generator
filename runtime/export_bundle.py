@@ -117,6 +117,62 @@ def _json_payload(record: ArtifactRecord) -> Mapping[str, Any] | None:
     return None
 
 
+def _current_pointer_targets(registry: ArtifactRegistry) -> tuple[set[str], dict[str, str]]:
+    """Read current repair pointers without selecting stale versions."""
+
+    targets: set[str] = set()
+    pointer_kinds: dict[str, str] = {}
+    for pointer in registry.list_records():
+        if pointer.status != "ready" or pointer.artifact_type != "current_artifact_pointer":
+            continue
+        payload = _json_payload(pointer)
+        if payload is None:
+            continue
+        kind = str(payload.get("pointer_kind") or "").strip()
+        target_id = str(payload.get("target_artifact_id") or "").strip()
+        target_hash = str(payload.get("target_content_hash") or "").strip()
+        target = registry.get(target_id) if target_id else None
+        if (
+            not kind
+            or target is None
+            or target.status != "ready"
+            or not target_hash
+            or target.content_hash != target_hash
+        ):
+            continue
+        targets.add(target_id)
+        pointer_kinds[kind] = target_id
+    return targets, pointer_kinds
+
+
+def _is_current_canonical_record(
+    record: ArtifactRecord,
+    *,
+    pointer_targets: set[str],
+    pointer_kinds: Mapping[str, str],
+) -> bool:
+    if record.artifact_type == "current_artifact_pointer":
+        return True
+    if record.metadata.get("versioned") and record.artifact_id not in pointer_targets:
+        return False
+    legacy_by_kind = {
+        "review_draft": {"review_draft"},
+        "citation_manifest": {"citation_manifest_v3", "citation_manifest:v3"},
+        "review_docx": {"review_docx"},
+        "validation_run_result": set(),
+    }
+    for kind, target_id in pointer_kinds.items():
+        if record.artifact_type in {
+            kind,
+            "validation_run_result_repaired" if kind == "validation_run_result" else "",
+        }:
+            if record.artifact_id == target_id:
+                return True
+            if record.artifact_id in legacy_by_kind.get(kind, set()):
+                return False
+    return True
+
+
 def _derive_current_evidence(
     workspace: JobWorkspace,
     registry: ArtifactRegistry,
@@ -247,6 +303,7 @@ _EXPORT_ALLOWLIST = frozenset(
         "adopted_outline",
         "outline_adoption_pointer",
         "outline_v3_adoption_current",
+        "current_artifact_pointer",
         "review_draft",
         "citation_manifest",
         "validation_run_result",
@@ -278,10 +335,16 @@ class ExportBundleService:
         # These parameters remain accepted only so older callers fail closed
         # at the same API boundary.  They are never used as trust evidence.
         caller_claims_supplied = completion is not None or closure is not None
+        pointer_targets, pointer_kinds = _current_pointer_targets(self.registry)
         records = [
             record
             for record in self.registry.list_records()
             if _matches(record, export_spec)
+            and _is_current_canonical_record(
+                record,
+                pointer_targets=pointer_targets,
+                pointer_kinds=pointer_kinds,
+            )
             and (
                 export_spec.export_mode == "forensic"
                 or record.status == "ready"
@@ -460,6 +523,8 @@ class ExportBundleService:
             registration_error = str(exc)
             issues.append(f"bundle_registration_failed:{exc}")
             bundle_status = "untrusted"
+            manifest["status"] = "untrusted"
+            manifest["issues"] = sorted(set(issues))
             try:
                 bundle_path.unlink()
             except OSError:
@@ -468,8 +533,8 @@ class ExportBundleService:
             job_id=self.workspace.job_id,
             status=bundle_status,
             bundle_id=bundle_id,
-            bundle_path=str(bundle_path),
-            artifact_id=artifact_id,
+            bundle_path="" if registration_error else str(bundle_path),
+            artifact_id="" if registration_error else artifact_id,
             manifest=manifest,
             issues=tuple(sorted(set([*issues, registration_error] if registration_error else issues))),
         )

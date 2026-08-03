@@ -68,6 +68,38 @@ def _summary(paper_key: str, title: str, finding: str) -> dict[str, Any]:
     return summary
 
 
+def _configured_test_provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+    if node_id == "relation_adjudication":
+        candidates = [
+            dict(item) for item in request.get("relation_candidates") or ()
+            if isinstance(item, Mapping)
+        ]
+        confirmed = [
+            str(item.get("relation_id") or "")
+            for item in candidates
+            if item.get("relation_id") and item.get("evidence_fields")
+        ]
+        return {"status": "success", "content": {"confirmed_relation_ids": confirmed, "rejected_relations": []}}
+    if node_id.endswith("_provider_generation"):
+        candidate_id = node_id.removesuffix("_provider_generation")
+        paper_keys = [str(item) for item in request.get("paper_keys") or ()]
+        logic = str(request.get("organizing_logic") or "evidence")
+        return {"status": "success", "content": {"candidate_id": candidate_id, "organizing_logic": logic, "sections": [{
+            "section_id": f"{candidate_id}_section_1",
+            "title": f"{logic} synthesis",
+            "goal": "Integrate evidence",
+            "paper_keys": paper_keys,
+            "relation_ids": list(request.get("relation_ids") or ()),
+            "claims": ["The provider-bound evidence supports this synthesis."],
+        }]}}
+    if node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
+        return {"status": "success", "content": {"passed": True, "blocking_diagnostics": [], "recommendations": []}}
+    if node_id == "arbitration":
+        candidate_ids = [str(item) for item in request.get("candidate_ids") or ()]
+        return {"status": "success", "content": {"selected_candidate_id": sorted(candidate_ids)[0] if candidate_ids else ""}}
+    return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
+
+
 def _executor(tmp_path: Path, *, provider: Any = None) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
@@ -79,7 +111,7 @@ def _executor(tmp_path: Path, *, provider: Any = None) -> OutlineV3Executor:
         ],
         workspace=workspace,
         artifact_registry=registry,
-        provider=provider,
+        provider=provider or _configured_test_provider,
         candidate_count=2,
     )
 

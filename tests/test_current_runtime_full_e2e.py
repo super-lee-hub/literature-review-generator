@@ -150,20 +150,23 @@ def _outline_provider_response(node_id: str, request: Mapping[str, Any]) -> dict
             claims.append(f"{title}: {finding}")
         if not claims:
             claims = [f"The corpus records evidence organized by {organizing_logic}."]
+        relation_ids = list(request.get("relation_ids") or ())[:8]
+        sections = [
+            {
+                "section_id": f"{candidate_id}_section_{index}",
+                "title": f"{organizing_logic.replace('_', ' ').title()} synthesis {index}",
+                "goal": "Integrate one bounded evidence cluster by research logic",
+                "paper_keys": [paper_key],
+                "relation_ids": relation_ids,
+                "claims": [claims[index - 1] if index <= len(claims) else claims[0]],
+            }
+            for index, paper_key in enumerate(paper_keys, start=1)
+        ]
         return _provider_response(
             {
                 "candidate_id": candidate_id,
                 "organizing_logic": organizing_logic,
-                "sections": [
-                    {
-                        "section_id": f"{candidate_id}_section_1",
-                        "title": f"{organizing_logic.replace('_', ' ').title()} synthesis",
-                        "goal": "Integrate evidence by research logic",
-                        "paper_keys": paper_keys,
-                        "relation_ids": list(request.get("relation_ids") or ())[:8],
-                        "claims": claims,
-                    }
-                ],
+                "sections": sections,
                 "claims": claims,
             }
         )
@@ -187,7 +190,7 @@ def _outline_provider_response(node_id: str, request: Mapping[str, Any]) -> dict
         candidate_ids = [str(item) for item in request.get("candidate_ids") or ()]
         return _provider_response(
             {
-                "selected_candidate_id": candidate_ids[0] if candidate_ids else "",
+                "selected_candidate_id": sorted(candidate_ids)[0] if candidate_ids else "",
                 "accepted_recommendations": [],
                 "rejected_recommendations": [],
             }
@@ -295,7 +298,6 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
     monkeypatch.setattr("ai_interface._call_ai_api", _adjudicator_response)
-    monkeypatch.setattr("validator._call_ai_api", _adjudicator_response)
     monkeypatch.setattr("validation.llm_adjudicator._call_ai_api", _adjudicator_response)
 
     spec = RuntimeJobSpec(

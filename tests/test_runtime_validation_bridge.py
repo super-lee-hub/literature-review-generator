@@ -8,6 +8,7 @@ import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
+from validation.execution_service import ValidationExecutionService
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRegistry,
@@ -16,10 +17,35 @@ from services.artifact_registry import (
 from services.job_workspace import JobWorkspace
 from tests.test_runtime_bridge_helpers import current_config, write_json
 from validation.run_result import (
+    ClaimValidationResultV1,
+    ClaimVerdict,
     ValidationExecutionStatus,
     ValidationInputArtifactsV1,
     ValidationRunResultV1,
 )
+
+
+def _supported_claim() -> ClaimValidationResultV1:
+    return ClaimValidationResultV1(
+        claim_result_id="claim:bridge-supported",
+        claim_unit_ids=(),
+        citation_set_key="citation-set-1",
+        paper_ids=("paper-alpha",),
+        block_ids=("block-1",),
+        claim_text="The evidence supports the bounded claim.",
+        claim_context="",
+        verdict=ClaimVerdict.SUPPORTED,
+        reasoning_summary="The registered evidence supports the claim.",
+        repair_hint="",
+        root_causes=(),
+        span_start=0,
+        span_end=10,
+        alignment_status="aligned",
+        alignment_confidence=1.0,
+        low_confidence=False,
+        details={"evidence_status": "clean_supported"},
+        evidence_candidates=(),
+    )
 
 
 def test_runtime_validation_bridge_registers_reports(
@@ -137,8 +163,10 @@ def test_runtime_validation_bridge_registers_reports(
             evidence_manifest_ids=(evidence_record.artifact_id,),
             evidence_manifest_hashes=(evidence_record.content_hash,),
         ),
-        review_has_citations=False,
         evidence_complete=True,
+        claim_results=(_supported_claim(),),
+        expected_claim_count=1,
+        review_has_citations=True,
     )
     write_json(validation_run_result_file, canonical_result.to_dict())
 
@@ -152,7 +180,7 @@ def test_runtime_validation_bridge_registers_reports(
             "manual_report_file": str(manual_report_file),
         }
 
-    monkeypatch.setattr("validator.run_review_validation", _fake_run_review_validation)
+    monkeypatch.setattr(ValidationExecutionService, "run_review_validation", _fake_run_review_validation)
     validation_result = bridge.run_validation(
         session,
         attempt_id="attempt-1",
@@ -202,7 +230,8 @@ def test_runtime_validation_bridge_registers_reports(
     )
     write_json(mismatched_path, mismatched_result.to_dict())
     monkeypatch.setattr(
-        "validator.run_review_validation",
+        ValidationExecutionService,
+        "run_review_validation",
         lambda _adapter: {
             "success": True,
             "validation_run_result": mismatched_result,
@@ -220,7 +249,7 @@ def test_runtime_validation_bridge_registers_reports(
     assert mismatched_stage.metadata["execution_status"] == "failed"
     assert mismatched_stage.metadata["validation_disposition"] == "unvalidated"
     assert mismatched_stage.metadata["declared_execution_status"] == "succeeded"
-    assert mismatched_stage.metadata["declared_validation_disposition"] == "clean"
+    assert mismatched_stage.metadata["declared_validation_disposition"] == "needs_review"
     assert mismatched_stage.metadata["failure_reason"] == (
         "validation_input_dependencies_unverified"
     )
@@ -248,7 +277,8 @@ def test_runtime_validation_bridge_rejects_legacy_report_as_verified(
     session = bridge.bootstrap()
 
     monkeypatch.setattr(
-        "validator.run_review_validation",
+        ValidationExecutionService,
+        "run_review_validation",
         lambda _adapter: {
             "success": True,
             "report": SimpleNamespace(report_id="legacy"),
@@ -286,7 +316,8 @@ def test_runtime_validation_bridge_rejects_success_without_canonical_file(
     )
 
     monkeypatch.setattr(
-        "validator.run_review_validation",
+        ValidationExecutionService,
+        "run_review_validation",
         lambda _adapter: {
             "success": True,
             "validation_run_result": in_memory,
@@ -339,7 +370,8 @@ def test_runtime_validation_bridge_rejects_canonical_identity_mismatch(
     write_json(canonical_path, canonical.to_dict())
 
     monkeypatch.setattr(
-        "validator.run_review_validation",
+        ValidationExecutionService,
+        "run_review_validation",
         lambda _adapter: {
             "success": True,
             "validation_run_result": ValidationRunResultV1.create(

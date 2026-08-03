@@ -51,43 +51,35 @@ def _dependency(record: ArtifactRecord) -> ArtifactDependencyRefV2:
 
 
 def current_adoption_record(registry: ArtifactRegistry) -> ArtifactRecord | None:
-    """Resolve the versioned adoption selected by the durable current pointer.
+    """Resolve only the adoption selected by the durable current pointer.
 
-    The pointer is the only current-state selector.  The legacy fixed identity
-    is accepted as a read-only compatibility fallback so existing workspaces
-    can be migrated without silently losing their adoption evidence.
+    A missing, stale, or malformed pointer is a hard stop.  Falling back to a
+    legacy identity or the newest adoption would silently select a different
+    outline version and make resume/export non-auditable.
     """
 
-    pointer = registry.get(ADOPTION_POINTER_ARTIFACT_ID)
-    if pointer is not None and pointer.status == "ready":
-        try:
-            pointer_payload = _load_json(pointer)
-        except ValueError:
-            pointer_payload = {}
-        target_id = str(pointer_payload.get("current_adoption_artifact_id") or "").strip()
-        target_hash = str(pointer_payload.get("current_adoption_hash") or "").strip()
-        target = registry.get(target_id) if target_id else None
-        if (
-            target is not None
-            and target.status == "ready"
-            and target.artifact_type == "adopted_outline"
-            and target.artifact_version == "v3"
-            and (not target_hash or target.content_hash == target_hash)
-        ):
-            return target
-
-    legacy = registry.get("outline-v3:adoption")
-    if legacy is not None and legacy.status == "ready":
-        return legacy
-
-    candidates = [
-        record
-        for record in registry.list_records()
-        if record.status == "ready"
-        and record.artifact_type == "adopted_outline"
-        and record.artifact_version == "v3"
-    ]
-    return max(candidates, key=lambda item: (item.created_at, item.artifact_id), default=None)
+    try:
+        pointer = _ready_record(registry, ADOPTION_POINTER_ARTIFACT_ID)
+        pointer_payload = _load_json(pointer)
+    except (ValueError, OSError, TypeError, RuntimeError):
+        return None
+    target_id = str(pointer_payload.get("current_adoption_artifact_id") or "").strip()
+    target_hash = str(pointer_payload.get("current_adoption_hash") or "").strip()
+    if not target_id or not target_hash:
+        return None
+    try:
+        target = _ready_record(registry, target_id)
+    except (ValueError, OSError, TypeError, RuntimeError):
+        return None
+    if (
+        target.artifact_type != "adopted_outline"
+        or target.artifact_version != "v3"
+        or target.content_hash != target_hash
+    ):
+        return None
+    if str(pointer_payload.get("adoption_identity") or "") != target.artifact_id:
+        return None
+    return target
 
 
 def _write_current_pointer(
@@ -320,7 +312,11 @@ class OutlineAdoptionTransaction:
                 "final_outline": dict(final_payload),
             },
         )
-        adopted_path = Path(self.workspace.artifact_path("outline_v3_adoption.json"))
+        adopted_path = Path(
+            self.workspace.artifact_path(
+                f"outline_v3/adoptions/{source.content_hash}/adoption.json"
+            )
+        )
         atomic_write_json(str(adopted_path), adopted.to_dict())
         adopted_record = self.registry.register_file(
             artifact_id=adopted_id,

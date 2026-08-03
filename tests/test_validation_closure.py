@@ -109,11 +109,15 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
     return workspace, registry
 
 
-def test_validation_closure_is_clean_only_with_registered_hash_bound_inputs(tmp_path: Path) -> None:
+def test_validation_closure_blocks_zero_claim_runs_even_with_registered_inputs(tmp_path: Path) -> None:
     workspace, registry = _bundle(tmp_path)
     result = ValidationClosureService(workspace, registry).inspect()
-    assert result.status == "clean"
-    assert result.semantic["contract_satisfied"] is True
+    # A succeeded run with zero validated claims is now explicitly
+    # needs_review, even when the review contains no citations.
+    assert result.status == "blocked"
+    assert result.semantic["contract_satisfied"] is False
+    assert result.semantic["validation_disposition"] == "needs_review"
+    assert "validation_contract_not_satisfied" in result.blocking_issues
     assert result.citation_counts["mapped_occurrences"] == 0
 
 

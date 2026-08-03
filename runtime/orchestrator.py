@@ -11,11 +11,13 @@ from runtime.architecture_gates import ArchitectureGateScope, collect_scannable_
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from runtime.job_spec import RuntimeJobSpec
 from runtime.provider_context import ProviderContextProfile
+from runtime.provider_runtime import hash_json
 from runtime.reconcile import ReconcileValidationError, validate_canonical_ai_summary
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_entry, stage_policy_for
 from validation.execution_service import ValidationExecutionService
+from validation.repair_transaction import current_artifact_record
 from outline.v3_executor import OutlineV3Executor
 from outline.adoption_transaction import current_adoption_record
 from services.model_capabilities import resolve_model_capability
@@ -108,7 +110,14 @@ class _RuntimeStageHost:
         self.workspace = workspace
         self.artifact_registry = artifact_registry
         self.settings = settings
-        self.summary_file = workspace.artifact_path(f"{self.project_name}_summaries.json")
+        current_summary = artifact_registry.get("summary_file")
+        self.summary_file = (
+            current_summary.path
+            if current_summary is not None
+            and current_summary.status == "ready"
+            and Path(current_summary.path).is_file()
+            else workspace.artifact_path(f"{self.project_name}_summaries.json")
+        )
         self.progress_path = workspace.artifact_path("stage1_progress_snapshot.json")
         self.checkpoint_path = workspace.checkpoint_path(f"{self.project_name}_checkpoint.json")
         self.fingerprint_bundle = dict(fingerprint_bundle or {})
@@ -221,15 +230,49 @@ class _RuntimeStageHost:
 
     def save_summaries(self, *, depends_on: Sequence[Any] = ()) -> bool:
         _workspace, registry = self._require_workspace()
-        atomic_write_json(self.summary_file, list(self.summaries))
+        summary_payload = list(self.summaries)
+        summary_set_hash = hash_json(summary_payload)
+        versioned_path = _workspace.artifact_path(
+            f"stage1/inputs/stage1_summaries_{summary_set_hash[:24]}.json"
+        )
+        if Path(versioned_path).is_file():
+            try:
+                existing_payload = json.loads(Path(versioned_path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"current Stage 1 summary artifact is unreadable: {versioned_path}") from exc
+            if hash_json(existing_payload) != summary_set_hash:
+                raise RuntimeError(f"content-addressed Stage 1 summary path has drifted: {versioned_path}")
+        else:
+            atomic_write_json(versioned_path, summary_payload)
+        self.summary_file = versioned_path
+        versioned_id = f"summary_file:{summary_set_hash}"
+        versioned_record = registry.register_file(
+            artifact_role="summary",
+            artifact_type="summary_file",
+            artifact_version="v1",
+            path=versioned_path,
+            producer="runtime.orchestrator._RuntimeStageHost",
+            artifact_id=versioned_id,
+            depends_on=list(depends_on),
+            metadata={
+                "immutable": True,
+                "summary_set_hash": summary_set_hash,
+                "versioned_artifact_id": versioned_id,
+            },
+        )
         registry.register_file(
             artifact_role="summary",
             artifact_type="summary_file",
             artifact_version="v1",
-            path=self.summary_file,
+            path=versioned_path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id="summary_file",
             depends_on=list(depends_on),
+            metadata={
+                "pointer_role": "current",
+                "current_version_artifact_id": versioned_record.artifact_id,
+                "summary_set_hash": summary_set_hash,
+            },
         )
         progress = Stage1ProgressSnapshot(
             artifact_type="stage1_progress_snapshot",
@@ -649,6 +692,7 @@ class InternalStageExecutorRegistry:
             provider=provider,
             provider_profile=profile,
             candidate_count=settings.outline_candidate_count(),
+            quality_gate=settings.outline_quality_gate(),
             review_intent=(
                 self.bridge.job_spec.metadata.get("review_intent")
                 if isinstance(self.bridge.job_spec.metadata.get("review_intent"), Mapping)
@@ -1118,11 +1162,8 @@ class AgentRuntimeBridge:
             artifact_registry=registry,
             settings=session.stage_host.settings,
             summaries=list(session.stage_host.summaries),
-            review_draft_record=registry.get("review_draft"),
-            citation_manifest_record=(
-                registry.get(session.stage_host.CITATION_MANIFEST_ARTIFACT_ID)
-                or registry.get("citation_manifest")
-            ),
+            review_draft_record=current_artifact_record(registry, "review_draft"),
+            citation_manifest_record=current_artifact_record(registry, "citation_manifest"),
             paper_artifact_records=paper_records,
             visual_artifact_records=visual_records,
             provider_factory=None,

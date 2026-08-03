@@ -206,7 +206,7 @@ def _build_prompts(packet: AdjudicationPacket) -> tuple[str, str]:
 
 
 def run_adjudication_stage(
-    generator_instance: Any,
+    service: Any,
     api_config: Optional[APIConfig],
     packet: AdjudicationPacket,
 ) -> Optional[Dict[str, Any]]:
@@ -235,7 +235,7 @@ def run_adjudication_stage(
         packet_payload = dict(getattr(packet, "__dict__", {}) or {})
 
     provider_runtime: Optional[ProviderRuntime] = None
-    runtime_factory: Any = getattr(generator_instance, "new_provider_runtime", None)
+    runtime_factory: Any = getattr(service, "new_provider_runtime", None)
     if callable(runtime_factory):
         packet_hash = hashlib.sha256(
             json.dumps(
@@ -258,7 +258,7 @@ def run_adjudication_stage(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "response_format": "json",
-        "logger": getattr(generator_instance, "logger", None),
+        "logger": getattr(service, "logger", None),
     }
     request_payload: Dict[str, Any] = {
         "system": system_prompt,
@@ -270,7 +270,7 @@ def run_adjudication_stage(
     }
     if provider_runtime is not None:
         call_kwargs["provider_runtime"] = provider_runtime
-        bind_call = getattr(generator_instance, "bind_provider_call", None)
+        bind_call = getattr(service, "bind_provider_call", None)
         if callable(bind_call):
             bind_call(
                 call_id=str(provider_runtime.call_id),
@@ -287,7 +287,7 @@ def run_adjudication_stage(
             **call_kwargs,
         )
     except Exception as exc:
-        logger = getattr(generator_instance, "logger", None)
+        logger = getattr(service, "logger", None)
         if logger:
             logger.warning(f"AI {packet.stage} adjudication failed: {exc}")
         return None
@@ -298,7 +298,27 @@ def run_adjudication_stage(
         # Real transports already append a receipt inside ai_interface and
         # therefore take the no-op branch above.
         try:
-            admission = provider_runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+            from runtime.provider_context import ProviderContextProfile
+
+            try:
+                context_limit = max(1, int(api_config.get("max_context_tokens") or 128_000))
+            except (TypeError, ValueError):
+                context_limit = 128_000
+            try:
+                output_limit = max(1, int(api_config.get("max_output_tokens") or max_tokens))
+            except (TypeError, ValueError):
+                output_limit = max_tokens
+            profile = ProviderContextProfile.conservative(
+                provider=str(api_config.get("provider_family") or "configured"),
+                model=str(api_config.get("model") or "validator"),
+                endpoint_type=str(api_config.get("endpoint_type") or "chat_completions"),
+                model_context_limit=context_limit,
+                max_output_tokens=output_limit,
+            )
+            estimate = profile.estimate_request(request_payload)
+            admission = provider_runtime.admit(
+                estimated_tokens=max(1, int(estimate["estimated_input_tokens"]))
+            )
             provider_runtime.complete(
                 admission=admission,
                 prompt=prompt,
@@ -323,7 +343,7 @@ def run_adjudication_stage(
 
     if not isinstance(report, dict):
         return None
-    bind_output = getattr(generator_instance, "bind_provider_output", None)
+    bind_output = getattr(service, "bind_provider_output", None)
     if provider_runtime is not None and callable(bind_output):
         bind_output(call_id=str(provider_runtime.call_id), content=report)
     report.setdefault("adjudication_stage", packet.stage)
