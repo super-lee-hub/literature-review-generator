@@ -27,7 +27,8 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from services.progress_state import Stage1ProgressSnapshot, write_stage1_progress_snapshot
 from services.queue_service import CancelToken
 from services.stage1_analysis_service import Stage1AnalysisService
 
@@ -230,13 +231,21 @@ class _RuntimeStageHost:
             artifact_id="summary_file",
             depends_on=list(depends_on),
         )
-        progress = {
-            "status": "complete",
-            "processed_count": len(self._checkpoint_processed_papers),
-            "failed_count": len(self._checkpoint_failed_papers),
-            "summary_file": self.summary_file,
-        }
-        atomic_write_json(self.progress_path, progress)
+        progress = Stage1ProgressSnapshot(
+            artifact_type="stage1_progress_snapshot",
+            artifact_version="v1",
+            created_from_job_id=registry.job_id,
+            created_at=utc_now_iso(),
+            project_name=self.project_name,
+            job_id=registry.job_id,
+            summary_file=self.summary_file,
+            summary_count=len(self.summaries),
+            processed_papers=sorted(self._checkpoint_processed_papers),
+            failed_papers=sorted(self._checkpoint_failed_papers),
+            fingerprint_bundle=dict(getattr(self, "fingerprint_bundle", {}) or {}),
+            checkpoint_file=self.checkpoint_path,
+        )
+        write_stage1_progress_snapshot(self.progress_path, progress)
         registry.register_file(
             artifact_role="progress",
             artifact_type="stage1_progress_snapshot",
@@ -269,6 +278,20 @@ class _RuntimeStageHost:
         workspace, _registry = self._require_workspace()
         return workspace.artifact_path("citation_manifest_v3.json")
 
+    def _citation_ref_catalog_path(self) -> str:
+        workspace, _registry = self._require_workspace()
+        return workspace.artifact_path("citation_ref_catalog.json")
+
+    def _load_citation_ref_catalog(self) -> dict[str, Any]:
+        path = Path(self._citation_ref_catalog_path())
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return {}
+        return dict(payload) if isinstance(payload, Mapping) else {}
+
     def _get_review_word_file_path(self) -> str:
         workspace, _registry = self._require_workspace()
         return workspace.artifact_path(f"{self.project_name}_literature_review.docx")
@@ -284,6 +307,9 @@ class _RuntimeStageHost:
         references: Sequence[str],
         word_file: str,
         generation_mode: str,
+        citation_ref_catalog: Mapping[str, Any] | None = None,
+        citation_ref_catalog_path: str = "",
+        citation_ref_catalog_hash: str = "",
     ) -> bool:
         from services.review_draft import build_review_draft
 
@@ -299,9 +325,26 @@ class _RuntimeStageHost:
             sections=review_sections,
             references=references,
             generation_mode=generation_mode,
+            paper_summaries=list(self.summaries),
+            citation_ref_catalog=citation_ref_catalog,
+            citation_ref_catalog_path=citation_ref_catalog_path,
+            citation_ref_catalog_hash=citation_ref_catalog_hash,
         )
         path = self._review_draft_path()
         atomic_write_json(path, draft.to_dict())
+        dependencies: list[ArtifactDependencyRefV2] = []
+        catalog_record = registry.get("citation_ref_catalog")
+        if catalog_record is not None and catalog_record.status == "ready":
+            dependencies.append(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=catalog_record.job_id,
+                    artifact_id=catalog_record.artifact_id,
+                    artifact_type=catalog_record.artifact_type,
+                    path=catalog_record.path,
+                    content_hash=catalog_record.content_hash,
+                )
+            )
         registry.register_file(
             artifact_role=self.REVIEW_DRAFT_ARTIFACT_ROLE,
             artifact_type=self.REVIEW_DRAFT_ARTIFACT_TYPE,
@@ -309,14 +352,26 @@ class _RuntimeStageHost:
             path=path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id="review_draft",
+            depends_on=dependencies,
         )
         return True
 
-    def _persist_citation_manifest(self, *, review_draft_path: str, review_word_path: str) -> bool:
+    def _persist_citation_manifest(
+        self,
+        *,
+        review_draft_path: str,
+        review_word_path: str,
+        citation_ref_catalog: Mapping[str, Any] | None = None,
+        citation_ref_catalog_path: str = "",
+        citation_ref_catalog_hash: str = "",
+    ) -> bool:
         from services.citation_manifest import build_citation_manifest_from_review_draft
 
         _workspace, registry = self._require_workspace()
         review_draft = json.loads(Path(review_draft_path).read_text(encoding="utf-8"))
+        catalog = dict(citation_ref_catalog or self._load_citation_ref_catalog())
+        catalog_path = citation_ref_catalog_path or self._citation_ref_catalog_path()
+        catalog_hash = citation_ref_catalog_hash or str(catalog.get("catalog_hash") or "")
         manifest = build_citation_manifest_from_review_draft(
             job_id=registry.job_id,
             project_name=self.project_name,
@@ -325,6 +380,9 @@ class _RuntimeStageHost:
             review_word_path=review_word_path,
             review_draft=review_draft,
             paper_summaries=list(self.summaries),
+            citation_ref_catalog=catalog or None,
+            citation_ref_catalog_path=catalog_path,
+            citation_ref_catalog_hash=catalog_hash,
         )
         path = self._citation_manifest_path()
         atomic_write_json(path, manifest.to_dict())
@@ -335,6 +393,33 @@ class _RuntimeStageHost:
             path=path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id=self.CITATION_MANIFEST_ARTIFACT_ID,
+            depends_on=[
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=registry.job_id,
+                    artifact_id="review_draft",
+                    artifact_type="review_draft",
+                    path=review_draft_path,
+                    content_hash=registry.get("review_draft").content_hash
+                    if registry.get("review_draft") is not None
+                    else "",
+                ),
+                *(
+                    [
+                        ArtifactDependencyRefV2(
+                            dependency_kind="local_job",
+                            job_id=catalog_record.job_id,
+                            artifact_id=catalog_record.artifact_id,
+                            artifact_type=catalog_record.artifact_type,
+                            path=catalog_record.path,
+                            content_hash=catalog_record.content_hash,
+                        )
+                    ]
+                    if (catalog_record := registry.get("citation_ref_catalog")) is not None
+                    and catalog_record.status == "ready"
+                    else []
+                ),
+            ],
         )
         return True
 
@@ -397,8 +482,11 @@ class InternalStageExecutorRegistry:
             *session.request.summary_sources,
             *session.request.reuse_summary_files,
         ):
-            if str(value).strip():
-                paths.append(str(value))
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                paths.append(text)
         for stage_result in results.values():
             for artifact in stage_result.artifacts:
                 if artifact.artifact_type == "summary_file" and artifact.path:
@@ -556,7 +644,8 @@ class InternalStageExecutorRegistry:
             self.bridge.job_spec.metadata.get("outline_fixture_mode", False)
         )
         provider = None if fixture_mode else self._outline_provider(session, profile, api_config)
-        adopted = bool(self.bridge.job_spec.metadata.get("adopt_outline", True))
+        adopt_value = self.bridge.job_spec.metadata.get("adopt_outline")
+        adopted = bool(adopt_value) if "adopt_outline" in self.bridge.job_spec.metadata else False
         executor = OutlineV3Executor(
             job_id=session.context.workspace.job_id,
             summaries=summaries,
@@ -619,11 +708,21 @@ class InternalStageExecutorRegistry:
         *,
         session: AgentRuntimeSession,
         results: Mapping[str, StageResult],
+        attempt_id: str,
     ) -> tuple[StageResult, int]:
-        del results
+        summaries = self._load_summary_payloads(session, results)
+        if not summaries:
+            raise RuntimeError("stage3 requires canonical Stage 1 summaries")
         final_record = session.context.registry.get("outline-v3:final_outline")
         if final_record is None or final_record.status != "ready":
             raise RuntimeError("stage3 requires a ready Outline v3 final outline")
+        # Writer v3 may consume only the explicit adoption artifact.  The
+        # setting remains part of the configuration surface for compatibility,
+        # but a current Outline v3 review can never implicitly promote a
+        # ready-for-adoption outline.
+        adoption_record = session.context.registry.get("outline-v3:adoption")
+        if adoption_record is None or adoption_record.status != "ready":
+            raise RuntimeError("stage3 requires an explicitly adopted Outline v3 final outline")
         try:
             envelope = json.loads(Path(final_record.path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -631,40 +730,45 @@ class InternalStageExecutorRegistry:
         payload = envelope.get("payload") if isinstance(envelope, Mapping) else None
         if not isinstance(payload, Mapping):
             raise RuntimeError("stage3 final outline payload is missing")
-        review_sections: list[dict[str, Any]] = []
-        for index, raw_section in enumerate(payload.get("sections") or (), start=1):
-            if not isinstance(raw_section, Mapping):
-                continue
-            raw_claims = raw_section.get("claims")
-            claim_values = raw_claims if isinstance(raw_claims, (list, tuple)) else ()
-            claims = [
-                str(claim).strip()
-                for claim in claim_values
-                if str(claim).strip()
-            ]
-            content = "\n\n".join(claims) or str(raw_section.get("goal") or "").strip()
-            if not content:
-                continue
-            review_sections.append(
-                {
-                    "section_number": index,
-                    "section_title": str(
-                        raw_section.get("title") or raw_section.get("section_id") or f"Section {index}"
-                    ).strip(),
-                    "content": content,
-                }
-            )
-        if not review_sections:
-            raise RuntimeError("stage3 final outline contains no reviewable sections")
+        packet_record = session.context.registry.get("outline-v3:section_evidence_packets")
+        if packet_record is None or packet_record.status != "ready":
+            raise RuntimeError("stage3 requires a ready section evidence packet set")
+        try:
+            packet_envelope = json.loads(Path(packet_record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("stage3 section evidence packets cannot be loaded") from exc
+        packet_payload = packet_envelope.get("payload") if isinstance(packet_envelope, Mapping) else None
+        packets = packet_payload.get("packets") if isinstance(packet_payload, Mapping) else None
+        if not isinstance(packets, list):
+            raise RuntimeError("stage3 section evidence packet payload is missing")
+        from services.review_generation_service import ReviewGenerationService
+
+        session.stage_host.summaries = list(summaries)
+        generation = ReviewGenerationService(
+            job_id=session.context.workspace.job_id,
+            attempt_id=attempt_id,
+            workspace=session.context.workspace,
+            artifact_registry=session.context.registry,
+            settings=session.context.settings,
+            summaries=summaries,
+            cancellation_checker=session.stage_host.check_cancelled,
+            logger=session.stage_host.logger,
+        ).run(
+            outline_payload=payload,
+            evidence_packets=[dict(item) for item in packets if isinstance(item, Mapping)],
+        )
         return (
             self.bridge.persist_review_chain(
                 session,
                 outline_file=final_record.path,
-                review_sections=review_sections,
+                review_sections=[dict(item) for item in generation.sections],
                 references=[],
                 generation_mode="outline_v3",
+                citation_ref_catalog=generation.citation_ref_catalog,
+                citation_ref_catalog_path=generation.citation_ref_catalog_path,
+                citation_ref_catalog_hash=generation.citation_ref_catalog.get("catalog_hash", ""),
             ),
-            0,
+            len(generation.receipt_ids),
         )
 
     def execute(
@@ -687,7 +791,11 @@ class InternalStageExecutorRegistry:
                 attempt_id=attempt_id,
             ),
             "outline": lambda: self._execute_outline(session=session, results=results),
-            "review": lambda: self._execute_review(session=session, results=results),
+            "review": lambda: self._execute_review(
+                session=session,
+                results=results,
+                attempt_id=attempt_id,
+            ),
             "validate": lambda: (self.bridge.run_validation(session), 0),
         }
         try:
@@ -1139,6 +1247,9 @@ class AgentRuntimeBridge:
         generation_mode: str = "full_review",
         rebuild_docx: bool = True,
         subagent_run_id: str | None = None,
+        citation_ref_catalog: Mapping[str, Any] | None = None,
+        citation_ref_catalog_path: str = "",
+        citation_ref_catalog_hash: str = "",
     ) -> StageResult:
         host = session.stage_host
         review_word_path = word_file or host._get_review_word_file_path()
@@ -1148,12 +1259,18 @@ class AgentRuntimeBridge:
             references=list(references or ()),
             word_file=review_word_path,
             generation_mode=generation_mode,
+            citation_ref_catalog=citation_ref_catalog,
+            citation_ref_catalog_path=citation_ref_catalog_path,
+            citation_ref_catalog_hash=citation_ref_catalog_hash,
         ):
             raise RuntimeError("current review draft persistence failed")
         draft_path = host._review_draft_path()
         if not host._persist_citation_manifest(
             review_draft_path=draft_path,
             review_word_path=review_word_path,
+            citation_ref_catalog=citation_ref_catalog,
+            citation_ref_catalog_path=citation_ref_catalog_path,
+            citation_ref_catalog_hash=citation_ref_catalog_hash,
         ):
             raise RuntimeError("current citation manifest persistence failed")
         manifest = host._load_citation_manifest()
@@ -1174,6 +1291,7 @@ class AgentRuntimeBridge:
         manifest_record = registry.get(host.CITATION_MANIFEST_ARTIFACT_ID)
         if draft_record is None or manifest_record is None:
             raise RuntimeError("review artifacts are not registered")
+        catalog_record = registry.get("citation_ref_catalog")
         docx_record = registry.register_file(
             artifact_role="review_docx",
             artifact_type="review_docx",
@@ -1219,11 +1337,14 @@ class AgentRuntimeBridge:
                 self._artifact_ref_from_record(draft_record),
                 self._artifact_ref_from_record(manifest_record),
                 self._artifact_ref_from_record(docx_record),
+                *([self._artifact_ref_from_record(catalog_record)] if catalog_record is not None else []),
             ],
             metadata={
                 "section_count": len(review_sections),
                 "reference_count": len(references or ()),
                 "word_file": review_word_path,
+                "citation_ref_catalog_hash": citation_ref_catalog_hash
+                or str((citation_ref_catalog or {}).get("catalog_hash") or ""),
             },
         )
 

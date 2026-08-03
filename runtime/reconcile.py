@@ -630,6 +630,24 @@ def _validate_json_object(_record: ArtifactRecord, path: Path) -> None:
     _read_json_object(path)
 
 
+def _validate_provider_receipt_ledger(record: ArtifactRecord, path: Path) -> None:
+    from runtime.provider_runtime import ProviderRuntimeContractError, ProviderRuntimeLedger
+
+    try:
+        receipts = ProviderRuntimeLedger(path).list_receipts()
+    except ProviderRuntimeContractError as exc:
+        raise ReconcileValidationError(f"provider receipt ledger is invalid: {exc}") from exc
+    if not receipts:
+        raise ReconcileValidationError("provider receipt ledger must contain at least one receipt")
+    for receipt in receipts:
+        if receipt.job_id != record.job_id:
+            raise ReconcileValidationError(
+                "provider receipt job_id does not match its Registry owner"
+            )
+        if not receipt.receipt_id or not receipt.stage_name or not receipt.route:
+            raise ReconcileValidationError("provider receipt is missing its durable routing identity")
+
+
 def _validate_json_array(_record: ArtifactRecord, path: Path) -> None:
     _read_json_array(path)
 
@@ -1410,7 +1428,7 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "review_draft": _validate_review_draft,
     "citation_manifest": _validate_citation_manifest,
     "citation_ref_catalog": _validate_citation_ref_catalog,
-    "provider_receipt_ledger": _validate_json_object,
+    "provider_receipt_ledger": _validate_provider_receipt_ledger,
     "stage1_canonical_summaries": _validate_json_object,
     "audit_record": _validate_audit_record,
     "validation_report_projection": _validate_nonempty_text,
