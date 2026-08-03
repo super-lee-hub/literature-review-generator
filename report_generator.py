@@ -152,7 +152,7 @@ def _canonical_paper_type(summary_like: Any) -> str:
     return str(get_routing(summary_like).get("paper_type") or "")
 
 
-def _flatten_type_specific_details(summary_like: Any) -> Dict[str, str]:
+def _flatten_specialized_details(summary_like: Any) -> Dict[str, str]:
     routing = get_routing(summary_like)
     core = get_core_analysis(summary_like)
     specialized = get_specialized_details(summary_like)

@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from services.artifact_registry import ArtifactRecord, ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 from validation.closure import ValidationClosureResult, ValidationClosureService
 from validation.repair_apply import run_repair_apply
@@ -30,7 +30,9 @@ from validation.repair_models import (
     RepairPlan,
     RepairPolicy,
     RepairRootCause,
+    NOT_APPLICABLE,
 )
+from validation.semantic_revalidation import run_semantic_revalidation
 
 
 REPAIR_TRANSACTION_ARTIFACT_TYPE = "repair_transaction"
@@ -374,17 +376,25 @@ class RepairTransactionService:
         primary_paper = paper_payloads[0] if paper_payloads else {}
         visual_payload = load(visual_record)
         return DependencyHashBundle(
-            summary_hash=_hash(aggregate_summary) if aggregate_summary else "",
-            paper_artifact_hash=_hash(paper_payloads) if paper_payloads else "",
-            visual_manifest_hash=_hash(visual_payload) if visual_record is not None else "",
+            summary_hash=_hash(aggregate_summary) if aggregate_summary else NOT_APPLICABLE,
+            paper_artifact_hash=_hash(paper_payloads) if paper_payloads else NOT_APPLICABLE,
+            visual_manifest_hash=_hash(visual_payload) if visual_record is not None else NOT_APPLICABLE,
             selected_visual_refs_hash=_hash(
                 primary_paper.get("stage1_inputs", {}).get("selected_visual_refs", [])
                 if isinstance(primary_paper.get("stage1_inputs"), Mapping)
                 else []
-            ) if primary_paper else "",
-            review_draft_hash=str(draft.get("content_hash") or "") if isinstance(draft, Mapping) else "",
-            citation_manifest_hash=str(manifest.get("content_hash") or "") if isinstance(manifest, Mapping) else "",
-            outline_hash=outline_record.content_hash if outline_record is not None else "",
+            ) if primary_paper else NOT_APPLICABLE,
+            review_draft_hash=(
+                str(draft.get("content_hash") or "").strip() or NOT_APPLICABLE
+                if isinstance(draft, Mapping)
+                else NOT_APPLICABLE
+            ),
+            citation_manifest_hash=(
+                str(manifest.get("content_hash") or "").strip() or NOT_APPLICABLE
+                if isinstance(manifest, Mapping)
+                else NOT_APPLICABLE
+            ),
+            outline_hash=outline_record.content_hash if outline_record is not None else NOT_APPLICABLE,
         )
 
     def _dependency_records(self) -> list[ArtifactRecord]:
@@ -512,18 +522,11 @@ class RepairTransactionService:
             )
         )
         atomic_write_json(str(path), plan.to_dict())
-        dependencies: list[dict[str, Any]] = []
+        dependencies: list[ArtifactDependencyRefV2] = []
         previous_records = self._dependency_records()
         for record in previous_records:
             if record.status == "ready":
-                dependencies.append(
-                    {
-                        "artifact_id": record.artifact_id,
-                        "artifact_type": record.artifact_type,
-                        "path": record.path,
-                        "content_hash": record.content_hash,
-                    }
-                )
+                dependencies.append(ArtifactDependencyRefV2.from_record(record))
         record = self.registry.register_file(
             artifact_id=f"repair_plan:{plan.plan_id}",
             artifact_role="repair_plan",
@@ -571,12 +574,7 @@ class RepairTransactionService:
             path=transaction_path,
             producer="validation.repair_transaction.RepairTransactionService",
             depends_on=[
-                {
-                    "artifact_id": record.artifact_id,
-                    "artifact_type": record.artifact_type,
-                    "path": record.path,
-                    "content_hash": record.content_hash,
-                },
+                ArtifactDependencyRefV2.from_record(record),
                 *dependencies,
             ],
             metadata={"status": transaction.status, "policy": transaction.policy},
@@ -715,7 +713,24 @@ class RepairTransactionService:
                 "targeted_revalidation": targeted_revalidation,
                 "mutation_performed": False,
             }
+        semantic_revalidation = run_semantic_revalidation(
+            patched_draft,
+            patched_manifest,
+            paper_artifacts,
+            citation_ref_catalog=citation_ref_catalog,
+        )
+        if not semantic_revalidation.passed:
+            return {
+                "status": "blocked",
+                "reason": "semantic revalidation failed; derived repair artifacts were not persisted",
+                "plan_id": plan_id,
+                "apply_result": apply_result,
+                "targeted_revalidation": targeted_revalidation,
+                "semantic_revalidation": semantic_revalidation.to_dict(),
+                "mutation_performed": False,
+            }
         apply_payload["targeted_revalidation"] = targeted_revalidation
+        apply_payload["semantic_revalidation"] = semantic_revalidation.to_dict()
         derived_draft_path = tx_dir / "review_draft_repaired.json"
         derived_manifest_path = tx_dir / "citation_manifest_repaired.json"
         apply_result_path = tx_dir / "repair_apply_result.json"
@@ -728,12 +743,7 @@ class RepairTransactionService:
             if item is not None
         ]
         dependency_payloads = [
-            {
-                "artifact_id": item.artifact_id,
-                "artifact_type": item.artifact_type,
-                "path": item.path,
-                "content_hash": item.content_hash,
-            }
+            ArtifactDependencyRefV2.from_record(item)
             for item in base_dependencies
         ]
         derived_draft_record = self.registry.register_file(
@@ -745,7 +755,11 @@ class RepairTransactionService:
             producer="validation.repair_transaction.RepairTransactionService",
             status="quarantined",
             depends_on=dependency_payloads,
-            metadata={"transaction_id": transaction_id, "canonical_replacement": False},
+            metadata={
+                "transaction_id": transaction_id,
+                "canonical_replacement": False,
+                "semantic_revalidation": semantic_revalidation.to_dict(),
+            },
         )
         derived_manifest_record = self.registry.register_file(
             artifact_id=f"citation_manifest_repaired:{transaction_id}",
@@ -756,7 +770,11 @@ class RepairTransactionService:
             producer="validation.repair_transaction.RepairTransactionService",
             status="quarantined",
             depends_on=dependency_payloads,
-            metadata={"transaction_id": transaction_id, "canonical_replacement": False},
+            metadata={
+                "transaction_id": transaction_id,
+                "canonical_replacement": False,
+                "semantic_revalidation": semantic_revalidation.to_dict(),
+            },
         )
         apply_record = self.registry.register_file(
             artifact_id=f"repair_apply_result:{transaction_id}",
@@ -768,20 +786,14 @@ class RepairTransactionService:
             status="quarantined",
             depends_on=[
                 *dependency_payloads,
-                {
-                    "artifact_id": derived_draft_record.artifact_id,
-                    "artifact_type": derived_draft_record.artifact_type,
-                    "path": derived_draft_record.path,
-                    "content_hash": derived_draft_record.content_hash,
-                },
-                {
-                    "artifact_id": derived_manifest_record.artifact_id,
-                    "artifact_type": derived_manifest_record.artifact_type,
-                    "path": derived_manifest_record.path,
-                    "content_hash": derived_manifest_record.content_hash,
-                },
+                ArtifactDependencyRefV2.from_record(derived_draft_record),
+                ArtifactDependencyRefV2.from_record(derived_manifest_record),
             ],
-            metadata={"transaction_id": transaction_id, "canonical_replacement": False},
+            metadata={
+                "transaction_id": transaction_id,
+                "canonical_replacement": False,
+                "semantic_revalidation": semantic_revalidation.to_dict(),
+            },
         )
         previous_records = self._dependency_records()
         transaction = RepairTransactionRecord(
@@ -810,14 +822,13 @@ class RepairTransactionService:
             status="quarantined",
             depends_on=[
                 *dependency_payloads,
-                {
-                    "artifact_id": apply_record.artifact_id,
-                    "artifact_type": apply_record.artifact_type,
-                    "path": apply_record.path,
-                    "content_hash": apply_record.content_hash,
-                },
+                ArtifactDependencyRefV2.from_record(apply_record),
             ],
-            metadata={"status": transaction.status, "canonical_replacement": False},
+            metadata={
+                "status": transaction.status,
+                "canonical_replacement": False,
+                "semantic_revalidation": semantic_revalidation.to_dict(),
+            },
         )
         return {
             "status": "quarantined",

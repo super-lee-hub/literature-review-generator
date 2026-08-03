@@ -180,10 +180,10 @@ def test_current_outline_dag_hash_and_resume_closure_are_deterministic() -> None
 
     assert plan.rerun_node_ids == sorted(plan.rerun_node_ids)
     assert plan.rerun_node_ids == [
-        "adoption",
         "arbitration",
         "coverage_audit",
         "final_outline",
+        "provider_receipt_closure",
         "section_evidence_packets",
         "selected_candidate",
         "stability_audit",

@@ -15,13 +15,12 @@ from runtime.reconcile import ReconcileValidationError, validate_canonical_ai_su
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_entry, stage_policy_for
-from runtime.validation_adapter import RuntimeValidationAdapter
+from validation.execution_service import ValidationExecutionService
 from outline.v3_executor import OutlineV3Executor
 from services.model_capabilities import resolve_model_capability
 from services.model_selection import get_outline_api_config
 from services.settings import ApplicationSettings
 from services.artifact_registry import (
-    ArtifactDependencyRef,
     ArtifactDependencyRefV2,
     ArtifactRecord,
     file_sha256,
@@ -196,7 +195,7 @@ class _RuntimeStageHost:
                     content_hash=record.content_hash,
                 )
             )
-        provider_record = registry.get("provider_receipts")
+        provider_record = registry.get("stage1_provider_receipts")
         if provider_record is not None and provider_record.status == "ready":
             dependencies.append(
                 ArtifactDependencyRefV2(
@@ -630,7 +629,7 @@ class InternalStageExecutorRegistry:
         capability = resolve_model_capability(api_config)
         model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(
-            api_config.get("max_output_tokens") or api_config.get("max_tokens"),
+            api_config.get("max_output_tokens"),
             4_096,
         )
         profile = ProviderContextProfile.conservative(
@@ -640,12 +639,7 @@ class InternalStageExecutorRegistry:
             model_context_limit=model_context_limit,
             max_output_tokens=max_output_tokens,
         )
-        fixture_mode = settings.outline_test_dev_fixture_mode() or bool(
-            self.bridge.job_spec.metadata.get("outline_fixture_mode", False)
-        )
-        provider = None if fixture_mode else self._outline_provider(session, profile, api_config)
-        adopt_value = self.bridge.job_spec.metadata.get("adopt_outline")
-        adopted = bool(adopt_value) if "adopt_outline" in self.bridge.job_spec.metadata else False
+        provider = self._outline_provider(session, profile, api_config)
         executor = OutlineV3Executor(
             job_id=session.context.workspace.job_id,
             summaries=summaries,
@@ -659,8 +653,6 @@ class InternalStageExecutorRegistry:
                 if isinstance(self.bridge.job_spec.metadata.get("review_intent"), Mapping)
                 else None
             ),
-            adopt=adopted,
-            adopted_by=str(self.bridge.job_spec.metadata.get("adopted_by") or "runtime"),
             cancellation_checker=session.stage_host.check_cancelled,
         )
         execution = executor.run()
@@ -679,7 +671,7 @@ class InternalStageExecutorRegistry:
         if not isinstance(final_payload, Mapping):
             raise RuntimeError("Outline v3 final outline payload is missing")
         artifact_refs: list[StageArtifactRef] = []
-        for node_id in ("adoption", "final_outline", "coverage_audit", "stability_audit", "stage_health"):
+        for node_id in ("final_outline", "coverage_audit", "stability_audit", "provider_receipt_closure", "stage_health"):
             record = session.context.registry.get(f"outline-v3:{node_id}")
             if record is not None and record.status == "ready":
                 artifact_refs.append(self.bridge._artifact_ref_from_record(record))
@@ -693,7 +685,6 @@ class InternalStageExecutorRegistry:
                 metadata={
                     "outline_mode": "v3",
                     "outline_v3_status": execution.status,
-                    "adopted": execution.adopted,
                     "node_ids": list(execution.node_ids),
                     "receipt_ids": list(execution.receipt_ids),
                     "artifact_paths": dict(execution.artifacts),
@@ -723,6 +714,35 @@ class InternalStageExecutorRegistry:
         adoption_record = session.context.registry.get("outline-v3:adoption")
         if adoption_record is None or adoption_record.status != "ready":
             raise RuntimeError("stage3 requires an explicitly adopted Outline v3 final outline")
+        try:
+            adoption_envelope = json.loads(Path(adoption_record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("stage3 adoption transaction cannot be loaded") from exc
+        adoption_payload = adoption_envelope.get("payload") if isinstance(adoption_envelope, Mapping) else None
+        if not isinstance(adoption_payload, Mapping):
+            raise RuntimeError("stage3 adoption transaction payload is missing")
+        gate_ids = {
+            "coverage_audit_hash": "outline-v3:coverage_audit",
+            "stability_audit_hash": "outline-v3:stability_audit",
+            "provider_receipt_closure_hash": "outline-v3:provider_receipt_closure",
+            "stage_health_hash": "outline-v3:stage_health",
+        }
+        if str(adoption_payload.get("final_outline_hash") or "") != final_record.content_hash:
+            raise RuntimeError("stage3 adoption transaction is bound to a different final outline")
+        for field_name, artifact_id in gate_ids.items():
+            record = session.context.registry.get(artifact_id)
+            if record is None or record.status != "ready" or str(adoption_payload.get(field_name) or "") != record.content_hash:
+                raise RuntimeError(f"stage3 adoption transaction does not bind current {artifact_id}")
+        closure_record = session.context.registry.get("outline-v3:provider_receipt_closure")
+        if closure_record is None or closure_record.status != "ready":
+            raise RuntimeError("stage3 requires a ready provider receipt closure")
+        try:
+            closure_envelope = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("stage3 provider receipt closure cannot be loaded") from exc
+        closure_payload = closure_envelope.get("payload") if isinstance(closure_envelope, Mapping) else None
+        if not isinstance(closure_payload, Mapping) or not bool(closure_payload.get("complete")):
+            raise RuntimeError("stage3 requires a complete provider receipt closure")
         try:
             envelope = json.loads(Path(final_record.path).read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -757,8 +777,7 @@ class InternalStageExecutorRegistry:
             outline_payload=payload,
             evidence_packets=[dict(item) for item in packets if isinstance(item, Mapping)],
         )
-        return (
-            self.bridge.persist_review_chain(
+        review_stage = self.bridge.persist_review_chain(
                 session,
                 outline_file=final_record.path,
                 review_sections=[dict(item) for item in generation.sections],
@@ -767,9 +786,17 @@ class InternalStageExecutorRegistry:
                 citation_ref_catalog=generation.citation_ref_catalog,
                 citation_ref_catalog_path=generation.citation_ref_catalog_path,
                 citation_ref_catalog_hash=generation.citation_ref_catalog.get("catalog_hash", ""),
-            ),
-            len(generation.receipt_ids),
-        )
+            )
+        closure_record = session.context.registry.get("review:provider_receipt_closure")
+        if closure_record is not None and closure_record.status == "ready":
+            review_stage = replace(
+                review_stage,
+                artifacts=[
+                    *review_stage.artifacts,
+                    self.bridge._artifact_ref_from_record(closure_record),
+                ],
+            )
+        return review_stage, len(generation.receipt_ids)
 
     def execute(
         self,
@@ -798,10 +825,10 @@ class InternalStageExecutorRegistry:
             ),
             "validate": lambda: (self.bridge.run_validation(session), 0),
         }
-        try:
-            return executors[stage]()
-        except KeyError as exc:
-            raise RuntimeError(f"unsupported runtime stage: {stage}") from exc
+        executor = executors.get(stage)
+        if executor is None:
+            raise RuntimeError(f"unsupported runtime stage: {stage}")
+        return executor()
 
 
 class AgentRuntimeBridge:
@@ -956,6 +983,9 @@ class AgentRuntimeBridge:
 
         generator_config = dict(stage_host.config)
         output_base_dir = generator_config.get("Paths", {}).get("output_path", "./output")
+        if self.job_spec.workspace_path:
+            planned_workspace = Path(self.job_spec.workspace_path).expanduser().resolve()
+            output_base_dir = str(planned_workspace.parent)
         resolved_project_name = runner._resolve_project_name_from_existing_workspaces(
             base_output_dir=output_base_dir,
             requested_project_name=project_name,
@@ -1058,14 +1088,14 @@ class AgentRuntimeBridge:
         )
         return self._artifact_ref_from_record(record)
 
-    def build_validation_adapter(
+    def build_validation_service(
         self,
         session: AgentRuntimeSession,
         *,
         attempt_id: str = "",
         external_registry_resolver: Any | None = None,
-    ) -> RuntimeValidationAdapter:
-        return RuntimeValidationAdapter(
+    ) -> ValidationExecutionService:
+        return ValidationExecutionService(
             session.stage_host,
             validation_attempt_id=attempt_id,
             validation_external_registry_resolver=external_registry_resolver,
@@ -1097,7 +1127,7 @@ class AgentRuntimeBridge:
         if source_bundle_record is None or source_bundle_record.status != "ready":
             raise RuntimeError("stage1 source bundle is not registered and ready")
         source_dependencies = [
-            ArtifactDependencyRef(
+            ArtifactDependencyRefV2(
                 dependency_kind="local_job",
                 job_id=source_bundle_record.job_id,
                 artifact_id=source_bundle_record.artifact_id,
@@ -1106,10 +1136,10 @@ class AgentRuntimeBridge:
                 content_hash=source_bundle_record.content_hash,
             )
         ]
-        provider_record = session.context.registry.get("provider_receipts")
+        provider_record = session.context.registry.get("stage1_provider_receipts")
         if provider_record is not None and provider_record.status == "ready":
             source_dependencies.append(
-                ArtifactDependencyRef(
+                ArtifactDependencyRefV2(
                     dependency_kind="local_job",
                     job_id=provider_record.job_id,
                     artifact_id=provider_record.artifact_id,
@@ -1139,11 +1169,15 @@ class AgentRuntimeBridge:
         atomic_write_json(
             manifest_path,
             {
-                "schema_version": "summary_source_manifest_v2",
+                "artifact_type": "summary_source_manifest",
+                "artifact_version": "v2",
+                "created_at": utc_now_iso(),
+                "project_name": host.project_name,
                 "source_kind": source_kind,
-                "summary_file": host.summary_file,
+                "source_path": source_bundle_record.path,
                 "source_items": list(source_items or []),
                 "rejected_candidates": list(rejected_candidates or []),
+                "materialized_summary_file": host.summary_file,
                 "summary_count": len(normalized_summaries),
             },
         )
@@ -1358,12 +1392,26 @@ class AgentRuntimeBridge:
     ) -> StageResult:
         import validator as builtin_validator  # type: ignore
 
-        adapter = self.build_validation_adapter(
+        validation_service = self.build_validation_service(
             session,
             attempt_id=attempt_id,
             external_registry_resolver=external_registry_resolver,
         )
-        result = dict(builtin_validator.run_review_validation(adapter) or {})
+        try:
+            result = dict(builtin_validator.run_review_validation(validation_service) or {})
+        finally:
+            validation_provider_receipts = validation_service.finalize_provider_receipts()
+
+        validation_closure = validation_provider_receipts.get("closure")
+        validation_expected_call_ids = tuple(
+            str(item)
+            for item in validation_provider_receipts.get("expected_call_ids", ())
+            if str(item).strip()
+        )
+        validation_closure_complete = bool(
+            not validation_expected_call_ids
+            or getattr(validation_closure, "complete", False)
+        )
 
         from validation.run_result import ValidationExecutionStatus, ValidationRunResultV1
 
@@ -1461,6 +1509,10 @@ class AgentRuntimeBridge:
             dependency_error = str(exc)
 
         artifact_refs: list[StageArtifactRef] = []
+        for receipt_key in ("ledger", "closure_record"):
+            receipt_record = validation_provider_receipts.get(receipt_key)
+            if receipt_record is not None:
+                artifact_refs.append(self._artifact_ref_from_record(receipt_record))
         validation_contract_complete = bool(
             validation_run_result.contract_satisfied
             and not dependency_error
@@ -1468,6 +1520,7 @@ class AgentRuntimeBridge:
         validation_success = bool(
             validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED
             and validation_contract_complete
+            and validation_closure_complete
         )
         contract_failure = ""
         if validation_run_result.execution_status is ValidationExecutionStatus.SUCCEEDED:
@@ -1475,6 +1528,8 @@ class AgentRuntimeBridge:
                 contract_failure = "validation_input_dependencies_unverified"
             elif not validation_contract_complete:
                 contract_failure = "validation_contract_incomplete"
+            elif not validation_closure_complete:
+                contract_failure = "validation_provider_receipt_closure_incomplete"
         published_execution_status = validation_run_result.execution_status.value
         published_validation_disposition = validation_run_result.validation_disposition.value
         if contract_failure:
@@ -1574,6 +1629,8 @@ class AgentRuntimeBridge:
                             validation_run_result.validation_disposition.value
                         ),
                         "failure_reason": contract_failure,
+                        "provider_receipt_closure_complete": validation_closure_complete,
+                        "provider_receipt_expected_call_count": len(validation_expected_call_ids),
                     },
                 )
             ],
@@ -1597,6 +1654,11 @@ class AgentRuntimeBridge:
                 "canonical_artifact_id": canonical_record.artifact_id if canonical_record else "",
                 "canonical_content_hash": canonical_record.content_hash if canonical_record else "",
                 "failure_reason": contract_failure,
+                "provider_receipt_closure_complete": validation_closure_complete,
+                "provider_receipt_expected_call_count": len(validation_expected_call_ids),
+                "provider_receipt_closure_hash": (
+                    str(getattr(validation_closure, "closure_hash", "") or "")
+                ),
             },
         )
 

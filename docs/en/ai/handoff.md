@@ -56,7 +56,7 @@ Key notes: `summary_schema.py` is the canonical summary fact source; `services/j
 
 Recommended convention: secrets in `.env`, non-sensitive parameters in `config.ini`.
 
-Key config sections: `Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Retry_Settings`, `Stage2_Retry`, `Validation`, `Styling`, `GUI`, `API_Parameters`
+Key config sections: `Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Runtime`, `Validation`, `Styling`, `GUI`. Provider-owned output limits, context limits, timeouts, and transport retry ceilings live in the relevant provider section.
 
 Key environment variables: `LLM_PRIMARY_READER_API`, `LLM_BACKUP_READER_API`, `LLM_WRITER_API`, `LLM_OUTLINE_API`, `LLM_FREE_MODE_API`, `LLM_VALIDATOR_API`, `MINERU_*`
 

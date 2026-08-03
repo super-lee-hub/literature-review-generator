@@ -101,7 +101,7 @@ def test_current_review_writer_consumes_packet_and_emits_structured_citation(tmp
     assert block["citations"][0]["ref_id"] == "R001"
     assert result.citation_ref_catalog["entries"][0]["ref_id"] == "R001"
     assert registry.get("citation_ref_catalog") is not None
-    assert registry.get("provider_receipts") is not None
+    assert registry.get("review_provider_receipts") is not None
 
 
 def test_current_review_writer_rejects_unresolved_citation(tmp_path: Path) -> None:

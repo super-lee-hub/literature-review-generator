@@ -53,7 +53,20 @@ def _summaries(count: int = 61) -> list[dict]:
                 "source_paper_id": f"source-paper-{index:03d}",
             },
             "ai_summary": normalize_ai_summary(
-                normalize_ai_summary({"summary": f"Contribution {index:03d}"})
+                {
+                    "schema_version": "summary_v2_lite",
+                    "routing": {
+                        "paper_type": "empirical",
+                        "classification_status": "resolved",
+                        "route_confidence": "high",
+                    },
+                    "core_analysis": {
+                        "summary": f"Contribution {index:03d}",
+                        "methodology": "controlled study",
+                        "findings": f"Finding {index:03d}",
+                        "conclusions": f"Conclusion {index:03d}",
+                    },
+                }
             ),
         }
         for index in range(1, count + 1)
@@ -2432,7 +2445,20 @@ def test_batch_derivation_fails_closed_for_divergent_summary_paper_lineage(
     summaries = json.loads(parent.read_text(encoding="utf-8"))
     if divergence == "ai_summary":
         summaries[0]["ai_summary"] = normalize_ai_summary(
-            normalize_ai_summary({"summary": "Divergent but canonical analysis."})
+            {
+                "schema_version": "summary_v2_lite",
+                "routing": {
+                    "paper_type": "empirical",
+                    "classification_status": "resolved",
+                    "route_confidence": "high",
+                },
+                "core_analysis": {
+                    "summary": "Divergent but canonical analysis.",
+                    "methodology": "controlled study",
+                    "findings": "Divergent finding.",
+                    "conclusions": "Divergent conclusion.",
+                },
+            }
         )
     else:
         summaries[0]["paper_info"]["source_paper_id"] = "divergent-source-id"

@@ -74,6 +74,7 @@ class JobRunRequest:
     zotero_report: Optional[str] = None
     library_path: Optional[str] = None
     queue_file: str = "output/_queue/queue.json"
+    workspace_path: Optional[str] = None
     requested_stages: tuple[str, ...] | None = None
     validation_required: bool | None = None
     require_clean_validation: bool | None = None
@@ -165,6 +166,7 @@ def build_job_request_from_mapping(params: Mapping[str, Any]) -> JobRunRequest:
         zotero_report=cast(Optional[str], params.get("zotero_report")),
         library_path=cast(Optional[str], params.get("library_path")),
         queue_file=str(params.get("queue_file", "output/_queue/queue.json")),
+        workspace_path=cast(Optional[str], params.get("workspace_path")),
         requested_stages=tuple(str(item) for item in params.get("requested_stages", ()) or ()) or None,
         validation_required=params.get("validation_required"),
         require_clean_validation=params.get("require_clean_validation"),
@@ -432,6 +434,11 @@ class JobRunner:
             reuse_summary_files=tuple(str(Path(item).expanduser().resolve()) for item in request.reuse_summary_files),
             generate_section=request.generate_section,
             queue_file=str(Path(request.queue_file).expanduser().resolve()),
+            workspace_path=(
+                str(Path(request.workspace_path).expanduser().resolve())
+                if request.workspace_path
+                else ""
+            ),
             metadata=metadata,
         )
 

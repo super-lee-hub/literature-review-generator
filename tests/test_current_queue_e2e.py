@@ -99,3 +99,32 @@ def test_current_queue_runner_cooperatively_acknowledges_running_cancel(tmp_path
     assert service.acknowledge_cancel("job-a", worker="test-worker") is True
     assert service.update_job_state("job-a", QueueState.CANCELLED) is True
     assert service.get_job_runtime("job-a").state == QueueState.CANCELLED  # type: ignore[union-attr]
+
+
+def test_current_queue_persists_canonical_workspace_independent_of_cwd(tmp_path: Path, monkeypatch) -> None:
+    queue_file = tmp_path / "output" / "_queue" / "queue.json"
+    queue_file.parent.mkdir(parents=True)
+    service = PersistentQueueService(queue_file)
+    service.add_job(
+        QueueJobSpec(
+            job_id="job-paths",
+            job_type="analyze",
+            project_name="project",
+            parameters={"output_path": "reports"},
+        )
+    )
+
+    expected_root = (tmp_path / "output" / "reports").resolve()
+    expected_workspace = (expected_root / "project__job-paths").resolve()
+    persisted = json.loads(queue_file.read_text(encoding="utf-8"))
+    assert persisted["jobs"]["job-paths"]["canonical_output_root"] == str(expected_root)
+    assert persisted["jobs"]["job-paths"]["workspace_path"] == str(expected_workspace)
+
+    unrelated_cwd = tmp_path / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    restarted = PersistentQueueService(queue_file)
+    job = restarted.get_job("job-paths")
+    assert job is not None
+    assert job.canonical_output_root == str(expected_root)
+    assert job.workspace_path == str(expected_workspace)

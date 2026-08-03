@@ -28,14 +28,7 @@ def _ready_record(registry: ArtifactRegistry, artifact_id: str) -> ArtifactRecor
     if record is None or record.status != "ready":
         raise ValueError(f"required adoption artifact is not ready: {artifact_id}")
     registry.verify_ready_dependencies(
-        [
-            {
-                "artifact_id": record.artifact_id,
-                "artifact_type": record.artifact_type,
-                "path": record.path,
-                "content_hash": record.content_hash,
-            }
-        ]
+        [_dependency(record)]
     )
     return record
 
@@ -60,6 +53,8 @@ class AdoptionTransactionResult:
     adopted_path: str = ""
     audit_artifact_id: str = ""
     reason: str = ""
+    actor: str = ""
+    expected_hash: str = ""
     mutation_performed: bool = False
     read_only: bool = False
 
@@ -72,6 +67,8 @@ class AdoptionTransactionResult:
             "adopted_path": self.adopted_path,
             "audit_artifact_id": self.audit_artifact_id,
             "reason": self.reason,
+            "actor": self.actor,
+            "expected_hash": self.expected_hash,
             "mutation_performed": self.mutation_performed,
             "read_only": self.read_only,
         }
@@ -84,7 +81,14 @@ class OutlineAdoptionTransaction:
         self.workspace = workspace
         self.registry = registry
 
-    def adopt(self, *, source_artifact_id: str, adopted_by: str) -> AdoptionTransactionResult:
+    def adopt(
+        self,
+        *,
+        source_artifact_id: str,
+        actor: str,
+        reason: str,
+        expected_hash: str,
+    ) -> AdoptionTransactionResult:
         source = _ready_record(self.registry, source_artifact_id)
         if source.artifact_type != "final_outline" or source.artifact_version != "v3":
             return AdoptionTransactionResult(
@@ -93,12 +97,44 @@ class OutlineAdoptionTransaction:
                 source_artifact_id=source_artifact_id,
                 reason="adoption requires a registered current Outline final_outline",
             )
-        if not str(adopted_by or "").strip():
+        actor = str(actor or "").strip()
+        reason = str(reason or "").strip()
+        expected_hash = str(expected_hash or "").strip()
+        if not actor:
             return AdoptionTransactionResult(
                 status="blocked",
                 job_id=self.workspace.job_id,
                 source_artifact_id=source_artifact_id,
                 reason="adoption actor is required",
+                actor=actor,
+                expected_hash=expected_hash,
+            )
+        if not reason:
+            return AdoptionTransactionResult(
+                status="blocked",
+                job_id=self.workspace.job_id,
+                source_artifact_id=source_artifact_id,
+                reason="adoption reason is required",
+                actor=actor,
+                expected_hash=expected_hash,
+            )
+        if not expected_hash:
+            return AdoptionTransactionResult(
+                status="blocked",
+                job_id=self.workspace.job_id,
+                source_artifact_id=source_artifact_id,
+                reason="expected final-outline hash is required",
+                actor=actor,
+                expected_hash=expected_hash,
+            )
+        if expected_hash != source.content_hash:
+            return AdoptionTransactionResult(
+                status="blocked",
+                job_id=self.workspace.job_id,
+                source_artifact_id=source_artifact_id,
+                reason="expected final-outline hash does not match the current Registry record",
+                actor=actor,
+                expected_hash=expected_hash,
             )
 
         final_payload = _load_json(source).get("payload")
@@ -106,9 +142,11 @@ class OutlineAdoptionTransaction:
             raise ValueError("final outline payload is missing")
         coverage = _ready_record(self.registry, "outline-v3:coverage_audit")
         stability = _ready_record(self.registry, "outline-v3:stability_audit")
+        receipt_closure = _ready_record(self.registry, "outline-v3:provider_receipt_closure")
         health = _ready_record(self.registry, "outline-v3:stage_health")
         coverage_payload = _load_json(coverage).get("payload")
         stability_payload = _load_json(stability).get("payload")
+        receipt_closure_payload = _load_json(receipt_closure).get("payload")
         health_payload = _load_json(health).get("payload")
         if not isinstance(coverage_payload, Mapping) or not bool(coverage_payload.get("passed")):
             return AdoptionTransactionResult(
@@ -130,6 +168,35 @@ class OutlineAdoptionTransaction:
                 job_id=self.workspace.job_id,
                 source_artifact_id=source_artifact_id,
                 reason="outline stage health is not adoption eligible",
+                actor=actor,
+                expected_hash=expected_hash,
+            )
+        if not isinstance(receipt_closure_payload, Mapping) or not bool(receipt_closure_payload.get("complete")):
+            return AdoptionTransactionResult(
+                status="blocked",
+                job_id=self.workspace.job_id,
+                source_artifact_id=source_artifact_id,
+                reason="provider receipt closure is not complete",
+                actor=actor,
+                expected_hash=expected_hash,
+            )
+        expected_gate_hashes = {
+            "coverage_audit_hash": coverage.content_hash,
+            "stability_audit_hash": stability.content_hash,
+            "provider_receipt_closure_hash": receipt_closure.content_hash,
+        }
+        mismatched_gates = [
+            key for key, value in expected_gate_hashes.items()
+            if str(health_payload.get(key) or "") != value
+        ]
+        if mismatched_gates:
+            return AdoptionTransactionResult(
+                status="blocked",
+                job_id=self.workspace.job_id,
+                source_artifact_id=source_artifact_id,
+                reason="stage health does not bind the current gate hashes: " + ", ".join(mismatched_gates),
+                actor=actor,
+                expected_hash=expected_hash,
             )
 
         adopted_id = "outline-v3:adoption"
@@ -142,20 +209,25 @@ class OutlineAdoptionTransaction:
                 adopted_artifact_id=existing.artifact_id,
                 adopted_path=existing.path,
                 reason="the current outline is already adopted",
+                actor=actor,
+                expected_hash=expected_hash,
             )
 
-        dependency_records = (source, coverage, stability, health)
+        dependency_records = (source, coverage, stability, receipt_closure, health)
         dependency_hashes = {record.artifact_id: record.content_hash for record in dependency_records}
         adopted = AdoptedOutline(
             job_id=self.workspace.job_id,
             dependency_hashes=dependency_hashes,
             payload={
                 "status": "adopted",
-                "adopted_by": str(adopted_by).strip(),
+                "actor": actor,
+                "reason": reason,
+                "expected_hash": expected_hash,
                 "final_outline_hash": source.content_hash,
                 "coverage_audit_hash": coverage.content_hash,
                 "stability_audit_hash": stability.content_hash,
                 "stage_health_hash": health.content_hash,
+                "provider_receipt_closure_hash": receipt_closure.content_hash,
                 "final_outline": dict(final_payload),
             },
         )
@@ -169,7 +241,7 @@ class OutlineAdoptionTransaction:
             path=adopted_path,
             producer="outline.adoption_transaction.OutlineAdoptionTransaction",
             depends_on=[_dependency(record) for record in dependency_records],
-            metadata={"adopted_by": str(adopted_by).strip()},
+            metadata={"actor": actor, "reason": reason, "expected_hash": expected_hash},
         )
 
         refs = [
@@ -186,8 +258,8 @@ class OutlineAdoptionTransaction:
             job_id=self.workspace.job_id,
             attempt_id=f"outline-adoption:{source.content_hash[:16]}",
             producer="outline.adoption_transaction.OutlineAdoptionTransaction",
-            actor=str(adopted_by).strip(),
-            reason="explicit adoption after current Outline gates",
+            actor=actor,
+            reason=reason,
             scope={"operation": "explicit_adoption", "source_artifact_id": source_artifact_id},
             target_artifacts=refs,
             input_artifact_refs=refs,
@@ -204,6 +276,7 @@ class OutlineAdoptionTransaction:
                 "require_stage_health": True,
                 "require_coverage_audit": True,
                 "require_stability_audit": True,
+                "require_provider_receipt_closure": True,
                 "require_current_outline": True,
             },
             disposition="adopted",
@@ -227,7 +300,9 @@ class OutlineAdoptionTransaction:
             adopted_artifact_id=adopted_record.artifact_id,
             adopted_path=adopted_record.path,
             audit_artifact_id=audit_record.artifact_id,
-            reason="current Outline output adopted",
+            reason=reason,
+            actor=actor,
+            expected_hash=expected_hash,
             mutation_performed=True,
         )
 

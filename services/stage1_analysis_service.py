@@ -28,7 +28,8 @@ from runtime.provider_runtime import (
 )
 from runtime.stage_contracts import PaperWorkItem, SourceBundle
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
-from services.job_workspace import JobWorkspace
+from services.evidence_manifest import build_evidence_manifest_v1
+from services.job_workspace import JobWorkspace, atomic_write_json
 from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
@@ -83,7 +84,7 @@ class Stage1AnalysisService:
         self.reader = reader
         self.logger = logger or logging.getLogger("auto_generate.stage1")
         self.receipt_ledger = ProviderRuntimeLedger(
-            self.workspace.artifact_path("provider_receipts.jsonl")
+            self.workspace.artifact_path("stage1_provider_receipts.jsonl")
         )
 
     def run(
@@ -119,6 +120,8 @@ class Stage1AnalysisService:
 
             summary, receipt_ids = self._generate_one(item)
             summaries.append(summary)
+            preprocess = summary.get("preprocess") if isinstance(summary, Mapping) else None
+            preprocess = preprocess if isinstance(preprocess, Mapping) else {}
             source_items.append(
                 {
                     "canonical_paper_key": paper_key,
@@ -126,6 +129,8 @@ class Stage1AnalysisService:
                     "source_pdf": item.source_pdf,
                     "disposition": "provider_generated",
                     "provider_receipt_ids": list(receipt_ids),
+                    "evidence_manifest_path": str(preprocess.get("evidence_manifest_path") or ""),
+                    "evidence_manifest_hash": str(preprocess.get("evidence_manifest_hash") or ""),
                 }
             )
             generated_count += 1
@@ -152,6 +157,26 @@ class Stage1AnalysisService:
 
         preprocess = self._preprocess(source_pdf)
         preprocess_metadata = self._preprocess_metadata(preprocess)
+        evidence_manifest = build_evidence_manifest_v1(
+            job_id=self.job_id,
+            canonical_paper_key=item.canonical_paper_key,
+            preprocess=preprocess_metadata,
+        )
+        evidence_manifest_path = self.workspace.artifact_path(
+            "evidence_manifests/"
+            f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
+        )
+        atomic_write_json(evidence_manifest_path, evidence_manifest.to_dict())
+        evidence_record = self.registry.register_file(
+            artifact_role="evidence_manifest",
+            artifact_type="evidence_manifest",
+            artifact_version="v1",
+            path=evidence_manifest_path,
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
+        )
+        preprocess_metadata["evidence_manifest_path"] = evidence_record.path
+        preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
         visual_bundle = self._build_visual_bundle(item, preprocess_metadata)
         stage1_settings = dict(self.settings.section("Stage1_Input"))
         if not stage1_settings:
@@ -189,6 +214,8 @@ class Stage1AnalysisService:
             stage_name="stage1_analyze",
             route="Primary_Reader_API",
             node_id=self._paper_key(item),
+            call_id=f"stage1:{self._paper_key(item)}",
+            endpoint_type=str(primary_config.get("endpoint_type") or "chat_completions"),
             schema_hash=self._schema_hash(),
         )
         provider_result = self._call_reader(
@@ -415,7 +442,7 @@ class Stage1AnalysisService:
             artifact_version="v1",
             path=str(self.receipt_ledger.path),
             producer="services.stage1_analysis_service.Stage1AnalysisService",
-            artifact_id="provider_receipts",
+            artifact_id="stage1_provider_receipts",
             metadata={"receipt_count": len(self.receipt_ledger.list_receipts())},
         )
 

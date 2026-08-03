@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace, atomic_write_json
 from validation.closure import ValidationClosureService
 from validation.run_result import ValidationInputArtifactsV1, ValidationRunResultV1
@@ -74,12 +74,7 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
         path=manifest_path,
         producer="tests",
         depends_on=[
-            {
-                "artifact_id": draft.artifact_id,
-                "artifact_type": draft.artifact_type,
-                "path": draft.path,
-                "content_hash": draft.content_hash,
-            }
+            ArtifactDependencyRefV2.from_record(draft).to_dict()
         ],
     )
     validation = ValidationRunResultV1.create(
@@ -107,18 +102,8 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
         path=validation_path,
         producer="tests",
         depends_on=[
-            {
-                "artifact_id": draft.artifact_id,
-                "artifact_type": draft.artifact_type,
-                "path": draft.path,
-                "content_hash": draft.content_hash,
-            },
-            {
-                "artifact_id": manifest.artifact_id,
-                "artifact_type": manifest.artifact_type,
-                "path": manifest.path,
-                "content_hash": manifest.content_hash,
-            },
+            ArtifactDependencyRefV2.from_record(draft).to_dict(),
+            ArtifactDependencyRefV2.from_record(manifest).to_dict(),
         ],
     )
     return workspace, registry

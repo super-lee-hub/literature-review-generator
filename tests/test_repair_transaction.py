@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import atomic_write_json
 from tests.test_validation_closure import _bundle
 from validation.repair_transaction import RepairTransactionService
@@ -65,18 +65,8 @@ def test_report_first_plan_persists_hash_bound_transaction(tmp_path: Path) -> No
         path=validation_path,
         producer="tests",
         depends_on=[
-            {
-                "artifact_id": draft.artifact_id,
-                "artifact_type": draft.artifact_type,
-                "path": draft.path,
-                "content_hash": draft.content_hash,
-            },
-            {
-                "artifact_id": manifest.artifact_id,
-                "artifact_type": manifest.artifact_type,
-                "path": manifest.path,
-                "content_hash": manifest.content_hash,
-            },
+            ArtifactDependencyRefV2.from_record(draft).to_dict(),
+            ArtifactDependencyRefV2.from_record(manifest).to_dict(),
         ],
     )
 

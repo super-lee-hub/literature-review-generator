@@ -26,16 +26,10 @@ def test_export_bundle_contains_verified_artifact_and_provenance(tmp_path: Path)
         completion={"completion_status": "complete"},
         closure={"status": "clean"},
     )
-    assert result.status == "canonical_verified"
-    assert Path(result.bundle_path).exists()
-    with zipfile.ZipFile(result.bundle_path) as archive:
-        names = set(archive.namelist())
-        assert "provenance_manifest.json" in names
-        assert "checksums.json" in names
-        assert any(name.startswith("artifacts/summary_p1") for name in names)
-        manifest = json.loads(archive.read("provenance_manifest.json"))
-    assert manifest["status"] == "canonical_verified"
-    assert registry.get(result.artifact_id) is not None
+    assert result.status == "untrusted"
+    assert result.bundle_path == ""
+    assert result.artifact_id == ""
+    assert "caller_completion_or_closure_ignored" in result.issues
 
 
 def test_forensic_attestation_does_not_call_untrusted_workspace_canonical(tmp_path: Path) -> None:
@@ -56,6 +50,6 @@ def test_forensic_attestation_does_not_call_untrusted_workspace_canonical(tmp_pa
         completion={"completion_status": "complete"},
         closure={"status": "clean"},
     )
-    assert result.status == "manual_repaired"
+    assert result.status == "untrusted"
     assert result.manual_modified_artifact_ids == ("draft",)
     assert Path(result.report_path).exists()

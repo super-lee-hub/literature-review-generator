@@ -8,16 +8,19 @@ import pytest
 from unittest.mock import Mock, patch
 from requests.exceptions import Timeout, ConnectionError, HTTPError  # type: ignore
 import ai_interface
-from ai_interface import _normalize_type_specific_details
+from runtime.provider_runtime import ProviderRuntime
 
 
 def _runtime_config(retries: str = "3", timeout: str = "600"):
     return {
         "Runtime": {
             "transport_retries": retries,
+            "retry_base_delay_seconds": "0",
+            "retry_max_delay_seconds": "0",
         },
-        "API_Parameters": {
-            "timeout_seconds": timeout,
+        "Primary_Reader_API": {
+            "read_timeout_seconds": timeout,
+            "transport_retries": retries,
         },
     }
 
@@ -31,6 +34,17 @@ class TestAIIinterface:
             'get_summary_from_ai',
             '_call_ai_api',
         ])
+        self._original_detailed_call = self.ai_interface._call_ai_api_detailed
+
+        def bound_test_runtime(*args, **kwargs):
+            if kwargs.get("provider_runtime") is None:
+                kwargs["provider_runtime"] = ProviderRuntime(test_only=True)
+            return self._original_detailed_call(*args, **kwargs)
+
+        self.ai_interface._call_ai_api_detailed = bound_test_runtime
+
+    def teardown_method(self):
+        self.ai_interface._call_ai_api_detailed = self._original_detailed_call
 
     @patch('ai_interface.requests.post')
     def test_call_ai_api_success(self, mock_post):
@@ -204,7 +218,7 @@ class TestAIIinterface:
         with patch('ai_interface.load_config', return_value=_runtime_config(retries="4")), patch('ai_interface.time.sleep', return_value=None):
             result = self.ai_interface._call_ai_api(
                 "test prompt",
-                {"api_key": "test_key", "model": "test_model"},
+                {"api_key": "test_key", "model": "test_model", "transport_retries": "4"},
                 "system prompt"
             )
 
@@ -219,7 +233,7 @@ class TestAIIinterface:
         with patch('ai_interface.load_config', return_value=_runtime_config(retries="invalid")), patch('ai_interface.time.sleep', return_value=None):
             result = self.ai_interface._call_ai_api(
                 "test prompt",
-                {"api_key": "test_key", "model": "test_model"},
+                {"api_key": "test_key", "model": "test_model", "transport_retries": "invalid"},
                 "system prompt"
             )
 

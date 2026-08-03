@@ -86,6 +86,7 @@ SectionEvidencePacketSet = _typed_artifact("SectionEvidencePacketSet", "section_
 FinalOutline = _typed_artifact("FinalOutline", "final_outline")
 CoverageAudit = _typed_artifact("CoverageAudit", "coverage_audit")
 StabilityAudit = _typed_artifact("StabilityAudit", "stability_audit")
+ProviderReceiptClosureArtifact = _typed_artifact("ProviderReceiptClosureArtifact", "provider_receipt_closure")
 OutlineStageHealth = _typed_artifact("OutlineStageHealth", "outline_stage_health")
 AdoptedOutline = _typed_artifact("AdoptedOutline", "adopted_outline")
 
@@ -105,6 +106,7 @@ __all__ = [
     "FinalOutline",
     "CoverageAudit",
     "StabilityAudit",
+    "ProviderReceiptClosureArtifact",
     "OutlineStageHealth",
     "AdoptedOutline",
 ]

@@ -19,6 +19,10 @@ def test_provider_runtime_enforces_budget_and_emits_redacted_append_only_receipt
         job_id="job-1",
         attempt_id="attempt-1",
         stage_name="analyze",
+        route="Primary_Reader_API",
+        node_id="paper-1",
+        call_id="call-1",
+        endpoint_type="chat_completions",
     )
 
     admission = runtime.admit(estimated_tokens=10)
@@ -69,6 +73,7 @@ def test_ai_detailed_call_attaches_durable_provider_receipt(monkeypatch, tmp_pat
         job_id="job-1",
         attempt_id="attempt-1",
         stage_name="analyze",
+        test_only=True,
     )
     result = ai_interface._call_ai_api_detailed(
         "prompt",
@@ -96,7 +101,7 @@ def test_ai_detailed_call_blocks_before_transport_when_budget_is_exhausted(monke
         raise AssertionError("transport should not run after budget admission failure")
 
     monkeypatch.setattr(ai_interface, "_call_ai_api_detailed_uninstrumented", fail_if_called)
-    runtime = ProviderRuntime(budget=ProviderBudgetV1(max_total_tokens=1))
+    runtime = ProviderRuntime(budget=ProviderBudgetV1(max_total_tokens=1), test_only=True)
     result = ai_interface._call_ai_api_detailed(
         "a long prompt",
         {"api_key": "secret", "model": "test-model", "api_base": "https://provider.example/v1"},
@@ -120,7 +125,7 @@ def test_ai_detailed_call_enforces_retry_budget_and_records_attempts(monkeypatch
 
     monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", fail_transport)
     monkeypatch.setattr(ai_interface, "load_config", lambda: {"Performance": {"api_retry_attempts": "5"}})
-    runtime = ProviderRuntime(budget=ProviderBudgetV1(max_retries_per_call=1))
+    runtime = ProviderRuntime(budget=ProviderBudgetV1(max_retries_per_call=1), test_only=True)
 
     result = ai_interface._call_ai_api_detailed(
         "prompt",

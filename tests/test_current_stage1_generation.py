@@ -32,20 +32,44 @@ def _write_pdf(path: Path) -> None:
 def _canonical_summary() -> dict[str, Any]:
     return normalize_ai_summary(
         {
-            "common_core": {
+            "routing": {
+                "paper_type": "empirical",
+                "paper_subtype_raw": "quantitative",
+                "paper_subtype_normalized": "quantitative",
+                "classification_status": "resolved",
+                "route_confidence": "high",
+                "classification_rationale": "controlled empirical design",
+                "secondary_candidates": [],
+            },
+            "paper_metadata": {
                 "title": "Evidence-bound study",
                 "authors": ["Example Author"],
                 "year": "2025",
+                "journal": "Example Journal",
+                "doi": "10.1000/example",
+            },
+            "core_analysis": {
                 "summary": "The study tests a treatment with a controlled experiment and reports a measurable improvement.",
                 "key_points": ["The treatment improved the outcome by 15 percent."],
                 "methodology": "A controlled experiment with N=120 observations.",
                 "findings": "The treatment improved the outcome by 15 percent (p < 0.01).",
                 "conclusions": "The result supports the proposed mechanism under the tested context.",
+                "relevance": "The result informs treatment design.",
+                "limitations": "The result is bounded by the tested context.",
+                "theoretical_framework": None,
+                "research_gap": "Further replication is needed.",
+                "future_research_directions": ["Replicate in another context."],
             },
-            "type_specific_details": {
-                "paper_type": "empirical",
-                "data_source_and_size": "Controlled experiment, N=120.",
-                "analysis_technique": "Group comparison with significance testing.",
+            "specialized_details": {
+                "empirical": {
+                    "research_questions_or_hypotheses": ["Does the treatment improve the outcome?"],
+                    "data_source_and_size": "Controlled experiment, N=120.",
+                    "analysis_technique": "Group comparison with significance testing.",
+                    "core_variables": {"independent": ["treatment"], "dependent": ["outcome"]},
+                    "sample_characteristics_or_context": "Controlled context.",
+                },
+                "review": None,
+                "conceptual": None,
             },
         }
     )

@@ -41,6 +41,7 @@ class CompletionEvidenceV1:
     require_clean_validation: bool = False
     validation_status: str = "missing"
     provider_receipts_complete: bool = False
+    provider_receipt_closure: Mapping[str, Any] | None = None
     declared_canonical_ready: bool | None = None
     degradation_reasons: tuple[str, ...] = ()
     evidence_sources: tuple[str, ...] = ()
@@ -55,6 +56,12 @@ class CompletionEvidenceV1:
         object.__setattr__(self, "canonical_artifacts", {
             str(key): bool(value) for key, value in self.canonical_artifacts.items()
         })
+        if isinstance(self.provider_receipt_closure, Mapping):
+            object.__setattr__(
+                self,
+                "provider_receipts_complete",
+                bool(self.provider_receipt_closure.get("complete", False)),
+            )
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "CompletionEvidenceV1":
@@ -76,6 +83,11 @@ class CompletionEvidenceV1:
             require_clean_validation=bool(payload.get("require_clean_validation", False)),
             validation_status=str(payload.get("validation_status") or "missing"),
             provider_receipts_complete=bool(payload.get("provider_receipts_complete", False)),
+            provider_receipt_closure=(
+                dict(payload["provider_receipt_closure"])
+                if isinstance(payload.get("provider_receipt_closure"), Mapping)
+                else None
+            ),
             declared_canonical_ready=(
                 bool(payload["declared_canonical_ready"])
                 if "declared_canonical_ready" in payload

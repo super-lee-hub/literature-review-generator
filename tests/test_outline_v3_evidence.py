@@ -111,7 +111,11 @@ def test_projection_uses_canonical_fields_and_is_input_order_invariant():
 
 def test_unresolved_identity_is_blocking_and_never_uses_list_position():
     result = build_outline_evidence_views([
-        {"status": "success", "paper_info": {"title": "Title only"}},
+        {
+            "status": "success",
+            "paper_info": {"title": "Title only"},
+            "ai_summary": _summary("10.1000/minimal", "Minimal")["ai_summary"],
+        },
     ])
 
     assert result.views == []
@@ -125,6 +129,7 @@ def test_explicit_alias_crosswalk_can_resolve_an_unstable_source():
         [{
             "status": "success",
             "paper_info": {"title": "Unstable Imported Record", "paper_key_aliases": ["legacy-7"]},
+            "ai_summary": _summary("10.1000/minimal", "Minimal")["ai_summary"],
         }],
         alias_crosswalk={"legacy-7": "canonical-paper-7"},
     )
@@ -136,7 +141,11 @@ def test_explicit_alias_crosswalk_can_resolve_an_unstable_source():
 
 def test_failed_source_status_is_blocking_even_when_identity_is_stable():
     result = build_outline_evidence_views([
-        {"status": "failed", "paper_info": {"doi": "10.1000/failed", "title": "Failed"}},
+        {
+            "status": "failed",
+            "paper_info": {"doi": "10.1000/failed", "title": "Failed"},
+            "ai_summary": _summary("10.1000/minimal", "Minimal")["ai_summary"],
+        },
     ])
 
     assert result.views == []

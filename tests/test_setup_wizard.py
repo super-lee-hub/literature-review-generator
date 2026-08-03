@@ -42,22 +42,20 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
             "-",
             "",
             "",
-            "planner-model",
-            "http://localhost:11434",
-            "free-key",
-            "5",
-            "7",
-            "2",
-            "0",
-            "3",
-            "45",
-            "180",
-            "y",
-            "4",
-            "60",
-            "300",
-            "y",
-            "./cache",
+                "planner-model",
+                "http://localhost:11434",
+                "free-key",
+                "5",
+                "7",
+                "2",
+                "0",
+                "3",
+                "1",
+                "45",
+                "180",
+                "0",
+                "y",
+                "./cache",
             "hybrid",
             "mineru_remote",
             "local",
@@ -88,30 +86,13 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
             "gpt-4o-mini",
             "",
             "validator-key",
-            "en",
-            "Calibri",
-            "11",
-            "15",
-            "13",
-            "900",
-            "3500",
-            "0.2",
-            "",
-            "",
-            "",
-            "",
-            "9000",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-        ]
-    )
+                "en",
+                "Calibri",
+                "11",
+                "15",
+                "13",
+            ]
+        )
 
     monkeypatch.setattr("builtins.input", lambda _="": next(answers))
     monkeypatch.setattr(
@@ -138,10 +119,17 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert parser["Paths"]["library_path"] == "D:/Zotero/storage"
     assert parser["Paths"]["output_path"] == "./custom-output"
 
-    assert parser["Retry_Settings"]["max_retry_rounds"] == "3"
-    assert parser["Retry_Settings"]["base_retry_delay"] == "45"
-    assert parser["Stage2_Retry"]["enabled"] == "true"
-    assert parser["Stage2_Retry"]["max_retry_rounds"] == "4"
+    assert "Retry_Settings" not in parser
+    assert "Stage2_Retry" not in parser
+    assert parser["Runtime"]["max_workers"] == "5"
+    assert parser["Runtime"]["transport_retries"] == "7"
+    assert parser["Runtime"]["node_retry_limit"] == "2"
+    assert parser["Runtime"]["stage1_retry_limit"] == "0"
+    assert parser["Runtime"]["review_section_retry_limit"] == "3"
+    assert parser["Runtime"]["validation_retry_limit"] == "1"
+    assert parser["Runtime"]["retry_base_delay_seconds"] == "45"
+    assert parser["Runtime"]["retry_max_delay_seconds"] == "180"
+    assert parser["Runtime"]["total_job_deadline_seconds"] == "0"
 
     assert parser["Preprocess"]["parser_mode"] == "hybrid"
     assert parser["Preprocess"]["primary_parser"] == "mineru_remote"
@@ -159,9 +147,9 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert parser["Runtime"]["total_job_deadline_seconds"] == "0"
     assert parser["GUI"]["language"] == "en"
     assert parser["Styling"]["font_name"] == "Calibri"
-    assert parser["API_Parameters"]["timeout_seconds"] == "900"
-    assert parser["API_Parameters"]["primary_max_tokens"] == "3500"
-    assert parser["API_Parameters"]["writer_max_tokens"] == "9000"
+    assert "API_Parameters" not in parser
+    assert parser["Primary_Reader_API"]["max_output_tokens"] == "3000"
+    assert parser["Writer_API"]["max_output_tokens"] == "32000"
 
     assert parser["Primary_Reader_API"]["model"] == "deepseek-r1"
     assert parser["Outline_API"]["model"] == "claude-writer"

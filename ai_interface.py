@@ -6,7 +6,7 @@ import os
 import time
 import re
 import requests  # type: ignore
-from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set
+from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mapping
 
 from models import APIConfig
 from config_loader import load_config
@@ -17,6 +17,7 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
+from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
 from summary_schema import (
     default_ai_summary,
@@ -457,15 +458,6 @@ def _default_core_variables() -> Dict[str, List[str]]:
     return dict(empirical.get("core_variables") or {})
 
 
-def _default_type_specific_details() -> Dict[str, Any]:
-    return dict(default_ai_summary()["specialized_details"])
-
-
-def _normalize_type_specific_details(payload: Any) -> Dict[str, Any]:
-    canonical = normalize_ai_summary({"specialized_details": payload})
-    return dict(canonical["specialized_details"])
-
-
 def _coerce_positive_int(value: Any, default: int) -> int:
     try:
         parsed = int(str(value).strip())
@@ -493,21 +485,27 @@ def _is_non_retriable_http_response(response: Any) -> bool:
     return status_code in _NON_RETRIABLE_HTTP_STATUSES
 
 
-def _load_api_runtime_settings() -> Tuple[int, int]:
+def _load_api_runtime_settings(api_config: Optional[Mapping[str, Any]] = None) -> Tuple[int, int]:
     timeout_seconds = _DEFAULT_TIMEOUT_SECONDS
     retry_attempts = _DEFAULT_API_RETRY_ATTEMPTS
+
+    if api_config:
+        timeout_seconds = _coerce_positive_int(
+            api_config.get("read_timeout_seconds", api_config.get("total_timeout_seconds", timeout_seconds)),
+            timeout_seconds,
+        )
+        retry_attempts = _coerce_positive_int(
+            api_config.get("transport_retries", retry_attempts),
+            retry_attempts,
+        )
+        return timeout_seconds, retry_attempts
 
     try:
         config = load_config()
     except Exception:
         return timeout_seconds, retry_attempts
 
-    api_parameters = config.get("API_Parameters", {}) or {}
     runtime = config.get("Runtime", {}) or {}
-    timeout_seconds = _coerce_positive_int(
-        api_parameters.get("timeout_seconds", timeout_seconds),
-        timeout_seconds,
-    )
     retry_attempts = _coerce_positive_int(
         runtime.get("transport_retries", retry_attempts),
         retry_attempts,
@@ -647,7 +645,7 @@ def _call_ai_api_detailed_uninstrumented(
                 logger.error(message)
             return finish(_api_result(status="failed", error_kind="fatal_config_or_auth", message=message))
 
-        configured_timeout_seconds, configured_retries = _load_api_runtime_settings()
+        configured_timeout_seconds, configured_retries = _load_api_runtime_settings(api_config)
         request_timeout_seconds = (
             _coerce_positive_int(timeout_seconds, configured_timeout_seconds)
             if timeout_seconds is not None
@@ -894,21 +892,66 @@ def _call_ai_api_detailed(
     timeout_seconds: Optional[int] = None,
     provider_runtime: Optional[ProviderRuntime] = None,
 ) -> Dict[str, Any]:
-    """Call the transport and attach a redacted provider receipt.
+    """Call the transport only after bound-runtime and complete-budget admission."""
 
-    ``provider_runtime`` is optional for compatibility.  An ephemeral runtime
-    still attaches a receipt to the detailed result; callers that need durable
-    audit evidence pass a job/attempt/stage-bound runtime with a ledger.
-    """
+    if provider_runtime is None:
+        return _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message="a bound ProviderRuntime is required for production model calls",
+        )
 
-    runtime = provider_runtime or ProviderRuntime()
-    estimated_tokens = max(0, len(prompt) + max(0, int(max_tokens)))
-    try:
-        admission = runtime.admit(estimated_tokens=estimated_tokens)
-    except ProviderBudgetExceeded as exc:
-        receipt = runtime.blocked_receipt(
+    def _positive_int(value: Any, default: int) -> int:
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed > 0 else default
+
+    request_payload: dict[str, Any] = {
+        "system": system_prompt,
+        "user": prompt,
+        "user_content": user_content,
+        "response_format": response_format,
+        "max_output_tokens": int(max_tokens),
+        "temperature": temperature,
+    }
+    capability = resolve_model_capability(api_config)
+    profile = ProviderContextProfile.conservative(
+        provider=str(api_config.get("provider_family") or capability.provider_family),
+        model=str(api_config.get("model") or ""),
+        endpoint_type=str(api_config.get("endpoint_type") or capability.endpoint_type),
+        model_context_limit=_positive_int(api_config.get("max_context_tokens"), 128_000),
+        max_output_tokens=max(1, int(max_tokens)),
+        reasoning_reserve=max(0, _positive_int(api_config.get("reasoning_reserve_tokens"), 0)),
+        safety_margin=max(0, _positive_int(api_config.get("safety_margin_tokens"), 256)),
+    )
+    budget = profile.estimate_request(request_payload)
+    if not budget["within_budget"]:
+        receipt = provider_runtime.blocked_receipt(
             prompt=prompt,
-            input_payload=user_content,
+            input_payload=request_payload,
+            api_config=api_config,
+            message=(
+                "provider input exceeds verified context budget: "
+                f"{budget['estimated_input_tokens']} > {budget['input_budget']}"
+            ),
+        )
+        blocked = _api_result(
+            status="failed",
+            error_kind="budget_exhausted",
+            message="provider input exceeds verified context budget",
+        )
+        blocked["provider_receipt"] = receipt.to_dict()
+        return blocked
+
+    estimated_tokens = int(budget["estimated_input_tokens"])
+    try:
+        admission = provider_runtime.admit(estimated_tokens=estimated_tokens)
+    except ProviderBudgetExceeded as exc:
+        receipt = provider_runtime.blocked_receipt(
+            prompt=prompt,
+            input_payload=request_payload,
             api_config=api_config,
             message=str(exc),
         )
@@ -931,14 +974,15 @@ def _call_ai_api_detailed(
         user_content=user_content,
         retry_attempts=retry_attempts,
         timeout_seconds=timeout_seconds,
-        max_retries_per_call=runtime.budget.max_retries_per_call,
+        max_retries_per_call=provider_runtime.budget.max_retries_per_call,
     )
-    receipt = runtime.complete(
+    receipt = provider_runtime.complete(
         admission=admission,
         prompt=prompt,
-        input_payload=user_content,
+        input_payload=request_payload,
         api_config=api_config,
         result=result,
+        metadata={"request_budget": budget},
     )
     enriched = dict(result)
     enriched["provider_receipt"] = receipt.to_dict()
@@ -1330,13 +1374,8 @@ def get_concept_profile(prompt: str, api_config: APIConfig, logger: Optional[Any
     """
     # 读取API参数配置
     try:
-        if config:
-            api_params = config.get('API_Parameters', {}) or {}  # type: ignore
-            max_tokens = int(api_params.get('concept_max_tokens', 4000))  # type: ignore
-            temperature = float(api_params.get('concept_temperature', 0.3))  # type: ignore
-        else:
-            max_tokens = 4000
-            temperature = 0.3
+        max_tokens = int(api_config.get('max_output_tokens', 4000))
+        temperature = float(api_config.get('temperature', 0.3))
     except (ValueError, TypeError) as e:
         if logger:
             logger.warning(f"读取概念分析API参数配置失败，使用默认值: {e}")
@@ -1363,13 +1402,8 @@ def get_concept_analysis(prompt: str, api_config: APIConfig, logger: Optional[An
     """
     # 读取API参数配置
     try:
-        if config:
-            api_params = config.get('API_Parameters', {}) or {}  # type: ignore
-            max_tokens = int(api_params.get('concept_max_tokens', 4000))  # type: ignore
-            temperature = float(api_params.get('concept_temperature', 0.3))  # type: ignore
-        else:
-            max_tokens = 4000
-            temperature = 0.3
+        max_tokens = int(api_config.get('max_output_tokens', 4000))
+        temperature = float(api_config.get('temperature', 0.3))
     except (ValueError, TypeError) as e:
         if logger:
             logger.warning(f"读取概念分析API参数配置失败，使用默认值: {e}")
@@ -1498,17 +1532,8 @@ def get_summary_from_ai_detailed(
             runtime_config = None
 
     try:
-        if runtime_config:
-            api_params = runtime_config.get('API_Parameters', {}) or {}  # type: ignore[union-attr]
-            if engine_type == 'primary':
-                max_tokens = int(api_params.get('primary_max_tokens', 3000))
-                temperature = float(api_params.get('primary_temperature', 0.3))
-            else:
-                max_tokens = int(api_params.get('backup_max_tokens', 8192))
-                temperature = float(api_params.get('backup_temperature', 0.3))
-        else:
-            max_tokens = 3000
-            temperature = 0.3
+        max_tokens = int(api_config.get('max_output_tokens', 3000 if engine_type == 'primary' else 8192))
+        temperature = float(api_config.get('temperature', 0.3))
     except (ValueError, TypeError) as exc:
         if logger:
             logger.warning(f"Failed to read API parameters, using defaults: {exc}")
@@ -1556,9 +1581,13 @@ def get_summary_from_ai_detailed(
         return detailed
     if ai_response:
         if logger:
-            logger.warning("AI returned non-dict content, trying manual extraction")
-        detailed["content"] = _extract_summary_manually(ai_response)
-        return detailed
+            logger.warning("AI returned non-dict content; current summary JSON is required")
+        return _api_result(
+            status="failed",
+            error_kind="invalid_response",
+            message="AI response must be a summary_v2_lite canonical JSON object",
+            engine_type=engine_type,
+        )
     return _api_result(
         status="failed",
         error_kind="invalid_response",
@@ -1746,11 +1775,11 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
     try:
         if config:
             if engine_type == 'primary':
-                max_tokens = int(config.get('API_Parameters', {}).get('primary_max_tokens', 3000))
-                temperature = float(config.get('API_Parameters', {}).get('primary_temperature', 0.3))
+                max_tokens = int(primary_api_config.get('max_output_tokens', 3000))
+                temperature = float(primary_api_config.get('temperature', 0.3))
             else:  # backup
-                max_tokens = int(config.get('API_Parameters', {}).get('backup_max_tokens', 8192))
-                temperature = float(config.get('API_Parameters', {}).get('backup_temperature', 0.3))
+                max_tokens = int(backup_api_config.get('max_output_tokens', 8192))
+                temperature = float(backup_api_config.get('temperature', 0.3))
         else:
             # 默认值（向后兼容）
             max_tokens = 3000
@@ -1790,226 +1819,9 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         return structured_summary
     if logger:
         logger.warning("AI返回非字典格式，尝试手动解析")
-    return _extract_summary_manually(ai_response)
-
-    # 验证必需字段（两段式结构）
-    if isinstance(ai_response, dict):  # type: ignore
-        structured_summary: Dict[str, Any] = ai_response
-
-        if 'common_core' not in structured_summary:
-            # 兼容旧格式，自动转换
-            if logger:
-                logger.debug("检测到旧格式摘要，自动转换为两段式结构")
-            structured_summary = {
-                'common_core': structured_summary,
-                'type_specific_details': _default_type_specific_details()
-            }
-
-        # 确保common_core是字典类型
-        if not isinstance(structured_summary.get('common_core'), dict):
-            if logger:
-                logger.error(f"common_core类型错误: {type(structured_summary.get('common_core'))}")
-            # 修复：返回None表示处理失败，而不是继续返回空结构
-            # 这样可以正确触发main.py中的失败处理逻辑
-            return None
-
-        # 验证common_core中的必需字段
-        required_fields = ['summary', 'key_points', 'methodology', 'findings', 'conclusions', 'relevance', 'limitations']
-        for field in required_fields:
-            if field not in structured_summary['common_core']:
-                structured_summary['common_core'][field] = '' if field != 'key_points' else []
-
-        metadata_defaults = {
-            'title': '',
-            'authors': [],
-            'year': '',
-            'journal': '',
-            'doi': '',
-        }
-        for field, default_value in metadata_defaults.items():
-            if field not in structured_summary['common_core']:
-                structured_summary['common_core'][field] = default_value
-
-        # 确保key_points是列表
-        if not isinstance(structured_summary['common_core']['key_points'], list):
-            structured_summary['common_core']['key_points'] = [str(structured_summary['common_core']['key_points'])]
-
-        # 确保type_specific_details存在
-        if 'type_specific_details' not in structured_summary:
-            structured_summary['type_specific_details'] = _default_type_specific_details()
-        else:
-            structured_summary['type_specific_details'] = _normalize_type_specific_details(structured_summary['type_specific_details'])
-
-        return structured_summary
-    else:
-        # 如果返回的是字符串，尝试手动提取信息
-        if logger:
-            logger.warning("AI返回非字典格式，尝试手动解析")
-        return _extract_summary_manually(ai_response)
-
-
-def _extract_summary_manually(ai_response: Union[Dict[str, Any], str]) -> Dict[str, Any]:
-    """
-    当JSON解析失败时，使用正则表达式从AI响应中提取摘要信息
-
-    Args:
-        ai_response: AI的原始响应文本
-
-    Returns:
-        手动提取的结构化摘要
-    """
-    # 导入正则表达式模块（如果尚未导入）
-    import re
-
-    # 初始化两段式结果字典
-    result: Dict[str, Any] = {
-        'common_core': {
-            'summary': '',
-            'key_points': [],
-            'methodology': '',
-            'findings': '',
-            'conclusions': '',
-            'relevance': '',
-            'limitations': ''
-        },
-        'type_specific_details': _default_type_specific_details()
-    }
-
-    # 尝试使用正则表达式提取JSON格式的部分
-    # 查找可能的JSON结构，即使周围有其他文本
-    json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
-    
-        # 确保ai_response是字符串类型
-    if isinstance(ai_response, dict):
-        # 如果是字典，尝试转换为JSON字符串
-        try:
-            ai_response_str = json.dumps(ai_response)
-        except (TypeError, ValueError):
-            ai_response_str = str(ai_response)
-    else:
-        ai_response_str = str(ai_response)
-    
-    json_matches: List[str] = re.findall(json_pattern, ai_response_str, re.DOTALL)
-    
-    for match in json_matches:
-        try:
-            # 尝试解析找到的JSON片段
-            json_data: Any = json.loads(match)
-            
-            # 如果解析成功，提取有用信息
-            if isinstance(json_data, dict):  # json.loads可能返回任何JSON类型，需要检查是否为字典
-                # 提取common_core部分
-                if 'common_core' in json_data:
-                    for key in result['common_core']:
-                        if key in json_data['common_core']:
-                            result['common_core'][key] = json_data['common_core'][key]
-                else:
-                    # 如果没有common_core，直接从顶层提取
-                    for key in result['common_core']:
-                        if key in json_data:
-                            result['common_core'][key] = json_data[key]
-                
-                # 如果成功提取到有用信息，直接返回
-                if any(result['common_core'].values()):
-                    return result
-        except (json.JSONDecodeError, AttributeError):
-            # 如果解析失败，继续尝试下一个匹配
-            continue
-
-    # 如果JSON提取失败，使用正则表达式直接从文本中提取内容
-    # 定义各种键的正则表达式模式
-    patterns = {
-        'summary': [
-            r'"summary"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'摘要[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'摘要[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)',
-            r'summary[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'summary[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)'
-        ],
-        'key_points': [
-            r'"key_points"\s*:\s*\[[^\]]*(?:\[[^\]]*\][^\]]*)*\]',
-            r'要点[：:]\s*\[[^\]]*(?:\[[^\]]*\][^\]]*)*\]',
-            r'key_points[：:]\s*\[[^\]]*(?:\[[^\]]*\][^\]]*)*\]'
-        ],
-        'methodology': [
-            r'"methodology"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'方法[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'方法[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)',
-            r'methodology[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'methodology[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)'
-        ],
-        'findings': [
-            r'"findings"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'发现[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'发现[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)',
-            r'findings[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'findings[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)'
-        ],
-        'conclusions': [
-            r'"conclusions"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'结论[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'结论[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)',
-            r'conclusions[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'conclusions[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)'
-        ],
-        'relevance': [
-            r'"relevance"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'相关性[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'相关性[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)',
-            r'relevance[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'relevance[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)'
-        ],
-        'limitations': [
-            r'"limitations"\s*:\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'限制[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'限制[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)',
-            r'limitations[：:]\s*"([^"]*(?:\\.[^"]*)*)"',
-            r'limitations[：:]\s*([^"\n\r]*(?:\n[^"\n\r]*)*)'
-        ]
-    }
-
-    # 对每个字段尝试所有模式
-    for field, field_patterns in patterns.items():
-        for pattern in field_patterns:
-            matches: List[str] = re.findall(pattern, ai_response_str, re.IGNORECASE | re.DOTALL)
-            if matches:
-                if field == 'key_points':
-                    # 对于key_points，需要进一步解析列表项
-                    list_content: str = matches[0]
-                    # 尝试提取列表项
-                    item_pattern = r'"([^"]*(?:\\.[^"]*)*)"'
-                    items: List[str] = re.findall(item_pattern, list_content)
-                    if not items:
-                        # 如果没有找到带引号的项，尝试不带引号的项
-                        item_pattern = r'([^,\[\]]+(?:\([^)]*\))?[^,\[\]]*)'
-                        items = re.findall(item_pattern, list_content)
-                    
-                    # 清理并过滤空项
-                    items = [item.strip().strip('"\'') for item in items if item.strip()]
-                    if items:
-                        result['common_core'][field] = items
-                        break
-                else:
-                    # 对于其他字段，直接使用第一个匹配
-                    content_str: str = matches[0].strip()
-                    # 清理内容
-                    content_str = re.sub(r'\s+', ' ', content_str)  # 合并多个空白字符
-                    content_str = content_str.strip('"\'' )  # 移除引号
-                    if content_str:
-                        result['common_core'][field] = content_str
-                        break
-
-
-    # 如果没有提取到任何内容，返回一个基本结构
-    if not any(result['common_core'].values()):
-        result['common_core']['summary'] = ai_response_str[:500]  # 取前500字符作为摘要
-        result['common_core']['key_points'] = ['解析失败，请查看原始响应']
-
-    return result
-
-
-
-
+    if logger:
+        logger.warning("AI returned non-dict content; canonical summary JSON is required")
+    return None
 
 if __name__ == "__main__":
     # 测试函数

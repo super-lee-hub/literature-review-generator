@@ -14,22 +14,44 @@ from summary_schema import normalize_ai_summary
 def _summary(paper_key: str, title: str, finding: str) -> dict[str, Any]:
     summary = normalize_ai_summary(
         {
-            "common_core": {
+            "routing": {
+                "paper_type": "empirical",
+                "paper_subtype_raw": "quantitative",
+                "paper_subtype_normalized": "quantitative",
+                "classification_status": "resolved",
+                "route_confidence": "high",
+                "classification_rationale": "controlled empirical design",
+                "secondary_candidates": [],
+            },
+            "paper_metadata": {
                 "title": title,
                 "authors": ["Author"],
                 "year": "2025",
+                "journal": "Example Journal",
+                "doi": "10.1000/example",
+            },
+            "core_analysis": {
                 "summary": finding,
                 "key_points": [finding],
                 "methodology": "Controlled empirical study",
                 "findings": finding,
                 "conclusions": finding,
+                "relevance": "The result informs the research question.",
                 "limitations": "The result is bounded by the tested context.",
                 "research_gap": "Further replication is needed.",
+                "theoretical_framework": None,
+                "future_research_directions": [],
             },
-            "type_specific_details": {
-                "paper_type": "empirical",
-                "data_source_and_size": "Two controlled samples",
-                "analysis_technique": "Regression analysis",
+            "specialized_details": {
+                "empirical": {
+                    "research_questions_or_hypotheses": [],
+                    "data_source_and_size": "Two controlled samples",
+                    "analysis_technique": "Regression analysis",
+                    "core_variables": {"independent": ["treatment"], "dependent": ["outcome"]},
+                    "sample_characteristics_or_context": "Controlled context.",
+                },
+                "review": None,
+                "conceptual": None,
             },
         }
     )
@@ -46,7 +68,7 @@ def _summary(paper_key: str, title: str, finding: str) -> dict[str, Any]:
     return summary
 
 
-def _executor(tmp_path: Path, *, adopt: bool = True, provider: Any = None) -> OutlineV3Executor:
+def _executor(tmp_path: Path, *, provider: Any = None) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
     return OutlineV3Executor(
@@ -59,7 +81,6 @@ def _executor(tmp_path: Path, *, adopt: bool = True, provider: Any = None) -> Ou
         artifact_registry=registry,
         provider=provider,
         candidate_count=2,
-        adopt=adopt,
     )
 
 
@@ -68,8 +89,8 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
     result = executor.run()
 
     assert result.ok is True
-    assert result.status == "complete"
-    assert result.adopted is True
+    assert result.status == "ready_for_adoption"
+    assert result.adopted is False
 
     packet_path = Path(result.artifacts["section_evidence_packets"])
     packet = json.loads(packet_path.read_text(encoding="utf-8"))["payload"]
@@ -85,7 +106,7 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
 
 
 def test_outline_v3_without_explicit_adoption_stops_at_ready_for_adoption(tmp_path: Path) -> None:
-    result = _executor(tmp_path, adopt=False).run()
+    result = _executor(tmp_path).run()
 
     assert result.ok is True
     assert result.status == "ready_for_adoption"

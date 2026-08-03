@@ -27,6 +27,7 @@ from models import APIConfig
 from runtime.job_spec import RuntimeJobSpec, load_runtime_job_spec
 from runtime.outline_v3_dag import OutlineNodeStore
 from runtime.outline_v3_replay import ModelCallReplayStore
+from runtime.orchestrator import AgentRuntimeBridge
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.stage_terminal import StageTerminalStore
 from services.artifact_registry import ArtifactRecord, ArtifactRegistry, RegistryError, file_sha256
@@ -704,7 +705,7 @@ class ReviewControlPlane:
                 "mutation_performed": False,
             }
 
-    def validate(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
+    def validation_status(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
         try:
@@ -725,6 +726,69 @@ class ReviewControlPlane:
             "reason": "canonical validation closure inspected without mutation",
             "mutation_performed": False,
             "read_only": True,
+        }
+
+    def validate(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
+        """Execute the current validation stage and persist its receipts/results.
+
+        ``validation-status`` is the read-only projection.  The command named
+        ``validate`` must cross the runtime boundary and run the built-in
+        current validator; it must not merely inspect a pre-existing report.
+        """
+
+        inspection = self.inspect(job_id=job_id, workspace=workspace)
+        resolved = Path(str(inspection["workspace_path"])).resolve()
+        spec_path = resolved / "artifacts" / "runtime_job_spec_v1.json"
+        if not spec_path.is_file():
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "reason": f"persisted runtime spec is missing: {spec_path}",
+                "mutation_performed": False,
+                "read_only": False,
+            }
+        try:
+            spec = load_runtime_job_spec(spec_path)
+            if spec.job_id != inspection["job_id"]:
+                raise ControlPlaneError(
+                    "persisted runtime spec job_id does not match the resolved workspace"
+                )
+            bridge = AgentRuntimeBridge(spec)
+            attempt_id = f"reviewctl-validation:{spec.job_id}:{time.time_ns()}"
+            session = bridge.bootstrap(
+                resume_requested=True,
+                claim_latest_pointer=False,
+                publish_running_state=False,
+            )
+            stage_result = bridge.run_validation(session, attempt_id=attempt_id)
+            session.context.registry.reload()
+            closure = ValidationClosureService(
+                session.context.workspace,
+                session.context.registry,
+            ).inspect()
+        except (OSError, RegistryError, RuntimeRunnerError, ValueError, TypeError, ControlPlaneError) as exc:
+            return {
+                "status": "blocked",
+                "job_id": inspection["job_id"],
+                "reason": str(exc),
+                "mutation_performed": False,
+                "read_only": False,
+            }
+        return {
+            "status": closure.status,
+            "job_id": inspection["job_id"],
+            "attempt_id": attempt_id,
+            "stage_result": {
+                "stage_name": stage_result.stage_name,
+                "success": stage_result.success,
+                "artifacts": [artifact.to_dict() for artifact in stage_result.artifacts],
+                "metadata": dict(stage_result.metadata),
+            },
+            "closure": closure.to_dict(),
+            "validation_artifact": closure.validation_artifact,
+            "reason": "current validation execution completed and closure was re-read from Registry",
+            "mutation_performed": True,
+            "read_only": False,
         }
 
     def cancel(
@@ -767,7 +831,9 @@ class ReviewControlPlane:
         job_id: str | None = None,
         workspace: str | Path | None = None,
         artifact_id: str,
-        adopted_by: str = "reviewctl",
+        actor: str = "",
+        reason: str = "",
+        expected_hash: str = "",
     ) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         artifact = next(
@@ -786,7 +852,7 @@ class ReviewControlPlane:
                 "reason": "adoption target is not a verified ready Registry artifact",
                 "mutation_performed": False,
             }
-        if not str(adopted_by or "").strip():
+        if not str(actor or "").strip():
             return {
                 "status": "blocked",
                 "job_id": inspection["job_id"],
@@ -798,7 +864,9 @@ class ReviewControlPlane:
         try:
             result = OutlineAdoptionTransaction(workspace_obj, registry).adopt(
                 source_artifact_id=artifact_id,
-                adopted_by=adopted_by,
+                actor=actor,
+                reason=reason,
+                expected_hash=expected_hash,
             )
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             return {
@@ -818,11 +886,8 @@ class ReviewControlPlane:
             raise ControlPlaneError("export requires --batch/--job or --workspace")
         inspection = self.inspect(job_id=job_id or batch_id, workspace=workspace)
         workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
-        closure = ValidationClosureService(workspace_obj, registry).inspect()
         result = ExportBundleService(workspace_obj, registry).export(
             spec=ExportBundleSpecV1(),
-            completion=inspection.get("status") or {},
-            closure=closure.to_dict(),
         )
         payload = result.to_dict()
         payload.update(
@@ -831,7 +896,6 @@ class ReviewControlPlane:
                 "workspace_path": inspection["workspace_path"],
                 "export_scope": "verified_registry_artifacts_and_forensic_provenance",
                 "inspection": inspection,
-                "closure": closure.to_dict(),
                 "read_only": False,
             }
         )
@@ -840,10 +904,7 @@ class ReviewControlPlane:
     def attest(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         workspace_obj, registry = AgentRuntimeRunner._open_workspace(inspection["workspace_path"])
-        closure = ValidationClosureService(workspace_obj, registry).inspect()
         result = ForensicAttestationService(workspace_obj, registry).attest(
-            completion=inspection.get("status") or {},
-            closure=closure.to_dict(),
             persist=True,
         )
         payload = result.to_dict()
@@ -851,7 +912,6 @@ class ReviewControlPlane:
             {
                 "workspace_path": inspection["workspace_path"],
                 "scope": "registry_file_hashes_dependency_graph_validation_closure",
-                "closure": closure.to_dict(),
                 "read_only": False,
                 "next_step": "full closure is required before trusting the inspected workspace"
                 if result.status == "untrusted"

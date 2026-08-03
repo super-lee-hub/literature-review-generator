@@ -83,6 +83,7 @@ def _evaluate_runtime_completion(
     validation_record = False
     required_provider_stages = {"outline", "review"}.intersection(outcome.required_stages)
     provider_receipts_complete = not required_provider_stages
+    provider_receipt_closures: list[Mapping[str, Any]] = []
     try:
         for record in registry.list_records():
             if record.status != "ready":
@@ -97,14 +98,24 @@ def _evaluate_runtime_completion(
             ArtifactRegistry._verify_ready_artifact(record)
             ready_job_outcome = ready_job_outcome or record.artifact_id == "job_outcome"
             validation_record = validation_record or record.artifact_type == "validation_run_result"
-            if record.artifact_type == "provider_receipt_ledger":
+            if record.artifact_type == "provider_receipt_closure":
                 try:
-                    provider_receipts_complete = bool(
-                        Path(record.path).is_file()
-                        and Path(record.path).read_text(encoding="utf-8").strip()
-                    )
-                except (OSError, UnicodeError):
+                    closure_envelope = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                    candidate = closure_envelope.get("payload") if isinstance(closure_envelope, Mapping) else None
+                    if isinstance(candidate, Mapping):
+                        provider_receipt_closures.append(dict(candidate))
+                except (OSError, UnicodeError, json.JSONDecodeError):
                     provider_receipts_complete = False
+        if required_provider_stages:
+            provider_receipts_complete = bool(provider_receipt_closures) and all(
+                bool(candidate.get("complete")) for candidate in provider_receipt_closures
+            )
+        provider_receipt_closure: Mapping[str, Any] | None = None
+        if provider_receipt_closures:
+            provider_receipt_closure = {
+                "complete": provider_receipts_complete,
+                "closures": provider_receipt_closures,
+            }
     except (OSError, RegistryError, TypeError, ValueError):
         registry_verified = False
 
@@ -125,6 +136,7 @@ def _evaluate_runtime_completion(
             "require_clean_validation": bool(policy.get("require_clean_validation", False)),
             "validation_status": validation_status,
             "provider_receipts_complete": provider_receipts_complete,
+            "provider_receipt_closure": provider_receipt_closure,
             "declared_canonical_ready": outcome.canonical_ready,
             "degradation_reasons": outcome.degradation_reasons,
             "evidence_sources": ("job_outcome_v1", "artifact_registry"),
@@ -150,6 +162,7 @@ class AgentRuntimeRunner:
             "final_outline",
             "coverage_audit",
             "stability_audit",
+            "provider_receipt_closure",
             "outline_stage_health",
             "adopted_outline",
             "stage1_canonical_summaries",

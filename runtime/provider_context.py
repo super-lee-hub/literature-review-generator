@@ -83,16 +83,11 @@ class ProviderContextProfile:
         return max(1, (len(text.encode("utf-8")) + 2) // 3)
 
     def estimate_request(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        fields = {
-            "system": request.get("system"),
-            "developer": request.get("developer"),
-            "user": request.get("user"),
-            "user_content": request.get("user_content"),
-            "structured_json": request.get("structured_json"),
-            "tool_schema": request.get("tool_schema"),
-            "image_file_metadata": request.get("image_file_metadata"),
-        }
-        input_tokens = self.estimate_tokens(fields)
+        # Estimate the exact canonical request object.  Do not project a
+        # caller-selected subset: evidence packets, relation candidates,
+        # citation catalogs, visual references, and future request fields all
+        # participate in admission automatically.
+        input_tokens = self.estimate_tokens(request)
         total_reserved = input_tokens + self.max_output_tokens + self.reasoning_reserve + self.safety_margin
         return {
             "estimated_input_tokens": input_tokens,

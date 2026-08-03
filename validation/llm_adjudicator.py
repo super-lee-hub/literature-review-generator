@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from ai_interface import _call_ai_api
 from models import APIConfig
+from runtime.provider_runtime import ProviderBudgetExceeded
 
 
 SOURCE_GROUNDED_TIERS = frozenset(
@@ -212,8 +214,8 @@ def run_adjudication_stage(
         return None
 
     try:
-        base_max_tokens = int((generator_instance.config.get("API_Parameters") or {}).get("claims_max_tokens", 4096))
-        base_temperature = float((generator_instance.config.get("API_Parameters") or {}).get("claims_temperature", 0.2))
+        base_max_tokens = int(api_config.get("max_output_tokens", 4096))
+        base_temperature = float(api_config.get("temperature", 0.2))
     except Exception:
         base_max_tokens = 4096
         base_temperature = 0.2
@@ -226,21 +228,79 @@ def run_adjudication_stage(
         temperature = base_temperature
 
     prompt, system_prompt = _build_prompts(packet)
+    provider_runtime = None
+    runtime_factory = getattr(generator_instance, "new_provider_runtime", None)
+    if callable(runtime_factory):
+        try:
+            packet_payload = asdict(packet)
+        except TypeError:
+            packet_payload = dict(getattr(packet, "__dict__", {}) or {})
+        packet_hash = hashlib.sha256(
+            json.dumps(
+                packet_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        citation_key = str(packet.citation_set_key or "validation").strip()
+        provider_runtime = runtime_factory(
+            stage_name="stage4_validate",
+            route="Validator_API",
+            node_id=f"{packet.stage}:{citation_key}",
+            call_id=f"validation:{packet.stage}:{packet_hash}",
+            api_config=api_config,
+        )
+    call_kwargs: Dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": "json",
+        "logger": getattr(generator_instance, "logger", None),
+    }
+    if provider_runtime is not None:
+        call_kwargs["provider_runtime"] = provider_runtime
     try:
         report = _call_ai_api(
             prompt,
             api_config,
             system_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            response_format="json",
-            logger=getattr(generator_instance, "logger", None),
+            **call_kwargs,
         )
     except Exception as exc:
         logger = getattr(generator_instance, "logger", None)
         if logger:
             logger.warning(f"AI {packet.stage} adjudication failed: {exc}")
         return None
+
+    if provider_runtime is not None and not provider_runtime.receipts:
+        # Injected provider callbacks used by the production E2E surface do
+        # not pass through ai_interface, so close their runtime explicitly.
+        # Real transports already append a receipt inside ai_interface and
+        # therefore take the no-op branch above.
+        try:
+            admission = provider_runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+            provider_runtime.complete(
+                admission=admission,
+                prompt=prompt,
+                input_payload={"packet": packet_payload},
+                api_config=api_config,
+                result={
+                    "status": "success" if isinstance(report, dict) else "failed",
+                    "content": report if isinstance(report, dict) else None,
+                    "finish_reason": "stop" if isinstance(report, dict) else "",
+                    "usage_status": "reported",
+                    "error_kind": None if isinstance(report, dict) else "invalid_response",
+                },
+                metadata={"execution_mode": "injected_adjudicator"},
+            )
+        except ProviderBudgetExceeded:
+            provider_runtime.blocked_receipt(
+                prompt=prompt,
+                input_payload={"packet": packet_payload},
+                api_config=api_config,
+                message="validation adjudicator did not produce a provider receipt before its budget closed",
+            )
 
     if not isinstance(report, dict):
         return None

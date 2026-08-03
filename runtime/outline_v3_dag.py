@@ -277,8 +277,8 @@ def create_outline_v3_node_dag(job_id: str, *, candidate_count: int = 5) -> Outl
         _node("final_outline", ["section_evidence_packets"]),
         _node("coverage_audit", ["final_outline", "coverage_contract"]),
         _node("stability_audit", ["coverage_audit"]),
-        _node("stage_health", ["stability_audit"]),
-        _node("adoption", ["stage_health", "coverage_audit", "stability_audit"]),
+        _node("provider_receipt_closure", ["stability_audit"]),
+        _node("stage_health", ["stability_audit", "provider_receipt_closure"]),
     ])
     return OutlineNodeDAG(job_id=job_id, nodes=nodes)
 
@@ -324,8 +324,8 @@ def plan_outline_v3_resume(dag: OutlineNodeDAG, failed_node_id: Optional[str] = 
     """Plan only the failed node and its downstream closure.
 
     Completed candidate nodes are preserved when a critique or arbitration
-    node fails; an adoption failure has no downstream nodes and therefore does
-    not rerun the outline.
+    node fails. Explicit adoption is a separate transaction and is not a DAG
+    execution node.
     """
 
     failures = dag.failed_node_ids
@@ -346,7 +346,7 @@ def plan_outline_v3_resume(dag: OutlineNodeDAG, failed_node_id: Optional[str] = 
     forbidden = [
         node_id
         for node_id in preserved
-        if node_id in {"final_outline", "adoption"} and target in {"structure_critique", "coverage_critique", "evidence_critique"}
+        if node_id == "final_outline" and target in {"structure_critique", "coverage_critique", "evidence_critique"}
     ]
     return ResumePlan(
         failed_node_id=target,

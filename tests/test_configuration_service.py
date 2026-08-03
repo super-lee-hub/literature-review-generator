@@ -14,7 +14,9 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert 'Outline_API' in config
     assert 'Free_Mode_API' in config
     assert 'Preprocess' in config
-    assert 'Stage2_Retry' in config
+    assert 'Stage2_Retry' not in config
+    assert 'Retry_Settings' not in config
+    assert 'API_Parameters' not in config
     assert 'Validation' in config
     assert config['Preprocess']['parser_mode'] == 'local'
     assert config['Preprocess']['primary_parser'] == 'local'
@@ -31,8 +33,8 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert config['Writer_API']['provider_family'] == 'aihubmix_openai'
     assert config['Writer_API']['max_output_tokens'] == '32000'
     assert config['Writer_API']['text_verbosity'] == 'high'
-    assert config['API_Parameters']['writer_max_tokens'] == '32000'
-    assert config['API_Parameters']['outline_max_tokens'] == '16000'
+    assert config['Writer_API']['max_output_tokens'] == '32000'
+    assert config['Outline_API']['max_output_tokens'] == '16000'
     assert config['Primary_Reader_API']['thinking'] == 'enabled'
     assert config['Primary_Reader_API']['max_context_tokens'] == '1000000'
     assert config['Outline_API']['reasoning_display'] == 'summarized'

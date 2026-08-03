@@ -323,12 +323,10 @@ Important config sections include:
 - `Validator_API`
 - `Performance`
 - `Preprocess`
-- `Retry_Settings`
-- `Stage2_Retry`
+- `Runtime` (typed retry limits, backoff, and job deadlines)
 - `Validation`
 - `Styling`
 - `GUI`
-- `API_Parameters`
 
 Important environment variables include:
 

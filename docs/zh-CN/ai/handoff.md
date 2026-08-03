@@ -56,7 +56,7 @@
 
 当前推荐约定：敏感信息放 `.env`，非敏感运行参数放 `config.ini`。
 
-关键配置段：`Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Retry_Settings`, `Stage2_Retry`, `Validation`, `Styling`, `GUI`, `API_Parameters`
+关键配置段：`Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Runtime`, `Validation`, `Styling`, `GUI`。provider 自有的输出限制、上下文限制、超时和传输重试上限写在对应 provider 段中。
 
 关键环境变量：`LLM_PRIMARY_READER_API`, `LLM_BACKUP_READER_API`, `LLM_WRITER_API`, `LLM_OUTLINE_API`, `LLM_FREE_MODE_API`, `LLM_VALIDATOR_API`, `MINERU_*`
 

@@ -25,6 +25,7 @@ from validation.repair_models import (
     RepairApplyResult,
     RepairPlan,
     RepairRootCause,
+    NOT_APPLICABLE,
 )
 from services.repair_policy import is_auto_safe_proposal
 
@@ -99,7 +100,7 @@ def _check_dependency_bundle(
     primary = resolved_artifacts[0]
 
     # Check aggregate summary hash across all papers
-    if bundle.summary_hash:
+    if bundle.summary_hash not in {"", NOT_APPLICABLE}:
         aggregate_summary: Dict[str, Any] = {}
         for artifact in resolved_artifacts:
             summary_data = artifact.get("analysis", {}).get("ai_summary", {})
@@ -110,20 +111,20 @@ def _check_dependency_bundle(
 
     # Check paper artifact hash — composite over all resolved artifacts
     # so that any artifact change is detected for multi-paper proposals.
-    if bundle.paper_artifact_hash:
+    if bundle.paper_artifact_hash not in {"", NOT_APPLICABLE}:
         composite = resolved_artifacts if len(resolved_artifacts) > 1 else primary
         current_artifact_hash = _compute_hash(composite)
         if current_artifact_hash != bundle.paper_artifact_hash:
             return False
 
     # Check visual manifest hash
-    if bundle.visual_manifest_hash:
+    if bundle.visual_manifest_hash not in {"", NOT_APPLICABLE}:
         current_visual_manifest_hash = _compute_hash(visual_manifest or {})
         if current_visual_manifest_hash != bundle.visual_manifest_hash:
             return False
 
     # Check visual refs hash (from primary artifact, matches plan-time)
-    if bundle.selected_visual_refs_hash:
+    if bundle.selected_visual_refs_hash not in {"", NOT_APPLICABLE}:
         selected_visual_refs = primary.get("stage1_inputs", {}).get("selected_visual_refs", [])
         current_visual_refs_hash = _compute_hash(selected_visual_refs)
         if current_visual_refs_hash != bundle.selected_visual_refs_hash:

@@ -56,6 +56,7 @@ class QueueJobSpec:
     config_fingerprint: str = ""
     current_stage: str = ""
     workspace_path: str = ""
+    canonical_output_root: str = ""
     log_path: str = ""
     produced_artifacts: List[str] = field(default_factory=list)
 
@@ -75,6 +76,7 @@ class QueueJobSpec:
         data.setdefault('config_fingerprint', '')
         data.setdefault('current_stage', '')
         data.setdefault('workspace_path', '')
+        data.setdefault('canonical_output_root', '')
         data.setdefault('log_path', '')
         data.setdefault('produced_artifacts', [])
         return cls(**data)
@@ -91,6 +93,7 @@ class QueueJobRuntime:
     retry_count: int = 0
     current_stage: str = ""
     workspace_path: str = ""
+    canonical_output_root: str = ""
     log_path: str = ""
     produced_artifacts: List[str] = field(default_factory=list)
     progress_snapshot: Dict[str, Any] = field(default_factory=dict)
@@ -109,6 +112,7 @@ class QueueJobRuntime:
             "retry_count": self.retry_count,
             "current_stage": self.current_stage,
             "workspace_path": self.workspace_path,
+            "canonical_output_root": self.canonical_output_root,
             "log_path": self.log_path,
             "produced_artifacts": self.produced_artifacts,
             "progress_snapshot": self.progress_snapshot,
@@ -129,6 +133,7 @@ class QueueJobRuntime:
             retry_count=data.get("retry_count", 0),
             current_stage=data.get("current_stage", ""),
             workspace_path=data.get("workspace_path", ""),
+            canonical_output_root=data.get("canonical_output_root", ""),
             log_path=data.get("log_path", ""),
             produced_artifacts=data.get("produced_artifacts", []),
             progress_snapshot=data.get("progress_snapshot", {}),
@@ -201,7 +206,13 @@ class InProcessQueueService:
 
 class PersistentQueueService:
     def __init__(self, queue_file_path: str | Path) -> None:
-        self.queue_file_path = Path(queue_file_path)
+        self.queue_file_path = Path(queue_file_path).expanduser().resolve()
+        queue_parent = self.queue_file_path.parent
+        self._canonical_output_root = (
+            queue_parent.parent
+            if queue_parent.name.casefold() == "_queue"
+            else queue_parent
+        ).resolve()
         self._lock = threading.Lock()
         self._jobs: Dict[str, QueueJobSpec] = {}
         self._runtimes: Dict[str, QueueJobRuntime] = {}
@@ -219,9 +230,87 @@ class PersistentQueueService:
                     job_id: QueueJobRuntime.from_dict(runtime_data)
                     for job_id, runtime_data in data.get("runtimes", {}).items()
                 }
+                self._normalize_loaded_jobs()
             except (json.JSONDecodeError, KeyError):
                 self._jobs = {}
                 self._runtimes = {}
+
+    def _resolve_path(self, raw_path: Any, *, base: Path | None = None) -> str:
+        value = str(raw_path or "").strip()
+        if not value:
+            return ""
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = (base or self._canonical_output_root) / path
+        return str(path.resolve())
+
+    def _config_output_root(self, parameters: Dict[str, Any]) -> str:
+        config_path_raw = str(parameters.get("config") or "").strip()
+        if not config_path_raw:
+            return ""
+        config_path = Path(self._resolve_path(config_path_raw))
+        if not config_path.is_file():
+            return ""
+        try:
+            import configparser
+
+            parser = configparser.ConfigParser()
+            parser.read(config_path, encoding="utf-8")
+            raw_output = parser.get("Paths", "output_path", fallback="").strip()
+        except (OSError, configparser.Error):
+            return ""
+        return self._resolve_path(raw_output, base=config_path.parent)
+
+    def _normalize_job_spec(self, job_spec: QueueJobSpec) -> QueueJobSpec:
+        parameters = dict(job_spec.parameters or {})
+        explicit_workspace = self._resolve_path(
+            job_spec.workspace_path or parameters.get("workspace_path")
+        )
+        canonical_root = self._resolve_path(job_spec.canonical_output_root)
+        if explicit_workspace:
+            canonical_root = str(Path(explicit_workspace).parent.resolve())
+        if not canonical_root:
+            for candidate in (
+                parameters.get("output_dir"),
+                parameters.get("output_path"),
+            ):
+                candidate_root = self._resolve_path(candidate)
+                if candidate_root:
+                    canonical_root = candidate_root
+                    break
+        if not canonical_root:
+            canonical_root = self._config_output_root(parameters) or str(self._canonical_output_root)
+
+        project_name = str(job_spec.project_name or parameters.get("project_name") or "project").strip()
+        if not explicit_workspace:
+            explicit_workspace = str(
+                (Path(canonical_root) / f"{project_name}__{job_spec.job_id}").resolve()
+            )
+        parameters.setdefault("project_name", project_name)
+        parameters["job_id"] = job_spec.job_id
+        parameters["workspace_path"] = explicit_workspace
+        parameters.setdefault("queue_file", str(self.queue_file_path))
+        return replace(
+            job_spec,
+            parameters=parameters,
+            workspace_path=explicit_workspace,
+            canonical_output_root=canonical_root,
+            log_path=str(Path(explicit_workspace) / "logs" / "job.log"),
+        )
+
+    def _normalize_loaded_jobs(self) -> None:
+        self._jobs = {
+            job_id: self._normalize_job_spec(job)
+            for job_id, job in self._jobs.items()
+        }
+        for job_id, job in self._jobs.items():
+            runtime = self._runtimes.get(job_id)
+            if runtime is not None:
+                runtime.workspace_path = runtime.workspace_path or job.workspace_path
+                runtime.canonical_output_root = (
+                    runtime.canonical_output_root or job.canonical_output_root
+                )
+                runtime.log_path = runtime.log_path or job.log_path
 
     def _save(self) -> None:
         self.queue_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,11 +330,22 @@ class PersistentQueueService:
 
     def add_job(self, job_spec: QueueJobSpec) -> str:
         with self._lock:
-            self._jobs[job_spec.job_id] = job_spec
-            if job_spec.job_id not in self._runtimes:
-                self._runtimes[job_spec.job_id] = QueueJobRuntime(job_id=job_spec.job_id)
+            normalized = self._normalize_job_spec(job_spec)
+            self._jobs[normalized.job_id] = normalized
+            if normalized.job_id not in self._runtimes:
+                self._runtimes[normalized.job_id] = QueueJobRuntime(
+                    job_id=normalized.job_id,
+                    workspace_path=normalized.workspace_path,
+                    canonical_output_root=normalized.canonical_output_root,
+                    log_path=normalized.log_path,
+                )
+            else:
+                runtime = self._runtimes[normalized.job_id]
+                runtime.workspace_path = normalized.workspace_path
+                runtime.canonical_output_root = normalized.canonical_output_root
+                runtime.log_path = normalized.log_path
             self._save()
-        return job_spec.job_id
+        return normalized.job_id
 
     def get_job(self, job_id: str) -> Optional[QueueJobSpec]:
         with self._lock:
@@ -293,6 +393,8 @@ class PersistentQueueService:
                 return False
             if "workspace_path" in info:
                 runtime.workspace_path = str(info["workspace_path"] or "")
+            if "canonical_output_root" in info:
+                runtime.canonical_output_root = str(info["canonical_output_root"] or "")
             if "log_path" in info:
                 runtime.log_path = str(info["log_path"] or "")
             if "produced_artifacts" in info:
@@ -382,6 +484,11 @@ class PersistentQueueService:
             self._runtimes[job_id] = QueueJobRuntime(
                 job_id=job_id,
                 retry_count=previous.retry_count,
+                workspace_path=self._jobs[job_id].workspace_path if job_id in self._jobs else "",
+                canonical_output_root=(
+                    self._jobs[job_id].canonical_output_root if job_id in self._jobs else ""
+                ),
+                log_path=self._jobs[job_id].log_path if job_id in self._jobs else "",
             )
             self._save()
         return True
@@ -537,36 +644,28 @@ class QueueRunner:
     def _external_cancel_requested(job_spec: QueueJobSpec) -> bool:
         """Read a cross-process cancellation marker without mutating state."""
 
-        import os
         from runtime.cancellation import CancellationRequestStore
         from services.job_workspace import JobWorkspace
 
         runtime_workspace = str(job_spec.workspace_path or "").strip()
-        if runtime_workspace:
-            workspace_path = Path(runtime_workspace).expanduser().resolve()
-            project_name = workspace_path.name.rsplit("__", 1)[0]
-            workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
-        else:
-            project_name = str(job_spec.parameters.get("project_name") or job_spec.project_name or "project")
-            base_output_dir = str(job_spec.parameters.get("output_dir") or os.path.join(os.getcwd(), "output"))
-            workspace = JobWorkspace(base_output_dir, project_name, job_spec.job_id)
+        if not runtime_workspace:
+            return False
+        workspace_path = Path(runtime_workspace).expanduser().resolve()
+        project_name = workspace_path.name.rsplit("__", 1)[0]
+        workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
         return CancellationRequestStore(workspace).is_requested()
 
     @staticmethod
     def _clear_external_cancel(job_spec: QueueJobSpec) -> None:
-        import os
         from runtime.cancellation import CancellationRequestStore
         from services.job_workspace import JobWorkspace
 
         runtime_workspace = str(job_spec.workspace_path or "").strip()
-        if runtime_workspace:
-            workspace_path = Path(runtime_workspace).expanduser().resolve()
-            project_name = workspace_path.name.rsplit("__", 1)[0]
-            workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
-        else:
-            project_name = str(job_spec.parameters.get("project_name") or job_spec.project_name or "project")
-            base_output_dir = str(job_spec.parameters.get("output_dir") or os.path.join(os.getcwd(), "output"))
-            workspace = JobWorkspace(base_output_dir, project_name, job_spec.job_id)
+        if not runtime_workspace:
+            return
+        workspace_path = Path(runtime_workspace).expanduser().resolve()
+        project_name = workspace_path.name.rsplit("__", 1)[0]
+        workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
         store = CancellationRequestStore(workspace)
         if store.read() is not None:
             store.clear(cleared_by="queue_runner", reason="retry")
@@ -648,7 +747,11 @@ class QueueRunner:
             self._update_job_stage(job_spec.job_id, "initializing")
             
             # 从job_spec参数构建JobRunRequest
-            params = job_spec.parameters
+            params = dict(job_spec.parameters)
+            params.setdefault("project_name", job_spec.project_name)
+            params.setdefault("job_id", job_spec.job_id)
+            params["workspace_path"] = job_spec.workspace_path
+            params["queue_file"] = str(self.queue_service.queue_file_path)
             project_name = params.get("project_name")
             # Build JobRunRequest from queued parameters
             from services.job_runner import build_job_request_from_mapping
@@ -660,9 +763,7 @@ class QueueRunner:
             
             
             # 计算工作区路径（基于项目名称和任务ID）
-            import os
-            base_output_dir = os.path.join(os.getcwd(), "output")
-            workspace_path = os.path.join(base_output_dir, f"{project_name}__{job_spec.job_id}")
+            workspace_path = str(Path(job_spec.workspace_path).expanduser().resolve())
             
             # 获取工作区锁
             workspace_lock = self._get_workspace_lock(workspace_path)
@@ -685,6 +786,7 @@ class QueueRunner:
             self._update_job_stage(job_spec.job_id, "completing")
             self._update_job_runtime_info(job_spec.job_id, {
                 "workspace_path": result.workspace_path,
+                "canonical_output_root": job_spec.canonical_output_root,
                 "log_path": result.log_path if hasattr(result, 'log_path') else job_spec.log_path,
                 "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
             })

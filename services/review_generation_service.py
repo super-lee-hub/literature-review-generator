@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Evidence-bound Writer Review v3 execution."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
@@ -17,6 +17,7 @@ from runtime.provider_runtime import (
     ProviderRuntime,
     ProviderRuntimeLedger,
 )
+from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.citation_ref_catalog import (
     build_document_ref_catalog,
@@ -66,8 +67,9 @@ class ReviewGenerationService:
         self.cancellation_checker = cancellation_checker
         self.logger = logger or logging.getLogger("auto_generate.review")
         self.receipt_ledger = ProviderRuntimeLedger(
-            self.workspace.artifact_path("provider_receipts.jsonl")
+            self.workspace.artifact_path("review_provider_receipts.jsonl")
         )
+        self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
 
     def run(
         self,
@@ -96,7 +98,25 @@ class ReviewGenerationService:
                 raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
             self._require_nonempty_packet(packet, section_id)
             allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
+            persisted = self._load_section(
+                section_id,
+                raw_section=raw_section,
+                packet=packet,
+                catalog=catalog,
+            )
+            if persisted is not None:
+                sections.append(persisted)
+                continue
             runtime = self._new_runtime(section_id)
+            self._expected_provider_calls[f"review:{section_id}"] = ExpectedProviderCall(
+                call_id=f"review:{section_id}",
+                job_id=self.job_id,
+                attempt_id=self.attempt_id,
+                stage_name="stage3_review",
+                node_id=section_id,
+                max_attempts=max(1, self.settings.runtime.node_retry_limit + 1),
+                usage_required=False,
+            )
             provider_result = self._call_writer(
                 section_number=number,
                 section=raw_section,
@@ -117,8 +137,7 @@ class ReviewGenerationService:
                 allowed_ref_ids=allowed_ref_ids,
                 catalog=catalog,
             )
-            sections.append(
-                {
+            section_payload = {
                     "section_number": number,
                     "section_title": str(
                         raw_section.get("title") or raw_section.get("section_id") or f"Section {number}"
@@ -127,11 +146,29 @@ class ReviewGenerationService:
                     "evidence_packet_id": section_id,
                     "provider_receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
                 }
+            self._persist_section(
+                section_id,
+                section_payload,
+                raw_section=raw_section,
+                packet=packet,
+                catalog=catalog,
             )
+            sections.append(section_payload)
+            if runtime.receipts:
+                receipt = runtime.receipts[-1]
+                self._expected_provider_calls[f"review:{section_id}"] = replace(
+                    self._expected_provider_calls[f"review:{section_id}"],
+                    prompt_hash=receipt.prompt_hash,
+                    input_hash=receipt.input_hash,
+                    config_hash=receipt.config_hash,
+                    schema_hash=receipt.schema_hash,
+                    output_hash=receipt.response_hash or "",
+                )
 
         if not sections:
             raise RuntimeError("Review v3 Writer produced no sections")
         self._register_receipt_ledger()
+        self._persist_receipt_closure()
         return ReviewGenerationResult(
             sections=tuple(sections),
             citation_ref_catalog=catalog,
@@ -183,6 +220,112 @@ class ReviewGenerationService:
             metadata={"catalog_hash": catalog["catalog_hash"]},
         )
         return catalog, path
+
+    def _section_path(self, section_id: str) -> Path:
+        safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in section_id)
+        return Path(self.workspace.artifact_path(f"review_sections/{safe}.json"))
+
+    def _load_section(
+        self,
+        section_id: str,
+        *,
+        raw_section: Mapping[str, Any],
+        packet: Mapping[str, Any],
+        catalog: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        record = self.registry.get(f"review-section:{section_id}")
+        path = self._section_path(section_id)
+        if record is None or record.status != "ready" or not path.is_file():
+            return None
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(envelope, Mapping) or envelope.get("status") != "ready":
+            return None
+        if envelope.get("outline_section_hash") != hashlib.sha256(
+            json.dumps(dict(raw_section), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest():
+            return None
+        if envelope.get("evidence_packet_hash") != hashlib.sha256(
+            json.dumps(dict(packet), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest():
+            return None
+        if envelope.get("catalog_hash") != str(catalog.get("catalog_hash") or ""):
+            return None
+        payload = envelope.get("section")
+        return dict(payload) if isinstance(payload, Mapping) else None
+
+    @staticmethod
+    def _input_hash(value: Mapping[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _persist_section(
+        self,
+        section_id: str,
+        section: Mapping[str, Any],
+        *,
+        raw_section: Mapping[str, Any],
+        packet: Mapping[str, Any],
+        catalog: Mapping[str, Any],
+    ) -> None:
+        path = self._section_path(section_id)
+        atomic_write_json(
+            str(path),
+            {
+                "status": "ready",
+                "job_id": self.job_id,
+                "section_id": section_id,
+                "outline_section_hash": self._input_hash(raw_section),
+                "evidence_packet_hash": self._input_hash(packet),
+                "catalog_hash": str(catalog.get("catalog_hash") or ""),
+                "section": dict(section),
+            },
+        )
+        dependencies: list[ArtifactDependencyRefV2] = []
+        for artifact_id in ("outline-v3:section_evidence_packets", "citation_ref_catalog"):
+            record = self.registry.get(artifact_id)
+            if record is not None and record.status == "ready":
+                dependencies.append(ArtifactDependencyRefV2.from_record(record))
+        self.registry.register_file(
+            artifact_role="review_section",
+            artifact_type="review_section",
+            artifact_version="v3",
+            path=str(path),
+            producer="services.review_generation_service.ReviewGenerationService",
+            artifact_id=f"review-section:{section_id}",
+            depends_on=dependencies,
+            metadata={"section_id": section_id, "catalog_hash": str(catalog.get("catalog_hash") or "")},
+        )
+
+    def _persist_receipt_closure(self) -> None:
+        expected_call_ids = set(self._expected_provider_calls)
+        closure = ProviderReceiptClosure.evaluate(
+            self._expected_provider_calls.values(),
+            [
+                receipt
+                for receipt in self.receipt_ledger.list_receipts()
+                if receipt.call_id in expected_call_ids
+            ],
+        )
+        path = Path(self.workspace.artifact_path("review_provider_receipt_closure.json"))
+        atomic_write_json(str(path), {"job_id": self.job_id, "payload": closure.to_dict()})
+        dependencies: list[ArtifactDependencyRefV2] = []
+        ledger = self.registry.get("review_provider_receipts")
+        if ledger is not None and ledger.status == "ready":
+            dependencies.append(ArtifactDependencyRefV2.from_record(ledger))
+        self.registry.register_file(
+            artifact_role="provider_receipt_closure",
+            artifact_type="provider_receipt_closure",
+            artifact_version="v1",
+            path=str(path),
+            producer="services.review_generation_service.ReviewGenerationService",
+            artifact_id="review:provider_receipt_closure",
+            depends_on=dependencies,
+            metadata={"closure_hash": closure.closure_hash, "complete": closure.complete},
+        )
 
     def _call_writer(
         self,
@@ -431,6 +574,8 @@ class ReviewGenerationService:
             stage_name="stage3_review",
             route="Writer_API",
             node_id=section_id,
+            call_id=f"review:{section_id}",
+            endpoint_type=str(config.get("endpoint_type") or "responses"),
             schema_hash=hashlib.sha256(b"review_draft_v3_writer_section").hexdigest(),
         )
 
@@ -471,7 +616,7 @@ class ReviewGenerationService:
             artifact_version="v1",
             path=str(self.receipt_ledger.path),
             producer="services.review_generation_service.ReviewGenerationService",
-            artifact_id="provider_receipts",
+            artifact_id="review_provider_receipts",
             metadata={"receipt_count": len(self.receipt_ledger.list_receipts())},
         )
 
@@ -480,7 +625,7 @@ class ReviewGenerationService:
             self.cancellation_checker()
 
     def _max_output_tokens(self) -> int:
-        raw = self.settings.section("Writer_API").get("max_output_tokens") or self.settings.section("API_Parameters").get("writer_max_tokens") or 32000
+        raw = self.settings.section("Writer_API").get("max_output_tokens") or 32000
         try:
             return max(256, int(raw))
         except (TypeError, ValueError):

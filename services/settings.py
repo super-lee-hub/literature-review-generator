@@ -26,12 +26,21 @@ API_KEYS = frozenset(
         "thinking",
         "reasoning_effort",
         "reasoning_display",
+        "text_verbosity",
         "max_context_tokens",
-        "max_tokens",
+        "max_output_tokens",
+        "temperature",
+        "connect_timeout_seconds",
+        "read_timeout_seconds",
+        "total_timeout_seconds",
+        "first_token_timeout_seconds",
+        "transport_retries",
+        "reasoning_reserve_tokens",
+        "safety_margin_tokens",
+        "supports_pdf_file_input",
+        "pdf_file_input",
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
-        "text_verbosity",
-        "max_output_tokens",
     }
 )
 
@@ -49,6 +58,11 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "max_workers",
             "transport_retries",
             "node_retry_limit",
+            "stage1_retry_limit",
+            "review_section_retry_limit",
+            "validation_retry_limit",
+            "retry_base_delay_seconds",
+            "retry_max_delay_seconds",
             "total_job_deadline_seconds",
             "retain_checkpoints_after_completion",
         }
@@ -74,7 +88,6 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "require_explicit_adoption",
             "technical_shard_target_tokens",
             "allow_bibliometric_provider",
-            "test_dev_fixture_mode",
         }
     ),
     "OutlineModels": frozenset(
@@ -125,32 +138,8 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "rag_backend",
         }
     ),
-    "Retry_Settings": frozenset({"max_retry_rounds", "base_retry_delay", "max_retry_delay"}),
-    "Stage2_Retry": frozenset({"enabled", "max_retry_rounds", "base_retry_delay", "max_retry_delay"}),
     "Styling": frozenset({"font_name", "font_size_body", "font_size_heading1", "font_size_heading2"}),
     "GUI": frozenset({"language"}),
-    "API_Parameters": frozenset(
-        {
-            "primary_max_tokens",
-            "primary_temperature",
-            "timeout_seconds",
-            "backup_max_tokens",
-            "backup_temperature",
-            "concept_max_tokens",
-            "concept_temperature",
-            "writer_max_tokens",
-            "writer_temperature",
-            "outline_max_tokens",
-            "outline_temperature",
-            "free_mode_max_tokens",
-            "free_mode_temperature",
-            "validator_max_tokens",
-            "validator_temperature",
-            "validator_context_max_tokens",
-            "claims_max_tokens",
-            "claims_temperature",
-        }
-    ),
     "Stage1_Input": frozenset(
         {
             "send_extracted_text",
@@ -224,6 +213,11 @@ class RuntimeSettings:
     max_workers: int = 3
     transport_retries: int = 2
     node_retry_limit: int = 2
+    stage1_retry_limit: int = 2
+    review_section_retry_limit: int = 2
+    validation_retry_limit: int = 1
+    retry_base_delay_seconds: int = 30
+    retry_max_delay_seconds: int = 120
     total_job_deadline_seconds: int = 0
     retain_checkpoints_after_completion: bool = False
 
@@ -234,6 +228,11 @@ class RuntimeSettings:
             max_workers=_int(section.get("max_workers"), 3),
             transport_retries=_int(section.get("transport_retries"), 2),
             node_retry_limit=_int(section.get("node_retry_limit"), 2),
+            stage1_retry_limit=_int(section.get("stage1_retry_limit"), 2),
+            review_section_retry_limit=_int(section.get("review_section_retry_limit"), 2),
+            validation_retry_limit=_int(section.get("validation_retry_limit"), 1),
+            retry_base_delay_seconds=_int(section.get("retry_base_delay_seconds"), 30),
+            retry_max_delay_seconds=_int(section.get("retry_max_delay_seconds"), 120),
             total_job_deadline_seconds=_int(section.get("total_job_deadline_seconds"), 0),
             retain_checkpoints_after_completion=_bool(section.get("retain_checkpoints_after_completion"), False),
         )
@@ -249,7 +248,6 @@ class OutlineSettings:
     require_explicit_adoption: bool = True
     technical_shard_target_tokens: int = 0
     allow_bibliometric_provider: bool = False
-    test_dev_fixture_mode: bool = False
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "OutlineSettings":
@@ -263,7 +261,6 @@ class OutlineSettings:
             require_explicit_adoption=_bool(section.get("require_explicit_adoption"), True),
             technical_shard_target_tokens=_int(section.get("technical_shard_target_tokens"), 0),
             allow_bibliometric_provider=_bool(section.get("allow_bibliometric_provider"), False),
-            test_dev_fixture_mode=_bool(section.get("test_dev_fixture_mode"), False),
         )
 
 
@@ -318,9 +315,6 @@ class ApplicationSettings:
 
     def outline_require_explicit_adopt(self) -> bool:
         return self.outline.require_explicit_adoption
-
-    def outline_test_dev_fixture_mode(self) -> bool:
-        return self.outline.test_dev_fixture_mode
 
     def outline_quality_gate_coverage_scope(self) -> str:
         value = str(self.section("OutlineQualityGate").get("coverage_scope", "full")).strip().lower()
@@ -391,8 +385,27 @@ class ApplicationSettings:
 def validate_config_keys(config: Mapping[str, Mapping[str, Any]]) -> list[str]:
     """Return strict unknown-section/key errors for the current schema."""
 
+    legacy_section_replacements = {
+        "Retry_Settings": "Use [Runtime].review_section_retry_limit and the other typed [Runtime] retry keys instead.",
+        "Stage2_Retry": "Use the typed retry keys in [Runtime] instead.",
+        "API_Parameters": "Put provider-owned limits and timeouts directly in the relevant provider section.",
+    }
+    legacy_key_replacements = {
+        ("Outline", "test_dev_fixture_mode"): (
+            "Fixture providers are test-injected only and cannot be enabled by production configuration."
+        ),
+        ("Runtime", "max_retry_rounds"): "Use [Runtime].node_retry_limit instead.",
+        ("Runtime", "base_retry_delay"): "Use [Runtime].retry_base_delay_seconds instead.",
+        ("Runtime", "max_retry_delay"): "Use [Runtime].retry_max_delay_seconds instead.",
+    }
     errors: list[str] = []
     for section_name, values in config.items():
+        if section_name in legacy_section_replacements:
+            errors.append(
+                f"Unsupported current configuration section [{section_name}]. "
+                f"{legacy_section_replacements[section_name]}"
+            )
+            continue
         allowed = CONFIG_KEYS.get(section_name)
         if allowed is None:
             for key in values:
@@ -405,9 +418,12 @@ def validate_config_keys(config: Mapping[str, Mapping[str, Any]]) -> list[str]:
             continue
         for key in values:
             if str(key) not in allowed:
+                replacement = legacy_key_replacements.get((section_name, str(key)))
+                suffix = f" {replacement}" if replacement else ""
                 errors.append(
                     f"Unsupported configuration key: [{section_name}].{key}. "
                     "This project accepts only the current typed configuration keys."
+                    f"{suffix}"
                 )
     return errors
 

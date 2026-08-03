@@ -66,6 +66,7 @@ class RuntimeJobSpec:
     reuse_summary_files: tuple[str, ...] = ()
     generate_section: int | None = None
     queue_file: str = "output/_queue/queue.json"
+    workspace_path: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -158,6 +159,7 @@ class RuntimeJobSpec:
             zotero_report=self.source.zotero_report or None,
             library_path=self.source.library_path or None,
             queue_file=self.queue_file,
+            workspace_path=self.workspace_path or None,
             requested_stages=requested_stages,
             validation_required=(
                 self.metadata["validation_required"]
@@ -220,6 +222,7 @@ class RuntimeJobSpec:
             summary_sources=tuple(resolve_path(item) for item in self.summary_sources),
             reuse_summary_files=tuple(resolve_path(item) for item in self.reuse_summary_files),
             queue_file=resolve_path(self.queue_file),
+            workspace_path=resolve_path(self.workspace_path),
             metadata=metadata,
         )
 
@@ -253,6 +256,7 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
+            workspace_path=str(payload.get("workspace_path") or ""),
             metadata=dict(payload.get("metadata") or {}),
         )
 

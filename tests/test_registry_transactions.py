@@ -89,43 +89,12 @@ def test_v1_registry_is_read_additively_and_next_write_emits_v2(tmp_path: Path) 
     )
     legacy_bytes = registry_path.read_bytes()
 
-    registry = ArtifactRegistry(registry_path, "job-legacy")
+    with pytest.raises(RegistryCorruption, match="unsupported artifact_registry_version"):
+        ArtifactRegistry(registry_path, "job-legacy")
 
+    # A legacy registry is rejected before any compatibility projection or
+    # write can occur.
     assert registry_path.read_bytes() == legacy_bytes
-
-    legacy = registry.get("legacy-artifact")
-
-    assert registry.revision == 0
-    assert legacy is not None
-    assert legacy.depends_on[0].dependency_kind == "local_job"
-    assert legacy.depends_on[0].job_id == "job-legacy"
-    assert legacy.depends_on[0].artifact_id == "source_pdf:source.pdf"
-
-    new_path = _write_artifact(tmp_path / "new.json", "new")
-    registry.register_file(
-        artifact_id="new-artifact",
-        artifact_role="summary",
-        artifact_type="summary_file",
-        artifact_version="v2",
-        path=new_path,
-        producer="tests",
-    )
-
-    payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert payload["artifact_registry_version"] == "v2"
-    assert payload["revision"] == 1
-    assert {item["artifact_id"] for item in payload["artifacts"]} == {
-        "legacy-artifact",
-        "new-artifact",
-    }
-    assert set(payload["artifacts"][0]["depends_on"][0]) == {
-        "dependency_kind",
-        "job_id",
-        "artifact_id",
-        "artifact_type",
-        "path",
-        "content_hash",
-    }
 
 
 @pytest.mark.parametrize(
@@ -648,7 +617,7 @@ def test_save_revalidates_ready_artifact_and_local_dependency_hashes(tmp_path: P
     registry_path.write_text(json.dumps(payload), encoding="utf-8")
     registry = ArtifactRegistry(registry_path, "job-save-verify")
 
-    with pytest.raises(UnverifiedDependency, match="dependency declared hash mismatch: parent"):
+    with pytest.raises(UnverifiedDependency, match="dependency content hash mismatch: parent"):
         registry.save()
 
     assert registry.revision == ready_revision

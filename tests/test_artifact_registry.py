@@ -3,9 +3,9 @@ import json
 import pytest
 
 from services.artifact_registry import (
-    ArtifactDependencyRef,
     ArtifactDependencyRefV2,
     ArtifactRegistry,
+    RegistryCorruption,
     UnverifiedArtifact,
     UnverifiedDependency,
 )
@@ -35,8 +35,11 @@ def test_artifact_registry_persists_records_and_dependencies(tmp_path) -> None:
         path=str(artifact_path),
         producer="tests",
         depends_on=[
-            ArtifactDependencyRef(
-                artifact_type="source",
+            ArtifactDependencyRefV2(
+                dependency_kind="local_job",
+                job_id="job-123",
+                artifact_id=source_record.artifact_id,
+                artifact_type=source_record.artifact_type,
                 path=source_record.path,
                 content_hash=source_record.content_hash,
             )
@@ -78,7 +81,10 @@ def test_ready_registration_rejects_unregistered_local_dependency(tmp_path) -> N
             path=child_path,
             producer="tests",
             depends_on=[
-                ArtifactDependencyRef(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id="job-123",
+                    artifact_id="parent",
                     artifact_type="parent",
                     path=str(parent_path),
                     content_hash="a" * 64,
@@ -90,7 +96,7 @@ def test_ready_registration_rejects_unregistered_local_dependency(tmp_path) -> N
     assert registry.revision == 0
 
 
-def test_path_only_dependency_rejects_ambiguous_registry_identity(tmp_path) -> None:
+def test_legacy_path_only_dependency_is_rejected(tmp_path) -> None:
     registry = ArtifactRegistry(tmp_path / "artifact_registry.json", "job-123")
     shared_path = tmp_path / "shared.json"
     shared_path.write_text("{}", encoding="utf-8")
@@ -106,7 +112,7 @@ def test_path_only_dependency_rejects_ambiguous_registry_identity(tmp_path) -> N
     child_path = tmp_path / "child.json"
     child_path.write_text("{}", encoding="utf-8")
 
-    with pytest.raises(UnverifiedDependency, match="multiple Registry records"):
+    with pytest.raises(RegistryCorruption, match="missing required fields"):
         registry.register_file(
             artifact_id="child",
             artifact_role="child",
@@ -115,10 +121,7 @@ def test_path_only_dependency_rejects_ambiguous_registry_identity(tmp_path) -> N
             path=child_path,
             producer="tests",
             depends_on=[
-                ArtifactDependencyRef(
-                    artifact_type="source",
-                    path=str(shared_path),
-                )
+                {"artifact_type": "source", "path": str(shared_path)}
             ],
         )
 
@@ -129,7 +132,10 @@ def test_quarantined_registration_preserves_unverified_dependency(tmp_path) -> N
     registry = ArtifactRegistry(tmp_path / "artifact_registry.json", "job-123")
     child_path = tmp_path / "child.json"
     child_path.write_text("{}", encoding="utf-8")
-    dependency = ArtifactDependencyRef(
+    dependency = ArtifactDependencyRefV2(
+        dependency_kind="local_job",
+        job_id="job-123",
+        artifact_id="parent",
         artifact_type="parent",
         path=str(tmp_path / "missing-parent.json"),
         content_hash="a" * 64,
@@ -200,10 +206,8 @@ def test_ready_transition_rejects_empty_artifact_hash(tmp_path) -> None:
     assert registry.get("candidate").status == "quarantined"  # type: ignore[union-attr]
 
 
-def test_legacy_dependency_constructor_keeps_positional_field_order() -> None:
-    dependency = ArtifactDependencyRef("source_pdf", "/tmp/source.pdf", "abc123")
-
-    assert dependency.artifact_type == "source_pdf"
-    assert dependency.path == "/tmp/source.pdf"
-    assert dependency.content_hash == "abc123"
-    assert dependency.dependency_kind == "local_job"
+def test_current_dependency_requires_explicit_identity() -> None:
+    with pytest.raises(RegistryCorruption, match="missing required fields"):
+        ArtifactDependencyRefV2.from_dict(
+            {"artifact_type": "source_pdf", "path": "/tmp/source.pdf", "content_hash": "abc123"}
+        )

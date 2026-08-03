@@ -11,7 +11,7 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 from services.job_workspace import JobWorkspace, atomic_write_json
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.repair_policy import (
     ValidationRepairPolicy,
     auto_safe_apply_enabled,
@@ -33,6 +33,19 @@ APPLIED_PATCH_RECORD_ARTIFACT_TYPE = "applied_patch_record"
 CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
 
 
+def _registered_dependency(
+    registry: ArtifactRegistry,
+    artifact_id: str,
+    *,
+    require_ready: bool = True,
+) -> ArtifactDependencyRefV2:
+    record = registry.get(str(artifact_id))
+    if record is None or (require_ready and record.status != "ready"):
+        expected = "ready current" if require_ready else "registered current"
+        raise ValueError(f"repair dependency is not a {expected} artifact: {artifact_id}")
+    return ArtifactDependencyRefV2.from_record(record)
+
+
 def persist_repair_plan(
     repair_plan: RepairPlan,
     workspace: JobWorkspace,
@@ -50,10 +63,8 @@ def persist_repair_plan(
         path=plan_path,
         producer="services.repair_integration.persist_repair_plan",
         job_id=repair_plan.created_from_job_id,
-        status="completed",
-        depends_on=[
-            {"artifact_id": repair_plan.validation_report_id, "role": "validation_report"},
-        ],
+        status="ready",
+        depends_on=[_registered_dependency(registry, repair_plan.validation_report_id)],
     )
     
     return plan_path
@@ -76,10 +87,8 @@ def persist_repair_report(
         path=report_path,
         producer="services.repair_integration.persist_repair_report",
         job_id=repair_report.created_from_job_id,
-        status="completed",
-        depends_on=[
-            {"artifact_id": repair_report.plan_id, "role": "repair_plan"},
-        ],
+        status="quarantined",
+        depends_on=[_registered_dependency(registry, f"repair_plan_{repair_report.plan_id}")],
     )
     
     return report_path
@@ -107,10 +116,8 @@ def persist_repair_apply_result(
         path=result_path,
         producer="services.repair_integration.persist_repair_apply_result",
         job_id=job_id,
-        status="completed",
-        depends_on=[
-            {"artifact_id": apply_result.plan_id, "role": "repair_plan"},
-        ],
+        status="quarantined",
+        depends_on=[_registered_dependency(registry, f"repair_plan_{apply_result.plan_id}")],
     )
     
     # Also persist individual patch records
@@ -125,10 +132,8 @@ def persist_repair_apply_result(
             path=record_path,
             producer="services.repair_integration.persist_repair_apply_result",
             job_id=job_id,
-            status="completed",
-            depends_on=[
-                {"artifact_id": apply_result.plan_id, "role": "repair_plan"},
-            ],
+            status="quarantined",
+            depends_on=[_registered_dependency(registry, f"repair_plan_{apply_result.plan_id}")],
         )
     
     return result_path
@@ -154,9 +159,13 @@ def persist_patched_citation_manifest(
         path=manifest_path,
         producer="services.repair_integration.persist_patched_citation_manifest",
         job_id=job_id,
-        status="completed",
+        status="quarantined",
         depends_on=[
-            {"artifact_id": f"repair_apply_result_{apply_result.plan_id}", "role": "repair_apply_result"},
+            _registered_dependency(
+                registry,
+                f"repair_apply_result_{apply_result.plan_id}",
+                require_ready=False,
+            )
         ],
         artifact_role="citation_manifest",
     )

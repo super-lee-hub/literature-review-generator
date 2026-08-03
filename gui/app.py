@@ -1161,14 +1161,13 @@ class WorkspaceController:
                 "max_workers": self.sections["Runtime"].get("max_workers", "3"),
                 "transport_retries": self.sections["Runtime"].get("transport_retries", "2"),
                 "node_retry_limit": self.sections["Runtime"].get("node_retry_limit", "2"),
+                "stage1_retry_limit": self.sections["Runtime"].get("stage1_retry_limit", "2"),
+                "review_section_retry_limit": self.sections["Runtime"].get("review_section_retry_limit", "2"),
+                "validation_retry_limit": self.sections["Runtime"].get("validation_retry_limit", "1"),
+                "retry_base_delay_seconds": self.sections["Runtime"].get("retry_base_delay_seconds", "30"),
+                "retry_max_delay_seconds": self.sections["Runtime"].get("retry_max_delay_seconds", "120"),
                 "total_job_deadline_seconds": self.sections["Runtime"].get("total_job_deadline_seconds", "0"),
                 "review_validation_enabled": current_settings.validation.review_enabled,
-            },
-            "stage2_retry": {
-                "enabled": self.sections.get("Stage2_Retry", {}).get("enabled", "true") == "true",
-                "max_retry_rounds": self.sections.get("Stage2_Retry", {}).get("max_retry_rounds", "2"),
-                "base_retry_delay": self.sections.get("Stage2_Retry", {}).get("base_retry_delay", "30"),
-                "max_retry_delay": self.sections.get("Stage2_Retry", {}).get("max_retry_delay", "120"),
             },
             "preprocess": {
                 "enabled": self.sections["Preprocess"].get("enabled", "true") == "true",
@@ -1942,6 +1941,11 @@ class WorkspaceController:
                 "max_workers": str(self.state["runtime"]["max_workers"]),
                 "transport_retries": str(self.state["runtime"]["transport_retries"]),
                 "node_retry_limit": str(self.state["runtime"]["node_retry_limit"]),
+                "stage1_retry_limit": str(self.state["runtime"]["stage1_retry_limit"]),
+                "review_section_retry_limit": str(self.state["runtime"]["review_section_retry_limit"]),
+                "validation_retry_limit": str(self.state["runtime"]["validation_retry_limit"]),
+                "retry_base_delay_seconds": str(self.state["runtime"]["retry_base_delay_seconds"]),
+                "retry_max_delay_seconds": str(self.state["runtime"]["retry_max_delay_seconds"]),
                 "total_job_deadline_seconds": str(self.state["runtime"]["total_job_deadline_seconds"]),
             }
         )
@@ -1950,14 +1954,6 @@ class WorkspaceController:
             {
                 "stage1_enabled": "false",
                 "review_enabled": "true" if self.state["runtime"]["review_validation_enabled"] else "false",
-            }
-        )
-        updated_sections["Stage2_Retry"].update(
-            {
-                "enabled": "true" if self.state["stage2_retry"]["enabled"] else "false",
-                "max_retry_rounds": str(self.state["stage2_retry"]["max_retry_rounds"]),
-                "base_retry_delay": str(self.state["stage2_retry"]["base_retry_delay"]),
-                "max_retry_delay": str(self.state["stage2_retry"]["max_retry_delay"]),
             }
         )
         updated_sections["Preprocess"].update(
@@ -1981,7 +1977,7 @@ class WorkspaceController:
         api_keys: Dict[str, str] = {}
         for section_name, card in self.api_cards.items():
             updated_sections.setdefault(section_name, {})
-            updated_sections[section_name]["provider"] = card["provider"]
+            updated_sections[section_name]["provider_family"] = card["provider"]
             updated_sections[section_name]["model"] = card["model"]
             updated_sections[section_name]["api_base"] = card["api_base"]
             updated_sections[section_name]["proxy_mode"] = card.get("proxy_mode", "environment") or "environment"
@@ -2036,10 +2032,16 @@ class WorkspaceController:
         if self.test_mode:
             response = self._mock_free_mode_response(message)
         else:
+            free_mode_output_dir = str(self.state["paths"].get("output_path") or "./output")
+            free_mode_project_name = str(
+                self.state["workflow"].get("project_name") or "free_mode"
+            ).strip() or "free_mode"
             response = await asyncio.to_thread(
                 plan_free_mode_chat_turn,
                 messages=list(self.free_mode_messages),
                 config=self.build_runtime_config(),
+                output_dir=free_mode_output_dir,
+                project_name=free_mode_project_name,
             )
 
         self.free_mode_busy = False
@@ -3419,16 +3421,12 @@ def launch_gui(
                         ui.input(t("最大并发"), value=controller.state["runtime"]["max_workers"]).bind_value(controller.state["runtime"], "max_workers")
                         ui.input(t("传输层重试次数"), value=controller.state["runtime"]["transport_retries"]).bind_value(controller.state["runtime"], "transport_retries")
                         ui.input(t("节点重试上限"), value=controller.state["runtime"]["node_retry_limit"]).bind_value(controller.state["runtime"], "node_retry_limit")
+                        ui.input(t("阶段一重试上限"), value=controller.state["runtime"]["stage1_retry_limit"]).bind_value(controller.state["runtime"], "stage1_retry_limit")
+                        ui.input(t("综述章节重试上限"), value=controller.state["runtime"]["review_section_retry_limit"]).bind_value(controller.state["runtime"], "review_section_retry_limit")
+                        ui.input(t("验证批次重试上限"), value=controller.state["runtime"]["validation_retry_limit"]).bind_value(controller.state["runtime"], "validation_retry_limit")
+                        ui.input(t("重试基础等待秒数"), value=controller.state["runtime"]["retry_base_delay_seconds"]).bind_value(controller.state["runtime"], "retry_base_delay_seconds")
+                        ui.input(t("重试最大等待秒数"), value=controller.state["runtime"]["retry_max_delay_seconds"]).bind_value(controller.state["runtime"], "retry_max_delay_seconds")
                         ui.input(t("任务总时限（秒）"), value=controller.state["runtime"]["total_job_deadline_seconds"]).bind_value(controller.state["runtime"], "total_job_deadline_seconds")
-
-                with ui.card().classes("ag-card p-6"):
-                    ui.label(t("阶段二重试")).classes("ag-section-title")
-                    ui.label(t("阶段二自动重试会在全文生成时自动补跑失败章节。")).classes("ag-subtle")
-                    with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                        ui.switch(t("启用阶段二自动重试"), value=controller.state["stage2_retry"]["enabled"]).bind_value(controller.state["stage2_retry"], "enabled")
-                        ui.input(t("阶段二最大重试轮数"), value=controller.state["stage2_retry"]["max_retry_rounds"]).bind_value(controller.state["stage2_retry"], "max_retry_rounds")
-                        ui.input(t("阶段二基础等待秒数"), value=controller.state["stage2_retry"]["base_retry_delay"]).bind_value(controller.state["stage2_retry"], "base_retry_delay")
-                        ui.input(t("阶段二最大等待秒数"), value=controller.state["stage2_retry"]["max_retry_delay"]).bind_value(controller.state["stage2_retry"], "max_retry_delay")
 
                 with ui.card().classes("ag-card ag-card-strong p-6"):
                     ui.label(t("PDF 预处理")).classes("ag-section-title")

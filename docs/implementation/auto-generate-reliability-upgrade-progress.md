@@ -237,7 +237,7 @@ code commit itself.
 
 | Command | Exit | Evidence |
 | --- | ---: | --- |
-| `python -m pytest -q tests/test_validation_run_result.py tests/test_sentence_segmenter.py tests/test_runtime_validation_bridge.py tests/test_claim_paper_alignment_validation.py tests/test_review_draft_durability.py tests/test_structured_citations.py tests/test_week3_validation.py tests/test_week4_repair_integration.py tests/test_runtime_orchestrator.py tests/test_runtime_subagent_contract.py tests/test_runtime_validation_adapter_contract.py tests/test_review_validation_replay.py` | 0 | `129 passed in 13.42s` after compatibility fixes |
+| `python -m pytest -q tests/test_validation_run_result.py tests/test_sentence_segmenter.py tests/test_runtime_validation_bridge.py tests/test_claim_paper_alignment_validation.py tests/test_review_draft_durability.py tests/test_structured_citations.py tests/test_week3_validation.py tests/test_week4_repair_integration.py tests/test_runtime_orchestrator.py tests/test_runtime_subagent_contract.py tests/test_runtime_validation_execution_service_contract.py tests/test_review_validation_replay.py` | 0 | `129 passed in 13.42s` after compatibility fixes |
 | `python -m pytest -q tests/test_validation_projections.py tests/test_citation_v3_cutover.py tests/test_validator_adjudication_flow.py tests/test_runtime_validation_bridge.py` | 0 | `17 passed in 3.74s` |
 | `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | 0 | `784 passed, 22 deselected in 59.00s`; zero skips |
 | `python -m pyright validation/run_result.py tests/test_validation_run_result.py tests/test_validation_projections.py services/sentence_segmenter.py services/review_draft.py services/citation_manifest.py validation/review_validator.py validation/claim_alignment_audit.py runtime/orchestrator.py validator.py` | 0 | `0 errors, 0 warnings, 0 informations` |
@@ -724,11 +724,11 @@ code commit itself.
 - Contracts and dependency resolution: `validation/run_result.py`,
   `validation/input_dependencies.py`.
 - Registration and recovery: `validator.py`, `runtime/orchestrator.py`,
-  `runtime/validation_adapter.py`, `runtime/runner.py`, `runtime/reconcile.py`.
+  `validation/execution_service.py`, `runtime/runner.py`, `runtime/reconcile.py`.
 - Regression coverage: `tests/test_validation_input_dependencies.py`,
   `tests/test_validation_run_result.py`, `tests/test_validation_projections.py`,
   `tests/test_runtime_validation_bridge.py`,
-  `tests/test_runtime_validation_adapter_contract.py`,
+  `tests/test_runtime_validation_execution_service_contract.py`,
   `tests/test_runtime_runner.py`, and `tests/test_synthetic_runtime_e2e.py`.
 
 ### Verification evidence

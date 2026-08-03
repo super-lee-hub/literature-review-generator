@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import fitz  # type: ignore
 
-from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry, file_sha256
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
 from services.job_workspace import atomic_write_json, utc_now_iso
 
 
@@ -261,7 +261,8 @@ class Stage1VisualArtifactBuilder:
         manifest_dependencies = list(depends_on)
         for visual in selected_visuals:
             manifest_dependencies.append(
-                ArtifactDependencyRef(
+                self._registered_input_dependency(
+                    artifact_registry,
                     artifact_type=visual.artifact_type,
                     path=visual.image_path,
                 )
@@ -291,14 +292,16 @@ class Stage1VisualArtifactBuilder:
         )
         atomic_write_json(bundle_path, bundle.to_dict())
         bundle_dependencies = [
-            ArtifactDependencyRef(
+            self._registered_input_dependency(
+                artifact_registry,
                 artifact_type="visual_manifest",
                 path=manifest_path,
             )
         ]
         for visual in selected_visuals:
             bundle_dependencies.append(
-                ArtifactDependencyRef(
+                self._registered_input_dependency(
+                    artifact_registry,
                     artifact_type=visual.artifact_type,
                     path=visual.image_path,
                 )
@@ -320,7 +323,7 @@ class Stage1VisualArtifactBuilder:
         pdf_hash: str,
         preprocess_metadata: Mapping[str, Any],
         artifact_registry: ArtifactRegistry,
-    ) -> List[ArtifactDependencyRef]:
+    ) -> List[ArtifactDependencyRefV2]:
         source_dependency = self._registered_input_dependency(
             artifact_registry,
             artifact_type="source_pdf",
@@ -351,7 +354,7 @@ class Stage1VisualArtifactBuilder:
         *,
         artifact_type: str,
         path: str,
-    ) -> ArtifactDependencyRef:
+    ) -> ArtifactDependencyRefV2:
         resolved_path = os.path.abspath(path)
         normalized_path = os.path.normcase(resolved_path)
         candidates = [
@@ -379,7 +382,7 @@ class Stage1VisualArtifactBuilder:
                 producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
                 artifact_id=f"visual-input:{artifact_type}:{path_hash}",
             )
-        return ArtifactDependencyRef(
+        return ArtifactDependencyRefV2(
             artifact_type=record.artifact_type,
             path=record.path,
             content_hash=record.content_hash,

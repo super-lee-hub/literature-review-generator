@@ -16,17 +16,44 @@ from summary_schema import normalize_ai_summary
 def _summary() -> dict[str, Any]:
     return normalize_ai_summary(
         {
-            "common_core": {
+            "routing": {
+                "paper_type": "empirical",
+                "paper_subtype_raw": "experiment",
+                "paper_subtype_normalized": "experiment",
+                "classification_status": "resolved",
+                "route_confidence": "high",
+                "classification_rationale": "visual empirical design",
+                "secondary_candidates": [],
+            },
+            "paper_metadata": {
                 "title": "Visual evidence study",
+                "authors": ["Example Author"],
+                "year": "2025",
+                "journal": "Example Journal",
+                "doi": "10.1000/visual",
+            },
+            "core_analysis": {
                 "summary": "A study with a figure-supported empirical result.",
                 "methodology": "Experiment with N=80 observations.",
                 "findings": "The figure reports a 20 percent improvement (p < 0.05).",
                 "conclusions": "The result is consistent with the proposed mechanism.",
+                "key_points": ["The figure reports a 20 percent improvement."],
+                "relevance": "The result informs visual evidence interpretation.",
+                "limitations": "The result is bounded by the tested context.",
+                "theoretical_framework": None,
+                "research_gap": "Further replication is needed.",
+                "future_research_directions": [],
             },
-            "type_specific_details": {
-                "paper_type": "empirical",
-                "data_source_and_size": "Experiment, N=80.",
-                "analysis_technique": "Regression analysis.",
+            "specialized_details": {
+                "empirical": {
+                    "research_questions_or_hypotheses": [],
+                    "data_source_and_size": "Experiment, N=80.",
+                    "analysis_technique": "Regression analysis.",
+                    "core_variables": {"independent": ["treatment"], "dependent": ["outcome"]},
+                    "sample_characteristics_or_context": "Experimental context.",
+                },
+                "review": None,
+                "conceptual": None,
             },
         }
     )

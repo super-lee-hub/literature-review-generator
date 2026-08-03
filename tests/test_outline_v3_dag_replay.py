@@ -45,7 +45,7 @@ def test_node_dag_contains_required_nodes_and_preserves_completed_candidates_on_
         "coverage_audit",
         "stability_audit",
         "stage_health",
-        "adoption",
+        "provider_receipt_closure",
     }.issubset(node_ids)
     assert "candidate_1_provider_generation" in node_ids
 
@@ -75,20 +75,24 @@ def test_node_dag_contains_required_nodes_and_preserves_completed_candidates_on_
     assert retry_plan.rerun_node_ids == plan.rerun_node_ids
     assert retried.get("candidate_1").status == "succeeded"
     assert retried.get("structure_critique").status == "pending"
-    assert retried.get("adoption").status == "pending"
+    assert retried.get("provider_receipt_closure").status == "pending"
     assert len(store.load().nodes) == len(dag.nodes)  # type: ignore[union-attr]
     assert len(registry.list_records()) >= 2
 
 
-def test_adoption_failure_does_not_rerun_outline(tmp_path):
+def test_receipt_closure_failure_reruns_only_receipt_closure_downstream(tmp_path):
     dag = create_outline_v3_node_dag("job-adoption", candidate_count=3)
     nodes = [
-        replace(node, status="failed" if node.node_id == "adoption" else "succeeded", output_hash="hash")
+        replace(
+            node,
+            status="failed" if node.node_id == "provider_receipt_closure" else "succeeded",
+            output_hash="hash",
+        )
         for node in dag.nodes
     ]
-    plan = plan_outline_v3_resume(replace(dag, nodes=nodes), "adoption")
+    plan = plan_outline_v3_resume(replace(dag, nodes=nodes), "provider_receipt_closure")
 
-    assert plan.rerun_node_ids == ["adoption"]
+    assert plan.rerun_node_ids == ["provider_receipt_closure", "stage_health"]
     assert "final_outline" in plan.preserved_node_ids
     assert "selected_candidate" in plan.preserved_node_ids
 

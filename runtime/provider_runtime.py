@@ -233,6 +233,7 @@ class ProviderCallReceiptV1:
     total_latency_ms: float | None = None
     timeout_kind: str = ""
     usage_status: str = "unreported"
+    test_only: bool = False
 
     def __post_init__(self) -> None:
         if self.artifact_type != PROVIDER_RECEIPT_ARTIFACT_TYPE:
@@ -249,6 +250,19 @@ class ProviderCallReceiptV1:
             raise ProviderRuntimeContractError("successful provider calls cannot carry an error kind")
         if self.status != "success" and self.error_kind is None:
             raise ProviderRuntimeContractError("failed or blocked calls require an error kind")
+        if not self.test_only:
+            for name in (
+                "job_id",
+                "attempt_id",
+                "stage_name",
+                "node_id",
+                "call_id",
+                "provider",
+                "model",
+                "endpoint_type",
+            ):
+                if not str(getattr(self, name) or "").strip():
+                    raise ProviderRuntimeContractError(f"bound provider receipt requires {name}")
         if self.attempts < 1:
             raise ProviderRuntimeContractError("provider attempts must be positive")
         for name in ("prompt_hash", "input_hash", "config_hash", "schema_hash"):
@@ -302,6 +316,8 @@ class ProviderCallReceiptV1:
         metadata: Mapping[str, Any] | None = None,
         node_id: str = "",
         call_id: str = "",
+        endpoint_type: str = "",
+        test_only: bool = False,
     ) -> "ProviderCallReceiptV1":
         status = "success" if result.get("status") == "success" else "failed"
         candidate_error_kind = str(result.get("error_kind") or "invalid_response")
@@ -347,7 +363,7 @@ class ProviderCallReceiptV1:
             metadata=metadata or {},
             node_id=node_id,
             call_id=call_id or f"call-{admission.sequence}",
-            endpoint_type=str(result.get("endpoint_type") or ""),
+            endpoint_type=str(result.get("endpoint_type") or endpoint_type),
             estimated_input_tokens=admission.estimated_tokens,
             cached_input_tokens=_optional_nonnegative_int(result.get("cached_input_tokens")),
             reasoning_tokens=_optional_nonnegative_int(result.get("reasoning_tokens")),
@@ -359,6 +375,7 @@ class ProviderCallReceiptV1:
             total_latency_ms=_optional_float(result.get("total_latency_ms")),
             timeout_kind=str(result.get("timeout_kind") or ""),
             usage_status=str(result.get("usage_status") or ("reported" if result.get("input_tokens") is not None or result.get("output_tokens") is not None else "unreported")),
+            test_only=test_only,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -421,6 +438,7 @@ class ProviderCallReceiptV1:
             total_latency_ms=_optional_float(payload.get("total_latency_ms")),
             timeout_kind=str(payload.get("timeout_kind") or ""),
             usage_status=str(payload.get("usage_status") or "unreported"),
+            test_only=bool(payload.get("test_only", False)),
         )
 
 
@@ -519,7 +537,28 @@ class ProviderRuntime:
         route: str = "",
         schema_hash: str | None = None,
         node_id: str = "",
+        call_id: str = "",
+        endpoint_type: str = "",
+        test_only: bool = False,
     ) -> None:
+        if not test_only:
+            missing = [
+                name
+                for name, value in {
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "stage_name": stage_name,
+                    "route": route,
+                    "node_id": node_id,
+                    "call_id": call_id,
+                    "ledger": ledger,
+                }.items()
+                if not str(value or "").strip()
+            ]
+            if missing:
+                raise ProviderRuntimeContractError(
+                    "bound ProviderRuntime requires: " + ", ".join(missing)
+                )
         self.budget = budget or ProviderBudgetV1()
         self.ledger = ledger
         self.job_id = job_id
@@ -527,6 +566,9 @@ class ProviderRuntime:
         self.stage_name = stage_name
         self.route = route
         self.node_id = node_id
+        self.call_id = call_id
+        self.endpoint_type = endpoint_type
+        self.test_only = bool(test_only)
         self.schema_hash = schema_hash or hash_text("provider-runtime-default-schema-v1")
         self.started_monotonic = time.monotonic()
         self.started_at = utc_now_iso()
@@ -616,7 +658,9 @@ class ProviderRuntime:
             started_at=admission.admitted_at,
             metadata=metadata,
             node_id=self.node_id,
-            call_id=str((metadata or {}).get("call_id") or ""),
+            call_id=str((metadata or {}).get("call_id") or self.call_id or f"call-{admission.sequence}"),
+            endpoint_type=str(result.get("endpoint_type") or self.endpoint_type),
+            test_only=self.test_only,
         )
         with self._lock:
             if self.ledger is not None:

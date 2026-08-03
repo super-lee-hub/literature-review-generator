@@ -7,13 +7,12 @@ only cross-paper synthesis and outline decisions use the provider boundary.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from outline.v3_artifacts import (
-    AdoptedOutline,
     ArbitrationDecision,
     ConfirmedGlobalRelationMap,
     CoverageAudit,
@@ -23,6 +22,7 @@ from outline.v3_artifacts import (
     OutlineArtifact,
     OutlineCandidate,
     OutlineStageHealth,
+    ProviderReceiptClosureArtifact,
     RelationAdjudicationResult,
     SectionEvidencePacket,
     SectionEvidencePacketSet,
@@ -42,7 +42,9 @@ from outline.v3_relations import build_global_relation_map, build_organizing_axe
 from runtime.outline_v3_dag import OutlineNodeDAG, OutlineNodeStore, create_outline_v3_node_dag
 from runtime.provider_completion import ProviderCompletionEvaluator
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import ProviderBudgetV1, ProviderRuntime, ProviderRuntimeLedger
+from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
+from runtime.provider_runtime import ProviderBudgetV1, ProviderRuntime, ProviderRuntimeLedger, hash_json, hash_text
+from runtime.outline_v3_replay import ModelCallReplayKey, ModelCallReplayStore
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
 from services.job_workspace import atomic_write_json, utc_now_iso
 
@@ -68,7 +70,7 @@ class OutlineV3ExecutionResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in {"complete", "ready_for_adoption"}
+        return self.status == "ready_for_adoption"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -125,8 +127,6 @@ class OutlineV3Executor:
         provider_profile: ProviderContextProfile | None = None,
         candidate_count: int = 5,
         review_intent: Mapping[str, Any] | None = None,
-        adopt: bool = False,
-        adopted_by: str = "system",
         fault_injector: FaultInjector | None = None,
         cancellation_checker: Callable[[], None] | None = None,
     ) -> None:
@@ -148,8 +148,6 @@ class OutlineV3Executor:
         )
         self.candidate_count = min(12, int(candidate_count))
         self.review_intent_input = dict(review_intent or {})
-        self.adopt_requested = bool(adopt)
-        self.adopted_by = str(adopted_by or "system")
         self.fault_injector = fault_injector
         self.cancellation_checker = cancellation_checker
         self.artifact_paths: dict[str, str] = {}
@@ -157,9 +155,12 @@ class OutlineV3Executor:
         self.receipts: list[str] = []
         self.diagnostics: list[str] = []
         self._payloads: dict[str, dict[str, Any]] = {}
-        self._receipt_ledger = ProviderRuntimeLedger(self._path("provider_receipts.jsonl"))
+        self._receipt_ledger = ProviderRuntimeLedger(self._path("outline_v3_provider_receipts.jsonl"))
+        self._replay_store = ModelCallReplayStore(self.workspace)
+        self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
         self._node_store = OutlineNodeStore(self.workspace, self.registry)
         self._dag = self._node_store.ensure(self.job_id, candidate_count=self.candidate_count)
+        self._hydrate_expected_provider_calls()
 
     def _build_registry(self) -> ArtifactRegistry:
         path = self._path("artifact_registry.json")
@@ -175,6 +176,74 @@ class OutlineV3Executor:
     def _node_path(self, node_id: str) -> str:
         safe = node_id.replace("/", "_").replace("\\", "_")
         return self._path(f"outline_v3/artifacts/{safe}.json")
+
+    def _provider_node_ids(self) -> tuple[str, ...]:
+        return (
+            "relation_adjudication",
+            *(f"candidate_{index}_provider_generation" for index in range(1, self.candidate_count + 1)),
+            "structure_critique",
+            "coverage_critique",
+            "evidence_critique",
+            "arbitration",
+        )
+
+    def _hydrate_expected_provider_calls(self) -> None:
+        """Load the current expected call graph from durable receipts/DAG state."""
+
+        known_ids = {f"outline:{node_id}" for node_id in self._provider_node_ids()}
+        for call_id in sorted(known_ids):
+            node_id = call_id.removeprefix("outline:")
+            self._expected_provider_calls[call_id] = ExpectedProviderCall(
+                call_id=call_id,
+                job_id=self.job_id,
+                attempt_id=f"outline:{node_id}",
+                stage_name="outline_v3",
+                node_id=node_id,
+                max_attempts=1,
+                usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
+            )
+        for receipt in self._receipt_ledger.list_receipts():
+            if receipt.call_id not in known_ids:
+                continue
+            self._expected_provider_calls[receipt.call_id] = ExpectedProviderCall(
+                call_id=receipt.call_id,
+                job_id=receipt.job_id,
+                attempt_id=receipt.attempt_id,
+                stage_name=receipt.stage_name,
+                node_id=receipt.node_id,
+                prompt_hash=receipt.prompt_hash,
+                input_hash=receipt.input_hash,
+                config_hash=receipt.config_hash,
+                schema_hash=receipt.schema_hash,
+                output_hash=receipt.response_hash or "",
+                max_attempts=1,
+                usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
+            )
+
+    def _record_expected_provider_call(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        *,
+        expect_json: bool,
+        api_config: Mapping[str, Any],
+    ) -> str:
+        call_id = f"outline:{node_id}"
+        prompt = json.dumps(request, sort_keys=True, ensure_ascii=False)
+        self._expected_provider_calls[call_id] = ExpectedProviderCall(
+            call_id=call_id,
+            job_id=self.job_id,
+            attempt_id=f"outline:{node_id}",
+            stage_name="outline_v3",
+            node_id=node_id,
+            prompt_hash=hash_text(prompt),
+            input_hash=hash_json(request),
+            config_hash=hash_json(api_config),
+            schema_hash=_hash_payload({"node_id": node_id, "expect_json": expect_json}),
+            max_attempts=1,
+            usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
+        )
+        return call_id
 
     def _check(self, node_id: str) -> None:
         if self.cancellation_checker is not None:
@@ -264,12 +333,7 @@ class OutlineV3Executor:
         if record is None or record.status != "ready":
             return None
         try:
-            self.registry.verify_ready_dependencies([{
-                "artifact_id": record.artifact_id,
-                "artifact_type": record.artifact_type,
-                "path": record.path,
-                "content_hash": record.content_hash,
-            }])
+            self.registry.verify_ready_dependencies([ArtifactDependencyRefV2.from_record(record)])
         except Exception:
             return None
         self.artifact_paths[node_id] = record.path
@@ -338,8 +402,61 @@ class OutlineV3Executor:
             return {"status": "success", "content": {"selected_candidate_id": str(payload.get("candidate_ids", ["candidate_1"])[0]), "accepted_recommendations": [], "rejected_recommendations": []}}
         return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
 
-    def _provider_call(self, node_id: str, request: Mapping[str, Any], *, expect_json: bool = True) -> dict[str, Any]:
+    def _provider_call(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        *,
+        expect_json: bool = True,
+        input_artifact_hashes: Sequence[str] = (),
+    ) -> dict[str, Any]:
         budget = self.profile.estimate_request(request)
+        api_config = {
+            "provider_family": self.profile.provider,
+            "model": self.profile.model,
+            "api_base": "internal",
+            "endpoint_type": self.profile.endpoint_type,
+        }
+        call_id = self._record_expected_provider_call(
+            node_id,
+            request,
+            expect_json=expect_json,
+            api_config=api_config,
+        )
+        replay_key = ModelCallReplayKey(
+            node_id=node_id,
+            node_version="v3",
+            schema_version="outline-v3",
+            model_route=self.profile.provider,
+            model_name=self.profile.model,
+            provider=self.profile.provider,
+            prompt_template_hash=_hash_payload({"node_id": node_id, "expect_json": expect_json}),
+            prompt_payload_hash=_hash_payload(request),
+            input_artifact_hashes=sorted(str(item) for item in input_artifact_hashes if str(item)),
+            config_hash=hash_json(api_config),
+        )
+        replay_lookup = self._replay_store.lookup(replay_key)
+        if replay_lookup.reusable and replay_lookup.record is not None:
+            for artifact_id in replay_lookup.record.output_artifact_ids:
+                replay_record = self.registry.get(artifact_id)
+                if replay_record is None or replay_record.status != "ready":
+                    continue
+                try:
+                    replay_payload = json.loads(Path(replay_record.path).read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                payload = replay_payload.get("payload") if isinstance(replay_payload, Mapping) else None
+                if isinstance(payload, Mapping) and hash_json(payload) == replay_lookup.record.output_hash:
+                    self.receipts.extend(replay_lookup.record.receipt_ids)
+                    self._expected_provider_calls[call_id] = replace(
+                        self._expected_provider_calls[call_id],
+                        output_hash=replay_lookup.record.output_hash,
+                    )
+                    return dict(payload)
+        if replay_lookup.status == "stale":
+            self.diagnostics.append(
+                f"replay stale for {node_id}: {','.join(replay_lookup.stale_reasons)}"
+            )
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=0),
             ledger=self._receipt_ledger,
@@ -348,10 +465,12 @@ class OutlineV3Executor:
             stage_name="outline_v3",
             route=node_id,
             node_id=node_id,
+            call_id=call_id,
+            endpoint_type=self.profile.endpoint_type,
             schema_hash=_hash_payload({"node_id": node_id, "expect_json": expect_json}),
         )
         if not budget["within_budget"]:
-            receipt = runtime.blocked_receipt(prompt=json.dumps(request, sort_keys=True), input_payload=request, api_config={"model": self.profile.model}, message="provider input exceeds verified context budget")
+            receipt = runtime.blocked_receipt(prompt=json.dumps(request, sort_keys=True, ensure_ascii=False), input_payload=request, api_config=api_config, message="provider input exceeds verified context budget")
             self.receipts.append(receipt.receipt_id)
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
         admission = runtime.admit(estimated_tokens=int(budget["estimated_input_tokens"]))
@@ -372,11 +491,27 @@ class OutlineV3Executor:
             admission=admission,
             prompt=json.dumps(request, sort_keys=True, ensure_ascii=False),
             input_payload=request,
-            api_config={"provider_family": self.profile.provider, "model": self.profile.model, "api_base": "internal"},
+            api_config=api_config,
             result=result,
-            metadata={"node_id": node_id, "estimation": budget},
+            metadata={
+                "node_id": node_id,
+                "estimation": budget,
+                "replay_status": replay_lookup.status,
+                "replay_stale_reasons": list(replay_lookup.stale_reasons),
+            },
         )
         self.receipts.append(receipt.receipt_id)
+        self._expected_provider_calls[call_id] = replace(
+            self._expected_provider_calls[call_id],
+            output_hash=receipt.response_hash or "",
+        )
+        if receipt.status == "success" and receipt.response_hash:
+            self._replay_store.append(
+                replay_key,
+                output_hash=receipt.response_hash,
+                output_artifact_ids=(f"outline-v3:{node_id}",),
+                receipt_ids=(receipt.receipt_id,),
+            )
         if completion.status != "complete":
             raise OutlineV3ExecutionError(f"provider output for {node_id} is {completion.status}")
         return _as_dict(completion.content)
@@ -398,7 +533,7 @@ class OutlineV3Executor:
         return self._persist(node_id, artifact, depends_on=dependencies, model=model, provider=provider)
 
     def _run_provider_node(self, node_id: str, request: Mapping[str, Any], cls: type[OutlineArtifact], deps: Mapping[str, str], *, minimum_output: int = 2) -> tuple[OutlineArtifact, Sequence[str], str, str]:
-        content = self._provider_call(node_id, request, expect_json=True)
+        content = self._provider_call(node_id, request, expect_json=True, input_artifact_hashes=tuple(deps.values()))
         return self._artifact(cls, content, deps), tuple(deps), self.profile.model, self.profile.provider
 
     def _validate_candidate_payload(
@@ -442,7 +577,7 @@ class OutlineV3Executor:
             artifact_version="v1",
             path=str(path),
             producer="outline.v3_executor.OutlineV3Executor",
-            artifact_id="provider_receipts",
+            artifact_id="outline_v3_provider_receipts",
             metadata={"receipt_count": len(self._receipt_ledger.list_receipts())},
         )
         self.artifact_paths["provider_receipts"] = record.path
@@ -716,62 +851,173 @@ class OutlineV3Executor:
                 self._artifact(CoverageAudit, {"passed": coverage_passed, "paper_coverage": {"total": len(corpus), "covered": len(covered & corpus), "missing": sorted(required_corpus - covered), "packet_missing": packet_missing_keys}, "claim_coverage": {"count": len(claims), "claims": claims}, "relation_coverage": {"planned": len(confirmed_map_model.relations), "used": len(used_relations), "unused": sorted(set(item.relation_id for item in confirmed_map_model.relations) - used_relations)}, "must_use_coverage": {"required": sorted(must_use), "covered": sorted(must_use & covered)}, "section_coverage": {"sections": len(sections), "empty_sections": empty_sections, "packet_papers": len(packet_papers)}, "contradiction_coverage": {"count": sum(len(packet.get("contradictions", [])) for packet in packets)}, "gap_coverage": {"count": sum(len(packet.get("gaps", [])) for packet in packets)}}, {"final_outline": _hash_payload(final), "coverage_contract": _hash_payload(contract), "section_evidence_packets": _hash_payload(packet_set)}),
                 ("final_outline", "coverage_contract", "section_evidence_packets"), "deterministic", "local",
             ))
-            summary_order = [view.paper_key for view in evidence_model.views]
-            section_order = [str(section.get("section_id") or "") for section in sections]
-            candidate_order_ok = candidate_ids == sorted(candidate_ids, key=lambda item: int(item.rsplit("_", 1)[-1]))
-            source_hashes_ok = set(evidence_model.source_summary_hashes) == {view.source_summary_hash for view in evidence_model.views}
             dependency_binding = all(
                 bool(packet.get("source_summary_hashes")) and bool(packet.get("evidence_view_hashes"))
                 for packet in packets
             )
-            stability_checks = {
-                "summary_order": summary_order == sorted(summary_order),
-                "shard_order": summary_order == sorted(summary_order),
-                "candidate_order": candidate_order_ok,
-                "section_order": section_order == sorted(section_order),
-                "replay": bool(final_payload.get("source_hashes")) and source_hashes_ok,
+            # Stability is an executable metamorphic audit.  It permutes the
+            # exact Stage 1 input sequence and recomputes the provider-free
+            # evidence projections.  Comparing only the already-sorted output
+            # (or checking that a list happens to be sorted) would not prove
+            # that source order is semantically irrelevant.
+            variants: list[tuple[str, list[dict[str, Any]]]] = [
+                ("baseline", list(self.summaries)),
+                ("identity_copy", [dict(item) for item in self.summaries]),
+            ]
+            if len(self.summaries) > 1:
+                midpoint = max(1, len(self.summaries) // 2)
+                variants.extend(
+                    [
+                        ("reversed", list(reversed(self.summaries))),
+                        ("rotated", list(self.summaries[midpoint:]) + list(self.summaries[:midpoint])),
+                        ("even_odd", list(self.summaries[::2]) + list(self.summaries[1::2])),
+                    ]
+                )
+            variant_signatures: dict[str, dict[str, Any]] = {}
+            variant_input_hashes: dict[str, str] = {}
+            variant_output_hashes: dict[str, str] = {}
+            variant_errors: dict[str, str] = {}
+            for variant_name, variant_summaries in variants:
+                variant_input_hashes[variant_name] = hash_json(variant_summaries)
+                try:
+                    variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
+                    variant_ledger = build_global_corpus_ledger(variant_evidence)
+                    variant_matrix = build_multi_view_matrix(variant_evidence)
+                    signature = {
+                        "paper_keys": [view.paper_key for view in variant_evidence.views],
+                        "view_hashes": [view.view_hash for view in variant_evidence.views],
+                        "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
+                        "evidence_blocking_diagnostics": sorted(
+                            hash_json(item) for item in variant_evidence.blocking_diagnostics
+                        ),
+                        "ledger_hash": hash_json(variant_ledger.to_dict()),
+                        "matrix_hash": hash_json(variant_matrix.to_dict()),
+                    }
+                    variant_signatures[variant_name] = signature
+                    variant_output_hashes[variant_name] = hash_json(signature)
+                except (TypeError, ValueError, KeyError) as exc:
+                    variant_errors[variant_name] = f"{type(exc).__name__}: {exc}"
+
+            baseline_signature = variant_signatures.get("baseline", {})
+            comparisons: dict[str, dict[str, Any]] = {}
+            for variant_name, signature in variant_signatures.items():
+                if variant_name == "baseline":
+                    continue
+                comparison = {
+                    field: signature.get(field) == baseline_signature.get(field)
+                    for field in (
+                        "paper_keys",
+                        "view_hashes",
+                        "source_summary_hashes",
+                        "evidence_blocking_diagnostics",
+                        "ledger_hash",
+                        "matrix_hash",
+                    )
+                }
+                comparison["stable"] = all(comparison.values())
+                comparisons[variant_name] = comparison
+            metamorphic_checks = {
+                "baseline_projection_succeeded": bool(baseline_signature) and "baseline" not in variant_errors,
+                "permutations_preserve_identity": bool(comparisons) and all(
+                    item.get("paper_keys") and item.get("view_hashes") for item in comparisons.values()
+                ),
+                "permutations_preserve_evidence": bool(comparisons) and all(
+                    item.get("source_summary_hashes")
+                    and item.get("evidence_blocking_diagnostics")
+                    and item.get("ledger_hash")
+                    and item.get("matrix_hash")
+                    for item in comparisons.values()
+                ),
                 "corpus_preserved": covered.issubset(corpus),
                 "must_use_preserved": must_use.issubset(covered),
                 "dependency_binding": dependency_binding,
             }
-            stability_status = "stable" if all(stability_checks.values()) else "blocked"
+            failed_checks = sorted(name for name, passed in metamorphic_checks.items() if not passed)
+            stability_status = "stable" if not failed_checks and not variant_errors else "blocked"
+            stability_payload = {
+                "status": stability_status,
+                "method": "metamorphic_projection_permutation_v1",
+                "variant_definitions": [name for name, _items in variants],
+                "variant_input_hashes": variant_input_hashes,
+                "variant_output_hashes": variant_output_hashes,
+                "variant_errors": variant_errors,
+                "comparisons": comparisons,
+                "checks": metamorphic_checks,
+                "failed_checks": failed_checks,
+            }
             stability = self._run_node("stability_audit", lambda: (
-                self._artifact(StabilityAudit, {"status": stability_status, "checks": stability_checks}, {"coverage_audit": _hash_payload(audit), "final_outline": _hash_payload(final)}),
+                self._artifact(StabilityAudit, stability_payload, {"coverage_audit": _hash_payload(audit), "final_outline": _hash_payload(final)}),
                 ("coverage_audit", "final_outline"), "deterministic", "local",
             ))
+            self._register_receipt_ledger()
+            expected_call_ids = set(self._expected_provider_calls)
+            closure = ProviderReceiptClosure.evaluate(
+                self._expected_provider_calls.values(),
+                [
+                    receipt
+                    for receipt in self._receipt_ledger.list_receipts()
+                    if receipt.call_id in expected_call_ids
+                ],
+            )
+            self._check("provider_receipt_closure")
+            closure_payload = self._persist(
+                "provider_receipt_closure",
+                self._artifact(
+                    ProviderReceiptClosureArtifact,
+                    closure.to_dict(),
+                    {"provider_receipts": self.artifact_records["provider_receipts"].content_hash},
+                ),
+                depends_on=("provider_receipts",),
+                model="deterministic",
+                provider="local",
+            )
+            closure_record = self.artifact_records["provider_receipt_closure"]
             health_diagnostics = list(self.diagnostics)
             if not coverage_passed:
                 health_diagnostics.append("coverage audit did not satisfy the explicit corpus contract")
             if stability_status != "stable":
                 health_diagnostics.append("stability audit is blocked")
+            if not closure.complete:
+                health_diagnostics.append("provider receipt closure is incomplete")
             critique_passed = all(bool(item.get("passed")) and not item.get("blocking_diagnostics") for item in critiques.values())
             if not critique_passed:
                 health_diagnostics.append("one or more provider-derived critiques did not pass")
             adoption_eligible = not health_diagnostics and bool(arbitration.get("selected_candidate_id"))
-            health = self._run_node("stage_health", lambda: (
-                self._artifact(OutlineStageHealth, {"status": "healthy" if adoption_eligible else "blocked", "adoption_eligible": adoption_eligible, "diagnostics": health_diagnostics, "node_count": len(self._dag.nodes), "receipt_count": len(self.receipts), "coverage_audit_hash": _hash_payload(audit), "stability_audit_hash": _hash_payload(stability)}, {"stability_audit": _hash_payload(stability), "coverage_audit": _hash_payload(audit), "arbitration": _hash_payload(arbitration)}),
-                ("stability_audit", "coverage_audit", "arbitration"), "deterministic", "local",
-            ))
-            adopted = False
-            if self.adopt_requested and adoption_eligible:
-                adoption = self._run_node("adoption", lambda: (
-                    self._artifact(AdoptedOutline, {"status": "adopted", "adopted_by": self.adopted_by, "final_outline_hash": _hash_payload(final), "coverage_audit_hash": _hash_payload(audit), "stability_audit_hash": _hash_payload(stability), "stage_health_hash": _hash_payload(health)}, {"final_outline": _hash_payload(final), "coverage_audit": _hash_payload(audit), "stability_audit": _hash_payload(stability), "stage_health": _hash_payload(health)}),
-                    ("final_outline", "coverage_audit", "stability_audit", "stage_health"), self.profile.model, self.profile.provider,
-                ))
-                adopted = adoption.get("status") == "adopted"
-            else:
-                adopted = False
-            self._register_receipt_ledger()
+            self._check("stage_health")
+            health = self._persist(
+                "stage_health",
+                self._artifact(
+                    OutlineStageHealth,
+                    {
+                        "status": "healthy" if adoption_eligible else "blocked",
+                        "adoption_eligible": adoption_eligible,
+                        "diagnostics": health_diagnostics,
+                        "node_count": len(self._dag.nodes),
+                        "receipt_count": len(self.receipts),
+                        "coverage_audit_hash": self.artifact_records["coverage_audit"].content_hash,
+                        "stability_audit_hash": self.artifact_records["stability_audit"].content_hash,
+                        "provider_receipt_closure_hash": closure_record.content_hash,
+                        "provider_receipt_closure": closure_payload,
+                    },
+                    {
+                        "stability_audit": _hash_payload(stability),
+                        "coverage_audit": _hash_payload(audit),
+                        "arbitration": _hash_payload(arbitration),
+                        "provider_receipt_closure": closure_record.content_hash,
+                    },
+                ),
+                depends_on=("stability_audit", "coverage_audit", "arbitration", "provider_receipt_closure"),
+                model="deterministic",
+                provider="local",
+            )
             loaded_dag = self._node_store.load()
             if loaded_dag is not None:
                 self._dag = loaded_dag
             if self._dag.failed_node_ids or not adoption_eligible:
                 status = "blocked"
-            elif adopted:
-                status = "complete"
             else:
                 status = "ready_for_adoption"
-            return OutlineV3ExecutionResult(self.job_id, status, adopted, dict(self.artifact_paths), tuple(node.node_id for node in self._dag.nodes if node.status == "succeeded"), tuple(self.receipts), tuple(self.diagnostics), self._dag)
+            return OutlineV3ExecutionResult(self.job_id, status, False, dict(self.artifact_paths), tuple(node.node_id for node in self._dag.nodes if node.status == "succeeded"), tuple(self.receipts), tuple(self.diagnostics), self._dag)
         except Exception as exc:
             self.diagnostics.append(str(exc))
             try:

@@ -68,7 +68,7 @@ def _normalize_refs(
         value = (
             ref
             if isinstance(ref, ArtifactDependencyRefV2)
-            else ArtifactDependencyRefV2.from_dict(ref, default_job_id=default_job_id)
+            else ArtifactDependencyRefV2.from_dict(ref)
         )
         normalized.append(value)
     return tuple(normalized)

@@ -17,6 +17,9 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set
 
 
+NOT_APPLICABLE = "not_applicable"
+
+
 class PatchGranularity(Enum):
     """Granularity levels for patches."""
     BLOCK = "block"  # Patch a single block
@@ -62,14 +65,18 @@ class DependencyHashBundle:
     
     @classmethod
     def from_dict(cls, data: Dict[str, str]) -> DependencyHashBundle:
+        def value(name: str) -> str:
+            raw = str(data.get(name) or "").strip()
+            return raw or NOT_APPLICABLE
+
         return cls(
-            summary_hash=data.get("summary_hash", ""),
-            paper_artifact_hash=data.get("paper_artifact_hash", ""),
-            visual_manifest_hash=data.get("visual_manifest_hash", ""),
-            selected_visual_refs_hash=data.get("selected_visual_refs_hash", ""),
-            review_draft_hash=data.get("review_draft_hash", ""),
-            citation_manifest_hash=data.get("citation_manifest_hash", ""),
-            outline_hash=data.get("outline_hash", ""),
+            summary_hash=value("summary_hash"),
+            paper_artifact_hash=value("paper_artifact_hash"),
+            visual_manifest_hash=value("visual_manifest_hash"),
+            selected_visual_refs_hash=value("selected_visual_refs_hash"),
+            review_draft_hash=value("review_draft_hash"),
+            citation_manifest_hash=value("citation_manifest_hash"),
+            outline_hash=value("outline_hash"),
         )
 
 

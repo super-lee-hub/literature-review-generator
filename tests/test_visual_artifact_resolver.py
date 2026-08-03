@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry
+from services.artifact_registry import ArtifactRegistry
 from services.visual_artifact_resolver import VisualArtifactResolver
 
 

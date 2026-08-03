@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ai_interface import _call_ai_api
 from free_mode.profile_manager import normalize_profile, save_profile
+from runtime.provider_runtime import ProviderBudgetV1, ProviderBudgetExceeded, ProviderRuntime, ProviderRuntimeLedger
 from services.model_selection import get_free_mode_api_config
 
 
@@ -41,10 +44,10 @@ profile 规则：
 
 
 def _get_free_mode_parameters(config: Dict[str, Any], logger: Any = None) -> tuple[int, float]:
-    api_params = (config or {}).get("API_Parameters", {}) or {}
+    api_params = (config or {}).get("Free_Mode_API", {}) or {}
     try:
-        max_tokens = int(api_params.get("free_mode_max_tokens", api_params.get("outline_max_tokens", 6000)))
-        temperature = float(api_params.get("free_mode_temperature", api_params.get("outline_temperature", 0.4)))
+        max_tokens = int(api_params.get("max_output_tokens", 6000))
+        temperature = float(api_params.get("temperature", 0.4))
         return max_tokens, temperature
     except (TypeError, ValueError) as exc:
         if logger:
@@ -94,10 +97,116 @@ def _normalize_planner_response(response: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _new_free_mode_provider_runtime(
+    *,
+    api_config: Dict[str, Any],
+    output_dir: Optional[str],
+    project_name: str,
+    stage_name: str,
+    prompt: str,
+    config: Dict[str, Any],
+    provider_runtime: Optional[ProviderRuntime],
+) -> Optional[ProviderRuntime]:
+    if provider_runtime is not None:
+        return provider_runtime
+    if not str(output_dir or "").strip():
+        return None
+    safe_project = str(project_name or "free_mode").strip() or "free_mode"
+    ledger_path = Path(output_dir).expanduser().resolve() / f"{safe_project}_free_mode_provider_receipts.jsonl"
+    try:
+        retry_limit = max(0, int(str((config or {}).get("Runtime", {}).get("node_retry_limit", 2)).strip()))
+    except (TypeError, ValueError):
+        retry_limit = 2
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:24]
+    return ProviderRuntime(
+        budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=retry_limit),
+        ledger=ProviderRuntimeLedger(ledger_path),
+        job_id=f"free-mode:{safe_project}",
+        attempt_id=f"free-mode:{stage_name}",
+        stage_name=f"free_mode_{stage_name}",
+        route="Free_Mode_API",
+        node_id=prompt_hash,
+        call_id=f"free-mode:{stage_name}:{prompt_hash}",
+        endpoint_type=str(api_config.get("endpoint_type") or "chat_completions"),
+        schema_hash=hashlib.sha256(b"free-mode-provider-request-v1").hexdigest(),
+    )
+
+
+def _complete_injected_free_mode_runtime(
+    provider_runtime: Optional[ProviderRuntime],
+    *,
+    prompt: str,
+    api_config: Dict[str, Any],
+    response: Any,
+) -> None:
+    if provider_runtime is None or provider_runtime.receipts:
+        return
+    result = {
+        "status": "success" if isinstance(response, dict) else "failed",
+        "content": response if isinstance(response, dict) else None,
+        "finish_reason": "stop" if isinstance(response, dict) else "",
+        "usage_status": "reported",
+        "error_kind": None if isinstance(response, dict) else "invalid_response",
+    }
+    try:
+        admission = provider_runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+        provider_runtime.complete(
+            admission=admission,
+            prompt=prompt,
+            input_payload={"prompt": prompt},
+            api_config=api_config,
+            result=result,
+            metadata={"execution_mode": "injected_free_mode"},
+        )
+    except ProviderBudgetExceeded:
+        provider_runtime.blocked_receipt(
+            prompt=prompt,
+            input_payload={"prompt": prompt},
+            api_config=api_config,
+            message="free-mode provider did not produce a receipt before its budget closed",
+        )
+
+
+def _call_free_mode_api(
+    *,
+    prompt: str,
+    api_config: Dict[str, Any],
+    system_prompt: str,
+    max_tokens: int,
+    temperature: float,
+    logger: Any,
+    provider_runtime: Optional[ProviderRuntime],
+) -> Any:
+    call_kwargs: Dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": "json",
+        "logger": logger,
+    }
+    if provider_runtime is not None:
+        call_kwargs["provider_runtime"] = provider_runtime
+    response = _call_ai_api(
+        prompt=prompt,
+        api_config=api_config,
+        system_prompt=system_prompt,
+        **call_kwargs,
+    )
+    _complete_injected_free_mode_runtime(
+        provider_runtime,
+        prompt=prompt,
+        api_config=api_config,
+        response=response,
+    )
+    return response
+
+
 def plan_free_mode_chat_turn(
     messages: List[Dict[str, str]],
     config: Dict[str, Any],
     logger: Any = None,
+    output_dir: Optional[str] = None,
+    project_name: str = "free_mode",
+    provider_runtime: Optional[ProviderRuntime] = None,
 ) -> Optional[Dict[str, Any]]:
     """Plan one conversational turn and update the free-mode profile draft."""
 
@@ -117,14 +226,23 @@ def plan_free_mode_chat_turn(
         f"{transcript}\n\n"
         "请输出本轮应答、缺失信息，以及更新后的 profile 草案。"
     )
-    response = _call_ai_api(
+    runtime = _new_free_mode_provider_runtime(
+        api_config=free_mode_api,
+        output_dir=output_dir,
+        project_name=project_name,
+        stage_name="chat",
+        prompt=prompt,
+        config=config,
+        provider_runtime=provider_runtime,
+    )
+    response = _call_free_mode_api(
         prompt=prompt,
         api_config=free_mode_api,
         system_prompt=FREE_MODE_CHAT_SYSTEM_PROMPT,
         max_tokens=max_tokens,
         temperature=temperature,
-        response_format="json",
         logger=logger,
+        provider_runtime=runtime,
     )
     if not isinstance(response, dict):
         return None
@@ -139,6 +257,7 @@ def generate_free_mode_profile(
     logger: Any = None,
     conversation_notes: Optional[List[str]] = None,
     conversation_messages: Optional[List[Dict[str, str]]] = None,
+    provider_runtime: Optional[ProviderRuntime] = None,
 ) -> Optional[Dict[str, Any]]:
     """Generate and persist a free-mode profile from user intent or a chat transcript."""
 
@@ -166,14 +285,23 @@ def generate_free_mode_profile(
             f"补充对话记录:\n{note_block if note_block else '(无)'}\n"
         )
 
-    response = _call_ai_api(
+    runtime = _new_free_mode_provider_runtime(
+        api_config=free_mode_api,
+        output_dir=output_dir,
+        project_name=project_name,
+        stage_name="profile",
+        prompt=prompt,
+        config=config,
+        provider_runtime=provider_runtime,
+    )
+    response = _call_free_mode_api(
         prompt=prompt,
         api_config=free_mode_api,
         system_prompt=FREE_MODE_PROFILE_SYSTEM_PROMPT,
         max_tokens=max_tokens,
         temperature=temperature,
-        response_format="json",
         logger=logger,
+        provider_runtime=runtime,
     )
     if not isinstance(response, dict):
         return None

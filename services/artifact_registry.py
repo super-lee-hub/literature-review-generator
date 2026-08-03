@@ -16,7 +16,7 @@ from services.job_workspace import utc_now_iso
 
 
 REGISTRY_VERSION = "v2"
-SUPPORTED_REGISTRY_VERSIONS = frozenset({"v1", REGISTRY_VERSION})
+SUPPORTED_REGISTRY_VERSIONS = frozenset({REGISTRY_VERSION})
 DEFAULT_REGISTRY_LOCK_TIMEOUT_SECONDS = 5.0
 DEFAULT_REGISTRY_LOCK_RETRY_INTERVAL_MS = 50
 DEFAULT_REGISTRY_REVISION_RETRY_LIMIT = 3
@@ -78,21 +78,38 @@ class ArtifactDependencyRefV2:
         return asdict(self)
 
     @classmethod
+    def from_record(cls, record: Any, *, dependency_kind: DependencyKind = "local_job") -> "ArtifactDependencyRefV2":
+        """Build a complete current reference from a registered artifact record."""
+
+        return cls(
+            dependency_kind=dependency_kind,
+            job_id=str(getattr(record, "job_id", "")),
+            artifact_id=str(getattr(record, "artifact_id", "")),
+            artifact_type=str(getattr(record, "artifact_type", "")),
+            path=os.fspath(getattr(record, "path", "")),
+            content_hash=str(getattr(record, "content_hash", "")),
+        )
+
+    @classmethod
     def from_dict(
         cls,
         payload: Mapping[str, Any],
-        *,
-        default_job_id: str = "",
     ) -> "ArtifactDependencyRefV2":
-        """Read both V2 dependencies and the legacy type/path/hash projection."""
+        """Read one strict current dependency reference."""
 
-        artifact_type = str(payload.get("artifact_type") or payload.get("role") or "")
-        path = os.fspath(payload.get("path") or "")
-        artifact_id = str(payload.get("artifact_id") or "")
-        if not artifact_id and artifact_type:
-            artifact_id = _legacy_dependency_id(artifact_type, path)
-        job_id = str(payload.get("job_id") or default_job_id)
-        raw_kind = str(payload.get("dependency_kind") or "local_job")
+        required = ("dependency_kind", "job_id", "artifact_id", "artifact_type", "path", "content_hash")
+        missing = [key for key in required if key not in payload or not str(payload.get(key) or "").strip()]
+        if missing:
+            raise RegistryCorruption(
+                "current dependency reference is missing required fields: " + ", ".join(missing)
+            )
+        if set(payload).intersection({"role"}):
+            raise RegistryCorruption("legacy dependency field 'role' is not accepted")
+        artifact_type = str(payload["artifact_type"])
+        path = os.fspath(payload["path"])
+        artifact_id = str(payload["artifact_id"])
+        job_id = str(payload["job_id"])
+        raw_kind = str(payload["dependency_kind"])
         if raw_kind not in {"local_job", "external_job"}:
             raise RegistryCorruption(f"invalid dependency_kind: {raw_kind!r}")
         return cls(
@@ -103,29 +120,6 @@ class ArtifactDependencyRefV2:
             path=path,
             content_hash=str(payload.get("content_hash") or ""),
         )
-
-
-class ArtifactDependencyRef(ArtifactDependencyRefV2):
-    """Backward-compatible constructor for the legacy type/path/hash field order."""
-
-    def __init__(
-        self,
-        artifact_type: str = "",
-        path: str = "",
-        content_hash: str = "",
-        *,
-        dependency_kind: DependencyKind = "local_job",
-        job_id: str = "",
-        artifact_id: str = "",
-    ) -> None:
-        object.__setattr__(self, "dependency_kind", dependency_kind)
-        object.__setattr__(self, "job_id", job_id)
-        object.__setattr__(self, "artifact_id", artifact_id)
-        object.__setattr__(self, "artifact_type", artifact_type)
-        object.__setattr__(self, "path", path)
-        object.__setattr__(self, "content_hash", content_hash)
-
-
 @dataclass(frozen=True)
 class ArtifactRecord:
     artifact_id: str
@@ -154,11 +148,6 @@ def _process_lock_for(path: str) -> threading.RLock:
             lock = threading.RLock()
             _PROCESS_LOCKS[key] = lock
         return lock
-
-
-def _legacy_dependency_id(artifact_type: str, path: str) -> str:
-    basename = os.path.basename(path) if path else "unknown"
-    return f"{artifact_type}:{basename}"
 
 
 class ArtifactRegistry:
@@ -227,7 +216,6 @@ class ArtifactRegistry:
         if not isinstance(raw_artifacts, list):
             raise RegistryCorruption("registry artifacts must be a JSON array")
 
-        default_job_id = raw_job_id
         artifacts: Dict[str, ArtifactRecord] = {}
         for index, item in enumerate(raw_artifacts):
             if not isinstance(item, dict):
@@ -239,7 +227,7 @@ class ArtifactRegistry:
             if not isinstance(dependencies_payload, list):
                 raise RegistryCorruption(f"artifact[{index}].depends_on must be an array")
             dependencies = [
-                ArtifactDependencyRefV2.from_dict(dependency, default_job_id=default_job_id)
+                ArtifactDependencyRefV2.from_dict(dependency)
                 for dependency in dependencies_payload
                 if isinstance(dependency, dict)
             ]
@@ -255,7 +243,7 @@ class ArtifactRegistry:
                 artifact_version=str(item.get("artifact_version") or ""),
                 path=os.fspath(item.get("path") or ""),
                 producer=str(item.get("producer") or ""),
-                job_id=str(item.get("job_id") or default_job_id),
+                job_id=str(item.get("job_id") or raw_job_id),
                 status=str(item.get("status") or ""),
                 content_hash=str(item.get("content_hash") or ""),
                 depends_on=dependencies,
@@ -426,32 +414,26 @@ class ArtifactRegistry:
             if isinstance(dependency, ArtifactDependencyRefV2):
                 ref = dependency
             elif isinstance(dependency, Mapping):
-                ref = ArtifactDependencyRefV2.from_dict(dependency, default_job_id=owner_job_id)
+                ref = ArtifactDependencyRefV2.from_dict(dependency)
             else:
                 raise TypeError(f"unsupported dependency reference: {type(dependency).__name__}")
 
+            ref = ArtifactDependencyRefV2.from_dict(ref.to_dict())
             registered = artifacts.get(ref.artifact_id) if ref.artifact_id else None
-            if registered is None and ref.path:
-                normalized_path = os.path.abspath(os.fspath(ref.path))
-                candidates = [
-                    record
-                    for record in artifacts.values()
-                    if os.path.normcase(record.path) == os.path.normcase(normalized_path)
-                    and (not ref.artifact_type or record.artifact_type == ref.artifact_type)
-                ]
-                if len(candidates) > 1:
-                    raise UnverifiedDependency(
-                        "dependency path resolves to multiple Registry records: "
-                        f"{normalized_path}"
-                    )
-                registered = candidates[0] if candidates else None
-            artifact_type = ref.artifact_type or (registered.artifact_type if registered else "unknown")
-            path = ref.path or (registered.path if registered else "")
-            artifact_id = ref.artifact_id or (
-                registered.artifact_id if registered else _legacy_dependency_id(artifact_type, path)
-            )
-            job_id = ref.job_id or (registered.job_id if registered else owner_job_id)
-            content_hash = ref.content_hash or (registered.content_hash if registered else "")
+            if registered is not None:
+                if registered.job_id != ref.job_id:
+                    raise UnverifiedDependency(f"dependency job_id mismatch: {ref.artifact_id}")
+                if registered.artifact_type != ref.artifact_type:
+                    raise UnverifiedDependency(f"dependency artifact_type mismatch: {ref.artifact_id}")
+                if os.path.abspath(registered.path) != os.path.abspath(ref.path):
+                    raise UnverifiedDependency(f"dependency path mismatch: {ref.artifact_id}")
+                if registered.content_hash != ref.content_hash:
+                    raise UnverifiedDependency(f"dependency content hash mismatch: {ref.artifact_id}")
+            artifact_type = ref.artifact_type
+            path = ref.path
+            artifact_id = ref.artifact_id
+            job_id = ref.job_id
+            content_hash = ref.content_hash
             dependency_kind: DependencyKind = ref.dependency_kind
             if job_id and job_id != owner_job_id:
                 dependency_kind = "external_job"
