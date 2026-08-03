@@ -8,7 +8,7 @@ Branch: `codex/platform-hardening-outline-v3`
 
 Base: `origin/main` at `ecac15976ebb3b6ee754fe5c0dfe44efacd72e9a`
 
-Reviewed head: `2158faa1d392acdc2250d147b26ed8ca367203d6`
+Reviewed head: `2158faa1d392acdc2250d147b26ed8ca367203d6` (baseline audit snapshot)
 
 This is a fact audit at the current PR head. It is intentionally separate
 from implementation work. The audit used the current production call graph
@@ -75,8 +75,10 @@ found.
 
 ## Audit conclusion
 
-The branch has substantial reusable infrastructure, but the current head does
-not satisfy the supplied completion definition. Production implementation must
-start only after this audit commit. The required order is P0 Stage 1 and
-Writer restoration, then Outline semantic closure, then provider/validation/
-repair/queue integration, followed by current full E2E and final documentation.
+This matrix is the pre-implementation baseline captured at the reviewed head;
+its `REGRESSED`, `BLOCKED`, and `NOT_IMPLEMENTED` entries are retained as the
+audit record rather than silently rewritten. Current implementation and test
+evidence is recorded in `PR14_CURRENT_VALIDATION_EVIDENCE.md`. The supplied
+completion definition still requires the final compile, type, collection,
+strict-marker, diff, remote-branch, Draft-PR, and CI checks before completion
+can be claimed.
