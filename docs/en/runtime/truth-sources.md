@@ -30,11 +30,11 @@ source of truth.
 | Stage | Canonical truth | Projections / exports |
 |---|---|---|
 | Source intake | `source_inventory_v1.json`, `source_bundle.json` | parser diagnostics and read-only paper views |
-| Stage 1 | canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, and source lineage | Excel and display summaries |
+| Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, and source lineage | Excel and display summaries |
 | Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, typed quality gate, exact execution bindings, node DAG, receipts, full-decision stability audit, final outline, stage health, versioned adoption record, and current adoption pointer | Markdown or human-readable outline displays |
 | Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog | DOCX and text reports |
 | Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests | TXT report, manual-review JSON, alignment audit, and completion projection |
-| Repair | typed repair issues/actions/patches, registered repair plan and apply result bound to the validation-run artifact, structural closure, and explicit versioned promotion transaction | human-readable repair summaries |
+| Repair | typed repair issues/actions/patches, quarantined derived inputs, current-service revalidation and receipt closure, and explicit versioned promotion transaction/current pointers | human-readable repair summaries |
 
 ## Public outcomes
 
@@ -49,9 +49,10 @@ Missing evidence maps to `evidence_gap`, never automatically to `unsupported`.
 Ambiguous or mismatched identity quarantines canonical generation and keeps
 `canonical_ready=false`.
 
-A zero-claim validation result is clean only when the review is explicitly
-citation-free. Successful validation is published only after canonical JSON
-read-back confirms job ID, attempt ID, and content hash.
+A zero-claim validation result is always `needs_review`; citation-free intent
+does not turn an unexecuted or empty validation into `clean`. Successful
+validation is published only after canonical JSON read-back confirms job ID,
+attempt ID, content hash, and the exact Registry dependency closure.
 
 Every declared review, citation, and evidence input hash is a 64-character
 lowercase SHA-256. The canonical payload's artifact ID/type/hash multiset must
@@ -104,7 +105,9 @@ gates pass; adoption writes a versioned identity and a current-pointer record.
 
 `reviewctl` is the single control plane. `status`, `next-action`,
 `validation-status`, `inspect`, and `attest` are provider-free reads.
-`run`, `resume`, `retry-node`, `validate`, `cancel`, `repair-plan`,
+`validate` executes the current `ValidationExecutionService` and persists a
+new validation attempt; it is not a closure-only inspection. `run`, `resume`,
+`retry-node`, `cancel`, `repair-plan`,
 `repair-apply`, `adopt`, `export`, and the queue list/add/run/retry/cancel/
 remove/import/export commands are explicit Registry- or queue-backed
 transitions. Queue workers claim a job with a cross-process lease and must
@@ -116,12 +119,15 @@ Validation closure requires the current review draft, citation manifest, and
 constructs an explicit `ValidationExecutionService` and records validation
 request identity before transport and normalized/output artifact identity after
 transport. Repair defaults to `report_only`; an explicit safe transaction
-creates only derived versioned artifacts, and promotion writes a
-`RepairPromotionTransaction` with structural revalidation, audit, and lineage
-without replacing canonical READY files. Adoption never silently promotes an
-intermediate candidate.
+creates only quarantined derived versioned artifacts, re-runs current
+validation against those exact files, and records receipt closure. Only
+`repair-promote` can write a new version and advance current pointers; it
+never replaces an older canonical READY file in place. Adoption never silently
+promotes an intermediate candidate.
 
 Export bundles contain verified files, provenance, checksums, completion
-evidence, and validation-closure evidence. `canonical_verified`,
+evidence, and validation-closure evidence. If canonical registration fails,
+the export is marked `untrusted`, its ZIP path and artifact ID are empty, and
+the temporary bundle is removed. `canonical_verified`,
 `manual_repaired`, and `untrusted` are attestation labels, not aliases for job
 success. A DOCX alone is never an export or completion proof.

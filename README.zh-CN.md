@@ -206,7 +206,7 @@ python main.py --project-name "my_review" --generate-review
 | `--analyze-only` / `-A` | 只运行阶段一：论文分析 |
 | `--generate-outline` / `-o` | 只运行阶段二：生成大纲 |
 | `--generate-review` / `-r` | 只运行阶段三：生成综述 |
-| `--validate-review` / `-v` | 验证已生成综述 |
+| `--validate-review` / `-v` | 通过当前 Validation service 验证已生成综述 |
 | `--retry-failed` | 重试阶段一失败论文 |
 | `--generate-section 3` | 只重做第 3 节综述 |
 | `--retry-review-failed` | 重试失败或缺失的综述章节 |
@@ -330,7 +330,7 @@ MINERU_ALLOWED_URL_HOSTS=
 | `[Outline_API]` | 阶段二大纲生成 |
 | `[Writer_API]` | 阶段三正文写作 |
 | `[Free_Mode_API]` | free mode / idea planning |
-| `[Validator_API]` | 综述验证 |
+| `[Validator_API]` | 当前 Validation service 使用的综述证据审理 Provider |
 
 每个 API 段可设置 `model`、`api_base`、`proxy_mode` 等。`proxy_mode = environment` 表示跟随系统代理环境变量；`proxy_mode = direct` 表示该 provider 绕过本地代理。
 
@@ -385,7 +385,12 @@ output/<project_name>/
 python main.py --project-name "my_review" --validate-review
 ```
 
-验证/修复管线会围绕 review draft、citation manifest、preprocess evidence 和 paper metadata 检查引用准确性、证据支撑和潜在漂移。启用时可能产生：
+验证/修复管线会通过当前 `ValidationExecutionService` 围绕 review draft、citation
+manifest、preprocess evidence 和 paper metadata 检查引用准确性、证据支撑和潜在漂移。
+`reviewctl validate` 会真正执行验证并写入新的 validation attempt；
+`reviewctl validation-status` 只读取持久化 closure。零 claim 永远是 `needs_review`，
+不会因为声明 citation-free 就变成 `clean`。Repair 先生成 quarantine 派生产物，
+只有重新验证闭合并显式 `repair-promote` 后才推进 current pointer。启用时可能产生：
 
 - `validation_report.json`
 - `repair_plan.json`
@@ -421,6 +426,8 @@ auto-generate-orchestrator
 | 只想修某一节 | 用 `--generate-section <n>` |
 | 只想补失败章节 | 用 `--retry-review-failed` |
 | 想验证生成结果 | 用 `--validate-review` |
+| 想执行当前控制面验证 | 用 `python -m reviewctl validate --job <job_id>` |
+| 想只查看验证闭环 | 用 `python -m reviewctl validation-status --job <job_id>` |
 | 想了解底层产物真相 | 看 [docs/zh-CN/runtime/](./docs/zh-CN/runtime/) |
 | 想接手开发 | 看 [docs/zh-CN/developer/](./docs/zh-CN/developer/) 和 [docs/zh-CN/reference/](./docs/zh-CN/reference/) |
 

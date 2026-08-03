@@ -17,8 +17,8 @@ The status and attestation outputs identify the job state, failed node, provider
 
 - Provider quota, retryable HTTP, transient network, or invalid-response failure: inspect the provider receipt and retry only the failed node when `next-action.safe_to_retry` is true.
 - Stale or tampered artifact: do not resume from it. Run `reconcile --dry-run`, retain the evidence, and create a report-only repair plan.
-- Missing validation closure: run `validate`; repair the input chain or rerun validation. A legacy text report is not a validation source.
-- A running or pending queue job: use `cancel`; retry only after the cancellation marker is cleared by a new `resume`/retry attempt.
+- Missing validation closure: run `validate` to execute the current validation service, then use `validation-status` to inspect the durable closure. Repair the input chain or rerun validation; a legacy text report is not a validation source.
+- A running or pending queue job: use `cancel`; retry only after the cancellation marker is cleared by a new `resume`/retry attempt. A worker that loses its lease heartbeat is fenced from completing or releasing the old claim.
 - Adoption failure: inspect coverage audit, stage health, final-outline hash, and blocking critiques. Do not bypass the gate.
 
 ## 3. Resume
@@ -33,6 +33,7 @@ Resume creates a new append-only attempt. It may reuse only Registry-verified ar
 
 ```text
 python -m reviewctl validate --workspace <workspace>
+python -m reviewctl validation-status --workspace <workspace>
 python -m reviewctl export --workspace <workspace>
 ```
 

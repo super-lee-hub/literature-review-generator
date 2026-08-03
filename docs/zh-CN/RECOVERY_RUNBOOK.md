@@ -13,13 +13,16 @@ python -m reviewctl attest --workspace <workspace>
 
 - quota、可重试 HTTP、临时网络或 invalid response：先看 receipt；只有 `safe_to_retry=true` 才重试失败节点。
 - artifact 过期或篡改：不要从它 resume；先运行 `reconcile --dry-run`，保留证据，再生成 report-only repair plan。
-- validation closure 缺失：运行 `validate`，修复输入链或重新验证；旧文本报告不是事实源。
+- validation closure 缺失：运行 `validate` 执行当前 Validation service，再用
+  `validation-status` 查看持久化 closure；修复输入链或重新验证，旧文本报告不是事实源。
 - pending/running 队列任务：使用 `cancel`；新一轮 resume/retry 才能清除取消标记。
+  丢失 lease heartbeat 的 worker 会被 fence，不得完成或释放旧 claim。
 - adoption 失败：检查 coverage audit、stage health、final-outline hash 和 blocking critique，不得绕过门禁。
 
 ```text
 python -m reviewctl resume --workspace <workspace>
 python -m reviewctl validate --workspace <workspace>
+python -m reviewctl validation-status --workspace <workspace>
 python -m reviewctl export --workspace <workspace>
 ```
 

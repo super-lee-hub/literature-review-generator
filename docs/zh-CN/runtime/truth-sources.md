@@ -25,11 +25,11 @@ Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是�
 | 阶段 | 规范真相源 | 投影/导出 |
 |---|---|---|
 | Source intake | `source_inventory_v1.json`、`source_bundle.json` | parser 诊断和只读 paper view |
-| Stage 1 | 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest 和来源链 | Excel 与显示用 summary |
+| Stage 1 | 不可变 content-addressed 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest 和来源链 | Excel 与显示用 summary |
 | Outline Intelligence v3 | 已注册 evidence views、corpus ledger、multi-view matrix、review intent、coverage contract、relation map、candidate plan、node DAG、receipts、final outline、stage health 和 adoption record | Markdown 或人类可读 outline 展示 |
 | Review | `review_draft.json`（`artifact_version=v3`）、`citation_manifest_v3.json` 和 citation-reference catalog | DOCX 与文本报告 |
 | Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包 | TXT、manual-review JSON、alignment audit 和 completion projection |
-| Repair | 与 validation-run artifact 绑定的已注册 repair plan 和 apply result | 人类可读 repair 摘要 |
+| Repair | typed repair issue/action/patch、quarantine 派生输入、current service 重新验证及 receipt 闭包、显式 versioned promotion transaction/current pointer | 人类可读 repair 摘要 |
 
 ## 公开状态
 
@@ -44,8 +44,10 @@ contradicted | wrong_source | needs_review`。
 `ambiguous/mismatch` 时可以完成诊断，但必须 quarantine，并保持
 `canonical_ready=false`。
 
-零 claim 的 Validation 只有在 review 明确声明 citation-free 时才可 clean。
-成功 Validation 必须在规范 JSON 回读后确认 job ID、attempt ID 和 content hash。
+零 claim 的 Validation 永远是 `needs_review`；即使 review 声明
+citation-free，也不能把未执行或空的验证变成 `clean`。成功 Validation
+必须在规范 JSON 回读后确认 job ID、attempt ID、content hash 和精确
+Registry dependency 闭包。
 规范 payload 的 artifact ID/type/hash 多重集合必须与 Registry `depends_on`
 完全一致；缺失、额外、重复、类型错误、job-kind 错误、路径错误或 hash 错误
 均 fail-closed。
@@ -82,15 +84,20 @@ hash，保留 replay receipt，并且 resume 只重跑失败节点的依赖闭�
 只有在 coverage、stage-health、identity 和 canonical-completion gate 全部通过后
 才可 adoption。
 
-`reviewctl` 是唯一控制面。`status`、`next-action`、`validate`、`inspect`、
-`attest` 是无 provider 的读取；`run`、`resume`、`retry-node`、`cancel`、
+`reviewctl` 是唯一控制面。`status`、`next-action`、`validation-status`、
+`inspect`、`attest` 是无 provider 的读取。`validate` 会真正执行当前
+`ValidationExecutionService` 并持久化新的 validation attempt，不是只检查
+已有 closure。`run`、`resume`、`retry-node`、`cancel`、
 `repair-plan`、`repair-apply`、`adopt`、`export` 是显式的 Registry-backed 状态
 迁移。cancel 是 cooperative 的，被取消 job 不得发布为 completed。
 
 Validation closure 要求当前 review draft、citation manifest 与
 `ValidationRunResultV1` 的输入 ID/hash 一致。Repair 默认 `report_only`；显式
-安全事务只创建 quarantine 的派生产物。Adoption 不会静默提升中间 candidate。
+安全事务只创建 quarantine 的派生产物，并用当前 service 对精确文件重新验证
+且闭合 receipt。只有 `repair-promote` 能创建新版本并推进 current pointer，
+不会原地覆盖旧 canonical READY 文件。Adoption 不会静默提升中间 candidate。
 
 Export bundle 包含已验证文件、provenance、checksum、completion evidence 和
-validation-closure evidence。`canonical_verified`、`manual_repaired`、
+validation-closure evidence。若 canonical 注册失败，导出状态为 `untrusted`，
+ZIP path 和 artifact ID 都为空，并删除临时 bundle。`canonical_verified`、`manual_repaired`、
 `untrusted` 是 attestation 标签，不是 job 成功别名；只有 DOCX 不能证明完成。

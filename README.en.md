@@ -194,7 +194,7 @@ Meaning:
 - `--generate-section <n>`: regenerate one section only
 - `--retry-failed`: retry only failed stage-1 papers
 - `--retry-review-failed`: retry only failed or missing review sections
-- `--validate-review`: run an extra validation pass; lower-level validation / repair artifacts are written into the active workspace
+- `--validate-review`: run an extra validation pass through the current validation service; lower-level validation / repair artifacts are written into the active workspace
 
 ### 6.5 GUI background queue
 
@@ -215,6 +215,12 @@ Outline v3 outputs are reusable only with an exact execution binding and closed
 provider receipt chain. Explicit adoption creates a versioned adoption identity
 and a current pointer; validation and repair remain separate, registry-backed
 gates.
+
+For the durable control plane, `python -m reviewctl validate --job <job_id>`
+executes the current `ValidationExecutionService` and persists a new validation
+attempt. Use `python -m reviewctl validation-status --job <job_id>` for a
+read-only closure view. A zero-claim result is `needs_review`, not `clean`, and
+repair outputs remain quarantined until explicit revalidation and promotion.
 
 ## 7. Advanced capabilities
 
@@ -334,7 +340,7 @@ Important config sections include:
 - `Writer_API`
 - `Outline_API`
 - `Free_Mode_API`
-- `Validator_API`
+- `Validator_API` (current validation adjudication provider, called through the validation service)
 - `Performance`
 - `Preprocess`
 - `Runtime` (typed retry limits, backoff, and job deadlines)
@@ -382,7 +388,7 @@ If you are here to work on the repository rather than just run it, start with:
 8. `.codex/skills/auto-generate-orchestrator/SKILL.md`
 9. `runtime/orchestrator.py`
 10. `preprocess/service.py`
-11. `validation/review_validator.py`
+11. `validation/execution_service.py`
 
 ## 12. One-line summary
 
