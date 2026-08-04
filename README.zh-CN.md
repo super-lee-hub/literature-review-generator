@@ -138,6 +138,14 @@ python launch_gui.py --reload --no-show
 
 GUI 的任务会进入 GUI 内部的持久化串行后台队列。提交一个任务后，表单仍可继续编辑，你可以准备下一项；CLI 和 Codex skill 不进入这个 GUI 队列。队列使用跨进程原子 snapshot；source/config fingerprint 变化会重置过期 retry 状态，lease generation 与 fence token 会阻止过期 worker 发布结果。heartbeat、expiry、取消和崩溃恢复都以持久化状态为准，不从 UI 文案推断。
 
+`run_all` 的持久化 StagePlan 在 validation 启用时固定执行
+analyze -> outline -> review -> validate；只有明确把 validation 设为 optional
+并禁用时才执行 analyze -> outline -> review，但这时仍要求 current artifact
+set。派生任务和 outline-only 任务没有 current set 时不能 canonical-ready。
+Outline stability 支持 `off`、默认的 `smoke` 和 `full`；五个 candidate 时，
+核心/smoke/full 预计分别为 10/20/60 次 Provider call，调用和估算成本会在
+transport 前做 preflight。
+
 ## 7. CLI 快速开始
 
 ### 7.1 PDF 文件夹一键跑完
@@ -202,7 +210,7 @@ python main.py --project-name "my_review" --generate-review
 | `python launch_gui.py` | 启动本地 GUI |
 | `--pdf-folder "D:\papers"` | 指定 PDF 文件夹 |
 | `--project-name "my_review"` | 指定项目名和输出工作区标识 |
-| `--run-all` / `-a` | 一键运行：分析 -> 大纲 -> 综述 |
+| `--run-all` / `-a` | 一键运行：分析 -> 大纲 -> 综述；validation policy 启用时还会执行验证 |
 | `--analyze-only` / `-A` | 只运行阶段一：论文分析 |
 | `--generate-outline` / `-o` | 只运行阶段二：生成大纲 |
 | `--generate-review` / `-r` | 只运行阶段三：生成综述 |
@@ -331,6 +339,7 @@ MINERU_ALLOWED_URL_HOSTS=
 | `[Writer_API]` | 阶段三正文写作 |
 | `[Free_Mode_API]` | free mode / idea planning |
 | `[Validator_API]` | 当前 Validation service 使用的综述证据审理 Provider |
+| `[OutlineStability]` | stability 模式、Provider call 上限和估算成本上限 |
 
 每个 API 段可设置 `model`、`api_base`、`proxy_mode` 等。`proxy_mode = environment` 表示跟随系统代理环境变量；`proxy_mode = direct` 表示该 provider 绕过本地代理。
 
@@ -392,6 +401,10 @@ manifest、preprocess evidence 和 paper metadata 检查引用准确性、证据
 不会因为声明 citation-free 就变成 `clean`。Repair 先生成 quarantine 派生产物，
 只有重新验证闭合并显式 `repair-promote` 后才推进 current pointer。完成与导出只消费
 原子 `CurrentArtifactSetV1` 及其 `CurrentStageClosureMapV1`，不会从任意 READY 产物推断完成。启用时可能产生：
+
+完成 map 会聚合 analyze、outline、review、validate 的 stage-indexed closure；
+validation 不是其他 provider 阶段的替代。只要缺少任一必需阶段或 current set，
+就保持 fail-closed。
 
 - `validation_report.json`
 - `repair_plan.json`

@@ -20,6 +20,10 @@ The status and attestation outputs identify the job state, failed node, provider
 - Missing validation closure: run `validate` to execute the current validation service, then use `validation-status` to inspect the durable closure. Repair the input chain or rerun validation; a legacy text report is not a validation source.
 - A running or pending queue job: use `cancel`; retry only after the cancellation marker is cleared by a new `resume`/retry attempt. A worker that loses its lease heartbeat is fenced from completing or releasing the old claim.
 - Adoption failure: inspect coverage audit, stage health, final-outline hash, and blocking critiques. Do not bypass the gate.
+- A `run_all` job that stops before validation is not automatically complete: inspect
+  the durable `StagePlan` and current-set requirement. If validation was optional
+  and disabled, analyze/outline/review still need complete stage-indexed closure
+  and a current set; if validation was required, run the missing `validate` stage.
 
 ## 3. Resume
 

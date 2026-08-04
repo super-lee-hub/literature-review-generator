@@ -3,7 +3,7 @@
 Date: 2026-08-04 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
-Code/test verification commit: `8464b5934ba9dde03de46e0723347728a6a4c4d5`
+Code/test verification commit: `65e9d24a9695c21846e3ab6868bec5212fdb5ad5`
 
 ## Current execution evidence
 
@@ -24,6 +24,11 @@ The current path persists and checks:
   unexpected, out-of-scope, usage, retry, and hash mismatches;
 - immutable `ValidationRunResultV1` plus exact Registry dependency closure;
 - stage-indexed provider closure derived from the durable requested-stage spec;
+- durable stage-plan policy for `run_all`: validation-enabled runs request
+  analyze/outline/review/validate; optional validation-disabled runs request
+  analyze/outline/review but still require the current artifact set;
+- derivation and outline-only jobs cannot become canonical-ready without a
+  current artifact set, and review requires explicit adoption where applicable;
 - reports and manual-review projections without treating closure inspection as
   validation execution.
 
@@ -31,15 +36,26 @@ The current path persists and checks:
 
 | Evidence | Result |
 |---|---|
-| Complete focused PR14/runtime group | `58 passed` |
-| Legacy registry/validation/repair compatibility group | `51 passed` |
-| Strict offline full gate | `688 passed, 22 deselected` from `710 collected` |
+| Queue/lease/Windows-spawn group | `26 passed` |
+| Closure/completion/stage-plan/current-artifact/GUI/export group | `77 passed` |
+| Outline v3 DAG/replay/stability group | `17 passed` |
+| Strict offline full gate | `708 passed, 22 deselected` from `730 collected` |
 | `python -m compileall -q .` | passed |
 | `python -m pyright` | `0 errors, 0 warnings, 0 informations` |
 | Current production-shaped three-PDF chain | passed; explicit adoption, current validation, export, and attestation |
 | Current repair control-plane E2E | passed; revalidation, DOCX rebuild, audit promotion, and atomic current-set switch |
 | Full stability and replay | passed; full perturbation path and zero-transport exact replay |
 | Queue Windows `spawn` fencing | passed; stale-worker publication rejected |
+| Current runtime-shaped E2E | passed; `1 passed` |
+| Current production-shaped E2E | passed; `1 passed` |
+
+Outline stability admission is persisted before transport. For candidate count
+`c`, core calls are `c+5`; with the default `c=5`, `off/smoke/full` estimate
+10/20/60 provider calls. Smoke contains one non-replay perturbation plus a
+zero-transport exact replay; full contains five non-replay perturbations plus
+that replay. The example policy is 24 calls and estimated cost 5.0, with
+rejection before any provider transport. Critic retry preserves completed
+candidate nodes and reruns the failed critic plus its downstream closure.
 
 The production-shaped chain injects deterministic responses at the configured
 transport boundary. It is `E2E_VERIFIED`, not `LIVE_VERIFIED`.
@@ -50,5 +66,6 @@ transport boundary. It is `E2E_VERIFIED`, not `LIVE_VERIFIED`.
 - Playwright and heavy OCR were excluded by the offline gate.
 - Focused negative tests cover the requested boundaries, but are not one
   monolithic failure-chain suite.
-- The two user-owned root ZIP files named in the task remain untouched and are
-  not validation inputs.
+- The ZIP files are absent from the committed diff and remote branch. The local
+  operator reports that they were not read or staged; remote GitHub evidence
+  cannot independently verify local read access.

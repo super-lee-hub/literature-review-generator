@@ -18,6 +18,10 @@ python -m reviewctl attest --workspace <workspace>
 - pending/running 队列任务：使用 `cancel`；新一轮 resume/retry 才能清除取消标记。
   丢失 lease heartbeat 的 worker 会被 fence，不得完成或释放旧 claim。
 - adoption 失败：检查 coverage audit、stage health、final-outline hash 和 blocking critique，不得绕过门禁。
+- `run_all` 如果在 validation 前停止，不能直接当作完成；先检查持久化
+  `StagePlan` 和 current-set requirement。若 validation 是 optional 且禁用，
+  analyze/outline/review 仍须有完整 stage-indexed closure 和 current set；若
+  validation 是 required，则必须补跑缺失的 `validate` 阶段。
 
 ```text
 python -m reviewctl resume --workspace <workspace>

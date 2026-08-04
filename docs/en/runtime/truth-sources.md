@@ -32,6 +32,14 @@ cannot satisfy a readiness or completion gate.
   diagnosis. READY promotion transactions are immutable and are never mutated
   in place.
 
+`artifacts/runtime_job_spec_v1.json` also stores the durable `StagePlan`. For
+`run_all`, validation-enabled jobs request `analyze`, `outline`, `review`, and
+`validate`; when validation is explicitly optional and disabled, only
+`validate` is omitted. Both paths still require the current artifact set for
+canonical readiness. Derivation and outline-only jobs cannot become canonical
+without a current set, and intermediate outline candidates require explicit
+adoption before they can feed the review path.
+
 Queue lifecycle reads `job_status`; a human-readable success flag is never a
 source of truth.
 
@@ -44,6 +52,7 @@ source of truth.
 | Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, typed quality gate, exact execution bindings, node DAG, receipts, full-decision stability audit, final outline, stage health, versioned adoption record, and current adoption pointer | Markdown or human-readable outline displays |
 | Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog, resolved through the current artifact set | DOCX and text reports |
 | Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
+| Stage plan | durable `stage_plan` inside `runtime_job_spec_v1.json`, including requested/required stages, validation policy, current-set requirement, and completion policy | job outcome and UI status projections |
 | Repair | typed repair issues/actions/patches, quarantined derived inputs, current-service revalidation and receipt closure, and explicit versioned promotion transaction with atomic current-set switching | human-readable repair summaries |
 
 Current production artifacts are validated by the pair
@@ -155,6 +164,11 @@ current-input/config/schema hashes, terminal artifact ID/hash, status, and
 Registry dependency IDs/hashes. A missing, stale, mismatched, or incomplete
 stage entry blocks canonical readiness. When a current set exists, its targets
 and hashes are authoritative.
+
+The map aggregates all required provider stages; validation is not a proxy for
+analyze, outline, or review. Completion therefore fails closed when any
+stage-indexed closure is missing, even if a historical READY artifact or a
+human-readable report exists.
 
 Validation closure requires the current review draft, citation manifest, and
 `ValidationRunResultV1` input IDs and hashes to match. The production path

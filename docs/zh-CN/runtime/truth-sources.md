@@ -23,6 +23,13 @@
   pointer 通过 compare-and-swap 推进；未被该 set 引用的旧 READY 产物只保留
   为历史或 quarantine 状态。
 
+`artifacts/runtime_job_spec_v1.json` 同时保存规范 `StagePlan`。`run_all` 在
+validation 启用时固定请求 `analyze`、`outline`、`review`、`validate`；只有在
+明确把 validation 设为 optional 且禁用时才省略 `validate`。两条路径都仍然
+要求 current artifact set 才能 canonical-ready。派生任务和 outline-only 任务
+在没有 current set 时不能 canonical-ready；中间 outline candidate 必须显式
+adoption 后才能进入 review 路径。
+
 Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是真相源。
 
 ## 各阶段规范真相源
@@ -34,6 +41,7 @@ Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是�
 | Outline Intelligence v3 | 已注册 evidence views、corpus ledger、multi-view matrix、review intent、coverage contract、relation map、candidate plan、node DAG、receipts、final outline、stage health 和 adoption record | Markdown 或人类可读 outline 展示 |
 | Review | `review_draft.json`（`artifact_version=v3`）、`citation_manifest_v3.json` 和 citation-reference catalog，并通过 current artifact set 解析 | DOCX 与文本报告 |
 | Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包；`CurrentStageClosureMapV1` 只解析 current set | TXT、manual-review JSON、alignment audit 和 completion projection |
+| Stage plan | `runtime_job_spec_v1.json` 内持久化的 `stage_plan`，包含 requested/required stages、validation policy、current-set requirement 和 completion policy | job outcome 与 GUI 状态投影 |
 | Repair | typed repair issue/action/patch、quarantine 派生输入、current service 重新验证及 receipt 闭包、带原子 current-set 切换的显式 versioned promotion transaction | 人类可读 repair 摘要 |
 
 ## 公开状态
@@ -97,6 +105,10 @@ hash，保留 replay receipt，并且 resume 只重跑失败节点的依赖闭�
 迁移。Queue worker 以跨进程 lease generation 和 fence token claim job，必须
 heartbeat，否则会失去 claim；过期 claim 可恢复，旧 worker 不能发布结果。cancel
 是 cooperative 的，被取消 job 不得发布为 completed。
+
+Completion map 会聚合所有 required provider stage；validation 不是 analyze、
+outline 或 review 的替代闭包。只要任一 stage-indexed closure 缺失，即使存在
+历史 READY 产物或人类可读报告，也必须 fail-closed。
 
 Validation closure 要求当前 review draft、citation manifest 与
 `ValidationRunResultV1` 的输入 ID/hash 一致。Repair 默认 `report_only`；显式

@@ -219,6 +219,14 @@ and a current pointer; validation and repair remain separate, registry-backed
 gates. Completion and export consume the atomic `CurrentArtifactSetV1` and its
 `CurrentStageClosureMapV1`, not an arbitrary READY artifact.
 
+The durable `run_all` stage plan requests analyze -> outline -> review ->
+validate when validation is enabled. If validation is explicitly optional and
+disabled, it requests analyze -> outline -> review, but still requires a
+current artifact set; derivation and outline-only jobs cannot become canonical
+without that set. Outline stability is `off`, `smoke` (default), or `full`:
+with five candidates the core/smoke/full call estimates are 10/20/60, and
+preflight records call and estimated-cost ceilings before transport.
+
 For the durable control plane, `python -m reviewctl validate --job <job_id>`
 executes the current `ValidationExecutionService` and persists a new validation
 attempt. Use `python -m reviewctl validation-status --job <job_id>` for a
@@ -344,6 +352,7 @@ Important config sections include:
 - `Outline_API`
 - `Free_Mode_API`
 - `Validator_API` (current validation adjudication provider, called through the validation service)
+- `OutlineStability` (stability mode, provider-call ceiling, and estimated-cost ceiling)
 - `Performance`
 - `Preprocess`
 - `Runtime` (typed retry limits, backoff, and job deadlines)

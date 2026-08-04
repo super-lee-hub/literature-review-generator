@@ -5,7 +5,7 @@
 `E2E_VERIFIED` 表示当前生产形状链路实际跑过，`LIVE_VERIFIED` 只保留给真实
 外部 Provider 运行，`NOT_VERIFIED` 表示所需 live 或 UI 证据尚未运行。
 
-当前离线基线为 collected 700、passed 678、deselected 22。Live API、
+当前离线基线为 collected 730、passed 708、deselected 22。Live API、
 Playwright 和 heavy OCR 本轮均为 `NOT_RUN`。
 
 | 功能 | 状态 | 规范实现 |
@@ -16,9 +16,10 @@ Playwright 和 heavy OCR 本轮均为 `NOT_RUN`。
 | Job outcome 与 attempts | E2E_VERIFIED | job outcome、append-only attempts、pointer 所有权 |
 | Stage 1 与证据 | E2E_VERIFIED | 不可变 content-addressed summaries、paper artifact、evidence manifest、edge checkpoint；summary -> source_bundle -> 来源 PDF 依赖链 |
 | ReviewBatch 派生 | INTEGRATED | 固定父 hash、child Stage 1 调用为零、derivation/coordinator lease、单调 generation、immutable max-head projection receipt |
-| Outline Intelligence v3 | E2E_VERIFIED | 已注册 evidence views、确定性 node DAG、精确 execution/replay 闭包、typed quality gate、stability variants、health 和显式 versioned adoption |
+| Outline Intelligence v3 | E2E_VERIFIED | 已注册 artifact validation surface、确定性 node DAG、精确 execution/replay 闭包、typed quality gate、`off`/`smoke`/`full` stability、调用/成本 preflight、checkpointed subruns、health、critic retry scope 和显式 versioned adoption |
 | Review/Citation/DOCX | E2E_VERIFIED | 当前 review draft v3、完整 section binding、manifest v3、token spans、实际引用 bibliography、DOCX |
 | Validation 真相源 | E2E_VERIFIED | 显式 `ValidationExecutionService` constructor 和 current runner boundary；transport 前 request binding；response/normalized/artifact/node receipt 闭包；持久化回读并绑定 job/attempt/hash 的 `ValidationRunResultV1`；review/citation/evidence `depends_on` 精确闭包；其他报告仅为投影 |
+| Stage plan 与 `run_all` policy | E2E_VERIFIED | validation 启用时持久化 plan 固定为 analyze/outline/review/validate；禁用时只省略 optional validation，但仍要求 `CurrentArtifactSet`；派生或 outline-only 不能在没有 current set 时 canonical-ready |
 | Outline quality 与 stability gates | E2E_VERIFIED | typed `OutlineQualityGate`、effective-section/duplicate/placeholder/empty-stream audit、order/relation/critic full-decision stability variants 和 gate-hash invalidation |
 | Repair promotion boundary | E2E_VERIFIED | typed issue/action/auto-safe patch、current service revalidation、quarantined 派生版本、原子 `CurrentArtifactSet` 切换以及不覆盖 canonical 的 versioned draft/manifest/DOCX/audit/lineage promotion |
 | AgentRuntimeRunner | E2E_VERIFIED | 在 `AgentRuntimeBridge` 上提供 run/resume/status/reconcile；持久化 `BaseException` 终态并从规范 artifact 恢复 Validation disposition |

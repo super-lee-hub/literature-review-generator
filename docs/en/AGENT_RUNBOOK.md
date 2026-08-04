@@ -10,6 +10,13 @@ Completion and export resolve the atomic `CurrentArtifactSetV1` through
 `current-artifact-set:pointer` and then build `CurrentStageClosureMapV1`; a
 historical READY artifact is not a substitute for the current set.
 
+The durable `StagePlan` controls completion. `run_all` requests analyze,
+outline, review, and validate when validation is enabled; an explicitly
+optional disabled validation policy requests only analyze, outline, and review,
+but still requires a current set. Derivation and outline-only actions cannot
+become canonical-ready without that set, and intermediate Outline v3 candidates
+are not silently adopted.
+
 ## Safe command order
 
 ```text
@@ -35,6 +42,9 @@ Use `--workspace <workspace_path>` when the job ID cannot be resolved. All comma
 - Queue workers use atomic snapshots, input/config fingerprints, lease
   generations, and fence tokens. An expired or fenced worker cannot publish a
   result; retry/cancel/recovery decisions must use the persisted queue state.
+- A lease is rechecked at the ArtifactRegistry publication boundary. A stale
+  worker, including a Windows `spawn` child whose claim expired, cannot publish
+  a canonical artifact merely because its local queue snapshot is stale.
 
 ## Validation, repair, and adoption
 

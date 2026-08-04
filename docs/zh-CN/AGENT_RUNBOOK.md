@@ -9,6 +9,12 @@ Outline v3 DAG/replay。
 `CurrentArtifactSetV1`，再构建 `CurrentStageClosureMapV1`；历史 READY 产物
 不能替代 current set。
 
+持久化 `StagePlan` 控制 completion。validation 启用时，`run_all` 请求
+analyze、outline、review、validate；明确设为 optional 且禁用时只请求
+analyze、outline、review，但仍要求 current set。派生和 outline-only 操作
+没有 current set 时不能 canonical-ready；中间 Outline v3 candidate 不会被
+静默 adoption。
+
 ## 安全顺序
 
 ```text
@@ -29,6 +35,10 @@ python -m reviewctl attest --job <job_id>
 Queue worker 使用原子 snapshot、input/config fingerprint、lease generation 和
 fence token。过期或被 fence 的 worker 不得发布结果；retry、cancel、恢复都必须
 以持久化 queue 状态为准。
+
+写入 ArtifactRegistry 前会再次校验 lease。包括 Windows `spawn` 子进程在内，
+claim 已过期的旧 worker 即使持有过期本地 queue snapshot，也不能发布 canonical
+artifact。
 
 `validate` 会对当前 v3 review draft、v3 citation manifest 和 evidence 输入真正执行
 当前 Validation，并持久化 `ValidationRunResultV1`、receipt 与 Registry 依赖。
