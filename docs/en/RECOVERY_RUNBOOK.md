@@ -17,8 +17,8 @@ The status and attestation outputs identify the job state, failed node, provider
 
 - Provider quota, retryable HTTP, transient network, or invalid-response failure: inspect the provider receipt and retry only the failed node when `next-action.safe_to_retry` is true.
 - Stale or tampered artifact: do not resume from it. Run `reconcile --dry-run`, retain the evidence, and create a report-only repair plan.
-- Missing validation closure: run `validate` to execute the current validation service, then use `validation-status` to inspect the durable closure. Repair the input chain or rerun validation; a legacy text report is not a validation source.
-- A running or pending queue job: use `cancel`; retry only after the cancellation marker is cleared by a new `resume`/retry attempt. A worker that loses its lease heartbeat is fenced from completing or releasing the old claim.
+- Missing validation closure: run `validate` to execute the current validation service, then use `validation-status` to inspect the durable closure. Repair the input chain or rerun validation; a legacy text report is not a validation source. If validation was explicitly optional and disabled, require the typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` and its empty receipt closure instead; it is not evidence that validation passed.
+- A running or pending queue job: use `cancel`; retry only after the cancellation marker is cleared by a new `resume`/retry attempt. A worker that loses its lease heartbeat is fenced from completing or releasing the old claim. Queue publication stages bytes privately, then uses queue-store -> Registry lock order; an immutable orphan after Registry failure is evidence to retain, not a reason to restore a fixed target.
 - Adoption failure: inspect coverage audit, stage health, final-outline hash, and blocking critiques. Do not bypass the gate.
 - A `run_all` job that stops before validation is not automatically complete: inspect
   the durable `StagePlan` and current-set requirement. If validation was optional

@@ -95,6 +95,53 @@ def atomic_write_json(path: str, payload: Any) -> None:
                     pass
 
 
+def publish_json_artifact(
+    publication_context: Any,
+    registry: Any,
+    path: str | os.PathLike[str],
+    payload: Any,
+    **register_kwargs: Any,
+) -> Any:
+    """Publish JSON through the explicit local/queue byte boundary.
+
+    The context owns staging, lease validation, immutable finalization, and
+    Registry registration.  Callers receive the Registry record so downstream
+    dependencies use the finalized path rather than a mutable legacy target.
+    """
+
+    result = publication_context.publish_json(
+        path,
+        payload,
+        registry=registry,
+        register_kwargs=register_kwargs,
+    )
+    artifact = getattr(result, "artifact", None)
+    if artifact is None:
+        raise RuntimeError("publication context did not return a registered artifact")
+    return artifact
+
+
+def publish_bytes_artifact(
+    publication_context: Any,
+    registry: Any,
+    path: str | os.PathLike[str],
+    payload: bytes,
+    **register_kwargs: Any,
+) -> Any:
+    """Publish non-JSON bytes through the same immutable byte boundary."""
+
+    result = publication_context.publish_bytes(
+        path,
+        payload,
+        registry=registry,
+        register_kwargs=register_kwargs,
+    )
+    artifact = getattr(result, "artifact", None)
+    if artifact is None:
+        raise RuntimeError("publication context did not return a registered artifact")
+    return artifact
+
+
 @dataclass(frozen=True)
 class WorkspacePaths:
     root_dir: str

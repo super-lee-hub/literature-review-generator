@@ -274,6 +274,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "mode": "smoke",
             "max_provider_calls": "24",
             "max_estimated_cost": "5.0",
+            "pricing_source": "config:OutlineStability-v1",
             "estimated_cost_per_1k_tokens": "0.001",
             "input_cost_per_1k_tokens": "0.0",
             "output_cost_per_1k_tokens": "0.001",

@@ -111,6 +111,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "mode",
             "max_provider_calls",
             "max_estimated_cost",
+            "pricing_source",
             "estimated_cost_per_1k_tokens",
             "input_cost_per_1k_tokens",
             "output_cost_per_1k_tokens",
@@ -284,6 +285,7 @@ class OutlineStabilitySettings:
     mode: str = "smoke"
     max_provider_calls: int = 24
     max_estimated_cost: float = 5.0
+    pricing_source: str = "config:OutlineStability-v1"
     estimated_cost_per_1k_tokens: float = 0.001
     input_cost_per_1k_tokens: float = 0.0
     output_cost_per_1k_tokens: float = 0.001
@@ -303,6 +305,7 @@ class OutlineStabilitySettings:
             mode=mode,
             max_provider_calls=max(0, _int(section.get("max_provider_calls"), 24)),
             max_estimated_cost=max(0.0, _float(section.get("max_estimated_cost"), 5.0)),
+            pricing_source=str(section.get("pricing_source") or "config:OutlineStability-v1").strip(),
             estimated_cost_per_1k_tokens=max(0.0, _float(section.get("estimated_cost_per_1k_tokens"), 0.001)),
             input_cost_per_1k_tokens=max(0.0, _float(section.get("input_cost_per_1k_tokens"), 0.0)),
             output_cost_per_1k_tokens=max(0.0, _float(section.get("output_cost_per_1k_tokens"), 0.001)),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ import zipfile
 
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry, RegistryError
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from services.queue_service import LocalPublicationContext
 
 
 EXPORT_BUNDLE_ARTIFACT_TYPE = "export_bundle"
@@ -151,7 +153,15 @@ def _current_pointer_targets(registry: ArtifactRegistry) -> tuple[set[str], dict
             "review_draft": current_set.review_draft_artifact_id,
             "citation_manifest": current_set.citation_manifest_artifact_id,
             "review_docx": current_set.review_docx_artifact_id,
-            "validation_run_result": current_set.validation_run_result_artifact_id,
+            (
+                "validation_disposition"
+                if current_set.validation_status == "not_requested"
+                else "validation_run_result"
+            ): (
+                current_set.validation_disposition_artifact_id
+                if current_set.validation_status == "not_requested"
+                else current_set.validation_run_result_artifact_id
+            ),
             "provider_receipt_closure": current_set.validation_receipt_closure_artifact_id,
         }
         for kind, target_id in current_targets.items():
@@ -229,8 +239,12 @@ def _derive_current_evidence(
 
         validation = ValidationClosureService(workspace, registry).inspect()
         closure = validation.to_dict()
-        if validation.status != "clean":
+        if validation.status not in {"clean", "not_requested"}:
             issues.append(f"validation_closure_not_clean:{validation.status}")
+        elif validation.status == "not_requested" and not bool(
+            (validation.semantic or {}).get("allow_unvalidated", False)
+        ):
+            issues.append("validation_disposition_policy_disallows_unvalidated")
     except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
         closure = {"status": "blocked", "blocking_issues": [str(exc)]}
         issues.append(f"validation_closure_unavailable:{exc}")
@@ -345,6 +359,8 @@ _EXPORT_ALLOWLIST = frozenset(
         "review_draft",
         "citation_manifest",
         "validation_run_result",
+        "validation_disposition",
+        "stage1_summary_reuse_record",
         "validation_projection",
         "review_docx",
         "repair_plan",
@@ -441,6 +457,16 @@ class ExportBundleService:
         adoption_manifest = dict(derived["adoption"])
         completion_status = str(completion_manifest.get("completion_status") or "unknown")
         closure_status = str(closure_manifest.get("status") or "unknown")
+        validation_semantic = closure_manifest.get("semantic")
+        unvalidated_allowed = bool(
+            closure_status == "not_requested"
+            and isinstance(validation_semantic, Mapping)
+            and validation_semantic.get("allow_unvalidated", False)
+            and not bool(closure_manifest.get("validation_required", False))
+        )
+        closure_trust_ready = closure_status == "clean" or (
+            closure_status == "not_requested" and unvalidated_allowed
+        )
         manual_modified = [
             entry["artifact_id"]
             for entry in file_entries
@@ -449,7 +475,7 @@ class ExportBundleService:
         trust_ready = not issues and (
             completion_status == "complete"
             and bool(completion_manifest.get("canonical_ready"))
-            and closure_status == "clean"
+            and closure_trust_ready
             and receipt_closure_manifest.get("status") == "clean"
             and (
                 not any(record.artifact_type == "final_outline" for record in records)
@@ -457,8 +483,14 @@ class ExportBundleService:
             )
             and not manual_modified
         )
-        bundle_status = "canonical_verified" if trust_ready else (
+        bundle_status = (
+            "canonical_unvalidated"
+            if trust_ready and unvalidated_allowed
+            else "canonical_verified"
+            if trust_ready
+            else (
             "manual_repaired" if not issues and manual_modified else "untrusted"
+            )
         )
         bundle_id = "export:" + _hash(
             {
@@ -491,6 +523,12 @@ class ExportBundleService:
             "records": file_entries,
             "completion_manifest": completion_manifest,
             "validation_closure": closure_manifest,
+            "validation_status": closure_status,
+            "validation_not_requested": bool(closure_status == "not_requested"),
+            "unvalidated_policy": {
+                "allowed": unvalidated_allowed,
+                "explicit_disposition": bool(closure_status == "not_requested"),
+            },
             "provider_receipt_closure": receipt_closure_manifest,
             "current_stage_closure_map": dict(derived["current_stage_closure_map"]),
             "requested_stages": list(derived["requested_stages"]),
@@ -510,80 +548,80 @@ class ExportBundleService:
                 issues=tuple(sorted(set(issues))),
             )
         checksums: dict[str, str] = {}
-        bundle_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_bundle_path = bundle_path.with_name(bundle_path.name + ".tmp")
-        try:
-            with zipfile.ZipFile(temp_bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                for record in ready_records:
-                    data = ready_payloads[record.artifact_id]
-                    arcname = f"artifacts/{_safe_name(record.artifact_id)}"
-                    archive.writestr(arcname, data)
-                    checksums[arcname] = hashlib.sha256(data).hexdigest()
-                manifest["issues"] = sorted(set(issues))
-                archive.writestr("provenance_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-                archive.writestr("checksums.json", json.dumps(checksums, ensure_ascii=False, indent=2, sort_keys=True))
-                archive.writestr(
-                    "completion_manifest.json",
-                    json.dumps(completion_manifest, ensure_ascii=False, indent=2),
-                )
-                archive.writestr(
-                    "validation_closure.json",
-                    json.dumps(closure_manifest, ensure_ascii=False, indent=2),
-                )
-                archive.writestr(
-                    "provider_receipt_closure.json",
-                    json.dumps(receipt_closure_manifest, ensure_ascii=False, indent=2),
-                )
-                archive.writestr("EXPORT_STATUS.txt", manifest["status"] + "\n")
-        except Exception:
-            try:
-                temp_bundle_path.unlink()
-            except OSError:
-                pass
-            raise
-        if not zipfile.is_zipfile(temp_bundle_path):
-            try:
-                temp_bundle_path.unlink()
-            except OSError:
-                pass
-            raise RegistryError("temporary export bundle failed ZIP verification")
-        temp_bundle_path.replace(bundle_path)
-
+        bundle_buffer = io.BytesIO()
+        with zipfile.ZipFile(bundle_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for record in ready_records:
+                data = ready_payloads[record.artifact_id]
+                arcname = f"artifacts/{_safe_name(record.artifact_id)}"
+                archive.writestr(arcname, data)
+                checksums[arcname] = hashlib.sha256(data).hexdigest()
+            manifest["issues"] = sorted(set(issues))
+            archive.writestr("provenance_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            archive.writestr("checksums.json", json.dumps(checksums, ensure_ascii=False, indent=2, sort_keys=True))
+            archive.writestr(
+                "completion_manifest.json",
+                json.dumps(completion_manifest, ensure_ascii=False, indent=2),
+            )
+            archive.writestr(
+                "validation_closure.json",
+                json.dumps(closure_manifest, ensure_ascii=False, indent=2),
+            )
+            archive.writestr(
+                "provider_receipt_closure.json",
+                json.dumps(receipt_closure_manifest, ensure_ascii=False, indent=2),
+            )
+            archive.writestr(
+                "EXPORT_STATUS.txt",
+                "status=" + str(manifest["status"]) + "\n"
+                + "validation_status=" + closure_status + "\n"
+                + "validation_required=" + str(bool(closure_manifest.get("validation_required", False))).lower() + "\n"
+                + "allow_unvalidated=" + str(unvalidated_allowed).lower() + "\n",
+            )
+        bundle_payload = bundle_buffer.getvalue()
+        if not zipfile.is_zipfile(io.BytesIO(bundle_payload)):
+            raise RegistryError("in-memory export bundle failed ZIP verification")
         artifact_id = f"export_bundle:{bundle_id}"
         registration_error = ""
         try:
-            registered = self.registry.register_file(
-                artifact_id=artifact_id,
-                artifact_role="export_bundle",
-                artifact_type=EXPORT_BUNDLE_ARTIFACT_TYPE,
-                artifact_version=EXPORT_BUNDLE_ARTIFACT_VERSION,
-                path=bundle_path,
-                producer="runtime.export_bundle.ExportBundleService",
-                depends_on=[ArtifactDependencyRefV2.from_record(record) for record in ready_records],
-                metadata={
-                    # GUI and API consumers historically used ``status``;
-                    # retain the explicit bundle name for newer callers.
-                    "status": bundle_status,
-                    "bundle_status": bundle_status,
-                    "issue_count": len(issues),
+            publication_context = getattr(self.registry, "publication_context", None) or LocalPublicationContext()
+            publication = publication_context.publish_bytes(
+                bundle_path,
+                bundle_payload,
+                registry=self.registry,
+                register_kwargs={
+                    "artifact_id": artifact_id,
+                    "artifact_role": "export_bundle",
+                    "artifact_type": EXPORT_BUNDLE_ARTIFACT_TYPE,
+                    "artifact_version": EXPORT_BUNDLE_ARTIFACT_VERSION,
+                    "producer": "runtime.export_bundle.ExportBundleService",
+                    "depends_on": [ArtifactDependencyRefV2.from_record(record) for record in ready_records],
+                    "metadata": {
+                        # GUI and API consumers historically used ``status``;
+                        # retain the explicit bundle name for newer callers.
+                        "status": bundle_status,
+                        "bundle_status": bundle_status,
+                        "validation_status": closure_status,
+                        "issue_count": len(issues),
+                    },
                 },
             )
+            registered = publication.artifact
+            if registered is None:
+                raise RegistryError("export bundle publication returned no Registry record")
             artifact_id = registered.artifact_id
+            final_bundle_path = Path(publication.final_path)
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             registration_error = str(exc)
             issues.append(f"bundle_registration_failed:{exc}")
             bundle_status = "untrusted"
             manifest["status"] = "untrusted"
             manifest["issues"] = sorted(set(issues))
-            try:
-                bundle_path.unlink()
-            except OSError:
-                pass
+            final_bundle_path = Path("")
         return ExportBundleResultV1(
             job_id=self.workspace.job_id,
             status=bundle_status,
             bundle_id=bundle_id,
-            bundle_path="" if registration_error else str(bundle_path),
+            bundle_path="" if registration_error else str(final_bundle_path),
             artifact_id="" if registration_error else artifact_id,
             manifest=manifest,
             issues=tuple(sorted(set([*issues, registration_error] if registration_error else issues))),
@@ -632,12 +670,19 @@ class ForensicAttestationService:
         closure_manifest = dict(derived["closure"])
         completion_status = str(completion_manifest.get("completion_status") or "unknown")
         closure_status = str(closure_manifest.get("status") or "unknown")
+        unvalidated_allowed = bool(
+            closure_status == "not_requested"
+            and isinstance(closure_manifest.get("semantic"), Mapping)
+            and closure_manifest["semantic"].get("allow_unvalidated", False)
+        )
         if issues:
             status = "untrusted"
         elif manual:
             status = "manual_repaired"
-        elif completion_status == "complete" and closure_status == "clean":
-            status = "canonical_verified"
+        elif completion_status == "complete" and (
+            closure_status == "clean" or (closure_status == "not_requested" and unvalidated_allowed)
+        ):
+            status = "canonical_unvalidated" if unvalidated_allowed else "canonical_verified"
         else:
             status = "untrusted"
             if completion_status != "complete":
@@ -667,31 +712,35 @@ class ForensicAttestationService:
             **evidence,
         }
         if persist:
-            atomic_write_json(str(report_path), report)
             try:
-                registered = self.registry.register_file(
-                    artifact_id=artifact_id,
-                    artifact_role="forensic_attestation",
-                    artifact_type=FORENSIC_ATTESTATION_ARTIFACT_TYPE,
-                    artifact_version=FORENSIC_ATTESTATION_ARTIFACT_VERSION,
-                    path=report_path,
-                    producer="runtime.export_bundle.ForensicAttestationService",
-                    depends_on=[
-                        ArtifactDependencyRefV2.from_record(record)
-                        for record in records
-                        if record.status == "ready" and record.artifact_id in verified
-                    ],
-                    metadata={"attestation_status": status, "evidence_hash": evidence_hash},
+                publication_context = getattr(self.registry, "publication_context", None) or LocalPublicationContext()
+                publication = publication_context.publish_json(
+                    report_path,
+                    report,
+                    registry=self.registry,
+                    register_kwargs={
+                        "artifact_id": artifact_id,
+                        "artifact_role": "forensic_attestation",
+                        "artifact_type": FORENSIC_ATTESTATION_ARTIFACT_TYPE,
+                        "artifact_version": FORENSIC_ATTESTATION_ARTIFACT_VERSION,
+                        "producer": "runtime.export_bundle.ForensicAttestationService",
+                        "depends_on": [
+                            ArtifactDependencyRefV2.from_record(record)
+                            for record in records
+                            if record.status == "ready" and record.artifact_id in verified
+                        ],
+                        "metadata": {"attestation_status": status, "evidence_hash": evidence_hash},
+                    },
                 )
+                registered = publication.artifact
+                if registered is None:
+                    raise RegistryError("forensic attestation publication returned no Registry record")
                 artifact_id = registered.artifact_id
+                report_path = Path(publication.final_path)
             except (OSError, RegistryError, ValueError, TypeError) as exc:
                 issues.append(f"attestation_registration_failed:{exc}")
                 status = "untrusted"
                 artifact_id = ""
-                try:
-                    report_path.unlink()
-                except OSError:
-                    pass
                 report_path = None
         return ForensicAttestationResultV1(
             job_id=self.workspace.job_id,

@@ -10,7 +10,8 @@ from typing import Any, Mapping
 from outline.v3_artifacts import AdoptedOutline
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
 from services.audit_record import AuditArtifactRefV1, AuditRecordV1
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_workspace import JobWorkspace, publish_json_artifact
+from services.queue_service import LocalPublicationContext
 
 
 ADOPTION_POINTER_ARTIFACT_ID = "outline-v3:adoption:current"
@@ -86,10 +87,18 @@ def _write_current_pointer(
     workspace: JobWorkspace,
     registry: ArtifactRegistry,
     adopted_record: ArtifactRecord,
+    publication_context: Any | None = None,
 ) -> ArtifactRecord:
     pointer_path = Path(workspace.artifact_path("outline_v3_adoption_current.json"))
-    atomic_write_json(
-        str(pointer_path),
+    publication_context = (
+        publication_context
+        or getattr(registry, "publication_context", None)
+        or LocalPublicationContext()
+    )
+    return publish_json_artifact(
+        publication_context,
+        registry,
+        pointer_path,
         {
             "artifact_type": ADOPTION_POINTER_ARTIFACT_TYPE,
             "artifact_version": ADOPTION_POINTER_ARTIFACT_VERSION,
@@ -100,13 +109,10 @@ def _write_current_pointer(
             "adoption_identity": adopted_record.artifact_id,
             "updated_at": adopted_record.created_at,
         },
-    )
-    return registry.register_file(
         artifact_id=ADOPTION_POINTER_ARTIFACT_ID,
         artifact_role=ADOPTION_POINTER_ARTIFACT_ROLE,
         artifact_type=ADOPTION_POINTER_ARTIFACT_TYPE,
         artifact_version=ADOPTION_POINTER_ARTIFACT_VERSION,
-        path=pointer_path,
         producer="outline.adoption_transaction.OutlineAdoptionTransaction",
         depends_on=[_dependency(adopted_record)],
         metadata={
@@ -152,9 +158,19 @@ class AdoptionTransactionResult:
 class OutlineAdoptionTransaction:
     """Apply an explicit, immutable adoption transaction to Outline V3 output."""
 
-    def __init__(self, workspace: JobWorkspace, registry: ArtifactRegistry) -> None:
+    def __init__(
+        self,
+        workspace: JobWorkspace,
+        registry: ArtifactRegistry,
+        publication_context: Any | None = None,
+    ) -> None:
         self.workspace = workspace
         self.registry = registry
+        self.publication_context = (
+            publication_context
+            or getattr(registry, "publication_context", None)
+            or LocalPublicationContext()
+        )
 
     def adopt(
         self,
@@ -277,7 +293,12 @@ class OutlineAdoptionTransaction:
         adopted_id = f"outline-v3:adoption:{source.content_hash[:16]}"
         existing = self.registry.get(adopted_id)
         if existing is not None and existing.status == "ready":
-            _write_current_pointer(self.workspace, self.registry, existing)
+            _write_current_pointer(
+                self.workspace,
+                self.registry,
+                existing,
+                self.publication_context,
+            )
             return AdoptionTransactionResult(
                 status="already_adopted",
                 job_id=self.workspace.job_id,
@@ -317,18 +338,25 @@ class OutlineAdoptionTransaction:
                 f"outline_v3/adoptions/{source.content_hash}/adoption.json"
             )
         )
-        atomic_write_json(str(adopted_path), adopted.to_dict())
-        adopted_record = self.registry.register_file(
+        adopted_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            adopted_path,
+            adopted.to_dict(),
             artifact_id=adopted_id,
             artifact_role="outline_v3_adoption",
             artifact_type=adopted.artifact_type,
             artifact_version=adopted.artifact_version,
-            path=adopted_path,
             producer="outline.adoption_transaction.OutlineAdoptionTransaction",
             depends_on=[_dependency(record) for record in dependency_records],
             metadata={"actor": actor, "reason": reason, "expected_hash": expected_hash},
         )
-        _write_current_pointer(self.workspace, self.registry, adopted_record)
+        _write_current_pointer(
+            self.workspace,
+            self.registry,
+            adopted_record,
+            self.publication_context,
+        )
 
         refs = [
             AuditArtifactRefV1(
@@ -369,13 +397,15 @@ class OutlineAdoptionTransaction:
             audit_id=f"outline-adoption:{source.content_hash[:24]}",
         )
         audit_path = Path(self.workspace.artifact_path(f"{audit.audit_id.replace(':', '-')}.json"))
-        atomic_write_json(str(audit_path), audit.to_dict())
-        audit_record = self.registry.register_file(
+        audit_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            audit_path,
+            audit.to_dict(),
             artifact_id=audit.audit_id,
             artifact_role="audit_record",
             artifact_type="audit_record",
             artifact_version="v1",
-            path=audit_path,
             producer="outline.adoption_transaction.OutlineAdoptionTransaction",
             depends_on=[*(_dependency(record) for record in dependency_records), _dependency(adopted_record)],
         )

@@ -14,6 +14,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,8 +27,14 @@ from services.artifact_registry import (
     ArtifactRegistry,
     file_sha256,
 )
-from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from services.job_workspace import (
+    JobWorkspace,
+    publish_bytes_artifact,
+    publish_json_artifact,
+    utc_now_iso,
+)
 from services.audit_record import AuditArtifactRefV1, AuditRecordV1
+from services.queue_service import LocalPublicationContext
 from validation.closure import ValidationClosureResult, ValidationClosureService
 from validation.repair_apply import run_repair_apply
 from validation.repair_models import (
@@ -202,6 +210,7 @@ def _write_current_artifact_pointer(
     target: ArtifactRecord,
     previous: ArtifactRecord | None,
     promotion_id: str,
+    publication_context: Any | None = None,
 ) -> ArtifactRecord:
     spec = CURRENT_REPAIR_POINTERS[kind]
     pointer_path = Path(workspace.artifact_path(f"current/{spec['filename']}"))
@@ -219,16 +228,23 @@ def _write_current_artifact_pointer(
         "promotion_transaction_id": promotion_id,
         "updated_at": utc_now_iso(),
     }
-    atomic_write_json(str(pointer_path), payload)
+    publication_context = (
+        publication_context
+        or getattr(registry, "publication_context", None)
+        or LocalPublicationContext()
+    )
     dependencies = [ArtifactDependencyRefV2.from_record(target)]
     if previous is not None and previous.artifact_id != target.artifact_id:
         dependencies.append(ArtifactDependencyRefV2.from_record(previous))
-    return registry.register_file(
+    return publish_json_artifact(
+        publication_context,
+        registry,
+        pointer_path,
+        payload,
         artifact_id=str(spec["pointer_id"]),
         artifact_role="current_artifact_pointer",
         artifact_type="current_artifact_pointer",
         artifact_version="v1",
-        path=pointer_path,
         producer="validation.repair_transaction.RepairTransactionService",
         depends_on=dependencies,
         metadata={
@@ -507,6 +523,7 @@ class RepairPromotionTransaction:
     artifact_type: str = "repair_promotion_transaction"
     artifact_version: str = "v1"
     validation_run_result_artifact_id: str = ""
+    validation_disposition_artifact_id: str = ""
     current_pointer_artifact_ids: Mapping[str, str] = field(default_factory=dict)
     current_artifact_set_id: str = ""
 
@@ -519,10 +536,38 @@ class RepairPromotionTransaction:
 
 
 class RepairTransactionService:
-    def __init__(self, workspace: JobWorkspace, registry: ArtifactRegistry) -> None:
+    def __init__(
+        self,
+        workspace: JobWorkspace,
+        registry: ArtifactRegistry,
+        publication_context: Any | None = None,
+    ) -> None:
         self.workspace = workspace
         self.registry = registry
+        self.publication_context = (
+            publication_context
+            or getattr(registry, "publication_context", None)
+            or LocalPublicationContext()
+        )
         self.closure_service = ValidationClosureService(workspace, registry)
+
+    def _publish_json(self, path: str | Path, payload: Any, **register_kwargs: Any) -> ArtifactRecord:
+        return publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            payload,
+            **register_kwargs,
+        )
+
+    def _publish_bytes(self, path: str | Path, payload: bytes, **register_kwargs: Any) -> ArtifactRecord:
+        return publish_bytes_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            payload,
+            **register_kwargs,
+        )
 
     def _canonical_inputs(self) -> tuple[ArtifactRecord | None, ArtifactRecord | None, ArtifactRecord | None]:
         return (
@@ -771,18 +816,18 @@ class RepairTransactionService:
                 f"repair_plans/{plan.plan_id.replace(':', '-')}.json"
             )
         )
-        atomic_write_json(str(path), plan.to_dict())
         dependencies: list[ArtifactDependencyRefV2] = []
         previous_records = self._dependency_records()
         for record in previous_records:
             if record.status == "ready":
                 dependencies.append(ArtifactDependencyRefV2.from_record(record))
-        record = self.registry.register_file(
+        record = self._publish_json(
+            path,
+            plan.to_dict(),
             artifact_id=f"repair_plan:{plan.plan_id}",
             artifact_role="repair_plan",
             artifact_type="repair_plan",
             artifact_version=plan.artifact_version,
-            path=path,
             producer="validation.repair_transaction.RepairTransactionService",
             depends_on=dependencies,
             metadata={
@@ -815,13 +860,13 @@ class RepairTransactionService:
                 f"repair_transactions/{transaction_id.replace(':', '-')}.json"
             )
         )
-        atomic_write_json(str(transaction_path), transaction.to_dict())
-        transaction_record = self.registry.register_file(
+        transaction_record = self._publish_json(
+            transaction_path,
+            transaction.to_dict(),
             artifact_id=transaction_id,
             artifact_role="repair_transaction",
             artifact_type=REPAIR_TRANSACTION_ARTIFACT_TYPE,
             artifact_version=REPAIR_TRANSACTION_ARTIFACT_VERSION,
-            path=transaction_path,
             producer="validation.repair_transaction.RepairTransactionService",
             depends_on=[
                 ArtifactDependencyRefV2.from_record(record),
@@ -999,9 +1044,6 @@ class RepairTransactionService:
         derived_draft_path = tx_dir / "review_draft_repaired.json"
         derived_manifest_path = tx_dir / "citation_manifest_repaired.json"
         apply_result_path = tx_dir / "repair_apply_result.json"
-        atomic_write_json(str(derived_draft_path), dict(patched_draft))
-        atomic_write_json(str(derived_manifest_path), dict(patched_manifest))
-        atomic_write_json(str(apply_result_path), apply_payload)
         base_dependencies = [
             item
             for item in (plan_record, draft_record, manifest_record, validation_record)
@@ -1011,12 +1053,13 @@ class RepairTransactionService:
             ArtifactDependencyRefV2.from_record(item)
             for item in base_dependencies
         ]
-        derived_draft_record = self.registry.register_file(
+        derived_draft_record = self._publish_json(
+            derived_draft_path,
+            dict(patched_draft),
             artifact_id=f"review_draft_repaired:{transaction_id}",
             artifact_role="review_draft_repaired",
             artifact_type="review_draft_repaired",
             artifact_version="v1",
-            path=derived_draft_path,
             producer="validation.repair_transaction.RepairTransactionService",
             status="quarantined",
             depends_on=dependency_payloads,
@@ -1026,12 +1069,13 @@ class RepairTransactionService:
                 "semantic_revalidation": semantic_revalidation.to_dict(),
             },
         )
-        derived_manifest_record = self.registry.register_file(
+        derived_manifest_record = self._publish_json(
+            derived_manifest_path,
+            dict(patched_manifest),
             artifact_id=f"citation_manifest_repaired:{transaction_id}",
             artifact_role="citation_manifest_repaired",
             artifact_type="citation_manifest_repaired",
             artifact_version="v1",
-            path=derived_manifest_path,
             producer="validation.repair_transaction.RepairTransactionService",
             status="quarantined",
             depends_on=dependency_payloads,
@@ -1041,12 +1085,13 @@ class RepairTransactionService:
                 "semantic_revalidation": semantic_revalidation.to_dict(),
             },
         )
-        apply_record = self.registry.register_file(
+        apply_record = self._publish_json(
+            apply_result_path,
+            apply_payload,
             artifact_id=f"repair_apply_result:{transaction_id}",
             artifact_role="repair_apply_result",
             artifact_type="repair_apply_result",
             artifact_version="v1",
-            path=apply_result_path,
             producer="validation.repair_transaction.RepairTransactionService",
             status="quarantined",
             depends_on=[
@@ -1076,13 +1121,13 @@ class RepairTransactionService:
             reason="auto-safe structural repair produced quarantined derived artifacts; canonical artifacts were not replaced",
         )
         transaction_path = tx_dir / "repair_transaction.json"
-        atomic_write_json(str(transaction_path), transaction.to_dict())
-        transaction_record = self.registry.register_file(
+        transaction_record = self._publish_json(
+            transaction_path,
+            transaction.to_dict(),
             artifact_id=transaction_id,
             artifact_role="repair_transaction",
             artifact_type=REPAIR_TRANSACTION_ARTIFACT_TYPE,
             artifact_version=REPAIR_TRANSACTION_ARTIFACT_VERSION,
-            path=transaction_path,
             producer="validation.repair_transaction.RepairTransactionService",
             status="quarantined",
             depends_on=[
@@ -1387,7 +1432,7 @@ class RepairTransactionService:
         # validation result to post-hoc metadata.
         promoted_draft_path = Path(validated_draft_record.path)
         promoted_manifest_path = Path(validated_manifest_record.path)
-        promoted_docx_path = promotion_dir / "review.docx"
+        promoted_docx_target_path = promotion_dir / "review.docx"
 
         promoted_draft = _load_json(validated_draft_record)
         promoted_manifest = _load_json(validated_manifest_record)
@@ -1400,6 +1445,11 @@ class RepairTransactionService:
                 "mutation_performed": False,
             }
 
+        temp_docx_fd, temp_docx_name = tempfile.mkstemp(
+            prefix="repair-review-",
+            suffix=".docx",
+        )
+        os.close(temp_docx_fd)
         try:
             from docx_writer import rebuild_review_docx_from_structured_artifacts
 
@@ -1407,8 +1457,9 @@ class RepairTransactionService:
                 SimpleNamespace(logger=None),
                 promoted_draft,
                 promoted_manifest,
-                str(promoted_docx_path),
+                temp_docx_name,
             )
+            promoted_docx_bytes = Path(temp_docx_name).read_bytes()
         except (OSError, TypeError, ValueError, KeyError, RuntimeError) as exc:
             return {
                 "status": "blocked",
@@ -1417,6 +1468,11 @@ class RepairTransactionService:
                 "repair_structural_closure": structural.to_dict(),
                 "mutation_performed": False,
             }
+        finally:
+            try:
+                Path(temp_docx_name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
         promoted_validation_id = f"validation_run_result:v1:repair:{versioned_suffix}"
         promoted_validation_path = Path(registered_revalidation.path)
@@ -1483,12 +1539,13 @@ class RepairTransactionService:
                 "promotion_transaction_id": promotion_id,
             },
         )
-        promoted_docx_record = self.registry.register_file(
+        promoted_docx_record = self._publish_bytes(
+            promoted_docx_target_path,
+            promoted_docx_bytes,
             artifact_id=versioned_docx_id,
             artifact_role="repair_promotion_review_docx",
             artifact_type="review_docx",
             artifact_version="v1",
-            path=promoted_docx_path,
             producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
             depends_on=[
                 ArtifactDependencyRefV2.from_record(promoted_draft_record),
@@ -1590,13 +1647,13 @@ class RepairTransactionService:
             audit_id=audit_id,
         )
         audit_path = promotion_dir / "repair_promotion_audit.json"
-        atomic_write_json(str(audit_path), audit.to_dict())
-        audit_record = self.registry.register_file(
+        audit_record = self._publish_json(
+            audit_path,
+            audit.to_dict(),
             artifact_id=audit_id,
             artifact_role="repair_promotion_audit",
             artifact_type="audit_record",
             artifact_version="v1",
-            path=audit_path,
             producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
             depends_on=[
                 *base_dependencies,
@@ -1628,13 +1685,13 @@ class RepairTransactionService:
                 "validation_run_result": previous_validation_record.artifact_id if previous_validation_record is not None else "",
             },
         }
-        atomic_write_json(str(lineage_path), lineage_payload)
-        lineage_record = self.registry.register_file(
+        lineage_record = self._publish_json(
+            lineage_path,
+            lineage_payload,
             artifact_id=lineage_id,
             artifact_role="repair_lineage",
             artifact_type="repair_lineage",
             artifact_version="v1",
-            path=lineage_path,
             producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
             depends_on=[
                 ArtifactDependencyRefV2.from_record(audit_record),
@@ -1675,17 +1732,15 @@ class RepairTransactionService:
             current_artifact_set_id="",
         )
         promotion_path = promotion_dir / "repair_promotion_transaction.json"
-        atomic_write_json(str(promotion_path), promotion.to_dict())
-        promotion_record = ArtifactRecord(
+        promotion_record = self._publish_json(
+            promotion_path,
+            promotion.to_dict(),
             artifact_id=promotion_id,
             artifact_role="repair_promotion_transaction",
             artifact_type=promotion.artifact_type,
             artifact_version=promotion.artifact_version,
-            path=str(promotion_path),
             producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
-            job_id=self.workspace.job_id,
             status="ready",
-            content_hash=file_sha256(promotion_path),
             depends_on=[
                 ArtifactDependencyRefV2.from_record(audit_record),
                 ArtifactDependencyRefV2.from_record(lineage_record),
@@ -1698,7 +1753,6 @@ class RepairTransactionService:
                 "canonical_replacement": True,
                 "quarantined_export": False,
             },
-            created_at=promotion.created_at,
         )
         current_set = self.registry.build_current_artifact_set(
             promotion_transaction_id=promotion_id,

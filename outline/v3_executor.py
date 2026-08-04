@@ -55,7 +55,8 @@ from runtime.provider_runtime import (
 )
 from runtime.outline_v3_replay import ModelCallReplayKey, ModelCallReplayStore
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
-from services.job_workspace import atomic_write_json
+from services.job_workspace import publish_bytes_artifact, publish_json_artifact
+from services.queue_service import LocalPublicationContext
 
 
 Provider = Callable[[str, Mapping[str, Any]], Any]
@@ -64,6 +65,63 @@ FaultInjector = Callable[[str, Mapping[str, Any]], None]
 
 class OutlineV3ExecutionError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class OutlineProviderCallPlan:
+    """A conservative, per-node provider-call estimate.
+
+    This is an admission estimate, not a provider bill.  The plan is kept
+    explicit so a caller can see which prompt, output, reasoning, and cache
+    assumptions were used before any transport is attempted.
+    """
+
+    artifact_type: str
+    artifact_version: str
+    job_id: str
+    stage_name: str
+    closure_epoch_id: str
+    logical_attempt_identity: str
+    variant_name: str
+    node_id: str
+    call_id: str
+    provider: str
+    model: str
+    endpoint_type: str
+    estimated_input_tokens: int
+    estimated_output_tokens: int
+    estimated_reasoning_tokens: int
+    estimated_cached_input_tokens: int
+    estimated_cache_write_tokens: int
+    estimated_total_tokens: int
+    input_cost_per_1k_tokens: float | None
+    output_cost_per_1k_tokens: float | None
+    reasoning_cost_per_1k_tokens: float | None
+    cache_read_cost_per_1k_tokens: float | None
+    cache_write_cost_per_1k_tokens: float | None
+    estimated_cost: float | None
+    pricing_source: str
+    pricing_policy: str
+    cost_status: str
+    assumptions: tuple[str, ...]
+    confidence: str
+    upper_bound: bool
+    transport_expected: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        # Keep the semantic names obvious for downstream audit readers while
+        # retaining the stable estimate names used by the preflight summary.
+        payload.update(
+            {
+                "prompt_input_tokens": self.estimated_input_tokens,
+                "output_tokens": self.estimated_output_tokens,
+                "reasoning_tokens": self.estimated_reasoning_tokens,
+                "cache_read_tokens": self.estimated_cached_input_tokens,
+                "cache_write_tokens": self.estimated_cache_write_tokens,
+            }
+        )
+        return payload
 
 
 @dataclass(frozen=True)
@@ -144,13 +202,15 @@ class OutlineV3Executor:
         max_provider_calls: int | None = None,
         max_estimated_cost: float | None = None,
         estimated_cost_per_1k_tokens: float = 0.001,
-        input_cost_per_1k_tokens: float = 0.0,
+        input_cost_per_1k_tokens: float | None = None,
         output_cost_per_1k_tokens: float | None = None,
         reasoning_cost_per_1k_tokens: float | None = None,
-        cache_read_cost_per_1k_tokens: float = 0.0,
-        cache_write_cost_per_1k_tokens: float = 0.0,
+        cache_read_cost_per_1k_tokens: float | None = None,
+        cache_write_cost_per_1k_tokens: float | None = None,
         max_smoke_overhead_ratio: float | None = None,
         max_source_prompt_tokens: int | None = None,
+        pricing_source: str | None = None,
+        pricing_policy: str = "estimate_only_not_billing_v1",
         publication_context: Any | None = None,
         _skip_exact_replay_verification: bool = False,
     ) -> None:
@@ -173,7 +233,7 @@ class OutlineV3Executor:
             "cache_read_cost_per_1k_tokens": cache_read_cost_per_1k_tokens,
             "cache_write_cost_per_1k_tokens": cache_write_cost_per_1k_tokens,
         }.items():
-            if not math.isfinite(float(value)) or float(value) < 0:
+            if value is not None and (not math.isfinite(float(value)) or float(value) < 0):
                 raise ValueError(f"{name} must be finite and non-negative")
         if max_smoke_overhead_ratio is not None and (
             not math.isfinite(float(max_smoke_overhead_ratio)) or float(max_smoke_overhead_ratio) < 1.0
@@ -185,7 +245,11 @@ class OutlineV3Executor:
         self.summaries = [dict(item) for item in summaries]
         self.workspace = workspace
         self.registry = artifact_registry or self._build_registry()
-        self.publication_context = publication_context
+        self.publication_context = (
+            publication_context
+            or getattr(self.registry, "publication_context", None)
+            or LocalPublicationContext()
+        )
         self.provider = provider
         self.profile = provider_profile or ProviderContextProfile.conservative(
             provider="fixture" if provider is None else "configured",
@@ -199,21 +263,36 @@ class OutlineV3Executor:
         self.max_provider_calls = int(max_provider_calls) if max_provider_calls is not None else None
         self.max_estimated_cost = float(max_estimated_cost) if max_estimated_cost is not None else None
         self.estimated_cost_per_1k_tokens = float(estimated_cost_per_1k_tokens)
-        self.input_cost_per_1k_tokens = float(input_cost_per_1k_tokens)
+        self._pricing_is_explicit = bool(
+            str(pricing_source or "").strip()
+            and all(
+                value is not None
+                for value in (
+                    input_cost_per_1k_tokens,
+                    output_cost_per_1k_tokens,
+                    reasoning_cost_per_1k_tokens,
+                    cache_read_cost_per_1k_tokens,
+                    cache_write_cost_per_1k_tokens,
+                )
+            )
+        )
+        self.input_cost_per_1k_tokens = float(input_cost_per_1k_tokens or 0.0)
         self.output_cost_per_1k_tokens = float(
             estimated_cost_per_1k_tokens if output_cost_per_1k_tokens is None else output_cost_per_1k_tokens
         )
         self.reasoning_cost_per_1k_tokens = float(
             estimated_cost_per_1k_tokens if reasoning_cost_per_1k_tokens is None else reasoning_cost_per_1k_tokens
         )
-        self.cache_read_cost_per_1k_tokens = float(cache_read_cost_per_1k_tokens)
-        self.cache_write_cost_per_1k_tokens = float(cache_write_cost_per_1k_tokens)
+        self.cache_read_cost_per_1k_tokens = float(cache_read_cost_per_1k_tokens or 0.0)
+        self.cache_write_cost_per_1k_tokens = float(cache_write_cost_per_1k_tokens or 0.0)
         self.max_smoke_overhead_ratio = (
             float(max_smoke_overhead_ratio) if max_smoke_overhead_ratio is not None else None
         )
         self.max_source_prompt_tokens = (
             int(max_source_prompt_tokens) if max_source_prompt_tokens is not None else None
         )
+        self.pricing_source = str(pricing_source or "")
+        self.pricing_policy = str(pricing_policy or "estimate_only_not_billing_v1")
         self.review_intent_input = dict(review_intent or {})
         self.quality_gate = quality_gate if isinstance(quality_gate, OutlineQualityGate) else OutlineQualityGate.from_mapping(quality_gate)
         self._review_intent_hash = build_review_intent(self.review_intent_input).content_hash
@@ -224,6 +303,7 @@ class OutlineV3Executor:
         self._provider_call_count = 0
         self._transport_call_count = 0
         self.stability_preflight: dict[str, Any] = {}
+        self.provider_call_plans: tuple[OutlineProviderCallPlan, ...] = ()
         default_attempt_payload = {
             "job_id": self.job_id,
             "summary_hashes": self._summary_hashes(),
@@ -260,12 +340,22 @@ class OutlineV3Executor:
         self.replay_diagnostics: list[str] = []
         self._blocking_critic_diagnostics: dict[str, tuple[str, ...]] = {}
         self._payloads: dict[str, dict[str, Any]] = {}
-        ledger_root = getattr(self.workspace, "root_dir", None) or self._path("")
+        ledger_root = Path(
+            getattr(self.workspace, "root_dir", None) or self._path("")
+        ) / ".publication-staging" / "provider-receipts"
         self._receipt_ledger = ProviderRuntimeLedger.for_epoch(
             ledger_root,
             stage_name="outline_v3",
             closure_epoch_id=self.closure_epoch_id,
         )
+        self.receipt_ledger_target_path = self._path("outline_v3_provider_receipts.jsonl")
+        existing_ledger = self.registry.get("outline_v3_provider_receipts")
+        if existing_ledger is not None and existing_ledger.status == "ready":
+            try:
+                self._receipt_ledger.path.parent.mkdir(parents=True, exist_ok=True)
+                self._receipt_ledger.path.write_bytes(Path(existing_ledger.path).read_bytes())
+            except OSError:
+                pass
         self._replay_store = ModelCallReplayStore(self.workspace)
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
         self._pending_replays: dict[str, tuple[ModelCallReplayKey, str, str]] = {}
@@ -349,10 +439,10 @@ class OutlineV3Executor:
     ) -> list[tuple[str, list[dict[str, Any]], list[str], dict[str, Any]]]:
         """Return the explicitly selected stability perturbations.
 
-        ``smoke`` is the default so ordinary runs pay only for a compact,
-        high-value perturbation set plus exact replay.  ``full`` retains the
-        comprehensive historical matrix; ``off`` records a disabled audit and
-        performs no stability provider work.
+        ``smoke`` is the default and runs one additional full reversed-summary
+        decision chain plus exact replay. ``full`` retains the comprehensive
+        perturbation matrix; ``off`` records a disabled audit and performs no
+        stability provider work.
         """
 
         if self.stability_mode == "off":
@@ -379,7 +469,6 @@ class OutlineV3Executor:
                 {
                     "summary_order": "reversed",
                     "shard_size": len(self.summaries),
-                    "compact": True,
                 },
             ),
         ]
@@ -419,34 +508,159 @@ class OutlineV3Executor:
             ),
         ]
 
+    def _provider_call_plan_variants(
+        self,
+    ) -> list[tuple[str, Sequence[Mapping[str, Any]], bool]]:
+        """Return plan rows for transport and zero-transport replay work."""
+
+        if self.stability_mode == "off":
+            return [("canonical", self.summaries, True)]
+        variants = self._stability_variant_plan()
+        planned: list[tuple[str, Sequence[Mapping[str, Any]], bool]] = []
+        for name, summaries, _order, definition in variants:
+            resume_kind = str(definition.get("resume") or "")
+            if name == "baseline":
+                planned.append((name, summaries, True))
+            elif resume_kind == "exact_replay":
+                planned.append((name, summaries, False))
+            elif resume_kind != "primary_baseline_reuse":
+                planned.append((name, summaries, True))
+        if not any(name == "exact_replay_resume" for name, _summaries, _transport in planned):
+            planned.append(("exact_replay_resume", self.summaries, False))
+        return planned
+
+    def _build_provider_call_plans(self) -> tuple[OutlineProviderCallPlan, ...]:
+        plans: list[OutlineProviderCallPlan] = []
+        for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
+            for node_id in self._provider_node_ids():
+                representative_request = {
+                    "job_id": self.job_id,
+                    "stage_name": "outline_v3",
+                    "variant_name": variant_name,
+                    "node_id": node_id,
+                    "summaries": list(variant_summaries),
+                    "candidate_count": self.candidate_count,
+                    "evidence_bound": True,
+                }
+                budget = self.profile.estimate_request(representative_request)
+                estimated_input = max(
+                    1,
+                    int(budget.get("estimated_input_tokens") or self.profile.estimate_tokens(representative_request)),
+                )
+                base_input_estimate = estimated_input
+                estimated_output = max(1, int(self.profile.max_output_tokens))
+                estimated_reasoning = max(0, int(self.profile.reasoning_reserve))
+                candidate_output_upper_bound = self.candidate_count * estimated_output
+                critic_input_upper_bound = 0
+                if node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
+                    critic_input_upper_bound = candidate_output_upper_bound
+                elif node_id == "arbitration":
+                    critic_input_upper_bound = candidate_output_upper_bound + 3 * estimated_output
+                if critic_input_upper_bound:
+                    estimated_input = max(
+                        estimated_input,
+                        base_input_estimate + critic_input_upper_bound,
+                    )
+                estimated_cached = 0
+                estimated_cache_write = 0
+                total = estimated_input + estimated_output + estimated_reasoning
+                cost = (
+                    estimated_input / 1000.0 * self.input_cost_per_1k_tokens
+                    + estimated_output / 1000.0 * self.output_cost_per_1k_tokens
+                    + estimated_reasoning / 1000.0 * self.reasoning_cost_per_1k_tokens
+                    + estimated_cached / 1000.0 * self.cache_read_cost_per_1k_tokens
+                    + estimated_cache_write / 1000.0 * self.cache_write_cost_per_1k_tokens
+                    if self._pricing_is_explicit
+                    else None
+                )
+                assumptions = [
+                    "prompt estimate is computed from a representative evidence-bound request",
+                    "configured max_output_tokens is used as the output upper bound",
+                    "reasoning reserve is charged as a separate upper-bound component",
+                    "cache read/write tokens are zero until the provider reports them",
+                    "estimated cost is a local admission estimate and is not billing data",
+                ]
+                if not self._pricing_is_explicit:
+                    assumptions.append(
+                        "pricing is unknown because an explicit pricing source and complete rate set were not supplied"
+                    )
+                if node_id.endswith("_provider_generation"):
+                    assumptions.append("candidate generation output is included in the upper bound")
+                if critic_input_upper_bound:
+                    assumptions.append(
+                        "critic/arbitration input upper bound includes candidate outputs at configured max_output_tokens"
+                    )
+                    if node_id == "arbitration":
+                        assumptions.append(
+                            "arbitration input also includes three critic outputs at configured max_output_tokens"
+                        )
+                plans.append(
+                    OutlineProviderCallPlan(
+                        artifact_type="outline_provider_call_plan",
+                        artifact_version="v1",
+                        job_id=self.job_id,
+                        stage_name="outline_v3",
+                        closure_epoch_id=self.closure_epoch_id,
+                        logical_attempt_identity=self.logical_attempt_identity,
+                        variant_name=variant_name,
+                        node_id=node_id,
+                        call_id=self._provider_call_id(node_id),
+                        provider=self.profile.provider,
+                        model=self.profile.model,
+                        endpoint_type=self.profile.endpoint_type,
+                        estimated_input_tokens=estimated_input,
+                        estimated_output_tokens=estimated_output,
+                        estimated_reasoning_tokens=estimated_reasoning,
+                        estimated_cached_input_tokens=estimated_cached,
+                        estimated_cache_write_tokens=estimated_cache_write,
+                        estimated_total_tokens=total,
+                        input_cost_per_1k_tokens=self.input_cost_per_1k_tokens,
+                        output_cost_per_1k_tokens=self.output_cost_per_1k_tokens,
+                        reasoning_cost_per_1k_tokens=self.reasoning_cost_per_1k_tokens,
+                        cache_read_cost_per_1k_tokens=self.cache_read_cost_per_1k_tokens,
+                        cache_write_cost_per_1k_tokens=self.cache_write_cost_per_1k_tokens,
+                        estimated_cost=cost,
+                        pricing_source=self.pricing_source,
+                        pricing_policy=self.pricing_policy,
+                        cost_status="estimate" if self._pricing_is_explicit else "unknown",
+                        assumptions=tuple(assumptions),
+                        confidence="medium",
+                        upper_bound=True,
+                        transport_expected=transport_expected,
+                    )
+                )
+        return tuple(plans)
+
     def _preflight_stability_budget(self) -> None:
         core_calls = len(self._provider_node_ids())
-        variants = self._stability_variant_plan()
-        non_replay_variants = sum(
-            1 for _name, _summaries, _order, definition in variants
-            if definition.get("resume") not in {"exact_replay", "primary_baseline_reuse"}
+        self.provider_call_plans = self._build_provider_call_plans()
+        transport_plans = [item for item in self.provider_call_plans if item.transport_expected]
+        estimated_provider_calls = len(transport_plans)
+        estimated_input_tokens = sum(item.estimated_input_tokens for item in transport_plans)
+        estimated_output_tokens = sum(item.estimated_output_tokens for item in transport_plans)
+        estimated_reasoning_tokens = sum(item.estimated_reasoning_tokens for item in transport_plans)
+        estimated_cached_input_tokens = sum(item.estimated_cached_input_tokens for item in transport_plans)
+        estimated_cache_write_tokens = sum(item.estimated_cache_write_tokens for item in transport_plans)
+        estimated_total_tokens = sum(item.estimated_total_tokens for item in transport_plans)
+        estimated_cost_values = [item.estimated_cost for item in transport_plans]
+        known_estimated_costs = [value for value in estimated_cost_values if value is not None]
+        estimated_cost = (
+            sum(known_estimated_costs)
+            if len(known_estimated_costs) == len(estimated_cost_values)
+            else None
         )
-        estimated_provider_calls = core_calls * (1 + non_replay_variants)
         estimated_input_per_call = max(
             1,
-            int(self.profile.estimate_tokens({"summaries": self.summaries})),
+            max((item.estimated_input_tokens for item in transport_plans), default=0),
         )
-        estimated_input_tokens = estimated_provider_calls * estimated_input_per_call
-        estimated_output_tokens = estimated_provider_calls * max(1, int(self.profile.max_output_tokens))
-        estimated_reasoning_tokens = estimated_provider_calls * max(0, int(self.profile.reasoning_reserve))
-        estimated_cached_input_tokens = 0
-        estimated_cache_write_tokens = 0
-        estimated_total_tokens = (
-            estimated_input_tokens + estimated_output_tokens + estimated_reasoning_tokens
-        )
-        estimated_cost = (
-            estimated_input_tokens / 1000.0 * self.input_cost_per_1k_tokens
-            + estimated_output_tokens / 1000.0 * self.output_cost_per_1k_tokens
-            + estimated_reasoning_tokens / 1000.0 * self.reasoning_cost_per_1k_tokens
-            + estimated_cached_input_tokens / 1000.0 * self.cache_read_cost_per_1k_tokens
-            + estimated_cache_write_tokens / 1000.0 * self.cache_write_cost_per_1k_tokens
-        )
+        variants = self._stability_variant_plan()
         self.stability_preflight = {
+            "artifact_type": "outline_provider_call_plan",
+            "artifact_version": "v1",
+            "job_id": self.job_id,
+            "stage_name": "outline_v3",
+            "closure_epoch_id": self.closure_epoch_id,
+            "logical_attempt_identity": self.logical_attempt_identity,
             "mode": self.stability_mode,
             "provider_nodes_per_decision": core_calls,
             "variant_names": [name for name, _summaries, _order, _definition in variants],
@@ -458,6 +672,18 @@ class OutlineV3Executor:
             "estimated_cache_write_tokens": estimated_cache_write_tokens,
             "estimated_total_tokens": estimated_total_tokens,
             "estimated_cost": estimated_cost,
+            "pricing_source": self.pricing_source,
+            "pricing_policy": self.pricing_policy,
+            "pricing_confidence": "medium" if self._pricing_is_explicit else "unknown",
+            "cost_status": "estimate" if self._pricing_is_explicit else "unknown",
+            "monetary_ceiling_enforced": bool(estimated_cost is not None),
+            "cost_ceiling_note": (
+                ""
+                if estimated_cost is not None
+                else "monetary ceiling was not enforced because pricing status is unknown"
+            ),
+            "provider_call_plan_hash": hash_json([item.to_dict() for item in self.provider_call_plans]),
+            "provider_call_plans": [item.to_dict() for item in self.provider_call_plans],
             "max_provider_calls": self.max_provider_calls,
             "max_estimated_cost": self.max_estimated_cost,
             "estimated_cost_per_1k_tokens": self.estimated_cost_per_1k_tokens,
@@ -479,9 +705,17 @@ class OutlineV3Executor:
         elif self.max_provider_calls is not None and estimated_provider_calls > self.max_provider_calls:
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_provider_calls_exceeded"
-        elif self.max_estimated_cost is not None and estimated_cost > self.max_estimated_cost:
+        elif (
+            self.max_estimated_cost is not None
+            and estimated_cost is not None
+            and estimated_cost > self.max_estimated_cost
+        ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_estimated_cost_exceeded"
+        elif self.max_estimated_cost is not None and estimated_cost is None:
+            self.stability_preflight["cost_ceiling_note"] = (
+                "monetary ceiling was not enforced because pricing status is unknown"
+            )
         elif estimated_input_per_call > self.profile.input_budget:
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_input_budget"
@@ -499,12 +733,81 @@ class OutlineV3Executor:
         ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "smoke_overhead_ratio_exceeded"
-        atomic_write_json(preflight_path, self.stability_preflight)
+        plan_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            preflight_path,
+            self.stability_preflight,
+            artifact_role="outline_provider_call_plan",
+            artifact_type="outline_provider_call_plan",
+            artifact_version="v1",
+            producer="outline.v3_executor.OutlineV3Executor",
+            artifact_id=f"outline-v3:provider_call_plan:{self.stability_mode}",
+            metadata={
+                "job_id": self.job_id,
+                "closure_epoch_id": self.closure_epoch_id,
+                "provider_call_plan_hash": self.stability_preflight["provider_call_plan_hash"],
+                "pricing_policy": self.pricing_policy,
+            },
+        )
+        self.artifact_paths["provider_call_plan"] = plan_record.path
+        self.artifact_records["provider_call_plan"] = plan_record
         if self.stability_preflight["preflight_status"] != "accepted":
             raise OutlineV3ExecutionError(
                 "outline stability preflight rejected: "
                 + str(self.stability_preflight.get("rejection_reason") or "unknown")
             )
+
+    def _actual_usage_cost_snapshot(self) -> dict[str, Any]:
+        """Return honest usage/cost evidence without inventing billing data."""
+
+        receipts = list(self._receipt_ledger.list_receipts())
+        input_known = all(receipt.input_tokens is not None for receipt in receipts)
+        output_known = all(receipt.output_tokens is not None for receipt in receipts)
+        reasoning_known = all(
+            receipt.reasoning_tokens is not None
+            or self.reasoning_cost_per_1k_tokens == 0
+            for receipt in receipts
+        )
+        actual_cost: float | None = None
+        if self._pricing_is_explicit and receipts and input_known and output_known and reasoning_known:
+            actual_cost = 0.0
+            for receipt in receipts:
+                actual_cost += int(receipt.input_tokens or 0) / 1000.0 * self.input_cost_per_1k_tokens
+                actual_cost += int(receipt.output_tokens or 0) / 1000.0 * self.output_cost_per_1k_tokens
+                actual_cost += int(receipt.reasoning_tokens or 0) / 1000.0 * self.reasoning_cost_per_1k_tokens
+                actual_cost += int(receipt.cached_input_tokens or 0) / 1000.0 * self.cache_read_cost_per_1k_tokens
+        estimated_cost = self.stability_preflight.get("estimated_cost")
+        variance = (
+            float(actual_cost) - float(estimated_cost)
+            if actual_cost is not None and estimated_cost is not None
+            else None
+        )
+        return {
+            "provider_calls": len(receipts),
+            "input_tokens": sum(int(receipt.input_tokens or 0) for receipt in receipts),
+            "output_tokens": sum(int(receipt.output_tokens or 0) for receipt in receipts),
+            "reasoning_tokens": sum(int(receipt.reasoning_tokens or 0) for receipt in receipts),
+            "cached_input_tokens": sum(int(receipt.cached_input_tokens or 0) for receipt in receipts),
+            "usage_status": (
+                "reported"
+                if receipts and input_known and output_known and reasoning_known
+                else "unreported_or_partial"
+            ),
+            "estimated_cost": estimated_cost,
+            "actual_cost": actual_cost,
+            "cost_variance": variance,
+            "cost_variance_status": "computed" if variance is not None else "not_computable",
+            "pricing_source": self.pricing_source,
+            "pricing_policy": self.pricing_policy,
+            "pricing_confidence": "medium" if self._pricing_is_explicit else "unknown",
+            "cost_status": "calculated" if actual_cost is not None else "unknown",
+            "assumptions": [
+                "missing provider usage is not converted to zero for cost claims",
+                "actual cost is a local calculation from reported token counts and configured rates",
+                "this field is not a provider invoice or billing record",
+            ],
+        }
 
     def _current_dependency_hashes(self, node_id: str) -> dict[str, str]:
         node = self._dag.get(node_id)
@@ -771,17 +1074,19 @@ class OutlineV3Executor:
         execution_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         path = self._node_path(node_id)
-        atomic_write_json(path, artifact.to_dict())
         artifact_id = (
             f"provider-receipt-closure:outline_v3:{self.closure_epoch_id}"
             if node_id == "provider_receipt_closure"
             else f"outline-v3:{node_id}"
         )
-        record = self.registry.register_file(
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            artifact.to_dict(),
             artifact_role="outline_v3_node_output",
             artifact_type=artifact.artifact_type,
             artifact_version=artifact.artifact_version,
-            path=path,
             producer="outline.v3_executor.OutlineV3Executor",
             artifact_id=artifact_id,
             depends_on=self._dependency_refs(depends_on),
@@ -797,11 +1102,14 @@ class OutlineV3Executor:
         if node_id == "provider_receipt_closure":
             # Preserve the historical lookup alias for downstream compatibility
             # while making the epoch-scoped record the canonical identity.
-            legacy_record = self.registry.register_file(
+            legacy_record = publish_json_artifact(
+                self.publication_context,
+                self.registry,
+                path,
+                artifact.to_dict(),
                 artifact_role="outline_v3_node_output_legacy_alias",
                 artifact_type=artifact.artifact_type,
                 artifact_version=artifact.artifact_version,
-                path=path,
                 producer="outline.v3_executor.OutlineV3Executor",
                 artifact_id="outline-v3:provider_receipt_closure",
                 depends_on=self._dependency_refs(depends_on),
@@ -880,7 +1188,14 @@ class OutlineV3Executor:
         if node is None:
             return None
         binding = dict(expected_binding or self.build_current_node_binding(node_id))
-        path = self._node_path(node_id)
+        record = self.registry.get(f"outline-v3:{node_id}")
+        if record is None or record.status != "ready":
+            record = self.registry.get(
+                f"provider-receipt-closure:outline_v3:{self.closure_epoch_id}"
+                if node_id == "provider_receipt_closure"
+                else f"outline-v3:{node_id}"
+            )
+        path = str(record.path) if record is not None else self._node_path(node_id)
         if node.status != "succeeded" or not Path(path).is_file():
             return None
         if node.execution_binding != binding:
@@ -896,7 +1211,6 @@ class OutlineV3Executor:
         payload = value.get("payload")
         if not isinstance(payload, Mapping):
             return None
-        record = self.registry.get(f"outline-v3:{node_id}")
         if record is None or record.status != "ready":
             return None
         try:
@@ -1044,14 +1358,15 @@ class OutlineV3Executor:
         """
 
         artifact = self._artifact(OutlineArtifact, payload, dependency_hashes)
-        path = self._node_path(node_id)
-        atomic_write_json(path, artifact.to_dict())
         artifact_id = f"outline-v3:stability:{hash_text(node_id)[:24]}"
-        record = self.registry.register_file(
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self._node_path(node_id),
+            artifact.to_dict(),
             artifact_role="outline_v3_stability_provider_output",
             artifact_type="outline_stability_provider_output",
             artifact_version="v1",
-            path=path,
             producer="outline.v3_executor.OutlineV3Executor",
             artifact_id=artifact_id,
             metadata={
@@ -1392,11 +1707,17 @@ class OutlineV3Executor:
         path = self._receipt_ledger.path
         if not path.is_file():
             return
-        record = self.registry.register_file(
+        payload = path.read_bytes()
+        if not payload.strip():
+            return
+        record = publish_bytes_artifact(
+            self.publication_context,
+            self.registry,
+            self.receipt_ledger_target_path,
+            payload,
             artifact_role="provider_receipts",
             artifact_type="provider_receipt_ledger",
             artifact_version="v1",
-            path=str(path),
             producer="outline.v3_executor.OutlineV3Executor",
             artifact_id="outline_v3_provider_receipts",
             metadata={"receipt_count": len(self._receipt_ledger.list_receipts())},
@@ -1550,7 +1871,10 @@ class OutlineV3Executor:
             summaries_path = self._path(
                 f"outline_v3/inputs/stage1_summaries_{summary_set_hash[:24]}.json"
             )
-            if Path(summaries_path).is_file():
+            immutable_id = f"outline-v3:stage1-summaries:{summary_set_hash}"
+            existing_record = self.registry.get(immutable_id)
+            if existing_record is not None and existing_record.status == "ready":
+                summaries_path = existing_record.path
                 try:
                     existing = json.loads(Path(summaries_path).read_text(encoding="utf-8"))
                 except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -1567,7 +1891,9 @@ class OutlineV3Executor:
                         f"content-addressed Stage 1 summary artifact has drifted: {summaries_path}"
                     )
             else:
-                atomic_write_json(
+                immutable_record = publish_json_artifact(
+                    self.publication_context,
+                    self.registry,
                     summaries_path,
                     {
                         "artifact_type": "stage1_canonical_summaries",
@@ -1576,26 +1902,35 @@ class OutlineV3Executor:
                         "summary_set_hash": summary_set_hash,
                         "summaries": self.summaries,
                     },
+                    artifact_role="stage1_input",
+                    artifact_type="stage1_canonical_summaries",
+                    artifact_version="v1",
+                    producer="outline.v3_executor.OutlineV3Executor",
+                    artifact_id=immutable_id,
+                    metadata={
+                        "immutable": True,
+                        "summary_set_hash": summary_set_hash,
+                        "versioned_artifact_id": immutable_id,
+                    },
                 )
-            immutable_id = f"outline-v3:stage1-summaries:{summary_set_hash}"
-            immutable_record = self.registry.register_file(
-                artifact_role="stage1_input",
-                artifact_type="stage1_canonical_summaries",
-                artifact_version="v1",
-                path=summaries_path,
-                producer="outline.v3_executor.OutlineV3Executor",
-                artifact_id=immutable_id,
-                metadata={
-                    "immutable": True,
+                summaries_path = immutable_record.path
+            immutable_record = self.registry.get(immutable_id)
+            if immutable_record is None or immutable_record.status != "ready":
+                raise OutlineV3ExecutionError("immutable Stage 1 summary record is unavailable after publication")
+            stage1 = publish_json_artifact(
+                self.publication_context,
+                self.registry,
+                summaries_path,
+                {
+                    "artifact_type": "stage1_canonical_summaries",
+                    "artifact_version": "v1",
+                    "job_id": self.job_id,
                     "summary_set_hash": summary_set_hash,
-                    "versioned_artifact_id": immutable_id,
+                    "summaries": self.summaries,
                 },
-            )
-            stage1 = self.registry.register_file(
                 artifact_role="stage1_input",
                 artifact_type="stage1_canonical_summaries",
                 artifact_version="v1",
-                path=summaries_path,
                 producer="outline.v3_executor.OutlineV3Executor",
                 artifact_id="stage1_summaries",
                 depends_on=[ArtifactDependencyRefV2.from_record(immutable_record)],
@@ -2396,6 +2731,34 @@ class OutlineV3Executor:
                             "evidence": evidence_model,
                             "replay_evidence": [],
                         }
+                    elif definition.get("resume") == "exact_replay":
+                        # The canonical decision chain has already persisted
+                        # its replay records above.  Replaying it through the
+                        # stability-node namespace would manufacture new
+                        # identities and could never hit the canonical keys.
+                        # Reuse the canonical decision here; the fresh
+                        # second-executor check below is the durable zero-
+                        # transport replay proof.
+                        replay_events = [
+                            {
+                                "node_id": node_id,
+                                "semantic_node_id": node_id,
+                                "closure_epoch_id": self.closure_epoch_id,
+                                "lookup_status": "canonical_replay",
+                                "provider_invoked": False,
+                                "reused_artifact_ids": [],
+                                "reused_receipt_ids": [],
+                                "reused_artifact_id": "",
+                                "reused_receipt_id": "",
+                            }
+                            for node_id in self._provider_node_ids()
+                        ]
+                        decision = {
+                            "signature": primary_signature,
+                            "final_outline": final,
+                            "evidence": evidence_model,
+                            "replay_evidence": replay_events,
+                        }
                     else:
                         # The exact-replay variant must execute the same concrete
                         # baseline call identities.  Its audit label remains
@@ -2491,6 +2854,7 @@ class OutlineV3Executor:
                     f"primary:{node_id}"
                     for node_id in self._blocking_critic_diagnostics
                 )
+            actual_usage = self._actual_usage_cost_snapshot()
             stability_payload = {
                 "status": stability_status,
                 "method": (
@@ -2500,6 +2864,8 @@ class OutlineV3Executor:
                 ),
                 "stability_mode": self.stability_mode,
                 "preflight": dict(self.stability_preflight),
+                "provider_call_plan": [item.to_dict() for item in self.provider_call_plans],
+                "provider_call_plan_hash": str(self.stability_preflight.get("provider_call_plan_hash") or ""),
                 "provider_call_count_before_stability": stability_call_count_before,
                 "provider_call_count_after_stability": self._provider_call_count,
                 "transport_call_count_before_stability": stability_transport_count_before,
@@ -2524,11 +2890,7 @@ class OutlineV3Executor:
                     if key.startswith("estimated_")
                 },
                 "actual_usage_totals": {
-                    "input_tokens": sum(int(receipt.input_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
-                    "output_tokens": sum(int(receipt.output_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
-                    "reasoning_tokens": sum(int(receipt.reasoning_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
-                    "cached_input_tokens": sum(int(receipt.cached_input_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
-                    "provider_calls": len(self._receipt_ledger.list_receipts()),
+                    **actual_usage,
                 },
             }
             stability = self._run_node("stability_audit", lambda: (

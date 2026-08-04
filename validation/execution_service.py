@@ -28,7 +28,11 @@ from runtime.provider_runtime import (
     hash_text,
 )
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_workspace import (
+    JobWorkspace,
+    publish_bytes_artifact,
+    publish_json_artifact,
+)
 
 
 @dataclass
@@ -54,6 +58,7 @@ class ValidationExecutionService:
     logger: Any
     runtime_config: Mapping[str, Any] = field(default_factory=dict)
     validation_external_registry_resolver: Callable[[str], Any | None] | None = None
+    publication_context: Any | None = None
     _provider_receipt_ledger: ProviderRuntimeLedger | None = field(
         default=None,
         init=False,
@@ -78,6 +83,13 @@ class ValidationExecutionService:
         self.summaries = [dict(item) for item in self.summaries if isinstance(item, Mapping)]
         self.paper_artifact_records = tuple(self.paper_artifact_records or ())
         self.visual_artifact_records = tuple(self.visual_artifact_records or ())
+        if self.publication_context is None:
+            from services.queue_service import LocalPublicationContext
+
+            self.publication_context = (
+                getattr(self.artifact_registry, "publication_context", None)
+                or LocalPublicationContext()
+            )
         input_hashes = {
             "review_draft": self.review_draft_record.content_hash if self.review_draft_record else "",
             "citation_manifest": self.citation_manifest_record.content_hash if self.citation_manifest_record else "",
@@ -143,10 +155,14 @@ class ValidationExecutionService:
         """Return the append-only validation receipt ledger for this attempt."""
 
         if self._provider_receipt_ledger is None:
-            self._provider_receipt_ledger = ProviderRuntimeLedger.for_epoch(
-                self.workspace.root_dir,
-                stage_name="stage4_validate",
-                closure_epoch_id=self.closure_epoch_id,
+            safe_epoch = "".join(
+                char if char.isalnum() or char in {"-", "_", "."} else "_"
+                for char in self.closure_epoch_id
+            )
+            self._provider_receipt_ledger = ProviderRuntimeLedger(
+                self.workspace.artifact_path(
+                    f".publication-staging/provider-receipts/stage4_validate/{safe_epoch}.jsonl"
+                )
             )
         return self._provider_receipt_ledger
 
@@ -273,7 +289,9 @@ class ValidationExecutionService:
         output_path = self.workspace.artifact_path(
             f"validation_provider_outputs/{safe_call_id}.json"
         )
-        atomic_write_json(
+        output_record = publish_json_artifact(
+            self.publication_context,
+            self.artifact_registry,
             output_path,
             {
                 "artifact_type": "validation_provider_output",
@@ -285,12 +303,9 @@ class ValidationExecutionService:
                 "content_hash": normalized_hash,
                 "payload": content,
             },
-        )
-        output_record = self.artifact_registry.register_file(
             artifact_role="validation_provider_output",
             artifact_type="validation_provider_output",
             artifact_version="v1",
-            path=output_path,
             producer="validation.execution_service.ValidationExecutionService",
             artifact_id=f"validation-provider-output:{safe_call_id}",
         )
@@ -319,14 +334,15 @@ class ValidationExecutionService:
                 raise RuntimeError(f"current Stage 1 summary artifact is unreadable: {path}") from exc
             if hash_json(existing) != summary_set_hash:
                 raise RuntimeError(f"content-addressed Stage 1 summary artifact has drifted: {path}")
-        else:
-            atomic_write_json(path, self.summaries)
         immutable_id = f"summary_file:{summary_set_hash}"
-        immutable_record = self.artifact_registry.register_file(
+        immutable_record = publish_json_artifact(
+            self.publication_context,
+            self.artifact_registry,
+            path,
+            self.summaries,
             artifact_role="summary",
             artifact_type="summary_file",
             artifact_version="v1",
-            path=path,
             producer="validation.execution_service.ValidationExecutionService",
             artifact_id=immutable_id,
             metadata={
@@ -335,11 +351,14 @@ class ValidationExecutionService:
                 "versioned_artifact_id": immutable_id,
             },
         )
-        self.artifact_registry.register_file(
+        publish_json_artifact(
+            self.publication_context,
+            self.artifact_registry,
+            path,
+            self.summaries,
             artifact_role="summary",
             artifact_type="summary_file",
             artifact_version="v1",
-            path=path,
             producer="validation.execution_service.ValidationExecutionService",
             artifact_id="summary_file",
             depends_on=[ArtifactDependencyRefV2.from_record(immutable_record)],
@@ -366,12 +385,14 @@ class ValidationExecutionService:
             result=result,
             paper_key=paper_key,
         )
-        atomic_write_json(path, artifact.to_dict())
-        self.artifact_registry.register_file(
+        publish_json_artifact(
+            self.publication_context,
+            self.artifact_registry,
+            path,
+            artifact.to_dict(),
             artifact_role="paper_summary",
             artifact_type="paper_artifact",
             artifact_version="v1",
-            path=path,
             producer="validation.execution_service.ValidationExecutionService",
             artifact_id=f"paper:{digest}",
         )
@@ -402,12 +423,14 @@ class ValidationExecutionService:
             citation_ref_catalog_hash=citation_ref_catalog_hash,
         )
         path = self.citation_manifest_path
-        atomic_write_json(path, manifest.to_dict())
-        self.artifact_registry.register_file(
+        publish_json_artifact(
+            self.publication_context,
+            self.artifact_registry,
+            path,
+            manifest.to_dict(),
             artifact_role="citation_manifest",
             artifact_type="citation_manifest",
             artifact_version="v3",
-            path=path,
             producer="validation.execution_service.ValidationExecutionService",
             artifact_id="citation_manifest_v3",
             depends_on=[
@@ -426,11 +449,25 @@ class ValidationExecutionService:
     def rebuild_review_docx(self, review_draft: Mapping[str, Any], citation_manifest: Mapping[str, Any], output_path: str) -> None:
         from docx_writer import rebuild_review_docx_from_structured_artifacts
 
+        staging_path = self.workspace.artifact_path(
+            ".publication-staging/review-docx/rebuilt_review.docx"
+        )
         rebuild_review_docx_from_structured_artifacts(
             self,
             dict(review_draft),
             dict(citation_manifest),
+            staging_path,
+        )
+        publish_bytes_artifact(
+            self.publication_context,
+            self.artifact_registry,
             output_path,
+            Path(staging_path).read_bytes(),
+            artifact_role="review_docx",
+            artifact_type="review_docx",
+            artifact_version="v1",
+            producer="validation.execution_service.ValidationExecutionService",
+            artifact_id="review_docx",
         )
 
     def revalidate_review_artifacts(
@@ -511,12 +548,16 @@ class ValidationExecutionService:
         )
         ledger_record = None
         ledger_path = self.provider_receipt_ledger.path
-        if ledger_path.is_file():
-            ledger_record = self.artifact_registry.register_file(
+        ledger_payload = ledger_path.read_bytes() if ledger_path.is_file() else b""
+        if ledger_payload:
+            ledger_record = publish_bytes_artifact(
+                self.publication_context,
+                self.artifact_registry,
+                self.workspace.artifact_path("validation_provider_receipts.jsonl"),
+                ledger_payload,
                 artifact_role="provider_receipts",
                 artifact_type="provider_receipt_ledger",
                 artifact_version="v1",
-                path=str(ledger_path),
                 producer="validation.execution_service.ValidationExecutionService",
                 artifact_id=ledger_artifact_id,
                 metadata={"receipt_count": len(receipts)},
@@ -536,19 +577,6 @@ class ValidationExecutionService:
             "expected_calls": [asdict(expected) for expected in expected_calls],
         }
         closure_artifact_id = f"provider-receipt-closure:stage4_validate:{resolved_epoch}"
-        atomic_write_json(
-            closure_path,
-            {
-                "artifact_type": "provider_receipt_closure",
-                "artifact_version": "v1",
-                "job_id": self.job_id,
-                "stage_name": "stage4_validate",
-                "attempt_id": self.attempt_id,
-                "closure_epoch_id": resolved_epoch,
-                "expected_call_graph_hash": self.expected_call_graph_hash,
-                "payload": closure_payload,
-            },
-        )
         dependencies: list[ArtifactDependencyRefV2] = []
         dependency_ids: set[str] = set()
 
@@ -582,11 +610,23 @@ class ValidationExecutionService:
                     None,
                 )
             )
-        closure_record = self.artifact_registry.register_file(
+        closure_record = publish_json_artifact(
+            self.publication_context,
+            self.artifact_registry,
+            closure_path,
+            {
+                "artifact_type": "provider_receipt_closure",
+                "artifact_version": "v1",
+                "job_id": self.job_id,
+                "stage_name": "stage4_validate",
+                "attempt_id": self.attempt_id,
+                "closure_epoch_id": resolved_epoch,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "payload": closure_payload,
+            },
             artifact_role="provider_receipt_closure",
             artifact_type="provider_receipt_closure",
             artifact_version="v1",
-            path=closure_path,
             producer="validation.execution_service.ValidationExecutionService",
             artifact_id=closure_artifact_id,
             depends_on=dependencies,

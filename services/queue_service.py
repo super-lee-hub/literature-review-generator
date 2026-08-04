@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 import os
+import re
 import threading
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -14,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Mapping, Optional, TypeGuard, TypeVar
 
 from services.artifact_registry import (
+    ArtifactDependencyRefV2,
     ArtifactRegistry,
     PublicationFenceRejected,
     RegistryError,
@@ -37,6 +41,68 @@ class JobCancelledError(RuntimeError):
 
 class QueuePublicationRejected(PublicationFenceRejected):
     """Raised when a queue-owned canonical publication loses its lease fence."""
+
+
+@dataclass(frozen=True)
+class StagedArtifactPublication:
+    """One lease-private byte set waiting for the short publication boundary."""
+
+    target_path: str
+    staging_path: str
+    content_hash: str
+    size_bytes: int
+    job_id: str
+    lease_id: str
+    worker_id: str
+    lease_generation: int
+    fence_token: str
+
+
+@dataclass(frozen=True)
+class PublishedArtifactPublication:
+    """The immutable file identity produced by a guarded publication."""
+
+    target_path: str
+    final_path: str
+    content_hash: str
+    staged_path: str
+    artifact: Any | None = None
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _safe_publication_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._") or "publication"
+
+
+def _write_staged_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _immutable_publication_path(target: Path, content_hash: str) -> Path:
+    """Return a deterministic versioned sibling, never a mutable fixed path."""
+
+    marker = content_hash[:24]
+    if marker and marker in target.stem:
+        return target
+    suffix = target.suffix
+    stem = target.name[: -len(suffix)] if suffix else target.name
+    return target.with_name(f"{stem}__{marker}{suffix}")
 
 
 class QueueState(Enum):
@@ -1155,6 +1221,106 @@ class PersistentQueueService:
         return QueuePublicationContext(self, lease)
 
 
+class LocalPublicationContext:
+    """Explicit publication context for non-queue/direct execution.
+
+    Direct execution has no cross-process lease to fence, but it still uses the
+    same staged-then-registered API.  Keeping this context explicit prevents a
+    queue worker from accidentally acquiring an unrestricted ``ArtifactRegistry``
+    when a publication context was expected.
+    """
+
+    def registry(
+        self,
+        registry_path: str | Path,
+        job_id: str,
+    ) -> ArtifactRegistry:
+        return ArtifactRegistry(registry_path, job_id)
+
+    def stage_bytes(self, target_path: str | Path, payload: bytes) -> StagedArtifactPublication:
+        target = Path(target_path).expanduser().resolve()
+        content_hash = _sha256_bytes(payload)
+        staging_dir = target.parent / ".publication-staging" / "local"
+        staging_path = staging_dir / f"{_safe_publication_component(target.name)}.{uuid.uuid4().hex}.stage"
+        _write_staged_bytes(staging_path, payload)
+        return StagedArtifactPublication(
+            target_path=str(target),
+            staging_path=str(staging_path),
+            content_hash=content_hash,
+            size_bytes=len(payload),
+            job_id="local",
+            lease_id="local",
+            worker_id="local",
+            lease_generation=0,
+            fence_token="local",
+        )
+
+    def finalize_staged(
+        self,
+        staged: StagedArtifactPublication,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        target = Path(staged.target_path).expanduser().resolve()
+        final_path = _immutable_publication_path(target, staged.content_hash)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staged.staging_path, final_path)
+        artifact = None
+        if register_kwargs is not None:
+            if registry is None:
+                raise PublicationFenceRejected("artifact registration requires an explicit registry")
+            kwargs = dict(register_kwargs)
+            kwargs["path"] = str(final_path)
+            try:
+                artifact = registry.register_file(**kwargs)
+            except Exception:
+                # Direct execution has no queue-owned forensic orphan policy.
+                # If Registry registration fails after the immutable rename,
+                # remove only this publication and leave no misleading export
+                # artifact behind. QueuePublicationContext intentionally keeps
+                # its immutable orphan for later reconciliation.
+                try:
+                    final_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+        return PublishedArtifactPublication(
+            target_path=str(target),
+            final_path=str(final_path),
+            content_hash=staged.content_hash,
+            staged_path=staged.staging_path,
+            artifact=artifact,
+        )
+
+    def publish_bytes(
+        self,
+        target_path: str | Path,
+        payload: bytes,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        staged = self.stage_bytes(target_path, payload)
+        return self.finalize_staged(staged, registry=registry, register_kwargs=register_kwargs)
+
+    def publish_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        return self.publish_bytes(
+            target_path,
+            encoded,
+            registry=registry,
+            register_kwargs=register_kwargs,
+        )
+
+
 class QueuePublicationContext:
     """Lease-bound factory for queue-owned ArtifactRegistry facades."""
 
@@ -1179,6 +1345,239 @@ class QueuePublicationContext:
             job_id=target_job_id,
         )
 
+    def _staging_directory(self, target: Path) -> Path:
+        return (
+            target.parent
+            / ".publication-staging"
+            / _safe_publication_component(self.lease.job_id)
+            / (
+                f"generation-{int(self.lease.lease_generation)}-"
+                f"{_safe_publication_component(self.lease.lease_id)}"
+            )
+        )
+
+    def stage_bytes(self, target_path: str | Path, payload: bytes) -> StagedArtifactPublication:
+        """Write only to a lease-generation-private staging path.
+
+        Staging is deliberately allowed to finish after a lease expires; the
+        final boundary below is what makes the bytes canonical (or leaves them
+        as an unreferenced orphan).
+        """
+
+        target = Path(target_path).expanduser().resolve()
+        content_hash = _sha256_bytes(payload)
+        staging_dir = self._staging_directory(target)
+        staging_path = staging_dir / (
+            f"{_safe_publication_component(target.name)}.{uuid.uuid4().hex}.stage"
+        )
+        _write_staged_bytes(staging_path, payload)
+        return StagedArtifactPublication(
+            target_path=str(target),
+            staging_path=str(staging_path),
+            content_hash=content_hash,
+            size_bytes=len(payload),
+            job_id=self.lease.job_id,
+            lease_id=self.lease.lease_id,
+            worker_id=self.lease.worker_id,
+            lease_generation=self.lease.lease_generation,
+            fence_token=self.lease.fence_token,
+        )
+
+    def _assert_live_unlocked(self) -> None:
+        runtime = self.queue_service._runtimes.get(self.lease.job_id)
+        if not self.queue_service._lease_owned(
+            runtime,
+            lease_id=self.lease.lease_id,
+            worker_id=self.lease.worker_id,
+            lease_generation=self.lease.lease_generation,
+            fence_token=self.lease.fence_token,
+        ):
+            raise QueuePublicationRejected(
+                f"queue lease is no longer current for byte publication: {self.lease.job_id}"
+            )
+
+    @staticmethod
+    def _manifest_payload(
+        *,
+        staged: StagedArtifactPublication,
+        final_path: Path,
+        artifact: Any,
+    ) -> dict[str, Any]:
+        return {
+            "artifact_type": "lease_publication_manifest",
+            "artifact_version": "v1",
+            "job_id": staged.job_id,
+            "lease_id": staged.lease_id,
+            "worker_id": staged.worker_id,
+            "lease_generation": staged.lease_generation,
+            "fence_token": staged.fence_token,
+            "target_path": staged.target_path,
+            "final_path": str(final_path),
+            "staging_path": staged.staging_path,
+            "content_hash": staged.content_hash,
+            "size_bytes": staged.size_bytes,
+            "registered_artifact_id": str(getattr(artifact, "artifact_id", "")),
+            "registered_artifact_hash": str(getattr(artifact, "content_hash", "")),
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+
+    def _register_publication_manifest_unlocked(
+        self,
+        *,
+        staged: StagedArtifactPublication,
+        final_path: Path,
+        artifact: Any,
+        registry: ArtifactRegistry,
+    ) -> Any:
+        """Persist exact lease/fence evidence without entering a mutable path.
+
+        This is intentionally performed after the target artifact registration,
+        while the queue lock is still held.  If either Registry write fails,
+        the finalized bytes remain immutable but unreferenced; no fixed target
+        or current pointer can be changed by that failure.
+        """
+
+        payload = self._manifest_payload(
+            staged=staged,
+            final_path=final_path,
+            artifact=artifact,
+        )
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        manifest_hash = _sha256_bytes(encoded)
+        artifact_id = _safe_publication_component(
+            str(getattr(artifact, "artifact_id", "published-artifact"))
+        )
+        manifest_target = (
+            final_path.parent
+            / ".publication-manifests"
+            / f"{artifact_id}__{manifest_hash[:24]}.json"
+        )
+        manifest_staging = (
+            self._staging_directory(manifest_target)
+            / f"{_safe_publication_component(manifest_target.name)}.{uuid.uuid4().hex}.stage"
+        )
+        _write_staged_bytes(manifest_staging, encoded)
+        manifest_final = _immutable_publication_path(manifest_target, manifest_hash)
+        manifest_final.parent.mkdir(parents=True, exist_ok=True)
+        if manifest_final.exists():
+            if _sha256_bytes(manifest_final.read_bytes()) != manifest_hash:
+                raise QueuePublicationRejected(
+                    f"lease publication manifest already contains different bytes: {manifest_final}"
+                )
+            manifest_staging.unlink(missing_ok=True)
+        else:
+            os.replace(str(manifest_staging), str(manifest_final))
+        return ArtifactRegistry.register_file(
+            registry,
+            artifact_role="lease_publication_manifest",
+            artifact_type="lease_publication_manifest",
+            artifact_version="v1",
+            path=str(manifest_final),
+            producer="services.queue_service.QueuePublicationContext",
+            artifact_id=f"lease-publication:{artifact_id}:{manifest_hash[:24]}",
+            depends_on=[ArtifactDependencyRefV2.from_record(artifact)],
+            metadata={
+                "target_artifact_id": str(getattr(artifact, "artifact_id", "")),
+                "target_artifact_hash": str(getattr(artifact, "content_hash", "")),
+                "immutable": True,
+            },
+        )
+
+    def finalize_staged(
+        self,
+        staged: StagedArtifactPublication,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        """Finalize bytes and registry mutations under ``queue -> Registry``.
+
+        If the registry write fails after the immutable rename, the finalized
+        file is intentionally retained without a Registry reference.  It is
+        therefore an immutable orphan and cannot replace the previous current
+        bytes or pointer.
+        """
+
+        if (
+            staged.job_id != self.lease.job_id
+            or staged.lease_id != self.lease.lease_id
+            or staged.worker_id != self.lease.worker_id
+            or staged.lease_generation != self.lease.lease_generation
+            or staged.fence_token != self.lease.fence_token
+        ):
+            raise QueuePublicationRejected("staged artifact does not belong to this lease")
+        target = Path(staged.target_path).expanduser().resolve()
+        staging = Path(staged.staging_path).expanduser().resolve()
+        if not staging.is_file() or _sha256_bytes(staging.read_bytes()) != staged.content_hash:
+            raise QueuePublicationRejected("staged artifact bytes are missing or changed")
+        with self.queue_service._store_lock():
+            # Lock order is deliberately queue store -> Registry transaction.
+            self._assert_live_unlocked()
+            final_path = _immutable_publication_path(target, staged.content_hash)
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                if not final_path.is_file() or _sha256_bytes(final_path.read_bytes()) != staged.content_hash:
+                    raise QueuePublicationRejected(
+                        f"immutable publication target already contains different bytes: {final_path}"
+                    )
+                try:
+                    staging.unlink()
+                except OSError:
+                    pass
+            else:
+                os.replace(str(staging), str(final_path))
+            artifact = None
+            if register_kwargs is not None:
+                if registry is None:
+                    raise QueuePublicationRejected("artifact registration requires an explicit registry")
+                kwargs = dict(register_kwargs)
+                kwargs["path"] = str(final_path)
+                # The facade's public override would reacquire the non-
+                # reentrant queue lock.  Calling the base implementation here
+                # preserves the documented queue -> Registry lock order.
+                artifact = ArtifactRegistry.register_file(registry, **kwargs)
+                if str(kwargs.get("artifact_type") or "") != "lease_publication_manifest":
+                    self._register_publication_manifest_unlocked(
+                        staged=staged,
+                        final_path=final_path,
+                        artifact=artifact,
+                        registry=registry,
+                    )
+            return PublishedArtifactPublication(
+                target_path=str(target),
+                final_path=str(final_path),
+                content_hash=staged.content_hash,
+                staged_path=str(staging),
+                artifact=artifact,
+            )
+
+    def publish_bytes(
+        self,
+        target_path: str | Path,
+        payload: bytes,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        staged = self.stage_bytes(target_path, payload)
+        return self.finalize_staged(staged, registry=registry, register_kwargs=register_kwargs)
+
+    def publish_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        return self.publish_bytes(
+            target_path,
+            encoded,
+            registry=registry,
+            register_kwargs=register_kwargs,
+        )
+
 
 class QueueOwnedArtifactRegistry(ArtifactRegistry):
     """ArtifactRegistry whose writes are owned by one live queue lease.
@@ -1198,6 +1597,10 @@ class QueueOwnedArtifactRegistry(ArtifactRegistry):
     ) -> None:
         self._queue_service = queue_service
         self._queue_lease = lease
+        # Expose the same lease-bound byte publisher to downstream services
+        # (export, forensic reports, and stage persistence) instead of letting
+        # them fall back to an unrestricted fixed-path write.
+        self.publication_context = QueuePublicationContext(queue_service, lease)
         super().__init__(
             registry_path,
             job_id,

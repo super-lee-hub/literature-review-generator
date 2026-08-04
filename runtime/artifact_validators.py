@@ -45,6 +45,7 @@ OUTLINE_V3_ARTIFACT_TYPES = frozenset(
         "adopted_outline",
         "stage1_canonical_summaries",
         "outline_v3_node_dag",
+        "outline_provider_call_plan",
     }
 )
 
@@ -65,6 +66,10 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "validation_run_result",
         "validation_run_result_repaired",
         "provider_receipt_closure",
+        "provider_expected_call_graph",
+        "stage1_summary_reuse_record",
+        "validation_disposition",
+        "lease_publication_manifest",
         "repair_plan",
         "repair_apply_result",
         "repair_report",
@@ -100,7 +105,7 @@ CURRENT_OUTLINE_ARTIFACT_VERSIONS: dict[str, frozenset[str]] = {
     artifact_type: frozenset({"v1", "v3"})
     if artifact_type == "provider_receipt_closure"
     else frozenset({"v1"})
-    if artifact_type in {"outline_v3_node_dag", "stage1_canonical_summaries"}
+    if artifact_type in {"outline_v3_node_dag", "stage1_canonical_summaries", "outline_provider_call_plan"}
     else frozenset({"v3"})
     for artifact_type in OUTLINE_V3_ARTIFACT_TYPES
 }
@@ -457,6 +462,262 @@ def _validate_receipt_closure(record: Any, _path: str | Path, root: Mapping[str,
         raise ArtifactSchemaError("provider_receipt_closure payload has invalid completion identity")
 
 
+def _validate_provider_expected_call_graph(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("provider_expected_call_graph",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "stage_name",
+            "attempt_id",
+            "closure_epoch_id",
+            "expected_call_graph_hash",
+            "source_bundle_hash",
+            "runtime_spec_hash",
+            "expected_calls",
+        ),
+        "provider_expected_call_graph",
+    )
+    expected_calls = root.get("expected_calls")
+    if not isinstance(expected_calls, list):
+        raise ArtifactSchemaError("provider_expected_call_graph.expected_calls must be an array")
+    for index, item in enumerate(expected_calls):
+        if not isinstance(item, Mapping):
+            raise ArtifactSchemaError(f"provider_expected_call_graph.expected_calls[{index}] is not an object")
+        _require_fields(
+            item,
+            (
+                "call_id",
+                "job_id",
+                "attempt_id",
+                "stage_name",
+                "node_id",
+                "prompt_hash",
+                "input_hash",
+                "config_hash",
+                "schema_hash",
+                "closure_epoch_id",
+                "expected_call_graph_hash",
+            ),
+            f"provider_expected_call_graph.expected_calls[{index}]",
+        )
+        if str(item.get("job_id") or "") != str(root.get("job_id") or ""):
+            raise ArtifactSchemaError("provider_expected_call_graph call job_id mismatch")
+        if str(item.get("closure_epoch_id") or "") != str(root.get("closure_epoch_id") or ""):
+            raise ArtifactSchemaError("provider_expected_call_graph call epoch mismatch")
+        if str(item.get("expected_call_graph_hash") or "") != str(root.get("expected_call_graph_hash") or ""):
+            raise ArtifactSchemaError("provider_expected_call_graph call graph hash mismatch")
+    for label in ("expected_call_graph_hash", "source_bundle_hash", "runtime_spec_hash"):
+        value = str(root.get(label) or "")
+        if len(value) != 64:
+            raise ArtifactSchemaError(f"provider_expected_call_graph.{label} must be a SHA-256 hex digest")
+
+
+def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_summary_reuse_record",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "stage_name",
+            "attempt_id",
+            "reused_summary_artifact_id",
+            "reused_summary_artifact_hash",
+            "source_bundle_paper_identity",
+            "input_manifest_hashes",
+            "original_provider_receipt_ids",
+            "current_runtime_spec_hash",
+            "reuse_policy",
+            "reuse_decision_reason",
+            "created_at",
+            "content_hash",
+        ),
+        "stage1_summary_reuse_record",
+    )
+    identity = root.get("source_bundle_paper_identity")
+    manifests = root.get("input_manifest_hashes")
+    receipt_ids = root.get("original_provider_receipt_ids")
+    if not isinstance(identity, Mapping) or not str(identity.get("canonical_paper_key") or ""):
+        raise ArtifactSchemaError("stage1_summary_reuse_record paper identity is invalid")
+    if not isinstance(manifests, Mapping) or not manifests:
+        raise ArtifactSchemaError("stage1_summary_reuse_record input manifests are invalid")
+    if not isinstance(receipt_ids, list):
+        raise ArtifactSchemaError("stage1_summary_reuse_record original receipt IDs must be an array")
+    for label in ("reused_summary_artifact_hash", "current_runtime_spec_hash", "content_hash"):
+        value = str(root.get(label) or "")
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
+            raise ArtifactSchemaError(f"stage1_summary_reuse_record.{label} is not a SHA-256 hex digest")
+    if str(root.get("reuse_policy") or "") != "exact_summary_reuse_v1":
+        raise ArtifactSchemaError("stage1_summary_reuse_record reuse policy is invalid")
+    from runtime.provider_runtime import hash_json
+
+    canonical = dict(root)
+    expected_hash = str(canonical.pop("content_hash") or "")
+    if hash_json(canonical) != expected_hash:
+        raise ArtifactSchemaError("stage1_summary_reuse_record.content_hash does not match content")
+
+
+def _validate_outline_provider_call_plan(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("outline_provider_call_plan",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "stage_name",
+            "closure_epoch_id",
+            "provider_call_plan_hash",
+            "provider_call_plans",
+            "pricing_policy",
+        ),
+        "outline_provider_call_plan",
+    )
+    if str(root.get("stage_name") or "") != "outline_v3":
+        raise ArtifactSchemaError("outline_provider_call_plan stage_name is invalid")
+    if len(str(root.get("provider_call_plan_hash") or "")) != 64:
+        raise ArtifactSchemaError("outline_provider_call_plan hash is invalid")
+    root_cost_status = str(root.get("cost_status") or "")
+    if root_cost_status not in {"estimate", "unknown"}:
+        raise ArtifactSchemaError("outline_provider_call_plan cost_status is invalid")
+    if root_cost_status == "unknown" and root.get("estimated_cost") is not None:
+        raise ArtifactSchemaError(
+            "outline_provider_call_plan cannot claim an estimated cost when pricing is unknown"
+        )
+    plans = root.get("provider_call_plans")
+    if not isinstance(plans, list) or not plans:
+        raise ArtifactSchemaError("outline_provider_call_plan must contain plan rows")
+    required = (
+        "variant_name",
+        "node_id",
+        "call_id",
+        "provider",
+        "model",
+        "estimated_input_tokens",
+        "estimated_output_tokens",
+        "estimated_reasoning_tokens",
+        "estimated_cached_input_tokens",
+        "estimated_cache_write_tokens",
+        "estimated_total_tokens",
+        "estimated_cost",
+        "pricing_source",
+        "pricing_policy",
+        "cost_status",
+        "assumptions",
+        "confidence",
+        "upper_bound",
+        "transport_expected",
+    )
+    for index, item in enumerate(plans):
+        if not isinstance(item, Mapping):
+            raise ArtifactSchemaError(f"outline_provider_call_plan row {index} is not an object")
+        _require_fields(item, required, f"outline_provider_call_plan[{index}]")
+        for field_name in (
+            "estimated_input_tokens",
+            "estimated_output_tokens",
+            "estimated_reasoning_tokens",
+            "estimated_cached_input_tokens",
+            "estimated_cache_write_tokens",
+            "estimated_total_tokens",
+        ):
+            raw_value: Any = item.get(field_name)
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ArtifactSchemaError(
+                    f"outline_provider_call_plan[{index}].{field_name} must be an integer"
+                ) from exc
+            if value < 0:
+                raise ArtifactSchemaError(
+                    f"outline_provider_call_plan[{index}].{field_name} cannot be negative"
+                )
+        estimated_cost = item.get("estimated_cost")
+        cost_status = str(item.get("cost_status") or "")
+        if cost_status not in {"estimate", "unknown"}:
+            raise ArtifactSchemaError(
+                f"outline_provider_call_plan[{index}].cost_status is invalid"
+            )
+        if cost_status == "unknown" and estimated_cost is not None:
+            raise ArtifactSchemaError(
+                f"outline_provider_call_plan[{index}] cannot include estimated_cost when pricing is unknown"
+            )
+        if estimated_cost is not None:
+            try:
+                if float(estimated_cost) < 0:
+                    raise ArtifactSchemaError(
+                        f"outline_provider_call_plan[{index}].estimated_cost cannot be negative"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise ArtifactSchemaError(
+                    f"outline_provider_call_plan[{index}].estimated_cost is invalid"
+                ) from exc
+        if str(item.get("confidence") or "") not in {"low", "medium", "high"}:
+            raise ArtifactSchemaError(f"outline_provider_call_plan[{index}].confidence is invalid")
+        if not isinstance(item.get("assumptions"), list):
+            raise ArtifactSchemaError(f"outline_provider_call_plan[{index}].assumptions must be an array")
+        if not isinstance(item.get("upper_bound"), bool) or not isinstance(item.get("transport_expected"), bool):
+            raise ArtifactSchemaError(f"outline_provider_call_plan[{index}] has invalid bound flags")
+
+
+def _validate_validation_disposition(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("validation_disposition",),
+        expected_version="v1",
+    )
+    try:
+        from validation.disposition import ValidationDispositionV1
+
+        ValidationDispositionV1.from_dict(root)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ArtifactSchemaError(f"validation_disposition is invalid: {exc}") from exc
+
+
+def _validate_lease_publication_manifest(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("lease_publication_manifest",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "lease_id",
+            "lease_generation",
+            "fence_token",
+            "target_path",
+            "final_path",
+            "content_hash",
+            "size_bytes",
+            "registered_artifact_id",
+        ),
+        "lease_publication_manifest",
+    )
+    raw_lease_generation: Any = root.get("lease_generation")
+    raw_size_bytes: Any = root.get("size_bytes")
+    if not isinstance(raw_lease_generation, int) or int(raw_lease_generation) < 0:
+        raise ArtifactSchemaError("lease_publication_manifest.lease_generation is invalid")
+    if not isinstance(raw_size_bytes, int) or int(raw_size_bytes) < 0:
+        raise ArtifactSchemaError("lease_publication_manifest.size_bytes is invalid")
+    if len(str(root.get("content_hash") or "")) != 64:
+        raise ArtifactSchemaError("lease_publication_manifest.content_hash is invalid")
+
+
 def _validate_receipt_ledger(record: Any, path: str | Path, _root: Mapping[str, Any] | None = None) -> None:
     if str(getattr(record, "artifact_version", "") or "") != "v1":
         raise ArtifactSchemaError("provider_receipt_ledger must use artifact_version v1")
@@ -504,6 +765,11 @@ def _validate_current_set(record: Any, _path: str | Path, root: Mapping[str, Any
         raise ArtifactSchemaError("current_artifact_set job_id mismatch")
     if len(current_set.promotion_transaction_hash) != 64:
         raise ArtifactSchemaError("current_artifact_set promotion_transaction_hash is invalid")
+    if current_set.validation_status == "not_requested":
+        if not current_set.validation_disposition_artifact_id or len(current_set.validation_disposition_artifact_hash) != 64:
+            raise ArtifactSchemaError("not_requested current_artifact_set requires validation disposition")
+    elif not current_set.validation_run_result_artifact_id or len(current_set.validation_run_result_artifact_hash) != 64:
+        raise ArtifactSchemaError("validated current_artifact_set requires validation run result")
 
 
 def _validate_current_set_pointer(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
@@ -587,6 +853,12 @@ def _validate_promotion_transaction(record: Any, _path: str | Path, root: Mappin
         raise ArtifactSchemaError("repair_promotion_transaction.audit_artifact_id cannot be empty")
     if str(root.get("canonical_version") or "") != "runtime-validation" and not str(root.get("lineage_artifact_id") or ""):
         raise ArtifactSchemaError("repair_promotion_transaction.lineage_artifact_id cannot be empty")
+    if not str(root.get("validation_run_result_artifact_id") or "") and not str(
+        root.get("validation_disposition_artifact_id") or ""
+    ):
+        raise ArtifactSchemaError(
+            "repair_promotion_transaction requires validation run result or validation disposition"
+        )
 
 
 def _validate_repair_lineage(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -668,6 +940,11 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("validation_run_result", "v1"): _validate_validation_result,
         ("validation_run_result_repaired", "v1"): _validate_validation_result,
         ("provider_receipt_closure", "v1"): _validate_receipt_closure,
+        ("provider_expected_call_graph", "v1"): _validate_provider_expected_call_graph,
+        ("stage1_summary_reuse_record", "v1"): _validate_stage1_summary_reuse_record,
+        ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
+        ("validation_disposition", "v1"): _validate_validation_disposition,
+        ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,
         ("provider_receipt_ledger", "v1"): _validate_receipt_ledger,
         ("repair_plan", "v1"): _validate_repair_plan,
         ("repair_apply_result", "v1"): _validate_repair_apply,
@@ -763,6 +1040,8 @@ def validate_current_outline_artifact(record: Any, path: str | Path) -> None:
             raise ArtifactSchemaError("outline_v3_node_dag job_id mismatch")
         if not isinstance(root.get("nodes"), list) or not root.get("nodes"):
             raise ArtifactSchemaError("outline_v3_node_dag.nodes must be a non-empty array")
+    elif artifact_type == "outline_provider_call_plan":
+        _validate_outline_provider_call_plan(record, path, root)
     else:
         _validate_model(record, root)
 

@@ -145,8 +145,15 @@ def test_current_stage1_generates_canonical_summary_and_receipt(tmp_path: Path) 
     assert summary["ai_summary"]["schema_version"] == "summary_v2_lite"
     assert summary["stage1_input"]["input_mode"] == "text_only"
     assert result.receipt_ids
+    assert result.receipt_ledger_path
+    assert result.receipt_ledger_path == service.registry.get("stage1_provider_receipts").path  # type: ignore[union-attr]
     ledger = ProviderRuntimeLedger(result.receipt_ledger_path)
     assert len(ledger.list_receipts()) == 1
+    closure = service.finalize_provider_receipt_closure()
+    closure_payload = json.loads(Path(closure.path).read_text(encoding="utf-8"))
+    assert closure_payload["expected_provider_transport_count"] == 1
+    assert closure_payload["payload"]["complete"] is False
+    assert any(item.artifact_type == "evidence_manifest" for item in service.registry.list_records())
 
 
 def test_current_stage1_resume_reuses_matching_summary_without_provider_call(tmp_path: Path) -> None:
@@ -165,6 +172,14 @@ def test_current_stage1_resume_reuses_matching_summary_without_provider_call(tmp
     assert len(calls) == 1
     assert second.generated_count == 0
     assert second.reused_count == 1
+    assert second.receipt_ids == ()
+    assert second.receipt_ledger_path == ""
+    assert second.summaries[0]["provider"]["receipt_ledger_path"] == ""
+    assert second.reuse_evidence_ids
+    reuse_record = service.registry.get(second.reuse_evidence_ids[0])
+    assert reuse_record is not None
+    assert reuse_record.metadata["transport_count"] == 0
+    assert reuse_record.depends_on
     assert second.summaries[0]["ai_summary"] == first.summaries[0]["ai_summary"]
 
 

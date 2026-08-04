@@ -30,8 +30,13 @@ from services.citation_ref_catalog import (
     resolve_ref_id,
     validate_document_ref_catalog,
 )
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_workspace import (
+    JobWorkspace,
+    publish_bytes_artifact,
+    publish_json_artifact,
+)
 from services.settings import ApplicationSettings
+from services.queue_service import LocalPublicationContext
 
 
 WriterCallable = Callable[..., Mapping[str, Any]]
@@ -61,19 +66,31 @@ class ReviewGenerationService:
         writer: WriterCallable | None = None,
         cancellation_checker: Callable[[], None] | None = None,
         logger: logging.Logger | None = None,
+        publication_context: Any | None = None,
     ) -> None:
         self.job_id = str(job_id)
         self.attempt_id = str(attempt_id or "review")
         self.workspace = workspace
         self.registry = artifact_registry
+        self.publication_context = (
+            publication_context
+            or getattr(artifact_registry, "publication_context", None)
+            or LocalPublicationContext()
+        )
         self.settings = settings
         self.summaries = [dict(item) for item in summaries]
         self.writer = writer
         self.cancellation_checker = cancellation_checker
         self.logger = logger or logging.getLogger("auto_generate.review")
-        self.receipt_ledger = ProviderRuntimeLedger(
-            self.workspace.artifact_path("review_provider_receipts.jsonl")
+        self.receipt_ledger_target_path = self.workspace.artifact_path(
+            "review_provider_receipts.jsonl"
         )
+        self.receipt_ledger = ProviderRuntimeLedger(
+            self.workspace.artifact_path(
+                f".publication-staging/provider-receipts/review/{self.attempt_id}.jsonl"
+            )
+        )
+        self.receipt_ledger_path = ""
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
         self.expected_call_graph_hash = ""
         self.closure_epoch_id = ""
@@ -289,7 +306,7 @@ class ReviewGenerationService:
             citation_ref_catalog=catalog,
             citation_ref_catalog_path=str(catalog_path),
             receipt_ids=tuple(receipt.receipt_id for receipt in self.receipt_ledger.list_receipts()),
-            receipt_ledger_path=str(self.receipt_ledger.path),
+            receipt_ledger_path=self.receipt_ledger_path,
         )
 
     def _build_and_persist_catalog(self) -> tuple[dict[str, Any], Path]:
@@ -310,7 +327,6 @@ class ReviewGenerationService:
             existing_catalog=existing,
         )
         validate_document_ref_catalog(catalog)
-        atomic_write_json(str(path), catalog)
         dependencies: list[ArtifactDependencyRefV2] = []
         summary_record = self.registry.get("summary_file")
         if summary_record is not None and summary_record.status == "ready":
@@ -324,17 +340,20 @@ class ReviewGenerationService:
                     content_hash=summary_record.content_hash,
                 )
             )
-        self.registry.register_file(
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            catalog,
             artifact_role="citation_ref_catalog",
             artifact_type="citation_ref_catalog",
             artifact_version="v1",
-            path=str(path),
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id="citation_ref_catalog",
             depends_on=dependencies,
             metadata={"catalog_hash": catalog["catalog_hash"]},
         )
-        return catalog, path
+        return catalog, Path(record.path)
 
     def _section_path(self, section_id: str, binding_hash: str = "") -> Path:
         safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in section_id)
@@ -413,7 +432,8 @@ class ReviewGenerationService:
         }
 
     def _load_review_replay(self, *, section_id: str, binding: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        path = self._review_replay_path()
+        current = self.registry.get("review_replay")
+        path = Path(current.path) if current is not None and current.status == "ready" else self._review_replay_path()
         if not path.is_file():
             return None
         binding_hash = hash_json(binding)
@@ -460,19 +480,35 @@ class ReviewGenerationService:
         }
         if existing == payload:
             return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-            handle.flush()
-        self.registry.register_file(
+        current = self.registry.get("review_replay")
+        existing_bytes = b""
+        if current is not None and current.status == "ready":
+            try:
+                existing_bytes = Path(current.path).read_bytes()
+            except OSError:
+                existing_bytes = b""
+        elif path.is_file():
+            try:
+                existing_bytes = path.read_bytes()
+            except OSError:
+                existing_bytes = b""
+        line = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        record = publish_bytes_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            existing_bytes + line,
             artifact_role="review_replay",
             artifact_type="review_replay_ledger",
             artifact_version="v1",
-            path=str(path),
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id="review_replay",
             metadata={"binding_version": "review-section-binding-v1"},
         )
+        del record
 
     def _load_section(
         self,
@@ -572,20 +608,17 @@ class ReviewGenerationService:
         section_hash = hash_json(section)
         binding_hash = hash_json(binding)
         path = self._section_path(section_id, binding_hash)
-        atomic_write_json(
-            str(path),
-            {
-                "artifact_type": "review_section",
-                "artifact_version": "v3",
-                "status": "ready",
-                "job_id": self.job_id,
-                "section_id": section_id,
-                "binding_hash": binding_hash,
-                "binding": dict(binding),
-                "content_hash": section_hash,
-                "section": dict(section),
-            },
-        )
+        section_payload = {
+            "artifact_type": "review_section",
+            "artifact_version": "v3",
+            "status": "ready",
+            "job_id": self.job_id,
+            "section_id": section_id,
+            "binding_hash": binding_hash,
+            "binding": dict(binding),
+            "content_hash": section_hash,
+            "section": dict(section),
+        }
         dependencies: list[ArtifactDependencyRefV2] = []
         for artifact_id in (
             "outline-v3:section_evidence_packets",
@@ -596,11 +629,14 @@ class ReviewGenerationService:
             record = self.registry.get(artifact_id)
             if record is not None and record.status == "ready":
                 dependencies.append(ArtifactDependencyRefV2.from_record(record))
-        immutable_record = self.registry.register_file(
+        immutable_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            section_payload,
             artifact_role="review_section",
             artifact_type="review_section",
             artifact_version="v3",
-            path=str(path),
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id=f"review-section:{section_id}:{binding_hash[:24]}",
             depends_on=dependencies,
@@ -612,11 +648,14 @@ class ReviewGenerationService:
                 "versioned_artifact_id": f"review-section:{section_id}:{binding_hash[:24]}",
             },
         )
-        self.registry.register_file(
+        publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            section_payload,
             artifact_role="review_section",
             artifact_type="review_section",
             artifact_version="v3",
-            path=str(path),
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id=f"review-section:{section_id}",
             depends_on=dependencies + [ArtifactDependencyRefV2.from_record(immutable_record)],
@@ -657,19 +696,16 @@ class ReviewGenerationService:
                 for expected in self._expected_provider_calls.values()
             ],
         }
-        atomic_write_json(
-            str(path),
-            {
-                "artifact_type": "provider_receipt_closure",
-                "artifact_version": "v1",
-                "job_id": self.job_id,
-                "stage_name": "stage3_review",
-                "attempt_id": self.attempt_id,
-                "closure_epoch_id": self.closure_epoch_id,
-                "expected_call_graph_hash": self.expected_call_graph_hash,
-                "payload": closure_payload,
-            },
-        )
+        closure_document = {
+            "artifact_type": "provider_receipt_closure",
+            "artifact_version": "v1",
+            "job_id": self.job_id,
+            "stage_name": "stage3_review",
+            "attempt_id": self.attempt_id,
+            "closure_epoch_id": self.closure_epoch_id,
+            "expected_call_graph_hash": self.expected_call_graph_hash,
+            "payload": closure_payload,
+        }
         dependencies: list[ArtifactDependencyRefV2] = []
         dependency_ids: set[str] = set()
 
@@ -704,11 +740,14 @@ class ReviewGenerationService:
                     None,
                 )
             )
-        self.registry.register_file(
+        publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            closure_document,
             artifact_role="provider_receipt_closure",
             artifact_type="provider_receipt_closure",
             artifact_version="v1",
-            path=str(path),
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id="review:provider_receipt_closure",
             depends_on=dependencies,
@@ -1059,15 +1098,23 @@ class ReviewGenerationService:
     def _register_receipt_ledger(self) -> None:
         if not self.receipt_ledger.path.is_file():
             return
-        self.registry.register_file(
+        payload = self.receipt_ledger.path.read_bytes()
+        if not payload.strip():
+            self.receipt_ledger_path = ""
+            return
+        record = publish_bytes_artifact(
+            self.publication_context,
+            self.registry,
+            self.receipt_ledger_target_path,
+            payload,
             artifact_role="provider_receipts",
             artifact_type="provider_receipt_ledger",
             artifact_version="v1",
-            path=str(self.receipt_ledger.path),
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id="review_provider_receipts",
             metadata={"receipt_count": len(self.receipt_ledger.list_receipts())},
         )
+        self.receipt_ledger_path = record.path
 
     def _check_cancelled(self) -> None:
         if self.cancellation_checker is not None:

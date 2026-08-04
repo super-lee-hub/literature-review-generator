@@ -3,7 +3,8 @@
 Date: 2026-08-04 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
-Code/test verification commit: `65e9d24a9695c21846e3ab6868bec5212fdb5ad5`
+Code/test verification: refreshed at the final pre-publication branch tip; the
+final commit SHA is recorded in the PR description and delivery report.
 
 ## Current execution evidence
 
@@ -36,10 +37,8 @@ The current path persists and checks:
 
 | Evidence | Result |
 |---|---|
-| Queue/lease/Windows-spawn group | `26 passed` |
-| Closure/completion/stage-plan/current-artifact/GUI/export group | `77 passed` |
-| Outline v3 DAG/replay/stability group | `17 passed` |
-| Strict offline full gate | `708 passed, 22 deselected` from `730 collected` |
+| Focused boundary regressions | passed; queue, closure, repair, export, Stage 1, validation, GUI-controller, adoption, multimodal, and Outline groups |
+| Strict offline full gate | `726 passed, 22 deselected` from `748 collected` |
 | `python -m compileall -q .` | passed |
 | `python -m pyright` | `0 errors, 0 warnings, 0 informations` |
 | Current production-shaped three-PDF chain | passed; explicit adoption, current validation, export, and attestation |

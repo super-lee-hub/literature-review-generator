@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import pytest
+
 from outline.v3_executor import OutlineV3Executor
 from runtime.provider_runtime import ProviderRuntimeLedger
 from services.artifact_registry import ArtifactRegistry
@@ -107,6 +109,8 @@ def _executor(
     stability_mode: str = "smoke",
     max_provider_calls: int | None = None,
     max_estimated_cost: float | None = None,
+    pricing_source: str | None = "tests:explicit-rates-v1",
+    candidate_count: int = 2,
 ) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
@@ -119,10 +123,16 @@ def _executor(
         workspace=workspace,
         artifact_registry=registry,
         provider=provider or _configured_test_provider,
-        candidate_count=2,
+        candidate_count=candidate_count,
         stability_mode=stability_mode,
         max_provider_calls=max_provider_calls,
         max_estimated_cost=max_estimated_cost,
+        pricing_source=pricing_source,
+        input_cost_per_1k_tokens=0.0,
+        output_cost_per_1k_tokens=0.001,
+        reasoning_cost_per_1k_tokens=0.001,
+        cache_read_cost_per_1k_tokens=0.0,
+        cache_write_cost_per_1k_tokens=0.0,
     )
 
 
@@ -143,7 +153,7 @@ def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> 
     assert first["source_summary_hashes"]
     assert first["retrieval_provenance"]["source_artifacts"]
 
-    ledger = ProviderRuntimeLedger(executor._receipt_ledger.path)
+    ledger = ProviderRuntimeLedger(result.artifacts["provider_receipts"])
     assert ledger.list_receipts()
 
 
@@ -204,6 +214,124 @@ def test_outline_v3_stability_cost_budget_rejects_before_transport(tmp_path: Pat
     preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
     assert preflight["preflight_status"] == "rejected"
     assert preflight["rejection_reason"] == "max_estimated_cost_exceeded"
+
+
+def test_outline_v3_unknown_pricing_does_not_claim_a_monetary_ceiling(tmp_path: Path) -> None:
+    result = _executor(
+        tmp_path,
+        pricing_source=None,
+        max_estimated_cost=0.0,
+    ).run()
+
+    assert result.ok is True
+    preflight_paths = list(tmp_path.rglob("stability_preflight_*.json"))
+    assert preflight_paths
+    preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
+    assert preflight["cost_status"] == "unknown"
+    assert preflight["estimated_cost"] is None
+    assert preflight["monetary_ceiling_enforced"] is False
+    assert "monetary ceiling was not enforced" in preflight["cost_ceiling_note"]
+
+
+@pytest.mark.parametrize(
+    ("candidate_count", "stability_mode", "expected_transport_calls"),
+    [
+        (1, "off", 6),
+        (2, "off", 7),
+        (5, "off", 10),
+        (1, "smoke", 12),
+        (2, "smoke", 14),
+        (5, "smoke", 20),
+        (1, "full", 36),
+        (2, "full", 42),
+        (5, "full", 60),
+    ],
+)
+def test_outline_v3_call_plan_has_exact_transport_count(
+    tmp_path: Path,
+    candidate_count: int,
+    stability_mode: str,
+    expected_transport_calls: int,
+) -> None:
+    executor = _executor(
+        tmp_path,
+        candidate_count=candidate_count,
+        stability_mode=stability_mode,
+    )
+
+    executor._preflight_stability_budget()
+
+    transport_plans = [item for item in executor.provider_call_plans if item.transport_expected]
+    replay_plans = [item for item in executor.provider_call_plans if not item.transport_expected]
+    assert len(transport_plans) == expected_transport_calls
+    assert len(replay_plans) == (0 if stability_mode == "off" else candidate_count + 5)
+    assert executor.stability_preflight["estimated_provider_calls"] == expected_transport_calls
+    assert all(item.cost_status == "estimate" for item in transport_plans)
+
+
+@pytest.mark.parametrize(
+    ("stability_mode", "expected_transport_calls"),
+    [("off", 7), ("smoke", 14), ("full", 42)],
+)
+def test_outline_v3_transport_trace_matches_call_plan(
+    tmp_path: Path,
+    stability_mode: str,
+    expected_transport_calls: int,
+) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode=stability_mode,
+        candidate_count=2,
+    ).run()
+
+    assert result.ok is True
+    assert len(transport_calls) == expected_transport_calls
+    stability = json.loads(
+        Path(result.artifacts["stability_audit"]).read_text(encoding="utf-8")
+    )["payload"]
+    assert stability["preflight"]["estimated_provider_calls"] == expected_transport_calls
+    assert stability["provider_call_count_total"] == expected_transport_calls
+    assert stability["transport_call_count_after_stability"] == expected_transport_calls
+
+
+def test_outline_v3_actual_usage_and_cost_are_reported_without_billing_claim(tmp_path: Path) -> None:
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = dict(_configured_test_provider(node_id, request))
+        response.update(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "reasoning_tokens": 5,
+                "cached_input_tokens": 3,
+                "usage_status": "reported",
+            }
+        )
+        return response
+
+    result = _executor(tmp_path, provider=provider, stability_mode="smoke").run()
+
+    assert result.ok is True
+    stability = json.loads(
+        Path(result.artifacts["stability_audit"]).read_text(encoding="utf-8")
+    )["payload"]
+    usage = stability["actual_usage_totals"]
+    assert usage["provider_calls"] == 14
+    assert usage["usage_status"] == "reported"
+    assert usage["input_tokens"] == 14 * 100
+    assert usage["output_tokens"] == 14 * 20
+    assert usage["reasoning_tokens"] == 14 * 5
+    assert usage["actual_cost"] is not None
+    assert usage["actual_cost"] > 0
+    assert usage["cost_status"] == "calculated"
+    assert usage["pricing_source"] == "tests:explicit-rates-v1"
+    assert usage["pricing_policy"] == "estimate_only_not_billing_v1"
 
 
 def test_outline_v3_relation_adjudication_unknown_id_is_fail_closed(tmp_path: Path) -> None:

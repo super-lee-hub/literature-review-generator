@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import json
 import logging
 from pathlib import Path
@@ -29,8 +29,14 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
-from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
-from services.progress_state import Stage1ProgressSnapshot, write_stage1_progress_snapshot
+from services.job_workspace import (
+    JobWorkspace,
+    atomic_write_json,
+    publish_bytes_artifact,
+    publish_json_artifact,
+    utc_now_iso,
+)
+from services.progress_state import Stage1ProgressSnapshot
 from services.queue_service import CancelToken
 from services.stage1_analysis_service import Stage1AnalysisService
 
@@ -118,7 +124,14 @@ class _RuntimeStageHost:
             and Path(current_summary.path).is_file()
             else workspace.artifact_path(f"{self.project_name}_summaries.json")
         )
-        self.progress_path = workspace.artifact_path("stage1_progress_snapshot.json")
+        current_progress = artifact_registry.get("stage1_progress_snapshot")
+        self.progress_path = (
+            current_progress.path
+            if current_progress is not None
+            and current_progress.status == "ready"
+            and Path(current_progress.path).is_file()
+            else workspace.artifact_path("stage1_progress_snapshot.json")
+        )
         self.checkpoint_path = workspace.checkpoint_path(f"{self.project_name}_checkpoint.json")
         self.fingerprint_bundle = dict(fingerprint_bundle or {})
         self.resume_state_report = resume_state_report
@@ -127,6 +140,12 @@ class _RuntimeStageHost:
         if self.job_workspace is None or self.artifact_registry is None:
             raise RuntimeError("runtime stage host is not bound to a job workspace")
         return self.job_workspace, self.artifact_registry
+
+    @staticmethod
+    def _publication_context(registry: Any) -> Any:
+        from services.queue_service import LocalPublicationContext
+
+        return getattr(registry, "publication_context", None) or LocalPublicationContext()
 
     @staticmethod
     def get_paper_key(paper: Mapping[str, Any]) -> str:
@@ -163,7 +182,6 @@ class _RuntimeStageHost:
             result=result,
             paper_key=paper_key,
         )
-        atomic_write_json(path, artifact.to_dict())
         dependency_paths = {
             str(paper.get("source_pdf") or "").strip(),
         }
@@ -217,11 +235,14 @@ class _RuntimeStageHost:
                     content_hash=provider_record.content_hash,
                 )
             )
-        registry.register_file(
+        publish_json_artifact(
+            self._publication_context(registry),
+            registry,
+            path,
+            artifact.to_dict(),
             artifact_role=self.PAPER_ARTIFACT_ROLE,
             artifact_type=self.PAPER_ARTIFACT_TYPE,
             artifact_version=self.PAPER_ARTIFACT_VERSION,
-            path=path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id=self._paper_artifact_id(paper),
             depends_on=dependencies,
@@ -242,15 +263,15 @@ class _RuntimeStageHost:
                 raise RuntimeError(f"current Stage 1 summary artifact is unreadable: {versioned_path}") from exc
             if hash_json(existing_payload) != summary_set_hash:
                 raise RuntimeError(f"content-addressed Stage 1 summary path has drifted: {versioned_path}")
-        else:
-            atomic_write_json(versioned_path, summary_payload)
-        self.summary_file = versioned_path
         versioned_id = f"summary_file:{summary_set_hash}"
-        versioned_record = registry.register_file(
+        versioned_record = publish_json_artifact(
+            self._publication_context(registry),
+            registry,
+            versioned_path,
+            summary_payload,
             artifact_role="summary",
             artifact_type="summary_file",
             artifact_version="v1",
-            path=versioned_path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id=versioned_id,
             depends_on=list(depends_on),
@@ -260,11 +281,15 @@ class _RuntimeStageHost:
                 "versioned_artifact_id": versioned_id,
             },
         )
-        registry.register_file(
+        self.summary_file = versioned_record.path
+        publish_json_artifact(
+            self._publication_context(registry),
+            registry,
+            versioned_path,
+            summary_payload,
             artifact_role="summary",
             artifact_type="summary_file",
             artifact_version="v1",
-            path=versioned_path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id="summary_file",
             depends_on=list(depends_on),
@@ -288,12 +313,14 @@ class _RuntimeStageHost:
             fingerprint_bundle=dict(getattr(self, "fingerprint_bundle", {}) or {}),
             checkpoint_file=self.checkpoint_path,
         )
-        write_stage1_progress_snapshot(self.progress_path, progress)
-        registry.register_file(
+        progress_record = publish_json_artifact(
+            self._publication_context(registry),
+            registry,
+            self.progress_path,
+            asdict(progress),
             artifact_role="progress",
             artifact_type="stage1_progress_snapshot",
             artifact_version="v1",
-            path=self.progress_path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id="stage1_progress_snapshot",
             depends_on=[
@@ -307,6 +334,7 @@ class _RuntimeStageHost:
                 )
             ],
         )
+        self.progress_path = progress_record.path
         return True
 
     def _get_summary_source_manifest_path(self) -> str:
@@ -374,7 +402,6 @@ class _RuntimeStageHost:
             citation_ref_catalog_hash=citation_ref_catalog_hash,
         )
         path = self._review_draft_path()
-        atomic_write_json(path, draft.to_dict())
         dependencies: list[ArtifactDependencyRefV2] = []
         catalog_record = registry.get("citation_ref_catalog")
         if catalog_record is not None and catalog_record.status == "ready":
@@ -388,11 +415,14 @@ class _RuntimeStageHost:
                     content_hash=catalog_record.content_hash,
                 )
             )
-        registry.register_file(
+        publish_json_artifact(
+            self._publication_context(registry),
+            registry,
+            path,
+            draft.to_dict(),
             artifact_role=self.REVIEW_DRAFT_ARTIFACT_ROLE,
             artifact_type=self.REVIEW_DRAFT_ARTIFACT_TYPE,
             artifact_version=self.REVIEW_DRAFT_ARTIFACT_VERSION,
-            path=path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id="review_draft",
             depends_on=dependencies,
@@ -428,12 +458,17 @@ class _RuntimeStageHost:
             citation_ref_catalog_hash=catalog_hash,
         )
         path = self._citation_manifest_path()
-        atomic_write_json(path, manifest.to_dict())
-        registry.register_file(
+        draft_record = registry.get("review_draft")
+        if draft_record is None or draft_record.status != "ready":
+            raise RuntimeError("review draft must be registered before citation manifest publication")
+        publish_json_artifact(
+            self._publication_context(registry),
+            registry,
+            path,
+            manifest.to_dict(),
             artifact_role=self.CITATION_MANIFEST_ARTIFACT_ROLE,
             artifact_type=self.CITATION_MANIFEST_ARTIFACT_TYPE,
             artifact_version=self.CITATION_MANIFEST_ARTIFACT_VERSION,
-            path=path,
             producer="runtime.orchestrator._RuntimeStageHost",
             artifact_id=self.CITATION_MANIFEST_ARTIFACT_ID,
             depends_on=[
@@ -442,10 +477,8 @@ class _RuntimeStageHost:
                     job_id=registry.job_id,
                     artifact_id="review_draft",
                     artifact_type="review_draft",
-                    path=review_draft_path,
-                    content_hash=registry.get("review_draft").content_hash
-                    if registry.get("review_draft") is not None
-                    else "",
+                    path=draft_record.path,
+                    content_hash=draft_record.content_hash,
                 ),
                 *(
                     [
@@ -594,6 +627,7 @@ class InternalStageExecutorRegistry:
                 config=session.stage_host.config,
                 settings=session.context.settings,
                 cancellation_checker=session.stage_host.check_cancelled,
+                publication_context=session.context.publication_context,
                 logger=session.stage_host.logger,
             )
             generation = generation_service.run(bundle, existing_summaries=summaries)
@@ -626,6 +660,7 @@ class InternalStageExecutorRegistry:
             config=session.stage_host.config,
             settings=session.context.settings,
             cancellation_checker=session.stage_host.check_cancelled,
+            publication_context=session.context.publication_context,
             logger=session.stage_host.logger,
         )
         generation_service.prepare_empty_provider_receipt_closure(bundle)
@@ -718,6 +753,7 @@ class InternalStageExecutorRegistry:
             stability_mode=stability.mode,
             max_provider_calls=stability.max_provider_calls or None,
             max_estimated_cost=stability.max_estimated_cost or None,
+            pricing_source=stability.pricing_source,
             estimated_cost_per_1k_tokens=stability.estimated_cost_per_1k_tokens,
             input_cost_per_1k_tokens=stability.input_cost_per_1k_tokens,
             output_cost_per_1k_tokens=stability.output_cost_per_1k_tokens,
@@ -845,6 +881,7 @@ class InternalStageExecutorRegistry:
             summaries=summaries,
             cancellation_checker=session.stage_host.check_cancelled,
             logger=session.stage_host.logger,
+            publication_context=session.context.publication_context,
         ).run(
             outline_payload=payload,
             evidence_packets=[dict(item) for item in packets if isinstance(item, Mapping)],
@@ -1133,12 +1170,14 @@ class AgentRuntimeBridge:
                 )
             )
         path = session.context.workspace.artifact_path("source_bundle.json")
-        atomic_write_json(path, source_bundle.to_dict())
-        record = session.context.registry.register_file(
+        record = publish_json_artifact(
+            session.context.publication_context,
+            session.context.registry,
+            path,
+            source_bundle.to_dict(),
             artifact_role="source_bundle",
             artifact_type="source_bundle",
             artifact_version="v1",
-            path=path,
             producer="runtime.orchestrator.AgentRuntimeBridge.persist_source_bundle",
             artifact_id="source_bundle",
             depends_on=source_dependencies,
@@ -1154,12 +1193,14 @@ class AgentRuntimeBridge:
     ) -> StageArtifactRef:
         trace_entries = list(entries or self.initial_stage_trace())
         path = session.context.workspace.artifact_path(artifact_name)
-        atomic_write_json(path, {"entries": trace_entries})
-        record = session.context.registry.register_file(
+        record = publish_json_artifact(
+            session.context.publication_context,
+            session.context.registry,
+            path,
+            {"entries": trace_entries},
             artifact_role="runtime_stage_trace",
             artifact_type="runtime_stage_trace",
             artifact_version="v1",
-            path=path,
             producer="runtime.orchestrator.AgentRuntimeBridge.write_stage_trace",
             artifact_id="runtime_stage_trace",
         )
@@ -1200,6 +1241,7 @@ class AgentRuntimeBridge:
             logger=session.stage_host.logger,
             runtime_config=session.stage_host.config,
             validation_external_registry_resolver=external_registry_resolver,
+            publication_context=session.context.publication_context,
         )
 
     def persist_stage1_results(
@@ -1266,9 +1308,15 @@ class AgentRuntimeBridge:
 
         if not host.save_summaries(depends_on=source_dependencies):
             raise RuntimeError("stage1 summary persistence failed")
+        # Resume and completion reports must follow the Registry-selected
+        # immutable paths produced by the publication boundary.
+        object.__setattr__(session.context, "summary_path", host.summary_file)
+        object.__setattr__(session.context, "progress_path", host.progress_path)
 
         manifest_path = host._get_summary_source_manifest_path()
-        atomic_write_json(
+        summary_source_record = publish_json_artifact(
+            session.context.publication_context,
+            session.context.registry,
             manifest_path,
             {
                 "artifact_type": "summary_source_manifest",
@@ -1282,16 +1330,14 @@ class AgentRuntimeBridge:
                 "materialized_summary_file": host.summary_file,
                 "summary_count": len(normalized_summaries),
             },
-        )
-        session.context.registry.register_file(
             artifact_role="summary_source",
             artifact_type="summary_source_manifest",
             artifact_version="v2",
-            path=manifest_path,
             producer=producer,
             artifact_id="summary_source_manifest",
             depends_on=source_dependencies,
         )
+        manifest_path = summary_source_record.path
 
         artifact_refs = [
             self._artifact_ref_for_path(
@@ -1303,7 +1349,7 @@ class AgentRuntimeBridge:
             ),
             self._artifact_ref_for_path(
                 session,
-                session.context.progress_path,
+                host.progress_path,
                 artifact_role="progress",
                 artifact_type="stage1_progress_snapshot",
                 artifact_version="v1",
@@ -1385,6 +1431,27 @@ class AgentRuntimeBridge:
                 "provider_receipt_closure": (
                     stage1_closure_record.artifact_id if stage1_closure_record is not None else ""
                 ),
+                "expected_provider_transport_count": int(
+                    getattr(stage1_generation, "expected_provider_transport_count", 0)
+                    if stage1_generation is not None
+                    else 0
+                ),
+                "actual_provider_transport_count": int(
+                    getattr(stage1_generation, "actual_provider_transport_count", 0)
+                    if stage1_generation is not None
+                    else len(provider_receipt_ids or [])
+                ),
+                "provider_receipt_count": len(provider_receipt_ids or []),
+                "reuse_evidence_count": int(
+                    len(getattr(stage1_generation, "reuse_evidence_ids", ()) or ())
+                    if stage1_generation is not None
+                    else 0
+                ),
+                "reuse_evidence_ids": list(
+                    getattr(stage1_generation, "reuse_evidence_ids", ()) or ()
+                    if stage1_generation is not None
+                    else ()
+                ),
             },
         )
 
@@ -1417,7 +1484,10 @@ class AgentRuntimeBridge:
             citation_ref_catalog_hash=citation_ref_catalog_hash,
         ):
             raise RuntimeError("current review draft persistence failed")
-        draft_path = host._review_draft_path()
+        draft_record = session.context.registry.get("review_draft")
+        if draft_record is None or draft_record.status != "ready":
+            raise RuntimeError("current review draft record is unavailable after publication")
+        draft_path = draft_record.path
         if not host._persist_citation_manifest(
             review_draft_path=draft_path,
             review_word_path=review_word_path,
@@ -1426,30 +1496,44 @@ class AgentRuntimeBridge:
             citation_ref_catalog_hash=citation_ref_catalog_hash,
         ):
             raise RuntimeError("current citation manifest persistence failed")
-        manifest = host._load_citation_manifest()
+        manifest_record = session.context.registry.get(host.CITATION_MANIFEST_ARTIFACT_ID)
+        if manifest_record is None or manifest_record.status != "ready":
+            raise RuntimeError("current citation manifest record is unavailable after publication")
+        try:
+            manifest_payload = json.loads(Path(manifest_record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("current citation manifest is unreadable after publication") from exc
+        manifest = dict(manifest_payload) if isinstance(manifest_payload, Mapping) else {}
         if not manifest:
             raise RuntimeError("current citation manifest is unavailable")
+        docx_source_path = Path(review_word_path)
         if rebuild_docx:
             from docx_writer import rebuild_review_docx_from_structured_artifacts
 
-            draft = json.loads(Path(draft_path).read_text(encoding="utf-8"))
+            draft = json.loads(Path(draft_record.path).read_text(encoding="utf-8"))
+            docx_source_path = Path(
+                session.context.workspace.artifact_path(
+                    ".publication-staging/review-docx/rebuilt_review.docx"
+                )
+            )
             rebuild_review_docx_from_structured_artifacts(
                 host,
                 draft,
                 manifest,
-                review_word_path,
+                str(docx_source_path),
             )
         registry = session.context.registry
-        draft_record = registry.get("review_draft")
-        manifest_record = registry.get(host.CITATION_MANIFEST_ARTIFACT_ID)
-        if draft_record is None or manifest_record is None:
-            raise RuntimeError("review artifacts are not registered")
         catalog_record = registry.get("citation_ref_catalog")
-        docx_record = registry.register_file(
+        if not docx_source_path.is_file():
+            raise RuntimeError(f"review DOCX bytes are unavailable before publication: {docx_source_path}")
+        docx_record = publish_bytes_artifact(
+            session.context.publication_context,
+            registry,
+            review_word_path,
+            docx_source_path.read_bytes(),
             artifact_role="review_docx",
             artifact_type="review_docx",
             artifact_version="v1",
-            path=review_word_path,
             producer=producer,
             artifact_id="review_docx",
             depends_on=[
@@ -1655,23 +1739,42 @@ class AgentRuntimeBridge:
 
         canonical_record: ArtifactRecord | None = None
         if validation_run_result_file:
-            canonical_record = session.context.registry.register_file(
-                artifact_role="validation",
-                artifact_type="validation_run_result",
-                artifact_version="v1",
-                path=validation_run_result_file,
-                producer=producer,
-                depends_on=depends_on,
-                artifact_id=validation_run_result.validation_run_id,
-                status="ready" if validation_success else "quarantined",
-                external_registry_resolver=external_registry_resolver,
-                metadata={
-                    "execution_status": validation_run_result.execution_status.value,
-                    "validation_disposition": validation_run_result.validation_disposition.value,
-                    "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
-                    "dependency_error": dependency_error,
-                },
+            existing_canonical = session.context.registry.get(
+                validation_run_result.validation_run_id
             )
+            if existing_canonical is not None and Path(existing_canonical.path).is_file():
+                canonical_record = existing_canonical
+                if canonical_record.status == "ready" and not validation_success:
+                    canonical_record = session.context.registry.update_record(
+                        canonical_record.artifact_id,
+                        status="quarantined",
+                        metadata_updates={"dependency_error": dependency_error},
+                    )
+            else:
+                canonical_record = publish_bytes_artifact(
+                    session.context.publication_context,
+                    session.context.registry,
+                    validation_run_result_file,
+                    Path(validation_run_result_file).read_bytes(),
+                    artifact_role="validation",
+                    artifact_type="validation_run_result",
+                    artifact_version="v1",
+                    producer=producer,
+                    depends_on=depends_on,
+                    artifact_id=validation_run_result.validation_run_id,
+                    status="ready" if validation_success else "quarantined",
+                    external_registry_resolver=external_registry_resolver,
+                    metadata={
+                        "execution_status": validation_run_result.execution_status.value,
+                        "validation_disposition": validation_run_result.validation_disposition.value,
+                        "claim_verdict_counts": dict(validation_run_result.claim_verdict_counts),
+                        "dependency_error": dependency_error,
+                    },
+                )
+            if canonical_record is None:
+                raise RuntimeError("validation result publication returned no Registry record")
+            validation_run_result_file = canonical_record.path
+            canonical_digest = canonical_record.content_hash
             if canonical_record.content_hash != canonical_digest:
                 session.context.registry.update_record(
                     canonical_record.artifact_id,
@@ -1716,15 +1819,21 @@ class AgentRuntimeBridge:
         for path, artifact_type, artifact_prefix in projections:
             if not path or canonical_record is None or not validation_success:
                 continue
-            record = session.context.registry.register_file(
-                artifact_role="validation_projection",
-                artifact_type=artifact_type,
-                artifact_version="v1",
-                path=path,
-                producer=producer,
-                depends_on=projection_dependencies,
-                artifact_id=f"{artifact_prefix}:{Path(path).name}",
-            )
+            projection_id = f"{artifact_prefix}:{Path(path).name}"
+            record = session.context.registry.get(projection_id)
+            if record is None or not Path(record.path).is_file():
+                record = publish_bytes_artifact(
+                    session.context.publication_context,
+                    session.context.registry,
+                    path,
+                    Path(path).read_bytes(),
+                    artifact_role="validation_projection",
+                    artifact_type=artifact_type,
+                    artifact_version="v1",
+                    producer=producer,
+                    depends_on=projection_dependencies,
+                    artifact_id=projection_id,
+                )
             artifact_refs.append(self._artifact_ref_from_record(record))
 
         if validation_success:
@@ -1783,17 +1892,16 @@ class AgentRuntimeBridge:
                     f"runtime_validation/{promotion_id.replace(':', '-')}/repair_promotion_transaction.json"
                 )
             )
-            atomic_write_json(str(promotion_path), promotion.to_dict())
-            promotion_record = ArtifactRecord(
-                artifact_id=promotion_id,
+            promotion_record = publish_json_artifact(
+                session.context.publication_context,
+                session.context.registry,
+                promotion_path,
+                promotion.to_dict(),
                 artifact_role="repair_promotion_transaction",
                 artifact_type=promotion.artifact_type,
                 artifact_version=promotion.artifact_version,
-                path=str(promotion_path),
                 producer="runtime.orchestrator._RuntimeStageHost.validate",
-                job_id=session.context.workspace.job_id,
-                status="ready",
-                content_hash=file_sha256(promotion_path),
+                artifact_id=promotion_id,
                 depends_on=[
                     ArtifactDependencyRefV2.from_record(review_draft_record),
                     ArtifactDependencyRefV2.from_record(citation_manifest_record),
@@ -1807,7 +1915,6 @@ class AgentRuntimeBridge:
                     "commit_boundary": "current_artifact_set_pointer_cas",
                     "canonical_replacement": True,
                 },
-                created_at=promotion.created_at,
             )
             current_set = session.context.registry.build_current_artifact_set(
                 promotion_transaction_id=promotion_id,
@@ -2041,6 +2148,10 @@ class AgentRuntimeBridge:
         artifact_id: str = "",
     ) -> StageArtifactRef:
         abs_path = str(Path(path).resolve())
+        if artifact_id:
+            identity_record = session.context.registry.get(artifact_id)
+            if identity_record is not None and identity_record.status == "ready":
+                return self._artifact_ref_from_record(identity_record)
         for record in session.context.registry.list_records():
             if record.path == abs_path:
                 return self._artifact_ref_from_record(record)

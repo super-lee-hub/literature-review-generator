@@ -34,7 +34,13 @@ from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderRecei
 from runtime.stage_contracts import PaperWorkItem, SourceBundle
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry, file_sha256
 from services.evidence_manifest import build_evidence_manifest_v1
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_workspace import (
+    JobWorkspace,
+    atomic_write_json,
+    publish_bytes_artifact,
+    publish_json_artifact,
+    utc_now_iso,
+)
 from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
@@ -61,6 +67,9 @@ class Stage1AnalysisResult:
     expected_call_graph_path: str = ""
     expected_call_graph_hash: str = ""
     closure_epoch_id: str = ""
+    reuse_evidence_ids: tuple[str, ...] = ()
+    expected_provider_transport_count: int = 0
+    actual_provider_transport_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,7 @@ class Stage1AnalysisService:
         settings: ApplicationSettings,
         cancellation_checker: Callable[[], None] | None = None,
         reader: ReaderCallable | None = None,
+        publication_context: Any | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.job_id = str(job_id)
@@ -100,16 +110,31 @@ class Stage1AnalysisService:
         self.settings = settings
         self.cancellation_checker = cancellation_checker
         self.reader = reader
-        self.logger = logger or logging.getLogger("auto_generate.stage1")
-        self.receipt_ledger = ProviderRuntimeLedger(
-            self.workspace.artifact_path("stage1_provider_receipts.jsonl")
+        from services.queue_service import LocalPublicationContext
+
+        self.publication_context = (
+            publication_context
+            or getattr(artifact_registry, "publication_context", None)
+            or LocalPublicationContext()
         )
+        self.logger = logger or logging.getLogger("auto_generate.stage1")
+        safe_attempt = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.attempt_id or "stage1")
+        self.receipt_ledger_target_path = self.workspace.artifact_path(
+            "stage1_provider_receipts.jsonl"
+        )
+        self.receipt_ledger = ProviderRuntimeLedger(
+            self.workspace.artifact_path(
+                f".publication-staging/provider-receipts/stage1/{safe_attempt}.jsonl"
+            )
+        )
+        self.receipt_ledger_path = ""
         self.expected_calls: tuple[ExpectedProviderCall, ...] = ()
         self.expected_call_graph_hash = ""
         self.closure_epoch_id = ""
         self.expected_call_graph_path = ""
         self.receipt_closure_path = ""
         self.receipt_closure_hash = ""
+        self.reuse_evidence_ids: list[str] = []
 
     def run(
         self,
@@ -146,6 +171,11 @@ class Stage1AnalysisService:
                     "source_pdf": item.item.source_pdf,
                     "disposition": "reused" if item.previous is not None else "provider_generated",
                     "provider_receipt_ids": list(receipt_ids),
+                    "reuse_evidence_id": str(
+                        (summary.get("reuse_metadata") or {}).get("reuse_evidence_id") or ""
+                    )
+                    if isinstance(summary, Mapping)
+                    else "",
                     "evidence_manifest_path": str(preprocess.get("evidence_manifest_path") or ""),
                     "evidence_manifest_hash": str(preprocess.get("evidence_manifest_hash") or ""),
                 }
@@ -159,21 +189,35 @@ class Stage1AnalysisService:
             raise RuntimeError("Stage 1 did not produce one result for every source work item")
 
         self._register_receipt_ledger()
+        # The provider path is optional evidence.  A zero-transport reuse run
+        # must not inherit a historical ledger path or manufacture a target
+        # that was never published.
+        for summary in summaries:
+            provider = summary.get("provider") if isinstance(summary, Mapping) else None
+            if isinstance(provider, Mapping):
+                summary["provider"] = {
+                    **dict(provider),
+                    "receipt_ledger_path": self.receipt_ledger_path,
+                }
         current_epoch_receipts = tuple(
             receipt
             for receipt in self.receipt_ledger.list_receipts()
             if str(receipt.closure_epoch_id or "") == self.closure_epoch_id
         )
+        actual_transport_count = len(current_epoch_receipts)
         return Stage1AnalysisResult(
             summaries=tuple(summaries),
             source_items=tuple(source_items),
             receipt_ids=tuple(receipt.receipt_id for receipt in current_epoch_receipts),
-            receipt_ledger_path=str(self.receipt_ledger.path),
+            receipt_ledger_path=self.receipt_ledger_path,
             reused_count=reused_count,
             generated_count=generated_count,
             expected_call_graph_path=self.expected_call_graph_path,
             expected_call_graph_hash=self.expected_call_graph_hash,
             closure_epoch_id=self.closure_epoch_id,
+            reuse_evidence_ids=tuple(self.reuse_evidence_ids),
+            expected_provider_transport_count=len(self.expected_calls),
+            actual_provider_transport_count=actual_transport_count,
         )
 
     def prepare_empty_provider_receipt_closure(self, bundle: SourceBundle) -> None:
@@ -206,12 +250,14 @@ class Stage1AnalysisService:
             "evidence_manifests/"
             f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
         )
-        atomic_write_json(evidence_manifest_path, evidence_manifest.to_dict())
-        evidence_record = self.registry.register_file(
+        evidence_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            evidence_manifest_path,
+            evidence_manifest.to_dict(),
             artifact_role="evidence_manifest",
             artifact_type="evidence_manifest",
             artifact_version="v1",
-            path=evidence_manifest_path,
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
         )
@@ -254,19 +300,23 @@ class Stage1AnalysisService:
         source_record = self.registry.get("source_bundle")
         if source_record is None:
             source_path = self.workspace.artifact_path("source_bundle_v1.json")
-            atomic_write_json(source_path, bundle.to_dict())
-            source_record = self.registry.register_file(
+            source_record = publish_json_artifact(
+                self.publication_context,
+                self.registry,
+                source_path,
+                bundle.to_dict(),
                 artifact_role="source_bundle",
                 artifact_type="source_bundle",
                 artifact_version="v1",
-                path=source_path,
                 producer="services.stage1_analysis_service.Stage1AnalysisService",
                 artifact_id="source_bundle",
             )
         runtime_record = self.registry.get("runtime_job_spec")
         if runtime_record is None:
             spec_path = self.workspace.artifact_path("stage1_execution_spec_v1.json")
-            atomic_write_json(
+            runtime_record = publish_json_artifact(
+                self.publication_context,
+                self.registry,
                 spec_path,
                 {
                     "artifact_type": "runtime_job_spec",
@@ -275,12 +325,9 @@ class Stage1AnalysisService:
                     "stage_name": "stage1_analyze",
                     "attempt_id": self.attempt_id,
                 },
-            )
-            runtime_record = self.registry.register_file(
                 artifact_role="runtime_spec",
                 artifact_type="runtime_job_spec",
                 artifact_version="v1",
-                path=spec_path,
                 producer="services.stage1_analysis_service.Stage1AnalysisService",
                 artifact_id="runtime_job_spec",
             )
@@ -292,6 +339,9 @@ class Stage1AnalysisService:
         prepared: Sequence[_PreparedStage1Item],
     ) -> None:
         source_bundle_hash, runtime_spec_hash = self._ensure_durable_input_records(bundle)
+        # Exact summary reuse is evidence, not provider work.  The expected
+        # graph contains only items that can genuinely produce a transport
+        # receipt in this epoch.
         graph_seed = [
             {
                 "call_id": f"stage1:{self._paper_key(item.item)}",
@@ -313,6 +363,7 @@ class Stage1AnalysisService:
                 "usage_required": False,
             }
             for item in prepared
+            if item.previous is None
         ]
         graph_hash = hash_json({
             "job_id": self.job_id,
@@ -351,7 +402,9 @@ class Stage1AnalysisService:
         self.expected_call_graph_path = self.workspace.artifact_path(
             "stage1/provider_expected_calls.json"
         )
-        atomic_write_json(
+        graph_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
             self.expected_call_graph_path,
             {
                 "artifact_type": "provider_expected_call_graph",
@@ -365,12 +418,9 @@ class Stage1AnalysisService:
                 "runtime_spec_hash": runtime_spec_hash,
                 "expected_calls": [asdict(item) for item in self.expected_calls],
             },
-        )
-        self.registry.register_file(
             artifact_role="provider_expected_call_graph",
             artifact_type="provider_expected_call_graph",
             artifact_version="v1",
-            path=self.expected_call_graph_path,
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id="stage1:provider_expected_call_graph",
             metadata={
@@ -379,8 +429,10 @@ class Stage1AnalysisService:
                 "source_bundle_hash": source_bundle_hash,
                 "runtime_spec_hash": runtime_spec_hash,
                 "expected_call_count": len(self.expected_calls),
+                "reuse_excluded_from_expected_calls": True,
             },
         )
+        self.expected_call_graph_path = graph_record.path
 
     def _execute_prepared(
         self,
@@ -405,27 +457,23 @@ class Stage1AnalysisService:
             logical_attempt_identity=self.attempt_id,
         )
         if prepared.previous is not None:
-            provider_result: Mapping[str, Any] = {
-                "status": "success",
-                "content": prepared.previous.get("ai_summary"),
-            }
-            admission = runtime.admit(estimated_tokens=max(1, len(prepared.built_input.prompt_text) // 4))
-            runtime.complete(
-                admission=admission,
-                prompt=prepared.built_input.prompt_text,
-                input_payload=prepared.built_input.to_metadata_dict(),
-                api_config=prepared.primary_config,
-                result=provider_result,
-                metadata={"execution_mode": "reused_summary"},
-            )
             summary = dict(prepared.previous)
+            reuse_record = self._persist_reuse_evidence(prepared)
+            self.reuse_evidence_ids.append(reuse_record.artifact_id)
             summary["provider"] = {
                 **dict(summary.get("provider") or {}),
                 "route": "Stage1Reuse",
-                "receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
-                "receipt_ledger_path": str(self.receipt_ledger.path),
+                "receipt_ids": [],
+                "receipt_ledger_path": self.receipt_ledger_path,
+                "transport_count": 0,
+                "reuse_evidence_id": reuse_record.artifact_id,
             }
-            return summary, tuple(receipt.receipt_id for receipt in runtime.receipts)
+            summary["reuse_metadata"] = {
+                "reused": True,
+                "reuse_evidence_id": reuse_record.artifact_id,
+                "reason": "exact_summary_reuse",
+            }
+            return summary, ()
 
         provider_result = self._call_reader(
             item=item,
@@ -461,10 +509,78 @@ class Stage1AnalysisService:
                 "route": runtime.route,
                 "model": str(prepared.primary_config.get("model") or ""),
                 "receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
-                "receipt_ledger_path": str(self.receipt_ledger.path),
+                "receipt_ledger_path": self.receipt_ledger_path,
             },
         }
         return summary, tuple(receipt.receipt_id for receipt in runtime.receipts)
+
+    def _persist_reuse_evidence(self, prepared: _PreparedStage1Item) -> ArtifactRecord:
+        """Persist typed evidence for a zero-transport exact summary reuse."""
+
+        previous = dict(prepared.previous or {})
+        previous_hash = hash_json(previous)
+        source_paper_id = str(prepared.item.source_paper_id or "").strip()
+        provider_payload = previous.get("provider")
+        source_receipt_ids = list(
+            provider_payload.get("receipt_ids", [])
+            if isinstance(provider_payload, Mapping)
+            else []
+        )
+        runtime_record = self.registry.get("runtime_job_spec")
+        evidence = {
+            "artifact_type": "stage1_summary_reuse_record",
+            "artifact_version": "v1",
+            "job_id": self.job_id,
+            "stage_name": "stage1_analyze",
+            "attempt_id": self.attempt_id,
+            "reused_summary_artifact_id": str(
+                previous.get("artifact_id") or f"summary:{previous_hash}"
+            ),
+            "reused_summary_artifact_hash": previous_hash,
+            "source_bundle_paper_identity": {
+                "canonical_paper_key": self._paper_key(prepared.item),
+                "source_paper_id": source_paper_id,
+                "source_pdf": str(prepared.item.source_pdf),
+            },
+            "input_manifest_hashes": {
+                "evidence_manifest": str(
+                    prepared.preprocess_metadata.get("evidence_manifest_hash") or ""
+                ),
+                "stage1_input": hash_json(prepared.built_input.to_metadata_dict()),
+            },
+            "original_provider_receipt_ids": source_receipt_ids,
+            "current_runtime_spec_hash": str(runtime_record.content_hash if runtime_record else ""),
+            "reuse_policy": "exact_summary_reuse_v1",
+            "reuse_decision_reason": "exact_summary_reuse",
+            "created_at": utc_now_iso(),
+        }
+        evidence["content_hash"] = hash_json(evidence)
+        digest = str(evidence["content_hash"])[:24]
+        path = self.workspace.artifact_path(f"stage1/reuse_records/{digest}.json")
+        dependencies: list[ArtifactDependencyRefV2] = []
+        manifest_record = self.registry.get(
+            f"evidence_manifest:{self._paper_key(prepared.item)}"
+        )
+        for record in (manifest_record, runtime_record):
+            if record is not None and record.status == "ready":
+                dependencies.append(ArtifactDependencyRefV2.from_record(record))
+        return publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            evidence,
+            artifact_role="stage1_summary_reuse_record",
+            artifact_type="stage1_summary_reuse_record",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"stage1:summary_reuse:{digest}",
+            depends_on=dependencies,
+            metadata={
+                "reuse_policy": "exact_summary_reuse_v1",
+                "transport_count": 0,
+                "reused_summary_artifact_hash": previous_hash,
+            },
+        )
 
     def _paper_artifact_id(self, item: PaperWorkItem) -> str:
         digest = hashlib.sha256(self._paper_key(item).encode("utf-8")).hexdigest()[:24]
@@ -480,7 +596,11 @@ class Stage1AnalysisService:
 
         from dataclasses import replace as dataclass_replace
 
-        receipts = self.receipt_ledger.list_receipts()
+        receipts = tuple(
+            receipt
+            for receipt in self.receipt_ledger.list_receipts()
+            if str(receipt.closure_epoch_id or "") == self.closure_epoch_id
+        )
         by_call = {
             call_id: max(
                 (receipt for receipt in receipts if receipt.call_id == call_id),
@@ -501,7 +621,11 @@ class Stage1AnalysisService:
                     record
                     for record in self.registry.list_records()
                     if record.artifact_type == "paper_artifact"
-                    and Path(record.path).resolve() == Path(expected.artifact_path).resolve()
+                    and (
+                        record.artifact_id
+                        == f"paper:{hashlib.sha256(str(expected.node_id).encode('utf-8')).hexdigest()[:24]}"
+                        or Path(record.path).resolve() == Path(expected.artifact_path).resolve()
+                    )
                 ),
                 None,
             )
@@ -525,6 +649,11 @@ class Stage1AnalysisService:
                     registry_file_hash=(file_sha256(paper_record.path) if paper_record else ""),
                     registered_artifact_hash=str(paper_record.content_hash if paper_record else ""),
                     node_output_hash=str(paper_record.content_hash if paper_record else ""),
+                    # The expected graph declares the logical target before
+                    # generation.  Closure must bind the actually finalized
+                    # immutable path, otherwise a valid receipt is checked
+                    # against the retired mutable target.
+                    artifact_path=str(paper_record.path if paper_record else expected.artifact_path),
                 )
             )
         closure = ProviderReceiptClosure.evaluate(bound, receipts)
@@ -543,7 +672,22 @@ class Stage1AnalysisService:
             "paper_artifact_ids": sorted(set(paper_ids)),
             "payload": closure.to_dict(),
         }
-        atomic_write_json(self.receipt_closure_path, payload)
+        reuse_records = [
+            self.registry.get(artifact_id) for artifact_id in self.reuse_evidence_ids
+        ]
+        reuse_records = [
+            record
+            for record in reuse_records
+            if record is not None and record.status == "ready"
+        ]
+        payload["reuse_evidence_ids"] = [record.artifact_id for record in reuse_records]
+        payload["reuse_evidence_count"] = len(reuse_records)
+        payload["expected_provider_transport_count"] = len(self.expected_calls)
+        payload["actual_provider_transport_count"] = sum(
+            1
+            for receipt in receipts
+            if str(receipt.closure_epoch_id or "") == self.closure_epoch_id
+        )
         dependency_records = []
         for artifact_id in (
             "source_bundle",
@@ -551,6 +695,7 @@ class Stage1AnalysisService:
             "stage1:provider_expected_call_graph",
             "stage1_provider_receipts",
             *sorted(set(paper_ids)),
+            *[record.artifact_id for record in reuse_records],
         ):
             candidate = self.registry.get(artifact_id)
             if candidate is not None and candidate.status == "ready":
@@ -560,11 +705,14 @@ class Stage1AnalysisService:
             for record in self.registry.list_records()
             if record.status == "ready" and record.artifact_type == "evidence_manifest"
         )
-        record = self.registry.register_file(
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.receipt_closure_path,
+            payload,
             artifact_role="provider_receipt_closure",
             artifact_type="provider_receipt_closure",
             artifact_version="v1",
-            path=self.receipt_closure_path,
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id="stage1:provider_receipt_closure",
             depends_on=[ArtifactDependencyRefV2.from_record(item) for item in dependency_records],
@@ -574,8 +722,10 @@ class Stage1AnalysisService:
                 "complete": closure.complete,
                 "depends_on_expected_graph": "stage1:provider_expected_call_graph",
                 "paper_artifact_ids": sorted(set(paper_ids)),
+                "reuse_evidence_ids": [record.artifact_id for record in reuse_records],
             },
         )
+        self.receipt_closure_path = record.path
         self.receipt_closure_hash = record.content_hash
         return record
 
@@ -597,12 +747,14 @@ class Stage1AnalysisService:
             "evidence_manifests/"
             f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
         )
-        atomic_write_json(evidence_manifest_path, evidence_manifest.to_dict())
-        evidence_record = self.registry.register_file(
+        evidence_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            evidence_manifest_path,
+            evidence_manifest.to_dict(),
             artifact_role="evidence_manifest",
             artifact_type="evidence_manifest",
             artifact_version="v1",
-            path=evidence_manifest_path,
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
         )
@@ -684,7 +836,7 @@ class Stage1AnalysisService:
                     "route": runtime.route,
                     "model": str(primary_config.get("model") or ""),
                     "receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
-                    "receipt_ledger_path": str(self.receipt_ledger.path),
+                "receipt_ledger_path": self.receipt_ledger_path,
                 },
             },
             tuple(receipt.receipt_id for receipt in runtime.receipts),
@@ -865,17 +1017,43 @@ class Stage1AnalysisService:
             )
 
     def _register_receipt_ledger(self) -> None:
-        if not self.receipt_ledger.path.is_file():
+        current_receipts = tuple(
+            receipt
+            for receipt in self.receipt_ledger.list_receipts()
+            if str(receipt.closure_epoch_id or "") == self.closure_epoch_id
+        )
+        # A zero-transport run has no provider receipt ledger.  Do not publish
+        # an empty JSONL file that downstream validators could mistake for a
+        # genuine transport receipt artifact.
+        if not current_receipts:
+            self.receipt_ledger_path = ""
             return
-        self.registry.register_file(
+        payload = b"".join(
+            (
+                json.dumps(
+                    receipt.to_dict(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            for receipt in current_receipts
+        )
+        record = publish_bytes_artifact(
+            self.publication_context,
+            self.registry,
+            self.receipt_ledger_target_path,
+            payload,
             artifact_role="provider_receipts",
             artifact_type="provider_receipt_ledger",
             artifact_version="v1",
-            path=str(self.receipt_ledger.path),
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id="stage1_provider_receipts",
-            metadata={"receipt_count": len(self.receipt_ledger.list_receipts())},
+            metadata={"receipt_count": len(current_receipts)},
         )
+        self.receipt_ledger_path = record.path
 
     def _index_existing(
         self,

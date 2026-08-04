@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from services.artifact_registry import ArtifactDependencyRefV2, file_sha256
-from services.job_workspace import atomic_write_json
+from services.job_workspace import publish_bytes_artifact, publish_json_artifact
 from services.model_selection import get_validator_api_config
 from services.repair_policy import (
     ValidationRepairPolicy,
@@ -564,7 +564,67 @@ def _write_reports(
         completion_path = workspace.report_path(
             f"{workspace.project_name}_validation_completion.json"
         )
-    atomic_write_json(result_path, result.to_dict())
+    registry = service.artifact_registry
+    publication_context = getattr(service, "publication_context", None)
+    if publication_context is None:
+        from services.queue_service import LocalPublicationContext
+
+        publication_context = LocalPublicationContext()
+    dependencies: list[ArtifactDependencyRefV2] = []
+    supplied_records = [
+        record
+        for record in (
+            dependency_records
+            if dependency_records is not None
+            else (
+                service.review_draft_record,
+                service.citation_manifest_record,
+            )
+        )
+        if record is not None
+    ]
+    # The canonical Validation payload names every input identity, including
+    # evidence manifests.  Its Registry edge set must carry the same exact
+    # identity multiset; retaining only draft/manifest edges would make a
+    # result appear valid until a later reconcile/resume pass.
+    records_by_id = {
+        str(record.artifact_id): record
+        for record in supplied_records
+        if str(getattr(record, "artifact_id", ""))
+    }
+    for artifact_id in (
+        result.input_artifacts.review_draft_id,
+        result.input_artifacts.citation_manifest_id,
+        *result.input_artifacts.evidence_manifest_ids,
+    ):
+        normalized_id = str(artifact_id or "")
+        if not normalized_id or normalized_id in records_by_id:
+            continue
+        resolved = registry.get(normalized_id)
+        if resolved is not None:
+            records_by_id[normalized_id] = resolved
+    for record in records_by_id.values():
+        if record is not None:
+            dependencies.append(ArtifactDependencyRefV2.from_record(record))
+    canonical_record = publish_json_artifact(
+        publication_context,
+        registry,
+        result_path,
+        result.to_dict(),
+        artifact_role=result_artifact_role,
+        artifact_type=result_artifact_type,
+        artifact_version="v1",
+        producer="validation.current_validation",
+        artifact_id=result_artifact_id or result.validation_run_id,
+        status="ready" if result.contract_satisfied and not output_dir else "quarantined",
+        depends_on=dependencies,
+        metadata={
+            "execution_status": result.execution_status.value,
+            "validation_disposition": result.validation_disposition.value,
+            "contract_satisfied": result.contract_satisfied,
+        },
+    )
+    result_path = canonical_record.path
     lines = [
         "auto-generate validation report",
         f"generated_at: {result.updated_at}",
@@ -588,7 +648,20 @@ def _write_reports(
                 f"   reasoning: {claim.reasoning_summary}",
             ]
         )
-    Path(report_path).write_text("\n".join(lines), encoding="utf-8")
+    report_record = publish_bytes_artifact(
+        publication_context,
+        registry,
+        report_path,
+        "\n".join(lines).encode("utf-8"),
+        artifact_role="validation_projection",
+        artifact_type="validation_report_projection",
+        artifact_version="v1",
+        producer="validation.current_validation",
+        artifact_id=f"validation-report:{Path(report_path).name}",
+        status=canonical_record.status,
+        depends_on=[ArtifactDependencyRefV2.from_record(canonical_record)],
+    )
+    report_path = report_record.path
     manual_items = [
         {
             "citation_set_key": claim.citation_set_key,
@@ -603,7 +676,9 @@ def _write_reports(
         if claim.verdict
         in {ClaimVerdict.NEEDS_REVIEW, ClaimVerdict.WRONG_SOURCE, ClaimVerdict.CONTRADICTED}
     ]
-    atomic_write_json(
+    manual_record = publish_json_artifact(
+        publication_context,
+        registry,
         manual_path,
         {
             "generated_at": result.updated_at,
@@ -614,8 +689,18 @@ def _write_reports(
             "total_items": len(manual_items),
             "items": manual_items,
         },
+        artifact_role="validation_projection",
+        artifact_type="manual_review_projection",
+        artifact_version="v1",
+        producer="validation.current_validation",
+        artifact_id=f"manual-review:{Path(manual_path).name}",
+        status=canonical_record.status,
+        depends_on=[ArtifactDependencyRefV2.from_record(canonical_record)],
     )
-    atomic_write_json(
+    manual_path = manual_record.path
+    completion_record = publish_json_artifact(
+        publication_context,
+        registry,
         completion_path,
         {
             "artifact_type": "validation_completion_projection",
@@ -626,34 +711,18 @@ def _write_reports(
             "claim_verdict_counts": dict(result.claim_verdict_counts),
             "contradicted_count": result.contradicted_count,
             "total_claims": result.total_claims,
-            "canonical_result_path": result_path,
+            "canonical_result_path": canonical_record.path,
             "canonical_result_hash": result.stable_hash(),
         },
-    )
-    registry = service.artifact_registry
-    dependencies: list[ArtifactDependencyRefV2] = []
-    records_for_dependencies = dependency_records or (
-        service.review_draft_record,
-        service.citation_manifest_record,
-    )
-    for record in records_for_dependencies:
-        if record is not None:
-            dependencies.append(ArtifactDependencyRefV2.from_record(record))
-    registry.register_file(
-        artifact_role=result_artifact_role,
-        artifact_type=result_artifact_type,
+        artifact_role="validation_projection",
+        artifact_type="validation_completion_projection",
         artifact_version="v1",
-        path=result_path,
         producer="validation.current_validation",
-        artifact_id=result_artifact_id or result.validation_run_id,
-        status="ready" if result.contract_satisfied and not output_dir else "quarantined",
-        depends_on=dependencies,
-        metadata={
-            "execution_status": result.execution_status.value,
-            "validation_disposition": result.validation_disposition.value,
-            "contract_satisfied": result.contract_satisfied,
-        },
+        artifact_id=f"validation-completion:{Path(completion_path).name}",
+        status=canonical_record.status,
+        depends_on=[ArtifactDependencyRefV2.from_record(canonical_record)],
     )
+    completion_path = completion_record.path
     return {
         "validation_run_result_file": result_path,
         "report_file": report_path,

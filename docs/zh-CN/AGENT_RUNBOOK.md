@@ -36,12 +36,17 @@ Queue worker 使用原子 snapshot、input/config fingerprint、lease generation
 fence token。过期或被 fence 的 worker 不得发布结果；retry、cancel、恢复都必须
 以持久化 queue 状态为准。
 
-写入 ArtifactRegistry 前会再次校验 lease。包括 Windows `spawn` 子进程在内，
-claim 已过期的旧 worker 即使持有过期本地 queue snapshot，也不能发布 canonical
-artifact。
+Canonical bytes 先写入 lease generation 私有 staging。发布时先取得 queue store
+lock，复核 lease/worker/generation/fence，再进入 Registry transaction；该
+queue -> Registry 锁顺序是契约的一部分。最终文件 immutable，并记录 staged/final
+hash 的 publication manifest。包括 Windows `spawn` 子进程在内，claim 已过期的旧
+worker 即使持有过期本地 queue snapshot，也不能发布 canonical artifact。
 
 `validate` 会对当前 v3 review draft、v3 citation manifest 和 evidence 输入真正执行
-当前 Validation，并持久化 `ValidationRunResultV1`、receipt 与 Registry 依赖。
+当前 Validation，并持久化 `ValidationRunResultV1`、receipt 与 Registry 依赖。若
+validation 明确 optional 且禁用，runner 改为持久化 typed
+`ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` 与空 closure；
+这只证明未请求，不代表 Validation 通过。
 `validation-status` 才是只读的 closure 检查，包含 Registry 身份和哈希相等性。
 `repair-plan` 默认 report-first，只能写入哈希绑定的计划和事务记录；明确标记为
 `auto_apply_safe` 的 `repair-apply` 也只生成 `quarantined` 派生版本，不替换
@@ -50,5 +55,11 @@ canonical READY 文件。`repair-promote --transaction <id> --actor <actor> --re
 current pointer。
 
 `adopt --artifact <final_outline_id> --actor <actor>` 是显式采用操作，要求 final outline、coverage audit、stage health、哈希和 blocking critique 门禁全部通过；Outline v3 candidate plan 不会被静默提升。`export` 和 `attest` 会生成 provenance、checksum、completion、validation closure 与依赖图证据；canonical 注册失败会返回 `untrusted`、空 path/id，并删除临时 ZIP。
+
+Outline stability 有 `off`、`smoke`、`full` 三种模式：smoke 增加一个完整
+reversed-summary decision chain 和 exact replay，full 执行完整 perturbation matrix。
+每个 node 的 call/token/cost plan 都会持久化；只有命名 pricing source 和完整 rate
+存在时才执行 monetary ceiling，未知价格记录为 `cost_status=unknown`，本地计算
+usage 不等于 Provider billing。
 
 信任状态只有 `canonical_verified`、`manual_repaired` 和 `untrusted`。不能因为磁盘上有 DOCX、报告文本或手工编辑过的 Registry/Stage Health 就宣称完成。

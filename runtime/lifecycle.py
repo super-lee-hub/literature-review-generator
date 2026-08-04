@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import json
 import os
 from pathlib import Path
@@ -9,10 +9,11 @@ from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, cast
 from services.artifact_registry import ArtifactRegistry
 from services.job_fingerprint import FingerprintInputs, build_fingerprint_bundle, sanitize_config_for_fingerprint
 from services.job_outcome import JobDisposition, JobOutcomeV1, JobStatus
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_workspace import JobWorkspace, atomic_write_json, publish_json_artifact
 from services.progress_state import determine_resume_state
 from services.settings import ApplicationSettings
 from services.source_inventory import SourceInventoryV1
+from services.queue_service import LocalPublicationContext
 from runtime.stage_planning import StagePlanError, build_stage_plan
 
 
@@ -42,6 +43,7 @@ class BootstrappedRuntimeContext:
     readiness_policy_snapshot: Dict[str, Any]
     required_stages: tuple[str, ...]
     job_outcome_path: str
+    publication_context: Any
     attempt_number: int = 1
     resumed_from_attempt: int | None = None
 
@@ -112,6 +114,44 @@ def _coerce_inventory(
     return SourceInventoryV1.from_dict(source_inventory)
 
 
+def _resume_report_payload(report: Any) -> dict[str, Any]:
+    if hasattr(report, "to_dict") and callable(report.to_dict):
+        payload = report.to_dict()
+    elif is_dataclass(report):
+        payload = asdict(cast(Any, report))
+    elif isinstance(report, Mapping):
+        payload = dict(report)
+    else:
+        raise TypeError("resume report must be serializable")
+    if not isinstance(payload, Mapping):
+        raise TypeError("resume report payload must be an object")
+    return dict(payload)
+
+
+def _publish_resume_report(
+    *,
+    context: BootstrappedRuntimeContext | None,
+    workspace: JobWorkspace,
+    registry: ArtifactRegistry,
+    report: Any,
+    publication_context: Any,
+    producer: str,
+) -> str:
+    target = workspace.artifact_path("resume_state_report.json")
+    record = publish_json_artifact(
+        publication_context,
+        registry,
+        target,
+        _resume_report_payload(report),
+        artifact_role="resume",
+        artifact_type="resume_state_report",
+        artifact_version="v1",
+        producer=producer,
+        artifact_id="resume_state_report",
+    )
+    return record.path
+
+
 def bootstrap_job_runtime(
     *,
     request: Any,
@@ -180,12 +220,11 @@ def bootstrap_job_runtime(
         fingerprint_bundle=fingerprint_bundle_dict,
         request=request,
     )
-    if publication_context is None:
-        # Direct execution is an explicit unrestricted/local publication
-        # context.  Queue workers inject a lease-bound facade instead.
-        registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    else:
-        registry = publication_context.registry(workspace.paths.registry_path, workspace.job_id)
+    active_publication_context = publication_context or LocalPublicationContext()
+    # Direct execution uses an explicit local context. Queue workers inject a
+    # lease-bound context and therefore never silently fall back to an
+    # unrestricted registry facade.
+    registry = active_publication_context.registry(workspace.paths.registry_path, workspace.job_id)
 
     # Stage 1 summaries are content-addressed now.  On resume the durable
     # ``summary_file`` record is the current pointer; falling back to the
@@ -199,7 +238,14 @@ def bootstrap_job_runtime(
         and Path(current_summary.path).is_file()
         else workspace.artifact_path(f"{project_name}_summaries.json")
     )
-    progress_path = workspace.artifact_path("stage1_progress_snapshot.json")
+    current_progress = registry.get("stage1_progress_snapshot")
+    progress_path = (
+        current_progress.path
+        if current_progress is not None
+        and current_progress.status == "ready"
+        and Path(current_progress.path).is_file()
+        else workspace.artifact_path("stage1_progress_snapshot.json")
+    )
     checkpoint_path = workspace.checkpoint_path(f"{project_name}_checkpoint.json")
     resume_report = determine_resume_state(
         project_name=project_name,
@@ -211,7 +257,12 @@ def bootstrap_job_runtime(
     )
 
     if resume_requested:
-        persisted_report_path = workspace.artifact_path("resume_state_report.json")
+        persisted_report_record = registry.get("resume_state_report")
+        persisted_report_path = (
+            persisted_report_record.path
+            if persisted_report_record is not None and persisted_report_record.status == "ready"
+            else workspace.artifact_path("resume_state_report.json")
+        )
         try:
             with open(persisted_report_path, "r", encoding="utf-8") as handle:
                 persisted_report = json.load(handle)
@@ -240,12 +291,14 @@ def bootstrap_job_runtime(
     source_inventory_path = ""
     if inventory is not None:
         source_inventory_path = workspace.artifact_path("source_inventory_v1.json")
-        atomic_write_json(source_inventory_path, inventory_payload)
-        registry.register_file(
+        inventory_record = publish_json_artifact(
+            active_publication_context,
+            registry,
+            source_inventory_path,
+            inventory_payload,
             artifact_role="source_inventory",
             artifact_type="source_inventory",
             artifact_version="v1",
-            path=source_inventory_path,
             producer="runtime.lifecycle.bootstrap_job_runtime",
             artifact_id="source_inventory",
             status="ready" if effective_source_ready else "quarantined",
@@ -254,15 +307,15 @@ def bootstrap_job_runtime(
                 "canonical_ready": effective_source_ready,
             },
         )
+        source_inventory_path = inventory_record.path
 
-    resume_report_path = write_resume_report(workspace, resume_report)
-    registry.register_file(
-        artifact_role="resume",
-        artifact_type="resume_state_report",
-        artifact_version="v1",
-        path=resume_report_path,
+    resume_report_path = _publish_resume_report(
+        context=None,
+        workspace=workspace,
+        registry=registry,
+        report=resume_report,
+        publication_context=active_publication_context,
         producer="runtime.lifecycle.bootstrap_job_runtime",
-        artifact_id="resume_state_report",
     )
 
     generator.bind_job_workspace(
@@ -294,6 +347,7 @@ def bootstrap_job_runtime(
         readiness_policy_snapshot=readiness_policy_snapshot,
         required_stages=required_stages,
         job_outcome_path=job_outcome_path,
+        publication_context=active_publication_context,
     )
     if publish_running_state:
         publish_running_job_runtime(
@@ -321,12 +375,14 @@ def publish_running_job_runtime(
         completed_stages=("source_intake",) if context.source_canonical_ready else (),
         degradation_reasons=context.source_degradation_reasons,
     )
-    atomic_write_json(context.job_outcome_path, running_outcome.to_dict())
-    context.registry.register_file(
+    outcome_record = publish_json_artifact(
+        context.publication_context,
+        context.registry,
+        context.job_outcome_path,
+        running_outcome.to_dict(),
         artifact_role="job_outcome",
         artifact_type="job_outcome",
         artifact_version="v1",
-        path=context.job_outcome_path,
         producer="runtime.lifecycle.publish_running_job_runtime",
         artifact_id="job_outcome",
         metadata={
@@ -336,6 +392,11 @@ def publish_running_job_runtime(
             "outcome_revision": running_outcome.outcome_revision,
         },
     )
+    # The context is frozen to make lifecycle inputs explicit, but the
+    # selected outcome path is a durable Registry projection.  Keep the
+    # compatibility field pointed at the immutable version actually published
+    # so existing callers cannot accidentally read a stale fixed-path file.
+    object.__setattr__(context, "job_outcome_path", outcome_record.path)
     pointer_writer = (
         context.workspace.write_latest_pointer
         if claim_latest_pointer
@@ -370,14 +431,13 @@ def finalize_job_runtime(
         checkpoint_file=context.checkpoint_path,
         expected_fingerprint_bundle=context.fingerprint_bundle,
     )
-    final_resume_report_path = write_resume_report(context.workspace, final_resume_report)
-    context.registry.register_file(
-        artifact_role="resume",
-        artifact_type="resume_state_report",
-        artifact_version="v1",
-        path=final_resume_report_path,
+    final_resume_report_path = _publish_resume_report(
+        context=context,
+        workspace=context.workspace,
+        registry=context.registry,
+        report=final_resume_report,
+        publication_context=context.publication_context,
         producer="runtime.lifecycle.finalize_job_runtime",
-        artifact_id="resume_state_report",
     )
     if status not in {"pending", "running", "completed", "failed", "cancelled"}:
         raise ValueError(f"unsupported job status: {status}")
@@ -427,12 +487,14 @@ def finalize_job_runtime(
         degradation_reasons=merged_reasons,
         outcome_revision=2,
     )
-    atomic_write_json(context.job_outcome_path, outcome.to_dict())
-    context.registry.register_file(
+    outcome_record = publish_json_artifact(
+        context.publication_context,
+        context.registry,
+        context.job_outcome_path,
+        outcome.to_dict(),
         artifact_role="job_outcome",
         artifact_type="job_outcome",
         artifact_version="v1",
-        path=context.job_outcome_path,
         producer="runtime.lifecycle.finalize_job_runtime",
         artifact_id="job_outcome",
         metadata={
@@ -442,6 +504,7 @@ def finalize_job_runtime(
             "outcome_revision": outcome.outcome_revision,
         },
     )
+    object.__setattr__(context, "job_outcome_path", outcome_record.path)
     if before_latest_pointer is not None:
         before_latest_pointer(outcome)
     context.workspace.write_latest_pointer_if_owned(

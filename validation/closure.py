@@ -162,6 +162,10 @@ class ValidationClosureResult:
     def clean(self) -> bool:
         return self.status == "clean"
 
+    @property
+    def unvalidated(self) -> bool:
+        return self.status == "not_requested"
+
 
 @dataclass(frozen=True)
 class _InputResolution:
@@ -235,16 +239,9 @@ _ACTION_STAGE_DEFAULTS = {
 def _durable_requested_stages(registry: ArtifactRegistry) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
     """Read the immutable job spec before deriving any provider-stage scope."""
 
-    workspace_root = Path(registry.registry_path).parent
-    # RuntimeJobRunner persists the durable specification under the workspace's
-    # artifact directory.  Keep the root-level path as a legacy read-only
-    # fallback for older workspaces, but never infer stage scope when neither
-    # immutable location exists.
-    candidates = (
-        workspace_root / "artifacts" / "runtime_job_spec_v1.json",
-        workspace_root / "runtime_job_spec_v1.json",
-    )
-    spec_path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    spec_path, path_issues = _durable_runtime_spec_path(registry)
+    if path_issues:
+        return (), "", path_issues
     if not spec_path.is_file():
         return (), "", ()
     try:
@@ -272,6 +269,37 @@ def _durable_requested_stages(registry: ArtifactRegistry) -> tuple[tuple[str, ..
     return normalized, spec_hash, ()
 
 
+def _durable_runtime_spec_path(
+    registry: ArtifactRegistry,
+) -> tuple[Path, tuple[str, ...]]:
+    """Resolve the Registry-selected immutable runtime spec, with a legacy fallback."""
+
+    try:
+        record = registry.get("runtime_job_spec")
+    except (OSError, RegistryError, TypeError, ValueError) as exc:
+        return Path(registry.registry_path).parent / "artifacts" / "runtime_job_spec_v1.json", (
+            f"runtime_job_spec_registry_untrusted:{exc}",
+        )
+    if record is not None:
+        if record.status != "ready":
+            return Path(record.path), ("runtime_job_spec_registry_not_ready",)
+        spec_path = Path(record.path)
+        try:
+            ArtifactRegistry._verify_ready_artifact(record)
+        except (OSError, RegistryError, TypeError, ValueError) as exc:
+            return spec_path, (f"runtime_job_spec_registry_untrusted:{exc}",)
+        return spec_path, ()
+
+    workspace_root = Path(registry.registry_path).parent
+    # Keep fixed-path lookup only as a read-only compatibility fallback for
+    # pre-publication workspaces.  New writers register the versioned path.
+    candidates = (
+        workspace_root / "artifacts" / "runtime_job_spec_v1.json",
+        workspace_root / "runtime_job_spec_v1.json",
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), candidates[0]), ()
+
+
 def _durable_current_set_required(
     registry: ArtifactRegistry,
     requested_stages: Sequence[str],
@@ -279,12 +307,9 @@ def _durable_current_set_required(
     """Read the persisted stage-plan current-set gate without trusting a projection."""
 
     fallback = "validate" in requested_stages
-    workspace_root = Path(registry.registry_path).parent
-    candidates = (
-        workspace_root / "artifacts" / "runtime_job_spec_v1.json",
-        workspace_root / "runtime_job_spec_v1.json",
-    )
-    spec_path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    spec_path, path_issues = _durable_runtime_spec_path(registry)
+    if path_issues:
+        return fallback
     raw = _json_object(spec_path)
     metadata = raw.get("metadata") if isinstance(raw, Mapping) else None
     stage_plan = metadata.get("stage_plan") if isinstance(metadata, Mapping) else None
@@ -688,7 +713,15 @@ def resolve_current_stage_closure_map(
             ("review", current_set.review_draft_artifact_id, current_set.review_draft_artifact_hash),
             ("citation_manifest", current_set.citation_manifest_artifact_id, current_set.citation_manifest_artifact_hash),
             ("review_docx", current_set.review_docx_artifact_id, current_set.review_docx_artifact_hash),
-            ("validation", current_set.validation_run_result_artifact_id, current_set.validation_run_result_artifact_hash),
+            (
+                "validation",
+                current_set.validation_disposition_artifact_id
+                if current_set.validation_status == "not_requested"
+                else current_set.validation_run_result_artifact_id,
+                current_set.validation_disposition_artifact_hash
+                if current_set.validation_status == "not_requested"
+                else current_set.validation_run_result_artifact_hash,
+            ),
             ("validation_receipt_closure", current_set.validation_receipt_closure_artifact_id, current_set.validation_receipt_closure_artifact_hash),
         )
         for stage, artifact_id, expected_hash in targets:
@@ -756,7 +789,7 @@ class ValidationClosureService:
             draft = self.registry.get(current_set.review_draft_artifact_id)
             manifest = self.registry.get(current_set.citation_manifest_artifact_id)
             validation = (
-                _choose_record(records, artifact_type="validation_run_result", version="v1")
+                self.registry.get(current_set.validation_disposition_artifact_id)
                 if current_set.validation_status == "not_requested"
                 else self.registry.get(current_set.validation_run_result_artifact_id)
             )
@@ -765,7 +798,13 @@ class ValidationClosureService:
             if manifest is None:
                 blocking.append("current_set_citation_manifest_missing")
             if validation is None:
-                blocking.append("current_set_validation_missing")
+                blocking.append(
+                    "current_set_validation_disposition_missing"
+                    if current_set.validation_status == "not_requested"
+                    else "current_set_validation_missing"
+                )
+            elif current_set.validation_status == "not_requested" and validation.artifact_type != "validation_disposition":
+                blocking.append("current_set_validation_disposition_type_mismatch")
             return _InputResolution(draft, manifest, validation, tuple(blocking))
         draft = _choose_record(
             records,
@@ -914,7 +953,40 @@ class ValidationClosureService:
             "contract_satisfied": False,
         }
         validation_result: ValidationRunResultV1 | None = None
-        if validation_payload is not None:
+        if resolution.validation is not None and resolution.validation.artifact_type == "validation_disposition":
+            from validation.disposition import ValidationDispositionV1
+
+            try:
+                disposition = ValidationDispositionV1.from_dict(validation_payload or {})
+            except (TypeError, ValueError, KeyError) as exc:
+                blocking.append(f"validation_disposition_contract_invalid:{exc}")
+            else:
+                semantic_status = "not_requested"
+                semantic.update(
+                    {
+                        "status": disposition.status,
+                        "validation_disposition": disposition.status,
+                        "contract_satisfied": True,
+                        "allow_unvalidated": disposition.allow_unvalidated,
+                        "actor": disposition.actor,
+                        "reason": disposition.reason,
+                        "stage_plan_hash": disposition.stage_plan_hash,
+                        "spec_hash": disposition.spec_hash,
+                        "disposition_hash": disposition.disposition_hash,
+                    }
+                )
+                exact_inputs = (
+                    ("review_draft", disposition.review_draft_artifact_id, disposition.review_draft_artifact_hash, resolution.draft),
+                    ("citation_manifest", disposition.citation_manifest_artifact_id, disposition.citation_manifest_artifact_hash, resolution.manifest),
+                    ("review_docx", disposition.review_docx_artifact_id, disposition.review_docx_artifact_hash, self.registry.get(disposition.review_docx_artifact_id)),
+                )
+                for label, artifact_id, content_hash, record in exact_inputs:
+                    if record is None or record.artifact_id != artifact_id or record.content_hash != content_hash:
+                        blocking.append(f"validation_disposition_{label}_input_stale")
+                runtime_spec = self.registry.get("runtime_job_spec")
+                if runtime_spec is None or runtime_spec.content_hash != disposition.spec_hash:
+                    blocking.append("validation_disposition_spec_stale")
+        elif validation_payload is not None:
             try:
                 validation_result = ValidationRunResultV1.from_dict(validation_payload)
                 validation_result.validate()
@@ -962,6 +1034,8 @@ class ValidationClosureService:
         ) else ("findings" if findings else "clean")
         if blocking:
             status = "blocked"
+        elif semantic_status == "not_requested":
+            status = "not_requested"
         elif semantic_status == "unvalidated":
             status = "unvalidated"
         elif semantic_status in {"needs_review", "unvalidated"}:

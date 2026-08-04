@@ -8,7 +8,8 @@ import uuid
 
 from runtime.attempt_store import _write_json_exclusive
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
-from services.job_workspace import utc_now_iso
+from services.job_workspace import publish_json_artifact, utc_now_iso
+from services.queue_service import LocalPublicationContext
 
 
 STAGE_TERMINAL_ARTIFACT_TYPE = "runtime_stage_terminal"
@@ -215,9 +216,19 @@ class TerminalStageRecordV1:
 
 
 class StageTerminalStore:
-    def __init__(self, workspace: object, registry: ArtifactRegistry) -> None:
+    def __init__(
+        self,
+        workspace: object,
+        registry: ArtifactRegistry,
+        publication_context: Any | None = None,
+    ) -> None:
         self.workspace = workspace
         self.registry = registry
+        self.publication_context = (
+            publication_context
+            or getattr(registry, "publication_context", None)
+            or LocalPublicationContext()
+        )
         self.directory = Path(str(getattr(workspace, "artifact_path")(STAGE_TERMINAL_DIR)))
 
     def path_for(self, record: TerminalStageRecordV1) -> Path:
@@ -229,12 +240,14 @@ class StageTerminalStore:
         if record.job_id != self.registry.job_id:
             raise StageTerminalContractError("stage terminal job_id does not match Registry owner")
         path = self.path_for(record)
-        _write_json_exclusive(path, record.to_dict())
-        return self.registry.register_file(
+        return publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            record.to_dict(),
             artifact_role=STAGE_TERMINAL_ROLE,
             artifact_type=STAGE_TERMINAL_ARTIFACT_TYPE,
             artifact_version=STAGE_TERMINAL_ARTIFACT_VERSION,
-            path=path,
             producer="runtime.stage_terminal.StageTerminalStore",
             artifact_id=record.record_id,
             depends_on=record.output_artifact_refs,
@@ -248,6 +261,35 @@ class StageTerminalStore:
         )
 
     def load_records(self) -> tuple[tuple[TerminalStageRecordV1, Path], ...]:
+        registered_records = [
+            record
+            for record in self.registry.list_records()
+            if record.status == "ready"
+            and record.artifact_type == STAGE_TERMINAL_ARTIFACT_TYPE
+            and record.artifact_version == STAGE_TERMINAL_ARTIFACT_VERSION
+        ]
+        if registered_records:
+            records: list[tuple[TerminalStageRecordV1, Path]] = []
+            for registered in sorted(registered_records, key=lambda item: item.created_at):
+                path = Path(registered.path)
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise StageTerminalContractError(
+                        f"cannot read registered stage terminal {path}: {exc}"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise StageTerminalContractError(
+                        f"registered stage terminal must be an object: {path}"
+                    )
+                record = TerminalStageRecordV1.from_dict(payload)
+                if record.job_id != self.registry.job_id or record.record_id != registered.artifact_id:
+                    raise StageTerminalContractError(
+                        f"registered stage terminal identity mismatch: {path}"
+                    )
+                records.append((record, path))
+            return tuple(records)
+
         if not self.directory.exists():
             return ()
         records: list[tuple[TerminalStageRecordV1, Path]] = []

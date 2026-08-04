@@ -31,9 +31,10 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_outcome import JobOutcomeV1
-from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from services.job_workspace import JobWorkspace, publish_json_artifact, utc_now_iso
 from services.queue_service import JobCancelledError
 from services.queue_service import CancelToken
+from runtime.provider_runtime import hash_json
 
 
 class RuntimeRunnerError(RuntimeError):
@@ -160,6 +161,12 @@ def _evaluate_runtime_completion(
     validation_status = "clean" if outcome.job_disposition == "clean" and validation_record else (
         "findings" if outcome.job_disposition == "findings" else "missing"
     )
+    try:
+        current_set = registry.resolve_current_artifact_set()
+    except (OSError, RegistryError, TypeError, ValueError):
+        current_set = None
+    if current_set is not None and current_set.validation_status == "not_requested":
+        validation_status = "not_requested"
     return CanonicalCompletionEvaluator.evaluate(
         {
             "job_id": outcome.job_id,
@@ -171,6 +178,9 @@ def _evaluate_runtime_completion(
             "canonical_artifacts": {"job_outcome": ready_job_outcome},
             "validation_required": bool(policy.get("validation_required", False)),
             "require_clean_validation": bool(policy.get("require_clean_validation", False)),
+            "allow_unvalidated_when_validation_optional": bool(
+                policy.get("allow_unvalidated_when_validation_optional", False)
+            ),
             "validation_status": validation_status,
             "provider_receipts_complete": provider_receipts_complete,
             "provider_receipt_closure": provider_receipt_closure,
@@ -329,8 +339,15 @@ class AgentRuntimeRunner:
     def _validate_persisted_spec(
         workspace: JobWorkspace,
         expected_payload: Mapping[str, Any],
+        registry: ArtifactRegistry | None = None,
     ) -> None:
-        path = Path(workspace.artifact_path("runtime_job_spec_v1.json"))
+        active_registry = registry or ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+        record = active_registry.get("runtime_job_spec")
+        path = Path(
+            record.path
+            if record is not None and record.status == "ready"
+            else workspace.artifact_path("runtime_job_spec_v1.json")
+        )
         try:
             persisted_spec = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -536,6 +553,7 @@ class AgentRuntimeRunner:
         """
 
         from runtime.provider_receipt_closure import ProviderReceiptClosure
+        from validation.disposition import ValidationDispositionV1
         from validation.repair_transaction import RepairPromotionTransaction
 
         context = session.context
@@ -562,31 +580,48 @@ class AgentRuntimeRunner:
         def ref(record: ArtifactRecord) -> ArtifactDependencyRefV2:
             return ArtifactDependencyRefV2.from_record(record)
 
+        runtime_spec = registry.get("runtime_job_spec")
+        if runtime_spec is None or runtime_spec.status != "ready":
+            raise RuntimeRunnerError(
+                "cannot publish optional validation disposition without a ready runtime_job_spec"
+            )
+        stage_plan_hash = hash_json(context.readiness_policy_snapshot.get("stage_plan") or {})
+        disposition = ValidationDispositionV1.create(
+            job_id=job_id,
+            stage_plan_hash=stage_plan_hash,
+            spec_hash=runtime_spec.content_hash,
+            review_draft_artifact_id=draft.artifact_id,
+            review_draft_artifact_hash=draft.content_hash,
+            citation_manifest_artifact_id=manifest.artifact_id,
+            citation_manifest_artifact_hash=manifest.content_hash,
+            review_docx_artifact_id=review_docx.artifact_id,
+            review_docx_artifact_hash=review_docx.content_hash,
+            actor="runtime.runner.AgentRuntimeRunner",
+            reason="review completed with validation explicitly not requested by the durable stage plan",
+        )
         disposition_id = "validation:not_requested"
         disposition_path = Path(
             context.workspace.artifact_path("validation/not_requested/validation_disposition.json")
         )
-        atomic_write_json(
-            str(disposition_path),
-            {
-                "artifact_type": "validation_disposition",
-                "artifact_version": "v1",
-                "job_id": job_id,
-                "status": "not_requested",
-                "reason": "review validation is disabled by the durable stage plan",
-            },
-        )
         disposition_record = registry.get(disposition_id)
         if disposition_record is None or disposition_record.status != "ready":
-            disposition_record = registry.register_file(
+            disposition_record = publish_json_artifact(
+                context.publication_context,
+                registry,
+                disposition_path,
+                disposition.to_dict(),
                 artifact_role="validation_disposition",
                 artifact_type="validation_disposition",
                 artifact_version="v1",
-                path=str(disposition_path),
                 producer="runtime.runner.AgentRuntimeRunner",
                 artifact_id=disposition_id,
-                depends_on=(ref(draft), ref(manifest), ref(review_docx)),
-                metadata={"validation_status": "not_requested"},
+                depends_on=(ref(draft), ref(manifest), ref(review_docx), ref(runtime_spec)),
+                metadata={
+                    "validation_status": "not_requested",
+                    "allow_unvalidated": True,
+                    "stage_plan_hash": stage_plan_hash,
+                    "spec_hash": runtime_spec.content_hash,
+                },
             )
         if disposition_record is None:
             raise RuntimeRunnerError("optional validation disposition registration returned no record")
@@ -596,22 +631,21 @@ class AgentRuntimeRunner:
         closure_path = Path(
             context.workspace.artifact_path("validation/not_requested/provider_receipt_closure.json")
         )
-        atomic_write_json(
-            str(closure_path),
-            {
-                "artifact_type": "provider_receipt_closure",
-                "artifact_version": "v1",
-                "job_id": job_id,
-                "payload": empty_closure.to_dict(),
-            },
-        )
         closure_record = registry.get(closure_id)
         if closure_record is None or closure_record.status != "ready":
-            closure_record = registry.register_file(
+            closure_record = publish_json_artifact(
+                context.publication_context,
+                registry,
+                closure_path,
+                {
+                    "artifact_type": "provider_receipt_closure",
+                    "artifact_version": "v1",
+                    "job_id": job_id,
+                    "payload": empty_closure.to_dict(),
+                },
                 artifact_role="validation_provider_receipt_closure",
                 artifact_type="provider_receipt_closure",
                 artifact_version="v1",
-                path=str(closure_path),
                 producer="runtime.runner.AgentRuntimeRunner",
                 artifact_id=closure_id,
                 depends_on=(ref(disposition_record),),
@@ -657,14 +691,17 @@ class AgentRuntimeRunner:
                     closure_record.artifact_id: closure_record.content_hash,
                 },
                 created_at=utc_now_iso(),
-                validation_run_result_artifact_id=disposition_record.artifact_id,
+                validation_run_result_artifact_id="",
+                validation_disposition_artifact_id=disposition_record.artifact_id,
             )
-            atomic_write_json(str(promotion_path), promotion.to_dict())
-            promotion_record = registry.register_file(
+            promotion_record = publish_json_artifact(
+                context.publication_context,
+                registry,
+                promotion_path,
+                promotion.to_dict(),
                 artifact_role="repair_promotion_transaction",
                 artifact_type="repair_promotion_transaction",
                 artifact_version="v1",
-                path=str(promotion_path),
                 producer="runtime.runner.AgentRuntimeRunner",
                 artifact_id=promotion_id,
                 depends_on=(
@@ -692,13 +729,15 @@ class AgentRuntimeRunner:
             citation_manifest_artifact_hash=manifest.content_hash,
             review_docx_artifact_id=review_docx.artifact_id,
             review_docx_artifact_hash=review_docx.content_hash,
-            validation_run_result_artifact_id=disposition_record.artifact_id,
-            validation_run_result_artifact_hash=disposition_record.content_hash,
+            validation_run_result_artifact_id="",
+            validation_run_result_artifact_hash="",
             validation_receipt_closure_artifact_id=closure_record.artifact_id,
             validation_receipt_closure_artifact_hash=closure_record.content_hash,
             validation_status="not_requested",
             actor="runtime.runner.AgentRuntimeRunner",
             reason="review completed with validation explicitly not requested",
+            validation_disposition_artifact_id=disposition_record.artifact_id,
+            validation_disposition_artifact_hash=disposition_record.content_hash,
         )
         registry.switch_current_artifact_set(
             current_set,
@@ -763,7 +802,11 @@ class AgentRuntimeRunner:
                 candidate = AttemptExecutionLease(workspace)
                 candidate.acquire()
                 try:
-                    self._validate_persisted_spec(workspace, normalized_spec_payload)
+                    self._validate_persisted_spec(
+                        workspace,
+                        normalized_spec_payload,
+                        ArtifactRegistry(workspace.paths.registry_path, workspace.job_id),
+                    )
                 except BaseException:
                     candidate.release()
                     raise
@@ -851,16 +894,24 @@ class AgentRuntimeRunner:
             claim_latest_pointer=not resume,
         )
         if not resume:
-            atomic_write_json(normalized_spec_path, normalized_spec_payload)
+            publish_json_artifact(
+                session.context.publication_context,
+                session.context.registry,
+                normalized_spec_path,
+                normalized_spec_payload,
+                artifact_role="runtime_spec",
+                artifact_type="runtime_job_spec",
+                artifact_version="v1",
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id="runtime_job_spec",
+                metadata={
+                    "job_id": session.context.workspace.job_id,
+                    "stage_plan_hash": str(
+                        (normalized_spec_payload.get("metadata") or {}).get("stage_plan_hash") or ""
+                    ),
+                },
+            )
         self._fault("after_artifact_write_before_registry", artifact_type="runtime_job_spec")
-        session.context.registry.register_file(
-            artifact_role="runtime_spec",
-            artifact_type="runtime_job_spec",
-            artifact_version="v1",
-            path=normalized_spec_path,
-            producer="runtime.runner.AgentRuntimeRunner",
-            artifact_id="runtime_job_spec",
-        )
 
         try:
             bundle = bridge.build_source_bundle()
@@ -1144,7 +1195,10 @@ class AgentRuntimeRunner:
                 status=status,
             ),
         )
-        payload = json.loads(Path(session.context.job_outcome_path).read_text(encoding="utf-8"))
+        outcome_record = session.context.registry.get("job_outcome")
+        if outcome_record is None or outcome_record.status != "ready":
+            raise RuntimeRunnerError("job outcome is not registered after finalization")
+        payload = json.loads(Path(outcome_record.path).read_text(encoding="utf-8"))
         outcome = JobOutcomeV1.from_dict(payload)
         evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
         return RuntimeExecutionResult(
@@ -1158,7 +1212,7 @@ class AgentRuntimeRunner:
             resumed_from_attempt=outcome.resumed_from_attempt,
             completed_stages=outcome.completed_stages,
             failed_stage=outcome.failed_stage,
-            job_outcome_path=session.context.job_outcome_path,
+            job_outcome_path=outcome_record.path,
             message=message,
             completion_status=evaluation.status,
             completion_reasons=evaluation.reasons,
@@ -1231,8 +1285,11 @@ class AgentRuntimeRunner:
         """Read the canonical job head without mutating workspace state."""
 
         workspace, _registry = cls._open_workspace(workspace_path)
-        outcome_path = Path(workspace.artifact_path("job_outcome_v1.json"))
-        if not outcome_path.is_file():
+        outcome_record = _registry.get("job_outcome")
+        outcome_path = Path(outcome_record.path) if outcome_record is not None else Path(
+            workspace.artifact_path("job_outcome_v1.json")
+        )
+        if outcome_record is None or outcome_record.status != "ready" or not outcome_path.is_file():
             raise RuntimeRunnerError(f"job outcome is missing: {outcome_path}")
         else:
             payload = json.loads(outcome_path.read_text(encoding="utf-8"))

@@ -159,6 +159,8 @@ class CurrentArtifactSetV1:
     validation_receipt_closure_artifact_id: str
     validation_receipt_closure_artifact_hash: str
     validation_status: str = "clean"
+    validation_disposition_artifact_id: str = ""
+    validation_disposition_artifact_hash: str = ""
     previous_set_id: str = ""
     actor: str = ""
     reason: str = ""
@@ -179,8 +181,6 @@ class CurrentArtifactSetV1:
             "citation_manifest_artifact_hash",
             "review_docx_artifact_id",
             "review_docx_artifact_hash",
-            "validation_run_result_artifact_id",
-            "validation_run_result_artifact_hash",
             "validation_receipt_closure_artifact_id",
             "validation_receipt_closure_artifact_hash",
             "actor",
@@ -190,6 +190,25 @@ class CurrentArtifactSetV1:
         missing = [key for key in required if not str(payload.get(key) or "").strip()]
         if missing:
             raise RegistryCorruption("current artifact set is missing: " + ", ".join(missing))
+        validation_status = str(payload.get("validation_status") or "clean")
+        if validation_status not in {"clean", "findings", "not_requested"}:
+            raise RegistryCorruption(f"invalid current artifact set validation_status: {validation_status!r}")
+        if validation_status == "not_requested":
+            conditional = (
+                "validation_disposition_artifact_id",
+                "validation_disposition_artifact_hash",
+            )
+        else:
+            conditional = (
+                "validation_run_result_artifact_id",
+                "validation_run_result_artifact_hash",
+            )
+        conditional_missing = [key for key in conditional if not str(payload.get(key) or "").strip()]
+        if conditional_missing:
+            raise RegistryCorruption(
+                "current artifact set is missing validation evidence: "
+                + ", ".join(conditional_missing)
+            )
         return cls(
             set_id=str(payload["set_id"]),
             job_id=str(payload["job_id"]),
@@ -201,11 +220,13 @@ class CurrentArtifactSetV1:
             citation_manifest_artifact_hash=str(payload["citation_manifest_artifact_hash"]),
             review_docx_artifact_id=str(payload["review_docx_artifact_id"]),
             review_docx_artifact_hash=str(payload["review_docx_artifact_hash"]),
-            validation_run_result_artifact_id=str(payload["validation_run_result_artifact_id"]),
-            validation_run_result_artifact_hash=str(payload["validation_run_result_artifact_hash"]),
+            validation_run_result_artifact_id=str(payload.get("validation_run_result_artifact_id") or ""),
+            validation_run_result_artifact_hash=str(payload.get("validation_run_result_artifact_hash") or ""),
             validation_receipt_closure_artifact_id=str(payload["validation_receipt_closure_artifact_id"]),
             validation_receipt_closure_artifact_hash=str(payload["validation_receipt_closure_artifact_hash"]),
-            validation_status=str(payload.get("validation_status") or "clean"),
+            validation_status=validation_status,
+            validation_disposition_artifact_id=str(payload.get("validation_disposition_artifact_id") or ""),
+            validation_disposition_artifact_hash=str(payload.get("validation_disposition_artifact_hash") or ""),
             previous_set_id=str(payload.get("previous_set_id") or ""),
             actor=str(payload["actor"]),
             reason=str(payload["reason"]),
@@ -220,11 +241,16 @@ class CurrentArtifactSetV1:
         }
 
     def target_artifact_pairs(self) -> tuple[tuple[str, str], ...]:
+        validation_pair = (
+            (self.validation_disposition_artifact_id, self.validation_disposition_artifact_hash)
+            if self.validation_status == "not_requested"
+            else (self.validation_run_result_artifact_id, self.validation_run_result_artifact_hash)
+        )
         return (
             (self.review_draft_artifact_id, self.review_draft_artifact_hash),
             (self.citation_manifest_artifact_id, self.citation_manifest_artifact_hash),
             (self.review_docx_artifact_id, self.review_docx_artifact_hash),
-            (self.validation_run_result_artifact_id, self.validation_run_result_artifact_hash),
+            validation_pair,
             (self.validation_receipt_closure_artifact_id, self.validation_receipt_closure_artifact_hash),
         )
 
@@ -1013,9 +1039,22 @@ class ArtifactRegistry:
         actor: str,
         reason: str,
         previous_set_id: str = "",
+        validation_disposition_artifact_id: str = "",
+        validation_disposition_artifact_hash: str = "",
     ) -> CurrentArtifactSetV1:
         """Create a deterministic set identity from exact artifact IDs/hashes."""
 
+        if validation_status not in {"clean", "findings", "not_requested"}:
+            raise ArtifactConflict(f"invalid current artifact set validation_status: {validation_status!r}")
+        if validation_status == "not_requested":
+            if not validation_disposition_artifact_id or len(validation_disposition_artifact_hash) != 64:
+                raise ArtifactConflict(
+                    "not_requested current artifact set requires a typed validation disposition"
+                )
+        elif not validation_run_result_artifact_id or len(validation_run_result_artifact_hash) != 64:
+            raise ArtifactConflict(
+                "validated current artifact set requires a validation run result"
+            )
         created_at = utc_now_iso()
         fields = {
             "job_id": self.job_id,
@@ -1032,6 +1071,8 @@ class ArtifactRegistry:
             "validation_receipt_closure_artifact_id": validation_receipt_closure_artifact_id,
             "validation_receipt_closure_artifact_hash": validation_receipt_closure_artifact_hash,
             "validation_status": validation_status,
+            "validation_disposition_artifact_id": validation_disposition_artifact_id,
+            "validation_disposition_artifact_hash": validation_disposition_artifact_hash,
             "previous_set_id": previous_set_id,
             "actor": actor,
             "reason": reason,
@@ -1068,6 +1109,11 @@ class ArtifactRegistry:
                 raise RegistryRevisionConflict(
                     f"expected registry revision {expected_revision}, found {disk_revision}"
                 )
+            # Revalidate before any current-set bytes or pointer bytes are
+            # written. QueuePublicationContext holds the queue lock while
+            # this Registry transaction is active, so this is the short
+            # queue -> Registry publication boundary.
+            publication_metadata = self._publication_metadata()
             pointer = artifacts.get("current-artifact-set:pointer")
             previous_set_id = str((pointer.metadata if pointer else {}).get("current_set_id") or "")
             if current_set.previous_set_id != previous_set_id:
@@ -1192,7 +1238,6 @@ class ArtifactRegistry:
             merged[current_set.set_id] = set_record
             merged[pointer_record.artifact_id] = pointer_record
             next_revision = disk_revision + 1
-            publication_metadata = self._publication_metadata()
             if publication_metadata:
                 if prepared_promotion_record is not None:
                     merged[prepared_promotion_record.artifact_id] = self._with_publication_metadata(

@@ -42,17 +42,28 @@ Use `--workspace <workspace_path>` when the job ID cannot be resolved. All comma
 - Queue workers use atomic snapshots, input/config fingerprints, lease
   generations, and fence tokens. An expired or fenced worker cannot publish a
   result; retry/cancel/recovery decisions must use the persisted queue state.
-- A lease is rechecked at the ArtifactRegistry publication boundary. A stale
-  worker, including a Windows `spawn` child whose claim expired, cannot publish
-  a canonical artifact merely because its local queue snapshot is stale.
+- Canonical bytes are staged under the lease generation. Publication takes the
+  queue store lock, rechecks lease/worker/generation/fence, then takes the
+  Registry transaction lock; this queue -> Registry lock order is part of the
+  contract. The final file is immutable and a publication manifest records the
+  staged/final hashes. A stale worker, including a Windows `spawn` child whose
+  claim expired, cannot publish a canonical artifact merely because its local
+  queue snapshot is stale.
 
 ## Validation, repair, and adoption
 
-- `validate` executes current validation over the current v3 review draft, v3 citation manifest, and evidence inputs, then persists `ValidationRunResultV1`, receipts, and Registry dependencies. `validation-status` is the read-only closure check, including Registry identity and hash equality.
+- `validate` executes current validation over the current v3 review draft, v3 citation manifest, and evidence inputs, then persists `ValidationRunResultV1`, receipts, and Registry dependencies. If validation is explicitly optional and disabled, the runner instead persists typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` plus an empty closure; this is evidence of non-requesting, not a passed validation. `validation-status` is the read-only closure check, including Registry identity and hash equality.
 - `repair-plan` is report-first. It may persist a hash-bound plan and transaction record, but it does not edit canonical artifacts.
 - `repair-apply` accepts only an explicitly `auto_apply_safe` plan. Its outputs are registered as `quarantined` derived versions; canonical READY draft, manifest, outline, and DOCX artifacts are not replaced.
 - `repair-promote --transaction <id> --actor <actor> --reason <reason>` revalidates the quarantined derived inputs through the current service, requires a complete closure, and only then creates a new version and advances current pointers.
 - `adopt --artifact <final_outline_id> --actor <actor>` is explicit. It requires a READY final outline, passing coverage audit, adoptable stage health, matching hashes, and no blocking critique. It writes `adopted_final_outline` and an immutable adoption audit record. Outline v3 candidate plans are not silently promoted by this command.
+
+Outline stability uses `off`, `smoke`, or `full`: smoke adds one full
+reversed-summary decision chain and exact replay; full runs the complete
+perturbation matrix. Call/token/cost plans are persisted per node. A monetary
+ceiling is enforced only with a named pricing source and complete rates;
+unknown pricing is reported as `cost_status=unknown`, and calculated usage is
+not provider billing.
 
 ## Export and trust
 

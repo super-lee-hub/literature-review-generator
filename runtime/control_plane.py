@@ -98,6 +98,15 @@ def _record_payload(record: ArtifactRecord) -> dict[str, Any]:
     }
 
 
+def _persisted_runtime_spec_path(workspace_path: str | Path, registry: ArtifactRegistry) -> Path:
+    """Resolve the current runtime spec through Registry identity first."""
+
+    record = registry.get("runtime_job_spec")
+    if record is not None and record.status == "ready":
+        return Path(record.path)
+    return Path(workspace_path) / "artifacts" / "runtime_job_spec_v1.json"
+
+
 def _json_object(path: Path) -> Mapping[str, Any] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -518,10 +527,10 @@ class ReviewControlPlane:
         workspace: str | Path | None = None,
     ) -> dict[str, Any]:
         resolved = self.resolve_workspace(job_id=job_id, workspace=workspace)
-        spec_path = Path(resolved) / "artifacts" / "runtime_job_spec_v1.json"
+        workspace_obj, registry = AgentRuntimeRunner._open_workspace(resolved)
+        spec_path = _persisted_runtime_spec_path(resolved, registry)
         if not spec_path.is_file():
             raise ControlPlaneError(f"persisted runtime spec is missing: {spec_path}")
-        workspace_obj, registry = AgentRuntimeRunner._open_workspace(resolved)
         outline_resume_plan: dict[str, Any] | None = None
         try:
             node_store = OutlineNodeStore(workspace_obj, registry)
@@ -762,7 +771,7 @@ class ReviewControlPlane:
                 "reason": "repair transaction has no quarantined draft/manifest to revalidate",
                 "mutation_performed": False,
             }
-        spec_path = Path(str(inspection["workspace_path"])) / "artifacts" / "runtime_job_spec_v1.json"
+        spec_path = _persisted_runtime_spec_path(inspection["workspace_path"], registry)
         if not spec_path.is_file():
             return {
                 "status": "blocked",
@@ -922,7 +931,8 @@ class ReviewControlPlane:
 
         inspection = self.inspect(job_id=job_id, workspace=workspace)
         resolved = Path(str(inspection["workspace_path"])).resolve()
-        spec_path = resolved / "artifacts" / "runtime_job_spec_v1.json"
+        _workspace_obj, registry = AgentRuntimeRunner._open_workspace(resolved)
+        spec_path = _persisted_runtime_spec_path(resolved, registry)
         if not spec_path.is_file():
             return {
                 "status": "blocked",

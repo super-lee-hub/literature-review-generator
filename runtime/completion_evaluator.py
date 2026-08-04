@@ -39,6 +39,7 @@ class CompletionEvidenceV1:
     canonical_artifacts: Mapping[str, bool] = field(default_factory=dict)
     validation_required: bool = False
     require_clean_validation: bool = False
+    allow_unvalidated_when_validation_optional: bool = False
     validation_status: str = "missing"
     provider_receipts_complete: bool = False
     provider_receipt_closure: Mapping[str, Any] | None = None
@@ -82,6 +83,9 @@ class CompletionEvidenceV1:
             canonical_artifacts=canonical_artifacts,
             validation_required=bool(payload.get("validation_required", False)),
             require_clean_validation=bool(payload.get("require_clean_validation", False)),
+            allow_unvalidated_when_validation_optional=bool(
+                payload.get("allow_unvalidated_when_validation_optional", False)
+            ),
             validation_status=str(payload.get("validation_status") or "missing"),
             provider_receipts_complete=bool(payload.get("provider_receipts_complete", False)),
             provider_receipt_closure=(
@@ -189,13 +193,19 @@ class CanonicalCompletionEvaluator:
                 reasons.append("current_artifact_set_missing")
             for issue in current_map.get("blocking_issues") or ():
                 reasons.append(f"current_stage_closure:{issue}")
+        if snapshot.validation_status not in {"clean", "findings", "not_requested", "missing"}:
+            reasons.append(f"validation_status_invalid:{snapshot.validation_status}")
         if snapshot.validation_required:
             if snapshot.validation_status == "missing":
                 reasons.append("validation_missing")
+            elif snapshot.validation_status == "not_requested":
+                reasons.append("validation_not_requested:required")
             elif snapshot.require_clean_validation and snapshot.validation_status != "clean":
                 reasons.append(f"validation_not_clean:{snapshot.validation_status}")
             elif snapshot.validation_status not in {"clean", "findings"}:
                 reasons.append(f"validation_not_complete:{snapshot.validation_status}")
+        elif snapshot.validation_status == "not_requested" and not snapshot.allow_unvalidated_when_validation_optional:
+            reasons.append("validation_not_requested:policy_disallows_unvalidated")
         reasons.extend(f"degradation:{reason}" for reason in snapshot.degradation_reasons)
         reasons = list(dict.fromkeys(reasons))
 
@@ -243,6 +253,9 @@ class CanonicalCompletionEvaluator:
                 canonical_artifacts=canonical_artifacts or {},
                 validation_required=bool(policy.get("validation_required", False)),
                 require_clean_validation=bool(policy.get("require_clean_validation", False)),
+                allow_unvalidated_when_validation_optional=bool(
+                    policy.get("allow_unvalidated_when_validation_optional", False)
+                ),
                 validation_status=validation_status,
                 provider_receipts_complete=provider_receipts_complete,
                 declared_canonical_ready=typed.canonical_ready,

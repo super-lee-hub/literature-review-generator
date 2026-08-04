@@ -13,6 +13,13 @@ cannot satisfy a readiness or completion gate.
 - `artifact_registry.json` is the artifact/dependency graph. Registry writes
   use a workspace lease, revisioned transaction, atomic replacement, and
   fail-closed corruption handling.
+- Queue-owned canonical bytes are published through a lease-generation-aware
+  staging context. The publication boundary takes the queue store lock first,
+  rechecks lease/worker/generation/fence, then registers the immutable
+  content-addressed file under the Registry transaction; the reverse lock order
+  is not allowed. A successful byte publication also records an immutable
+  `lease_publication_manifest`; a Registry failure leaves the immutable orphan
+  for diagnosis rather than restoring a mutable fixed target.
 - `job_outcome_v1.json` is the job-head projection: lifecycle status,
   disposition, readiness policy, required/completed stages, and
   `canonical_ready`.
@@ -48,10 +55,10 @@ source of truth.
 | Stage | Canonical truth | Projections / exports |
 |---|---|---|
 | Source intake | `source_inventory_v1.json`, `source_bundle.json` | parser diagnostics and read-only paper views |
-| Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, and source lineage | Excel and display summaries |
+| Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, source lineage, expected-call closure, reuse records, and current-epoch receipt ledger | Excel and display summaries |
 | Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, typed quality gate, exact execution bindings, node DAG, receipts, full-decision stability audit, final outline, stage health, versioned adoption record, and current adoption pointer | Markdown or human-readable outline displays |
 | Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog, resolved through the current artifact set | DOCX and text reports |
-| Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
+| Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; when optional validation is disabled, typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` plus an empty receipt closure binds the current set; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
 | Stage plan | durable `stage_plan` inside `runtime_job_spec_v1.json`, including requested/required stages, validation policy, current-set requirement, and completion policy | job outcome and UI status projections |
 | Repair | typed repair issues/actions/patches, quarantined derived inputs, current-service revalidation and receipt closure, and explicit versioned promotion transaction with atomic current-set switching | human-readable repair summaries |
 
@@ -130,15 +137,19 @@ coverage, quality, stability, stage-health, identity, and canonical-completion
 gates pass; adoption writes a versioned identity and a current-pointer record.
 
 The stability policy is explicit: `off`, `smoke` (the default), or `full`.
-Smoke executes only the compact high-value perturbations plus exact replay;
-full executes the comprehensive release/audit matrix. Stability writes a
-preflight estimate for provider calls and estimated cost before transport and
-rejects a configured `max_provider_calls` or `max_estimated_cost` breach
-before any provider call. Subruns are checkpointed. Candidate order, source
-order, and alternative shard size are represented in the execution input;
-exact replay uses a fresh executor and records zero provider transport calls.
-Natural-language outputs are compared through documented semantic thresholds,
-not byte identity unless the replay contract explicitly requires it.
+Smoke executes one additional full reversed-summary decision chain plus exact
+replay; full executes the comprehensive release/audit matrix. Stability writes
+per-node call/token/cost plans and a preflight estimate before transport and
+rejects a configured `max_provider_calls` or `max_estimated_cost` breach before
+any provider call. Monetary admission is enforced only when a named pricing
+source and complete rates are present; otherwise `cost_status=unknown` keeps
+call/token ceilings but does not claim a monetary ceiling. Reported provider
+usage is calculated locally and is explicitly not billing data. Subruns are
+checkpointed. Candidate order, source order, and alternative shard size are
+represented in the execution input; exact replay uses a fresh executor and
+records zero provider transport calls. Natural-language outputs are compared
+through documented semantic thresholds, not byte identity unless the replay
+contract explicitly requires it.
 
 `reviewctl` is the single control plane. `status`, `next-action`,
 `validation-status`, `inspect`, and `attest` are provider-free reads.
@@ -149,11 +160,12 @@ new validation attempt; it is not a closure-only inspection. `run`, `resume`,
 remove/import/export commands are explicit Registry- or queue-backed
 transitions. Queue workers claim a job with a cross-process lease generation
 and fence token and must heartbeat or lose the claim; expired claims are
-recoverable and stale workers cannot publish. The canonical ArtifactRegistry
-publication boundary rechecks that lease/fence before registering a produced
-artifact, so a stale worker cannot publish merely because queue metadata has
-not yet converged. Cancellation is cooperative and a cancelled job cannot
-publish a completed queue state.
+recoverable and stale workers cannot publish. The canonical byte publication
+boundary stages output privately, then takes the queue store lock before the
+Registry transaction and rechecks lease/fence at that point. A stale worker
+cannot publish merely because queue metadata has not yet converged; immutable
+bytes are never restored to a mutable fixed target. Cancellation is cooperative
+and a cancelled job cannot publish a completed queue state.
 
 Completion and export use `CurrentStageClosureMapV1`, not the validation
 closure as a proxy for every provider stage. The map derives requested stages

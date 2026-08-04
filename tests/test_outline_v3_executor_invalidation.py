@@ -59,7 +59,9 @@ def test_executor_missing_receipt_invalidates_replay_before_reuse(tmp_path: Path
     assert first.ok is True
     first_call_count = len(calls)
 
-    ledger_path = Path(first_executor._receipt_ledger.path)
+    published_ledger = first_executor.registry.get("outline_v3_provider_receipts")
+    assert published_ledger is not None
+    ledger_path = Path(published_ledger.path)
     receipts = [line for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert receipts
     ledger_path.write_text("\n".join(receipts[1:]) + "\n", encoding="utf-8")
@@ -179,3 +181,56 @@ def test_executor_review_intent_change_invalidates_replay_binding(tmp_path: Path
     assert first_dag.get("outline_evidence_views").execution_binding == second_dag.get("outline_evidence_views").execution_binding
     assert first_dag.get("review_intent").execution_binding["review_intent_hash"] != second_dag.get("review_intent").execution_binding["review_intent_hash"]
     assert second_dag.get("final_outline").status == "succeeded"
+
+
+def test_executor_provider_failure_persists_failed_node_and_resumes_only_descendants(
+    tmp_path: Path,
+) -> None:
+    first_executor = _executor(tmp_path, stability_mode="off")
+    injected = {"done": False}
+
+    def fault_injector(node_id: str, _payload: Mapping[str, Any]) -> None:
+        if node_id == "candidate_2_provider_generation" and not injected["done"]:
+            injected["done"] = True
+            raise RuntimeError("injected provider failure")
+
+    first_executor.fault_injector = fault_injector
+    first = first_executor.run()
+    first_dag = OutlineNodeStore(first_executor.workspace, first_executor.registry).load()
+
+    assert first.ok is False
+    assert first.status == "blocked"
+    assert any("injected provider failure" in item for item in first.diagnostics)
+    assert first_dag is not None
+    assert first_dag.get("candidate_1_provider_generation").status == "succeeded"
+    assert first_dag.get("candidate_2_provider_generation").status == "failed"
+
+    calls: list[str] = []
+    holder: dict[str, OutlineV3Executor] = {}
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        calls.append(node_id)
+        return holder["executor"]._fixture_response(node_id, request)
+
+    second_executor = OutlineV3Executor(
+        job_id=first_executor.job_id,
+        summaries=first_executor.summaries,
+        workspace=first_executor.workspace,
+        artifact_registry=first_executor.registry,
+        provider=provider,
+        candidate_count=2,
+        stability_mode="off",
+    )
+    holder["executor"] = second_executor
+    second = second_executor.run()
+
+    assert second.ok is True
+    assert second.status == "ready_for_adoption"
+    assert calls == [
+        "candidate_2_provider_generation",
+        "structure_critique",
+        "coverage_critique",
+        "evidence_critique",
+        "arbitration",
+    ]
+    assert not second.dag.failed_node_ids
