@@ -54,6 +54,10 @@ class UnverifiedArtifact(RegistryError):
     """Raised when a ready artifact's durable file identity cannot be verified."""
 
 
+class PublicationFenceRejected(RegistryError):
+    """Raised when a guarded publication context is no longer authorized."""
+
+
 DependencyKind = Literal["local_job", "external_job"]
 
 
@@ -154,6 +158,7 @@ class CurrentArtifactSetV1:
     validation_run_result_artifact_hash: str
     validation_receipt_closure_artifact_id: str
     validation_receipt_closure_artifact_hash: str
+    validation_status: str = "clean"
     previous_set_id: str = ""
     actor: str = ""
     reason: str = ""
@@ -200,6 +205,7 @@ class CurrentArtifactSetV1:
             validation_run_result_artifact_hash=str(payload["validation_run_result_artifact_hash"]),
             validation_receipt_closure_artifact_id=str(payload["validation_receipt_closure_artifact_id"]),
             validation_receipt_closure_artifact_hash=str(payload["validation_receipt_closure_artifact_hash"]),
+            validation_status=str(payload.get("validation_status") or "clean"),
             previous_set_id=str(payload.get("previous_set_id") or ""),
             actor=str(payload["actor"]),
             reason=str(payload["reason"]),
@@ -246,6 +252,7 @@ class ArtifactRegistry:
         registry_lock_timeout_seconds: float = DEFAULT_REGISTRY_LOCK_TIMEOUT_SECONDS,
         registry_lock_retry_interval_ms: int = DEFAULT_REGISTRY_LOCK_RETRY_INTERVAL_MS,
         registry_revision_retry_limit: int = DEFAULT_REGISTRY_REVISION_RETRY_LIMIT,
+        publication_guard: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.registry_path = os.path.abspath(os.fspath(registry_path))
         self.lock_path = f"{self.registry_path}.lock"
@@ -253,6 +260,7 @@ class ArtifactRegistry:
         self.registry_lock_timeout_seconds = max(0.0, float(registry_lock_timeout_seconds))
         self.registry_lock_retry_interval_ms = max(1, int(registry_lock_retry_interval_ms))
         self.registry_revision_retry_limit = max(1, int(registry_revision_retry_limit))
+        self._publication_guard = publication_guard
         self._process_lock = _process_lock_for(self.lock_path)
         self._artifacts: Dict[str, ArtifactRecord] = {}
         self._revision = 0
@@ -673,6 +681,38 @@ class ArtifactRegistry:
             metadata=deepcopy(record.metadata),
         )
 
+    def _publication_metadata(self) -> Dict[str, Any]:
+        """Revalidate a guarded publication immediately before registry commit."""
+
+        if self._publication_guard is None:
+            return {}
+        payload = self._publication_guard()
+        if not isinstance(payload, Mapping):
+            raise PublicationFenceRejected("publication guard must return a mapping")
+        return deepcopy(dict(payload))
+
+    @staticmethod
+    def _with_publication_metadata(
+        record: ArtifactRecord,
+        publication_metadata: Mapping[str, Any],
+        *,
+        existing: ArtifactRecord | None = None,
+    ) -> ArtifactRecord:
+        if not publication_metadata:
+            return record
+        # READY promotion transactions are immutable after their first durable
+        # registration.  The enclosing current-set/pointer records receive the
+        # new fence identity when they are switched.
+        if (
+            existing is not None
+            and existing.artifact_type == "repair_promotion_transaction"
+            and existing.status == "ready"
+        ):
+            return replace(record, metadata=deepcopy(existing.metadata))
+        metadata = deepcopy(record.metadata)
+        metadata["publication_fence"] = deepcopy(dict(publication_metadata))
+        return replace(record, metadata=metadata)
+
     def _register_transaction(
         self,
         build_record: Callable[[Mapping[str, ArtifactRecord]], ArtifactRecord],
@@ -697,14 +737,21 @@ class ArtifactRegistry:
                 candidate = replace(candidate, created_at=existing.created_at)
             if candidate.status == "ready":
                 self._verify_ready_artifact(candidate)
+            publication_metadata = self._publication_metadata()
+            candidate = self._with_publication_metadata(
+                candidate,
+                publication_metadata,
+                existing=existing,
+            )
+            self._validate_artifact_merge(existing, candidate)
             merged = dict(artifacts)
             merged[candidate.artifact_id] = candidate
             next_revision = disk_revision + 1
             self._write_registry_unlocked(merged, next_revision)
             # Memory changes only after the durable os.replace succeeds.
-            self._artifacts = merged
-            self._revision = next_revision
-            return self._copy_record(candidate)
+        self._artifacts = merged
+        self._revision = next_revision
+        return self._copy_record(candidate)
 
     def save(
         self,
@@ -748,6 +795,16 @@ class ArtifactRegistry:
                     )
                 snapshot[record.artifact_id] = record
             next_revision = disk_revision + 1
+            publication_metadata = self._publication_metadata()
+            if publication_metadata:
+                snapshot = {
+                    artifact_id: self._with_publication_metadata(
+                        record,
+                        publication_metadata,
+                        existing=disk_artifacts.get(artifact_id),
+                    )
+                    for artifact_id, record in snapshot.items()
+                }
             self._write_registry_unlocked(snapshot, next_revision)
             self._artifacts = snapshot
             self._revision = next_revision
@@ -952,6 +1009,7 @@ class ArtifactRegistry:
         validation_run_result_artifact_hash: str,
         validation_receipt_closure_artifact_id: str,
         validation_receipt_closure_artifact_hash: str,
+        validation_status: str = "clean",
         actor: str,
         reason: str,
         previous_set_id: str = "",
@@ -973,6 +1031,7 @@ class ArtifactRegistry:
             "validation_run_result_artifact_hash": validation_run_result_artifact_hash,
             "validation_receipt_closure_artifact_id": validation_receipt_closure_artifact_id,
             "validation_receipt_closure_artifact_hash": validation_receipt_closure_artifact_hash,
+            "validation_status": validation_status,
             "previous_set_id": previous_set_id,
             "actor": actor,
             "reason": reason,
@@ -1091,6 +1150,7 @@ class ArtifactRegistry:
                 metadata={
                     "promotion_transaction_id": current_set.promotion_transaction_id,
                     "promotion_transaction_hash": current_set.promotion_transaction_hash,
+                    "validation_status": current_set.validation_status,
                     "actor": current_set.actor,
                     "reason": current_set.reason,
                     "target_artifact_ids": [record.artifact_id for record in target_records],
@@ -1116,6 +1176,7 @@ class ArtifactRegistry:
                     "previous_set_id": previous_set_id,
                     "promotion_transaction_id": current_set.promotion_transaction_id,
                     "promotion_transaction_hash": current_set.promotion_transaction_hash,
+                    "validation_status": current_set.validation_status,
                     "actor": current_set.actor,
                     "reason": current_set.reason,
                 },
@@ -1131,6 +1192,26 @@ class ArtifactRegistry:
             merged[current_set.set_id] = set_record
             merged[pointer_record.artifact_id] = pointer_record
             next_revision = disk_revision + 1
+            publication_metadata = self._publication_metadata()
+            if publication_metadata:
+                if prepared_promotion_record is not None:
+                    merged[prepared_promotion_record.artifact_id] = self._with_publication_metadata(
+                        prepared_promotion_record,
+                        publication_metadata,
+                        existing=artifacts.get(prepared_promotion_record.artifact_id),
+                    )
+                set_record = self._with_publication_metadata(
+                    set_record,
+                    publication_metadata,
+                    existing=artifacts.get(set_record.artifact_id),
+                )
+                pointer_record = self._with_publication_metadata(
+                    pointer_record,
+                    publication_metadata,
+                    existing=artifacts.get(pointer_record.artifact_id),
+                )
+                merged[current_set.set_id] = set_record
+                merged[pointer_record.artifact_id] = pointer_record
             self._write_registry_unlocked(merged, next_revision)
             self._artifacts = merged
             self._revision = next_revision

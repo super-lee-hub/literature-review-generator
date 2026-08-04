@@ -270,6 +270,19 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "max_summary_refs_per_prompt": "80",
             "max_outline_retry_count": "2",
         },
+        "OutlineStability": {
+            "mode": "smoke",
+            "max_provider_calls": "24",
+            "max_estimated_cost": "5.0",
+            "estimated_cost_per_1k_tokens": "0.001",
+            "input_cost_per_1k_tokens": "0.0",
+            "output_cost_per_1k_tokens": "0.001",
+            "reasoning_cost_per_1k_tokens": "0.001",
+            "cache_read_cost_per_1k_tokens": "0.0",
+            "cache_write_cost_per_1k_tokens": "0.0",
+            "max_smoke_overhead_ratio": "2.0",
+            "max_source_prompt_tokens": "0",
+        },
         "OutlineQualityGate": dict(OUTLINE_QUALITY_GATE_DEFAULTS),
     }
 

@@ -86,18 +86,14 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
         config=str(_test_config(tmp_path)),
         action="run_all",
         queue_file=str(tmp_path / "queue.json"),
-        metadata={
-            "requested_stages": ["analyze", "outline", "review", "validate"],
-            "validation_required": True,
-            "require_clean_validation": True,
-            "allow_unvalidated_when_validation_optional": False,
-        },
     )
 
     first = AgentRuntimeRunner(spec).run()
-    assert first.job_status == "failed", first
-    assert first.failed_stage == "review", first
+    assert first.job_status == "completed", first
+    assert first.job_disposition == "needs_review", first
+    assert first.failed_stage is None, first
     assert first.completed_stages == ("source_intake", "analyze", "outline"), first
+    assert "explicit adoption" in first.message, first
 
     control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
     inspection = control.inspect(workspace=first.workspace_path)

@@ -291,11 +291,18 @@ class ProviderReceiptClosure:
                     try:
                         envelope = json.loads(Path(registry_path).read_text(encoding="utf-8"))
                         if isinstance(envelope, Mapping):
-                            if str(envelope.get("content_hash") or "") != content_hash:
+                            # Some artifact writers keep the registry hash
+                            # outside the JSON envelope.  When an embedded
+                            # hash exists it must agree; its absence is not a
+                            # second, circular content-hash requirement.
+                            embedded_content_hash = str(envelope.get("content_hash") or "")
+                            if embedded_content_hash and embedded_content_hash != content_hash:
                                 mismatch_fields.add("artifact_content_hash")
                             payload = envelope.get("payload")
                             if payload is None:
                                 payload = envelope.get("section")
+                            if payload is None:
+                                payload = envelope.get("analysis")
                             if payload_hash and hash_json(payload) != payload_hash:
                                 mismatch_fields.add("artifact_payload_hash")
                     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):

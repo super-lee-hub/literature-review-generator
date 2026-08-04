@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
 from runtime.provider_runtime import (
     ProviderBudgetV1,
@@ -139,6 +141,36 @@ def test_hash_mismatch_blocks_with_explicit_reason(tmp_path: Path) -> None:
 
     assert closure.complete is False
     assert "provider_response_hash" in closure.hash_mismatches[receipt.call_id]
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("job_id", "attempt_id", "stage_name", "node_id", "prompt_hash", "input_hash", "config_hash", "schema_hash"),
+)
+def test_receipt_binding_identity_mismatch_is_stale_and_blocked(
+    tmp_path: Path,
+    field_name: str,
+) -> None:
+    receipt, expected = _bound_receipt(tmp_path, call_id=f"call-{field_name}")
+    value = "other-stage" if field_name == "stage_name" else "f" * 64
+    mismatched = replace(expected, **{field_name: value})
+
+    closure = ProviderReceiptClosure.evaluate([mismatched], [receipt])
+
+    assert closure.complete is False
+    assert closure.stale_call_ids == (receipt.call_id,)
+    assert field_name in closure.hash_mismatches[receipt.call_id]
+
+
+def test_receipt_closure_rejects_a_changed_logical_attempt_identity(tmp_path: Path) -> None:
+    receipt, expected = _bound_receipt(tmp_path, call_id="call-attempt-identity")
+    mismatched = replace(expected, logical_attempt_identity="other-attempt")
+
+    closure = ProviderReceiptClosure.evaluate([mismatched], [receipt])
+
+    assert closure.complete is False
+    assert closure.stale_call_ids == (receipt.call_id,)
+    assert "logical_attempt_identity" in closure.hash_mismatches[receipt.call_id]
 
 
 def test_missing_expected_call_blocks_with_explicit_reason(tmp_path: Path) -> None:

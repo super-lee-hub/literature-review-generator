@@ -163,7 +163,29 @@ class CanonicalCompletionEvaluator:
             reasons.append("provider_receipts_incomplete")
         if snapshot.current_stage_closure_map is not None:
             current_map = snapshot.current_stage_closure_map
-            if str(current_map.get("current_set_id") or "") == "":
+            requested_map_stages = {
+                str(stage).strip()
+                for stage in (current_map.get("requested_stages") or ())
+                if str(stage).strip() and str(stage).strip() != "source_intake"
+            }
+            required_outcome_stages = {
+                str(stage).strip()
+                for stage in snapshot.required_stages
+                if str(stage).strip() and str(stage).strip() != "source_intake"
+            }
+            if requested_map_stages != required_outcome_stages:
+                reasons.append("current_stage_closure:stage_set_mismatch")
+            provider_stage_names = {"analyze", "outline", "review", "validate"}
+            expected_provider_stages = required_outcome_stages & provider_stage_names
+            actual_provider_stages = {
+                str(stage).strip()
+                for stage in (current_map.get("provider_closures_by_stage") or {})
+                if str(stage).strip()
+            }
+            if actual_provider_stages != expected_provider_stages:
+                reasons.append("current_stage_closure:provider_stage_set_mismatch")
+            current_set_required = bool(current_map.get("current_set_required", True))
+            if current_set_required and str(current_map.get("current_set_id") or "") == "":
                 reasons.append("current_artifact_set_missing")
             for issue in current_map.get("blocking_issues") or ():
                 reasons.append(f"current_stage_closure:{issue}")

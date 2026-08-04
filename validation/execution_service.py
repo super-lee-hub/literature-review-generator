@@ -7,7 +7,7 @@ not imported here; it remains an external compatibility shim only.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 from pathlib import Path
@@ -70,6 +70,7 @@ class ValidationExecutionService:
         repr=False,
     )
     closure_epoch_id: str = field(default="", init=False)
+    expected_call_graph_hash: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         self.job_id = str(self.job_id or self.workspace.job_id)
@@ -83,11 +84,18 @@ class ValidationExecutionService:
             "papers": hash_json([record.content_hash for record in self.paper_artifact_records]),
             "visuals": hash_json([record.content_hash for record in self.visual_artifact_records]),
         }
+        self.expected_call_graph_hash = hash_json(
+            {
+                "stage_name": "stage4_validate",
+                "schema": "validation-v1",
+                "call_id_pattern": "validation:{packet_stage}:{packet_hash}",
+            }
+        )
         self.closure_epoch_id = compute_closure_epoch_id(
             job_id=self.job_id,
             stage_name="stage4_validate",
             logical_attempt_identity=self.attempt_id,
-            expected_call_graph_hash=hash_json({"stage": "stage4_validate", "schema": "validation-v1"}),
+            expected_call_graph_hash=self.expected_call_graph_hash,
             current_input_artifact_hashes=input_hashes,
             provider_config_hash=hash_json(_redact_mapping(dict(self.runtime_config or {}))),
             schema_version="validation-v1",
@@ -222,6 +230,7 @@ class ValidationExecutionService:
             node_id=resolved_node,
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.attempt_id,
+            expected_call_graph_hash=self.expected_call_graph_hash,
             max_attempts=max(1, retry_limit + 1),
             usage_required=endpoint_type not in {"internal", "fixture"},
         )
@@ -515,21 +524,64 @@ class ValidationExecutionService:
         closure_path = closure_path or self.workspace.artifact_path(
             "validation_provider_receipt_closure.json"
         )
-        closure_artifact_id = f"provider-receipt-closure:stage4_validate:{closure.closure_epoch_id or self.closure_epoch_id}"
+        resolved_epoch = closure.closure_epoch_id or self.closure_epoch_id
+        closure_payload = {
+            **closure.to_dict(),
+            "job_id": self.job_id,
+            "stage_name": "stage4_validate",
+            "attempt_id": self.attempt_id,
+            "logical_attempt_identity": self.attempt_id,
+            "closure_epoch_id": resolved_epoch,
+            "expected_call_graph_hash": self.expected_call_graph_hash,
+            "expected_calls": [asdict(expected) for expected in expected_calls],
+        }
+        closure_artifact_id = f"provider-receipt-closure:stage4_validate:{resolved_epoch}"
         atomic_write_json(
             closure_path,
             {
                 "artifact_type": "provider_receipt_closure",
                 "artifact_version": "v1",
                 "job_id": self.job_id,
+                "stage_name": "stage4_validate",
                 "attempt_id": self.attempt_id,
-                "closure_epoch_id": closure.closure_epoch_id or self.closure_epoch_id,
-                "payload": closure.to_dict(),
+                "closure_epoch_id": resolved_epoch,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "payload": closure_payload,
             },
         )
         dependencies: list[ArtifactDependencyRefV2] = []
-        if ledger_record is not None and ledger_record.status == "ready":
-            dependencies.append(ArtifactDependencyRefV2.from_record(ledger_record))
+        dependency_ids: set[str] = set()
+
+        def add_dependency(record: ArtifactRecord | None) -> None:
+            if record is None or record.status != "ready" or record.artifact_id in dependency_ids:
+                return
+            dependency_ids.add(record.artifact_id)
+            dependencies.append(ArtifactDependencyRefV2.from_record(record))
+
+        add_dependency(ledger_record)
+        for record in (
+            self.review_draft_record,
+            self.citation_manifest_record,
+            *self.paper_artifact_records,
+            *self.visual_artifact_records,
+        ):
+            add_dependency(record)
+        for expected in expected_calls:
+            expected_path = str(expected.artifact_path or "").strip()
+            if not expected_path:
+                continue
+            expected_resolved = Path(expected_path).resolve()
+            add_dependency(
+                next(
+                    (
+                        record
+                        for record in self.artifact_registry.list_records()
+                        if record.status == "ready"
+                        and Path(record.path).resolve() == expected_resolved
+                    ),
+                    None,
+                )
+            )
         closure_record = self.artifact_registry.register_file(
             artifact_role="provider_receipt_closure",
             artifact_type="provider_receipt_closure",
@@ -541,7 +593,11 @@ class ValidationExecutionService:
             metadata={
                 "closure_hash": closure.closure_hash,
                 "complete": closure.complete,
-                "closure_epoch_id": closure.closure_epoch_id or self.closure_epoch_id,
+                "job_id": self.job_id,
+                "stage_name": "stage4_validate",
+                "attempt_id": self.attempt_id,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "closure_epoch_id": resolved_epoch,
             },
         )
         return {

@@ -13,6 +13,7 @@ from services.job_workspace import JobWorkspace, atomic_write_json
 from services.progress_state import determine_resume_state
 from services.settings import ApplicationSettings
 from services.source_inventory import SourceInventoryV1
+from runtime.stage_planning import StagePlanError, build_stage_plan
 
 
 ResumeReportWriter = Callable[[JobWorkspace, Any], str]
@@ -49,35 +50,26 @@ def _required_stages_for_request(
     request: Any,
     *,
     validation_required: bool,
+    validation_enabled: bool = True,
 ) -> tuple[str, ...]:
-    requested_stages = getattr(request, "requested_stages", None)
-    action = str(getattr(request, "action", "analyze") or "analyze")
-    if action == "derive_review_batch":
-        return ("source_intake", "derive_review_batch")
-    if requested_stages is not None:
-        stages = tuple(dict.fromkeys((
-            "source_intake",
-            *(str(item) for item in requested_stages if str(item) != "source_intake"),
-        )))
-        return tuple(
-            stage for stage in stages if validation_required or stage != "validate"
-        )
-    mapping = {
-        "analyze": ("source_intake", "analyze"),
-        "derive_review_batch": ("source_intake", "derive_review_batch"),
-        "retry_failed": ("source_intake", "analyze"),
-        "generate_outline": ("source_intake", "outline"),
-        "generate_review": ("source_intake", "outline", "review"),
-        "generate_section": ("source_intake", "outline", "review"),
-        "retry_review_failed": ("source_intake", "outline", "review"),
-        "validate_review": ("source_intake", "validate"),
-        "run_all": ("source_intake", "analyze", "outline", "review"),
-    }
-    stages = mapping.get(action, ("source_intake", action))
-    return tuple(stage for stage in stages if validation_required or stage != "validate")
+    plan = build_stage_plan(
+        action=str(getattr(request, "action", "analyze") or "analyze"),
+        requested_stages=getattr(request, "requested_stages", None),
+        validation_enabled=validation_enabled,
+        validation_required=validation_required,
+        require_clean_validation=getattr(request, "require_clean_validation", None),
+        allow_unvalidated_when_validation_optional=getattr(
+            request, "allow_unvalidated_when_validation_optional", None
+        ),
+    )
+    return plan.required_stages
 
 
-def _readiness_policy_for_request(request: Any) -> dict[str, Any]:
+def _readiness_policy_for_request(
+    request: Any,
+    *,
+    validation_enabled: bool = True,
+) -> dict[str, Any]:
     def configured_bool(field_name: str) -> bool | None:
         value = getattr(request, field_name, None)
         if value is None:
@@ -87,33 +79,26 @@ def _readiness_policy_for_request(request: Any) -> dict[str, Any]:
         return value
 
     action = str(getattr(request, "action", "analyze") or "analyze")
-    requested_stages = getattr(request, "requested_stages", None)
-    default_validation_required = (
-        "validate" in requested_stages
-        if requested_stages is not None
-        else action == "validate_review"
-    )
     configured_validation_required = configured_bool("validation_required")
-    validation_required = (
-        default_validation_required
-        if configured_validation_required is None
-        else configured_validation_required
-    )
     configured_require_clean = configured_bool("require_clean_validation")
-    require_clean_validation = (
-        validation_required if configured_require_clean is None else configured_require_clean
-    )
     configured_allow_unvalidated = configured_bool("allow_unvalidated_when_validation_optional")
-    allow_unvalidated = (
-        not validation_required
-        if configured_allow_unvalidated is None
-        else configured_allow_unvalidated
+    plan = build_stage_plan(
+        action=action,
+        requested_stages=getattr(request, "requested_stages", None),
+        validation_enabled=validation_enabled,
+        validation_required=configured_validation_required,
+        require_clean_validation=configured_require_clean,
+        allow_unvalidated_when_validation_optional=configured_allow_unvalidated,
     )
     return {
-        "validation_required": validation_required,
-        "require_clean_validation": require_clean_validation,
+        "validation_enabled": bool(validation_enabled),
+        "validation_required": plan.validation_required,
+        "require_clean_validation": plan.require_clean_validation,
         "source_identity_required": str(getattr(request, "source_mode", "direct")) == "zotero",
-        "allow_unvalidated_when_validation_optional": allow_unvalidated,
+        "allow_unvalidated_when_validation_optional": plan.allow_unvalidated_when_validation_optional,
+        "current_artifact_set_required": plan.current_artifact_set_required,
+        "validation_status": plan.validation_status,
+        "stage_plan": plan.to_dict(),
     }
 
 
@@ -143,6 +128,7 @@ def bootstrap_job_runtime(
     resume_requested: bool = False,
     resume_preflight: ResumePreflight | None = None,
     publish_running_state: bool = True,
+    publication_context: Any | None = None,
 ) -> BootstrappedRuntimeContext:
     generator_config = cast(MutableMapping[str, Dict[str, str]], generator.config)
     settings = ApplicationSettings.from_config(generator_config)
@@ -194,7 +180,12 @@ def bootstrap_job_runtime(
         fingerprint_bundle=fingerprint_bundle_dict,
         request=request,
     )
-    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    if publication_context is None:
+        # Direct execution is an explicit unrestricted/local publication
+        # context.  Queue workers inject a lease-bound facade instead.
+        registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    else:
+        registry = publication_context.registry(workspace.paths.registry_path, workspace.job_id)
 
     # Stage 1 summaries are content-addressed now.  On resume the durable
     # ``summary_file`` record is the current pointer; falling back to the
@@ -235,10 +226,14 @@ def bootstrap_job_runtime(
         if resume_preflight is not None:
             resume_preflight(workspace)
 
-    readiness_policy_snapshot = _readiness_policy_for_request(request)
+    readiness_policy_snapshot = _readiness_policy_for_request(
+        request,
+        validation_enabled=settings.review_validation_enabled(),
+    )
     required_stages = _required_stages_for_request(
         request,
         validation_required=bool(readiness_policy_snapshot["validation_required"]),
+        validation_enabled=settings.review_validation_enabled(),
     )
 
     effective_source_ready = bool(source_canonical_ready) if source_canonical_ready is not None else inventory is not None

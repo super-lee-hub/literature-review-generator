@@ -69,6 +69,7 @@ class JobRunRequest:
     free_mode_profile: Optional[str] = None
     free_mode_idea: Optional[str] = None
     progress_tracker: Optional[Any] = None
+    publication_context: Optional[Any] = None
     gui: bool = False
     source_mode: str = "direct"
     zotero_report: Optional[str] = None
@@ -338,6 +339,7 @@ class JobRunner:
     def _request_snapshot(request: JobRunRequest) -> dict[str, Any]:
         payload = asdict(request)
         payload.pop("progress_tracker", None)
+        payload.pop("publication_context", None)
         return payload
 
     def _build_workspace(
@@ -451,5 +453,9 @@ class JobRunner:
         token = cancel_token or (
             request.progress_tracker if isinstance(request.progress_tracker, CancelToken) else None
         )
-        execution = AgentRuntimeRunner(self._runtime_spec(request), cancel_token=token).run()
+        execution = AgentRuntimeRunner(
+            self._runtime_spec(request),
+            cancel_token=token,
+            publication_context=request.publication_context,
+        ).run()
         return self._result_from_execution(execution)

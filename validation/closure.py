@@ -19,7 +19,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from services.artifact_registry import ArtifactRecord, ArtifactRegistry, CurrentArtifactSetV1, RegistryError
+from services.artifact_registry import (
+    ArtifactRecord,
+    ArtifactRegistry,
+    CurrentArtifactSetV1,
+    RegistryError,
+    file_sha256,
+)
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 from validation.run_result import (
     ValidationRunResultError,
@@ -178,6 +184,7 @@ class CurrentStageClosureMapV1:
     requested_stages: tuple[str, ...] = ()
     spec_hash: str = ""
     provider_closures_by_stage: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    current_set_required: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -194,12 +201,19 @@ class CurrentStageClosureMapV1:
             "provider_closures_by_stage": {
                 str(key): dict(value) for key, value in self.provider_closures_by_stage.items()
             },
+            "current_set_required": self.current_set_required,
         }
 
 
 _PROVIDER_STAGE_NAMES = {
     "analyze": "stage1_analyze",
     "outline": "stage2_outline",
+    "review": "stage3_review",
+    "validate": "stage4_validate",
+}
+_PROVIDER_RECEIPT_STAGE_NAMES = {
+    "analyze": "stage1_analyze",
+    "outline": "outline_v3",
     "review": "stage3_review",
     "validate": "stage4_validate",
 }
@@ -212,10 +226,8 @@ _ACTION_STAGE_DEFAULTS = {
     "retry_failed": ("analyze",),
     "retry_review_failed": ("outline", "review"),
     "validate_review": ("validate",),
-    # Keep this fallback identical to AgentRuntimeRunner._requested_stages.
-    # Validation is requested only when it is explicit in the durable spec or
-    # the action is validate_review; a default run_all does not silently add a
-    # stage that the runner did not execute.
+    # The production runner persists a typed stage plan.  This fallback is
+    # retained only for legacy workspaces that predate that durable plan.
     "run_all": ("analyze", "outline", "review"),
 }
 
@@ -260,6 +272,27 @@ def _durable_requested_stages(registry: ArtifactRegistry) -> tuple[tuple[str, ..
     return normalized, spec_hash, ()
 
 
+def _durable_current_set_required(
+    registry: ArtifactRegistry,
+    requested_stages: Sequence[str],
+) -> bool:
+    """Read the persisted stage-plan current-set gate without trusting a projection."""
+
+    fallback = "validate" in requested_stages
+    workspace_root = Path(registry.registry_path).parent
+    candidates = (
+        workspace_root / "artifacts" / "runtime_job_spec_v1.json",
+        workspace_root / "runtime_job_spec_v1.json",
+    )
+    spec_path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    raw = _json_object(spec_path)
+    metadata = raw.get("metadata") if isinstance(raw, Mapping) else None
+    stage_plan = metadata.get("stage_plan") if isinstance(metadata, Mapping) else None
+    if not isinstance(stage_plan, Mapping) or "current_artifact_set_required" not in stage_plan:
+        return fallback
+    return bool(stage_plan.get("current_artifact_set_required"))
+
+
 def _payload_for_record(record: ArtifactRecord) -> tuple[Mapping[str, Any] | None, list[Mapping[str, Any]]]:
     """Load a JSON closure or JSONL provider ledger without trusting projections."""
 
@@ -289,7 +322,7 @@ def _provider_record_for_stage(
     current_set: CurrentArtifactSetV1 | None,
 ) -> ArtifactRecord | None:
     preferred_ids: dict[str, tuple[str, ...]] = {
-        "analyze": ("stage1:provider_receipt_closure", "stage1_provider_receipts"),
+        "analyze": ("stage1:provider_receipt_closure",),
         "outline": ("outline-v3:provider_receipt_closure",),
         "review": ("review:provider_receipt_closure",),
         "validate": (
@@ -300,7 +333,7 @@ def _provider_record_for_stage(
     ready = [
         item for item in records
         if item.status == "ready"
-        and item.artifact_type in {"provider_receipt_closure", "provider_receipt_ledger"}
+        and item.artifact_type == "provider_receipt_closure"
     ]
     for artifact_id in preferred_ids.get(stage, ()):
         if not artifact_id:
@@ -309,6 +342,7 @@ def _provider_record_for_stage(
         if candidate is not None:
             return candidate
     expected_stage_name = _PROVIDER_STAGE_NAMES.get(stage, stage)
+    expected_receipt_stage_name = _PROVIDER_RECEIPT_STAGE_NAMES.get(stage, expected_stage_name)
     candidates: list[ArtifactRecord] = []
     for item in ready:
         metadata_stage = str(item.metadata.get("stage_name") or "")
@@ -354,6 +388,7 @@ def _provider_closure_entry(
     """Build a stage-indexed, hash-bound closure descriptor."""
 
     expected_stage_name = _PROVIDER_STAGE_NAMES.get(stage, stage)
+    expected_receipt_stage_name = _PROVIDER_RECEIPT_STAGE_NAMES.get(stage, expected_stage_name)
     terminal_status = str((terminal_payload or {}).get("status") or "")
     terminal_model_calls = int((terminal_payload or {}).get("model_call_count") or 0)
     entry: dict[str, Any] = {
@@ -388,11 +423,10 @@ def _provider_closure_entry(
     elif terminal_status != "succeeded":
         blocking.append(f"requested_stage_terminal_not_succeeded:{stage}")
     if record is None:
-        if terminal_model_calls > 0:
-            blocking.append(f"provider_closure_missing:{stage}")
-        else:
-            entry["status"] = "not_required"
-            entry["complete"] = True
+        # A terminal call count/ledger row is not an expected-call contract.
+        # Every requested provider stage must publish a closure artifact, even
+        # when its expected set is empty.
+        blocking.append(f"provider_closure_missing:{stage}")
         return entry, blocking
 
     entry.update(
@@ -412,7 +446,25 @@ def _provider_closure_entry(
     except (OSError, RegistryError, ValueError, TypeError) as exc:
         blocking.append(f"provider_closure_untrusted:{stage}:{exc}")
     payload, receipt_rows = _payload_for_record(record)
-    closure = payload if isinstance(payload, Mapping) else {}
+    raw_envelope = _json_object(record.path)
+    closure = dict(payload) if isinstance(payload, Mapping) else {}
+    # Stage 1 keeps the closure result under ``payload`` and the predeclared
+    # call graph in the outer envelope; review/validation embed the full
+    # contract in the payload.  Normalize both durable layouts before any
+    # identity or expected-call comparison so neither projection can weaken
+    # the same closure contract.
+    if isinstance(raw_envelope, Mapping):
+        for field_name in (
+            "job_id",
+            "stage_name",
+            "attempt_id",
+            "logical_attempt_identity",
+            "closure_epoch_id",
+            "expected_call_graph_hash",
+            "expected_calls",
+        ):
+            if field_name not in closure and field_name in raw_envelope:
+                closure[field_name] = raw_envelope[field_name]
     # A closure artifact normally depends on a durable receipt ledger.  Copy
     # the stage-bound receipt facts into the stage descriptor so the map does
     # not reduce input/config/schema provenance to a closure hash alone.
@@ -425,27 +477,174 @@ def _provider_closure_entry(
         dependency_receipts.extend(
             row
             for row in dependency_rows
-            if not row.get("stage_name") or str(row.get("stage_name")) == expected_stage_name
+            if not row.get("stage_name") or str(row.get("stage_name")) == expected_receipt_stage_name
         )
     if dependency_receipts:
         receipt_rows = dependency_receipts
+    if raw_envelope is None:
+        blocking.append(f"provider_closure_envelope_unreadable:{stage}")
+    outer_job_id = str((raw_envelope or {}).get("job_id") or "")
+    if outer_job_id != registry.job_id:
+        blocking.append(f"provider_closure_outer_job_mismatch:{stage}")
+    closure_job_id = str(closure.get("job_id") or "")
+    if closure_job_id != registry.job_id:
+        blocking.append(f"provider_closure_job_mismatch:{stage}")
+    closure_stage_name = str(
+        closure.get("stage_name")
+        or (raw_envelope or {}).get("stage_name")
+        or record.metadata.get("stage_name")
+        or ""
+    )
+    if closure_stage_name != expected_stage_name:
+        blocking.append(f"provider_closure_stage_name_mismatch:{stage}")
+    closure_epoch_id = str(
+        closure.get("closure_epoch_id")
+        or (raw_envelope or {}).get("closure_epoch_id")
+        or record.metadata.get("closure_epoch_id")
+        or ""
+    )
+    if not closure_epoch_id:
+        blocking.append(f"provider_closure_epoch_missing:{stage}")
+    expected_graph_hash = str(
+        closure.get("expected_call_graph_hash")
+        or (raw_envelope or {}).get("expected_call_graph_hash")
+        or record.metadata.get("expected_call_graph_hash")
+        or ""
+    )
+    if not expected_graph_hash:
+        blocking.append(f"provider_closure_expected_graph_missing:{stage}")
+    raw_expected_calls = closure.get("expected_calls")
+    expected_call_payloads = (
+        [item for item in raw_expected_calls if isinstance(item, Mapping)]
+        if isinstance(raw_expected_calls, list)
+        else []
+    )
+    if not isinstance(raw_expected_calls, list) or len(expected_call_payloads) != len(raw_expected_calls):
+        blocking.append(f"provider_closure_expected_calls_missing:{stage}")
+    expected_payload_ids = [str(item.get("call_id") or "") for item in expected_call_payloads]
+    if any(not item for item in expected_payload_ids) or len(set(expected_payload_ids)) != len(expected_payload_ids):
+        blocking.append(f"provider_closure_expected_call_identity_invalid:{stage}")
+    expected_graph_hashes = {
+        str(item.get("expected_call_graph_hash") or "")
+        for item in expected_call_payloads
+        if str(item.get("expected_call_graph_hash") or "")
+    }
+    if expected_graph_hash and expected_graph_hashes and expected_graph_hashes != {expected_graph_hash}:
+        blocking.append(f"provider_closure_expected_graph_mismatch:{stage}")
+    dependency_records = [
+        dependency_record
+        for dependency in record.depends_on
+        if (dependency_record := registry.get(dependency.artifact_id)) is not None
+        and dependency_record.status == "ready"
+    ]
+    dependency_paths = {
+        str(Path(dependency_record.path).resolve()): dependency_record
+        for dependency_record in dependency_records
+    }
+    for expected_call in expected_call_payloads:
+        call_id = str(expected_call.get("call_id") or "") or "unknown"
+        identity_fields = {
+            "job_id": (str(expected_call.get("job_id") or ""), registry.job_id),
+            "stage_name": (str(expected_call.get("stage_name") or ""), expected_receipt_stage_name),
+            "attempt_id": (str(expected_call.get("attempt_id") or ""), "<non-empty>"),
+            "node_id": (str(expected_call.get("node_id") or ""), "<non-empty>"),
+            "logical_attempt_identity": (
+                str(expected_call.get("logical_attempt_identity") or ""),
+                "<non-empty>",
+            ),
+            "closure_epoch_id": (str(expected_call.get("closure_epoch_id") or ""), closure_epoch_id),
+            "expected_call_graph_hash": (
+                str(expected_call.get("expected_call_graph_hash") or ""),
+                expected_graph_hash,
+            ),
+        }
+        for field_name, (actual, required) in identity_fields.items():
+            if (required == "<non-empty>" and not actual) or (
+                required != "<non-empty>" and actual != required
+            ):
+                blocking.append(
+                    f"provider_closure_expected_call_identity_mismatch:{stage}:{call_id}:{field_name}"
+                )
+        artifact_path = str(expected_call.get("artifact_path") or "").strip()
+        registry_file_hash = str(expected_call.get("registry_file_hash") or "").strip()
+        if not artifact_path:
+            blocking.append(f"provider_closure_expected_artifact_path_missing:{stage}:{call_id}")
+            continue
+        if not registry_file_hash:
+            blocking.append(f"provider_closure_expected_registry_hash_missing:{stage}:{call_id}")
+            continue
+        resolved_path = str(Path(artifact_path).resolve())
+        dependency_record = dependency_paths.get(resolved_path)
+        if dependency_record is None:
+            blocking.append(
+                f"provider_closure_expected_artifact_dependency_missing:{stage}:{call_id}"
+            )
+        elif dependency_record.content_hash != registry_file_hash:
+            blocking.append(
+                f"provider_closure_expected_artifact_dependency_hash_mismatch:{stage}:{call_id}"
+            )
+        try:
+            if file_sha256(artifact_path) != registry_file_hash:
+                blocking.append(f"provider_closure_expected_file_hash_mismatch:{stage}:{call_id}")
+        except (OSError, TypeError, ValueError):
+            blocking.append(f"provider_closure_expected_artifact_unreadable:{stage}:{call_id}")
     expected_ids = [str(item) for item in closure.get("expected_call_ids") or () if str(item)]
     observed_ids = [str(item) for item in closure.get("observed_call_ids") or () if str(item)]
-    if receipt_rows:
-        expected_ids = sorted({str(item.get("call_id") or "") for item in receipt_rows if str(item.get("call_id") or "")})
-        observed_ids = list(expected_ids)
+    # Never derive the expected set from the receipt ledger.  The closure
+    # payload must carry the predeclared call graph explicitly.
     entry["closure_epoch_id"] = str(closure.get("closure_epoch_id") or record.metadata.get("closure_epoch_id") or "")
     entry["expected_call_ids"] = sorted(set(expected_ids))
     entry["observed_call_ids"] = sorted(set(observed_ids))
     entry["input_hashes"] = sorted({str(item.get("input_hash") or "") for item in receipt_rows if str(item.get("input_hash") or "")})
     entry["config_hashes"] = sorted({str(item.get("config_hash") or "") for item in receipt_rows if str(item.get("config_hash") or "")})
     entry["schema_hashes"] = sorted({str(item.get("schema_hash") or "") for item in receipt_rows if str(item.get("schema_hash") or "")})
-    entry["call_graph_hash"] = str(closure.get("closure_hash") or "") or _stable_hash(
-        entry["expected_call_ids"]
-    )
-    complete = bool(closure.get("complete")) if payload is not None else bool(receipt_rows) and all(
-        str(item.get("status") or "") == "success" for item in receipt_rows
-    )
+    entry["call_graph_hash"] = expected_graph_hash
+    if set(expected_ids) != set(expected_payload_ids):
+        blocking.append(f"provider_closure_expected_call_set_mismatch:{stage}")
+    if set(observed_ids) != set(expected_ids):
+        blocking.append(f"provider_closure_observed_call_set_mismatch:{stage}")
+    if entry["closure_epoch_id"] != closure_epoch_id:
+        blocking.append(f"provider_closure_epoch_mismatch:{stage}")
+    if not any(
+        dependency_record.artifact_type == "provider_receipt_ledger"
+        for dependency_record in record.depends_on
+    ):
+        blocking.append(f"provider_closure_receipt_ledger_dependency_missing:{stage}")
+    terminal_output_ids = {
+        str(item.get("artifact_id") or "")
+        for item in (terminal_payload or {}).get("output_artifact_refs") or ()
+        if isinstance(item, Mapping) and str(item.get("artifact_id") or "")
+    }
+    if record.artifact_id not in terminal_output_ids and not any(
+        str(item.get("content_hash") or "") == record.content_hash
+        for item in (terminal_payload or {}).get("output_artifact_refs") or ()
+        if isinstance(item, Mapping)
+    ):
+        blocking.append(f"provider_closure_terminal_dependency_missing:{stage}")
+    expected_by_id = {
+        str(item.get("call_id") or ""): item
+        for item in expected_call_payloads
+        if str(item.get("call_id") or "")
+    }
+    receipt_row_ids = {str(row.get("call_id") or "") for row in receipt_rows if str(row.get("call_id") or "")}
+    if receipt_rows and receipt_row_ids != set(observed_ids):
+        blocking.append(f"provider_closure_receipt_set_mismatch:{stage}")
+    for row in receipt_rows:
+        row_stage = str(row.get("stage_name") or "")
+        row_job = str(row.get("job_id") or "")
+        row_epoch = str(row.get("closure_epoch_id") or "")
+        if row_job != registry.job_id or row_stage != expected_receipt_stage_name or row_epoch != closure_epoch_id:
+            blocking.append(f"provider_closure_receipt_identity_mismatch:{stage}")
+        expected_row = expected_by_id.get(str(row.get("call_id") or ""))
+        if expected_row is None:
+            continue
+        for field_name in ("prompt_hash", "input_hash", "config_hash", "schema_hash"):
+            expected_value = str(expected_row.get(field_name) or "")
+            if not expected_value or str(row.get(field_name) or "") != expected_value:
+                blocking.append(f"provider_closure_receipt_binding_mismatch:{stage}:{field_name}")
+    if not str(closure.get("closure_hash") or ""):
+        blocking.append(f"provider_closure_hash_missing:{stage}")
+    complete = bool(closure.get("complete")) if payload is not None else False
     entry["complete"] = complete
     entry["status"] = "complete" if complete else "blocked"
     if not complete:
@@ -457,10 +656,8 @@ def _provider_closure_entry(
     observed_stage_names = {
         str(item.get("stage_name") or "") for item in receipt_rows if str(item.get("stage_name") or "")
     }
-    if observed_stage_names and observed_stage_names != {expected_stage_name}:
+    if observed_stage_names and observed_stage_names != {expected_receipt_stage_name}:
         blocking.append(f"provider_closure_stage_mismatch:{stage}")
-    if str(closure.get("job_id") or "") and str(closure.get("job_id")) != registry.job_id:
-        blocking.append(f"provider_closure_job_mismatch:{stage}")
     return entry, blocking
 
 
@@ -478,12 +675,13 @@ def resolve_current_stage_closure_map(
         current_set = registry.resolve_current_artifact_set()
     except (OSError, RegistryError, ValueError, TypeError) as exc:
         blocking.append(f"current_artifact_set_untrusted:{exc}")
-    if current_set is None and not blocking:
-        blocking.append("current_artifact_set_missing")
     stages: dict[str, Mapping[str, Any]] = {}
     provider_closures: dict[str, Mapping[str, Any]] = {}
     requested_stages, spec_hash, spec_blocking = _durable_requested_stages(registry)
     blocking.extend(spec_blocking)
+    current_set_required = _durable_current_set_required(registry, requested_stages)
+    if current_set is None and not blocking and current_set_required:
+        blocking.append("current_artifact_set_missing")
     records = registry.list_records()
     if current_set is not None:
         targets = (
@@ -502,19 +700,19 @@ def resolve_current_stage_closure_map(
                 blocking.append(f"current_stage_artifact_hash_mismatch:{stage}")
                 continue
             stages[stage] = _record_payload(record) or {}
-        logical_stages = tuple(stage for stage in requested_stages if stage in _PROVIDER_STAGE_NAMES)
-        for logical_stage in logical_stages:
-            terminal_record, terminal_payload = _terminal_for_stage(logical_stage, records)
-            provider_record = _provider_record_for_stage(logical_stage, records, current_set)
-            entry, entry_blocking = _provider_closure_entry(
-                logical_stage,
-                provider_record,
-                terminal_record,
-                terminal_payload,
-                registry,
-            )
-            provider_closures[logical_stage] = entry
-            blocking.extend(entry_blocking)
+    logical_stages = tuple(stage for stage in requested_stages if stage in _PROVIDER_STAGE_NAMES)
+    for logical_stage in logical_stages:
+        terminal_record, terminal_payload = _terminal_for_stage(logical_stage, records)
+        provider_record = _provider_record_for_stage(logical_stage, records, current_set)
+        entry, entry_blocking = _provider_closure_entry(
+            logical_stage,
+            provider_record,
+            terminal_record,
+            terminal_payload,
+            registry,
+        )
+        provider_closures[logical_stage] = entry
+        blocking.extend(entry_blocking)
     payload = {
         "job_id": resolved_job_id,
         "current_set_id": current_set.set_id if current_set else "",
@@ -534,6 +732,7 @@ def resolve_current_stage_closure_map(
         requested_stages=requested_stages,
         spec_hash=spec_hash,
         provider_closures_by_stage=provider_closures,
+        current_set_required=current_set_required,
     )
 
 
@@ -556,7 +755,11 @@ class ValidationClosureService:
         if current_set is not None:
             draft = self.registry.get(current_set.review_draft_artifact_id)
             manifest = self.registry.get(current_set.citation_manifest_artifact_id)
-            validation = self.registry.get(current_set.validation_run_result_artifact_id)
+            validation = (
+                _choose_record(records, artifact_type="validation_run_result", version="v1")
+                if current_set.validation_status == "not_requested"
+                else self.registry.get(current_set.validation_run_result_artifact_id)
+            )
             if draft is None:
                 blocking.append("current_set_review_draft_missing")
             if manifest is None:
@@ -799,6 +1002,14 @@ class ValidationClosureService:
                 map_hash=_stable_hash({"error": str(exc)}),
                 blocking_issues=(f"current_stage_closure_map_untrusted:{exc}",),
             )
+        for issue in stage_map.blocking_issues:
+            if issue not in blocking:
+                blocking.append(issue)
+        if stage_map.blocking_issues:
+            status = "blocked"
+        evidence_payload["status"] = status
+        evidence_payload["blocking_issues"] = sorted(set(blocking))
+        evidence_payload["stage_closure_map_hash"] = stage_map.map_hash
         return ValidationClosureResult(
             job_id=self.workspace.job_id,
             status=status,

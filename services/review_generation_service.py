@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import logging
@@ -18,6 +18,7 @@ from runtime.provider_runtime import (
     ProviderRuntime,
     ProviderRuntimeLedger,
     _redact_mapping,
+    compute_closure_epoch_id,
     hash_json,
     hash_text,
 )
@@ -74,6 +75,8 @@ class ReviewGenerationService:
             self.workspace.artifact_path("review_provider_receipts.jsonl")
         )
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
+        self.expected_call_graph_hash = ""
+        self.closure_epoch_id = ""
 
     def run(
         self,
@@ -91,6 +94,78 @@ class ReviewGenerationService:
         raw_sections = outline_payload.get("sections")
         if not isinstance(raw_sections, list):
             raise RuntimeError("Review v3 outline payload has no sections array")
+
+        section_ids = tuple(
+            str(raw_section.get("section_id") or f"section_{number}").strip()
+            for number, raw_section in enumerate(raw_sections, start=1)
+            if isinstance(raw_section, Mapping)
+        )
+        if not section_ids:
+            raise RuntimeError("Review v3 outline contains no executable sections")
+        writer_config_for_epoch = dict(self.settings.section("Writer_API"))
+        self.expected_call_graph_hash = hash_json(
+            {
+                "stage_name": "stage3_review",
+                "call_ids": [f"review:{section_id}" for section_id in section_ids],
+                "schema_hash": hashlib.sha256(b"review_draft_v3_writer_section").hexdigest(),
+            }
+        )
+        self.closure_epoch_id = compute_closure_epoch_id(
+            job_id=self.job_id,
+            stage_name="stage3_review",
+            logical_attempt_identity=self.attempt_id,
+            expected_call_graph_hash=self.expected_call_graph_hash,
+            current_input_artifact_hashes={
+                "outline": hash_json(outline_payload),
+                "catalog": hash_json(catalog),
+                "evidence_packets": hash_json(evidence_packets),
+                "summaries": hash_json(self.summaries),
+            },
+            provider_config_hash=hash_json(_redact_mapping(writer_config_for_epoch)),
+            schema_version="review-v3",
+        )
+
+        # Predeclare the complete section graph before the first Writer
+        # transport.  Resume may later fill output hashes from an existing
+        # section replay, but it cannot change the expected call set.
+        for number, raw_section in enumerate(raw_sections, start=1):
+            if not isinstance(raw_section, Mapping):
+                continue
+            section_id = str(raw_section.get("section_id") or f"section_{number}").strip()
+            packet = packet_by_section.get(section_id)
+            if packet is None:
+                raise RuntimeError(f"Review v3 has no evidence packet for section {section_id}")
+            self._require_nonempty_packet(packet, section_id)
+            allowed_ref_ids = self._allowed_ref_ids(packet, catalog)
+            runtime = self._new_runtime(section_id)
+            prompt = self._prompt(raw_section, packet, catalog, allowed_ref_ids)
+            request_payload = self._writer_request_payload(prompt)
+            binding = self._section_binding(
+                section_id=section_id,
+                raw_section=raw_section,
+                packet=packet,
+                catalog=catalog,
+                request_payload=request_payload,
+                runtime=runtime,
+                writer_config=writer_config_for_epoch,
+            )
+            self._expected_provider_calls[f"review:{section_id}"] = ExpectedProviderCall(
+                call_id=f"review:{section_id}",
+                job_id=self.job_id,
+                attempt_id=runtime.attempt_id,
+                stage_name=runtime.stage_name,
+                node_id=section_id,
+                closure_epoch_id=self.closure_epoch_id,
+                logical_attempt_identity=self.attempt_id,
+                expected_call_graph_hash=self.expected_call_graph_hash,
+                prompt_hash=str(binding["prompt_hash"]),
+                input_hash=str(binding["prompt_payload_hash"]),
+                config_hash=str(binding["writer_config_hash"]),
+                schema_hash=runtime.schema_hash,
+                max_attempts=max(1, self.settings.runtime.node_retry_limit + 1),
+                usage_required=str(writer_config_for_epoch.get("endpoint_type") or "responses")
+                not in {"internal", "fixture"},
+            )
 
         for number, raw_section in enumerate(raw_sections, start=1):
             self._check_cancelled()
@@ -122,6 +197,9 @@ class ReviewGenerationService:
                 attempt_id=runtime.attempt_id,
                 stage_name=runtime.stage_name,
                 node_id=section_id,
+                closure_epoch_id=self.closure_epoch_id,
+                logical_attempt_identity=self.attempt_id,
+                expected_call_graph_hash=self.expected_call_graph_hash,
                 prompt_hash=str(binding["prompt_hash"]),
                 input_hash=str(binding["prompt_payload_hash"]),
                 config_hash=str(binding["writer_config_hash"]),
@@ -566,19 +644,66 @@ class ReviewGenerationService:
             out_of_scope=out_of_scope_receipts,
         )
         path = Path(self.workspace.artifact_path("review_provider_receipt_closure.json"))
+        closure_payload = {
+            **closure.to_dict(),
+            "job_id": self.job_id,
+            "stage_name": "stage3_review",
+            "attempt_id": self.attempt_id,
+            "logical_attempt_identity": self.attempt_id,
+            "closure_epoch_id": self.closure_epoch_id,
+            "expected_call_graph_hash": self.expected_call_graph_hash,
+            "expected_calls": [
+                asdict(expected)
+                for expected in self._expected_provider_calls.values()
+            ],
+        }
         atomic_write_json(
             str(path),
             {
                 "artifact_type": "provider_receipt_closure",
                 "artifact_version": "v1",
                 "job_id": self.job_id,
-                "payload": closure.to_dict(),
+                "stage_name": "stage3_review",
+                "attempt_id": self.attempt_id,
+                "closure_epoch_id": self.closure_epoch_id,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "payload": closure_payload,
             },
         )
         dependencies: list[ArtifactDependencyRefV2] = []
+        dependency_ids: set[str] = set()
+
+        def add_dependency(record: Any) -> None:
+            if record is None or record.status != "ready" or record.artifact_id in dependency_ids:
+                return
+            dependency_ids.add(record.artifact_id)
+            dependencies.append(ArtifactDependencyRefV2.from_record(record))
+
         ledger = self.registry.get("review_provider_receipts")
-        if ledger is not None and ledger.status == "ready":
-            dependencies.append(ArtifactDependencyRefV2.from_record(ledger))
+        add_dependency(ledger)
+        for artifact_id in (
+            "citation_ref_catalog",
+            "outline-v3:final_outline",
+            "outline-v3:section_evidence_packets",
+            "outline-v3:adoption:current",
+        ):
+            add_dependency(self.registry.get(artifact_id))
+        for expected in self._expected_provider_calls.values():
+            expected_path = str(expected.artifact_path or "").strip()
+            if not expected_path:
+                continue
+            expected_resolved = Path(expected_path).resolve()
+            add_dependency(
+                next(
+                    (
+                        record
+                        for record in self.registry.list_records()
+                        if record.status == "ready"
+                        and Path(record.path).resolve() == expected_resolved
+                    ),
+                    None,
+                )
+            )
         self.registry.register_file(
             artifact_role="provider_receipt_closure",
             artifact_type="provider_receipt_closure",
@@ -587,7 +712,15 @@ class ReviewGenerationService:
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id="review:provider_receipt_closure",
             depends_on=dependencies,
-            metadata={"closure_hash": closure.closure_hash, "complete": closure.complete},
+            metadata={
+                "job_id": self.job_id,
+                "stage_name": "stage3_review",
+                "attempt_id": self.attempt_id,
+                "closure_epoch_id": self.closure_epoch_id,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "closure_hash": closure.closure_hash,
+                "complete": closure.complete,
+            },
         )
 
     def _call_writer(
@@ -864,6 +997,8 @@ class ReviewGenerationService:
             route="Writer_API",
             node_id=section_id,
             call_id=f"review:{section_id}",
+            closure_epoch_id=self.closure_epoch_id,
+            logical_attempt_identity=self.attempt_id,
             endpoint_type=str(config.get("endpoint_type") or "responses"),
             schema_hash=hashlib.sha256(b"review_draft_v3_writer_section").hexdigest(),
         )

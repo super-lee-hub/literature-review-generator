@@ -11,9 +11,13 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, List, Optional, TypeGuard, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Mapping, Optional, TypeGuard, TypeVar
 
-from services.artifact_registry import ArtifactRegistry, RegistryError
+from services.artifact_registry import (
+    ArtifactRegistry,
+    PublicationFenceRejected,
+    RegistryError,
+)
 
 T = TypeVar("T")
 
@@ -29,6 +33,10 @@ def _queue_process_lock(path: Path) -> threading.RLock:
 
 class JobCancelledError(RuntimeError):
     pass
+
+
+class QueuePublicationRejected(PublicationFenceRejected):
+    """Raised when a queue-owned canonical publication loses its lease fence."""
 
 
 class QueueState(Enum):
@@ -1141,6 +1149,120 @@ class PersistentQueueService:
             self._jobs = ordered_jobs
             self._save()
 
+    def publication_context(self, lease: QueueLease) -> "QueuePublicationContext":
+        """Return the only canonical publication surface available to a worker."""
+
+        return QueuePublicationContext(self, lease)
+
+
+class QueuePublicationContext:
+    """Lease-bound factory for queue-owned ArtifactRegistry facades."""
+
+    def __init__(self, queue_service: PersistentQueueService, lease: QueueLease) -> None:
+        self.queue_service = queue_service
+        self.lease = lease
+
+    def registry(
+        self,
+        registry_path: str | Path,
+        job_id: str | None = None,
+    ) -> "QueueOwnedArtifactRegistry":
+        target_job_id = str(job_id or self.lease.job_id)
+        if target_job_id != self.lease.job_id:
+            raise QueuePublicationRejected(
+                f"publication job {target_job_id!r} does not match lease job {self.lease.job_id!r}"
+            )
+        return QueueOwnedArtifactRegistry(
+            self.queue_service,
+            self.lease,
+            registry_path=registry_path,
+            job_id=target_job_id,
+        )
+
+
+class QueueOwnedArtifactRegistry(ArtifactRegistry):
+    """ArtifactRegistry whose writes are owned by one live queue lease.
+
+    Lock order is fixed at ``queue store -> Registry``.  The publication guard
+    runs while both locks are held and only inspects the already-loaded queue
+    runtime; it never reacquires the queue lock.
+    """
+
+    def __init__(
+        self,
+        queue_service: PersistentQueueService,
+        lease: QueueLease,
+        *,
+        registry_path: str | Path,
+        job_id: str,
+    ) -> None:
+        self._queue_service = queue_service
+        self._queue_lease = lease
+        super().__init__(
+            registry_path,
+            job_id,
+            publication_guard=self._publication_metadata_unlocked,
+        )
+
+    @contextmanager
+    def _queue_write_lock(self):
+        with self._queue_service._store_lock():
+            runtime = self._queue_service._runtimes.get(self._queue_lease.job_id)
+            if not self._queue_service._lease_owned(
+                runtime,
+                lease_id=self._queue_lease.lease_id,
+                worker_id=self._queue_lease.worker_id,
+                lease_generation=self._queue_lease.lease_generation,
+                fence_token=self._queue_lease.fence_token,
+            ):
+                raise QueuePublicationRejected(
+                    f"queue lease is not current for canonical publication: {self._queue_lease.job_id}"
+                )
+            yield
+
+    def _publication_metadata_unlocked(self) -> Mapping[str, Any]:
+        """Recheck the fence without acquiring the queue lock recursively."""
+
+        runtime = self._queue_service._runtimes.get(self._queue_lease.job_id)
+        if not self._queue_service._lease_owned(
+            runtime,
+            lease_id=self._queue_lease.lease_id,
+            worker_id=self._queue_lease.worker_id,
+            lease_generation=self._queue_lease.lease_generation,
+            fence_token=self._queue_lease.fence_token,
+        ):
+            raise QueuePublicationRejected(
+                f"queue lease expired or was reclaimed during canonical publication: "
+                f"{self._queue_lease.job_id}"
+            )
+        return {
+            "job_id": self._queue_lease.job_id,
+            "lease_id": self._queue_lease.lease_id,
+            "worker_id": self._queue_lease.worker_id,
+            "lease_generation": self._queue_lease.lease_generation,
+            "fence_token": self._queue_lease.fence_token,
+        }
+
+    def register_file(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().register_file(*args, **kwargs)
+
+    def register(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().register(*args, **kwargs)
+
+    def update_record(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().update_record(*args, **kwargs)
+
+    def save(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().save(*args, **kwargs)
+
+    def switch_current_artifact_set(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().switch_current_artifact_set(*args, **kwargs)
+
 
 def create_queue_job_id() -> str:
     return f"job_{uuid.uuid4().hex[:12]}"
@@ -1382,7 +1504,11 @@ class QueueRunner:
             progress_tracker = QueueRuntimeProgressTracker(
                 lambda snapshot, jid=job_spec.job_id: self._update_job_progress_snapshot(jid, snapshot)
             )
-            request = replace(request, progress_tracker=progress_tracker)
+            request = replace(
+                request,
+                progress_tracker=progress_tracker,
+                publication_context=self.queue_service.publication_context(lease),
+            )
             
             
             # 计算工作区路径（基于项目名称和任务ID）
@@ -1531,24 +1657,6 @@ class QueueRunner:
         if lease is None:
             self._mark_lease_lost(job_id)
             raise RuntimeError(f"queue lease lost while publishing runtime info for {job_id}")
-        produced_artifacts = [
-            str(item) for item in info.get("produced_artifacts") or () if str(item).strip()
-        ]
-        workspace_path = Path(str(info.get("workspace_path") or "")).expanduser()
-        registry_path = workspace_path / "artifact_registry.json"
-        verified_registry_path: Path | None = registry_path if registry_path.is_file() else None
-        for artifact in produced_artifacts:
-            if not self.queue_service.register_canonical_artifact_with_lease(
-                job_id,
-                artifact,
-                lease_id=lease.lease_id,
-                worker_id=lease.worker_id,
-                lease_generation=lease.lease_generation,
-                fence_token=lease.fence_token,
-                registry_path=verified_registry_path,
-            ):
-                self._mark_lease_lost(job_id)
-                raise RuntimeError(f"queue lease or canonical Registry lost for {job_id}")
         if not self.queue_service.update_job_runtime_info_with_lease(
             job_id,
             info,

@@ -242,6 +242,9 @@ def _test_config(tmp_path: Path) -> Path:
     parser["Validator_API"]["model"] = "validator-test"
     parser["Outline"]["candidate_count"] = "2"
     parser["Outline"]["require_explicit_adoption"] = "true"
+    # This chain verifies the legacy deterministic provider fixture. Stability
+    # smoke coverage is exercised by the dedicated Outline stability tests.
+    parser["OutlineStability"]["mode"] = "off"
     parser["Validation"]["review_enabled"] = "true"
     with target.open("w", encoding="utf-8") as handle:
         parser.write(handle)
@@ -317,11 +320,13 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     )
 
     # Production orchestration reaches the explicit adoption boundary and
-    # persists the failed review terminal; it does not auto-promote the outline.
+    # pauses before review; it does not auto-promote the outline.
     first = AgentRuntimeRunner(spec).run()
-    assert first.job_status == "failed", first
-    assert first.failed_stage == "review", first
+    assert first.job_status == "completed", first
+    assert first.job_disposition == "needs_review", first
+    assert first.failed_stage is None, first
     assert first.completed_stages == ("source_intake", "analyze", "outline"), first
+    assert "explicit adoption" in first.message, first
 
     control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
     inspection = control.inspect(workspace=first.workspace_path)

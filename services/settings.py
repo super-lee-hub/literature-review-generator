@@ -106,6 +106,21 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "max_outline_retry_count",
         }
     ),
+    "OutlineStability": frozenset(
+        {
+            "mode",
+            "max_provider_calls",
+            "max_estimated_cost",
+            "estimated_cost_per_1k_tokens",
+            "input_cost_per_1k_tokens",
+            "output_cost_per_1k_tokens",
+            "reasoning_cost_per_1k_tokens",
+            "cache_read_cost_per_1k_tokens",
+            "cache_write_cost_per_1k_tokens",
+            "max_smoke_overhead_ratio",
+            "max_source_prompt_tokens",
+        }
+    ),
     "OutlineQualityGate": frozenset(
         {
             "coverage_scope",
@@ -265,11 +280,47 @@ class OutlineSettings:
 
 
 @dataclass(frozen=True)
+class OutlineStabilitySettings:
+    mode: str = "smoke"
+    max_provider_calls: int = 24
+    max_estimated_cost: float = 5.0
+    estimated_cost_per_1k_tokens: float = 0.001
+    input_cost_per_1k_tokens: float = 0.0
+    output_cost_per_1k_tokens: float = 0.001
+    reasoning_cost_per_1k_tokens: float = 0.001
+    cache_read_cost_per_1k_tokens: float = 0.0
+    cache_write_cost_per_1k_tokens: float = 0.0
+    max_smoke_overhead_ratio: float = 2.0
+    max_source_prompt_tokens: int = 0
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "OutlineStabilitySettings":
+        section = _section(config, "OutlineStability")
+        mode = str(section.get("mode") or "smoke").strip().lower()
+        if mode not in {"off", "smoke", "full"}:
+            mode = "smoke"
+        return cls(
+            mode=mode,
+            max_provider_calls=max(0, _int(section.get("max_provider_calls"), 24)),
+            max_estimated_cost=max(0.0, _float(section.get("max_estimated_cost"), 5.0)),
+            estimated_cost_per_1k_tokens=max(0.0, _float(section.get("estimated_cost_per_1k_tokens"), 0.001)),
+            input_cost_per_1k_tokens=max(0.0, _float(section.get("input_cost_per_1k_tokens"), 0.0)),
+            output_cost_per_1k_tokens=max(0.0, _float(section.get("output_cost_per_1k_tokens"), 0.001)),
+            reasoning_cost_per_1k_tokens=max(0.0, _float(section.get("reasoning_cost_per_1k_tokens"), 0.001)),
+            cache_read_cost_per_1k_tokens=max(0.0, _float(section.get("cache_read_cost_per_1k_tokens"), 0.0)),
+            cache_write_cost_per_1k_tokens=max(0.0, _float(section.get("cache_write_cost_per_1k_tokens"), 0.0)),
+            max_smoke_overhead_ratio=max(1.0, _float(section.get("max_smoke_overhead_ratio"), 2.0)),
+            max_source_prompt_tokens=max(0, _int(section.get("max_source_prompt_tokens"), 0)),
+        )
+
+
+@dataclass(frozen=True)
 class ApplicationSettings:
     config_schema: int = CONFIG_SCHEMA_VERSION
     validation: ValidationSettings = field(default_factory=ValidationSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     outline: OutlineSettings = field(default_factory=OutlineSettings)
+    outline_stability: OutlineStabilitySettings = field(default_factory=OutlineStabilitySettings)
     sections: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     @classmethod
@@ -280,6 +331,7 @@ class ApplicationSettings:
             validation=ValidationSettings.from_config(config),
             runtime=RuntimeSettings.from_config(config),
             outline=OutlineSettings.from_config(config),
+            outline_stability=OutlineStabilitySettings.from_config(config),
             sections={
                 str(section): {str(key): str(value) for key, value in values.items()}
                 for section, values in config.items()
@@ -312,6 +364,9 @@ class ApplicationSettings:
 
     def outline_candidate_count(self) -> int:
         return self.outline.candidate_count
+
+    def outline_stability_settings(self) -> OutlineStabilitySettings:
+        return self.outline_stability
 
     def outline_require_explicit_adopt(self) -> bool:
         return self.outline.require_explicit_adoption

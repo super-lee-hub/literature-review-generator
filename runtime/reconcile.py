@@ -694,8 +694,43 @@ def _validate_provider_receipt_ledger(record: ArtifactRecord, path: Path) -> Non
             raise ReconcileValidationError(
                 "provider receipt job_id does not match its Registry owner"
             )
-            if not receipt.receipt_id or not receipt.stage_name or not receipt.route:
-                raise ReconcileValidationError("provider receipt is missing its durable routing identity")
+        if not receipt.receipt_id or not receipt.stage_name or not receipt.route:
+            raise ReconcileValidationError("provider receipt is missing its durable routing identity")
+
+
+def _validate_provider_output(record: ArtifactRecord, path: Path) -> None:
+    """Validate one durable normalized provider output referenced by a closure."""
+
+    from runtime.provider_runtime import hash_json
+
+    payload = _read_json_object(path)
+    required = {
+        "artifact_type",
+        "artifact_version",
+        "job_id",
+        "attempt_id",
+        "stage_name",
+        "call_id",
+        "content_hash",
+        "payload",
+    }
+    missing = sorted(field for field in required if field not in payload)
+    if missing:
+        raise ReconcileValidationError(
+            "provider output is missing required fields: " + ", ".join(missing)
+        )
+    if payload.get("artifact_type") != "validation_provider_output":
+        raise ReconcileValidationError("provider output artifact_type is invalid")
+    if payload.get("artifact_version") != "v1":
+        raise ReconcileValidationError("provider output artifact_version is invalid")
+    if str(payload.get("job_id") or "") != record.job_id:
+        raise ReconcileValidationError("provider output job_id does not match its Registry owner")
+    for field in ("attempt_id", "stage_name", "call_id"):
+        if not str(payload.get(field) or "").strip():
+            raise ReconcileValidationError(f"provider output {field} is empty")
+    content_hash = str(payload.get("content_hash") or "")
+    if content_hash != hash_json(payload.get("payload")):
+        raise ReconcileValidationError("provider output content_hash does not match payload")
 
 
 def _validate_current_production_artifact(record: ArtifactRecord, path: Path) -> None:
@@ -1474,6 +1509,7 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "review_docx": _validate_docx,
     "source_pdf": _validate_pdf,
     "validation_run_result": _validate_validation_run_result,
+    "validation_disposition": _validate_json_object,
     "runtime_job_spec": _validate_json_object,
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_summary_source_manifest,
@@ -1488,7 +1524,9 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "citation_manifest": _validate_citation_manifest,
     "citation_ref_catalog": _validate_citation_ref_catalog,
     "provider_receipt_ledger": _validate_provider_receipt_ledger,
+    "validation_provider_output": _validate_provider_output,
     "provider_receipt_closure": _validate_provider_receipt_closure,
+    "provider_expected_call_graph": _validate_json_object,
     "stage1_canonical_summaries": _validate_json_object,
     "audit_record": _validate_audit_record,
     "validation_report_projection": _validate_nonempty_text,

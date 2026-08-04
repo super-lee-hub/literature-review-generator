@@ -7,8 +7,9 @@ only cross-paper synthesis and outline decisions use the provider boundary.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -143,6 +144,14 @@ class OutlineV3Executor:
         max_provider_calls: int | None = None,
         max_estimated_cost: float | None = None,
         estimated_cost_per_1k_tokens: float = 0.001,
+        input_cost_per_1k_tokens: float = 0.0,
+        output_cost_per_1k_tokens: float | None = None,
+        reasoning_cost_per_1k_tokens: float | None = None,
+        cache_read_cost_per_1k_tokens: float = 0.0,
+        cache_write_cost_per_1k_tokens: float = 0.0,
+        max_smoke_overhead_ratio: float | None = None,
+        max_source_prompt_tokens: int | None = None,
+        publication_context: Any | None = None,
         _skip_exact_replay_verification: bool = False,
     ) -> None:
         if not str(job_id).strip():
@@ -156,12 +165,27 @@ class OutlineV3Executor:
             raise ValueError("max_provider_calls cannot be negative")
         if max_estimated_cost is not None and float(max_estimated_cost) < 0:
             raise ValueError("max_estimated_cost cannot be negative")
-        if float(estimated_cost_per_1k_tokens) < 0:
-            raise ValueError("estimated_cost_per_1k_tokens cannot be negative")
+        for name, value in {
+            "estimated_cost_per_1k_tokens": estimated_cost_per_1k_tokens,
+            "input_cost_per_1k_tokens": input_cost_per_1k_tokens,
+            "output_cost_per_1k_tokens": estimated_cost_per_1k_tokens if output_cost_per_1k_tokens is None else output_cost_per_1k_tokens,
+            "reasoning_cost_per_1k_tokens": estimated_cost_per_1k_tokens if reasoning_cost_per_1k_tokens is None else reasoning_cost_per_1k_tokens,
+            "cache_read_cost_per_1k_tokens": cache_read_cost_per_1k_tokens,
+            "cache_write_cost_per_1k_tokens": cache_write_cost_per_1k_tokens,
+        }.items():
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if max_smoke_overhead_ratio is not None and (
+            not math.isfinite(float(max_smoke_overhead_ratio)) or float(max_smoke_overhead_ratio) < 1.0
+        ):
+            raise ValueError("max_smoke_overhead_ratio must be at least 1")
+        if max_source_prompt_tokens is not None and int(max_source_prompt_tokens) < 0:
+            raise ValueError("max_source_prompt_tokens cannot be negative")
         self.job_id = str(job_id)
         self.summaries = [dict(item) for item in summaries]
         self.workspace = workspace
         self.registry = artifact_registry or self._build_registry()
+        self.publication_context = publication_context
         self.provider = provider
         self.profile = provider_profile or ProviderContextProfile.conservative(
             provider="fixture" if provider is None else "configured",
@@ -175,6 +199,21 @@ class OutlineV3Executor:
         self.max_provider_calls = int(max_provider_calls) if max_provider_calls is not None else None
         self.max_estimated_cost = float(max_estimated_cost) if max_estimated_cost is not None else None
         self.estimated_cost_per_1k_tokens = float(estimated_cost_per_1k_tokens)
+        self.input_cost_per_1k_tokens = float(input_cost_per_1k_tokens)
+        self.output_cost_per_1k_tokens = float(
+            estimated_cost_per_1k_tokens if output_cost_per_1k_tokens is None else output_cost_per_1k_tokens
+        )
+        self.reasoning_cost_per_1k_tokens = float(
+            estimated_cost_per_1k_tokens if reasoning_cost_per_1k_tokens is None else reasoning_cost_per_1k_tokens
+        )
+        self.cache_read_cost_per_1k_tokens = float(cache_read_cost_per_1k_tokens)
+        self.cache_write_cost_per_1k_tokens = float(cache_write_cost_per_1k_tokens)
+        self.max_smoke_overhead_ratio = (
+            float(max_smoke_overhead_ratio) if max_smoke_overhead_ratio is not None else None
+        )
+        self.max_source_prompt_tokens = (
+            int(max_source_prompt_tokens) if max_source_prompt_tokens is not None else None
+        )
         self.review_intent_input = dict(review_intent or {})
         self.quality_gate = quality_gate if isinstance(quality_gate, OutlineQualityGate) else OutlineQualityGate.from_mapping(quality_gate)
         self._review_intent_hash = build_review_intent(self.review_intent_input).content_hash
@@ -196,7 +235,7 @@ class OutlineV3Executor:
         self.logical_attempt_identity = str(logical_attempt_identity or "").strip() or (
             f"outline:{hash_json(default_attempt_payload)[:32]}"
         )
-        expected_call_graph_hash = hash_json({
+        self.expected_call_graph_hash = hash_json({
             "provider_nodes": self._provider_node_ids(),
             "stability_roles": ["candidate_provider_generation", "arbitration"],
         })
@@ -204,7 +243,7 @@ class OutlineV3Executor:
             job_id=self.job_id,
             stage_name="outline_v3",
             logical_attempt_identity=self.logical_attempt_identity,
-            expected_call_graph_hash=expected_call_graph_hash,
+            expected_call_graph_hash=self.expected_call_graph_hash,
             current_input_artifact_hashes={
                 "summary_set": hash_json(self.summaries),
                 "review_intent": self._review_intent_hash,
@@ -219,6 +258,7 @@ class OutlineV3Executor:
         self.receipts: list[str] = []
         self.diagnostics: list[str] = []
         self.replay_diagnostics: list[str] = []
+        self._blocking_critic_diagnostics: dict[str, tuple[str, ...]] = {}
         self._payloads: dict[str, dict[str, Any]] = {}
         ledger_root = getattr(self.workspace, "root_dir", None) or self._path("")
         self._receipt_ledger = ProviderRuntimeLedger.for_epoch(
@@ -326,25 +366,21 @@ class OutlineV3Executor:
                 "baseline",
                 list(self.summaries),
                 normal_candidate_order,
-                {"summary_order": "original", "shard_size": len(self.summaries)},
+                {
+                    "summary_order": "original",
+                    "shard_size": len(self.summaries),
+                    "resume": "primary_baseline_reuse",
+                },
             ),
             (
                 "summary_order_reversed",
                 list(reversed(self.summaries)),
                 normal_candidate_order,
-                {"summary_order": "reversed", "shard_size": len(self.summaries)},
-            ),
-            (
-                "candidate_execution_order_permuted",
-                list(self.summaries),
-                list(reversed(normal_candidate_order)),
-                {"summary_order": "original", "candidate_execution_order": "reversed", "shard_size": len(self.summaries)},
-            ),
-            (
-                "exact_replay_resume",
-                list(self.summaries),
-                normal_candidate_order,
-                {"summary_order": "original", "resume": "exact_replay", "shard_size": len(self.summaries)},
+                {
+                    "summary_order": "reversed",
+                    "shard_size": len(self.summaries),
+                    "compact": True,
+                },
             ),
         ]
         if self.stability_mode == "smoke":
@@ -369,8 +405,18 @@ class OutlineV3Executor:
                 normal_candidate_order,
                 {"summary_order": "original", "shard_size": 1, "shard_order": "canonical"},
             ),
-            smoke[2],
-            smoke[3],
+            (
+                "candidate_execution_order_permuted",
+                list(self.summaries),
+                list(reversed(normal_candidate_order)),
+                {"summary_order": "original", "candidate_execution_order": "reversed", "shard_size": len(self.summaries)},
+            ),
+            (
+                "exact_replay_resume",
+                list(self.summaries),
+                normal_candidate_order,
+                {"summary_order": "original", "resume": "exact_replay", "shard_size": len(self.summaries)},
+            ),
         ]
 
     def _preflight_stability_budget(self) -> None:
@@ -378,23 +424,49 @@ class OutlineV3Executor:
         variants = self._stability_variant_plan()
         non_replay_variants = sum(
             1 for _name, _summaries, _order, definition in variants
-            if definition.get("resume") != "exact_replay"
+            if definition.get("resume") not in {"exact_replay", "primary_baseline_reuse"}
         )
         estimated_provider_calls = core_calls * (1 + non_replay_variants)
-        estimated_tokens = estimated_provider_calls * max(
+        estimated_input_per_call = max(
             1,
-            int(self.profile.max_output_tokens) + int(self.profile.reasoning_reserve),
+            int(self.profile.estimate_tokens({"summaries": self.summaries})),
         )
-        estimated_cost = (estimated_tokens / 1000.0) * self.estimated_cost_per_1k_tokens
+        estimated_input_tokens = estimated_provider_calls * estimated_input_per_call
+        estimated_output_tokens = estimated_provider_calls * max(1, int(self.profile.max_output_tokens))
+        estimated_reasoning_tokens = estimated_provider_calls * max(0, int(self.profile.reasoning_reserve))
+        estimated_cached_input_tokens = 0
+        estimated_cache_write_tokens = 0
+        estimated_total_tokens = (
+            estimated_input_tokens + estimated_output_tokens + estimated_reasoning_tokens
+        )
+        estimated_cost = (
+            estimated_input_tokens / 1000.0 * self.input_cost_per_1k_tokens
+            + estimated_output_tokens / 1000.0 * self.output_cost_per_1k_tokens
+            + estimated_reasoning_tokens / 1000.0 * self.reasoning_cost_per_1k_tokens
+            + estimated_cached_input_tokens / 1000.0 * self.cache_read_cost_per_1k_tokens
+            + estimated_cache_write_tokens / 1000.0 * self.cache_write_cost_per_1k_tokens
+        )
         self.stability_preflight = {
             "mode": self.stability_mode,
             "provider_nodes_per_decision": core_calls,
             "variant_names": [name for name, _summaries, _order, _definition in variants],
             "estimated_provider_calls": estimated_provider_calls,
+            "estimated_input_tokens": estimated_input_tokens,
+            "estimated_output_tokens": estimated_output_tokens,
+            "estimated_reasoning_tokens": estimated_reasoning_tokens,
+            "estimated_cached_input_tokens": estimated_cached_input_tokens,
+            "estimated_cache_write_tokens": estimated_cache_write_tokens,
+            "estimated_total_tokens": estimated_total_tokens,
             "estimated_cost": estimated_cost,
             "max_provider_calls": self.max_provider_calls,
             "max_estimated_cost": self.max_estimated_cost,
             "estimated_cost_per_1k_tokens": self.estimated_cost_per_1k_tokens,
+            "input_cost_per_1k_tokens": self.input_cost_per_1k_tokens,
+            "output_cost_per_1k_tokens": self.output_cost_per_1k_tokens,
+            "reasoning_cost_per_1k_tokens": self.reasoning_cost_per_1k_tokens,
+            "cache_read_cost_per_1k_tokens": self.cache_read_cost_per_1k_tokens,
+            "cache_write_cost_per_1k_tokens": self.cache_write_cost_per_1k_tokens,
+            "max_source_prompt_tokens": self.max_source_prompt_tokens,
             "provider_configured": self.provider is not None,
             "preflight_status": "accepted",
         }
@@ -410,6 +482,23 @@ class OutlineV3Executor:
         elif self.max_estimated_cost is not None and estimated_cost > self.max_estimated_cost:
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_estimated_cost_exceeded"
+        elif estimated_input_per_call > self.profile.input_budget:
+            self.stability_preflight["preflight_status"] = "rejected"
+            self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_input_budget"
+        elif (
+            self.max_source_prompt_tokens is not None
+            and estimated_input_per_call > self.max_source_prompt_tokens
+        ):
+            self.stability_preflight["preflight_status"] = "rejected"
+            self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_configured_limit"
+        elif (
+            self.max_smoke_overhead_ratio is not None
+            and self.stability_mode == "smoke"
+            and core_calls > 0
+            and estimated_provider_calls / core_calls > self.max_smoke_overhead_ratio
+        ):
+            self.stability_preflight["preflight_status"] = "rejected"
+            self.stability_preflight["rejection_reason"] = "smoke_overhead_ratio_exceeded"
         atomic_write_json(preflight_path, self.stability_preflight)
         if self.stability_preflight["preflight_status"] != "accepted":
             raise OutlineV3ExecutionError(
@@ -591,10 +680,7 @@ class OutlineV3Executor:
             node_id=semantic_node_id,
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
-            expected_call_graph_hash=hash_json({
-                "provider_nodes": self._provider_node_ids(),
-                "stability_roles": ["candidate_provider_generation", "arbitration"],
-            }),
+            expected_call_graph_hash=self.expected_call_graph_hash,
             prompt_hash=str(binding.get("prompt_hash") or ""),
             input_hash=str(binding.get("prompt_payload_hash") or ""),
             config_hash=str(binding.get("provider_config_hash") or ""),
@@ -618,10 +704,7 @@ class OutlineV3Executor:
                 node_id=node_id,
                 closure_epoch_id=self.closure_epoch_id,
                 logical_attempt_identity=self.logical_attempt_identity,
-                expected_call_graph_hash=hash_json({
-                    "provider_nodes": self._provider_node_ids(),
-                    "stability_roles": ["candidate_provider_generation", "arbitration"],
-                }),
+                expected_call_graph_hash=self.expected_call_graph_hash,
                 max_attempts=1,
                 usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
             )
@@ -645,10 +728,7 @@ class OutlineV3Executor:
             node_id=semantic_node_id,
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
-            expected_call_graph_hash=hash_json({
-                "provider_nodes": self._provider_node_ids(),
-                "stability_roles": ["candidate_provider_generation", "arbitration"],
-            }),
+            expected_call_graph_hash=self.expected_call_graph_hash,
             prompt_hash=hash_text(prompt),
             input_hash=hash_json(request),
             config_hash=hash_json(api_config),
@@ -1222,16 +1302,56 @@ class OutlineV3Executor:
         loaded = self._load_node(node_id, binding)
         if loaded is not None:
             return loaded
-        self._check(node_id)
-        artifact, dependencies, model, provider = factory()
-        return self._persist(
-            node_id,
-            artifact,
-            depends_on=dependencies,
-            model=model,
-            provider=provider,
-            execution_binding=binding,
-        )
+        try:
+            self._check(node_id)
+            artifact, dependencies, model, provider = factory()
+            if node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
+                payload = artifact.payload if isinstance(artifact.payload, Mapping) else {}
+                if not bool(payload.get("passed", True)) or payload.get("blocking_diagnostics"):
+                    diagnostics = tuple(
+                        str(item)
+                        for item in (payload.get("blocking_diagnostics") or ())
+                    ) or (f"{node_id} returned a non-passing critic result",)
+                    # A critic rejection is a durable stage result, not a
+                    # transport exception.  Keep the artifact available so
+                    # the stability audit can record the rejection and the
+                    # final stage-health gate can quarantine adoption.
+                    self._blocking_critic_diagnostics[node_id] = diagnostics
+            persisted = self._persist(
+                node_id,
+                artifact,
+                depends_on=dependencies,
+                model=model,
+                provider=provider,
+                execution_binding=binding,
+            )
+            return persisted
+        except Exception as exc:
+            # A provider crash or a rejected critic result must remain visible in
+            # the durable DAG.  Resume/retry then reruns this node and its
+            # descendants instead of treating an exception as an anonymous
+            # stage-level failure.
+            try:
+                self._dag = self._node_store.record_node(
+                    node_id,
+                    status="failed",
+                    input_hash=_hash_payload(dict(binding.get("dependency_hashes") or {})),
+                    output_hash="",
+                    output_artifact_ids=(),
+                    model_route=str(binding.get("provider_route") or ""),
+                    model_name=str(binding.get("model_name") or ""),
+                    provider=str(binding.get("provider_family") or ""),
+                    config_snapshot={"candidate_count": self.candidate_count},
+                    budget_snapshot={"input_budget": self.profile.input_budget},
+                    receipt_ids=tuple(self.receipts),
+                    diagnostics=(f"{type(exc).__name__}: {exc}",),
+                    execution_binding=binding,
+                )
+            except Exception as record_error:
+                self.diagnostics.append(
+                    f"failed node {node_id} could not be persisted: {type(record_error).__name__}: {record_error}"
+                )
+            raise
 
     def _run_provider_node(self, node_id: str, request: Mapping[str, Any], cls: type[OutlineArtifact], deps: Mapping[str, str], *, minimum_output: int = 2) -> tuple[OutlineArtifact, Sequence[str], str, str]:
         content = self._provider_call(node_id, request, expect_json=True, input_artifact_hashes=tuple(deps.values()))
@@ -1329,7 +1449,11 @@ class OutlineV3Executor:
                 f"exact replay transport invoked for {node_id}"
             )
 
-        second_registry = ArtifactRegistry(self.registry.registry_path, self.job_id)
+        second_registry = (
+            self.publication_context.registry(self.registry.registry_path, self.job_id)
+            if self.publication_context is not None
+            else ArtifactRegistry(self.registry.registry_path, self.job_id)
+        )
         second_executor = OutlineV3Executor(
             job_id=self.job_id,
             summaries=self.summaries,
@@ -1341,6 +1465,7 @@ class OutlineV3Executor:
             review_intent=self.review_intent_input,
             quality_gate=self.quality_gate,
             logical_attempt_identity=self.logical_attempt_identity,
+            publication_context=self.publication_context,
             # The fresh-executor proof replays the canonical decision chain;
             # it must not launch the perturbation matrix again.  Running the
             # audit variants here would manufacture new variant keys and turn
@@ -1414,7 +1539,11 @@ class OutlineV3Executor:
             "compared_artifact_hashes": dict(expected_hashes),
         }
 
-    def run(self) -> OutlineV3ExecutionResult:
+    def run(self) -> OutlineV3ExecutionResult:  # pyright: ignore[reportGeneralTypeIssues]
+        # This orchestration method intentionally keeps the ordered DAG
+        # execution visible; the semantic subroutines below carry the
+        # individual validation contracts.  Pyright's path-complexity limit
+        # cannot analyze this finite dispatcher without losing useful types.
         try:
             self._preflight_stability_budget()
             summary_set_hash = hash_json(self.summaries)
@@ -2206,6 +2335,41 @@ class OutlineV3Executor:
                     "replay_evidence": list(self._replay_evidence[replay_evidence_start:]),
                 }
 
+            assignment_counts_primary: dict[str, int] = {}
+            for packet in packets:
+                for paper_key in packet.get("paper_keys") or ():
+                    assignment_counts_primary[str(paper_key)] = assignment_counts_primary.get(str(paper_key), 0) + 1
+            primary_signature = {
+                "paper_keys": sorted(str(item) for item in final.get("paper_keys") or ()),
+                "corpus_paper_keys": sorted(contract_model.corpus_paper_keys),
+                "must_use_paper_keys": sorted(contract_model.must_use_paper_keys),
+                "selected_candidate_id": str(final.get("candidate_id") or ""),
+                "section_count": len(final.get("sections") or ()),
+                "section_identity": sorted(str(item.get("section_id") or "") for item in final.get("sections") or () if isinstance(item, Mapping)),
+                "section_title_goal": sorted(
+                    (str(item.get("title") or ""), str(item.get("goal") or ""))
+                    for item in final.get("sections") or ()
+                    if isinstance(item, Mapping)
+                ),
+                "assignment_overlap": sorted(key for key, value in assignment_counts_primary.items() if value > 1),
+                "relation_ids": sorted(str(item) for item in final.get("relation_ids") or ()),
+                "claims": sorted(str(claim) for packet in packets for claim in packet.get("planned_claims") or () if str(claim).strip()),
+                "contradictions": sorted(hash_json(item) for packet in packets for item in packet.get("contradictions") or ()),
+                "gaps": sorted(str(gap) for packet in packets for gap in packet.get("gaps") or () if str(gap).strip()),
+                "methods": sorted(str(method) for packet in packets for method in packet.get("methods") or () if str(method).strip()),
+                "contexts": sorted(str(context) for packet in packets for context in packet.get("contexts") or () if str(context).strip()),
+                "duplicates": sorted(key for key, value in assignment_counts_primary.items() if value > 1),
+                "unsupported_claims": [],
+                "final_outline_hash": hash_json(final),
+                "evidence_projection_hash": hash_json({
+                    "views": [view.view_hash for view in evidence_model.views],
+                    "ledger": ledger_model.content_hash,
+                    "matrix": matrix_model.content_hash,
+                }),
+                "shard_plan_hash": hash_json([view.to_dict() for view in evidence_model.views]),
+                "shard_sizes": [len(evidence_model.views)],
+            }
+
             variants = self._stability_variant_plan()
             variant_signatures: dict[str, dict[str, Any]] = {}
             variant_input_hashes: dict[str, str] = {}
@@ -2225,20 +2389,28 @@ class OutlineV3Executor:
                 variant_input_hashes[variant_name] = hash_json({"summaries": variant_summaries, "definition": definition})
                 rerun_replay_node_ids[variant_name] = []
                 try:
-                    # The exact-replay variant must execute the same concrete
-                    # baseline call identities.  Its audit label remains
-                    # distinct in the stability report, but changing the
-                    # label here would manufacture new replay keys and make
-                    # a valid replay look missing.
-                    execution_variant_name = (
-                        "baseline" if definition.get("resume") == "exact_replay" else variant_name
-                    )
-                    decision = _variant_decision(
-                        execution_variant_name,
-                        variant_summaries,
-                        candidate_order,
-                        definition,
-                    )
+                    if definition.get("resume") == "primary_baseline_reuse":
+                        decision = {
+                            "signature": primary_signature,
+                            "final_outline": final,
+                            "evidence": evidence_model,
+                            "replay_evidence": [],
+                        }
+                    else:
+                        # The exact-replay variant must execute the same concrete
+                        # baseline call identities.  Its audit label remains
+                        # distinct in the stability report, but changing the
+                        # label here would manufacture new replay keys and make
+                        # a valid replay look missing.
+                        execution_variant_name = (
+                            "baseline" if definition.get("resume") == "exact_replay" else variant_name
+                        )
+                        decision = _variant_decision(
+                            execution_variant_name,
+                            variant_summaries,
+                            candidate_order,
+                            definition,
+                        )
                     if definition.get("resume") == "exact_replay":
                         replay_events = [
                             item for item in decision.get("replay_evidence", [])
@@ -2307,7 +2479,18 @@ class OutlineV3Executor:
                     *[f"{name}:{field}" for name, comparison in comparisons.items() for field, passed in comparison.items() if field != "title_goal_similarity" and not passed],
                     *[name for name, passed in metamorphic_checks.items() if not passed],
                 ])
-                stability_status = "stable" if final_outline_stable and not variant_errors else "blocked"
+            stability_status = "stable" if final_outline_stable and not variant_errors else "blocked"
+            if self._blocking_critic_diagnostics:
+                stability_status = "blocked"
+                for node_id, diagnostics in self._blocking_critic_diagnostics.items():
+                    variant_errors.setdefault(
+                        f"primary:{node_id}",
+                        f"{node_id}: {'; '.join(diagnostics)}",
+                    )
+                failed_checks.extend(
+                    f"primary:{node_id}"
+                    for node_id in self._blocking_critic_diagnostics
+                )
             stability_payload = {
                 "status": stability_status,
                 "method": (
@@ -2335,6 +2518,18 @@ class OutlineV3Executor:
                 "thresholds": {"title_goal_similarity": 1.0, "final_outline_fields": list(final_fields)},
                 "checks": metamorphic_checks,
                 "failed_checks": failed_checks,
+                "estimated_totals": {
+                    key: value
+                    for key, value in self.stability_preflight.items()
+                    if key.startswith("estimated_")
+                },
+                "actual_usage_totals": {
+                    "input_tokens": sum(int(receipt.input_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
+                    "output_tokens": sum(int(receipt.output_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
+                    "reasoning_tokens": sum(int(receipt.reasoning_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
+                    "cached_input_tokens": sum(int(receipt.cached_input_tokens or 0) for receipt in self._receipt_ledger.list_receipts()),
+                    "provider_calls": len(self._receipt_ledger.list_receipts()),
+                },
             }
             stability = self._run_node("stability_audit", lambda: (
                 self._artifact(StabilityAudit, stability_payload, {"coverage_audit": _hash_payload(audit), "final_outline": _hash_payload(final)}),
@@ -2370,14 +2565,30 @@ class OutlineV3Executor:
                 out_of_scope=out_of_scope_receipts,
             )
             self._check("provider_receipt_closure")
+            closure_contract = {
+                **closure.to_dict(),
+                "job_id": self.job_id,
+                "stage_name": "stage2_outline",
+                "attempt_id": self.logical_attempt_identity,
+                "logical_attempt_identity": self.logical_attempt_identity,
+                "closure_epoch_id": self.closure_epoch_id,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "expected_calls": [asdict(expected) for expected in canonical_expected],
+            }
+            closure_dependency_ids = ["provider_receipts"]
+            closure_dependency_ids.extend(
+                expected.node_id
+                for expected in canonical_expected
+                if expected.node_id in self.artifact_records
+            )
             closure_payload = self._persist(
                 "provider_receipt_closure",
                 self._artifact(
                     ProviderReceiptClosureArtifact,
-                    closure.to_dict(),
+                    closure_contract,
                     {"provider_receipts": self.artifact_records["provider_receipts"].content_hash},
                 ),
-                depends_on=("provider_receipts",),
+                depends_on=tuple(dict.fromkeys(closure_dependency_ids)),
                 model="deterministic",
                 provider="local",
             )
@@ -2464,6 +2675,26 @@ class OutlineV3Executor:
                 model="deterministic",
                 provider="local",
             )
+            # Mark critic rejections failed only after their dependent audit
+            # artifacts have been materialized.  This preserves a complete
+            # audit trail while keeping DAG resume semantics explicit.
+            for node_id, diagnostics in self._blocking_critic_diagnostics.items():
+                record = self.artifact_records.get(node_id)
+                if record is None:
+                    continue
+                self._dag = self._node_store.record_node(
+                    node_id,
+                    status="failed",
+                    input_hash=_hash_payload(dict(self._dag.get(node_id).execution_binding.get("dependency_hashes") or {})),
+                    output_hash=record.content_hash,
+                    output_artifact_ids=(record.artifact_id,),
+                    model_route=str(self._dag.get(node_id).model_route or ""),
+                    model_name=str(self._dag.get(node_id).model_name or ""),
+                    provider=str(self._dag.get(node_id).provider or ""),
+                    receipt_ids=tuple(self._dag.get(node_id).receipt_ids),
+                    diagnostics=diagnostics,
+                    execution_binding=self._dag.get(node_id).execution_binding,
+                )
             loaded_dag = self._node_store.load()
             if loaded_dag is not None:
                 self._dag = loaded_dag

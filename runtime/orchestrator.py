@@ -586,7 +586,7 @@ class InternalStageExecutorRegistry:
     ) -> tuple[StageResult, int]:
         summaries = self._load_summary_payloads(session, results)
         if bundle.paper_work_items:
-            generation = Stage1AnalysisService(
+            generation_service = Stage1AnalysisService(
                 job_id=session.context.workspace.job_id,
                 attempt_id=attempt_id,
                 workspace=session.context.workspace,
@@ -595,7 +595,8 @@ class InternalStageExecutorRegistry:
                 settings=session.context.settings,
                 cancellation_checker=session.stage_host.check_cancelled,
                 logger=session.stage_host.logger,
-            ).run(bundle, existing_summaries=summaries)
+            )
+            generation = generation_service.run(bundle, existing_summaries=summaries)
             normalized = self._validate_summary_identity(generation.summaries, bundle)
             return (
                 self.bridge.persist_stage1_results(
@@ -610,17 +611,30 @@ class InternalStageExecutorRegistry:
                     provider_receipt_ids=list(generation.receipt_ids),
                     generated_count=generation.generated_count,
                     reused_count=generation.reused_count,
+                    stage1_generation=generation_service,
                 ),
                 len(generation.receipt_ids),
             )
         if not summaries:
             raise RuntimeError("Stage 1 requires a source work item or a canonical summary source")
         normalized = self._validate_summary_identity(summaries, bundle)
+        generation_service = Stage1AnalysisService(
+            job_id=session.context.workspace.job_id,
+            attempt_id=attempt_id,
+            workspace=session.context.workspace,
+            artifact_registry=session.context.registry,
+            config=session.stage_host.config,
+            settings=session.context.settings,
+            cancellation_checker=session.stage_host.check_cancelled,
+            logger=session.stage_host.logger,
+        )
+        generation_service.prepare_empty_provider_receipt_closure(bundle)
         return (
             self.bridge.persist_stage1_results(
                 session,
                 normalized,
                 source_kind="runtime_summary_source",
+                stage1_generation=generation_service,
             ),
             0,
         )
@@ -684,6 +698,7 @@ class InternalStageExecutorRegistry:
             max_output_tokens=max_output_tokens,
         )
         provider = self._outline_provider(session, profile, api_config)
+        stability = settings.outline_stability_settings()
         executor = OutlineV3Executor(
             job_id=session.context.workspace.job_id,
             summaries=summaries,
@@ -699,6 +714,18 @@ class InternalStageExecutorRegistry:
                 else None
             ),
             cancellation_checker=session.stage_host.check_cancelled,
+            publication_context=self.bridge.publication_context,
+            stability_mode=stability.mode,
+            max_provider_calls=stability.max_provider_calls or None,
+            max_estimated_cost=stability.max_estimated_cost or None,
+            estimated_cost_per_1k_tokens=stability.estimated_cost_per_1k_tokens,
+            input_cost_per_1k_tokens=stability.input_cost_per_1k_tokens,
+            output_cost_per_1k_tokens=stability.output_cost_per_1k_tokens,
+            reasoning_cost_per_1k_tokens=stability.reasoning_cost_per_1k_tokens,
+            cache_read_cost_per_1k_tokens=stability.cache_read_cost_per_1k_tokens,
+            cache_write_cost_per_1k_tokens=stability.cache_write_cost_per_1k_tokens,
+            max_smoke_overhead_ratio=stability.max_smoke_overhead_ratio,
+            max_source_prompt_tokens=stability.max_source_prompt_tokens or None,
         )
         execution = executor.run()
         if not execution.ok:
@@ -882,9 +909,10 @@ class InternalStageExecutorRegistry:
 class AgentRuntimeBridge:
     """Thin additive bridge used by the repo-local skill entrypoint."""
 
-    def __init__(self, job_spec: RuntimeJobSpec) -> None:
+    def __init__(self, job_spec: RuntimeJobSpec, publication_context: Any | None = None) -> None:
         job_spec.validate()
         self.job_spec = job_spec
+        self.publication_context = publication_context
 
     def build_job_request(self) -> JobRunRequest:
         request = self.job_spec.to_job_request()
@@ -1071,6 +1099,7 @@ class AgentRuntimeBridge:
             resume_requested=resume_requested,
             resume_preflight=resume_preflight,
             publish_running_state=publish_running_state,
+            publication_context=self.publication_context,
         )
         return AgentRuntimeSession(
             runner=runner,
@@ -1187,6 +1216,7 @@ class AgentRuntimeBridge:
         provider_receipt_ids: list[str] | None = None,
         generated_count: int = 0,
         reused_count: int = 0,
+        stage1_generation: Any | None = None,
     ) -> StageResult:
         host = session.stage_host
         if write_excel_report:
@@ -1308,6 +1338,17 @@ class AgentRuntimeBridge:
                 )
             )
 
+        stage1_closure_record = None
+        expected_graph_record = None
+        if stage1_generation is not None:
+            stage1_closure_record = stage1_generation.finalize_provider_receipt_closure()
+            expected_graph_record = session.context.registry.get(
+                "stage1:provider_expected_call_graph"
+            )
+            if expected_graph_record is not None:
+                artifact_refs.append(self._artifact_ref_from_record(expected_graph_record))
+            artifact_refs.append(self._artifact_ref_from_record(stage1_closure_record))
+
         if provider_record is not None and provider_record.status == "ready":
             artifact_refs.append(self._artifact_ref_from_record(provider_record))
 
@@ -1338,6 +1379,12 @@ class AgentRuntimeBridge:
                 "generated_count": int(generated_count),
                 "reused_count": int(reused_count),
                 "provider_receipt_ids": list(provider_receipt_ids or []),
+                "provider_expected_call_graph": (
+                    expected_graph_record.artifact_id if expected_graph_record is not None else ""
+                ),
+                "provider_receipt_closure": (
+                    stage1_closure_record.artifact_id if stage1_closure_record is not None else ""
+                ),
             },
         )
 

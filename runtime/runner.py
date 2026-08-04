@@ -114,6 +114,18 @@ def _evaluate_runtime_completion(
                     and bool(provider_entries[stage].get("complete"))
                     for stage in required_provider_stages
                 )
+        if isinstance(provider_entries, Mapping):
+            # Keep the stage-indexed aggregate as the completion source.  The
+            # validation closure is one entry in that map, not a replacement
+            # for analyze/outline/review evidence.
+            provider_receipt_closure = {
+                "complete": provider_receipts_complete,
+                "stages": {
+                    str(stage): dict(value)
+                    for stage, value in provider_entries.items()
+                    if isinstance(value, Mapping)
+                },
+            }
         current_receipt_ref = (current_stage_closure_map.get("stages") or {}).get(
             "validation_receipt_closure"
         )
@@ -125,10 +137,19 @@ def _evaluate_runtime_completion(
             closure_envelope = json.loads(Path(current_receipt.path).read_text(encoding="utf-8"))
             candidate = closure_envelope.get("payload") if isinstance(closure_envelope, Mapping) else None
             if isinstance(candidate, Mapping):
-                provider_receipt_closure = dict(candidate)
-                provider_receipts_complete = bool(candidate.get("complete"))
+                if isinstance(provider_receipt_closure, Mapping):
+                    provider_receipt_closure = {
+                        **dict(provider_receipt_closure),
+                        "validation": dict(candidate),
+                    }
+                else:
+                    provider_receipt_closure = {
+                        "complete": provider_receipts_complete,
+                        "validation": dict(candidate),
+                    }
             else:
-                provider_receipts_complete = False
+                if "validate" in required_provider_stages:
+                    provider_receipts_complete = False
         elif "validate" in required_provider_stages:
             provider_receipts_complete = False
     except (OSError, RegistryError, TypeError, ValueError):
@@ -219,6 +240,7 @@ class AgentRuntimeRunner:
         origin_dir: str | Path | None = None,
         fault_injector: FaultInjector | None = None,
         cancel_token: CancelToken | None = None,
+        publication_context: Any | None = None,
     ) -> None:
         resolved = job_spec.resolved_from(origin_dir) if origin_dir is not None else job_spec
         self._require_explicit_path_origins(resolved)
@@ -226,6 +248,7 @@ class AgentRuntimeRunner:
         self.job_spec = resolved
         self.fault_injector = fault_injector
         self.cancel_token = cancel_token
+        self.publication_context = publication_context
 
     @staticmethod
     def _require_explicit_path_origins(spec: RuntimeJobSpec) -> None:
@@ -257,10 +280,31 @@ class AgentRuntimeRunner:
             raise RuntimeRunnerError("resume requires an explicit job_id")
         metadata = dict(self.job_spec.metadata)
         requested_stages = metadata.get("requested_stages")
-        if requested_stages is not None:
-            metadata["requested_stages"] = list(
-                dict.fromkeys(str(item) for item in requested_stages)
+        from config_loader import load_config
+        from services.settings import ApplicationSettings
+        from runtime.stage_planning import StagePlanError, build_stage_plan
+
+        try:
+            settings = ApplicationSettings.from_config(load_config(self.job_spec.config))
+            plan = build_stage_plan(
+                action=self.job_spec.action,
+                requested_stages=requested_stages,
+                validation_enabled=settings.review_validation_enabled(),
+                validation_required=metadata.get("validation_required"),
+                require_clean_validation=metadata.get("require_clean_validation"),
+                allow_unvalidated_when_validation_optional=metadata.get(
+                    "allow_unvalidated_when_validation_optional"
+                ),
             )
+        except (StagePlanError, OSError, ValueError) as exc:
+            raise RuntimeRunnerError(str(exc)) from exc
+        metadata["requested_stages"] = list(plan.requested_stages)
+        metadata["validation_required"] = plan.validation_required
+        metadata["require_clean_validation"] = plan.require_clean_validation
+        metadata["allow_unvalidated_when_validation_optional"] = (
+            plan.allow_unvalidated_when_validation_optional
+        )
+        metadata["stage_plan"] = plan.to_dict()
         return replace(
             self.job_spec,
             job_id=self.job_spec.job_id or JobWorkspace.generate_job_id(),
@@ -480,6 +524,187 @@ class AgentRuntimeRunner:
         except Exception as exc:
             raise RuntimeRunnerError(f"built-in stage executor failed for {stage}: {exc}") from exc
 
+    @staticmethod
+    def _publish_optional_current_artifact_set(session: AgentRuntimeSession) -> None:
+        """Publish a review set whose validation disposition is explicit.
+
+        When review validation is disabled, the review artifacts still need a
+        durable current-set boundary.  Validation is represented by a typed
+        ``not_requested`` disposition and an empty, complete receipt closure;
+        the set remains ineligible for validation-stage completion until a
+        later explicit validation run replaces it.
+        """
+
+        from runtime.provider_receipt_closure import ProviderReceiptClosure
+        from validation.repair_transaction import RepairPromotionTransaction
+
+        context = session.context
+        registry = context.registry
+        current_set = registry.resolve_current_artifact_set()
+        if current_set is not None:
+            return
+        job_id = context.workspace.job_id
+        draft = registry.get("review_draft")
+        manifest = registry.get("citation_manifest_v3")
+        review_docx = registry.get("review_docx")
+        if (
+            draft is None
+            or manifest is None
+            or review_docx is None
+            or draft.status != "ready"
+            or manifest.status != "ready"
+            or review_docx.status != "ready"
+        ):
+            raise RuntimeRunnerError(
+                "cannot publish optional current artifact set without ready review, citation, and DOCX artifacts"
+            )
+
+        def ref(record: ArtifactRecord) -> ArtifactDependencyRefV2:
+            return ArtifactDependencyRefV2.from_record(record)
+
+        disposition_id = "validation:not_requested"
+        disposition_path = Path(
+            context.workspace.artifact_path("validation/not_requested/validation_disposition.json")
+        )
+        atomic_write_json(
+            str(disposition_path),
+            {
+                "artifact_type": "validation_disposition",
+                "artifact_version": "v1",
+                "job_id": job_id,
+                "status": "not_requested",
+                "reason": "review validation is disabled by the durable stage plan",
+            },
+        )
+        disposition_record = registry.get(disposition_id)
+        if disposition_record is None or disposition_record.status != "ready":
+            disposition_record = registry.register_file(
+                artifact_role="validation_disposition",
+                artifact_type="validation_disposition",
+                artifact_version="v1",
+                path=str(disposition_path),
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id=disposition_id,
+                depends_on=(ref(draft), ref(manifest), ref(review_docx)),
+                metadata={"validation_status": "not_requested"},
+            )
+        if disposition_record is None:
+            raise RuntimeRunnerError("optional validation disposition registration returned no record")
+
+        empty_closure = ProviderReceiptClosure.evaluate((), ())
+        closure_id = "validation:provider_receipt_closure:not_requested"
+        closure_path = Path(
+            context.workspace.artifact_path("validation/not_requested/provider_receipt_closure.json")
+        )
+        atomic_write_json(
+            str(closure_path),
+            {
+                "artifact_type": "provider_receipt_closure",
+                "artifact_version": "v1",
+                "job_id": job_id,
+                "payload": empty_closure.to_dict(),
+            },
+        )
+        closure_record = registry.get(closure_id)
+        if closure_record is None or closure_record.status != "ready":
+            closure_record = registry.register_file(
+                artifact_role="validation_provider_receipt_closure",
+                artifact_type="provider_receipt_closure",
+                artifact_version="v1",
+                path=str(closure_path),
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id=closure_id,
+                depends_on=(ref(disposition_record),),
+                metadata={
+                    "stage_name": "validation",
+                    "validation_status": "not_requested",
+                },
+            )
+        if closure_record is None:
+            raise RuntimeRunnerError("optional validation closure registration returned no record")
+
+        promotion_id = "runtime-validation:not-requested"
+        promotion_path = Path(
+            context.workspace.artifact_path(
+                "validation/not_requested/repair_promotion_transaction.json"
+            )
+        )
+        promotion_record = registry.get(promotion_id)
+        if promotion_record is None or promotion_record.status != "ready":
+            promotion = RepairPromotionTransaction(
+                transaction_id=promotion_id,
+                job_id=job_id,
+                source_transaction_id="",
+                status="prepared",
+                actor="runtime.runner.AgentRuntimeRunner",
+                reason="review completed with validation explicitly not requested",
+                canonical_version="runtime-validation",
+                review_draft_artifact_id=draft.artifact_id,
+                citation_manifest_artifact_id=manifest.artifact_id,
+                review_docx_artifact_id=review_docx.artifact_id,
+                audit_artifact_id="",
+                lineage_artifact_id="",
+                canonical_input_hashes={
+                    draft.artifact_id: draft.content_hash,
+                    manifest.artifact_id: manifest.content_hash,
+                    review_docx.artifact_id: review_docx.content_hash,
+                },
+                output_hashes={
+                    draft.artifact_id: draft.content_hash,
+                    manifest.artifact_id: manifest.content_hash,
+                    review_docx.artifact_id: review_docx.content_hash,
+                    disposition_record.artifact_id: disposition_record.content_hash,
+                    closure_record.artifact_id: closure_record.content_hash,
+                },
+                created_at=utc_now_iso(),
+                validation_run_result_artifact_id=disposition_record.artifact_id,
+            )
+            atomic_write_json(str(promotion_path), promotion.to_dict())
+            promotion_record = registry.register_file(
+                artifact_role="repair_promotion_transaction",
+                artifact_type="repair_promotion_transaction",
+                artifact_version="v1",
+                path=str(promotion_path),
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id=promotion_id,
+                depends_on=(
+                    ref(draft),
+                    ref(manifest),
+                    ref(review_docx),
+                    ref(disposition_record),
+                    ref(closure_record),
+                ),
+                metadata={
+                    "status": "prepared",
+                    "promotion_state": "prepared",
+                    "validation_status": "not_requested",
+                },
+            )
+        if promotion_record is None:
+            raise RuntimeRunnerError("optional validation promotion registration returned no record")
+
+        current_set = registry.build_current_artifact_set(
+            promotion_transaction_id=promotion_id,
+            promotion_transaction_hash=promotion_record.content_hash,
+            review_draft_artifact_id=draft.artifact_id,
+            review_draft_artifact_hash=draft.content_hash,
+            citation_manifest_artifact_id=manifest.artifact_id,
+            citation_manifest_artifact_hash=manifest.content_hash,
+            review_docx_artifact_id=review_docx.artifact_id,
+            review_docx_artifact_hash=review_docx.content_hash,
+            validation_run_result_artifact_id=disposition_record.artifact_id,
+            validation_run_result_artifact_hash=disposition_record.content_hash,
+            validation_receipt_closure_artifact_id=closure_record.artifact_id,
+            validation_receipt_closure_artifact_hash=closure_record.content_hash,
+            validation_status="not_requested",
+            actor="runtime.runner.AgentRuntimeRunner",
+            reason="review completed with validation explicitly not requested",
+        )
+        registry.switch_current_artifact_set(
+            current_set,
+            prepared_promotion_record=promotion_record,
+        )
+
     def run(self) -> RuntimeExecutionResult:
         return self._execute(resume=False)
 
@@ -520,7 +745,7 @@ class AgentRuntimeRunner:
                 batch_spec.parent_selection()
             )
             validated_batch_parent_registry_path = validated_parent_registry.registry_path
-        bridge = AgentRuntimeBridge(spec)
+        bridge = AgentRuntimeBridge(spec, publication_context=self.publication_context)
         normalized_spec_payload = spec.to_dict()
         resume_preflight = None
         workspace_preflight = None
@@ -719,6 +944,23 @@ class AgentRuntimeRunner:
 
             for stage in self._requested_stages(spec):
                 active_stage = stage
+                if stage == "review" and spec.action == "run_all":
+                    from outline.adoption_transaction import current_adoption_record
+
+                    adoption = current_adoption_record(session.context.registry)
+                    if adoption is None or adoption.status != "ready":
+                        reason = "outline is ready_for_adoption; explicit adoption is required before review"
+                        attempt_store.finish(running_attempt, "succeeded", reason=reason)
+                        return self._finalize_result(
+                            session,
+                            status="completed",
+                            disposition="needs_review",
+                            canonical_ready=False,
+                            completed=tuple(completed),
+                            failed_stage=None,
+                            requires_attention=True,
+                            message=reason,
+                        )
                 if stage in results:
                     continue
                 if resume:
@@ -757,6 +999,8 @@ class AgentRuntimeRunner:
                     continue
                 results[stage] = result
                 completed.append(stage)
+                if stage == "review" and "validate" not in self._requested_stages(spec):
+                    self._publish_optional_current_artifact_set(session)
 
             disposition = "unvalidated"
             policy = session.context.readiness_policy_snapshot

@@ -5,10 +5,13 @@ import threading
 import time
 from typing import Any
 
+import pytest
+
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import atomic_write_json
-from services.queue_service import PersistentQueueService, QueueJobSpec, QueueState
+from services.queue_service import PersistentQueueService, QueueJobSpec, QueueLease, QueueState
 from services.queue_service import QueueRunner
+from services.queue_service import QueuePublicationRejected
 
 
 def _spawn_claim_worker(
@@ -104,6 +107,53 @@ def _spawn_stale_canonical_mutator(
                 )
             }
         )
+    except BaseException as exc:  # pragma: no cover - surfaced through the parent assertion
+        result_queue.put({"error": f"{type(exc).__name__}: {exc}"})
+
+
+def _spawn_stale_registry_mutator(
+    queue_file: str,
+    job_id: str,
+    artifact_path: str,
+    registry_path: str,
+    lease_id: str,
+    worker_id: str,
+    lease_generation: int,
+    fence_token: str,
+    result_queue: Any,
+) -> None:
+    """Exercise the lease-bound Registry facade from a real spawn child."""
+
+    try:
+        service = PersistentQueueService(queue_file)
+        stale_lease = QueueLease(
+            job_id=job_id,
+            lease_id=lease_id,
+            worker_id=worker_id,
+            expires_at="",
+            revision=0,
+            lease_generation=lease_generation,
+            fence_token=fence_token,
+        )
+        registry = service.publication_context(stale_lease).registry(registry_path, job_id)
+        register_rejected = False
+        switch_rejected = False
+        try:
+            registry.register_file(
+                artifact_id="stale:spawn-register",
+                artifact_role="test",
+                artifact_type="test",
+                artifact_version="v1",
+                path=artifact_path,
+                producer="tests",
+            )
+        except QueuePublicationRejected:
+            register_rejected = True
+        try:
+            registry.switch_current_artifact_set(None)  # type: ignore[arg-type]
+        except QueuePublicationRejected:
+            switch_rejected = True
+        result_queue.put({"register_rejected": register_rejected, "switch_rejected": switch_rejected})
     except BaseException as exc:  # pragma: no cover - surfaced through the parent assertion
         result_queue.put({"error": f"{type(exc).__name__}: {exc}"})
 
@@ -243,6 +293,119 @@ def test_stale_spawned_worker_cannot_publish_after_lease_recovery(tmp_path) -> N
     assert final_runtime.state == QueueState.RUNNING
     assert final_runtime.worker_id == "current-worker"
     assert final_runtime.fence_token == current_lease.fence_token
+
+
+def test_stale_queue_owned_registry_rejects_direct_register_and_switch(tmp_path) -> None:
+    queue_file = tmp_path / "queue.json"
+    registry_path = tmp_path / "workspace" / "artifact_registry.json"
+    artifact_path = tmp_path / "workspace" / "artifact.json"
+    artifact_path.parent.mkdir()
+    atomic_write_json(str(artifact_path), {"artifact": "current"})
+    service = PersistentQueueService(queue_file)
+    _add_job(service, "direct-fenced-job")
+
+    stale_lease = service.claim_job("direct-fenced-job", worker_id="stale", lease_seconds=1)
+    assert stale_lease is not None
+    time.sleep(1.1)
+    assert service.recover_expired_leases() == ["direct-fenced-job"]
+    current_lease = service.claim_job("direct-fenced-job", worker_id="current", lease_seconds=30)
+    assert current_lease is not None
+
+    stale_registry = service.publication_context(stale_lease).registry(
+        registry_path,
+        "direct-fenced-job",
+    )
+    with pytest.raises(QueuePublicationRejected):
+        stale_registry.register_file(
+            artifact_id="stale:direct-register",
+            artifact_role="test",
+            artifact_type="test",
+            artifact_version="v1",
+            path=artifact_path,
+            producer="tests",
+        )
+    with pytest.raises(QueuePublicationRejected):
+        stale_registry.switch_current_artifact_set(None)  # type: ignore[arg-type]
+
+    current_registry = service.publication_context(current_lease).registry(
+        registry_path,
+        "direct-fenced-job",
+    )
+    registered = current_registry.register_file(
+        artifact_id="current:direct-register",
+        artifact_role="test",
+        artifact_type="test",
+        artifact_version="v1",
+        path=artifact_path,
+        producer="tests",
+    )
+    assert registered.status == "ready"
+
+
+def test_stale_spawned_worker_cannot_publish_through_queue_owned_registry(tmp_path) -> None:
+    queue_file = tmp_path / "queue.json"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry_path = workspace / "artifact_registry.json"
+    artifact_path = workspace / "artifact.json"
+    atomic_write_json(str(artifact_path), {"artifact": "spawn-fenced"})
+    service = PersistentQueueService(queue_file)
+    _add_job(service, "spawn-registry-fenced-job")
+
+    stale_lease = service.claim_job("spawn-registry-fenced-job", worker_id="stale", lease_seconds=1)
+    assert stale_lease is not None
+    time.sleep(1.1)
+    assert service.recover_expired_leases() == ["spawn-registry-fenced-job"]
+    current_lease = service.claim_job("spawn-registry-fenced-job", worker_id="current", lease_seconds=30)
+    assert current_lease is not None
+
+    current_registry = service.publication_context(current_lease).registry(
+        registry_path,
+        "spawn-registry-fenced-job",
+    )
+    current_record = current_registry.register_file(
+        artifact_id="current:spawn-register",
+        artifact_role="test",
+        artifact_type="test",
+        artifact_version="v1",
+        path=artifact_path,
+        producer="tests",
+    )
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_spawn_stale_registry_mutator,
+        args=(
+            str(queue_file),
+            "spawn-registry-fenced-job",
+            str(artifact_path),
+            str(registry_path),
+            stale_lease.lease_id,
+            stale_lease.worker_id,
+            stale_lease.lease_generation,
+            stale_lease.fence_token,
+            result_queue,
+        ),
+    )
+    try:
+        process.start()
+        process.join(30)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        result = result_queue.get(timeout=5)
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+
+    assert result == {"register_rejected": True, "switch_rejected": True}
+    records = ArtifactRegistry(registry_path, "spawn-registry-fenced-job").list_records()
+    assert any(record.artifact_id == current_record.artifact_id for record in records)
+    assert not any(record.artifact_id == "stale:spawn-register" for record in records)
+    assert PersistentQueueService(queue_file).get_job_runtime("spawn-registry-fenced-job").fence_token == current_lease.fence_token
 
 
 def test_expired_queue_lease_is_recovered_for_a_new_worker(tmp_path) -> None:
