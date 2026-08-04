@@ -472,6 +472,8 @@ class RepairTransactionRecord:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        payload["artifact_type"] = REPAIR_TRANSACTION_ARTIFACT_TYPE
+        payload["artifact_version"] = REPAIR_TRANSACTION_ARTIFACT_VERSION
         payload["previous_artifact_ids"] = list(self.previous_artifact_ids)
         payload["applied_artifact_ids"] = list(self.applied_artifact_ids)
         payload["applied_patch_ids"] = list(self.applied_patch_ids)
@@ -1652,8 +1654,55 @@ class RepairTransactionService:
                     "mutation_performed": False,
                 }
             previous_set = None
+        promotion = RepairPromotionTransaction(
+            transaction_id=promotion_id,
+            job_id=self.workspace.job_id,
+            source_transaction_id=transaction_id,
+            status="prepared",
+            actor=actor,
+            reason=reason,
+            canonical_version="repair-v3",
+            review_draft_artifact_id=promoted_draft_record.artifact_id,
+            citation_manifest_artifact_id=promoted_manifest_record.artifact_id,
+            review_docx_artifact_id=promoted_docx_record.artifact_id,
+            audit_artifact_id=audit_record.artifact_id,
+            lineage_artifact_id=lineage_record.artifact_id,
+            canonical_input_hashes={item.artifact_id: item.content_hash for item in input_records},
+            output_hashes={item.artifact_id: item.content_hash for item in output_records},
+            created_at=utc_now_iso(),
+            validation_run_result_artifact_id=promoted_validation_record.artifact_id,
+            current_pointer_artifact_ids={},
+            current_artifact_set_id="",
+        )
+        promotion_path = promotion_dir / "repair_promotion_transaction.json"
+        atomic_write_json(str(promotion_path), promotion.to_dict())
+        promotion_record = ArtifactRecord(
+            artifact_id=promotion_id,
+            artifact_role="repair_promotion_transaction",
+            artifact_type=promotion.artifact_type,
+            artifact_version=promotion.artifact_version,
+            path=str(promotion_path),
+            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
+            job_id=self.workspace.job_id,
+            status="ready",
+            content_hash=file_sha256(promotion_path),
+            depends_on=[
+                ArtifactDependencyRefV2.from_record(audit_record),
+                ArtifactDependencyRefV2.from_record(lineage_record),
+                *(ArtifactDependencyRefV2.from_record(item) for item in output_records),
+            ],
+            metadata={
+                "status": promotion.status,
+                "promotion_state": "prepared",
+                "commit_boundary": "current_artifact_set_pointer_cas",
+                "canonical_replacement": True,
+                "quarantined_export": False,
+            },
+            created_at=promotion.created_at,
+        )
         current_set = self.registry.build_current_artifact_set(
             promotion_transaction_id=promotion_id,
+            promotion_transaction_hash=promotion_record.content_hash,
             review_draft_artifact_id=promoted_draft_record.artifact_id,
             review_draft_artifact_hash=promoted_draft_record.content_hash,
             citation_manifest_artifact_id=promoted_manifest_record.artifact_id,
@@ -1668,60 +1717,24 @@ class RepairTransactionService:
             reason=reason,
             previous_set_id=previous_set.set_id if previous_set is not None else "",
         )
-        current_set_pointer_record = self.registry.switch_current_artifact_set(current_set)
+        current_set_pointer_record = self.registry.switch_current_artifact_set(
+            current_set,
+            prepared_promotion_record=promotion_record,
+        )
         pointer_records = {"current_artifact_set": current_set_pointer_record}
         pointer_ids = {
             "current_artifact_set": current_set_pointer_record.artifact_id,
             "current_artifact_set_id": current_set.set_id,
         }
 
-        promotion = RepairPromotionTransaction(
-            transaction_id=promotion_id,
-            job_id=self.workspace.job_id,
-            source_transaction_id=transaction_id,
-            status="promoted",
-            actor=actor,
-            reason=reason,
-            canonical_version="repair-v3",
-            review_draft_artifact_id=promoted_draft_record.artifact_id,
-            citation_manifest_artifact_id=promoted_manifest_record.artifact_id,
-            review_docx_artifact_id=promoted_docx_record.artifact_id,
-            audit_artifact_id=audit_record.artifact_id,
-            lineage_artifact_id=lineage_record.artifact_id,
-            canonical_input_hashes={item.artifact_id: item.content_hash for item in input_records},
-            output_hashes={item.artifact_id: item.content_hash for item in output_records},
-            created_at=utc_now_iso(),
-            validation_run_result_artifact_id=promoted_validation_record.artifact_id,
-            current_pointer_artifact_ids=pointer_ids,
-            current_artifact_set_id=current_set.set_id,
-        )
-        promotion_path = promotion_dir / "repair_promotion_transaction.json"
-        atomic_write_json(str(promotion_path), promotion.to_dict())
-        promotion_record = self.registry.register_file(
-            artifact_id=promotion_id,
-            artifact_role="repair_promotion_transaction",
-            artifact_type=promotion.artifact_type,
-            artifact_version=promotion.artifact_version,
-            path=promotion_path,
-            producer="validation.repair_transaction.RepairTransactionService.promote_transaction",
-            depends_on=[
-                ArtifactDependencyRefV2.from_record(audit_record),
-                ArtifactDependencyRefV2.from_record(lineage_record),
-                *(ArtifactDependencyRefV2.from_record(item) for item in output_records),
-                *(ArtifactDependencyRefV2.from_record(item) for item in pointer_records.values()),
-            ],
-            metadata={
-                "status": promotion.status,
-                "canonical_replacement": True,
-                "quarantined_export": False,
-                "current_pointer_artifact_ids": pointer_ids,
-            },
-        )
+        registered_promotion = self.registry.get(promotion_id)
+        if registered_promotion is None or registered_promotion.content_hash != promotion_record.content_hash:
+            raise RuntimeError("prepared promotion transaction was not committed with current artifact set")
         return {
             "status": "promoted",
             "job_id": self.workspace.job_id,
             "transaction_id": transaction_id,
-            "promotion_transaction_id": promotion_record.artifact_id,
+            "promotion_transaction_id": promotion_id,
             "versioned_artifact_ids": [item.artifact_id for item in output_records],
             "audit_artifact_id": audit_record.artifact_id,
             "lineage_artifact_id": lineage_record.artifact_id,

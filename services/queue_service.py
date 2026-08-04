@@ -13,6 +13,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeGuard, TypeVar
 
+from services.artifact_registry import ArtifactRegistry, RegistryError
+
 T = TypeVar("T")
 
 _QUEUE_PROCESS_LOCKS_GUARD = threading.Lock()
@@ -799,8 +801,9 @@ class PersistentQueueService:
         worker_id: str,
         lease_generation: int,
         fence_token: str,
+        registry_path: str | Path | None = None,
     ) -> bool:
-        """Fence produced-artifact claims so reclaimed workers cannot publish."""
+        """Fence produced-artifact claims and verify the canonical Registry."""
 
         with self._store_lock():
             runtime = self._runtimes.get(job_id)
@@ -815,6 +818,29 @@ class PersistentQueueService:
             value = str(artifact_id or "").strip()
             if not value:
                 return False
+            if registry_path is not None:
+                candidate_registry_path = Path(registry_path).expanduser().resolve()
+                if not candidate_registry_path.is_file():
+                    return False
+                try:
+                    registry = ArtifactRegistry(candidate_registry_path, job_id)
+                    record = registry.get(value)
+                    if record is None:
+                        candidate_path = Path(value).expanduser().resolve()
+                        record = next(
+                            (
+                                item
+                                for item in registry.list_records()
+                                if Path(item.path).expanduser().resolve() == candidate_path
+                            ),
+                            None,
+                        )
+                    if record is None or record.status != "ready":
+                        return False
+                    ArtifactRegistry._verify_ready_artifact(record)
+                    registry.verify_ready_dependencies(record.depends_on)
+                except (OSError, RegistryError, TypeError, ValueError):
+                    return False
             if value not in runtime.produced_artifacts:
                 runtime.produced_artifacts.append(value)
             runtime.revision += 1
@@ -1502,7 +1528,28 @@ class QueueRunner:
         """更新任务的运行时信息"""
         self._heartbeat(job_id)
         lease = self._leases.get(job_id)
-        if lease is None or not self.queue_service.update_job_runtime_info_with_lease(
+        if lease is None:
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while publishing runtime info for {job_id}")
+        produced_artifacts = [
+            str(item) for item in info.get("produced_artifacts") or () if str(item).strip()
+        ]
+        workspace_path = Path(str(info.get("workspace_path") or "")).expanduser()
+        registry_path = workspace_path / "artifact_registry.json"
+        verified_registry_path: Path | None = registry_path if registry_path.is_file() else None
+        for artifact in produced_artifacts:
+            if not self.queue_service.register_canonical_artifact_with_lease(
+                job_id,
+                artifact,
+                lease_id=lease.lease_id,
+                worker_id=lease.worker_id,
+                lease_generation=lease.lease_generation,
+                fence_token=lease.fence_token,
+                registry_path=verified_registry_path,
+            ):
+                self._mark_lease_lost(job_id)
+                raise RuntimeError(f"queue lease or canonical Registry lost for {job_id}")
+        if not self.queue_service.update_job_runtime_info_with_lease(
             job_id,
             info,
             lease_id=lease.lease_id,

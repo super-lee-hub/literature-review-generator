@@ -75,12 +75,35 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "current_artifact_set_pointer",
         "current_artifact_pointer",
         "outline_adoption_pointer",
-        "export_manifest",
+        "export_bundle",
         "forensic_attestation",
+        "provider_receipt_ledger",
+        "review_section",
     }
 )
 
+# These versions are historical projections still written by compatibility
+# helpers.  They are not current production contracts; allowing them here
+# keeps the Registry able to read/migrate old records without weakening any
+# current-version validator below.
+LEGACY_COMPATIBLE_ARTIFACT_VERSIONS: dict[str, frozenset[str]] = {
+    "review_draft": frozenset({"v1", "v2"}),
+    "citation_manifest": frozenset({"v1", "v2"}),
+}
+
 CURRENT_ARTIFACT_TYPES = OUTLINE_V3_ARTIFACT_TYPES | CURRENT_PRODUCTION_ARTIFACT_TYPES
+
+# Outline artifacts are versioned individually.  The DAG snapshot and the
+# immutable Stage 1 input predate the v3 envelope and are intentionally kept
+# as explicit v1 contracts; every other current Outline artifact uses v3.
+CURRENT_OUTLINE_ARTIFACT_VERSIONS: dict[str, frozenset[str]] = {
+    artifact_type: frozenset({"v1", "v3"})
+    if artifact_type == "provider_receipt_closure"
+    else frozenset({"v1"})
+    if artifact_type in {"outline_v3_node_dag", "stage1_canonical_summaries"}
+    else frozenset({"v3"})
+    for artifact_type in OUTLINE_V3_ARTIFACT_TYPES
+}
 
 _ENVELOPE_TYPES = frozenset(
     {
@@ -311,91 +334,395 @@ def _require_owner(root: Mapping[str, Any], record: Any, artifact_type: str) -> 
         raise ArtifactSchemaError(f"{artifact_type} has an invalid owner job identity")
 
 
-def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
+def _validate_production_identity(
+    record: Any,
+    root: Mapping[str, Any],
+    *,
+    expected_types: tuple[str, ...] | None = None,
+    expected_version: str,
+) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
-    version = str(getattr(record, "artifact_version", "") or root.get("artifact_version") or "")
-    if artifact_type in {"current_artifact_set", "current_artifact_set_pointer"}:
-        if version != "v1":
-            raise ArtifactSchemaError(f"{artifact_type} must use artifact_version v1")
-        from services.artifact_registry import CurrentArtifactSetV1
-
-        try:
-            current_set = CurrentArtifactSetV1.from_dict(root)
-        except (TypeError, ValueError) as exc:
-            raise ArtifactSchemaError(f"{artifact_type} is not a valid CurrentArtifactSetV1") from exc
-        owner = str(getattr(record, "job_id", "") or "")
-        if current_set.job_id != owner:
-            raise ArtifactSchemaError(f"{artifact_type} job_id mismatch")
-        return
-    if version != "v3":
-        # A legacy projection is not a current artifact.  Its historical
-        # service-level validator remains responsible for compatibility.
-        return
-    if str(root.get("artifact_type") or "") != artifact_type:
-        raise ArtifactSchemaError(f"artifact type mismatch: {artifact_type!r}")
-    if str(root.get("artifact_version") or "") != version:
-        raise ArtifactSchemaError(f"{artifact_type}.artifact_version does not match the registry")
+    root_type = str(root.get("artifact_type") or "")
+    if expected_types is None:
+        expected_types = (artifact_type,)
+    if root_type not in expected_types:
+        raise ArtifactSchemaError(
+            f"{artifact_type} payload artifact_type {root_type!r} is not one of {expected_types!r}"
+        )
+    if str(root.get("artifact_version") or "") not in {expected_version, "v3" if expected_version == "v1" and artifact_type.endswith("_repaired") else expected_version}:
+        raise ArtifactSchemaError(f"{artifact_type}.artifact_version is invalid")
+    if str(getattr(record, "artifact_version", "") or "") != expected_version:
+        raise ArtifactSchemaError(f"{artifact_type} registry version is not {expected_version}")
     _require_owner(root, record, artifact_type)
-    specific_fields: dict[str, tuple[str, ...]] = {
-        "review_draft": ("created_at", "draft_identity", "generation_context", "content", "projections"),
-        "review_draft_repaired": ("created_at", "draft_identity", "generation_context", "content", "projections"),
-        "citation_manifest": ("created_at", "manifest_identity", "review_reference", "occurrences", "citation_sets", "bibliography"),
-        "citation_manifest_repaired": ("created_at", "manifest_identity", "review_reference", "occurrences", "citation_sets", "bibliography"),
-        "citation_ref_catalog": ("created_at", "entries"),
-        "review_replay_ledger": ("records",),
-        "validation_run_result": ("status", "conclusion", "details"),
-        "validation_run_result_repaired": ("status", "conclusion", "details"),
-        "provider_receipt_closure": ("closure_epoch_id", "expected_call_ids", "complete", "closure_hash"),
-        "repair_plan": ("plan_id", "created_at", "proposals", "issues", "manual_review_actions"),
-        "repair_apply_result": ("success", "plan_id", "applied_count", "rejected_count"),
-        "repair_report": ("report_id", "created_at", "plan_id", "summary", "proposals_detail"),
-        "repair_transaction": ("transaction_id", "status", "plan_id"),
-        "repair_promotion_transaction": ("transaction_id", "status", "plan_id"),
-        "repair_lineage": ("lineage_id", "source_artifact_ids", "derived_artifact_ids"),
-        "current_artifact_pointer": ("artifact_id", "artifact_hash", "role"),
-        "outline_adoption_pointer": ("adoption_id", "status", "expected_hash"),
-        "export_manifest": ("bundle_id", "artifact_ids", "manifest_hash"),
-        "forensic_attestation": ("attestation_id", "status", "evidence", "created_at"),
+
+
+def _validate_review_json(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    expected_types = ("review_draft",) if artifact_type == "review_draft" else ("review_draft", "review_draft_repaired")
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=expected_types,
+        expected_version="v1" if artifact_type.endswith("_repaired") else "v3",
+    )
+    _require_fields(root, ("created_at", "draft_identity", "generation_context", "content", "projections"), artifact_type)
+    if not isinstance(root.get("content"), Mapping) or not isinstance(root.get("draft_identity"), Mapping):
+        raise ArtifactSchemaError(f"{artifact_type} content and draft_identity must be objects")
+
+
+def _validate_citation_json(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    expected_types = ("citation_manifest",) if artifact_type == "citation_manifest" else ("citation_manifest", "citation_manifest_repaired")
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=expected_types,
+        expected_version="v1" if artifact_type.endswith("_repaired") else "v3",
+    )
+    _require_fields(
+        root,
+        ("created_at", "manifest_identity", "review_reference", "occurrences", "citation_sets", "bibliography"),
+        artifact_type,
+    )
+    if not isinstance(root.get("occurrences"), list) or not isinstance(root.get("bibliography"), list):
+        raise ArtifactSchemaError(f"{artifact_type} occurrences and bibliography must be arrays")
+
+
+def _validate_citation_ref_catalog(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    """Validate the canonical R### catalog with its owning service contract."""
+
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("citation_ref_catalog",),
+        expected_version="v1",
+    )
+    from services.citation_ref_catalog import validate_document_ref_catalog
+
+    try:
+        validate_document_ref_catalog(root)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ArtifactSchemaError(f"citation_ref_catalog failed canonical validation: {exc}") from exc
+
+
+def _validate_repaired_json(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    if artifact_type == "review_draft_repaired":
+        _validate_review_json(record, path, root)
+    elif artifact_type == "citation_manifest_repaired":
+        _validate_citation_json(record, path, root)
+    else:
+        raise ArtifactSchemaError(f"unsupported repaired artifact type: {artifact_type}")
+
+
+def _validate_docx(record: Any, path: str | Path, _root: Mapping[str, Any] | None = None) -> None:
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    if str(getattr(record, "artifact_version", "") or "") != "v1":
+        raise ArtifactSchemaError(f"{artifact_type} must use artifact_version v1")
+    file_path = Path(path)
+    if file_path.stat().st_size <= 0:
+        raise ArtifactSchemaError(f"{artifact_type} is empty")
+    try:
+        with zipfile.ZipFile(file_path) as archive:
+            names = set(archive.namelist())
+            if "[Content_Types].xml" not in names or "word/document.xml" not in names:
+                raise ArtifactSchemaError(f"{artifact_type} is not a valid OOXML document")
+    except zipfile.BadZipFile as exc:
+        raise ArtifactSchemaError(f"{artifact_type} is not a valid OOXML document") from exc
+
+
+def _validate_validation_result(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    from validation.run_result import ValidationRunResultV1
+
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    if artifact_type == "validation_run_result_repaired":
+        allowed = ("validation_run_result", "validation_run_result_repaired")
+    else:
+        allowed = ("validation_run_result",)
+    _validate_production_identity(record, root, expected_types=allowed, expected_version="v1")
+    try:
+        ValidationRunResultV1.from_dict(root)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ArtifactSchemaError(f"{artifact_type} failed ValidationRunResultV1 validation: {exc}") from exc
+
+
+def _validate_receipt_closure(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("provider_receipt_closure",), expected_version="v1")
+    payload_value = root.get("payload")
+    payload: Mapping[str, Any] = payload_value if isinstance(payload_value, Mapping) else root
+    _require_fields(payload, ("closure_epoch_id", "expected_call_ids", "observed_call_ids", "missing_call_ids", "hash_mismatches", "complete", "closure_hash"), "provider_receipt_closure.payload")
+    if not isinstance(payload.get("expected_call_ids"), list) or not isinstance(payload.get("hash_mismatches"), Mapping):
+        raise ArtifactSchemaError("provider_receipt_closure payload has invalid call graph fields")
+    if not isinstance(payload.get("complete"), bool) or not str(payload.get("closure_hash") or ""):
+        raise ArtifactSchemaError("provider_receipt_closure payload has invalid completion identity")
+
+
+def _validate_receipt_ledger(record: Any, path: str | Path, _root: Mapping[str, Any] | None = None) -> None:
+    if str(getattr(record, "artifact_version", "") or "") != "v1":
+        raise ArtifactSchemaError("provider_receipt_ledger must use artifact_version v1")
+    records = 0
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ArtifactSchemaError("provider_receipt_ledger cannot be read") from exc
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ArtifactSchemaError(f"provider_receipt_ledger line {line_number} is invalid JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise ArtifactSchemaError(f"provider_receipt_ledger line {line_number} is not an object")
+        _require_fields(payload, ("artifact_type", "artifact_version", "receipt_id", "call_id", "job_id", "stage_name", "status"), "provider_receipt_ledger entry")
+        if str(payload.get("artifact_type") or "") != "provider_call_receipt":
+            raise ArtifactSchemaError("provider receipt ledger entry has an invalid artifact_type")
+        if str(payload.get("artifact_version") or "") != "v2":
+            raise ArtifactSchemaError("provider receipt ledger entry is not provider_call_receipt v2")
+        try:
+            from runtime.provider_runtime import ProviderCallReceiptV1
+
+            ProviderCallReceiptV1.from_dict(payload)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise ArtifactSchemaError(
+                f"provider receipt ledger entry failed ProviderCallReceiptV1 validation: {exc}"
+            ) from exc
+        records += 1
+    if records == 0:
+        raise ArtifactSchemaError("provider_receipt_ledger must contain at least one receipt")
+
+
+def _validate_current_set(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    from services.artifact_registry import CurrentArtifactSetV1
+
+    _validate_production_identity(record, root, expected_types=("current_artifact_set",), expected_version="v1")
+    try:
+        current_set = CurrentArtifactSetV1.from_dict(root)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactSchemaError("current_artifact_set is not a valid CurrentArtifactSetV1") from exc
+    if current_set.job_id != str(getattr(record, "job_id", "") or ""):
+        raise ArtifactSchemaError("current_artifact_set job_id mismatch")
+    if len(current_set.promotion_transaction_hash) != 64:
+        raise ArtifactSchemaError("current_artifact_set promotion_transaction_hash is invalid")
+
+
+def _validate_current_set_pointer(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_current_set(record, path, root)
+    current_set = root
+    metadata = getattr(record, "metadata", {}) or {}
+    if str(metadata.get("current_set_id") or "") != str(current_set.get("set_id") or ""):
+        raise ArtifactSchemaError("current_artifact_set_pointer current_set_id mismatch")
+    if str(metadata.get("current_set_hash") or "") != str(getattr(record, "content_hash", "") or ""):
+        raise ArtifactSchemaError("current_artifact_set_pointer current_set_hash mismatch")
+
+
+def _validate_current_pointer(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("current_artifact_pointer",), expected_version="v1")
+    _require_fields(
+        root,
+        ("pointer_kind", "pointer_role", "target_artifact_id", "target_content_hash", "target_path", "promotion_transaction_id", "updated_at"),
+        "current_artifact_pointer",
+    )
+    if str(root.get("pointer_role") or "") != "current" or len(str(root.get("target_content_hash") or "")) != 64:
+        raise ArtifactSchemaError("current_artifact_pointer target identity is invalid")
+
+
+def _validate_outline_adoption_pointer(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("outline_adoption_pointer", "current_outline_adoption_pointer"), expected_version="v1")
+    if str(getattr(record, "artifact_id", "") or "") == "outline-v3:adoption:current":
+        _require_fields(
+            root,
+            (
+                "role",
+                "current_adoption_artifact_id",
+                "current_adoption_hash",
+                "adoption_identity",
+                "updated_at",
+            ),
+            "outline_adoption_pointer",
+        )
+        if str(root.get("role") or "") != "current" or len(str(root.get("current_adoption_hash") or "")) != 64:
+            raise ArtifactSchemaError("current outline adoption pointer identity is invalid")
+    else:
+        _require_fields(root, ("status", "adoption_id", "expected_hash"), "outline_adoption_pointer")
+        if str(root.get("expected_hash") or "") == "":
+            raise ArtifactSchemaError("outline_adoption_pointer.expected_hash cannot be empty")
+
+
+def _validate_repair_plan(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("repair_plan",), expected_version="v1")
+    _require_fields(root, ("plan_id", "created_at", "created_from_job_id", "validation_report_id", "policy", "proposals", "issues", "manual_review_actions"), "repair_plan")
+
+
+def _validate_repair_apply(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("repair_apply_result",), expected_version="v1")
+    _require_fields(root, ("plan_id", "applied_count", "rejected_count"), "repair_apply_result")
+
+
+def _validate_repair_report(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("repair_report",), expected_version="v1")
+    _require_fields(root, ("report_id", "created_at", "plan_id", "summary", "proposals_detail"), "repair_report")
+
+
+def _validate_repair_transaction(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    version = str(getattr(record, "artifact_version", "") or "")
+    if version not in {"v1", "v3"}:
+        raise ArtifactSchemaError("repair_transaction must use artifact_version v1 or v3")
+    _validate_production_identity(record, root, expected_types=("repair_transaction",), expected_version=version)
+    _require_fields(root, ("transaction_id", "job_id", "status", "policy", "plan_id", "validation_artifact_id", "previous_artifact_ids", "previous_artifact_hashes", "created_at"), "repair_transaction")
+
+
+def _validate_promotion_transaction(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("repair_promotion_transaction",), expected_version="v1")
+    _require_fields(
+        root,
+        ("transaction_id", "job_id", "source_transaction_id", "status", "actor", "reason", "canonical_version", "review_draft_artifact_id", "citation_manifest_artifact_id", "review_docx_artifact_id", "audit_artifact_id", "lineage_artifact_id", "canonical_input_hashes", "output_hashes", "created_at", "validation_run_result_artifact_id"),
+        "repair_promotion_transaction",
+    )
+    if str(root.get("status") or "") not in {"prepared", "promoted"}:
+        raise ArtifactSchemaError("repair_promotion_transaction.status is invalid")
+    if not isinstance(root.get("canonical_input_hashes"), Mapping) or not isinstance(root.get("output_hashes"), Mapping) or not root.get("output_hashes"):
+        raise ArtifactSchemaError("repair_promotion_transaction hash maps are invalid")
+    if str(root.get("canonical_version") or "") != "runtime-validation" and not str(root.get("audit_artifact_id") or ""):
+        raise ArtifactSchemaError("repair_promotion_transaction.audit_artifact_id cannot be empty")
+    if str(root.get("canonical_version") or "") != "runtime-validation" and not str(root.get("lineage_artifact_id") or ""):
+        raise ArtifactSchemaError("repair_promotion_transaction.lineage_artifact_id cannot be empty")
+
+
+def _validate_repair_lineage(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("repair_lineage",), expected_version="v1")
+    _require_fields(root, ("lineage_id", "source_transaction_id", "canonical_inputs", "derived_repair_inputs", "versioned_outputs", "structural_closure", "canonical_replacement"), "repair_lineage")
+    if not isinstance(root.get("canonical_inputs"), Mapping) or not isinstance(root.get("versioned_outputs"), Mapping):
+        raise ArtifactSchemaError("repair_lineage hash maps are invalid")
+
+
+def _validate_review_section(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("review_section",), expected_version="v3")
+    _require_fields(root, ("status", "section_id", "binding_hash", "binding", "content_hash", "section"), "review_section")
+
+
+def _validate_export_bundle(record: Any, path: str | Path, _root: Mapping[str, Any] | None = None) -> None:
+    if str(getattr(record, "artifact_version", "") or "") != "v1":
+        raise ArtifactSchemaError("export_bundle must use artifact_version v1")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if not {"provenance_manifest.json", "checksums.json", "EXPORT_STATUS.txt"}.issubset(names):
+                raise ArtifactSchemaError("export_bundle is missing provenance files")
+            manifest = json.loads(archive.read("provenance_manifest.json").decode("utf-8"))
+    except (OSError, UnicodeError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as exc:
+        raise ArtifactSchemaError("export_bundle cannot be read as a verified ZIP") from exc
+    if not isinstance(manifest, Mapping):
+        raise ArtifactSchemaError("export_bundle provenance manifest must be an object")
+    _require_fields(
+        manifest,
+        (
+            "artifact_type",
+            "artifact_version",
+            "bundle_id",
+            "job_id",
+            "status",
+            "spec",
+            "records",
+            "completion_manifest",
+            "validation_closure",
+            "provider_receipt_closure",
+            "current_stage_closure_map",
+            "requested_stages",
+            "spec_hash",
+            "issues",
+        ),
+        "export_bundle.provenance_manifest",
+    )
+    if str(manifest.get("artifact_type") or "") != "export_bundle" or str(manifest.get("artifact_version") or "") != "v1":
+        raise ArtifactSchemaError("export_bundle provenance identity is invalid")
+    if str(manifest.get("job_id") or "") != str(getattr(record, "job_id", "") or ""):
+        raise ArtifactSchemaError("export_bundle job_id mismatch")
+    if (
+        not isinstance(manifest.get("records"), list)
+        or not isinstance(manifest.get("issues"), list)
+        or not isinstance(manifest.get("current_stage_closure_map"), Mapping)
+        or not isinstance(manifest.get("requested_stages"), list)
+        or not isinstance(manifest.get("spec_hash"), str)
+    ):
+        raise ArtifactSchemaError("export_bundle records/issues must be arrays")
+
+
+def _validate_forensic_attestation(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(record, root, expected_types=("forensic_attestation",), expected_version="v1")
+    _require_fields(root, ("checked_at", "evidence_hash", "status", "graph", "verified", "manual", "issues", "completion", "closure", "receipt_closure", "adoption"), "forensic_attestation")
+
+
+def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    version = str(getattr(record, "artifact_version", "") or "")
+    validators = {
+        ("review_draft", "v3"): _validate_review_json,
+        ("review_draft_repaired", "v1"): _validate_repaired_json,
+        ("citation_manifest", "v3"): _validate_citation_json,
+        ("citation_manifest_repaired", "v1"): _validate_repaired_json,
+        ("citation_ref_catalog", "v1"): _validate_citation_ref_catalog,
+        ("review_replay_ledger", "v1"): lambda r, p, x: _validate_review_replay_ledger(r, p),
+        ("review_docx", "v1"): _validate_docx,
+        ("review_docx_repaired", "v1"): _validate_docx,
+        ("validation_run_result", "v1"): _validate_validation_result,
+        ("validation_run_result_repaired", "v1"): _validate_validation_result,
+        ("provider_receipt_closure", "v1"): _validate_receipt_closure,
+        ("provider_receipt_ledger", "v1"): _validate_receipt_ledger,
+        ("repair_plan", "v1"): _validate_repair_plan,
+        ("repair_apply_result", "v1"): _validate_repair_apply,
+        ("repair_report", "v1"): _validate_repair_report,
+        ("repair_transaction", "v1"): _validate_repair_transaction,
+        ("repair_transaction", "v3"): _validate_repair_transaction,
+        ("repair_promotion_transaction", "v1"): _validate_promotion_transaction,
+        ("repair_lineage", "v1"): _validate_repair_lineage,
+        ("current_artifact_set", "v1"): _validate_current_set,
+        ("current_artifact_set_pointer", "v1"): _validate_current_set_pointer,
+        ("current_artifact_pointer", "v1"): _validate_current_pointer,
+        ("outline_adoption_pointer", "v1"): _validate_outline_adoption_pointer,
+        ("export_bundle", "v1"): _validate_export_bundle,
+        ("forensic_attestation", "v1"): _validate_forensic_attestation,
+        ("review_section", "v3"): _validate_review_section,
     }
-    fields = specific_fields.get(artifact_type)
-    if fields is None:
-        raise ArtifactSchemaError(f"no current validator is registered for {artifact_type!r}")
-    _require_fields(root, fields, artifact_type)
-    for field_name in fields:
-        value = root.get(field_name)
-        if field_name not in {"status", "conclusion", "success", "applied_count", "rejected_count"} and value in (None, ""):
-            raise ArtifactSchemaError(f"{artifact_type}.{field_name} cannot be empty")
-    if artifact_type == "review_docx":
-        file_path = Path(path)
-        if file_path.suffix.casefold() == ".docx":
-            if file_path.stat().st_size <= 0:
-                raise ArtifactSchemaError("review_docx is empty")
-            try:
-                with zipfile.ZipFile(file_path) as archive:
-                    if "[Content_Types].xml" not in archive.namelist() or "word/document.xml" not in archive.namelist():
-                        raise ArtifactSchemaError("review_docx is not a valid OOXML document")
-            except zipfile.BadZipFile as exc:
-                raise ArtifactSchemaError("review_docx is not a valid OOXML document") from exc
+    validator = validators.get((artifact_type, version))
+    if validator is None:
+        raise ArtifactSchemaError(
+            f"no version-aware current validator is registered for {(artifact_type, version)!r}"
+        )
+    validator(record, path, root)
 
 
 def validate_registered_artifact(record: Any, path: str | Path) -> None:
     """Unified ready-artifact validator used by registry and runtime gates."""
 
     artifact_type = str(getattr(record, "artifact_type", "") or "")
-    if artifact_type in OUTLINE_V3_ARTIFACT_TYPES and str(getattr(record, "artifact_version", "") or "") == "v3":
+    version = str(getattr(record, "artifact_version", "") or "")
+    if artifact_type in OUTLINE_V3_ARTIFACT_TYPES:
+        artifact_version = str(getattr(record, "artifact_version", "") or "")
+        if artifact_version not in CURRENT_OUTLINE_ARTIFACT_VERSIONS[artifact_type]:
+            raise ArtifactSchemaError(
+                f"no version-aware current validator is registered for "
+                f"{(artifact_type, artifact_version)!r}"
+            )
+        if artifact_type == "provider_receipt_closure" and artifact_version == "v1":
+            root = _read_object(path)
+            _validate_current_production_artifact(record, path, root)
+            return
         validate_current_outline_artifact(record, path)
         return
     if artifact_type in CURRENT_PRODUCTION_ARTIFACT_TYPES:
-        if artifact_type == "review_replay_ledger":
-            _validate_review_replay_ledger(record, path)
+        if version in LEGACY_COMPATIBLE_ARTIFACT_VERSIONS.get(artifact_type, frozenset()):
             return
-        if artifact_type in {"review_docx", "review_docx_repaired"} and Path(path).suffix.casefold() == ".docx":
-            # The OOXML payload is binary; its owning reconciliation validator
-            # performs the ZIP/document.xml check for the legacy v1 artifact.
-            # A v3 JSON envelope is still validated through the normal branch.
-            if str(getattr(record, "artifact_version", "") or "") != "v3":
-                return
-        root = _read_object(path)
+        if artifact_type in {
+            "review_docx",
+            "review_docx_repaired",
+            "export_bundle",
+            "provider_receipt_ledger",
+            "review_replay_ledger",
+        }:
+            root = None
+        else:
+            root = _read_object(path)
         _validate_current_production_artifact(record, path, root)
         return
 
@@ -406,17 +733,32 @@ def validate_current_outline_artifact(record: Any, path: str | Path) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     if artifact_type not in OUTLINE_V3_ARTIFACT_TYPES:
         raise ArtifactSchemaError(f"unsupported current Outline artifact type: {artifact_type!r}")
+    artifact_version = str(getattr(record, "artifact_version", "") or "")
+    if artifact_version not in CURRENT_OUTLINE_ARTIFACT_VERSIONS[artifact_type]:
+        raise ArtifactSchemaError(
+            f"no version-aware current validator is registered for "
+            f"{(artifact_type, artifact_version)!r}"
+        )
     root = _read_object(path)
+    if artifact_type == "provider_receipt_closure" and artifact_version == "v1":
+        _validate_current_production_artifact(record, path, root)
+        return
     if artifact_type in _ENVELOPE_TYPES:
         _validate_envelope(record, root)
     elif artifact_type == "stage1_canonical_summaries":
-        _require_fields(root, ("job_id", "summaries"), artifact_type)
+        _require_fields(root, ("artifact_type", "artifact_version", "job_id", "summaries"), artifact_type)
+        if str(root.get("artifact_type") or "") != artifact_type or str(root.get("artifact_version") or "") != artifact_version:
+            raise ArtifactSchemaError("stage1_canonical_summaries identity mismatch")
         if not isinstance(root.get("summaries"), list) or not root.get("summaries"):
             raise ArtifactSchemaError("stage1_canonical_summaries.summaries must be a non-empty array")
         if str(getattr(record, "job_id", "") or "") != str(root.get("job_id") or ""):
             raise ArtifactSchemaError("stage1_canonical_summaries job_id mismatch")
     elif artifact_type == "outline_v3_node_dag":
         _require_fields(root, ("job_id", "dag_version", "nodes", "content_hash"), artifact_type)
+        if "artifact_type" in root and str(root.get("artifact_type") or "") != artifact_type:
+            raise ArtifactSchemaError("outline_v3_node_dag artifact_type identity mismatch")
+        if "artifact_version" in root and str(root.get("artifact_version") or "") != artifact_version:
+            raise ArtifactSchemaError("outline_v3_node_dag identity mismatch")
         if str(root.get("job_id") or "") != str(getattr(record, "job_id", "") or ""):
             raise ArtifactSchemaError("outline_v3_node_dag job_id mismatch")
         if not isinstance(root.get("nodes"), list) or not root.get("nodes"):
@@ -433,6 +775,8 @@ __all__ = [
     "ArtifactSchemaError",
     "CURRENT_ARTIFACT_TYPES",
     "CURRENT_PRODUCTION_ARTIFACT_TYPES",
+    "CURRENT_OUTLINE_ARTIFACT_VERSIONS",
+    "LEGACY_COMPATIBLE_ARTIFACT_VERSIONS",
     "OUTLINE_V3_ARTIFACT_TYPES",
     "make_outline_schema_validators",
     "validate_registered_artifact",

@@ -143,6 +143,7 @@ class CurrentArtifactSetV1:
     set_id: str
     job_id: str
     promotion_transaction_id: str
+    promotion_transaction_hash: str
     review_draft_artifact_id: str
     review_draft_artifact_hash: str
     citation_manifest_artifact_id: str
@@ -161,9 +162,12 @@ class CurrentArtifactSetV1:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "CurrentArtifactSetV1":
         required = (
+            "artifact_type",
+            "artifact_version",
             "set_id",
             "job_id",
             "promotion_transaction_id",
+            "promotion_transaction_hash",
             "review_draft_artifact_id",
             "review_draft_artifact_hash",
             "citation_manifest_artifact_id",
@@ -185,6 +189,7 @@ class CurrentArtifactSetV1:
             set_id=str(payload["set_id"]),
             job_id=str(payload["job_id"]),
             promotion_transaction_id=str(payload["promotion_transaction_id"]),
+            promotion_transaction_hash=str(payload["promotion_transaction_hash"]),
             review_draft_artifact_id=str(payload["review_draft_artifact_id"]),
             review_draft_artifact_hash=str(payload["review_draft_artifact_hash"]),
             citation_manifest_artifact_id=str(payload["citation_manifest_artifact_id"]),
@@ -202,7 +207,11 @@ class CurrentArtifactSetV1:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {
+            "artifact_type": "current_artifact_set",
+            "artifact_version": "v1",
+            **asdict(self),
+        }
 
     def target_artifact_pairs(self) -> tuple[tuple[str, str], ...]:
         return (
@@ -477,6 +486,29 @@ class ArtifactRegistry:
                 f"artifact_id {candidate.artifact_id!r} conflicts on "
                 f"{', '.join(conflicting_fields)}"
             )
+        if existing.artifact_type == "repair_promotion_transaction" and existing.status == "ready":
+            immutable_fields = (
+                "artifact_role",
+                "artifact_type",
+                "artifact_version",
+                "path",
+                "producer",
+                "job_id",
+                "status",
+                "content_hash",
+                "depends_on",
+                "metadata",
+            )
+            changed = [
+                field_name
+                for field_name in immutable_fields
+                if getattr(existing, field_name) != getattr(candidate, field_name)
+            ]
+            if changed:
+                raise ArtifactConflict(
+                    f"READY promotion transaction is immutable: {candidate.artifact_id!r}; "
+                    f"changed fields: {', '.join(changed)}"
+                )
 
     def _normalize_dependencies(
         self,
@@ -909,6 +941,7 @@ class ArtifactRegistry:
         self,
         *,
         promotion_transaction_id: str,
+        promotion_transaction_hash: str,
         review_draft_artifact_id: str,
         review_draft_artifact_hash: str,
         citation_manifest_artifact_id: str,
@@ -929,6 +962,7 @@ class ArtifactRegistry:
         fields = {
             "job_id": self.job_id,
             "promotion_transaction_id": promotion_transaction_id,
+            "promotion_transaction_hash": promotion_transaction_hash,
             "review_draft_artifact_id": review_draft_artifact_id,
             "review_draft_artifact_hash": review_draft_artifact_hash,
             "citation_manifest_artifact_id": citation_manifest_artifact_id,
@@ -952,6 +986,7 @@ class ArtifactRegistry:
         self,
         current_set: CurrentArtifactSetV1,
         *,
+        prepared_promotion_record: ArtifactRecord | None = None,
         expected_revision: int | None = None,
     ) -> ArtifactRecord:
         """Atomically register a validated immutable set and switch its pointer.
@@ -994,6 +1029,32 @@ class ArtifactRegistry:
                     f"found {previous_set_id!r}"
                 )
 
+            promotion_record = prepared_promotion_record or artifacts.get(
+                current_set.promotion_transaction_id
+            )
+            if promotion_record is None:
+                raise UnverifiedDependency(
+                    "current artifact set promotion transaction is not registered: "
+                    f"{current_set.promotion_transaction_id}"
+                )
+            if (
+                promotion_record.artifact_id != current_set.promotion_transaction_id
+                or promotion_record.artifact_type != "repair_promotion_transaction"
+                or promotion_record.artifact_version != "v1"
+                or promotion_record.status != "ready"
+                or promotion_record.job_id != self.job_id
+                or promotion_record.content_hash != current_set.promotion_transaction_hash
+            ):
+                raise UnverifiedDependency(
+                    "current artifact set promotion transaction ID/hash binding is invalid"
+                )
+            if prepared_promotion_record is not None:
+                self._validate_artifact_merge(
+                    artifacts.get(prepared_promotion_record.artifact_id),
+                    prepared_promotion_record,
+                )
+            self._verify_ready_artifact(promotion_record)
+
             target_records: list[ArtifactRecord] = []
             for artifact_id, expected_hash in current_set.target_artifact_pairs():
                 record = artifacts.get(artifact_id)
@@ -1015,6 +1076,7 @@ class ArtifactRegistry:
             self._write_json_atomic(set_path, current_set.to_dict())
             set_content_hash = file_sha256(set_path)
             target_refs = [ArtifactDependencyRefV2.from_record(record) for record in target_records]
+            promotion_ref = ArtifactDependencyRefV2.from_record(promotion_record)
             set_record = ArtifactRecord(
                 artifact_id=current_set.set_id,
                 artifact_role="current_artifact_set",
@@ -1025,9 +1087,10 @@ class ArtifactRegistry:
                 job_id=self.job_id,
                 status="ready",
                 content_hash=set_content_hash,
-                depends_on=target_refs,
+                depends_on=[*target_refs, promotion_ref],
                 metadata={
                     "promotion_transaction_id": current_set.promotion_transaction_id,
+                    "promotion_transaction_hash": current_set.promotion_transaction_hash,
                     "actor": current_set.actor,
                     "reason": current_set.reason,
                     "target_artifact_ids": [record.artifact_id for record in target_records],
@@ -1052,6 +1115,7 @@ class ArtifactRegistry:
                     "current_set_hash": set_content_hash,
                     "previous_set_id": previous_set_id,
                     "promotion_transaction_id": current_set.promotion_transaction_id,
+                    "promotion_transaction_hash": current_set.promotion_transaction_hash,
                     "actor": current_set.actor,
                     "reason": current_set.reason,
                 },
@@ -1059,6 +1123,8 @@ class ArtifactRegistry:
             )
             self._verify_ready_artifact(pointer_record)
             merged = dict(artifacts)
+            if prepared_promotion_record is not None:
+                merged[prepared_promotion_record.artifact_id] = prepared_promotion_record
             existing_set = merged.get(current_set.set_id)
             if existing_set is not None and existing_set.content_hash != set_content_hash:
                 raise ArtifactConflict(f"immutable current artifact set changed: {current_set.set_id}")
@@ -1095,6 +1161,18 @@ class ArtifactRegistry:
             resolved = CurrentArtifactSetV1.from_dict(payload)
             if resolved.set_id != set_id or resolved.job_id != self.job_id:
                 raise UnverifiedArtifact("current artifact set identity does not match pointer")
+            promotion = artifacts.get(resolved.promotion_transaction_id)
+            if (
+                promotion is None
+                or promotion.status != "ready"
+                or promotion.content_hash != resolved.promotion_transaction_hash
+                or promotion.artifact_type != "repair_promotion_transaction"
+                or promotion.artifact_version != "v1"
+            ):
+                raise UnverifiedArtifact(
+                    "current artifact set promotion transaction ID/hash binding is invalid"
+                )
+            self._verify_ready_artifact(promotion)
             for artifact_id, expected_hash in resolved.target_artifact_pairs():
                 record = artifacts.get(artifact_id)
                 if record is None or record.status != "ready" or record.content_hash != expected_hash:

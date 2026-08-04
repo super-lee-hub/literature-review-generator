@@ -5,6 +5,8 @@ import threading
 import time
 from typing import Any
 
+from services.artifact_registry import ArtifactRegistry
+from services.job_workspace import atomic_write_json
 from services.queue_service import PersistentQueueService, QueueJobSpec, QueueState
 from services.queue_service import QueueRunner
 
@@ -70,6 +72,36 @@ def _spawn_stale_mutator(
                     fence_token=fence_token,
                     state=QueueState.FAILED,
                 ),
+            }
+        )
+    except BaseException as exc:  # pragma: no cover - surfaced through the parent assertion
+        result_queue.put({"error": f"{type(exc).__name__}: {exc}"})
+
+
+def _spawn_stale_canonical_mutator(
+    queue_file: str,
+    job_id: str,
+    artifact_path: str,
+    registry_path: str,
+    lease_id: str,
+    worker_id: str,
+    lease_generation: int,
+    fence_token: str,
+    result_queue: Any,
+) -> None:
+    try:
+        service = PersistentQueueService(queue_file)
+        result_queue.put(
+            {
+                "canonical": service.register_canonical_artifact_with_lease(
+                    job_id,
+                    artifact_path,
+                    lease_id=lease_id,
+                    worker_id=worker_id,
+                    lease_generation=lease_generation,
+                    fence_token=fence_token,
+                    registry_path=registry_path,
+                )
             }
         )
     except BaseException as exc:  # pragma: no cover - surfaced through the parent assertion

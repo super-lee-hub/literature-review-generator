@@ -393,4 +393,5 @@ def test_current_control_plane_revalidates_and_promotes_quarantined_repair(
     assert registry.get("current-artifact-set:pointer") is not None
     promotion = registry.get(result["promotion_transaction_id"])
     assert promotion is not None and promotion.status == "ready"
-    assert json.loads(Path(promotion.path).read_text(encoding="utf-8"))["status"] == "promoted"
+    assert json.loads(Path(promotion.path).read_text(encoding="utf-8"))["status"] == "prepared"
+    assert current_set.promotion_transaction_hash == promotion.content_hash

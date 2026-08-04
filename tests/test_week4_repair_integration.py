@@ -42,12 +42,24 @@ from validation.review_validator import (
     RootCause,
     ValidationConclusion,
 )
+from validation.run_result import ValidationRunResultV1
 
 
 def _register_validation_fixture(workspace: JobWorkspace, registry: ArtifactRegistry, artifact_id: str = "val-001") -> None:
     path = Path(workspace.artifact_path(f"validation/{artifact_id}.json"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"artifact_type": "validation_run_result", "artifact_id": artifact_id}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            ValidationRunResultV1.create(
+                job_id=workspace.job_id,
+                attempt_id=f"{artifact_id}:attempt",
+                execution_status="failed",
+                review_has_citations=False,
+                evidence_complete=False,
+            ).to_dict()
+        ),
+        encoding="utf-8",
+    )
     registry.register_file(
         artifact_id=artifact_id,
         artifact_role="validation_run_result",

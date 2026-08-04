@@ -22,10 +22,15 @@ cannot satisfy a readiness or completion gate.
 - `runtime_stage_terminals/*/*.json` proves stage completion only when every
   output, hash, schema, dependency, and terminal record validates.
 - `current-artifact-set:pointer` resolves one immutable `CurrentArtifactSetV1`
-  containing the exact five current targets (draft, citation manifest, DOCX,
-  validation result, and validation receipt closure) with their hashes. The
-  pointer is advanced by compare-and-swap; older ready artifacts remain
-  historical or quarantined unless referenced by that set.
+  containing the exact current targets (draft, citation manifest, DOCX,
+  validation result, and validation receipt closure) with their hashes and the
+  bound `repair_promotion_transaction` ID/hash. Promotion first prepares and
+  validates every immutable READY output and its transaction record, then
+  changes the set and pointer inside one Registry OS-lock/CAS boundary. A
+  failed validation, registration, or CAS leaves the previous pointer and
+  current set unchanged; a staged set file may remain quarantined for
+  diagnosis. READY promotion transactions are immutable and are never mutated
+  in place.
 
 Queue lifecycle reads `job_status`; a human-readable success flag is never a
 source of truth.
@@ -40,6 +45,13 @@ source of truth.
 | Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog, resolved through the current artifact set | DOCX and text reports |
 | Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
 | Repair | typed repair issues/actions/patches, quarantined derived inputs, current-service revalidation and receipt closure, and explicit versioned promotion transaction with atomic current-set switching | human-readable repair summaries |
+
+Current production artifacts are validated by the pair
+`(artifact_type, artifact_version)`. Unknown versions for a current production
+type fail closed; they are not silently treated as legacy. The canonical
+export type is `export_bundle` (`v1`), not `export_manifest`. Review, citation,
+DOCX, validation, receipt, repair, promotion, lineage, current-set, pointer,
+export, and forensic artifacts each have an explicit versioned validator.
 
 ## Public outcomes
 
@@ -108,6 +120,17 @@ unaffected upstream nodes. A final outline is adoptable only after the
 coverage, quality, stability, stage-health, identity, and canonical-completion
 gates pass; adoption writes a versioned identity and a current-pointer record.
 
+The stability policy is explicit: `off`, `smoke` (the default), or `full`.
+Smoke executes only the compact high-value perturbations plus exact replay;
+full executes the comprehensive release/audit matrix. Stability writes a
+preflight estimate for provider calls and estimated cost before transport and
+rejects a configured `max_provider_calls` or `max_estimated_cost` breach
+before any provider call. Subruns are checkpointed. Candidate order, source
+order, and alternative shard size are represented in the execution input;
+exact replay uses a fresh executor and records zero provider transport calls.
+Natural-language outputs are compared through documented semantic thresholds,
+not byte identity unless the replay contract explicitly requires it.
+
 `reviewctl` is the single control plane. `status`, `next-action`,
 `validation-status`, `inspect`, and `attest` are provider-free reads.
 `validate` executes the current `ValidationExecutionService` and persists a
@@ -117,8 +140,21 @@ new validation attempt; it is not a closure-only inspection. `run`, `resume`,
 remove/import/export commands are explicit Registry- or queue-backed
 transitions. Queue workers claim a job with a cross-process lease generation
 and fence token and must heartbeat or lose the claim; expired claims are
-recoverable and stale workers cannot publish. Cancellation is cooperative and
-a cancelled job cannot publish a completed queue state.
+recoverable and stale workers cannot publish. The canonical ArtifactRegistry
+publication boundary rechecks that lease/fence before registering a produced
+artifact, so a stale worker cannot publish merely because queue metadata has
+not yet converged. Cancellation is cooperative and a cancelled job cannot
+publish a completed queue state.
+
+Completion and export use `CurrentStageClosureMapV1`, not the validation
+closure as a proxy for every provider stage. The map derives requested stages
+from the durable `artifacts/runtime_job_spec_v1.json` (with only the documented
+legacy fallback), maps logical stages to their physical runtime names, and
+records for each required stage the closure epoch, expected call graph,
+current-input/config/schema hashes, terminal artifact ID/hash, status, and
+Registry dependency IDs/hashes. A missing, stale, mismatched, or incomplete
+stage entry blocks canonical readiness. When a current set exists, its targets
+and hashes are authoritative.
 
 Validation closure requires the current review draft, citation manifest, and
 `ValidationRunResultV1` input IDs and hashes to match. The production path

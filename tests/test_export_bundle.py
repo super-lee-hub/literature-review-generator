@@ -56,6 +56,18 @@ def test_export_registration_failure_is_untrusted_and_removes_bundle(
             "completion": {"completion_status": "complete", "canonical_ready": True},
             "closure": {"status": "clean"},
             "receipt_closure": {"status": "clean", "complete": True},
+            "current_stage_closure_map": {
+                "artifact_type": "current_stage_closure_map",
+                "artifact_version": "v1",
+                "current_set_id": "test-set",
+                "stages": {},
+                "requested_stages": [],
+                "spec_hash": "",
+                "provider_closures_by_stage": {},
+                "blocking_issues": [],
+            },
+            "requested_stages": [],
+            "spec_hash": "",
             "adoption": {"status": "not_adopted"},
             "issues": [],
         },
@@ -87,6 +99,7 @@ def test_forensic_attestation_does_not_call_untrusted_workspace_canonical(tmp_pa
         artifact_version="v2",
         path=source,
         producer="tests",
+        status="quarantined",
         metadata={"manual_modified": True},
     )
     result = ForensicAttestationService(workspace, registry).attest(

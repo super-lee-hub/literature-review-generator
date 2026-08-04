@@ -17,7 +17,7 @@ from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle, StageArtifactRef, StageResult
 from runtime.subagent_policy import ExecutionMode, build_runtime_stage_trace_entry, stage_policy_for
 from validation.execution_service import ValidationExecutionService
-from validation.repair_transaction import current_artifact_record
+from validation.repair_transaction import RepairPromotionTransaction, current_artifact_record
 from outline.v3_executor import OutlineV3Executor
 from outline.adoption_transaction import current_adoption_record
 from services.model_capabilities import resolve_model_capability
@@ -1702,8 +1702,69 @@ class AgentRuntimeBridge:
                     "validation, and validation receipt closure artifacts"
                 )
             previous_set = session.context.registry.resolve_current_artifact_set()
+            promotion_id = f"runtime-validation:{validation_run_result.validation_run_id}"
+            promotion = RepairPromotionTransaction(
+                transaction_id=promotion_id,
+                job_id=session.context.workspace.job_id,
+                source_transaction_id="",
+                status="prepared",
+                actor=producer,
+                reason="validation completed and established the verified current artifact set",
+                canonical_version="runtime-validation",
+                review_draft_artifact_id=review_draft_record.artifact_id,
+                citation_manifest_artifact_id=citation_manifest_record.artifact_id,
+                review_docx_artifact_id=review_docx_record.artifact_id,
+                audit_artifact_id="",
+                lineage_artifact_id="",
+                canonical_input_hashes={
+                    review_draft_record.artifact_id: review_draft_record.content_hash,
+                    citation_manifest_record.artifact_id: citation_manifest_record.content_hash,
+                    review_docx_record.artifact_id: review_docx_record.content_hash,
+                },
+                output_hashes={
+                    review_draft_record.artifact_id: review_draft_record.content_hash,
+                    citation_manifest_record.artifact_id: citation_manifest_record.content_hash,
+                    review_docx_record.artifact_id: review_docx_record.content_hash,
+                    canonical_record.artifact_id: canonical_record.content_hash,
+                    validation_closure_record.artifact_id: validation_closure_record.content_hash,
+                },
+                created_at=utc_now_iso(),
+                validation_run_result_artifact_id=canonical_record.artifact_id,
+            )
+            promotion_path = Path(
+                session.context.workspace.artifact_path(
+                    f"runtime_validation/{promotion_id.replace(':', '-')}/repair_promotion_transaction.json"
+                )
+            )
+            atomic_write_json(str(promotion_path), promotion.to_dict())
+            promotion_record = ArtifactRecord(
+                artifact_id=promotion_id,
+                artifact_role="repair_promotion_transaction",
+                artifact_type=promotion.artifact_type,
+                artifact_version=promotion.artifact_version,
+                path=str(promotion_path),
+                producer="runtime.orchestrator._RuntimeStageHost.validate",
+                job_id=session.context.workspace.job_id,
+                status="ready",
+                content_hash=file_sha256(promotion_path),
+                depends_on=[
+                    ArtifactDependencyRefV2.from_record(review_draft_record),
+                    ArtifactDependencyRefV2.from_record(citation_manifest_record),
+                    ArtifactDependencyRefV2.from_record(review_docx_record),
+                    ArtifactDependencyRefV2.from_record(canonical_record),
+                    ArtifactDependencyRefV2.from_record(validation_closure_record),
+                ],
+                metadata={
+                    "status": promotion.status,
+                    "promotion_state": "prepared",
+                    "commit_boundary": "current_artifact_set_pointer_cas",
+                    "canonical_replacement": True,
+                },
+                created_at=promotion.created_at,
+            )
             current_set = session.context.registry.build_current_artifact_set(
-                promotion_transaction_id=f"runtime-validation:{validation_run_result.validation_run_id}",
+                promotion_transaction_id=promotion_id,
+                promotion_transaction_hash=promotion_record.content_hash,
                 review_draft_artifact_id=review_draft_record.artifact_id,
                 review_draft_artifact_hash=review_draft_record.content_hash,
                 citation_manifest_artifact_id=citation_manifest_record.artifact_id,
@@ -1718,7 +1779,10 @@ class AgentRuntimeBridge:
                 reason="validation completed and established the verified current artifact set",
                 previous_set_id=previous_set.set_id if previous_set is not None else "",
             )
-            current_set_pointer = session.context.registry.switch_current_artifact_set(current_set)
+            current_set_pointer = session.context.registry.switch_current_artifact_set(
+                current_set,
+                prepared_promotion_record=promotion_record,
+            )
             current_set_record = session.context.registry.get(current_set.set_id)
             if current_set_record is None or current_set_record.status != "ready":
                 raise RuntimeError("current artifact set was not registered as ready")

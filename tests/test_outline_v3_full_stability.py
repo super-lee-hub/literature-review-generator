@@ -76,7 +76,7 @@ def test_full_stability_runs_relation_rejection_critique_and_order_sensitive_arb
             }
         return _configured_test_provider(node_id, request)
 
-    result = _executor(tmp_path, provider=provider).run()
+    result = _executor(tmp_path, provider=provider, stability_mode="full").run()
 
     assert result.ok is False
     assert result.status == "blocked"
@@ -87,6 +87,10 @@ def test_full_stability_runs_relation_rejection_critique_and_order_sensitive_arb
     stability = json.loads(stability_path.read_text(encoding="utf-8"))["payload"]
     assert stability["method"] == "metamorphic_full_decision_v2"
     assert stability["status"] == "blocked"
+    assert stability["preflight"]["estimated_provider_calls"] > 0
+    assert stability["exact_replay_verification"]["status"] == "verified"
+    assert stability["exact_replay_verification"]["provider_invoked"] is False
+    assert stability["exact_replay_verification"]["transport_call_count"] == 0
     assert any(
         not comparison["stable"]
         for comparison in stability["comparisons"].values()
@@ -111,7 +115,7 @@ def test_full_stability_quarantines_blocking_critic_before_adoption(tmp_path: Pa
             }
         return _configured_test_provider(node_id, request)
 
-    result = _executor(tmp_path, provider=provider).run()
+    result = _executor(tmp_path, provider=provider, stability_mode="full").run()
 
     assert result.ok is False
     assert result.status == "blocked"

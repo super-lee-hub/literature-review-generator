@@ -81,7 +81,9 @@ def _evaluate_runtime_completion(
     registry_verified = True
     ready_job_outcome = False
     validation_record = False
-    required_provider_stages = {"outline", "review"}.intersection(outcome.required_stages)
+    required_provider_stages = {"analyze", "outline", "review", "validate"}.intersection(
+        outcome.required_stages
+    )
     provider_receipts_complete = not required_provider_stages
     provider_receipt_closure: Mapping[str, Any] | None = None
     current_stage_closure_map: Mapping[str, Any] | None = None
@@ -102,6 +104,16 @@ def _evaluate_runtime_completion(
         from validation.closure import resolve_current_stage_closure_map
 
         current_stage_closure_map = resolve_current_stage_closure_map(registry).to_dict()
+        provider_entries = current_stage_closure_map.get("provider_closures_by_stage")
+        if required_provider_stages:
+            if not isinstance(provider_entries, Mapping):
+                provider_receipts_complete = False
+            else:
+                provider_receipts_complete = all(
+                    isinstance(provider_entries.get(stage), Mapping)
+                    and bool(provider_entries[stage].get("complete"))
+                    for stage in required_provider_stages
+                )
         current_receipt_ref = (current_stage_closure_map.get("stages") or {}).get(
             "validation_receipt_closure"
         )
@@ -117,7 +129,7 @@ def _evaluate_runtime_completion(
                 provider_receipts_complete = bool(candidate.get("complete"))
             else:
                 provider_receipts_complete = False
-        elif required_provider_stages:
+        elif "validate" in required_provider_stages:
             provider_receipts_complete = False
     except (OSError, RegistryError, TypeError, ValueError):
         registry_verified = False

@@ -497,6 +497,8 @@ class ReviewGenerationService:
         atomic_write_json(
             str(path),
             {
+                "artifact_type": "review_section",
+                "artifact_version": "v3",
                 "status": "ready",
                 "job_id": self.job_id,
                 "section_id": section_id,
@@ -564,7 +566,15 @@ class ReviewGenerationService:
             out_of_scope=out_of_scope_receipts,
         )
         path = Path(self.workspace.artifact_path("review_provider_receipt_closure.json"))
-        atomic_write_json(str(path), {"job_id": self.job_id, "payload": closure.to_dict()})
+        atomic_write_json(
+            str(path),
+            {
+                "artifact_type": "provider_receipt_closure",
+                "artifact_version": "v1",
+                "job_id": self.job_id,
+                "payload": closure.to_dict(),
+            },
+        )
         dependencies: list[ArtifactDependencyRefV2] = []
         ledger = self.registry.get("review_provider_receipts")
         if ledger is not None and ledger.status == "ready":

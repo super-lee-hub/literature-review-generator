@@ -237,10 +237,22 @@ def _derive_current_evidence(
 
     closure_records: list[ArtifactRecord] = []
     closure_payloads: list[Mapping[str, Any]] = []
+    stage_map_payload: Mapping[str, Any] = {
+        "artifact_type": "current_stage_closure_map",
+        "artifact_version": "v1",
+        "job_id": registry.job_id,
+        "current_set_id": "",
+        "stages": {},
+        "requested_stages": [],
+        "spec_hash": "",
+        "provider_closures_by_stage": {},
+        "blocking_issues": ["current_stage_closure_map_unavailable"],
+    }
     try:
         from validation.closure import resolve_current_stage_closure_map
 
         stage_map = resolve_current_stage_closure_map(registry)
+        stage_map_payload = stage_map.to_dict()
         current_receipt_id = str(
             (stage_map.stages.get("validation_receipt_closure") or {}).get("artifact_id") or ""
         )
@@ -307,6 +319,9 @@ def _derive_current_evidence(
         "completion": completion,
         "closure": closure,
         "receipt_closure": receipt_closure,
+        "current_stage_closure_map": stage_map_payload,
+        "requested_stages": list(stage_map_payload.get("requested_stages") or ()),
+        "spec_hash": str(stage_map_payload.get("spec_hash") or ""),
         "adoption": adoption,
         "issues": sorted(set(issues)),
     }
@@ -453,6 +468,9 @@ class ExportBundleService:
                 "completion": completion_manifest,
                 "closure": closure_manifest,
                 "receipt_closure": receipt_closure_manifest,
+                "current_stage_closure_map": dict(derived["current_stage_closure_map"]),
+                "requested_stages": list(derived["requested_stages"]),
+                "spec_hash": str(derived["spec_hash"]),
                 "adoption": adoption_manifest,
             }
         )[:24]
@@ -474,6 +492,9 @@ class ExportBundleService:
             "completion_manifest": completion_manifest,
             "validation_closure": closure_manifest,
             "provider_receipt_closure": receipt_closure_manifest,
+            "current_stage_closure_map": dict(derived["current_stage_closure_map"]),
+            "requested_stages": list(derived["requested_stages"]),
+            "spec_hash": str(derived["spec_hash"]),
             "adoption": adoption_manifest,
             "manual_repaired": bool(manual_modified),
             "issues": sorted(set(issues)),
@@ -539,7 +560,13 @@ class ExportBundleService:
                 path=bundle_path,
                 producer="runtime.export_bundle.ExportBundleService",
                 depends_on=[ArtifactDependencyRefV2.from_record(record) for record in ready_records],
-                metadata={"bundle_status": bundle_status, "issue_count": len(issues)},
+                metadata={
+                    # GUI and API consumers historically used ``status``;
+                    # retain the explicit bundle name for newer callers.
+                    "status": bundle_status,
+                    "bundle_status": bundle_status,
+                    "issue_count": len(issues),
+                },
             )
             artifact_id = registered.artifact_id
         except (OSError, RegistryError, ValueError, TypeError) as exc:

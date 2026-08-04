@@ -100,7 +100,14 @@ def _configured_test_provider(node_id: str, request: Mapping[str, Any]) -> Mappi
     return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
 
 
-def _executor(tmp_path: Path, *, provider: Any = None) -> OutlineV3Executor:
+def _executor(
+    tmp_path: Path,
+    *,
+    provider: Any = None,
+    stability_mode: str = "smoke",
+    max_provider_calls: int | None = None,
+    max_estimated_cost: float | None = None,
+) -> OutlineV3Executor:
     workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
     return OutlineV3Executor(
@@ -113,6 +120,9 @@ def _executor(tmp_path: Path, *, provider: Any = None) -> OutlineV3Executor:
         artifact_registry=registry,
         provider=provider or _configured_test_provider,
         candidate_count=2,
+        stability_mode=stability_mode,
+        max_provider_calls=max_provider_calls,
+        max_estimated_cost=max_estimated_cost,
     )
 
 
@@ -144,6 +154,56 @@ def test_outline_v3_without_explicit_adoption_stops_at_ready_for_adoption(tmp_pa
     assert result.status == "ready_for_adoption"
     assert result.adopted is False
     assert "adoption" not in result.artifacts
+
+
+def test_outline_v3_stability_provider_call_budget_rejects_before_transport(tmp_path: Path) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="smoke",
+        max_provider_calls=1,
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert transport_calls == []
+    assert any("max_provider_calls_exceeded" in item for item in result.diagnostics)
+    preflight_paths = list(tmp_path.rglob("stability_preflight_*.json"))
+    assert preflight_paths
+    preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
+    assert preflight["preflight_status"] == "rejected"
+    assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+
+
+def test_outline_v3_stability_cost_budget_rejects_before_transport(tmp_path: Path) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="smoke",
+        max_estimated_cost=0.0,
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert transport_calls == []
+    assert any("max_estimated_cost_exceeded" in item for item in result.diagnostics)
+    preflight_paths = list(tmp_path.rglob("stability_preflight_*.json"))
+    assert preflight_paths
+    preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
+    assert preflight["preflight_status"] == "rejected"
+    assert preflight["rejection_reason"] == "max_estimated_cost_exceeded"
 
 
 def test_outline_v3_relation_adjudication_unknown_id_is_fail_closed(tmp_path: Path) -> None:
