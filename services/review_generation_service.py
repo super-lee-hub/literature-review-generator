@@ -676,11 +676,17 @@ class ReviewGenerationService:
             token_ref_ids = self._token_refs(text)
             explicit = raw_block.get("ref_ids") or raw_block.get("citation_ref_ids") or ()
             explicit_ref_ids = [str(item).strip() for item in explicit if str(item).strip()]
-            ref_ids = list(dict.fromkeys([*token_ref_ids, *explicit_ref_ids]))
-            if not token_ref_ids and explicit_ref_ids:
-                token = f"[[cite_ref:{', '.join(explicit_ref_ids)}]]"
+            missing_explicit_ref_ids = [
+                ref_id for ref_id in explicit_ref_ids if ref_id not in set(token_ref_ids)
+            ]
+            if missing_explicit_ref_ids:
+                # Explicit refs are promises about the rendered text, not a
+                # side-channel list.  Materialize every promised ref as a
+                # structured token so occurrence spans and the manifest see
+                # the same citation truth source.
+                token = f"[[cite_ref:{', '.join(missing_explicit_ref_ids)}]]"
                 text = f"{text} {token}"
-                ref_ids = self._token_refs(text)
+            ref_ids = list(dict.fromkeys([*self._token_refs(text), *explicit_ref_ids]))
             if not ref_ids:
                 raise RuntimeError(f"Writer block {section_number}:{order} has no structured citation")
             invalid = [ref_id for ref_id in ref_ids if ref_id not in allowed_ref_ids]

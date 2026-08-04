@@ -52,6 +52,25 @@ def test_executor_second_run_reuses_only_exact_binding_and_receipt_closure(tmp_p
         assert "quality_gate_hash" in node.execution_binding
 
 
+def test_executor_missing_receipt_invalidates_replay_before_reuse(tmp_path: Path) -> None:
+    calls: list[str] = []
+    first_executor = _counted_fixture_executor(tmp_path, calls)
+    first = first_executor.run()
+    assert first.ok is True
+    first_call_count = len(calls)
+
+    ledger_path = Path(first_executor._receipt_ledger.path)
+    receipts = [line for line in ledger_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert receipts
+    ledger_path.write_text("\n".join(receipts[1:]) + "\n", encoding="utf-8")
+
+    second_executor = _counted_fixture_executor(tmp_path, calls)
+    second = second_executor.run()
+
+    assert second.ok is True
+    assert len(calls) > first_call_count
+
+
 def test_executor_summary_change_invalidates_downstream_and_preserves_no_stale_reuse(tmp_path: Path) -> None:
     calls: list[str] = []
     first_executor = _counted_fixture_executor(tmp_path, calls)

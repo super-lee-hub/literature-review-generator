@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from runtime.artifact_validators import ArtifactSchemaError, validate_current_outline_artifact
+from runtime.artifact_validators import (
+    ArtifactSchemaError,
+    validate_current_outline_artifact,
+    validate_registered_artifact,
+)
 from runtime.reconcile import _validate_validation_run_result
 from validation.run_result import ValidationRunResultError
 
@@ -36,3 +40,49 @@ def test_validation_run_result_rejects_placeholder_json(tmp_path: Path, payload:
 
     with pytest.raises(ValidationRunResultError):
         _validate_validation_run_result(record, path)
+
+
+def test_review_replay_ledger_validates_jsonl_records(tmp_path: Path) -> None:
+    path = tmp_path / "review_replay.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "replay_version": "review-section-replay-v1",
+                "section_id": "candidate_1_section_1",
+                "binding_hash": "b" * 64,
+                "artifact_id": "review-section:candidate_1_section_1",
+                "artifact_path": str(tmp_path / "section.json"),
+                "artifact_content_hash": "c" * 64,
+                "registry_file_hash": "d" * 64,
+                "receipt_id": "receipt-1",
+                "normalized_output_hash": "e" * 64,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record = SimpleNamespace(
+        artifact_type="review_replay_ledger",
+        artifact_version="v1",
+        job_id="job-1",
+    )
+
+    validate_registered_artifact(record, path)
+
+
+def test_review_replay_ledger_rejects_json_object_and_malformed_lines(tmp_path: Path) -> None:
+    record = SimpleNamespace(
+        artifact_type="review_replay_ledger",
+        artifact_version="v1",
+        job_id="job-1",
+    )
+    object_path = tmp_path / "object.jsonl"
+    object_path.write_text(json.dumps({"records": []}), encoding="utf-8")
+    malformed_path = tmp_path / "malformed.jsonl"
+    malformed_path.write_text("not-json\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactSchemaError):
+        validate_registered_artifact(record, object_path)
+    with pytest.raises(ArtifactSchemaError):
+        validate_registered_artifact(record, malformed_path)

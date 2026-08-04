@@ -41,3 +41,28 @@ def test_adoption_uses_versioned_identity_and_current_pointer(tmp_path: Path) ->
     adopted_payload = json.loads(Path(adopted_record.path).read_text(encoding="utf-8"))["payload"]
     assert adopted_payload["adoption_identity"] == adopted.adopted_artifact_id
     assert adopted_payload["current_pointer_artifact_id"] == ADOPTION_POINTER_ARTIFACT_ID
+
+
+def test_stale_adoption_pointer_is_not_used_as_current(tmp_path: Path) -> None:
+    executor = _executor(tmp_path)
+    result = executor.run()
+    assert result.ok is True
+
+    source = executor.registry.get("outline-v3:final_outline")
+    assert source is not None
+    adopted = OutlineAdoptionTransaction(executor.workspace, executor.registry).adopt(
+        source_artifact_id=source.artifact_id,
+        actor="test-researcher",
+        reason="create a pointer that will become stale",
+        expected_hash=source.content_hash,
+    )
+    assert adopted.status == "succeeded"
+
+    pointer = executor.registry.get(ADOPTION_POINTER_ARTIFACT_ID)
+    assert pointer is not None
+    pointer_path = Path(pointer.path)
+    payload = json.loads(pointer_path.read_text(encoding="utf-8"))
+    payload["current_adoption_hash"] = "0" * 64
+    pointer_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert current_adoption_record(executor.registry) is None

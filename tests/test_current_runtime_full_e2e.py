@@ -12,6 +12,7 @@ from runtime.control_plane import ReviewControlPlane
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.runner import AgentRuntimeRunner
 from summary_schema import normalize_ai_summary
+from validation.closure import resolve_current_stage_closure_map
 
 
 def _write_pdf(path: Path, title: str, finding: str) -> None:
@@ -356,10 +357,15 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     assert validation_status["read_only"] is True
 
     completed_inspection = control.inspect(workspace=first.workspace_path)
+    _workspace, completed_registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+    current_stage_map = resolve_current_stage_closure_map(completed_registry)
+    validation_closure_id = str(
+        current_stage_map.stages["validation_receipt_closure"]["artifact_id"]
+    )
     validation_closure = next(
         artifact
         for artifact in completed_inspection["artifacts"]
-        if artifact["artifact_id"] == "validation:provider_receipt_closure"
+        if artifact["artifact_id"] == validation_closure_id
     )
     closure_payload = json.loads(Path(validation_closure["path"]).read_text(encoding="utf-8"))
     assert closure_payload["payload"]["complete"] is True

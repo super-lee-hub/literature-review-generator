@@ -42,6 +42,7 @@ class CompletionEvidenceV1:
     validation_status: str = "missing"
     provider_receipts_complete: bool = False
     provider_receipt_closure: Mapping[str, Any] | None = None
+    current_stage_closure_map: Mapping[str, Any] | None = None
     declared_canonical_ready: bool | None = None
     degradation_reasons: tuple[str, ...] = ()
     evidence_sources: tuple[str, ...] = ()
@@ -86,6 +87,11 @@ class CompletionEvidenceV1:
             provider_receipt_closure=(
                 dict(payload["provider_receipt_closure"])
                 if isinstance(payload.get("provider_receipt_closure"), Mapping)
+                else None
+            ),
+            current_stage_closure_map=(
+                dict(payload["current_stage_closure_map"])
+                if isinstance(payload.get("current_stage_closure_map"), Mapping)
                 else None
             ),
             declared_canonical_ready=(
@@ -155,6 +161,12 @@ class CanonicalCompletionEvaluator:
                 reasons.append(f"canonical_artifact_unready:{artifact_id}")
         if not snapshot.provider_receipts_complete:
             reasons.append("provider_receipts_incomplete")
+        if snapshot.current_stage_closure_map is not None:
+            current_map = snapshot.current_stage_closure_map
+            if str(current_map.get("current_set_id") or "") == "":
+                reasons.append("current_artifact_set_missing")
+            for issue in current_map.get("blocking_issues") or ():
+                reasons.append(f"current_stage_closure:{issue}")
         if snapshot.validation_required:
             if snapshot.validation_status == "missing":
                 reasons.append("validation_missing")
@@ -167,7 +179,7 @@ class CanonicalCompletionEvaluator:
 
         if snapshot.job_status in {"failed", "cancelled"} or snapshot.failed_stage:
             status: CompletionStatus = "failed"
-        elif any(reason.startswith(("declared_canonical_ready:", "artifact_registry_", "canonical_artifact_", "provider_receipts_", "validation_", "degradation:")) for reason in reasons):
+        elif any(reason.startswith(("declared_canonical_ready:", "artifact_registry_", "canonical_artifact_", "provider_receipts_", "validation_", "current_artifact_set_", "current_stage_closure:", "degradation:")) for reason in reasons):
             status = "blocked"
         elif reasons:
             status = "incomplete"

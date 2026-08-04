@@ -22,6 +22,10 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
         {
             "artifact_type": "review_draft",
             "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-01-01T00:00:00Z",
+            "draft_identity": {"draft_id": "closure-draft"},
+            "generation_context": {"source": "test"},
             "content": {
                 "sections": [
                     {
@@ -37,6 +41,7 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
                     }
                 ]
             },
+            "projections": {},
         },
     )
     draft = registry.register_file(
@@ -50,7 +55,15 @@ def _bundle(tmp_path: Path, *, render_policy: bool = True):
     manifest_payload = {
         "artifact_type": "citation_manifest",
         "artifact_version": "v3",
+        "created_from_job_id": workspace.job_id,
+        "created_at": "2026-01-01T00:00:00Z",
+        "manifest_identity": {"manifest_id": "closure-manifest"},
+        "review_reference": {
+            "review_draft_path": str(draft_path),
+            "review_word_path": str(workspace.artifact_path("review.docx")),
+        },
         "occurrences": [],
+        "citation_sets": [],
         "bibliography": [],
     }
     if render_policy:

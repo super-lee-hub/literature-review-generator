@@ -137,14 +137,31 @@ def test_validator_populates_verified_input_artifact_contract(tmp_path: Path) ->
     review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
     evidence_path = workspace.artifact_path("paper_artifacts/paper-a.evidence_manifest_v1.json")
-    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v3"})
+    atomic_write_json(
+        review_path,
+        {
+            "artifact_type": "review_draft",
+            "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "draft_identity": {"draft_id": "review:v3"},
+            "generation_context": {"mode": "test"},
+            "content": {"sections": []},
+            "projections": {},
+        },
+    )
     atomic_write_json(
         citation_path,
         {
             "artifact_type": "citation_manifest",
             "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "manifest_identity": {"manifest_id": "citation:v3"},
+            "review_reference": {"artifact_id": "review:v3"},
             "citation_sets": [{"citation_set_key": "paper-a", "paper_ids": ["paper-a"]}],
             "occurrences": [],
+            "bibliography": [],
         },
     )
     atomic_write_json(evidence_path, {"artifact_type": "evidence_manifest", "artifact_version": "v1"})
@@ -262,10 +279,32 @@ def test_validator_registers_external_evidence_only_with_verified_identity(
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
     review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
-    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v3"})
+    atomic_write_json(
+        review_path,
+        {
+            "artifact_type": "review_draft",
+            "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "draft_identity": {"draft_id": "review:v3"},
+            "generation_context": {"mode": "test"},
+            "content": {"sections": []},
+            "projections": {},
+        },
+    )
     atomic_write_json(
         citation_path,
-        {"artifact_type": "citation_manifest", "artifact_version": "v3"},
+        {
+            "artifact_type": "citation_manifest",
+            "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "manifest_identity": {"manifest_id": "citation:v3"},
+            "review_reference": {"artifact_id": "review:v3"},
+            "occurrences": [],
+            "citation_sets": [],
+            "bibliography": [],
+        },
     )
     review_record = registry.register_file(
         artifact_id="review:v3",
@@ -382,6 +421,10 @@ def test_validator_does_not_treat_cited_draft_with_empty_manifest_as_citation_fr
     review_draft = {
         "artifact_type": "review_draft",
         "artifact_version": "v3",
+        "created_from_job_id": workspace.job_id,
+        "created_at": "2026-08-04T00:00:00Z",
+        "draft_identity": {"draft_id": "review:v3"},
+        "generation_context": {"mode": "test"},
         "content": {
             "sections": [
                 {
@@ -395,12 +438,18 @@ def test_validator_does_not_treat_cited_draft_with_empty_manifest_as_citation_fr
                 }
             ]
         },
+        "projections": {},
     }
     citation_manifest = {
         "artifact_type": "citation_manifest",
         "artifact_version": "v3",
+        "created_from_job_id": workspace.job_id,
+        "created_at": "2026-08-04T00:00:00Z",
+        "manifest_identity": {"manifest_id": "citation:v3"},
+        "review_reference": {"artifact_id": "review:v3"},
         "citation_sets": [],
         "occurrences": [],
+        "bibliography": [],
     }
     atomic_write_json(review_path, review_draft)
     atomic_write_json(citation_path, citation_manifest)

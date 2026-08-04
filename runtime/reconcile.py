@@ -26,7 +26,9 @@ from services.artifact_registry import (
 from services.job_outcome import JobOutcomeV1
 from runtime.artifact_validators import (
     ArtifactSchemaError,
+    CURRENT_PRODUCTION_ARTIFACT_TYPES,
     OUTLINE_V3_ARTIFACT_TYPES as CURRENT_OUTLINE_V3_ARTIFACT_TYPES,
+    validate_registered_artifact,
     validate_current_outline_artifact,
 )
 from summary_schema import (
@@ -692,8 +694,17 @@ def _validate_provider_receipt_ledger(record: ArtifactRecord, path: Path) -> Non
             raise ReconcileValidationError(
                 "provider receipt job_id does not match its Registry owner"
             )
-        if not receipt.receipt_id or not receipt.stage_name or not receipt.route:
-            raise ReconcileValidationError("provider receipt is missing its durable routing identity")
+            if not receipt.receipt_id or not receipt.stage_name or not receipt.route:
+                raise ReconcileValidationError("provider receipt is missing its durable routing identity")
+
+
+def _validate_current_production_artifact(record: ArtifactRecord, path: Path) -> None:
+    """Reuse the registry's strict validator for current production artifacts."""
+
+    try:
+        validate_registered_artifact(record, path)
+    except ArtifactSchemaError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_json_array(_record: ArtifactRecord, path: Path) -> None:
@@ -1488,6 +1499,12 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "outline_stage_health": _validate_outline_stage_health,
     "outline_adoption_pointer": _validate_outline_adoption_pointer,
 }
+
+for _current_production_artifact_type in CURRENT_PRODUCTION_ARTIFACT_TYPES:
+    DEFAULT_SCHEMA_VALIDATORS.setdefault(
+        _current_production_artifact_type,
+        _validate_current_production_artifact,
+    )
 
 for _current_outline_artifact_type in CURRENT_OUTLINE_V3_ARTIFACT_TYPES:
     if _current_outline_artifact_type in {"stage1_canonical_summaries", "outline_v3_node_dag"}:

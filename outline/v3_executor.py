@@ -42,7 +42,14 @@ from runtime.outline_v3_dag import OutlineNodeDAG, OutlineNodeStore
 from runtime.provider_completion import ProviderCompletionEvaluator
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
-from runtime.provider_runtime import ProviderBudgetV1, ProviderRuntime, ProviderRuntimeLedger, hash_json, hash_text
+from runtime.provider_runtime import (
+    ProviderBudgetV1,
+    ProviderRuntime,
+    ProviderRuntimeLedger,
+    compute_closure_epoch_id,
+    hash_json,
+    hash_text,
+)
 from runtime.outline_v3_replay import ModelCallReplayKey, ModelCallReplayStore
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
 from services.job_workspace import atomic_write_json
@@ -129,6 +136,8 @@ class OutlineV3Executor:
         quality_gate: OutlineQualityGate | Mapping[str, Any] | None = None,
         fault_injector: FaultInjector | None = None,
         cancellation_checker: Callable[[], None] | None = None,
+        logical_attempt_identity: str | None = None,
+        _skip_exact_replay_verification: bool = False,
     ) -> None:
         if not str(job_id).strip():
             raise ValueError("job_id is required")
@@ -153,16 +162,52 @@ class OutlineV3Executor:
         self._coverage_contract_hash = self._compute_current_coverage_contract_hash()
         self.fault_injector = fault_injector
         self.cancellation_checker = cancellation_checker
+        self._skip_exact_replay_verification = bool(_skip_exact_replay_verification)
+        default_attempt_payload = {
+            "job_id": self.job_id,
+            "summary_hashes": self._summary_hashes(),
+            "review_intent_hash": self._review_intent_hash,
+            "coverage_contract_hash": self._coverage_contract_hash,
+            "candidate_count": self.candidate_count,
+            "quality_gate_hash": self.quality_gate.content_hash,
+        }
+        self.logical_attempt_identity = str(logical_attempt_identity or "").strip() or (
+            f"outline:{hash_json(default_attempt_payload)[:32]}"
+        )
+        expected_call_graph_hash = hash_json({
+            "provider_nodes": self._provider_node_ids(),
+            "stability_roles": ["candidate_provider_generation", "arbitration"],
+        })
+        self.closure_epoch_id = compute_closure_epoch_id(
+            job_id=self.job_id,
+            stage_name="outline_v3",
+            logical_attempt_identity=self.logical_attempt_identity,
+            expected_call_graph_hash=expected_call_graph_hash,
+            current_input_artifact_hashes={
+                "summary_set": hash_json(self.summaries),
+                "review_intent": self._review_intent_hash,
+                "coverage_contract": self._coverage_contract_hash,
+                "quality_gate": self.quality_gate.content_hash,
+            },
+            provider_config_hash=self._context_profile_hash(),
+            schema_version="outline-v3",
+        )
         self.artifact_paths: dict[str, str] = {}
         self.artifact_records: dict[str, ArtifactRecord] = {}
         self.receipts: list[str] = []
         self.diagnostics: list[str] = []
         self.replay_diagnostics: list[str] = []
         self._payloads: dict[str, dict[str, Any]] = {}
-        self._receipt_ledger = ProviderRuntimeLedger(self._path("outline_v3_provider_receipts.jsonl"))
+        ledger_root = getattr(self.workspace, "root_dir", None) or self._path("")
+        self._receipt_ledger = ProviderRuntimeLedger.for_epoch(
+            ledger_root,
+            stage_name="outline_v3",
+            closure_epoch_id=self.closure_epoch_id,
+        )
         self._replay_store = ModelCallReplayStore(self.workspace)
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
         self._pending_replays: dict[str, tuple[ModelCallReplayKey, str, str]] = {}
+        self._replay_evidence: list[dict[str, Any]] = []
         self._node_store = OutlineNodeStore(self.workspace, self.registry)
         self._dag = self._node_store.ensure(self.job_id, candidate_count=self.candidate_count)
         self._hydrate_expected_provider_calls()
@@ -202,6 +247,26 @@ class OutlineV3Executor:
 
     def _summary_hashes(self) -> list[str]:
         return sorted(_hash_payload(item) for item in self.summaries)
+
+    def _semantic_node_id(self, node_id: str) -> str:
+        """Return the deterministic replay identity for one concrete call."""
+
+        # Stability variants are separate provider calls.  Their audit hash is
+        # part of the identity; collapsing it would make different variant
+        # prompts share one receipt contract and falsely block closure.
+        return str(node_id or "")
+
+    def _provider_call_id(self, node_id: str) -> str:
+        return f"outline:{self._semantic_node_id(node_id)}"
+
+    def _replay_binding_hash(self, binding: Mapping[str, Any]) -> str:
+        """Hash the semantic binding, not the concrete stability audit node."""
+
+        semantic = self._semantic_node_id(str(binding.get("node_id") or ""))
+        replay_binding = dict(binding)
+        replay_binding["node_id"] = semantic
+        replay_binding["semantic_node_id"] = semantic
+        return hash_json(replay_binding)
 
     def _context_profile_hash(self) -> str:
         return _hash_payload({
@@ -275,7 +340,7 @@ class OutlineV3Executor:
             "section_evidence_packets", "final_outline", "coverage_audit", "stability_audit",
             "provider_receipt_closure", "stage_health",
         }
-        provider_node = node_id in self._provider_node_ids()
+        provider_node = node_id in self._provider_node_ids() or node_id.startswith("stability:")
         config = dict(api_config or {})
         if provider_node:
             config.update({
@@ -284,7 +349,11 @@ class OutlineV3Executor:
                 "endpoint_type": self.profile.endpoint_type,
                 "route": provider,
             })
-        candidate_sensitive = node_id in review_nodes or node_id.startswith("candidate_")
+        candidate_sensitive = (
+            node_id in review_nodes
+            or node_id.startswith("candidate_")
+            or node_id.startswith("stability:")
+        )
         relevant_config = {
             "candidate_count": self.candidate_count if candidate_sensitive else 0,
             "quality_gate": self.quality_gate.to_dict() if candidate_sensitive else {},
@@ -292,6 +361,7 @@ class OutlineV3Executor:
         }
         return {
             "node_id": node_id,
+            "semantic_node_id": self._semantic_node_id(node_id),
             "node_version": "v3",
             "artifact_type": artifact_type,
             "artifact_version": artifact_version,
@@ -310,12 +380,13 @@ class OutlineV3Executor:
             "prompt_payload_hash": prompt_payload_hash,
             "prompt_hash": hash_text(json.dumps(prompt, sort_keys=True, ensure_ascii=False)) if prompt is not None else "",
             "provider_config_hash": hash_json(api_config) if api_config is not None else "",
-            "schema_hash": _hash_payload({"node_id": node_id, "expect_json": True}),
+            "schema_hash": _hash_payload({"node_id": self._semantic_node_id(node_id), "expect_json": True}),
             "context_profile_hash": self._context_profile_hash() if provider_node else "",
             "relevant_runtime_config_hash": _hash_payload(relevant_config),
         }
 
     def _provider_binding(self, node_id: str, request: Mapping[str, Any], *, expect_json: bool, input_artifact_hashes: Sequence[str]) -> dict[str, Any]:
+        semantic_node_id = self._semantic_node_id(node_id)
         api_config = {
             "provider_family": self.profile.provider,
             "model": self.profile.model,
@@ -331,9 +402,9 @@ class OutlineV3Executor:
                 for index, value in enumerate(sorted(str(item) for item in input_artifact_hashes if str(item)))
             },
             model=self.profile.model,
-            provider=node_id,
+            provider=semantic_node_id,
             prompt=request,
-            prompt_template_hash=_hash_payload({"node_id": node_id, "expect_json": expect_json}),
+            prompt_template_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
             prompt_payload_hash=hash_json(request),
             api_config=api_config,
         )
@@ -349,12 +420,16 @@ class OutlineV3Executor:
         }
         if len(expected_receipts) != len(set(str(value) for value in record.receipt_ids)):
             return False
+        semantic_node_id = str(binding.get("semantic_node_id") or self._semantic_node_id(str(binding.get("node_id") or "")))
+        semantic_call_id = f"outline:{semantic_node_id}"
         for receipt in expected_receipts.values():
             if receipt.status != "success" or receipt.response_hash != normalized_hash:
                 return False
-            if receipt.job_id != self.job_id or receipt.attempt_id != f"outline:{binding.get('node_id')}":
+            if receipt.job_id != self.job_id or receipt.attempt_id != semantic_call_id:
                 return False
-            if receipt.node_id != str(binding.get("node_id") or "") or receipt.call_id != f"outline:{binding.get('node_id')}":
+            if receipt.node_id != semantic_node_id or receipt.call_id != semantic_call_id:
+                return False
+            if receipt.closure_epoch_id != self.closure_epoch_id:
                 return False
             if receipt.prompt_hash != str(binding.get("prompt_hash") or ""):
                 return False
@@ -371,17 +446,24 @@ class OutlineV3Executor:
         return True
 
     def _register_expected_from_binding(self, node_id: str, binding: Mapping[str, Any]) -> str:
-        call_id = f"outline:{node_id}"
+        semantic_node_id = str(binding.get("semantic_node_id") or self._semantic_node_id(node_id))
+        call_id = f"outline:{semantic_node_id}"
         self._expected_provider_calls[call_id] = ExpectedProviderCall(
             call_id=call_id,
             job_id=self.job_id,
-            attempt_id=f"outline:{node_id}",
+            attempt_id=call_id,
             stage_name="outline_v3",
-            node_id=node_id,
+            node_id=semantic_node_id,
+            closure_epoch_id=self.closure_epoch_id,
+            logical_attempt_identity=self.logical_attempt_identity,
+            expected_call_graph_hash=hash_json({
+                "provider_nodes": self._provider_node_ids(),
+                "stability_roles": ["candidate_provider_generation", "arbitration"],
+            }),
             prompt_hash=str(binding.get("prompt_hash") or ""),
             input_hash=str(binding.get("prompt_payload_hash") or ""),
             config_hash=str(binding.get("provider_config_hash") or ""),
-            schema_hash=str(binding.get("schema_hash") or _hash_payload({"node_id": node_id, "expect_json": True})),
+            schema_hash=str(binding.get("schema_hash") or _hash_payload({"node_id": semantic_node_id, "expect_json": True})),
             max_attempts=1,
             usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
         )
@@ -396,9 +478,15 @@ class OutlineV3Executor:
             self._expected_provider_calls[call_id] = ExpectedProviderCall(
                 call_id=call_id,
                 job_id=self.job_id,
-                attempt_id=f"outline:{node_id}",
+                attempt_id=call_id,
                 stage_name="outline_v3",
                 node_id=node_id,
+                closure_epoch_id=self.closure_epoch_id,
+                logical_attempt_identity=self.logical_attempt_identity,
+                expected_call_graph_hash=hash_json({
+                    "provider_nodes": self._provider_node_ids(),
+                    "stability_roles": ["candidate_provider_generation", "arbitration"],
+                }),
                 max_attempts=1,
                 usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
             )
@@ -411,18 +499,25 @@ class OutlineV3Executor:
         expect_json: bool,
         api_config: Mapping[str, Any],
     ) -> str:
-        call_id = f"outline:{node_id}"
+        semantic_node_id = self._semantic_node_id(node_id)
+        call_id = f"outline:{semantic_node_id}"
         prompt = json.dumps(request, sort_keys=True, ensure_ascii=False)
         self._expected_provider_calls[call_id] = ExpectedProviderCall(
             call_id=call_id,
             job_id=self.job_id,
-            attempt_id=f"outline:{node_id}",
+            attempt_id=call_id,
             stage_name="outline_v3",
-            node_id=node_id,
+            node_id=semantic_node_id,
+            closure_epoch_id=self.closure_epoch_id,
+            logical_attempt_identity=self.logical_attempt_identity,
+            expected_call_graph_hash=hash_json({
+                "provider_nodes": self._provider_node_ids(),
+                "stability_roles": ["candidate_provider_generation", "arbitration"],
+            }),
             prompt_hash=hash_text(prompt),
             input_hash=hash_json(request),
             config_hash=hash_json(api_config),
-            schema_hash=_hash_payload({"node_id": node_id, "expect_json": expect_json}),
+            schema_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
             max_attempts=1,
             usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
         )
@@ -462,7 +557,11 @@ class OutlineV3Executor:
     ) -> dict[str, Any]:
         path = self._node_path(node_id)
         atomic_write_json(path, artifact.to_dict())
-        artifact_id = f"outline-v3:{node_id}"
+        artifact_id = (
+            f"provider-receipt-closure:outline_v3:{self.closure_epoch_id}"
+            if node_id == "provider_receipt_closure"
+            else f"outline-v3:{node_id}"
+        )
         record = self.registry.register_file(
             artifact_role="outline_v3_node_output",
             artifact_type=artifact.artifact_type,
@@ -477,8 +576,29 @@ class OutlineV3Executor:
                 "content_hash": artifact.content_hash,
                 "model": model,
                 "provider": provider,
+                "closure_epoch_id": self.closure_epoch_id if node_id == "provider_receipt_closure" else "",
             },
         )
+        if node_id == "provider_receipt_closure":
+            # Preserve the historical lookup alias for downstream compatibility
+            # while making the epoch-scoped record the canonical identity.
+            legacy_record = self.registry.register_file(
+                artifact_role="outline_v3_node_output_legacy_alias",
+                artifact_type=artifact.artifact_type,
+                artifact_version=artifact.artifact_version,
+                path=path,
+                producer="outline.v3_executor.OutlineV3Executor",
+                artifact_id="outline-v3:provider_receipt_closure",
+                depends_on=self._dependency_refs(depends_on),
+                metadata={
+                    "job_id": self.job_id,
+                    "node_id": node_id,
+                    "content_hash": artifact.content_hash,
+                    "closure_epoch_id": self.closure_epoch_id,
+                    "canonical_artifact_id": artifact_id,
+                },
+            )
+            self.artifact_records["provider_receipt_closure_legacy"] = legacy_record
         self.artifact_paths[node_id] = record.path
         self.artifact_records[node_id] = record
         self._payloads[node_id] = dict(artifact.payload)
@@ -507,7 +627,7 @@ class OutlineV3Executor:
             ),
             execution_binding=binding,
         )
-        expected = self._expected_provider_calls.get(f"outline:{node_id}")
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
         if expected is not None:
             expected = replace(
                 expected,
@@ -531,6 +651,8 @@ class OutlineV3Executor:
                     node_output_hash=artifact.content_hash,
                     output_artifact_ids=(artifact_id,),
                     receipt_ids=(receipt_id,),
+                    audit_node_id=node_id,
+                    closure_epoch_id=self.closure_epoch_id,
                 )
                 self._expected_provider_calls[expected.call_id] = replace(
                     self._expected_provider_calls[expected.call_id],
@@ -578,7 +700,7 @@ class OutlineV3Executor:
                 prompt_payload_hash=str(binding.get("prompt_payload_hash") or ""),
                 input_artifact_hashes=list(dict(binding.get("dependency_hashes") or {}).values()),
                 config_hash=str(binding.get("provider_config_hash") or ""),
-                execution_binding_hash=hash_json(binding),
+                execution_binding_hash=self._replay_binding_hash(binding),
             )
             replay = self._replay_store.lookup(replay_key)
             if not replay.reusable or replay.record is None:
@@ -714,7 +836,7 @@ class OutlineV3Executor:
         self.artifact_paths[node_id] = record.path
         self.artifact_records[node_id] = record
         self._payloads[node_id] = dict(payload)
-        expected = self._expected_provider_calls.get(f"outline:{node_id}")
+        expected = self._expected_provider_calls.get(self._provider_call_id(node_id))
         if expected is not None:
             expected = replace(
                 expected,
@@ -737,6 +859,8 @@ class OutlineV3Executor:
                     node_output_hash=artifact.content_hash,
                     output_artifact_ids=(artifact_id,),
                     receipt_ids=(receipt_id,),
+                    audit_node_id=node_id,
+                    closure_epoch_id=self.closure_epoch_id,
                 )
                 self._expected_provider_calls[expected.call_id] = replace(
                     self._expected_provider_calls[expected.call_id],
@@ -766,18 +890,19 @@ class OutlineV3Executor:
             input_artifact_hashes=input_artifact_hashes,
         )
         call_id = self._register_expected_from_binding(node_id, binding)
+        semantic_node_id = self._semantic_node_id(node_id)
         replay_key = ModelCallReplayKey(
-            node_id=node_id,
+            node_id=semantic_node_id,
             node_version="v3",
             schema_version="outline-v3",
             model_route=self.profile.provider,
             model_name=self.profile.model,
             provider=self.profile.provider,
-            prompt_template_hash=_hash_payload({"node_id": node_id, "expect_json": expect_json}),
+            prompt_template_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
             prompt_payload_hash=hash_json(request),
             input_artifact_hashes=sorted(str(item) for item in input_artifact_hashes if str(item)),
             config_hash=hash_json(api_config),
-            execution_binding_hash=hash_json(binding),
+            execution_binding_hash=self._replay_binding_hash(binding),
         )
         replay_lookup = self._replay_store.lookup(replay_key)
         if replay_lookup.reusable and replay_lookup.record is not None:
@@ -808,6 +933,18 @@ class OutlineV3Executor:
                         replay_output_hash=replay_lookup.record.output_hash,
                         node_output_hash=replay_lookup.record.node_output_hash or replay_record.content_hash,
                     )
+                    self._replay_evidence.append({
+                        "node_id": node_id,
+                        "semantic_node_id": semantic_node_id,
+                        "closure_epoch_id": self.closure_epoch_id,
+                        "key_hash": replay_key.key_hash,
+                        "lookup_status": "hit",
+                        "provider_invoked": False,
+                        "reused_artifact_ids": list(replay_lookup.record.output_artifact_ids),
+                        "reused_receipt_ids": list(replay_lookup.record.receipt_ids),
+                        "reused_artifact_id": str(replay_lookup.record.output_artifact_ids[0]) if replay_lookup.record.output_artifact_ids else "",
+                        "reused_receipt_id": str(replay_lookup.record.receipt_ids[0]) if replay_lookup.record.receipt_ids else "",
+                    })
                     return dict(payload)
         if replay_lookup.status == "stale":
             self.replay_diagnostics.append(
@@ -817,11 +954,13 @@ class OutlineV3Executor:
             budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=0),
             ledger=self._receipt_ledger,
             job_id=self.job_id,
-            attempt_id=f"outline:{node_id}",
+            attempt_id=call_id,
             stage_name="outline_v3",
-            route=node_id,
-            node_id=node_id,
+            route=semantic_node_id,
+            node_id=semantic_node_id,
             call_id=call_id,
+            closure_epoch_id=self.closure_epoch_id,
+            logical_attempt_identity=self.logical_attempt_identity,
             endpoint_type=self.profile.endpoint_type,
             schema_hash=str(binding["schema_hash"]),
         )
@@ -861,6 +1000,8 @@ class OutlineV3Executor:
             result=result,
             metadata={
                 "node_id": node_id,
+                "semantic_node_id": semantic_node_id,
+                "closure_epoch_id": self.closure_epoch_id,
                 "estimation": budget,
                 "replay_status": replay_lookup.status,
                 "replay_stale_reasons": list(replay_lookup.stale_reasons),
@@ -878,6 +1019,18 @@ class OutlineV3Executor:
             if receipt.response_hash != normalized_hash:
                 raise OutlineV3ExecutionError(f"provider response hash for {node_id} does not match normalized output")
             self._pending_replays[node_id] = (replay_key, normalized_hash, receipt.receipt_id)
+        self._replay_evidence.append({
+            "node_id": node_id,
+            "semantic_node_id": semantic_node_id,
+            "closure_epoch_id": self.closure_epoch_id,
+            "key_hash": replay_key.key_hash,
+            "lookup_status": "stale" if replay_lookup.status == "stale" else "miss",
+            "provider_invoked": True,
+            "reused_artifact_ids": [],
+            "reused_receipt_ids": [],
+            "reused_artifact_id": "",
+            "reused_receipt_id": "",
+        })
         if completion.status != "complete":
             raise OutlineV3ExecutionError(f"provider output for {node_id} is {completion.status}")
         if node_id.startswith("stability:"):
@@ -977,6 +1130,128 @@ class OutlineV3Executor:
         )
         self.artifact_paths["provider_receipts"] = record.path
         self.artifact_records["provider_receipts"] = record
+
+    def _verify_exact_replay_with_second_executor(self) -> dict[str, Any]:
+        """Resume the same workspace through a fresh executor with no transport.
+
+        The in-process stability variant proves that the semantic replay key is
+        usable.  This second executor is the stronger boundary check: a fresh
+        registry, node store, and replay store must reproduce the provider
+        outputs without being allowed to invoke the provider transport.
+        """
+
+        comparison_nodes = (
+            "structure_critique",
+            "coverage_critique",
+            "evidence_critique",
+            "arbitration",
+            "selected_candidate",
+            "section_evidence_packets",
+            "final_outline",
+            "provider_receipt_closure",
+        )
+
+        def semantic_artifact_hash(executor: "OutlineV3Executor", node_id: str) -> str:
+            record = executor.artifact_records.get(node_id)
+            if record is None:
+                return ""
+            try:
+                payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return record.content_hash
+            if isinstance(payload, Mapping) and str(payload.get("content_hash") or ""):
+                return str(payload["content_hash"])
+            return record.content_hash
+
+        expected_hashes = {
+            node_id: semantic_artifact_hash(self, node_id)
+            for node_id in comparison_nodes
+            if node_id in self.artifact_records
+        }
+        transport_calls: list[str] = []
+
+        def forbidden_provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+            transport_calls.append(str(node_id))
+            raise OutlineV3ExecutionError(
+                f"exact replay transport invoked for {node_id}"
+            )
+
+        second_registry = ArtifactRegistry(self.registry.registry_path, self.job_id)
+        second_executor = OutlineV3Executor(
+            job_id=self.job_id,
+            summaries=self.summaries,
+            workspace=self.workspace,
+            artifact_registry=second_registry,
+            provider=forbidden_provider,
+            provider_profile=self.profile,
+            candidate_count=self.candidate_count,
+            review_intent=self.review_intent_input,
+            quality_gate=self.quality_gate,
+            logical_attempt_identity=self.logical_attempt_identity,
+            _skip_exact_replay_verification=True,
+        )
+        second_result = second_executor.run()
+        if transport_calls:
+            raise OutlineV3ExecutionError(
+                "second-executor exact replay invoked provider transport: "
+                + ",".join(transport_calls)
+            )
+        if not second_result.ok:
+            second_health = ""
+            health_path = second_result.artifacts.get("stage_health")
+            if health_path:
+                try:
+                    health_envelope = json.loads(Path(health_path).read_text(encoding="utf-8"))
+                    health_payload = health_envelope.get("payload") if isinstance(health_envelope, Mapping) else {}
+                    second_health = json.dumps(
+                        {
+                            "status": health_payload.get("status") if isinstance(health_payload, Mapping) else "",
+                            "diagnostics": health_payload.get("diagnostics") if isinstance(health_payload, Mapping) else [],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    second_health = "unreadable_stage_health"
+            raise OutlineV3ExecutionError(
+                "second-executor exact replay was blocked "
+                f"with status={second_result.status}, "
+                f"failed_nodes={list(second_executor._dag.failed_node_ids)}: "
+                + "; ".join(second_result.diagnostics)
+                + f"; stage_health={second_health}"
+            )
+        second_hashes = {
+            node_id: semantic_artifact_hash(second_executor, node_id)
+            for node_id in comparison_nodes
+            if node_id in second_executor.artifact_records
+        }
+        if expected_hashes != second_hashes:
+            raise OutlineV3ExecutionError(
+                "second-executor exact replay changed decision artifacts: "
+                + ",".join(
+                    sorted(
+                        node_id
+                        for node_id in set(expected_hashes) | set(second_hashes)
+                        if expected_hashes.get(node_id) != second_hashes.get(node_id)
+                    )
+                )
+            )
+        replay_hits = [
+            item for item in second_executor._replay_evidence
+            if not item.get("provider_invoked")
+        ]
+        if not replay_hits:
+            raise OutlineV3ExecutionError(
+                "second-executor exact replay produced no replay-store hits"
+            )
+        return {
+            "status": "verified",
+            "provider_invoked": False,
+            "transport_call_count": 0,
+            "replay_hit_count": len(replay_hits),
+            "replay_evidence": replay_hits,
+            "compared_artifact_hashes": dict(expected_hashes),
+        }
 
     def run(self) -> OutlineV3ExecutionResult:
         try:
@@ -1493,11 +1768,38 @@ class OutlineV3Executor:
                 variant_summaries: Sequence[Mapping[str, Any]],
                 candidate_order: Sequence[str],
             ) -> dict[str, Any]:
+                replay_evidence_start = len(self._replay_evidence)
                 variant_evidence = build_outline_evidence_views(variant_summaries, self.job_id)
                 variant_ledger = build_global_corpus_ledger(variant_evidence)
                 variant_matrix = build_multi_view_matrix(variant_evidence)
                 variant_candidates = build_global_relation_map(variant_evidence, variant_matrix, variant_ledger)
-                variant_confirmed = [item for item in variant_candidates.relations if item.evidence_fields]
+                variant_relation_request = {
+                    "relation_candidates": [item.to_dict() for item in variant_candidates.relations],
+                    "evidence": [view.to_dict() for view in variant_evidence.views],
+                    "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
+                }
+                relation_key_hash = hash_json({"variant": variant_name, "role": "relation_adjudication"})[:16]
+                relation_audit_node_id = f"stability:{relation_key_hash}:relation_adjudication"
+                relation_adjudication = self._provider_call(
+                    relation_audit_node_id,
+                    variant_relation_request,
+                    expect_json=True,
+                    input_artifact_hashes=(
+                        *sorted(variant_evidence.source_summary_hashes),
+                        variant_candidates.content_hash,
+                    ),
+                    transport_node_id="relation_adjudication",
+                )
+                confirmed_relation_ids = {
+                    str(item).strip()
+                    for item in relation_adjudication.get("confirmed_relation_ids") or ()
+                    if str(item).strip()
+                }
+                variant_confirmed = [
+                    item
+                    for item in variant_candidates.relations
+                    if item.evidence_fields and item.relation_id in confirmed_relation_ids
+                ]
                 variant_relation_map = GlobalRelationMap(
                     relations=variant_confirmed,
                     paper_keys=list(variant_candidates.paper_keys),
@@ -1553,6 +1855,69 @@ class OutlineV3Executor:
                         allowed_relation_ids=[item.relation_id for item in variant_relation_map.relations],
                     )
                     variant_contents[candidate_id] = generated
+                variant_generation_hashes = {
+                    candidate_id: hash_json(content)
+                    for candidate_id, content in variant_contents.items()
+                }
+                variant_critique_requests = {
+                    "structure_critique": {
+                        "node_id": "structure_critique",
+                        "candidate_contents": variant_contents,
+                        "candidate_hashes": variant_generation_hashes,
+                        "review_intent": variant_intent.to_dict(),
+                        "checks": [
+                            "section_progression",
+                            "duplicate_assignments",
+                            "goal_claim_alignment",
+                            "placeholder_sections",
+                            "empty_research_streams",
+                        ],
+                    },
+                    "coverage_critique": {
+                        "node_id": "coverage_critique",
+                        "candidate_contents": variant_contents,
+                        "candidate_hashes": variant_generation_hashes,
+                        "coverage_contract": variant_contract.to_dict(),
+                        "corpus_ledger": variant_ledger.to_dict(),
+                        "must_use_paper_keys": list(variant_contract.must_use_paper_keys),
+                        "relations": [item.to_dict() for item in variant_relation_map.relations],
+                    },
+                    "evidence_critique": {
+                        "node_id": "evidence_critique",
+                        "candidate_contents": variant_contents,
+                        "candidate_hashes": variant_generation_hashes,
+                        "candidate_claims": {
+                            key: value.get("planned_claims", [])
+                            for key, value in variant_contents.items()
+                        },
+                        "section_evidence": {
+                            key: value.get("sections", [])
+                            for key, value in variant_contents.items()
+                        },
+                        "paper_keys": sorted(variant_contract.corpus_paper_keys),
+                        "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
+                        "relation_evidence": [item.to_dict() for item in variant_relation_map.relations],
+                    },
+                }
+                variant_critiques: dict[str, dict[str, Any]] = {}
+                for critique_name, critique_request in variant_critique_requests.items():
+                    critique_key_hash = hash_json({"variant": variant_name, "role": critique_name})[:16]
+                    critique_audit_node_id = f"stability:{critique_key_hash}:{critique_name}"
+                    critique = self._provider_call(
+                        critique_audit_node_id,
+                        critique_request,
+                        expect_json=True,
+                        input_artifact_hashes=(
+                            variant_contract.content_hash,
+                            *variant_generation_hashes.values(),
+                        ),
+                        transport_node_id=critique_name,
+                    )
+                    if not bool(critique.get("passed", True)) or critique.get("blocking_diagnostics"):
+                        raise OutlineV3ExecutionError(
+                            f"stability {variant_name} {critique_name} returned blocking diagnostics"
+                        )
+                    variant_critiques[critique_name] = critique
                 arbitration_request = {
                     "candidate_ids": list(variant_contents),
                     "candidates": [
@@ -1562,8 +1927,19 @@ class OutlineV3Executor:
                         }
                         for candidate_id in variant_contents
                     ],
+                    "critiques": variant_critiques,
+                    "blocking_diagnostics": [
+                        *variant_evidence.blocking_diagnostics,
+                        *variant_relation_map.blocking_diagnostics,
+                        *[
+                            str(item)
+                            for critique in variant_critiques.values()
+                            for item in critique.get("blocking_diagnostics") or ()
+                        ],
+                    ],
                     "review_intent": variant_intent.to_dict(),
                     "coverage_contract_hash": variant_contract.content_hash,
+                    "selection_rule": "critique_aware_coverage_then_evidence_then_structure",
                 }
                 arbitration_key_hash = hash_json(
                     {"variant": variant_name, "role": "arbitration"}
@@ -1640,7 +2016,14 @@ class OutlineV3Executor:
                     "final_outline_hash": hash_json(variant_final),
                     "evidence_projection_hash": hash_json({"views": [view.view_hash for view in variant_evidence.views], "ledger": variant_ledger.content_hash, "matrix": variant_matrix.content_hash}),
                 }
-                return {"final_outline": variant_final, "signature": signature, "evidence": variant_evidence, "ledger": variant_ledger, "matrix": variant_matrix}
+                return {
+                    "final_outline": variant_final,
+                    "signature": signature,
+                    "evidence": variant_evidence,
+                    "ledger": variant_ledger,
+                    "matrix": variant_matrix,
+                    "replay_evidence": list(self._replay_evidence[replay_evidence_start:]),
+                }
 
             midpoint = max(1, len(self.summaries) // 2)
             normal_candidate_order = [f"candidate_{index}" for index in range(1, self.candidate_count + 1)]
@@ -1660,27 +2043,37 @@ class OutlineV3Executor:
             variant_errors: dict[str, str] = {}
             rerun_replay_node_ids: dict[str, list[str]] = {}
             projection_signatures: dict[str, dict[str, Any]] = {}
+            exact_replay_verification: dict[str, Any] = {
+                "status": "not_run",
+                "provider_invoked": False,
+            }
             for variant_name, variant_summaries, candidate_order, definition in variants:
                 variant_definitions[variant_name] = definition
                 variant_input_hashes[variant_name] = hash_json({"summaries": variant_summaries, "definition": definition})
                 rerun_replay_node_ids[variant_name] = []
                 try:
-                    decision = _variant_decision(variant_name, variant_summaries, candidate_order)
+                    # The exact-replay variant must execute the same concrete
+                    # baseline call identities.  Its audit label remains
+                    # distinct in the stability report, but changing the
+                    # label here would manufacture new replay keys and make
+                    # a valid replay look missing.
+                    execution_variant_name = (
+                        "baseline" if definition.get("resume") == "exact_replay" else variant_name
+                    )
+                    decision = _variant_decision(execution_variant_name, variant_summaries, candidate_order)
                     if definition.get("resume") == "exact_replay":
-                        replay_decision = _variant_decision(
-                            variant_name,
-                            variant_summaries,
-                            candidate_order,
-                        )
-                        if hash_json(decision["final_outline"]) != hash_json(replay_decision["final_outline"]):
+                        replay_events = [
+                            item for item in decision.get("replay_evidence", [])
+                            if not item.get("provider_invoked")
+                        ]
+                        if not replay_events:
                             raise OutlineV3ExecutionError(
-                                "exact replay produced a different final outline"
+                                "exact replay did not resolve any durable replay records"
                             )
-                        decision = replay_decision
                         rerun_replay_node_ids[variant_name] = [
-                            call_id.removeprefix("outline:")
-                            for call_id in sorted(self._expected_provider_calls)
-                            if call_id.startswith("outline:stability:")
+                            str(item.get("node_id") or "")
+                            for item in replay_events
+                            if str(item.get("node_id") or "")
                         ]
                     variant_signatures[variant_name] = decision["signature"]
                     variant_output_hashes[variant_name] = hash_json(decision["final_outline"])
@@ -1690,7 +2083,7 @@ class OutlineV3Executor:
                         "view_hashes": [view.view_hash for view in variant_evidence.views],
                         "source_summary_hashes": sorted(variant_evidence.source_summary_hashes),
                     }
-                except (TypeError, ValueError, KeyError) as exc:
+                except (OutlineV3ExecutionError, TypeError, ValueError, KeyError) as exc:
                     variant_errors[variant_name] = f"{type(exc).__name__}: {exc}"
 
             baseline_signature = variant_signatures.get("baseline", {})
@@ -1734,6 +2127,8 @@ class OutlineV3Executor:
                 "variant_input_hashes": variant_input_hashes,
                 "variant_output_hashes": variant_output_hashes,
                 "rerun_replay_node_ids": rerun_replay_node_ids,
+                "replay_evidence": list(self._replay_evidence),
+                "exact_replay_verification": exact_replay_verification,
                 "variant_errors": variant_errors,
                 "baseline_final_outline_metrics": baseline_signature,
                 "comparisons": comparisons,
@@ -1774,6 +2169,44 @@ class OutlineV3Executor:
                 provider="local",
             )
             closure_record = self.artifact_records["provider_receipt_closure"]
+            if not self._skip_exact_replay_verification:
+                try:
+                    exact_replay_verification = self._verify_exact_replay_with_second_executor()
+                except (OutlineV3ExecutionError, OSError, TypeError, ValueError) as exc:
+                    exact_replay_verification = {
+                        "status": "blocked",
+                        "provider_invoked": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    variant_errors["exact_replay_resume"] = str(exact_replay_verification["error"])
+                second_replay_passed = exact_replay_verification.get("status") == "verified"
+                metamorphic_checks["second_executor_exact_replay"] = second_replay_passed
+                if not second_replay_passed:
+                    failed_checks.append("second_executor_exact_replay")
+                    stability_status = "blocked"
+                failed_checks = sorted(set(failed_checks))
+                stability_payload.update({
+                    "status": stability_status,
+                    "exact_replay_verification": exact_replay_verification,
+                    "variant_errors": variant_errors,
+                    "checks": metamorphic_checks,
+                    "failed_checks": failed_checks,
+                })
+                stability = self._persist(
+                    "stability_audit",
+                    self._artifact(
+                        StabilityAudit,
+                        stability_payload,
+                        {"coverage_audit": _hash_payload(audit), "final_outline": _hash_payload(final)},
+                    ),
+                    depends_on=("coverage_audit", "final_outline"),
+                    model="deterministic",
+                    provider="local",
+                )
+                refreshed_closure_record = self.registry.get("outline-v3:provider_receipt_closure")
+                if refreshed_closure_record is not None:
+                    closure_record = refreshed_closure_record
+                    self.artifact_records["provider_receipt_closure"] = refreshed_closure_record
             health_diagnostics = list(self.diagnostics)
             if not coverage_passed:
                 health_diagnostics.append("coverage audit did not satisfy the explicit corpus contract")

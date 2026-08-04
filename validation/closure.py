@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from services.artifact_registry import ArtifactRecord, ArtifactRegistry, RegistryError
+from services.artifact_registry import ArtifactRecord, ArtifactRegistry, CurrentArtifactSetV1, RegistryError
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 from validation.run_result import (
     ValidationRunResultError,
@@ -143,6 +143,8 @@ class ValidationClosureResult:
     findings: tuple[str, ...] = ()
     checked_at: str = ""
     evidence_hash: str = ""
+    current_set_id: str = ""
+    stage_closure_map_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -163,6 +165,80 @@ class _InputResolution:
     blocking: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class CurrentStageClosureMapV1:
+    """Resolved stage closures for the one current artifact set."""
+
+    job_id: str
+    current_set_id: str
+    stages: Mapping[str, Mapping[str, Any]]
+    resolved_at: str
+    map_hash: str
+    blocking_issues: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_type": "current_stage_closure_map",
+            "artifact_version": "v1",
+            "job_id": self.job_id,
+            "current_set_id": self.current_set_id,
+            "stages": {str(key): dict(value) for key, value in self.stages.items()},
+            "resolved_at": self.resolved_at,
+            "map_hash": self.map_hash,
+            "blocking_issues": list(self.blocking_issues),
+        }
+
+
+def resolve_current_stage_closure_map(
+    registry: ArtifactRegistry,
+    *,
+    job_id: str | None = None,
+) -> CurrentStageClosureMapV1:
+    """Resolve exact current stage artifacts through the atomic set pointer."""
+
+    resolved_job_id = str(job_id or registry.job_id)
+    blocking: list[str] = []
+    current_set: CurrentArtifactSetV1 | None = None
+    try:
+        current_set = registry.resolve_current_artifact_set()
+    except (OSError, RegistryError, ValueError, TypeError) as exc:
+        blocking.append(f"current_artifact_set_untrusted:{exc}")
+    if current_set is None and not blocking:
+        blocking.append("current_artifact_set_missing")
+    stages: dict[str, Mapping[str, Any]] = {}
+    if current_set is not None:
+        targets = (
+            ("review", current_set.review_draft_artifact_id, current_set.review_draft_artifact_hash),
+            ("citation_manifest", current_set.citation_manifest_artifact_id, current_set.citation_manifest_artifact_hash),
+            ("review_docx", current_set.review_docx_artifact_id, current_set.review_docx_artifact_hash),
+            ("validation", current_set.validation_run_result_artifact_id, current_set.validation_run_result_artifact_hash),
+            ("validation_receipt_closure", current_set.validation_receipt_closure_artifact_id, current_set.validation_receipt_closure_artifact_hash),
+        )
+        for stage, artifact_id, expected_hash in targets:
+            record = registry.get(artifact_id)
+            if record is None or record.status != "ready":
+                blocking.append(f"current_stage_artifact_missing:{stage}")
+                continue
+            if record.content_hash != expected_hash:
+                blocking.append(f"current_stage_artifact_hash_mismatch:{stage}")
+                continue
+            stages[stage] = _record_payload(record) or {}
+    payload = {
+        "job_id": resolved_job_id,
+        "current_set_id": current_set.set_id if current_set else "",
+        "stages": stages,
+        "blocking_issues": sorted(set(blocking)),
+    }
+    return CurrentStageClosureMapV1(
+        job_id=resolved_job_id,
+        current_set_id=payload["current_set_id"],
+        stages=stages,
+        resolved_at=utc_now_iso(),
+        map_hash=_stable_hash(payload),
+        blocking_issues=tuple(sorted(set(blocking))),
+    )
+
+
 class ValidationClosureService:
     """Read-only canonical draft/manifest/validation closure service."""
 
@@ -173,6 +249,23 @@ class ValidationClosureService:
     def _resolve_inputs(self) -> _InputResolution:
         records = self.registry.list_records()
         blocking: list[str] = []
+        try:
+            current_set = self.registry.resolve_current_artifact_set()
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            if self.registry.current_artifact_set_pointer() is not None:
+                return _InputResolution(None, None, None, (f"current_artifact_set_untrusted:{exc}",))
+            current_set = None
+        if current_set is not None:
+            draft = self.registry.get(current_set.review_draft_artifact_id)
+            manifest = self.registry.get(current_set.citation_manifest_artifact_id)
+            validation = self.registry.get(current_set.validation_run_result_artifact_id)
+            if draft is None:
+                blocking.append("current_set_review_draft_missing")
+            if manifest is None:
+                blocking.append("current_set_citation_manifest_missing")
+            if validation is None:
+                blocking.append("current_set_validation_missing")
+            return _InputResolution(draft, manifest, validation, tuple(blocking))
         draft = _choose_record(
             records,
             artifact_type="review_draft",
@@ -396,6 +489,18 @@ class ValidationClosureService:
             "blocking_issues": sorted(set(blocking)),
             "findings": sorted(set(findings)),
         }
+        pointer = self.registry.current_artifact_set_pointer()
+        try:
+            stage_map = resolve_current_stage_closure_map(self.registry)
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            stage_map = CurrentStageClosureMapV1(
+                job_id=self.workspace.job_id,
+                current_set_id="",
+                stages={},
+                resolved_at=utc_now_iso(),
+                map_hash=_stable_hash({"error": str(exc)}),
+                blocking_issues=(f"current_stage_closure_map_untrusted:{exc}",),
+            )
         return ValidationClosureResult(
             job_id=self.workspace.job_id,
             status=status,
@@ -414,6 +519,8 @@ class ValidationClosureService:
             findings=tuple(sorted(set(findings))),
             checked_at=utc_now_iso(),
             evidence_hash=_stable_hash(evidence_payload),
+            current_set_id=str((pointer.metadata if pointer else {}).get("current_set_id") or ""),
+            stage_closure_map_hash=stage_map.map_hash,
         )
 
 
@@ -458,6 +565,8 @@ __all__ = [
     "VALIDATION_CLOSURE_ARTIFACT_TYPE",
     "VALIDATION_CLOSURE_ARTIFACT_VERSION",
     "ValidationClosureResult",
+    "CurrentStageClosureMapV1",
     "ValidationClosureService",
     "persist_validation_closure",
+    "resolve_current_stage_closure_map",
 ]

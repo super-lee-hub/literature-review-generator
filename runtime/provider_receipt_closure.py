@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from runtime.provider_runtime import ProviderCallReceiptV1, hash_json
+from runtime.provider_runtime import ProviderCallReceiptV1, compute_closure_epoch_id, hash_json
 from services.artifact_registry import file_sha256
 
 
@@ -30,6 +30,9 @@ class ExpectedProviderCall:
     attempt_id: str
     stage_name: str
     node_id: str
+    closure_epoch_id: str = ""
+    logical_attempt_identity: str = ""
+    expected_call_graph_hash: str = ""
     prompt_hash: str = ""
     input_hash: str = ""
     config_hash: str = ""
@@ -55,6 +58,9 @@ class ExpectedProviderCall:
             attempt_id=str(payload.get("attempt_id") or ""),
             stage_name=str(payload.get("stage_name") or ""),
             node_id=str(payload.get("node_id") or ""),
+            closure_epoch_id=str(payload.get("closure_epoch_id") or ""),
+            logical_attempt_identity=str(payload.get("logical_attempt_identity") or ""),
+            expected_call_graph_hash=str(payload.get("expected_call_graph_hash") or ""),
             prompt_hash=str(payload.get("prompt_hash") or ""),
             input_hash=str(payload.get("input_hash") or ""),
             config_hash=str(payload.get("config_hash") or ""),
@@ -82,6 +88,7 @@ class ExpectedProviderCall:
 
 @dataclass(frozen=True)
 class ReceiptClosureResult:
+    closure_epoch_id: str = ""
     expected_call_ids: tuple[str, ...] = ()
     observed_call_ids: tuple[str, ...] = ()
     missing_call_ids: tuple[str, ...] = ()
@@ -91,6 +98,8 @@ class ReceiptClosureResult:
     hash_mismatches: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     unexpected_receipts: tuple[str, ...] = ()
     out_of_scope_receipts: tuple[str, ...] = ()
+    out_of_epoch_receipts: tuple[str, ...] = ()
+    historical_receipts: tuple[str, ...] = ()
     retry_exceeded_call_ids: tuple[str, ...] = ()
     usage_incomplete_call_ids: tuple[str, ...] = ()
     complete: bool = False
@@ -106,6 +115,8 @@ class ReceiptClosureResult:
             "incomplete_call_ids",
             "unexpected_receipts",
             "out_of_scope_receipts",
+            "out_of_epoch_receipts",
+            "historical_receipts",
             "retry_exceeded_call_ids",
             "usage_incomplete_call_ids",
         ):
@@ -126,6 +137,8 @@ class ReceiptClosureResult:
             "incomplete_call_ids",
             "unexpected_receipts",
             "out_of_scope_receipts",
+            "out_of_epoch_receipts",
+            "historical_receipts",
             "retry_exceeded_call_ids",
             "usage_incomplete_call_ids",
         ):
@@ -152,8 +165,50 @@ class ProviderReceiptClosure:
             for item in out_of_scope
         ]
         expected_by_id = {item.call_id: item for item in expected_items}
+        expected_epochs = {str(item.closure_epoch_id) for item in expected_items if str(item.closure_epoch_id)}
+        if len(expected_epochs) == 1:
+            closure_epoch_id = next(iter(expected_epochs))
+        elif expected_epochs:
+            closure_epoch_id = _hash(sorted(expected_epochs))
+        else:
+            # Legacy callers did not provide an epoch.  Their explicit
+            # ``observed`` collection remains the current collection, while
+            # ``out_of_scope`` is retained as forensic history.
+            closure_epoch_id = ""
+
+        if expected_epochs:
+            current_receipts = [
+                receipt for receipt in receipts if str(receipt.closure_epoch_id or "") in expected_epochs
+            ]
+            out_of_epoch_receipts = tuple(
+                sorted(
+                    {
+                        str(receipt.receipt_id or receipt.call_id)
+                        for receipt in receipts
+                        if str(receipt.closure_epoch_id or "") not in expected_epochs
+                        and str(receipt.receipt_id or receipt.call_id)
+                    }
+                )
+            )
+        else:
+            current_receipts = list(receipts)
+            out_of_epoch_receipts = ()
+        historical_receipts = tuple(
+            sorted(
+                {
+                    str(receipt.receipt_id or receipt.call_id)
+                    for receipt in receipts
+                    if str(receipt.receipt_id or receipt.call_id) and receipt not in current_receipts
+                }
+                | {
+                    str(receipt.receipt_id or receipt.call_id)
+                    for receipt in out_of_scope_receipts
+                    if str(receipt.receipt_id or receipt.call_id)
+                }
+            )
+        )
         receipts_by_id: dict[str, list[ProviderCallReceiptV1]] = {}
-        for receipt in receipts:
+        for receipt in current_receipts:
             receipts_by_id.setdefault(receipt.call_id, []).append(receipt)
 
         expected_ids = tuple(sorted(expected_by_id))
@@ -174,7 +229,17 @@ class ProviderReceiptClosure:
             current = max(candidates, key=lambda item: (item.attempts, item.sequence, item.finished_at))
             identity_mismatches = {
                 field: (str(getattr(current, field) or ""), str(getattr(contract, field) or ""))
-                for field in ("job_id", "attempt_id", "stage_name", "node_id", "prompt_hash", "input_hash", "config_hash", "schema_hash")
+                for field in (
+                    "job_id",
+                    "attempt_id",
+                    "stage_name",
+                    "node_id",
+                    "prompt_hash",
+                    "input_hash",
+                    "config_hash",
+                    "schema_hash",
+                    "logical_attempt_identity",
+                )
                 if getattr(contract, field) and str(getattr(current, field) or "") != str(getattr(contract, field) or "")
             }
             if identity_mismatches:
@@ -268,12 +333,12 @@ class ProviderReceiptClosure:
                 incomplete,
                 mismatches,
                 unexpected,
-                out_of_scope_ids,
                 retry_exceeded,
                 usage_incomplete,
             )
         )
         payload = {
+            "closure_epoch_id": closure_epoch_id,
             "expected_call_ids": expected_ids,
             "observed_call_ids": observed_ids,
             "missing_call_ids": tuple(sorted(missing)),
@@ -283,6 +348,8 @@ class ProviderReceiptClosure:
             "hash_mismatches": mismatches,
             "unexpected_receipts": unexpected,
             "out_of_scope_receipts": out_of_scope_ids,
+            "out_of_epoch_receipts": out_of_epoch_receipts,
+            "historical_receipts": historical_receipts,
             "retry_exceeded_call_ids": tuple(sorted(retry_exceeded)),
             "usage_incomplete_call_ids": tuple(sorted(usage_incomplete)),
             "complete": complete,
@@ -290,4 +357,9 @@ class ProviderReceiptClosure:
         return ReceiptClosureResult(**payload, closure_hash=_hash(payload))
 
 
-__all__ = ["ExpectedProviderCall", "ProviderReceiptClosure", "ReceiptClosureResult"]
+__all__ = [
+    "ExpectedProviderCall",
+    "ProviderReceiptClosure",
+    "ReceiptClosureResult",
+    "compute_closure_epoch_id",
+]

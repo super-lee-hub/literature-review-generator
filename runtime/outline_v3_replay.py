@@ -100,6 +100,11 @@ class ModelCallReplayRecord:
     node_output_hash: str = ""
     output_artifact_ids: List[str] = field(default_factory=list)
     receipt_ids: List[str] = field(default_factory=list)
+    # The key is deterministic for one concrete provider call, including a
+    # stability-variant audit hash.  These fields retain the concrete
+    # execution/audit identity for receipt and provenance checks.
+    audit_node_id: str = ""
+    closure_epoch_id: str = ""
     created_at: str = field(default_factory=utc_now_iso)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -115,6 +120,8 @@ class ModelCallReplayRecord:
             "node_output_hash": self.node_output_hash,
             "output_artifact_ids": _stable_unique(self.output_artifact_ids),
             "receipt_ids": _stable_unique(self.receipt_ids),
+            "audit_node_id": self.audit_node_id,
+            "closure_epoch_id": self.closure_epoch_id,
             "created_at": self.created_at,
         }
 
@@ -131,6 +138,8 @@ class ModelCallReplayRecord:
             node_output_hash=str(data.get("node_output_hash") or ""),
             output_artifact_ids=_stable_unique(data.get("output_artifact_ids") or []),
             receipt_ids=_stable_unique(data.get("receipt_ids") or []),
+            audit_node_id=str(data.get("audit_node_id") or ""),
+            closure_epoch_id=str(data.get("closure_epoch_id") or ""),
             created_at=str(data.get("created_at") or utc_now_iso()),
         )
 
@@ -200,7 +209,13 @@ class ModelCallReplayStore:
 
     def lookup(self, key: ModelCallReplayKey) -> ReplayLookup:
         records = self._read_records()
-        exact = [record for record in records if record.replay_id == f"replay:{key.key_hash}" and record.key == key]
+        expected_payload = key.to_dict()
+        exact = [
+            record
+            for record in records
+            if record.replay_id == f"replay:{key.key_hash}"
+            and record.key.to_dict() == expected_payload
+        ]
         if exact:
             record = exact[-1]
             if record.status == "succeeded" and record.output_hash:
@@ -225,6 +240,8 @@ class ModelCallReplayStore:
         normalized_output_hash: str = "",
         registered_artifact_hash: str = "",
         node_output_hash: str = "",
+        audit_node_id: str = "",
+        closure_epoch_id: str = "",
     ) -> ModelCallReplayRecord:
         if not output_hash:
             raise ValueError("a replay record requires output_hash")
@@ -237,6 +254,8 @@ class ModelCallReplayStore:
             node_output_hash=node_output_hash,
             output_artifact_ids=_stable_unique(output_artifact_ids),
             receipt_ids=_stable_unique(receipt_ids),
+            audit_node_id=str(audit_node_id or ""),
+            closure_epoch_id=str(closure_epoch_id or ""),
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:

@@ -30,7 +30,13 @@ from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.stage_terminal import StageTerminalStore
-from services.artifact_registry import ArtifactRecord, ArtifactRegistry, RegistryError, file_sha256
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRecord,
+    ArtifactRegistry,
+    RegistryError,
+    file_sha256,
+)
 from services.model_capabilities import resolve_model_capability
 from services.job_workspace import JobWorkspace
 from runtime.cancellation import CancellationRequestStore
@@ -773,6 +779,75 @@ class ReviewControlPlane:
                 claim_latest_pointer=False,
                 publish_running_state=False,
             )
+            active_registry = session.context.registry
+            active_registry.reload()
+            active_derived_draft = active_registry.get(derived_draft.artifact_id)
+            active_derived_manifest = active_registry.get(derived_manifest.artifact_id)
+            if active_derived_draft is None or active_derived_manifest is None:
+                raise ControlPlaneError("repair inputs changed before current-service revalidation")
+            if (
+                active_derived_draft.content_hash != derived_draft.content_hash
+                or active_derived_manifest.content_hash != derived_manifest.content_hash
+                or file_sha256(active_derived_draft.path) != active_derived_draft.content_hash
+                or file_sha256(active_derived_manifest.path) != active_derived_manifest.content_hash
+            ):
+                raise ControlPlaneError("repair input bytes changed before current-service revalidation")
+            versioned_suffix = source_record.content_hash[:16]
+            validated_draft_id = f"review_draft:v3:repair:{versioned_suffix}"
+            validated_manifest_id = f"citation_manifest:v3:repair:{versioned_suffix}"
+
+            def ensure_validation_candidate(
+                *,
+                artifact_id: str,
+                artifact_type: str,
+                artifact_role: str,
+                path: str,
+                depends_on: Sequence[ArtifactDependencyRefV2] = (),
+            ) -> ArtifactRecord:
+                existing = active_registry.get(artifact_id)
+                if existing is not None:
+                    if (
+                        existing.artifact_type != artifact_type
+                        or existing.artifact_version != "v3"
+                        or os.path.abspath(existing.path) != os.path.abspath(path)
+                        or existing.content_hash != file_sha256(path)
+                    ):
+                        raise ControlPlaneError(
+                            f"validation candidate identity conflict: {artifact_id}"
+                        )
+                    return existing
+                return active_registry.register_file(
+                    artifact_id=artifact_id,
+                    artifact_role=artifact_role,
+                    artifact_type=artifact_type,
+                    artifact_version="v3",
+                    path=path,
+                    producer="runtime.control_plane.ControlPlane.repair_promote",
+                    status="quarantined",
+                    depends_on=depends_on,
+                    metadata={
+                        "repair_validation_candidate": True,
+                        "source_artifact_id": (
+                            active_derived_draft.artifact_id
+                            if artifact_type == "review_draft"
+                            else active_derived_manifest.artifact_id
+                        ),
+                    },
+                )
+
+            validated_draft = ensure_validation_candidate(
+                artifact_id=validated_draft_id,
+                artifact_type="review_draft",
+                artifact_role="repair_validation_candidate_review_draft",
+                path=active_derived_draft.path,
+            )
+            validated_manifest = ensure_validation_candidate(
+                artifact_id=validated_manifest_id,
+                artifact_type="citation_manifest",
+                artifact_role="repair_validation_candidate_citation_manifest",
+                path=active_derived_manifest.path,
+                depends_on=(ArtifactDependencyRefV2.from_record(validated_draft),),
+            )
             revalidation_id = f"validation_run_result_repaired:{source_record.content_hash[:16]}"
             revalidation_dir = workspace_obj.artifact_path(
                 f"repair_revalidation/{source_record.content_hash[:16]}"
@@ -782,8 +857,8 @@ class ReviewControlPlane:
                 attempt_id=f"repair-revalidation:{source_record.content_hash[:16]}:{time.time_ns()}",
             )
             revalidation = validation_service.revalidate_review_artifacts(
-                review_draft_record=derived_draft,
-                citation_manifest_record=derived_manifest,
+                review_draft_record=validated_draft,
+                citation_manifest_record=validated_manifest,
                 output_dir=revalidation_dir,
                 result_artifact_id=revalidation_id,
             )

@@ -142,6 +142,22 @@ def _current_pointer_targets(registry: ArtifactRegistry) -> tuple[set[str], dict
             continue
         targets.add(target_id)
         pointer_kinds[kind] = target_id
+    try:
+        current_set = registry.resolve_current_artifact_set()
+    except (OSError, RegistryError, ValueError, TypeError):
+        current_set = None
+    if current_set is not None:
+        current_targets = {
+            "review_draft": current_set.review_draft_artifact_id,
+            "citation_manifest": current_set.citation_manifest_artifact_id,
+            "review_docx": current_set.review_docx_artifact_id,
+            "validation_run_result": current_set.validation_run_result_artifact_id,
+            "provider_receipt_closure": current_set.validation_receipt_closure_artifact_id,
+        }
+        for kind, target_id in current_targets.items():
+            if target_id:
+                targets.add(target_id)
+                pointer_kinds[kind] = target_id
     return targets, pointer_kinds
 
 
@@ -219,19 +235,26 @@ def _derive_current_evidence(
         closure = {"status": "blocked", "blocking_issues": [str(exc)]}
         issues.append(f"validation_closure_unavailable:{exc}")
 
-    closure_records = [
-        record
-        for record in registry.list_records()
-        if record.status == "ready" and record.artifact_type == "provider_receipt_closure"
-    ]
+    closure_records: list[ArtifactRecord] = []
     closure_payloads: list[Mapping[str, Any]] = []
-    for record in closure_records:
-        payload = _json_payload(record)
-        if payload is not None:
-            closure_payloads.append(payload)
-    receipt_complete = bool(closure_payloads) and all(
-        bool(payload.get("complete")) for payload in closure_payloads
-    )
+    try:
+        from validation.closure import resolve_current_stage_closure_map
+
+        stage_map = resolve_current_stage_closure_map(registry)
+        current_receipt_id = str(
+            (stage_map.stages.get("validation_receipt_closure") or {}).get("artifact_id") or ""
+        )
+        current_receipt = registry.get(current_receipt_id) if current_receipt_id else None
+        if current_receipt is not None and current_receipt.status == "ready":
+            closure_records = [current_receipt]
+            payload = _json_payload(current_receipt)
+            if payload is not None:
+                closure_payloads = [payload]
+        if stage_map.blocking_issues:
+            issues.extend(f"current_stage_closure_map:{item}" for item in stage_map.blocking_issues)
+    except (OSError, RegistryError, ValueError, TypeError) as exc:
+        issues.append(f"current_stage_closure_map_unavailable:{exc}")
+    receipt_complete = bool(closure_payloads) and bool(closure_payloads[0].get("complete"))
     receipt_closure = {
         "status": "clean" if receipt_complete else "blocked",
         "complete": receipt_complete,
@@ -637,10 +660,16 @@ class ForensicAttestationService:
             except (OSError, RegistryError, ValueError, TypeError) as exc:
                 issues.append(f"attestation_registration_failed:{exc}")
                 status = "untrusted"
+                artifact_id = ""
+                try:
+                    report_path.unlink()
+                except OSError:
+                    pass
+                report_path = None
         return ForensicAttestationResultV1(
             job_id=self.workspace.job_id,
             status=status,
-            report_path=str(report_path),
+            report_path=str(report_path) if report_path is not None else "",
             artifact_id=artifact_id,
             dependency_graph=graph,
             verified_artifact_ids=tuple(sorted(verified)),

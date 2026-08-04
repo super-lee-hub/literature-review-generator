@@ -22,6 +22,7 @@ from runtime.provider_runtime import (
     ProviderBudgetV1,
     ProviderRuntime,
     ProviderRuntimeLedger,
+    compute_closure_epoch_id,
     _redact_mapping,
     hash_json,
     hash_text,
@@ -68,6 +69,7 @@ class ValidationExecutionService:
         init=False,
         repr=False,
     )
+    closure_epoch_id: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         self.job_id = str(self.job_id or self.workspace.job_id)
@@ -75,6 +77,21 @@ class ValidationExecutionService:
         self.summaries = [dict(item) for item in self.summaries if isinstance(item, Mapping)]
         self.paper_artifact_records = tuple(self.paper_artifact_records or ())
         self.visual_artifact_records = tuple(self.visual_artifact_records or ())
+        input_hashes = {
+            "review_draft": self.review_draft_record.content_hash if self.review_draft_record else "",
+            "citation_manifest": self.citation_manifest_record.content_hash if self.citation_manifest_record else "",
+            "papers": hash_json([record.content_hash for record in self.paper_artifact_records]),
+            "visuals": hash_json([record.content_hash for record in self.visual_artifact_records]),
+        }
+        self.closure_epoch_id = compute_closure_epoch_id(
+            job_id=self.job_id,
+            stage_name="stage4_validate",
+            logical_attempt_identity=self.attempt_id,
+            expected_call_graph_hash=hash_json({"stage": "stage4_validate", "schema": "validation-v1"}),
+            current_input_artifact_hashes=input_hashes,
+            provider_config_hash=hash_json(_redact_mapping(dict(self.runtime_config or {}))),
+            schema_version="validation-v1",
+        )
 
     @property
     def project_name(self) -> str:
@@ -118,8 +135,10 @@ class ValidationExecutionService:
         """Return the append-only validation receipt ledger for this attempt."""
 
         if self._provider_receipt_ledger is None:
-            self._provider_receipt_ledger = ProviderRuntimeLedger(
-                self.workspace.artifact_path("validation_provider_receipts.jsonl")
+            self._provider_receipt_ledger = ProviderRuntimeLedger.for_epoch(
+                self.workspace.root_dir,
+                stage_name="stage4_validate",
+                closure_epoch_id=self.closure_epoch_id,
             )
         return self._provider_receipt_ledger
 
@@ -173,6 +192,8 @@ class ValidationExecutionService:
                 route=resolved_route,
                 node_id=resolved_node,
                 call_id=resolved_call,
+                closure_epoch_id=self.closure_epoch_id,
+                logical_attempt_identity=self.attempt_id,
                 endpoint_type=endpoint_type,
                 schema_hash=resolved_schema_hash,
             )
@@ -186,6 +207,8 @@ class ValidationExecutionService:
                 route=resolved_route,
                 node_id=resolved_node,
                 call_id=resolved_call,
+                closure_epoch_id=self.closure_epoch_id,
+                logical_attempt_identity=self.attempt_id,
                 endpoint_type=endpoint_type,
                 schema_hash=resolved_schema_hash,
             )
@@ -197,6 +220,8 @@ class ValidationExecutionService:
             attempt_id=self.attempt_id,
             stage_name=resolved_stage,
             node_id=resolved_node,
+            closure_epoch_id=self.closure_epoch_id,
+            logical_attempt_identity=self.attempt_id,
             max_attempts=max(1, retry_limit + 1),
             usage_required=endpoint_type not in {"internal", "fixture"},
         )
@@ -471,21 +496,9 @@ class ValidationExecutionService:
 
         receipts = list(self.provider_receipt_ledger.list_receipts())
         expected_calls = list(self._expected_provider_calls.values())
-        all_receipts = list(self.provider_receipt_ledger.list_receipts())
-        current_receipts = [
-            receipt
-            for receipt in all_receipts
-            if receipt.job_id == self.job_id
-            and receipt.stage_name == "stage4_validate"
-            and receipt.attempt_id == self.attempt_id
-        ]
-        out_of_scope_receipts = [
-            receipt for receipt in all_receipts if receipt not in current_receipts
-        ]
         closure: ReceiptClosureResult = ProviderReceiptClosure.evaluate(
             expected_calls,
-            current_receipts,
-            out_of_scope=out_of_scope_receipts,
+            receipts,
         )
         ledger_record = None
         ledger_path = self.provider_receipt_ledger.path
@@ -502,11 +515,15 @@ class ValidationExecutionService:
         closure_path = closure_path or self.workspace.artifact_path(
             "validation_provider_receipt_closure.json"
         )
+        closure_artifact_id = f"provider-receipt-closure:stage4_validate:{closure.closure_epoch_id or self.closure_epoch_id}"
         atomic_write_json(
             closure_path,
             {
+                "artifact_type": "provider_receipt_closure",
+                "artifact_version": "v1",
                 "job_id": self.job_id,
                 "attempt_id": self.attempt_id,
+                "closure_epoch_id": closure.closure_epoch_id or self.closure_epoch_id,
                 "payload": closure.to_dict(),
             },
         )
@@ -519,9 +536,13 @@ class ValidationExecutionService:
             artifact_version="v1",
             path=closure_path,
             producer="validation.execution_service.ValidationExecutionService",
-            artifact_id=artifact_id,
+            artifact_id=closure_artifact_id,
             depends_on=dependencies,
-            metadata={"closure_hash": closure.closure_hash, "complete": closure.complete},
+            metadata={
+                "closure_hash": closure.closure_hash,
+                "complete": closure.complete,
+                "closure_epoch_id": closure.closure_epoch_id or self.closure_epoch_id,
+            },
         )
         return {
             "ledger": ledger_record,

@@ -1680,6 +1680,55 @@ class AgentRuntimeBridge:
             )
             artifact_refs.append(self._artifact_ref_from_record(record))
 
+        if validation_success:
+            review_draft_record = session.context.registry.get("review_draft")
+            citation_manifest_record = session.context.registry.get("citation_manifest_v3")
+            review_docx_record = session.context.registry.get("review_docx")
+            validation_closure_record = validation_provider_receipts.get("closure_record")
+            if (
+                review_draft_record is None
+                or review_draft_record.status != "ready"
+                or citation_manifest_record is None
+                or citation_manifest_record.status != "ready"
+                or review_docx_record is None
+                or review_docx_record.status != "ready"
+                or canonical_record is None
+                or canonical_record.status != "ready"
+                or validation_closure_record is None
+                or validation_closure_record.status != "ready"
+            ):
+                raise RuntimeError(
+                    "current artifact set requires ready review, citation, document, "
+                    "validation, and validation receipt closure artifacts"
+                )
+            previous_set = session.context.registry.resolve_current_artifact_set()
+            current_set = session.context.registry.build_current_artifact_set(
+                promotion_transaction_id=f"runtime-validation:{validation_run_result.validation_run_id}",
+                review_draft_artifact_id=review_draft_record.artifact_id,
+                review_draft_artifact_hash=review_draft_record.content_hash,
+                citation_manifest_artifact_id=citation_manifest_record.artifact_id,
+                citation_manifest_artifact_hash=citation_manifest_record.content_hash,
+                review_docx_artifact_id=review_docx_record.artifact_id,
+                review_docx_artifact_hash=review_docx_record.content_hash,
+                validation_run_result_artifact_id=canonical_record.artifact_id,
+                validation_run_result_artifact_hash=canonical_record.content_hash,
+                validation_receipt_closure_artifact_id=validation_closure_record.artifact_id,
+                validation_receipt_closure_artifact_hash=validation_closure_record.content_hash,
+                actor=producer,
+                reason="validation completed and established the verified current artifact set",
+                previous_set_id=previous_set.set_id if previous_set is not None else "",
+            )
+            current_set_pointer = session.context.registry.switch_current_artifact_set(current_set)
+            current_set_record = session.context.registry.get(current_set.set_id)
+            if current_set_record is None or current_set_record.status != "ready":
+                raise RuntimeError("current artifact set was not registered as ready")
+            artifact_refs.extend(
+                [
+                    self._artifact_ref_from_record(current_set_record),
+                    self._artifact_ref_from_record(current_set_pointer),
+                ]
+            )
+
         self._append_stage_trace_entries(
             session,
             [

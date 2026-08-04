@@ -1143,6 +1143,10 @@ class WorkspaceController:
         self.free_mode_profile_path = ""
         self.free_mode_ready_to_apply = False
         self.free_mode_busy = False
+        self.lifecycle_snapshot: Dict[str, Any] = {}
+        self.lifecycle_actor = ""
+        self.lifecycle_reason = ""
+        self.lifecycle_busy = False
         self.status_message = self.t("工作台已就绪。先完成设置，再按“输入来源 → 运行方式 → 主流程”开始第一轮。")
         current_settings = ApplicationSettings.from_config(self.sections)
         mineru_base_url = self.env_values.get("MINERU_BASE_URL", DEFAULT_MINERU_BASE_URL)
@@ -2205,6 +2209,300 @@ class WorkspaceController:
         )
         self._safe_update_bound_list(self.bindings.log_views, lambda element: element.set_value(self.latest_log_excerpt))
 
+    def _latest_control_plane_workspace(self) -> str | None:
+        snapshot = _latest_workspace_snapshot(
+            str(self.state["paths"].get("output_path") or "./output"),
+            preferred_project=str(self.state["workflow"].get("project_name") or "").strip(),
+        )
+        workspace_path = str((snapshot or {}).get("workspace_path") or "").strip()
+        return workspace_path or None
+
+    def _control_plane_call(self, operation: str, **kwargs: Any) -> Dict[str, Any]:
+        workspace_path = self._latest_control_plane_workspace()
+        if not workspace_path:
+            return {
+                "status": "blocked",
+                "reason": "no canonical job workspace is available",
+                "mutation_performed": False,
+                "read_only": operation in {"inspect", "validation_status"},
+            }
+        try:
+            from runtime.control_plane import ReviewControlPlane
+
+            control = ReviewControlPlane(
+                repo_root=REPO_ROOT,
+                workspace_roots=[Path(self.state["paths"].get("output_path") or "./output")],
+            )
+            method = getattr(control, operation)
+            result = method(workspace=workspace_path, **kwargs)
+            return dict(result) if isinstance(result, dict) else {
+                "status": "blocked",
+                "reason": "invalid control-plane response",
+                "mutation_performed": False,
+            }
+        except Exception as exc:  # pragma: no cover - defensive GUI boundary.
+            return {
+                "status": "blocked",
+                "workspace_path": workspace_path,
+                "reason": str(exc),
+                "mutation_performed": False,
+                "read_only": operation in {"inspect", "validation_status"},
+            }
+
+    @staticmethod
+    def _canonical_lifecycle_states(
+        inspection: Dict[str, Any],
+        validation_status: Dict[str, Any],
+    ) -> list[str]:
+        records = [item for item in inspection.get("artifacts") or () if isinstance(item, dict)]
+
+        def has_ready_type(*artifact_types: str) -> bool:
+            return any(
+                str(item.get("artifact_type") or "") in artifact_types
+                and str(item.get("status") or "") == "ready"
+                for item in records
+            )
+
+        states: list[str] = []
+        job_status = str((inspection.get("status") or {}).get("job_status") or "").strip().lower()
+        if job_status == "cancel_requested":
+            states.append("cancel_requested")
+        elif job_status == "cancelled" or has_ready_type("cancellation_acknowledgement"):
+            states.append("cancel_acknowledged")
+
+        provider_receipts = inspection.get("provider_receipts") or {}
+        if provider_receipts and not bool(provider_receipts.get("complete")):
+            states.append("receipt_incomplete")
+
+        if has_ready_type("adopted_final_outline"):
+            states.append("adopted")
+        elif has_ready_type("final_outline"):
+            states.append("ready_for_adoption")
+
+        validation_artifact = validation_status.get("validation_artifact")
+        validation_state = str(validation_status.get("status") or "").strip().lower()
+        if isinstance(validation_artifact, dict) and validation_artifact.get("status") == "ready":
+            if validation_state == "clean":
+                states.append("validation_clean")
+            elif validation_state in {"findings", "needs_review"}:
+                states.append("validation_findings")
+            else:
+                states.append("validation_not_run")
+        elif validation_state == "running":
+            states.append("validation_running")
+        else:
+            states.append("validation_not_run")
+
+        if has_ready_type("repair_plan"):
+            states.append("repair_available")
+        if any(
+            str(item.get("artifact_type") or "") in {"repair_transaction", "repair_apply_result"}
+            and str(item.get("status") or "") == "quarantined"
+            for item in records
+        ):
+            states.append("repair_quarantined")
+
+        if any(
+            str(item.get("artifact_type") or "") == "export_bundle"
+            and str(item.get("status") or "") == "ready"
+            and str((item.get("metadata") or {}).get("status") or "") == "canonical_verified"
+            for item in records
+        ):
+            states.append("export_canonical_verified")
+        if any(
+            str(item.get("artifact_type") or "") == "export_bundle"
+            and str(item.get("status") or "") in {"quarantined", "failed"}
+            for item in records
+        ):
+            states.append("export_untrusted")
+        return list(dict.fromkeys(states))
+
+    def refresh_lifecycle(self, *, notify_user: bool = False) -> Dict[str, Any]:
+        inspection = self._control_plane_call("inspect")
+        workspace_path = str(inspection.get("workspace_path") or "")
+        inspection_blocked = str(inspection.get("status") or "").strip().lower() == "blocked"
+        validation_status = (
+            self._control_plane_call("validation_status")
+            if workspace_path and not inspection_blocked
+            else {"status": "blocked", "reason": inspection.get("reason", "")}
+        )
+        snapshot = {
+            "workspace_path": workspace_path,
+            "inspection": inspection,
+            "validation_status": validation_status,
+            "canonical_states": self._canonical_lifecycle_states(inspection, validation_status),
+        }
+        self.lifecycle_snapshot = snapshot
+        if notify_user:
+            if inspection_blocked:
+                self.notify(str(inspection.get("reason") or "canonical status is unavailable"), color="warning")
+            else:
+                self.notify(self.t("canonical lifecycle status refreshed"), color="positive")
+        return snapshot
+
+    def _notify_control_plane_result(self, result: Dict[str, Any]) -> None:
+        status = str(result.get("status") or "blocked").strip().lower()
+        message = str(result.get("reason") or result.get("message") or status)
+        if status in {"succeeded", "clean", "canonical_verified", "requested", "available"}:
+            self.notify(message, color="positive")
+        elif status in {"blocked", "untrusted", "failed", "findings"}:
+            self.notify(message, color="warning", multi_line=True)
+        else:
+            self.notify(message, color="info")
+
+    def adopt_current_outline(self) -> Dict[str, Any]:
+        actor = str(self.lifecycle_actor or "").strip()
+        reason = str(self.lifecycle_reason or "").strip()
+        if not actor or not reason:
+            result = {
+                "status": "blocked",
+                "reason": "adoption actor and reason are required",
+                "mutation_performed": False,
+            }
+            self._notify_control_plane_result(result)
+            return result
+        inspection = self._control_plane_call("inspect")
+        target = next(
+            (
+                item
+                for item in inspection.get("artifacts") or ()
+                if isinstance(item, dict)
+                and item.get("artifact_type") == "final_outline"
+                and item.get("status") == "ready"
+            ),
+            None,
+        )
+        if target is None:
+            result = {
+                "status": "blocked",
+                "reason": "no verified ready final outline is available for adoption",
+                "mutation_performed": False,
+            }
+        else:
+            result = self._control_plane_call(
+                "adopt",
+                artifact_id=str(target.get("artifact_id") or ""),
+                actor=actor,
+                reason=reason,
+                expected_hash=str(target.get("content_hash") or ""),
+            )
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def inspect_validation_status(self) -> Dict[str, Any]:
+        result = self._control_plane_call("validation_status")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    async def execute_current_validation(self) -> Dict[str, Any]:
+        self.lifecycle_busy = True
+        self.set_status(self.t("validation is running through the current validation service"))
+        result: Dict[str, Any] = {
+            "status": "blocked",
+            "reason": "validation execution did not return a control-plane result",
+            "mutation_performed": False,
+        }
+        try:
+            result = await asyncio.to_thread(self._control_plane_call, "validate")
+        finally:
+            self.lifecycle_busy = False
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def resume_current_workspace(self) -> Dict[str, Any]:
+        result = self._control_plane_call("resume")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def cancel_current_workspace(self) -> Dict[str, Any]:
+        result = self._control_plane_call("cancel", requested_by="gui", reason="user_requested_from_gui")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def create_repair_plan_from_gui(self) -> Dict[str, Any]:
+        result = self._control_plane_call("repair_plan")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def apply_repair_plan_from_gui(self) -> Dict[str, Any]:
+        """Ask the control plane to apply the selected verified repair plan."""
+
+        inspection = self._control_plane_call("inspect")
+        target = next(
+            (
+                item
+                for item in inspection.get("artifacts") or ()
+                if isinstance(item, dict)
+                and item.get("artifact_type") == "repair_plan"
+                and item.get("status") == "ready"
+            ),
+            None,
+        )
+        if target is None:
+            result = {
+                "status": "blocked",
+                "reason": "no verified ready repair plan is available",
+                "mutation_performed": False,
+            }
+        else:
+            result = self._control_plane_call(
+                "repair_apply",
+                plan_id=str(target.get("artifact_id") or ""),
+            )
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def promote_repaired_artifacts_from_gui(self) -> Dict[str, Any]:
+        """Promote only a quarantined repair through current revalidation."""
+
+        actor = str(self.lifecycle_actor or "").strip()
+        reason = str(self.lifecycle_reason or "").strip()
+        if not actor or not reason:
+            result = {
+                "status": "blocked",
+                "reason": "promotion actor and reason are required",
+                "mutation_performed": False,
+            }
+            self._notify_control_plane_result(result)
+            return result
+
+        inspection = self._control_plane_call("inspect")
+        transactions = [
+            item
+            for item in inspection.get("artifacts") or ()
+            if isinstance(item, dict)
+            and item.get("artifact_type") == "repair_transaction"
+            and item.get("status") == "quarantined"
+        ]
+        target = max(
+            transactions,
+            key=lambda item: (str(item.get("created_at") or ""), str(item.get("artifact_id") or "")),
+            default=None,
+        )
+        if target is None:
+            result = {
+                "status": "blocked",
+                "reason": "no quarantined repair transaction is available for promotion",
+                "mutation_performed": False,
+            }
+        else:
+            result = self._control_plane_call(
+                "repair_promote",
+                transaction_id=str(target.get("artifact_id") or ""),
+                actor=actor,
+                reason=reason,
+            )
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
     def persist_config(self, *, notify_user: bool = True) -> None:
         updated_sections, api_keys, extra_env_values = self._collect_config_payload()
         normalize_for_save(updated_sections)
@@ -2435,6 +2733,89 @@ class WorkspaceController:
             self.update_progress_widgets()
             self.refresh_logs()
             self.refresh_queue(notify_user=False)
+
+
+def _render_lifecycle_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    controller.refresh_lifecycle(notify_user=False)
+
+    state_labels = {
+        "ready_for_adoption": "ready_for_adoption",
+        "adopted": "adopted",
+        "validation_not_run": "validation_not_run",
+        "validation_running": "validation_running",
+        "validation_findings": "validation_findings",
+        "validation_clean": "validation_clean",
+        "receipt_incomplete": "receipt_incomplete",
+        "repair_available": "repair_available",
+        "repair_quarantined": "repair_quarantined",
+        "export_canonical_verified": "export_canonical_verified",
+        "export_untrusted": "export_untrusted",
+        "cancel_requested": "cancel_requested",
+        "cancel_acknowledged": "cancel_acknowledged",
+    }
+
+    def refresh_panel() -> None:
+        controller.refresh_lifecycle(notify_user=True)
+        render_panel.refresh()
+
+    async def execute_validation() -> None:
+        await controller.execute_current_validation()
+        render_panel.refresh()
+
+    def view_validation_status() -> None:
+        controller.inspect_validation_status()
+        render_panel.refresh()
+
+    @ui.refreshable
+    def render_panel() -> None:
+        snapshot = controller.lifecycle_snapshot
+        states = [state_labels.get(str(item), str(item)) for item in snapshot.get("canonical_states") or ()]
+        inspection = snapshot.get("inspection") or {}
+        validation = snapshot.get("validation_status") or {}
+        with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
+            ui.label(t("Canonical lifecycle")).classes("ag-section-title")
+            ui.label(
+                t("These states come from ReviewControlPlane and Registry evidence; the GUI does not infer success from files.")
+            ).classes("ag-subtle")
+            workspace_path = str(snapshot.get("workspace_path") or "")
+            ui.label(workspace_path or t("No canonical job workspace found.")).classes("ag-subtle q-mt-sm")
+            if states:
+                with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                    for state in states:
+                        ui.badge(state).props("outline")
+            else:
+                ui.label(t("canonical status unavailable")).classes("ag-subtle q-mt-md")
+            reason = str(inspection.get("reason") or validation.get("reason") or "").strip()
+            if reason:
+                ui.label(reason).classes("ag-subtle q-mt-sm")
+
+            with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                ui.button(t("Refresh canonical status"), on_click=refresh_panel).props("outline size=sm")
+                ui.button(t("View validation status"), on_click=view_validation_status).props("outline size=sm")
+                ui.button(t("Run validation"), on_click=execute_validation).props("unelevated size=sm")
+                ui.button(t("Resume workspace"), on_click=lambda: (controller.resume_current_workspace(), render_panel.refresh())).props("outline size=sm")
+                ui.button(t("Request cancellation"), on_click=lambda: (controller.cancel_current_workspace(), render_panel.refresh())).props("outline color=negative size=sm")
+                ui.button(t("Create report-only repair plan"), on_click=lambda: (controller.create_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
+                ui.button(t("Apply verified repair plan"), on_click=lambda: (controller.apply_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
+
+            with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
+                actor = ui.input(t("Adoption actor"), value=controller.lifecycle_actor)
+                actor.on("update:model-value", lambda event: setattr(controller, "lifecycle_actor", str(getattr(event, "value", "") or "")))
+                reason_input = ui.input(t("Adoption reason"), value=controller.lifecycle_reason)
+                reason_input.on("update:model-value", lambda event: setattr(controller, "lifecycle_reason", str(getattr(event, "value", "") or "")))
+            ui.button(
+                t("Adopt verified outline"),
+                on_click=lambda: (controller.adopt_current_outline(), render_panel.refresh()),
+            ).props("outline color=primary size=sm")
+            ui.button(
+                t("Promote repaired artifacts"),
+                on_click=lambda: (controller.promote_repaired_artifacts_from_gui(), render_panel.refresh()),
+            ).props("outline color=primary size=sm")
+
+    render_panel()
+    if not controller.test_mode:
+        ui.timer(4.0, refresh_panel)
 
 
 def _render_progress_card(controller: WorkspaceController) -> None:
@@ -3468,6 +3849,7 @@ def launch_gui(
             "/logs",
         ):
             _render_progress_card(controller)
+            _render_lifecycle_card(controller)
 
             def refresh_results_page() -> None:
                 controller.refresh_logs()

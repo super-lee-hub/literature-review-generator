@@ -105,6 +105,46 @@ def hash_json(value: Any) -> str:
         return stable_provider_hash("repr", repr(value))
 
 
+def compute_closure_epoch_id(
+    *,
+    job_id: str,
+    stage_name: str,
+    logical_attempt_identity: str,
+    expected_call_graph_hash: str,
+    current_input_artifact_hashes: Mapping[str, str] | list[str] | tuple[str, ...] = (),
+    provider_config_hash: str,
+    schema_version: str,
+) -> str:
+    """Return the content-addressed identity of one provider closure epoch.
+
+    Receipt ledgers are append-only, so an attempt must be identified by the
+    immutable inputs which define its expected call graph.  The returned
+    value deliberately contains no timestamps or random values: an exact
+    replay of the same logical attempt resolves to the same epoch, while a
+    retry with a new logical attempt identity gets a different epoch.
+    """
+
+    if isinstance(current_input_artifact_hashes, Mapping):
+        input_hashes: Any = {
+            str(key): str(value)
+            for key, value in sorted(current_input_artifact_hashes.items(), key=lambda item: str(item[0]))
+        }
+    else:
+        input_hashes = sorted(str(value) for value in current_input_artifact_hashes)
+    payload = {
+        "job_id": str(job_id),
+        "stage_name": str(stage_name),
+        "logical_attempt_identity": str(logical_attempt_identity),
+        "expected_call_graph_hash": str(expected_call_graph_hash),
+        "current_input_artifact_hashes": input_hashes,
+        "provider_config_hash": str(provider_config_hash),
+        "schema_version": str(schema_version),
+    }
+    return hashlib.sha256(
+        f"auto-generate\x00provider-closure-epoch-v1\x00{_canonical_json(payload)}".encode("utf-8")
+    ).hexdigest()
+
+
 def _redact_text(value: Any) -> str:
     text = str(value or "")
     for pattern in _REDACTION_PATTERNS:
@@ -221,6 +261,8 @@ class ProviderCallReceiptV1:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     node_id: str = ""
     call_id: str = ""
+    closure_epoch_id: str = ""
+    logical_attempt_identity: str = ""
     endpoint_type: str = ""
     estimated_input_tokens: int | None = None
     cached_input_tokens: int | None = None
@@ -316,6 +358,8 @@ class ProviderCallReceiptV1:
         metadata: Mapping[str, Any] | None = None,
         node_id: str = "",
         call_id: str = "",
+        closure_epoch_id: str = "",
+        logical_attempt_identity: str = "",
         endpoint_type: str = "",
         test_only: bool = False,
     ) -> "ProviderCallReceiptV1":
@@ -363,6 +407,8 @@ class ProviderCallReceiptV1:
             metadata=metadata or {},
             node_id=node_id,
             call_id=call_id or f"call-{admission.sequence}",
+            closure_epoch_id=str(closure_epoch_id or ""),
+            logical_attempt_identity=str(logical_attempt_identity or ""),
             endpoint_type=str(result.get("endpoint_type") or endpoint_type),
             estimated_input_tokens=admission.estimated_tokens,
             cached_input_tokens=_optional_nonnegative_int(result.get("cached_input_tokens")),
@@ -426,6 +472,8 @@ class ProviderCallReceiptV1:
             metadata=metadata,
             node_id=str(payload.get("node_id") or ""),
             call_id=str(payload.get("call_id") or ""),
+            closure_epoch_id=str(payload.get("closure_epoch_id") or ""),
+            logical_attempt_identity=str(payload.get("logical_attempt_identity") or ""),
             endpoint_type=str(payload.get("endpoint_type") or ""),
             estimated_input_tokens=_optional_nonnegative_int(payload.get("estimated_input_tokens")),
             cached_input_tokens=_optional_nonnegative_int(payload.get("cached_input_tokens")),
@@ -483,6 +531,22 @@ class ProviderRuntimeLedger:
         self.path = Path(path).expanduser().resolve()
         self._lock = _ledger_lock(self.path)
 
+    @classmethod
+    def for_epoch(cls, root: str | Path, *, stage_name: str, closure_epoch_id: str) -> "ProviderRuntimeLedger":
+        """Open the immutable stage/epoch ledger location.
+
+        Keeping the epoch in the path prevents a retry from silently mixing
+        receipts with a previous attempt.  Legacy callers may continue to
+        pass an explicit JSONL path to the normal constructor.
+        """
+
+        safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(stage_name or "stage"))
+        safe_epoch = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(closure_epoch_id or "unknown"))
+        root_path = Path(root).expanduser().resolve()
+        if root_path.suffix.casefold() == ".jsonl":
+            root_path = root_path.parent
+        return cls(root_path / "provider_receipts" / safe_stage / f"{safe_epoch}.jsonl")
+
     def _read_unlocked(self) -> list[ProviderCallReceiptV1]:
         if not self.path.exists():
             return []
@@ -538,6 +602,8 @@ class ProviderRuntime:
         schema_hash: str | None = None,
         node_id: str = "",
         call_id: str = "",
+        closure_epoch_id: str = "",
+        logical_attempt_identity: str = "",
         endpoint_type: str = "",
         test_only: bool = False,
     ) -> None:
@@ -567,9 +633,21 @@ class ProviderRuntime:
         self.route = route
         self.node_id = node_id
         self.call_id = call_id
+        self.logical_attempt_identity = str(logical_attempt_identity or attempt_id)
         self.endpoint_type = endpoint_type
         self.test_only = bool(test_only)
         self.schema_hash = schema_hash or hash_text("provider-runtime-default-schema-v1")
+        self.closure_epoch_id = str(closure_epoch_id or "")
+        if not self.closure_epoch_id and not self.test_only:
+            self.closure_epoch_id = compute_closure_epoch_id(
+                job_id=self.job_id,
+                stage_name=self.stage_name,
+                logical_attempt_identity=self.logical_attempt_identity,
+                expected_call_graph_hash=hash_json({"node_id": self.node_id, "call_id": self.call_id}),
+                current_input_artifact_hashes=(),
+                provider_config_hash=hash_json({"route": self.route}),
+                schema_version=self.schema_hash,
+            )
         self.started_monotonic = time.monotonic()
         self.started_at = utc_now_iso()
         self._lock = threading.RLock()
@@ -659,6 +737,8 @@ class ProviderRuntime:
             metadata=metadata,
             node_id=self.node_id,
             call_id=str((metadata or {}).get("call_id") or self.call_id or f"call-{admission.sequence}"),
+            closure_epoch_id=self.closure_epoch_id,
+            logical_attempt_identity=self.logical_attempt_identity,
             endpoint_type=str(result.get("endpoint_type") or self.endpoint_type),
             test_only=self.test_only,
         )
@@ -710,6 +790,7 @@ __all__ = [
     "ProviderRuntime",
     "ProviderRuntimeContractError",
     "ProviderRuntimeLedger",
+    "compute_closure_epoch_id",
     "hash_json",
     "hash_text",
     "stable_provider_hash",

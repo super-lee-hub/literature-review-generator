@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, cast
 
 from services.artifact_registry import ArtifactRegistry
@@ -195,7 +196,18 @@ def bootstrap_job_runtime(
     )
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
 
-    summary_path = workspace.artifact_path(f"{project_name}_summaries.json")
+    # Stage 1 summaries are content-addressed now.  On resume the durable
+    # ``summary_file`` record is the current pointer; falling back to the
+    # historical project-named path would incorrectly declare a resumable job
+    # non-resumable even though the registered summary bytes are present.
+    current_summary = registry.get("summary_file")
+    summary_path = (
+        current_summary.path
+        if current_summary is not None
+        and current_summary.status == "ready"
+        and Path(current_summary.path).is_file()
+        else workspace.artifact_path(f"{project_name}_summaries.json")
+    )
     progress_path = workspace.artifact_path("stage1_progress_snapshot.json")
     checkpoint_path = workspace.checkpoint_path(f"{project_name}_checkpoint.json")
     resume_report = determine_resume_state(

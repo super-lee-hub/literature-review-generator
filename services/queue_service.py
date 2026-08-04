@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Optional, TypeGuard, TypeVar
 
 T = TypeVar("T")
 
@@ -119,6 +119,8 @@ class QueueJobRuntime:
     lease_expires_at: Optional[str] = None
     heartbeat_at: Optional[str] = None
     revision: int = 0
+    lease_generation: int = 0
+    fence_token: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -143,6 +145,8 @@ class QueueJobRuntime:
             "lease_expires_at": self.lease_expires_at,
             "heartbeat_at": self.heartbeat_at,
             "revision": self.revision,
+            "lease_generation": self.lease_generation,
+            "fence_token": self.fence_token,
         }
 
     @classmethod
@@ -169,6 +173,8 @@ class QueueJobRuntime:
             lease_expires_at=data.get("lease_expires_at"),
             heartbeat_at=data.get("heartbeat_at"),
             revision=max(0, int(data.get("revision") or 0)),
+            lease_generation=max(0, int(data.get("lease_generation") or 0)),
+            fence_token=str(data.get("fence_token") or ""),
         )
 
 
@@ -181,6 +187,8 @@ class QueueLease:
     worker_id: str
     expires_at: str
     revision: int
+    lease_generation: int = 0
+    fence_token: str = ""
 
 
 @dataclass
@@ -441,6 +449,26 @@ class PersistentQueueService:
         except (TypeError, ValueError):
             return True
 
+    @classmethod
+    def _lease_owned(
+        cls,
+        runtime: QueueJobRuntime | None,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> TypeGuard[QueueJobRuntime]:
+        if runtime is None or runtime.state != QueueState.RUNNING:
+            return False
+        if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
+            return False
+        if runtime.lease_generation != int(lease_generation):
+            return False
+        if not fence_token or runtime.fence_token != str(fence_token):
+            return False
+        return not cls._lease_is_expired(runtime.lease_expires_at)
+
     @staticmethod
     def _utc_now() -> str:
         from services.job_workspace import utc_now_iso
@@ -449,8 +477,16 @@ class PersistentQueueService:
     def add_job(self, job_spec: QueueJobSpec) -> str:
         with self._store_lock():
             normalized = self._normalize_job_spec(job_spec)
+            previous = self._jobs.get(normalized.job_id)
+            fingerprints_changed = bool(
+                previous is not None
+                and (
+                    str(previous.input_fingerprint or "") != str(normalized.input_fingerprint or "")
+                    or str(previous.config_fingerprint or "") != str(normalized.config_fingerprint or "")
+                )
+            )
             self._jobs[normalized.job_id] = normalized
-            if normalized.job_id not in self._runtimes:
+            if normalized.job_id not in self._runtimes or fingerprints_changed:
                 self._runtimes[normalized.job_id] = QueueJobRuntime(
                     job_id=normalized.job_id,
                     workspace_path=normalized.workspace_path,
@@ -498,7 +534,7 @@ class PersistentQueueService:
     def update_job_stage(self, job_id: str, stage: str) -> bool:
         with self._store_lock():
             runtime = self._runtimes.get(job_id)
-            if runtime is None:
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
                 return False
             runtime.current_stage = str(stage or "")
             runtime.revision += 1
@@ -508,7 +544,7 @@ class PersistentQueueService:
     def update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> bool:
         with self._store_lock():
             runtime = self._runtimes.get(job_id)
-            if runtime is None:
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
                 return False
             if "workspace_path" in info:
                 runtime.workspace_path = str(info["workspace_path"] or "")
@@ -525,7 +561,7 @@ class PersistentQueueService:
     def update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> bool:
         with self._store_lock():
             runtime = self._runtimes.get(job_id)
-            if runtime is None:
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
                 return False
             runtime.progress_snapshot = dict(snapshot)
             stage = str(snapshot.get("stage") or "").strip()
@@ -552,6 +588,8 @@ class PersistentQueueService:
             if job_id not in self._runtimes:
                 return False
             runtime = self._runtimes[job_id]
+            if runtime.state == QueueState.RUNNING and runtime.lease_id:
+                return False
             allowed = {
                 QueueState.PENDING: {QueueState.RUNNING, QueueState.CANCEL_REQUESTED, QueueState.CANCELLED},
                 QueueState.RUNNING: {QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCEL_REQUESTED, QueueState.CANCELLED},
@@ -574,6 +612,7 @@ class PersistentQueueService:
                 runtime.worker_id = ""
                 runtime.lease_expires_at = None
                 runtime.heartbeat_at = None
+                runtime.fence_token = ""
             runtime.revision += 1
             self._save()
         return True
@@ -609,20 +648,32 @@ class PersistentQueueService:
                 runtime.worker_id = ""
                 runtime.lease_expires_at = None
                 runtime.heartbeat_at = None
+                runtime.fence_token = ""
             if runtime.state != QueueState.PENDING or runtime.cancel_requested:
                 return None
             lease_id = f"{resolved_worker}:{uuid.uuid4().hex}"
             expires_at = self._lease_expiry(lease_seconds)
             now = self._utc_now()
+            runtime.lease_generation = max(0, int(runtime.lease_generation)) + 1
+            fence_token = f"{job_id}:{runtime.lease_generation}:{lease_id}"
             runtime.state = QueueState.RUNNING
             runtime.started_at = runtime.started_at or now
             runtime.worker_id = resolved_worker
             runtime.lease_id = lease_id
             runtime.lease_expires_at = expires_at
             runtime.heartbeat_at = now
+            runtime.fence_token = fence_token
             runtime.revision += 1
             self._save()
-            return QueueLease(job_id, lease_id, resolved_worker, expires_at, runtime.revision)
+            return QueueLease(
+                job_id,
+                lease_id,
+                resolved_worker,
+                expires_at,
+                runtime.revision,
+                runtime.lease_generation,
+                fence_token,
+            )
 
     def heartbeat(
         self,
@@ -630,6 +681,8 @@ class PersistentQueueService:
         *,
         lease_id: str,
         worker_id: str,
+        lease_generation: int | None = None,
+        fence_token: str | None = None,
         lease_seconds: int = 60,
     ) -> bool:
         """Extend a claim only when its worker/lease pair still owns it."""
@@ -640,10 +693,180 @@ class PersistentQueueService:
                 return False
             if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
                 return False
+            if lease_generation is not None and runtime.lease_generation != int(lease_generation):
+                return False
+            if fence_token is not None and runtime.fence_token != str(fence_token):
+                return False
             if self._lease_is_expired(runtime.lease_expires_at):
                 return False
             runtime.heartbeat_at = self._utc_now()
             runtime.lease_expires_at = self._lease_expiry(lease_seconds)
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_stage_with_lease(
+        self,
+        job_id: str,
+        stage: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.current_stage = str(stage or "")
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_runtime_info_with_lease(
+        self,
+        job_id: str,
+        info: Dict[str, Any],
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            if "workspace_path" in info:
+                runtime.workspace_path = str(info["workspace_path"] or "")
+            if "canonical_output_root" in info:
+                runtime.canonical_output_root = str(info["canonical_output_root"] or "")
+            if "log_path" in info:
+                runtime.log_path = str(info["log_path"] or "")
+            if "produced_artifacts" in info:
+                runtime.produced_artifacts = [str(item) for item in info["produced_artifacts"] or []]
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_progress_snapshot_with_lease(
+        self,
+        job_id: str,
+        snapshot: Dict[str, Any],
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.progress_snapshot = dict(snapshot)
+            stage = str(snapshot.get("stage") or "").strip()
+            if stage:
+                runtime.current_stage = stage
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def register_canonical_artifact_with_lease(
+        self,
+        job_id: str,
+        artifact_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        """Fence produced-artifact claims so reclaimed workers cannot publish."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            value = str(artifact_id or "").strip()
+            if not value:
+                return False
+            if value not in runtime.produced_artifacts:
+                runtime.produced_artifacts.append(value)
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def set_job_result_with_lease(
+        self,
+        job_id: str,
+        result_summary: Dict[str, Any],
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.result_summary = dict(result_summary)
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def set_job_error_with_lease(
+        self,
+        job_id: str,
+        error_message: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.error_message = str(error_message or "")
             runtime.revision += 1
             self._save()
             return True
@@ -654,6 +877,8 @@ class PersistentQueueService:
         *,
         lease_id: str,
         worker_id: str,
+        lease_generation: int | None = None,
+        fence_token: str | None = None,
         state: QueueState,
         error_message: str | None = None,
     ) -> bool:
@@ -667,6 +892,12 @@ class PersistentQueueService:
                 return False
             if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
                 return False
+            if lease_generation is not None and runtime.lease_generation != int(lease_generation):
+                return False
+            if fence_token is not None and runtime.fence_token != str(fence_token):
+                return False
+            if self._lease_is_expired(runtime.lease_expires_at):
+                return False
             if state in {QueueState.COMPLETED, QueueState.FAILED} and runtime.cancel_requested:
                 return False
             runtime.state = state
@@ -676,6 +907,7 @@ class PersistentQueueService:
             runtime.worker_id = ""
             runtime.lease_expires_at = None
             runtime.heartbeat_at = None
+            runtime.fence_token = ""
             runtime.revision += 1
             self._save()
             return True
@@ -694,6 +926,7 @@ class PersistentQueueService:
                 runtime.worker_id = ""
                 runtime.lease_expires_at = None
                 runtime.heartbeat_at = None
+                runtime.fence_token = ""
                 runtime.revision += 1
                 recovered.append(job_id)
             if recovered:
@@ -702,19 +935,21 @@ class PersistentQueueService:
 
     def set_job_error(self, job_id: str, error_message: str) -> bool:
         with self._store_lock():
-            if job_id not in self._runtimes:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
                 return False
-            self._runtimes[job_id].error_message = error_message
-            self._runtimes[job_id].revision += 1
+            runtime.error_message = error_message
+            runtime.revision += 1
             self._save()
         return True
 
     def set_job_result(self, job_id: str, result_summary: Dict[str, Any]) -> bool:
         with self._store_lock():
-            if job_id not in self._runtimes:
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
                 return False
-            self._runtimes[job_id].result_summary = result_summary
-            self._runtimes[job_id].revision += 1
+            runtime.result_summary = result_summary
+            runtime.revision += 1
             self._save()
         return True
 
@@ -785,6 +1020,7 @@ class PersistentQueueService:
             runtime.worker_id = ""
             runtime.lease_expires_at = None
             runtime.heartbeat_at = None
+            runtime.fence_token = ""
             runtime.revision += 1
             self._save()
         return True
@@ -954,6 +1190,8 @@ class QueueRunner:
                 job_id,
                 lease_id=lease.lease_id,
                 worker_id=lease.worker_id,
+                lease_generation=lease.lease_generation,
+                fence_token=lease.fence_token,
                 state=QueueState.CANCELLED,
             ):
                 return
@@ -996,6 +1234,8 @@ class QueueRunner:
                     job_id,
                     lease_id=lease.lease_id,
                     worker_id=lease.worker_id,
+                    lease_generation=lease.lease_generation,
+                    fence_token=lease.fence_token,
                     lease_seconds=120,
                 ):
                     continue
@@ -1152,10 +1392,9 @@ class QueueRunner:
             
             job_status = str(getattr(result, "job_status", "failed") or "failed")
             if job_status == "completed":
-                # 更新任务状态为完成
-                self._release_job(job_spec.job_id, QueueState.COMPLETED)
-                
-                # 更新任务结果和工件信息
+                # Persist the result while the producing worker still owns
+                # the lease; a reclaimed worker must not publish a late
+                # result after the terminal transition.
                 result_summary = {
                     "exit_code": result.exit_code,
                     "message": result.message,
@@ -1163,7 +1402,10 @@ class QueueRunner:
                     "job_id": result.job_id,
                     "resume_state": result.resume_state,
                 }
-                self.queue_service.set_job_result(job_spec.job_id, result_summary)
+                if not self._set_job_result(job_spec.job_id, result_summary):
+                    raise RuntimeError(f"queue lease lost before result publication for {job_spec.job_id}")
+                # 更新任务状态为完成
+                self._release_job(job_spec.job_id, QueueState.COMPLETED)
             else:
                 # 检查是否因为取消而失败
                 # Queue lifecycle follows canonical execution status.  The
@@ -1200,7 +1442,17 @@ class QueueRunner:
     def _update_job_stage(self, job_id: str, stage: str) -> None:
         """更新任务的当前阶段"""
         self._heartbeat(job_id)
-        self.queue_service.update_job_stage(job_id, stage)
+        lease = self._leases.get(job_id)
+        if lease is None or not self.queue_service.update_job_stage_with_lease(
+            job_id,
+            stage,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        ):
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while updating stage for {job_id}")
 
     def _heartbeat(self, job_id: str) -> None:
         if self._lease_is_lost(job_id):
@@ -1212,6 +1464,8 @@ class QueueRunner:
             job_id,
             lease_id=lease.lease_id,
             worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
             lease_seconds=120,
         ):
             self._mark_lease_lost(job_id)
@@ -1237,6 +1491,8 @@ class QueueRunner:
             job_id,
             lease_id=lease.lease_id,
             worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
             state=state,
             error_message=error_message,
         ):
@@ -1244,11 +1500,45 @@ class QueueRunner:
     
     def _update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> None:
         """更新任务的运行时信息"""
-        self.queue_service.update_job_runtime_info(job_id, info)
+        self._heartbeat(job_id)
+        lease = self._leases.get(job_id)
+        if lease is None or not self.queue_service.update_job_runtime_info_with_lease(
+            job_id,
+            info,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        ):
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while updating runtime info for {job_id}")
 
     def _update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> None:
         """Persist the latest workflow progress snapshot for GUI queue inspection."""
-        self.queue_service.update_job_progress_snapshot(job_id, snapshot)
+        lease = self._leases.get(job_id)
+        if lease is None or not self.queue_service.update_job_progress_snapshot_with_lease(
+            job_id,
+            snapshot,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        ):
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while updating progress for {job_id}")
+
+    def _set_job_result(self, job_id: str, result_summary: Dict[str, Any]) -> bool:
+        lease = self._leases.get(job_id)
+        if lease is None:
+            return False
+        return self.queue_service.set_job_result_with_lease(
+            job_id,
+            result_summary,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        )
 
     def run(self) -> None:
         with self._lock:

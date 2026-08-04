@@ -2954,7 +2954,10 @@ def test_runtime_runner_coordinates_multi_variant_batch_without_generation_calls
     ).run()
 
     assert result.job_status == "completed"
-    assert result.canonical_ready is True
+    # A derivation-only coordinator has no review/validation CurrentArtifactSet;
+    # fail-closed completion must not promote it as a final review job.
+    assert result.canonical_ready is False
+    assert "current_artifact_set_missing" in result.completion_reasons
     assert "derive_review_batch" in result.completed_stages
     assert "analyze" not in result.completed_stages
     assert "outline" not in result.completed_stages

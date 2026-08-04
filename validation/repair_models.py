@@ -179,6 +179,44 @@ class AutoSafePatch:
     guard_contract: Dict[str, Any] = field(default_factory=dict)
     semantic_revalidation_required: bool = True
     status: str = "proposed"
+    operation_type: str = ""
+    replacement_text: str = ""
+    structured_operation: Dict[str, Any] = field(default_factory=dict)
+    anchor_hash_before: str = ""
+    anchor_hash_after: str = ""
+    expected_artifact_hashes: Dict[str, str] = field(default_factory=dict)
+    confidence: float = 0.0
+    root_cause: str = ""
+    preconditions: List[str] = field(default_factory=list)
+    postconditions: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not str(self.patch_id).strip() or not str(self.issue_id).strip() or not str(self.proposal_id).strip():
+            raise ValueError("auto-safe patches require patch, issue, and proposal identities")
+        if self.semantic_revalidation_required is not True:
+            raise ValueError("auto-safe patches require semantic revalidation")
+        operation = str(self.operation_type or "").strip().lower()
+        if operation not in {"replace_text", "structured_operation"}:
+            raise ValueError("auto-safe patches require an executable operation_type")
+        if operation == "replace_text" and not str(self.replacement_text):
+            raise ValueError("replace_text auto-safe patches require replacement_text")
+        if operation == "structured_operation" and not self.structured_operation:
+            raise ValueError("structured_operation auto-safe patches require a structured operation")
+        if not str(self.anchor_hash_before or self.target.anchor_hash).strip():
+            raise ValueError("auto-safe patches require an anchor hash")
+        if not self.expected_artifact_hashes:
+            raise ValueError("auto-safe patches require expected artifact hashes")
+        if any(
+            len(str(value)) != 64 or any(char not in "0123456789abcdef" for char in str(value))
+            for value in self.expected_artifact_hashes.values()
+        ):
+            raise ValueError("expected artifact hashes must be lowercase SHA-256 values")
+        if not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("auto-safe patch confidence must be between 0 and 1")
+        if not str(self.root_cause).strip():
+            raise ValueError("auto-safe patches require a root cause")
+        if not self.preconditions or not self.postconditions:
+            raise ValueError("auto-safe patches require preconditions and postconditions")
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)

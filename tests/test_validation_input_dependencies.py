@@ -58,7 +58,7 @@ def _validation_graph(
     records: list[ArtifactRecord] = []
     for artifact_id, artifact_type, version in (
         ("review:v2", "review_draft", "v2"),
-        ("citation:v3", "citation_manifest", "v3"),
+        ("citation:v2", "citation_manifest", "v2"),
         ("evidence:paper-a", "evidence_manifest", "v1"),
     ):
         path = Path(workspace.artifact_path(f"{artifact_id.replace(':', '-')}.json"))
@@ -271,7 +271,7 @@ def test_validation_dependency_resolution_preserves_external_evidence_identity(
     local_records: list[ArtifactRecord] = []
     for artifact_id, artifact_type, version in (
         ("review:v2", "review_draft", "v2"),
-        ("citation:v3", "citation_manifest", "v3"),
+        ("citation:v2", "citation_manifest", "v2"),
     ):
         path = Path(child_workspace.artifact_path(f"{artifact_id.replace(':', '-')}.json"))
         atomic_write_json(

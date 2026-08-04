@@ -603,6 +603,138 @@ def test_processing_mineru_card_unknown_mode_primary_drift_falls_back_to_local(g
     assert fallback_select.value == "none"
 
 
+def test_gui_lifecycle_states_are_registry_derived(gui_app_module) -> None:
+    inspection = {
+        "status": {"job_status": "completed"},
+        "artifacts": [
+            {"artifact_type": "final_outline", "status": "ready"},
+            {"artifact_type": "repair_plan", "status": "ready"},
+        ],
+        "provider_receipts": {"complete": False},
+    }
+
+    states = gui_app_module.WorkspaceController._canonical_lifecycle_states(
+        inspection,
+        {"status": "blocked", "validation_artifact": None},
+    )
+
+    assert states == [
+        "receipt_incomplete",
+        "ready_for_adoption",
+        "validation_not_run",
+        "repair_available",
+    ]
+    assert "validation_clean" not in states
+
+
+def test_gui_adoption_requires_actor_reason_and_calls_control_plane(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    calls: list[tuple[str, dict]] = []
+
+    def fake_control_plane_call(operation: str, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "inspect":
+            return {
+                "status": {"job_status": "failed"},
+                "workspace_path": "D:/output/demo__job-1",
+                "artifacts": [
+                    {
+                        "artifact_id": "outline-v3:final_outline",
+                        "artifact_type": "final_outline",
+                        "status": "ready",
+                        "content_hash": "a" * 64,
+                    }
+                ],
+                "provider_receipts": {"complete": True},
+            }
+        return {"status": "succeeded", "mutation_performed": True}
+
+    monkeypatch.setattr(controller, "_control_plane_call", fake_control_plane_call)
+    monkeypatch.setattr(controller, "refresh_lifecycle", lambda **_kwargs: {})
+
+    controller.lifecycle_actor = "researcher"
+    controller.lifecycle_reason = "explicit GUI approval"
+    result = controller.adopt_current_outline()
+
+    assert result["status"] == "succeeded"
+    assert calls[0][0] == "inspect"
+    assert calls[1] == (
+        "adopt",
+        {
+            "artifact_id": "outline-v3:final_outline",
+            "actor": "researcher",
+            "reason": "explicit GUI approval",
+            "expected_hash": "a" * 64,
+        },
+    )
+
+
+def test_gui_validation_button_executes_control_plane_validation(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    calls: list[str] = []
+
+    def fake_control_plane_call(operation: str, **_kwargs):
+        calls.append(operation)
+        if operation == "validate":
+            return {"status": "clean", "mutation_performed": True}
+        return {"status": "blocked", "validation_artifact": None}
+
+    monkeypatch.setattr(controller, "_control_plane_call", fake_control_plane_call)
+    monkeypatch.setattr(controller, "refresh_lifecycle", lambda **_kwargs: {})
+
+    result = asyncio.run(controller.execute_current_validation())
+
+    assert result["status"] == "clean"
+    assert calls[0] == "validate"
+
+
+def test_gui_repair_promotion_uses_quarantined_transaction_and_audit_context(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    calls: list[tuple[str, dict]] = []
+
+    def fake_control_plane_call(operation: str, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "inspect":
+            return {
+                "status": {"job_status": "failed"},
+                "artifacts": [
+                    {
+                        "artifact_id": "repair-tx:current",
+                        "artifact_type": "repair_transaction",
+                        "status": "quarantined",
+                        "created_at": "2026-08-04T00:00:00Z",
+                    },
+                    {
+                        "artifact_id": "repair-tx:old",
+                        "artifact_type": "repair_transaction",
+                        "status": "ready",
+                        "created_at": "2026-08-03T00:00:00Z",
+                    },
+                ],
+            }
+        return {"status": "promoted", "mutation_performed": True}
+
+    monkeypatch.setattr(controller, "_control_plane_call", fake_control_plane_call)
+    monkeypatch.setattr(controller, "refresh_lifecycle", lambda **_kwargs: {})
+    controller.lifecycle_actor = "researcher"
+    controller.lifecycle_reason = "approve the clean current-service repair revalidation"
+
+    result = controller.promote_repaired_artifacts_from_gui()
+
+    assert result["status"] == "promoted"
+    assert calls == [
+        ("inspect", {}),
+        (
+            "repair_promote",
+            {
+                "transaction_id": "repair-tx:current",
+                "actor": "researcher",
+                "reason": "approve the clean current-service repair revalidation",
+            },
+        ),
+    ]
+
+
 def test_processing_mineru_card_remote_first_primary_drift_falls_back_to_mineru(gui_app_module, monkeypatch) -> None:
     fake_ui = _FakeNiceGuiUi()
     monkeypatch.setattr(gui_app_module, "ui", fake_ui)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Mapping
+import zipfile
 
 from outline.v3_models import compute_v3_hash
 
@@ -46,6 +47,40 @@ OUTLINE_V3_ARTIFACT_TYPES = frozenset(
         "outline_v3_node_dag",
     }
 )
+
+# Non-outline artifacts which are consumed by the current validation,
+# promotion, export, and forensic gates.  Legacy v1/v2 projections remain
+# readable by their owning service; only the current version is admitted to
+# the unified ready-artifact dispatch below.
+CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
+    {
+        "review_draft",
+        "review_draft_repaired",
+        "citation_manifest",
+        "citation_manifest_repaired",
+        "citation_ref_catalog",
+        "review_replay_ledger",
+        "review_docx",
+        "review_docx_repaired",
+        "validation_run_result",
+        "validation_run_result_repaired",
+        "provider_receipt_closure",
+        "repair_plan",
+        "repair_apply_result",
+        "repair_report",
+        "repair_transaction",
+        "repair_promotion_transaction",
+        "repair_lineage",
+        "current_artifact_set",
+        "current_artifact_set_pointer",
+        "current_artifact_pointer",
+        "outline_adoption_pointer",
+        "export_manifest",
+        "forensic_attestation",
+    }
+)
+
+CURRENT_ARTIFACT_TYPES = OUTLINE_V3_ARTIFACT_TYPES | CURRENT_PRODUCTION_ARTIFACT_TYPES
 
 _ENVELOPE_TYPES = frozenset(
     {
@@ -153,6 +188,54 @@ def _read_object(path: str | Path) -> dict[str, Any]:
     return dict(raw)
 
 
+def _validate_review_replay_ledger(record: Any, path: str | Path) -> None:
+    """Validate the append-only JSONL ledger used to replay review sections."""
+
+    if str(getattr(record, "artifact_version", "") or "") != "v1":
+        raise ArtifactSchemaError("review_replay_ledger must use artifact_version v1")
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ArtifactSchemaError(f"review_replay_ledger cannot be read: {path}") from exc
+    required = (
+        "replay_version",
+        "section_id",
+        "binding_hash",
+        "artifact_id",
+        "artifact_path",
+        "artifact_content_hash",
+        "registry_file_hash",
+        "receipt_id",
+        "normalized_output_hash",
+    )
+    records = 0
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ArtifactSchemaError(
+                f"review_replay_ledger line {line_number} is not valid JSON"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ArtifactSchemaError(
+                f"review_replay_ledger line {line_number} must be an object"
+            )
+        missing = [field for field in required if not str(payload.get(field) or "")]
+        if missing:
+            raise ArtifactSchemaError(
+                f"review_replay_ledger line {line_number} is missing fields: {sorted(missing)}"
+            )
+        if str(payload.get("replay_version") or "") != "review-section-replay-v1":
+            raise ArtifactSchemaError(
+                f"review_replay_ledger line {line_number} has an invalid replay_version"
+            )
+        records += 1
+    if records == 0:
+        raise ArtifactSchemaError("review_replay_ledger must contain at least one record")
+
+
 def _require_fields(payload: Mapping[str, Any], fields: tuple[str, ...], label: str) -> None:
     missing = [field for field in fields if field not in payload]
     if missing:
@@ -215,6 +298,108 @@ def _validate_model(record: Any, root: Mapping[str, Any]) -> None:
             raise ArtifactSchemaError(f"{artifact_type}.blocking_diagnostics must be an array")
 
 
+def _require_owner(root: Mapping[str, Any], record: Any, artifact_type: str) -> None:
+    owner = str(
+        root.get("job_id")
+        or root.get("created_from_job_id")
+        or root.get("created_by_job_id")
+        or root.get("owner_job_id")
+        or ""
+    )
+    record_owner = str(getattr(record, "job_id", "") or "")
+    if not owner or (record_owner and owner != record_owner):
+        raise ArtifactSchemaError(f"{artifact_type} has an invalid owner job identity")
+
+
+def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    version = str(getattr(record, "artifact_version", "") or root.get("artifact_version") or "")
+    if artifact_type in {"current_artifact_set", "current_artifact_set_pointer"}:
+        if version != "v1":
+            raise ArtifactSchemaError(f"{artifact_type} must use artifact_version v1")
+        from services.artifact_registry import CurrentArtifactSetV1
+
+        try:
+            current_set = CurrentArtifactSetV1.from_dict(root)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSchemaError(f"{artifact_type} is not a valid CurrentArtifactSetV1") from exc
+        owner = str(getattr(record, "job_id", "") or "")
+        if current_set.job_id != owner:
+            raise ArtifactSchemaError(f"{artifact_type} job_id mismatch")
+        return
+    if version != "v3":
+        # A legacy projection is not a current artifact.  Its historical
+        # service-level validator remains responsible for compatibility.
+        return
+    if str(root.get("artifact_type") or "") != artifact_type:
+        raise ArtifactSchemaError(f"artifact type mismatch: {artifact_type!r}")
+    if str(root.get("artifact_version") or "") != version:
+        raise ArtifactSchemaError(f"{artifact_type}.artifact_version does not match the registry")
+    _require_owner(root, record, artifact_type)
+    specific_fields: dict[str, tuple[str, ...]] = {
+        "review_draft": ("created_at", "draft_identity", "generation_context", "content", "projections"),
+        "review_draft_repaired": ("created_at", "draft_identity", "generation_context", "content", "projections"),
+        "citation_manifest": ("created_at", "manifest_identity", "review_reference", "occurrences", "citation_sets", "bibliography"),
+        "citation_manifest_repaired": ("created_at", "manifest_identity", "review_reference", "occurrences", "citation_sets", "bibliography"),
+        "citation_ref_catalog": ("created_at", "entries"),
+        "review_replay_ledger": ("records",),
+        "validation_run_result": ("status", "conclusion", "details"),
+        "validation_run_result_repaired": ("status", "conclusion", "details"),
+        "provider_receipt_closure": ("closure_epoch_id", "expected_call_ids", "complete", "closure_hash"),
+        "repair_plan": ("plan_id", "created_at", "proposals", "issues", "manual_review_actions"),
+        "repair_apply_result": ("success", "plan_id", "applied_count", "rejected_count"),
+        "repair_report": ("report_id", "created_at", "plan_id", "summary", "proposals_detail"),
+        "repair_transaction": ("transaction_id", "status", "plan_id"),
+        "repair_promotion_transaction": ("transaction_id", "status", "plan_id"),
+        "repair_lineage": ("lineage_id", "source_artifact_ids", "derived_artifact_ids"),
+        "current_artifact_pointer": ("artifact_id", "artifact_hash", "role"),
+        "outline_adoption_pointer": ("adoption_id", "status", "expected_hash"),
+        "export_manifest": ("bundle_id", "artifact_ids", "manifest_hash"),
+        "forensic_attestation": ("attestation_id", "status", "evidence", "created_at"),
+    }
+    fields = specific_fields.get(artifact_type)
+    if fields is None:
+        raise ArtifactSchemaError(f"no current validator is registered for {artifact_type!r}")
+    _require_fields(root, fields, artifact_type)
+    for field_name in fields:
+        value = root.get(field_name)
+        if field_name not in {"status", "conclusion", "success", "applied_count", "rejected_count"} and value in (None, ""):
+            raise ArtifactSchemaError(f"{artifact_type}.{field_name} cannot be empty")
+    if artifact_type == "review_docx":
+        file_path = Path(path)
+        if file_path.suffix.casefold() == ".docx":
+            if file_path.stat().st_size <= 0:
+                raise ArtifactSchemaError("review_docx is empty")
+            try:
+                with zipfile.ZipFile(file_path) as archive:
+                    if "[Content_Types].xml" not in archive.namelist() or "word/document.xml" not in archive.namelist():
+                        raise ArtifactSchemaError("review_docx is not a valid OOXML document")
+            except zipfile.BadZipFile as exc:
+                raise ArtifactSchemaError("review_docx is not a valid OOXML document") from exc
+
+
+def validate_registered_artifact(record: Any, path: str | Path) -> None:
+    """Unified ready-artifact validator used by registry and runtime gates."""
+
+    artifact_type = str(getattr(record, "artifact_type", "") or "")
+    if artifact_type in OUTLINE_V3_ARTIFACT_TYPES and str(getattr(record, "artifact_version", "") or "") == "v3":
+        validate_current_outline_artifact(record, path)
+        return
+    if artifact_type in CURRENT_PRODUCTION_ARTIFACT_TYPES:
+        if artifact_type == "review_replay_ledger":
+            _validate_review_replay_ledger(record, path)
+            return
+        if artifact_type in {"review_docx", "review_docx_repaired"} and Path(path).suffix.casefold() == ".docx":
+            # The OOXML payload is binary; its owning reconciliation validator
+            # performs the ZIP/document.xml check for the legacy v1 artifact.
+            # A v3 JSON envelope is still validated through the normal branch.
+            if str(getattr(record, "artifact_version", "") or "") != "v3":
+                return
+        root = _read_object(path)
+        _validate_current_production_artifact(record, path, root)
+        return
+
+
 def validate_current_outline_artifact(record: Any, path: str | Path) -> None:
     """Validate one current Outline artifact at every reconciliation gate."""
 
@@ -246,7 +431,10 @@ def make_outline_schema_validators() -> dict[str, Any]:
 
 __all__ = [
     "ArtifactSchemaError",
+    "CURRENT_ARTIFACT_TYPES",
+    "CURRENT_PRODUCTION_ARTIFACT_TYPES",
     "OUTLINE_V3_ARTIFACT_TYPES",
     "make_outline_schema_validators",
+    "validate_registered_artifact",
     "validate_current_outline_artifact",
 ]

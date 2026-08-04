@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import ai_interface
+from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderBudgetV1,
@@ -139,3 +140,40 @@ def test_ai_detailed_call_enforces_retry_budget_and_records_attempts(monkeypatch
     assert calls == 2
     assert result["attempts"] == 2
     assert result["provider_receipt"]["attempts"] == 2
+
+
+def test_provider_context_admission_counts_nested_evidence_and_reserves() -> None:
+    profile = ProviderContextProfile(
+        provider="test",
+        model="test-model",
+        endpoint_type="responses",
+        model_context_limit=2_048,
+        verified_context_limit=1_600,
+        input_budget=500,
+        max_output_tokens=400,
+        reasoning_reserve=100,
+        safety_margin=100,
+    )
+    base = profile.estimate_request(
+        {
+            "evidence_views": [{"paper_key": "paper-1", "text": "short"}],
+            "relation_candidates": [{"relation_id": "r1"}],
+            "review_intent": {"question": "compare"},
+        }
+    )
+    expanded = profile.estimate_request(
+        {
+            "evidence_views": [{"paper_key": "paper-1", "text": "x" * 900}],
+            "relation_candidates": [{"relation_id": "r1", "evidence": "y" * 300}],
+            "review_intent": {"question": "compare", "coverage_contract": "z" * 300},
+        }
+    )
+
+    assert expanded["estimated_input_tokens"] > base["estimated_input_tokens"]
+    assert expanded["within_budget"] is False
+    assert expanded["estimated_total_tokens"] == (
+        expanded["estimated_input_tokens"]
+        + profile.max_output_tokens
+        + profile.reasoning_reserve
+        + profile.safety_margin
+    )

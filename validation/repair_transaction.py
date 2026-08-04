@@ -110,6 +110,43 @@ def current_artifact_record(
     spec = CURRENT_REPAIR_POINTERS.get(kind)
     if spec is None:
         raise ValueError(f"unknown current repair artifact kind: {kind}")
+    # CurrentArtifactSet is the authoritative production pointer.  The older
+    # per-kind pointers remain readable only as a migration fallback for jobs
+    # which predate the atomic set contract.
+    try:
+        current_set = registry.resolve_current_artifact_set()
+    except Exception:
+        if registry.current_artifact_set_pointer() is not None:
+            return None
+        current_set = None
+    if current_set is not None:
+        target_ids = {
+            "review_draft": current_set.review_draft_artifact_id,
+            "citation_manifest": current_set.citation_manifest_artifact_id,
+            "review_docx": current_set.review_docx_artifact_id,
+            "validation_run_result": current_set.validation_run_result_artifact_id,
+        }
+        target_hashes = {
+            "review_draft": current_set.review_draft_artifact_hash,
+            "citation_manifest": current_set.citation_manifest_artifact_hash,
+            "review_docx": current_set.review_docx_artifact_hash,
+            "validation_run_result": current_set.validation_run_result_artifact_hash,
+        }
+        target = registry.get(target_ids[kind])
+        if target is None or target.status != "ready":
+            return None
+        if (
+            target.artifact_type != spec["artifact_type"]
+            or target.artifact_version != spec["artifact_version"]
+            or target.content_hash != target_hashes[kind]
+        ):
+            return None
+        try:
+            if file_sha256(target.path) != target_hashes[kind]:
+                return None
+        except OSError:
+            return None
+        return target
     pointer = registry.get(str(spec["pointer_id"]))
     if pointer is None:
         fallback_id = str(spec.get("fallback_id") or "")
@@ -469,6 +506,7 @@ class RepairPromotionTransaction:
     artifact_version: str = "v1"
     validation_run_result_artifact_id: str = ""
     current_pointer_artifact_ids: Mapping[str, str] = field(default_factory=dict)
+    current_artifact_set_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -661,50 +699,25 @@ class RepairTransactionService:
                     )
                 )
                 continue
+            # Report-only planning records the issue and human action only.
+            # A PatchProposal is an executable intent, so an empty
+            # ``proposed_text`` is not allowed to masquerade as one.  A
+            # proposal is created only by the separate auto-safe path after
+            # a complete, guarded operation has been supplied.
             block_text = str(block.get("text") or "")
-            proposal_id = "patch:" + _hash(
-                {
-                    "validation": claim.get("claim_result_id"),
-                    "block_id": block_id,
-                    "draft_hash": draft_record.content_hash if draft_record else "",
-                }
-            )[:24]
-            proposals.append(
-                PatchProposal(
-                    proposal_id=proposal_id,
-                    citation_id=str(claim.get("citation_set_key") or claim.get("claim_result_id") or proposal_id),
-                    root_cause=root_cause,
-                    granularity=PatchGranularity.SPAN if claim.get("span_start") is not None else PatchGranularity.BLOCK,
-                    target=PatchTargetSignature(
-                        block_id=block_id,
-                        anchor_text=block_text,
-                        anchor_hash=hashlib.sha256(block_text.encode("utf-8")).hexdigest()[:8],
-                        span_start=claim.get("span_start") if isinstance(claim.get("span_start"), int) else None,
-                        span_end=claim.get("span_end") if isinstance(claim.get("span_end"), int) else None,
-                    ),
-                    original_text=str(claim.get("claim_text") or block_text),
-                    # Report-first plans describe an affected span but do not
-                    # pretend that an unverified rewrite is ready to apply.
-                    proposed_text="",
-                    confidence=0.0 if bool(claim.get("low_confidence")) else 0.5,
-                    fix_strategy="manual_review_mapping_first",
-                    dependency_bundle=self._dependency_bundle(closure),
-                    metadata={
-                        "issue_id": issue_id,
-                        "validation_result_id": validation_record.artifact_id if validation_record else "",
-                        "claim_result_id": str(claim.get("claim_result_id") or ""),
-                        "verdict": verdict,
-                        "report_only": True,
-                    },
-                )
-            )
             manual_review_actions.append(
                 ManualReviewAction(
                     action_id=f"manual-review:{issue_id}",
                     issue_id=issue_id,
-                    action="confirm_mapping_or_propose_structural_patch",
+                    action="confirm_mapping_or_propose_complete_structural_patch",
                     rationale="report-first plans never turn a validation finding into an automatic rewrite",
                     required_inputs=["review_draft", "citation_manifest", "paper_artifacts"],
+                    metadata={
+                        "block_text": block_text,
+                        "span_start": claim.get("span_start"),
+                        "span_end": claim.get("span_end"),
+                        "proposal_allowed_only_after_guarded_operation": True,
+                    },
                 )
             )
         proposals.sort(
@@ -1237,6 +1250,61 @@ class RepairTransactionService:
             (item for item in derived_records if item is not None and item.artifact_type == "citation_manifest_repaired"),
             None,
         )
+        expected_versioned_draft_id = f"review_draft:v3:repair:{source_hash_prefix}"
+        expected_versioned_manifest_id = f"citation_manifest:v3:repair:{source_hash_prefix}"
+        input_artifacts = revalidation_model.input_artifacts
+        if (
+            input_artifacts.review_draft_id != expected_versioned_draft_id
+            or input_artifacts.citation_manifest_id != expected_versioned_manifest_id
+            or not input_artifacts.review_draft_hash
+            or not input_artifacts.citation_manifest_hash
+        ):
+            return {
+                "status": "blocked",
+                "reason": "revalidation result is bound to different artifacts; validation bytes cannot be rebound",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+        validated_draft_record = self.registry.get(input_artifacts.review_draft_id)
+        validated_manifest_record = self.registry.get(input_artifacts.citation_manifest_id)
+        if (
+            validated_draft_record is None
+            or validated_manifest_record is None
+            or validated_draft_record.artifact_type != "review_draft"
+            or validated_manifest_record.artifact_type != "citation_manifest"
+            or validated_draft_record.artifact_version != "v3"
+            or validated_manifest_record.artifact_version != "v3"
+            or validated_draft_record.content_hash != input_artifacts.review_draft_hash
+            or validated_manifest_record.content_hash != input_artifacts.citation_manifest_hash
+            or validated_draft_record.content_hash != (derived_draft_record.content_hash if derived_draft_record else "")
+            or validated_manifest_record.content_hash != (derived_manifest_record.content_hash if derived_manifest_record else "")
+        ):
+            return {
+                "status": "blocked",
+                "reason": "revalidation input artifacts are not the exact registered repair bytes",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+        try:
+            validated_draft_hash = file_sha256(validated_draft_record.path)
+            validated_manifest_hash = file_sha256(validated_manifest_record.path)
+        except OSError as exc:
+            return {
+                "status": "blocked",
+                "reason": f"revalidation input artifact cannot be read: {exc}",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
+        if (
+            validated_draft_hash != input_artifacts.review_draft_hash
+            or validated_manifest_hash != input_artifacts.citation_manifest_hash
+        ):
+            return {
+                "status": "blocked",
+                "reason": "revalidation input artifact bytes changed after validation",
+                "transaction_id": transaction_id,
+                "mutation_performed": False,
+            }
         draft_payload = _load_json(derived_draft_record)
         manifest_payload = _load_json(derived_manifest_record)
         if draft_payload is None or manifest_payload is None:
@@ -1302,8 +1370,8 @@ class RepairTransactionService:
             }
 
         versioned_suffix = source_hash_prefix
-        versioned_draft_id = f"review_draft:v3:repair:{versioned_suffix}"
-        versioned_manifest_id = f"citation_manifest:v3:repair:{versioned_suffix}"
+        versioned_draft_id = expected_versioned_draft_id
+        versioned_manifest_id = expected_versioned_manifest_id
         versioned_docx_id = f"review_docx:v1:repair:{versioned_suffix}"
         promotion_dir = Path(
             self.workspace.artifact_path(
@@ -1311,50 +1379,26 @@ class RepairTransactionService:
             )
         )
         promotion_dir.mkdir(parents=True, exist_ok=True)
-        promoted_draft_path = promotion_dir / "review_draft_v3.json"
-        promoted_manifest_path = promotion_dir / "citation_manifest_v3.json"
+        # The draft and manifest bytes below are the exact files which the
+        # current validation service consumed.  Promotion may register these
+        # identities as ready, but it must not rewrite their JSON or rebind a
+        # validation result to post-hoc metadata.
+        promoted_draft_path = Path(validated_draft_record.path)
+        promoted_manifest_path = Path(validated_manifest_record.path)
         promoted_docx_path = promotion_dir / "review.docx"
 
-        promoted_draft = copy.deepcopy(draft_payload)
-        draft_identity = dict(promoted_draft.get("draft_identity") or {})
-        draft_identity.update(
-            {
-                "draft_id": versioned_draft_id,
-                "versioned_from_artifact_id": draft_record.artifact_id,
-                "repair_promotion_transaction_id": promotion_id,
+        promoted_draft = _load_json(validated_draft_record)
+        promoted_manifest = _load_json(validated_manifest_record)
+        if promoted_draft is None or promoted_manifest is None:
+            return {
+                "status": "blocked",
+                "reason": "validated repair bytes are not readable JSON",
+                "transaction_id": transaction_id,
+                "repair_structural_closure": structural.to_dict(),
+                "mutation_performed": False,
             }
-        )
-        promoted_draft["draft_identity"] = draft_identity
-        generation_context = dict(promoted_draft.get("generation_context") or {})
-        generation_context["repair_promotion_transaction_id"] = promotion_id
-        promoted_draft["generation_context"] = generation_context
-        projections = dict(promoted_draft.get("projections") or {})
-        projections["repair_promotion_transaction_id"] = promotion_id
-        projections["docx_path"] = str(promoted_docx_path)
-        promoted_draft["projections"] = projections
-
-        promoted_manifest = copy.deepcopy(manifest_payload)
-        manifest_identity = dict(promoted_manifest.get("manifest_identity") or {})
-        manifest_identity.update(
-            {
-                "manifest_id": versioned_manifest_id,
-                "versioned_from_artifact_id": manifest_record.artifact_id,
-                "repair_promotion_transaction_id": promotion_id,
-            }
-        )
-        promoted_manifest["manifest_identity"] = manifest_identity
-        review_reference = dict(promoted_manifest.get("review_reference") or {})
-        review_reference["review_draft_path"] = str(promoted_draft_path)
-        review_reference["review_word_path"] = str(promoted_docx_path)
-        promoted_manifest["review_reference"] = review_reference
-        manifest_dependencies = dict(promoted_manifest.get("dependencies") or {})
-        manifest_dependencies["repair_promotion_transaction_id"] = promotion_id
-        manifest_dependencies["versioned_review_draft_id"] = versioned_draft_id
-        promoted_manifest["dependencies"] = manifest_dependencies
 
         try:
-            atomic_write_json(str(promoted_draft_path), promoted_draft)
-            atomic_write_json(str(promoted_manifest_path), promoted_manifest)
             from docx_writer import rebuild_review_docx_from_structured_artifacts
 
             rebuild_review_docx_from_structured_artifacts(
@@ -1373,30 +1417,32 @@ class RepairTransactionService:
             }
 
         promoted_validation_id = f"validation_run_result:v1:repair:{versioned_suffix}"
-        promoted_validation_path = promotion_dir / "validation_run_result_v1.json"
-        promoted_validation_payload = copy.deepcopy(dict(revalidation_payload))
-        promoted_validation_payload["validation_run_id"] = promoted_validation_id
-        promoted_validation_payload["attempt_id"] = promotion_id
-        promoted_validation_payload["input_artifacts"] = {
-            **dict(promoted_validation_payload.get("input_artifacts") or {}),
-            "review_draft_id": versioned_draft_id,
-            "review_draft_hash": file_sha256(str(promoted_draft_path)),
-            "citation_manifest_id": versioned_manifest_id,
-            "citation_manifest_hash": file_sha256(str(promoted_manifest_path)),
-        }
-        try:
-            from validation.run_result import ValidationRunResultV1
-
-            promoted_validation_model = ValidationRunResultV1.from_dict(
-                promoted_validation_payload
-            )
-            if not promoted_validation_model.contract_satisfied:
-                raise ValueError("promoted validation result contract is not satisfied")
-            atomic_write_json(str(promoted_validation_path), promoted_validation_payload)
-        except (TypeError, ValueError, KeyError, RuntimeError, OSError) as exc:
+        promoted_validation_path = Path(registered_revalidation.path)
+        if file_sha256(promoted_validation_path) != registered_revalidation.content_hash:
             return {
                 "status": "blocked",
-                "reason": f"promoted validation result is invalid: {exc}",
+                "reason": "durable validation result bytes changed before promotion",
+                "transaction_id": transaction_id,
+                "repair_structural_closure": structural.to_dict(),
+                "mutation_performed": False,
+            }
+
+        closure_record_id = str(
+            validation_result.get("provider_receipt_closure_record_id")
+            or revalidation_payload.get("provider_receipt_closure_record_id")
+            or ""
+        ).strip()
+        closure_record = self.registry.get(closure_record_id) if closure_record_id else None
+        if (
+            closure_record is None
+            or closure_record.artifact_type != "provider_receipt_closure"
+            or closure_record.status != "ready"
+            or not closure_record.content_hash
+            or file_sha256(closure_record.path) != closure_record.content_hash
+        ):
+            return {
+                "status": "blocked",
+                "reason": "provider receipt closure record is not a verified ready artifact",
                 "transaction_id": transaction_id,
                 "repair_structural_closure": structural.to_dict(),
                 "mutation_performed": False,
@@ -1454,7 +1500,7 @@ class RepairTransactionService:
         )
 
         evidence_dependencies = []
-        for evidence_id in promoted_validation_payload.get("input_artifacts", {}).get(
+        for evidence_id in revalidation_payload.get("input_artifacts", {}).get(
             "evidence_manifest_ids", ()
         ):
             evidence_record = self.registry.get(str(evidence_id))
@@ -1471,6 +1517,7 @@ class RepairTransactionService:
                 ArtifactDependencyRefV2.from_record(promoted_draft_record),
                 ArtifactDependencyRefV2.from_record(promoted_manifest_record),
                 ArtifactDependencyRefV2.from_record(promoted_docx_record),
+                ArtifactDependencyRefV2.from_record(closure_record),
                 *evidence_dependencies,
             ],
             metadata={
@@ -1487,6 +1534,7 @@ class RepairTransactionService:
             promoted_manifest_record,
             promoted_docx_record,
             promoted_validation_record,
+            closure_record,
         ]
         output_refs = [
             AuditArtifactRefV1(
@@ -1592,42 +1640,39 @@ class RepairTransactionService:
             ],
         )
 
-        pointer_records = {
-            "review_draft": _write_current_artifact_pointer(
-                self.workspace,
-                self.registry,
-                kind="review_draft",
-                target=promoted_draft_record,
-                previous=draft_record,
-                promotion_id=promotion_id,
-            ),
-            "citation_manifest": _write_current_artifact_pointer(
-                self.workspace,
-                self.registry,
-                kind="citation_manifest",
-                target=promoted_manifest_record,
-                previous=manifest_record,
-                promotion_id=promotion_id,
-            ),
-            "review_docx": _write_current_artifact_pointer(
-                self.workspace,
-                self.registry,
-                kind="review_docx",
-                target=promoted_docx_record,
-                previous=previous_docx_record,
-                promotion_id=promotion_id,
-            ),
-            "validation_run_result": _write_current_artifact_pointer(
-                self.workspace,
-                self.registry,
-                kind="validation_run_result",
-                target=promoted_validation_record,
-                previous=previous_validation_record,
-                promotion_id=promotion_id,
-            ),
-        }
+        try:
+            previous_set = self.registry.resolve_current_artifact_set()
+        except Exception:
+            if self.registry.current_artifact_set_pointer() is not None:
+                return {
+                    "status": "blocked",
+                    "reason": "existing CurrentArtifactSet is untrusted; promotion is fail-closed",
+                    "transaction_id": transaction_id,
+                    "repair_structural_closure": structural.to_dict(),
+                    "mutation_performed": False,
+                }
+            previous_set = None
+        current_set = self.registry.build_current_artifact_set(
+            promotion_transaction_id=promotion_id,
+            review_draft_artifact_id=promoted_draft_record.artifact_id,
+            review_draft_artifact_hash=promoted_draft_record.content_hash,
+            citation_manifest_artifact_id=promoted_manifest_record.artifact_id,
+            citation_manifest_artifact_hash=promoted_manifest_record.content_hash,
+            review_docx_artifact_id=promoted_docx_record.artifact_id,
+            review_docx_artifact_hash=promoted_docx_record.content_hash,
+            validation_run_result_artifact_id=promoted_validation_record.artifact_id,
+            validation_run_result_artifact_hash=promoted_validation_record.content_hash,
+            validation_receipt_closure_artifact_id=closure_record.artifact_id,
+            validation_receipt_closure_artifact_hash=closure_record.content_hash,
+            actor=actor,
+            reason=reason,
+            previous_set_id=previous_set.set_id if previous_set is not None else "",
+        )
+        current_set_pointer_record = self.registry.switch_current_artifact_set(current_set)
+        pointer_records = {"current_artifact_set": current_set_pointer_record}
         pointer_ids = {
-            kind: record.artifact_id for kind, record in pointer_records.items()
+            "current_artifact_set": current_set_pointer_record.artifact_id,
+            "current_artifact_set_id": current_set.set_id,
         }
 
         promotion = RepairPromotionTransaction(
@@ -1648,6 +1693,7 @@ class RepairTransactionService:
             created_at=utc_now_iso(),
             validation_run_result_artifact_id=promoted_validation_record.artifact_id,
             current_pointer_artifact_ids=pointer_ids,
+            current_artifact_set_id=current_set.set_id,
         )
         promotion_path = promotion_dir / "repair_promotion_transaction.json"
         atomic_write_json(str(promotion_path), promotion.to_dict())

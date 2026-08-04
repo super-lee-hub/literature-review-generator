@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
+import pytest
+
 from runtime.stage_contracts import build_source_bundle
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
@@ -139,3 +141,94 @@ def test_current_review_writer_rejects_unresolved_citation(tmp_path: Path) -> No
         assert "outside its evidence packet" in str(exc) or "unresolved" in str(exc)
     else:
         raise AssertionError("unresolved Writer citation was accepted")
+
+
+def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_path: Path) -> None:
+    summary, _pdf_path = _stage1_summary(tmp_path)
+    config = {
+        "Writer_API": {"api_key": "writer", "model": "writer", "api_base": "https://writer.test/v1"},
+    }
+    workspace = JobWorkspace.create(str(tmp_path / "review-output"), "current", job_id="writer-resume-job")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    packets = [
+        {
+            "section_id": section_id,
+            "section_goal": f"Synthesize {section_id}",
+            "planned_claims": ["The treatment improves the outcome."],
+            "paper_keys": [summary["paper_info"]["canonical_paper_key"]],
+            "source_summary_hashes": ["summary-hash"],
+            "retrieval_provenance": {"source": "test", "section_id": section_id},
+        }
+        for section_id in ("section_1", "section_2")
+    ]
+    first_calls: list[int] = []
+
+    def crash_on_section_two(**kwargs: Any) -> Mapping[str, Any]:
+        section_number = int(kwargs["section_number"])
+        first_calls.append(section_number)
+        if section_number == 2:
+            raise RuntimeError("simulated section 2 process crash")
+        return {
+            "status": "success",
+            "content": {"blocks": [{"text": "The result supports the claim [[cite_ref:R001]]."}]},
+            "usage_status": "provider_not_supported",
+        }
+
+    first_service = ReviewGenerationService(
+        job_id=workspace.job_id,
+        attempt_id="review-resume-attempt",
+        workspace=workspace,
+        artifact_registry=registry,
+        settings=ApplicationSettings.from_config(config),
+        summaries=[summary],
+        writer=crash_on_section_two,
+    )
+    with pytest.raises(RuntimeError, match="simulated section 2 process crash"):
+        first_service.run(
+            outline_payload={
+                "title": "Evidence-led review",
+                "sections": [
+                    {"section_id": "section_1", "title": "Results 1", "goal": "First"},
+                    {"section_id": "section_2", "title": "Results 2", "goal": "Second"},
+                ],
+            },
+            evidence_packets=packets,
+        )
+    assert first_calls == [1, 2]
+    assert registry.get("review-section:section_1") is not None
+    assert registry.get("review-section:section_2") is None
+
+    retry_calls: list[int] = []
+
+    def retry_writer(**kwargs: Any) -> Mapping[str, Any]:
+        retry_calls.append(int(kwargs["section_number"]))
+        return {
+            "status": "success",
+            "content": {"blocks": [{"text": "The result supports the claim [[cite_ref:R001]]."}]},
+            "usage_status": "provider_not_supported",
+        }
+
+    retry_service = ReviewGenerationService(
+        job_id=workspace.job_id,
+        attempt_id="review-resume-attempt",
+        workspace=workspace,
+        artifact_registry=registry,
+        settings=ApplicationSettings.from_config(config),
+        summaries=[summary],
+        writer=retry_writer,
+    )
+    resumed = retry_service.run(
+        outline_payload={
+            "title": "Evidence-led review",
+            "sections": [
+                {"section_id": "section_1", "title": "Results 1", "goal": "First"},
+                {"section_id": "section_2", "title": "Results 2", "goal": "Second"},
+            ],
+        },
+        evidence_packets=packets,
+    )
+
+    assert retry_calls == [2]
+    assert [item["section_number"] for item in resumed.sections] == [1, 2]
+    assert registry.get("review-section:section_1") is not None
+    assert registry.get("review-section:section_2") is not None

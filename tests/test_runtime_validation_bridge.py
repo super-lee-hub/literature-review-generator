@@ -89,18 +89,37 @@ def test_runtime_validation_bridge_registers_reports(
 
     write_json(
         review_draft_path,
-        {"artifact_type": "review_draft", "artifact_version": "v3", "content": {"sections": []}},
+        {
+            "artifact_type": "review_draft",
+            "artifact_version": "v3",
+            "created_from_job_id": session.context.workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "draft_identity": {"draft_id": "review-draft"},
+            "generation_context": {"mode": "test"},
+            "content": {"sections": []},
+            "projections": {},
+        },
     )
     write_json(
         citation_manifest_path,
-        {"artifact_type": "citation_manifest", "artifact_version": "v3", "occurrences": [], "citation_sets": []},
+        {
+            "artifact_type": "citation_manifest",
+            "artifact_version": "v3",
+            "created_from_job_id": session.context.workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "manifest_identity": {"manifest_id": "citation_manifest_v3"},
+            "review_reference": {"artifact_id": "review-draft"},
+            "occurrences": [],
+            "citation_sets": [],
+            "bibliography": [],
+        },
     )
     write_json(
         evidence_manifest_path,
         {"artifact_type": "evidence_manifest", "artifact_version": "v1"},
     )
     review_record = session.context.registry.register_file(
-        artifact_id="review-draft",
+        artifact_id="review_draft",
         artifact_role="review_draft",
         artifact_type=session.stage_host.REVIEW_DRAFT_ARTIFACT_TYPE,
         artifact_version="v3",
@@ -108,7 +127,7 @@ def test_runtime_validation_bridge_registers_reports(
         producer="tests",
     )
     citation_record = session.context.registry.register_file(
-        artifact_id="citation-manifest-v3",
+        artifact_id="citation_manifest_v3",
         artifact_role="citation_manifest",
         artifact_type=session.stage_host.CITATION_MANIFEST_ARTIFACT_TYPE,
         artifact_version="v3",
@@ -146,6 +165,23 @@ def test_runtime_validation_bridge_registers_reports(
         producer="tests",
         depends_on=[external_evidence],
         external_registry_resolver=external_registry_resolver,
+    )
+    from docx import Document
+
+    review_docx_path = Path(session.stage_host._get_review_word_file_path())
+    review_docx_path.parent.mkdir(parents=True, exist_ok=True)
+    Document().save(str(review_docx_path))
+    session.context.registry.register_file(
+        artifact_id="review_docx",
+        artifact_role="review_docx",
+        artifact_type="review_docx",
+        artifact_version="v1",
+        path=review_docx_path,
+        producer="tests",
+        depends_on=[
+            ArtifactDependencyRefV2.from_record(review_record),
+            ArtifactDependencyRefV2.from_record(citation_record),
+        ],
     )
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text("ok", encoding="utf-8")
