@@ -6,6 +6,10 @@ are provider-free; `validate` is the explicit command that executes the current
 plane reads the durable Registry, job outcome, stage terminals, provider
 receipts, and Outline v3 DAG/replay state.
 
+Completion and export resolve the atomic `CurrentArtifactSetV1` through
+`current-artifact-set:pointer` and then build `CurrentStageClosureMapV1`; a
+historical READY artifact is not a substitute for the current set.
+
 ## Safe command order
 
 ```text
@@ -28,6 +32,9 @@ Use `--workspace <workspace_path>` when the job ID cannot be resolved. All comma
 - `retry-node` changes only the persisted failed Outline v3 node scope. It never regenerates completed candidates.
 - `reconcile --dry-run` is read-only. A non-dry reconciliation is allowed to repair only registered projections through the existing runtime reconciler.
 - `cancel` persists a cooperative cancellation request. It never kills processes. Workers observe it at safe checkpoints and must not publish `completed` afterward.
+- Queue workers use atomic snapshots, input/config fingerprints, lease
+  generations, and fence tokens. An expired or fenced worker cannot publish a
+  result; retry/cancel/recovery decisions must use the persisted queue state.
 
 ## Validation, repair, and adoption
 

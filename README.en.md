@@ -201,8 +201,10 @@ Meaning:
 Queueing remains a **GUI-first** interaction model. On the Workflow page,
 buttons such as "Analyze only", "Generate outline", "Generate review", and
 "Run all" submit jobs into the GUI's persistent serial queue. Queue state is
-stored with atomic cross-process snapshots and worker leases, so heartbeats,
-expiry, and crash recovery are explicit rather than inferred from a UI flag.
+stored with atomic cross-process snapshots; source/config fingerprints reset
+stale retry state, and lease generations plus fence tokens prevent an expired
+worker from publishing. Heartbeats, expiry, cancellation, and crash recovery
+are explicit rather than inferred from a UI flag.
 
 The CLI also exposes read/write queue operations through `reviewctl`:
 `queue-list`, `queue-add`, `queue-run`, `queue-retry`, `queue-cancel`,
@@ -214,7 +216,8 @@ directly and stays out of the GUI queue.
 Outline v3 outputs are reusable only with an exact execution binding and closed
 provider receipt chain. Explicit adoption creates a versioned adoption identity
 and a current pointer; validation and repair remain separate, registry-backed
-gates.
+gates. Completion and export consume the atomic `CurrentArtifactSetV1` and its
+`CurrentStageClosureMapV1`, not an arbitrary READY artifact.
 
 For the durable control plane, `python -m reviewctl validate --job <job_id>`
 executes the current `ValidationExecutionService` and persists a new validation
@@ -231,7 +234,7 @@ These are part of the current product surface, but not always required for a fir
 - `--free-mode-profile`: load a free-mode profile JSON
 - `--free-mode-idea`: pass a free-mode idea as text
 - `--merge`: merge multiple `summaries.json` files into one
-- `--outline-adopt`: outline-adopt compatibility path (manual / explicit flow, not the default main chain)
+- `--outline-adopt`: legacy compatibility option; use `python -m reviewctl adopt --artifact <final_outline_id> --actor <actor>` for the current explicit adoption transaction
 - preprocess cache artifacts such as `normalized.md`, `page_index.json`, `diagnostics.json`, and `chunks.json`
 - optional local RAG built during preprocessing
 

@@ -5,6 +5,10 @@
 命令。控制面读取 Registry、job outcome、stage terminal、API receipt 以及
 Outline v3 DAG/replay。
 
+完成与导出先通过 `current-artifact-set:pointer` 解析原子
+`CurrentArtifactSetV1`，再构建 `CurrentStageClosureMapV1`；历史 READY 产物
+不能替代 current set。
+
 ## 安全顺序
 
 ```text
@@ -21,6 +25,10 @@ python -m reviewctl attest --job <job_id>
 找不到任务 ID 时使用 `--workspace <workspace_path>`。所有命令只输出一个机器可读 JSON 对象。
 
 `run` 开始新的 runtime attempt，`resume` 只复用已由 Registry 验证的持久化阶段；`retry-node` 只重试持久化的失败 Outline v3 节点；`reconcile --dry-run` 只读；`cancel` 写入协作式取消请求，不杀进程。Worker 在安全检查点观察请求，之后不得发布 `completed`。
+
+Queue worker 使用原子 snapshot、input/config fingerprint、lease generation 和
+fence token。过期或被 fence 的 worker 不得发布结果；retry、cancel、恢复都必须
+以持久化 queue 状态为准。
 
 `validate` 会对当前 v3 review draft、v3 citation manifest 和 evidence 输入真正执行
 当前 Validation，并持久化 `ValidationRunResultV1`、receipt 与 Registry 依赖。

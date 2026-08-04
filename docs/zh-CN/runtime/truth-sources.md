@@ -17,6 +17,11 @@
   过期的 running attempt 变为 `interrupted`，不会被下一次运行改写。
 - `runtime_stage_terminals/*/*.json` 只有在 output、hash、schema、dependency
   和 terminal record 全部通过校验时，才证明阶段完成。
+- `current-artifact-set:pointer` 解析出一个不可变的
+  `CurrentArtifactSetV1`，其中包含五个精确的当前目标（draft、citation
+  manifest、DOCX、validation result、validation receipt closure）及其 hash。
+  pointer 通过 compare-and-swap 推进；未被该 set 引用的旧 READY 产物只保留
+  为历史或 quarantine 状态。
 
 Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是真相源。
 
@@ -27,9 +32,9 @@ Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是�
 | Source intake | `source_inventory_v1.json`、`source_bundle.json` | parser 诊断和只读 paper view |
 | Stage 1 | 不可变 content-addressed 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest 和来源链 | Excel 与显示用 summary |
 | Outline Intelligence v3 | 已注册 evidence views、corpus ledger、multi-view matrix、review intent、coverage contract、relation map、candidate plan、node DAG、receipts、final outline、stage health 和 adoption record | Markdown 或人类可读 outline 展示 |
-| Review | `review_draft.json`（`artifact_version=v3`）、`citation_manifest_v3.json` 和 citation-reference catalog | DOCX 与文本报告 |
-| Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包 | TXT、manual-review JSON、alignment audit 和 completion projection |
-| Repair | typed repair issue/action/patch、quarantine 派生输入、current service 重新验证及 receipt 闭包、显式 versioned promotion transaction/current pointer | 人类可读 repair 摘要 |
+| Review | `review_draft.json`（`artifact_version=v3`）、`citation_manifest_v3.json` 和 citation-reference catalog，并通过 current artifact set 解析 | DOCX 与文本报告 |
+| Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包；`CurrentStageClosureMapV1` 只解析 current set | TXT、manual-review JSON、alignment audit 和 completion projection |
+| Repair | typed repair issue/action/patch、quarantine 派生输入、current service 重新验证及 receipt 闭包、带原子 current-set 切换的显式 versioned promotion transaction | 人类可读 repair 摘要 |
 
 ## 公开状态
 
@@ -89,7 +94,9 @@ hash，保留 replay receipt，并且 resume 只重跑失败节点的依赖闭�
 `ValidationExecutionService` 并持久化新的 validation attempt，不是只检查
 已有 closure。`run`、`resume`、`retry-node`、`cancel`、
 `repair-plan`、`repair-apply`、`adopt`、`export` 是显式的 Registry-backed 状态
-迁移。cancel 是 cooperative 的，被取消 job 不得发布为 completed。
+迁移。Queue worker 以跨进程 lease generation 和 fence token claim job，必须
+heartbeat，否则会失去 claim；过期 claim 可恢复，旧 worker 不能发布结果。cancel
+是 cooperative 的，被取消 job 不得发布为 completed。
 
 Validation closure 要求当前 review draft、citation manifest 与
 `ValidationRunResultV1` 的输入 ID/hash 一致。Repair 默认 `report_only`；显式

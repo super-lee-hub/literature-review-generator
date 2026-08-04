@@ -136,7 +136,7 @@ python launch_gui.py --reload --no-show
    - Run all：一键跑完分析、大纲、正文。
 5. 到 Logs 页面观察日志；输出通常在 `output/<project_name>__<job_id>/`。
 
-GUI 的任务会进入 GUI 内部的持久化串行后台队列。提交一个任务后，表单仍可继续编辑，你可以准备下一项；CLI 和 Codex skill 不进入这个 GUI 队列。
+GUI 的任务会进入 GUI 内部的持久化串行后台队列。提交一个任务后，表单仍可继续编辑，你可以准备下一项；CLI 和 Codex skill 不进入这个 GUI 队列。队列使用跨进程原子 snapshot；source/config fingerprint 变化会重置过期 retry 状态，lease generation 与 fence token 会阻止过期 worker 发布结果。heartbeat、expiry、取消和崩溃恢复都以持久化状态为准，不从 UI 文案推断。
 
 ## 7. CLI 快速开始
 
@@ -219,7 +219,7 @@ python main.py --project-name "my_review" --generate-review
 | `--prime-with-folder <path>` + `--concept <name>` | 概念预热 / concept priming |
 | `--free-mode-profile <json>` | 加载 free mode profile |
 | `--free-mode-idea <text>` | 直接传入 free mode idea |
-| `--outline-adopt` | 显式采纳大纲仲裁结果；兼容/手动路径，不是默认主链 |
+| `--outline-adopt` | 旧兼容参数；当前主路径使用 `python -m reviewctl adopt --artifact <final_outline_id> --actor <actor>` 显式采纳 |
 | `--cleanup` | 清理旧工作空间，只保留最新的 |
 
 完整参数可运行：
@@ -390,7 +390,8 @@ manifest、preprocess evidence 和 paper metadata 检查引用准确性、证据
 `reviewctl validate` 会真正执行验证并写入新的 validation attempt；
 `reviewctl validation-status` 只读取持久化 closure。零 claim 永远是 `needs_review`，
 不会因为声明 citation-free 就变成 `clean`。Repair 先生成 quarantine 派生产物，
-只有重新验证闭合并显式 `repair-promote` 后才推进 current pointer。启用时可能产生：
+只有重新验证闭合并显式 `repair-promote` 后才推进 current pointer。完成与导出只消费
+原子 `CurrentArtifactSetV1` 及其 `CurrentStageClosureMapV1`，不会从任意 READY 产物推断完成。启用时可能产生：
 
 - `validation_report.json`
 - `repair_plan.json`

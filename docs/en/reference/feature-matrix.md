@@ -7,7 +7,7 @@ current production-shaped chain exercised it; `LIVE_VERIFIED` is reserved for
 an actual external-provider run; `NOT_VERIFIED` means the required live or UI
 evidence was not run.
 
-The current offline baseline is 678 collected tests, 656 passed, and 22
+The current offline baseline is 700 collected tests, 678 passed, and 22
 deselected. Live API, Playwright, and heavy OCR are `NOT_RUN` in this pass.
 
 | Feature | Status | Canonical implementation |
@@ -21,10 +21,10 @@ deselected. Live API, Playwright, and heavy OCR are `NOT_RUN` in this pass.
 | Outline Intelligence v3 | E2E_VERIFIED | registered 26-type artifact validation surface, deterministic node DAG, exact execution-binding/replay closure, typed quality gate and stability variants, health, and explicit versioned adoption pointer |
 | Review and citation chain | E2E_VERIFIED | current review draft v3, complete section binding, citation manifest v3, token spans, cited bibliography, DOCX |
 | Validation truth source | E2E_VERIFIED | explicit `ValidationExecutionService` constructor and current runner boundary; pre-transport request binding; response/normalized/artifact/node receipt closure; durable `ValidationRunResultV1` read-back with job/attempt/hash binding; exact review/citation/evidence `depends_on` closure; reports are projections |
-| Outline quality and stability gates | E2E_VERIFIED | typed `OutlineQualityGate`, effective-section/duplicate/placeholder/empty-stream audits, real provider stability variants, full-decision comparison, and gate-hash invalidation |
-| Repair promotion boundary | INTEGRATED | typed issues/actions/auto-safe patches, semantic revalidation, quarantined derived versions, and versioned draft/manifest/DOCX/audit/lineage promotion without canonical overwrite |
+| Outline quality and stability gates | E2E_VERIFIED | typed `OutlineQualityGate`, effective-section/duplicate/placeholder/empty-stream audits, order/relation/critic full-decision stability variants, and gate-hash invalidation |
+| Repair promotion boundary | E2E_VERIFIED | typed issues/actions/auto-safe patches, current-service revalidation, quarantined derived versions, and versioned draft/manifest/DOCX/audit/lineage promotion with atomic `CurrentArtifactSet` switching and no canonical overwrite |
 | AgentRuntimeRunner | E2E_VERIFIED | run/resume/status/reconcile over `AgentRuntimeBridge`; durable `BaseException` terminals and canonical Validation disposition recovery |
-| Queue outcome mapping | INTEGRATED | Queue reads `job_status`; `success` remains readiness compatibility only; worker leases heartbeat and fence lease loss |
+| Queue outcome mapping | E2E_VERIFIED | Queue reads `job_status`; `success` remains readiness compatibility only; cross-process worker leases heartbeat and fence lease loss |
 | MinerU/Docling/OCR safety | IMPLEMENTED | preflight, shared auth circuit breaker, bounded subprocess timeouts |
 | Windows machine progress | IMPLEMENTED | UTF-8 console and ASCII-safe JSON progress |
 | GUI workflow and queue | INTEGRATED | local workflow UI, atomic cross-process queue snapshots, CAS worker leases, heartbeat, expiry/crash recovery, and serial persistent queue |

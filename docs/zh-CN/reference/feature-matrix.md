@@ -5,7 +5,7 @@
 `E2E_VERIFIED` 表示当前生产形状链路实际跑过，`LIVE_VERIFIED` 只保留给真实
 外部 Provider 运行，`NOT_VERIFIED` 表示所需 live 或 UI 证据尚未运行。
 
-当前离线基线为 collected 678、passed 656、deselected 22。Live API、
+当前离线基线为 collected 700、passed 678、deselected 22。Live API、
 Playwright 和 heavy OCR 本轮均为 `NOT_RUN`。
 
 | 功能 | 状态 | 规范实现 |
@@ -19,10 +19,10 @@ Playwright 和 heavy OCR 本轮均为 `NOT_RUN`。
 | Outline Intelligence v3 | E2E_VERIFIED | 已注册 evidence views、确定性 node DAG、精确 execution/replay 闭包、typed quality gate、stability variants、health 和显式 versioned adoption |
 | Review/Citation/DOCX | E2E_VERIFIED | 当前 review draft v3、完整 section binding、manifest v3、token spans、实际引用 bibliography、DOCX |
 | Validation 真相源 | E2E_VERIFIED | 显式 `ValidationExecutionService` constructor 和 current runner boundary；transport 前 request binding；response/normalized/artifact/node receipt 闭包；持久化回读并绑定 job/attempt/hash 的 `ValidationRunResultV1`；review/citation/evidence `depends_on` 精确闭包；其他报告仅为投影 |
-| Outline quality 与 stability gates | E2E_VERIFIED | typed `OutlineQualityGate`、effective-section/duplicate/placeholder/empty-stream audit、真实 provider stability variants、full-decision comparison 和 gate-hash invalidation |
-| Repair promotion boundary | INTEGRATED | typed issue/action/auto-safe patch、semantic revalidation、quarantined 派生版本和不覆盖 canonical 的 versioned draft/manifest/DOCX/audit/lineage promotion |
+| Outline quality 与 stability gates | E2E_VERIFIED | typed `OutlineQualityGate`、effective-section/duplicate/placeholder/empty-stream audit、order/relation/critic full-decision stability variants 和 gate-hash invalidation |
+| Repair promotion boundary | E2E_VERIFIED | typed issue/action/auto-safe patch、current service revalidation、quarantined 派生版本、原子 `CurrentArtifactSet` 切换以及不覆盖 canonical 的 versioned draft/manifest/DOCX/audit/lineage promotion |
 | AgentRuntimeRunner | E2E_VERIFIED | 在 `AgentRuntimeBridge` 上提供 run/resume/status/reconcile；持久化 `BaseException` 终态并从规范 artifact 恢复 Validation disposition |
-| Queue 状态映射 | INTEGRATED | Queue 读取 `job_status`；旧 success 仅为 readiness 投影；worker lease 有独立 heartbeat 和 lease-loss fence |
+| Queue 状态映射 | E2E_VERIFIED | Queue 读取 `job_status`；旧 success 仅为 readiness 投影；跨进程 worker lease 有独立 heartbeat 和 lease-loss fence |
 | MinerU/Docling/OCR 稳定性 | IMPLEMENTED | preflight、共享认证熔断、受控子进程 timeout |
 | Windows 输出 | IMPLEMENTED | UTF-8 控制台与 ASCII-safe JSON progress |
 | GUI workflow 与 queue | INTEGRATED | 本地 workflow UI、跨进程原子 queue snapshot、CAS worker lease、heartbeat、expiry/crash recovery 和 serial persistent queue |

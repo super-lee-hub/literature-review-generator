@@ -1,10 +1,10 @@
 # PR14 Current Validation Evidence
 
-Date: 2026-08-03 (Asia/Shanghai)
+Date: 2026-08-04 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 Scope: current-only validation and its production caller
-Code verification commit: `4fa38893868c80dc855faf18e8d1b7c54e1dada3`
+Code verification commit: `3166a73e4b9ac036570a58bba899ebab579ba162`
 
 ## Current execution evidence
 
@@ -36,10 +36,14 @@ inspection cannot turn an unexecuted validation into `clean`.
 | Evidence | Result |
 | --- | --- |
 | `tests/test_current_production_full_e2e.py` | 1 passed; runner → current Stage 1 → Outline → explicit adoption → Review → current Validation → Export → Attestation |
+| `tests/test_current_validation_repair_e2e.py` | 1 passed; real control-plane repair revalidation, DOCX rebuild, audit promotion, and atomic `CurrentArtifactSet` switch |
+| `tests/test_outline_v3_full_stability.py` | 2 passed; order-sensitive full-decision perturbation and blocking-critic quarantine |
+| `tests/test_queue_multiprocess_leases.py` | 2 passed; Windows `spawn` lease winner/fence and stale-worker publication rejection |
+| current repair/GUI/queue focused group | **36 passed** |
 | `tests/test_runtime_validation_bridge.py`, current validation/repair tests | passed in the focused production validation group |
 | `tests/test_provider_receipt_closure.py` | out-of-scope receipt blocks closure |
-| Full offline gate: `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | **656 passed, 22 deselected** |
-| Collection: `python -m pytest --collect-only -q` | **678 tests collected** |
+| Full offline gate: `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"` | **678 passed, 22 deselected** |
+| Collection: `python -m pytest --collect-only -q` | **700 tests collected** |
 | `python -m compileall -q .` | passed |
 | `python -m pyright` | **0 errors, 0 warnings, 0 informations** |
 | current test-config doctor | `ok=true`, 0 provider network calls; `warn` only for pre-existing stale locks |
@@ -56,7 +60,8 @@ closure claims to export. It is `E2E_VERIFIED`, not `LIVE_VERIFIED`.
 - The consolidated negative production matrix (missing receipt, malformed
   relation, stale adoption, section crash recovery, cancellation, semantic
   repair failure, and export registration failure) is not yet one E2E suite;
-  individual focused failure tests exist.
+  individual focused failure tests exist. Successful control-plane repair
+  promotion is now covered separately by the current repair E2E.
 - Playwright and heavy OCR were excluded by the offline gate.
 - Remote SHA, CI, and PR state are recorded only after the final push.
 

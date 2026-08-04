@@ -21,6 +21,11 @@ cannot satisfy a readiness or completion gate.
   next attempt.
 - `runtime_stage_terminals/*/*.json` proves stage completion only when every
   output, hash, schema, dependency, and terminal record validates.
+- `current-artifact-set:pointer` resolves one immutable `CurrentArtifactSetV1`
+  containing the exact five current targets (draft, citation manifest, DOCX,
+  validation result, and validation receipt closure) with their hashes. The
+  pointer is advanced by compare-and-swap; older ready artifacts remain
+  historical or quarantined unless referenced by that set.
 
 Queue lifecycle reads `job_status`; a human-readable success flag is never a
 source of truth.
@@ -32,9 +37,9 @@ source of truth.
 | Source intake | `source_inventory_v1.json`, `source_bundle.json` | parser diagnostics and read-only paper views |
 | Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, and source lineage | Excel and display summaries |
 | Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, typed quality gate, exact execution bindings, node DAG, receipts, full-decision stability audit, final outline, stage health, versioned adoption record, and current adoption pointer | Markdown or human-readable outline displays |
-| Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog | DOCX and text reports |
-| Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests | TXT report, manual-review JSON, alignment audit, and completion projection |
-| Repair | typed repair issues/actions/patches, quarantined derived inputs, current-service revalidation and receipt closure, and explicit versioned promotion transaction/current pointers | human-readable repair summaries |
+| Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog, resolved through the current artifact set | DOCX and text reports |
+| Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
+| Repair | typed repair issues/actions/patches, quarantined derived inputs, current-service revalidation and receipt closure, and explicit versioned promotion transaction with atomic current-set switching | human-readable repair summaries |
 
 ## Public outcomes
 
@@ -110,9 +115,10 @@ new validation attempt; it is not a closure-only inspection. `run`, `resume`,
 `retry-node`, `cancel`, `repair-plan`,
 `repair-apply`, `adopt`, `export`, and the queue list/add/run/retry/cancel/
 remove/import/export commands are explicit Registry- or queue-backed
-transitions. Queue workers claim a job with a cross-process lease and must
-heartbeat or lose the claim; expired claims are recoverable. Cancellation is
-cooperative and a cancelled job cannot publish a completed queue state.
+transitions. Queue workers claim a job with a cross-process lease generation
+and fence token and must heartbeat or lose the claim; expired claims are
+recoverable and stale workers cannot publish. Cancellation is cooperative and
+a cancelled job cannot publish a completed queue state.
 
 Validation closure requires the current review draft, citation manifest, and
 `ValidationRunResultV1` input IDs and hashes to match. The production path

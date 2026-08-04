@@ -1,10 +1,10 @@
 # PR #14 Final Gap Audit
 
-Date: 2026-08-03
+Date: 2026-08-04
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 PR: #14 (`Draft` / `Open` / `Unmerged`)
-Audit baseline (code verification commit): `4fa38893868c80dc855faf18e8d1b7c54e1dada3`
+Audit baseline (code verification commit): `3166a73e4b9ac036570a58bba899ebab579ba162`
 
 This is a current-path audit of the remediation working tree. It does not
 promote deterministic provider injection to `LIVE_VERIFIED`, and it does not
@@ -23,13 +23,13 @@ Allowed status values are: `NOT_IMPLEMENTED`, `IMPLEMENTED_ONLY`,
 | Bound provider runtime and recursive request-budget admission | `runtime/provider_runtime.py`, `runtime/provider_context.py` | Stage 1, Outline, Review, Validation provider boundaries | provider runtime/context tests; configured-provider full E2E | E2E_VERIFIED | No live provider run has been performed. |
 | Expected receipt graph, separate hash domains, unexpected and out-of-scope receipts | `runtime/provider_receipt_closure.py`, `runtime/provider_receipt_closure.py` callers | stage finalization and completion evaluator | `tests/test_provider_receipt_closure.py`; full-chain receipt readback | E2E_VERIFIED | Add a process-restart receipt replay acceptance test if production operations require it. |
 | Outline quality gate is typed and bound into node/replay identity | `outline/v3_models.py`, `services/settings.py`, `outline/v3_executor.py` | `AgentRuntimeBridge._execute_outline` | semantic Outline tests; configured-provider full E2E | E2E_VERIFIED | None for the covered path; live provider evidence remains absent. |
-| Real provider-backed Stability Audit and exact replay | `outline/v3_executor.py`, `runtime/outline_v3_replay.py` | `OutlineV3Executor.run` | semantic stability/replay tests; configured-provider full E2E | E2E_VERIFIED | Expand failure-variant assertions for every documented metamorphic metric. |
+| Real provider-backed Stability Audit and exact replay | `outline/v3_executor.py`, `runtime/outline_v3_replay.py` | `OutlineV3Executor.run` | semantic stability/replay tests; full-decision order/relation/critic tests; configured-provider full E2E | E2E_VERIFIED | No live provider evidence is claimed. |
 | Immutable, content-addressed Stage 1 summary artifacts and reuse | `runtime/orchestrator.py`, `services/stage1_analysis_service.py`, `validation/execution_service.py` | Stage 1 execution/resume and Outline inputs | Stage 1 reuse/resume tests; production full E2E | E2E_VERIFIED | Add the mixed A/B/C source-change scenario to the final evidence set. |
 | Explicit Outline adoption transaction and current pointer | `outline/adoption_transaction.py`, `runtime/control_plane.py` | `reviewctl adopt`, resume review gate | adoption/control-plane tests; production full E2E | E2E_VERIFIED | Manual review is still required before PR promotion. |
 | Durable section Review artifacts, complete binding, citation spans, and replay | `services/review_generation_service.py`, citation catalog | `AgentRuntimeBridge._execute_review` | review/citation/DOCX tests; production full E2E | E2E_VERIFIED | Add a dedicated section-2 crash/recovery E2E if the operational recovery claim is needed. |
 | Current Validation execution, not closure-only inspection | `validation/execution_service.py`, `validation/current_validation.py`, `reviewctl.py` | runner validation stage and `reviewctl validate` | validation bridge/closure tests; production full E2E; no legacy `validator` patch | E2E_VERIFIED | Live Validator API evidence is not available in this run. |
 | Zero-claim, incomplete, missing-receipt and low-confidence outcomes fail closed | `validation/run_result.py`, `validation/current_validation.py` | validation result and completion evaluator | validation closure/run-result tests; production full E2E | E2E_VERIFIED | Add all failure-chain cases to one production control-plane suite. |
-| Report-first semantic repair revalidation and explicit promotion | `services/repair_integration.py`, `validation/execution_service.py`, `validation/repair_transaction.py`, `runtime/control_plane.py` | repair report/apply and `repair-promote` | repair transaction/promotion/week-4 tests; direct revalidation contracts | INTEGRATED | A complete successful control-plane repair E2E and failure-chain promotion E2E remain to be run. |
+| Report-first semantic repair revalidation and explicit promotion | `services/repair_integration.py`, `validation/execution_service.py`, `validation/repair_transaction.py`, `runtime/control_plane.py` | repair report/apply and `repair-promote` | repair transaction/promotion/week-4 tests; direct revalidation contracts; current control-plane repair E2E | E2E_VERIFIED | The consolidated failure-chain promotion matrix remains to be run. |
 | Cross-process QueueRunner heartbeat and lease-loss fencing | `services/queue_service.py` | queue worker claim/run/release | queue lease/heartbeat and persistent queue tests | E2E_VERIFIED | Run the full process-restart QueueRunner scenario; current evidence is focused rather than full operational E2E. |
 | Canonical GUI lifecycle states and control-plane mutations | `gui/app.py`, `runtime/control_plane.py` | GUI handlers and review control plane | GUI/controller tests | INTEGRATED | Playwright was not run in this offline pass. |
 | Trust-bound canonical export and registration-failure cleanup | `runtime/export_bundle.py` | `ReviewControlPlane.export` | export-bundle tests, including registration failure; production full E2E | E2E_VERIFIED | Add checksum-corruption/read-failure cases to the final consolidated export suite. |
@@ -46,10 +46,11 @@ Fresh checks already run:
 - `pytest -q tests/test_queue_claim_leases.py tests/test_persistent_queue_service.py`: **14 passed**.
 - `pytest -q tests/test_provider_receipt_closure.py tests/test_runtime_validation_bridge.py tests/test_current_production_full_e2e.py`: **7 passed**.
 - `pytest -q tests/test_pr14_current_architecture.py tests/test_current_production_full_e2e.py tests/test_export_bundle.py`: **10 passed**.
-- `pytest -q tests/test_current_review_generation.py tests/test_current_runtime_full_e2e.py tests/test_current_validation_repair_e2e.py tests/test_export_bundle.py`: **8 passed**.
+- `pytest -q tests/test_current_review_generation.py tests/test_current_runtime_full_e2e.py tests/test_current_validation_repair_e2e.py tests/test_export_bundle.py`: **9 passed**.
+- `pytest -q tests/test_current_validation_repair_e2e.py tests/test_current_validation_repair_contract.py tests/test_outline_v3_full_stability.py tests/test_queue_multiprocess_leases.py tests/test_gui_controller.py`: **36 passed**.
 - `pytest -q tests/test_outline_v3_executor_invalidation.py tests/test_validation_input_dependencies.py tests/test_validation_projections.py`: **22 passed**.
-- `python -m pytest --collect-only -q`: **678 tests collected**.
-- `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"`: **656 passed, 22 deselected**.
+- `python -m pytest --collect-only -q`: **700 tests collected**.
+- `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"`: **678 passed, 22 deselected**.
 - `python -m compileall -q .`: passed.
 - `python -m pyright`: **0 errors, 0 warnings, 0 informations**.
 - architecture forbidden-pattern scan: **no findings**.
