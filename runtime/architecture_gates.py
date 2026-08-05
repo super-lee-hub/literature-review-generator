@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 
 DEFAULT_PRODUCTION_ROOTS: tuple[str, ...] = (
@@ -114,6 +115,284 @@ DEFAULT_FORBIDDEN_PATTERNS: dict[str, str] = {
 }
 
 
+_PUBLICATION_WRITE_CALLS = frozenset(
+    {
+        "atomic_write_bytes",
+        "atomic_write_json",
+        "write_bytes",
+        "write_text",
+        "replace",
+        "rename",
+    }
+)
+_PUBLICATION_REGISTRY_CALLS = frozenset({"register_file", "register_files_atomic"})
+_PUBLICATION_EXCEPTION_MARKER = "publication-boundary-exception:"
+_PUBLICATION_IMPLEMENTATION_MARKER = "publication-boundary-implementation:"
+_PRIVATE_WRITE_MARKERS = frozenset(
+    {
+        ".publication-staging",
+        "cache",
+        "caches",
+        "temporary",
+        "temp/",
+        "tmp/",
+        "rendering-source",
+    }
+)
+
+
+def _call_name(call: ast.Call) -> str:
+    function = call.func
+    if isinstance(function, ast.Name):
+        return function.id
+    if isinstance(function, ast.Attribute):
+        return function.attr
+    return ""
+
+
+def _qualified_call_name(call: ast.Call) -> str:
+    function = call.func
+    if isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+        return f"{function.value.id}.{function.attr}"
+    return _call_name(call)
+
+
+def _expression_text(node: ast.AST, source: str) -> str:
+    try:
+        return ast.get_source_segment(source, node) or ast.unparse(node)
+    except (AttributeError, ValueError):
+        return ""
+
+
+def _write_target(call: ast.Call) -> ast.AST | None:
+    name = _call_name(call)
+    qualified_name = _qualified_call_name(call)
+    if name in {"write_bytes", "write_text"}:
+        if isinstance(call.func, ast.Attribute):
+            return call.func.value
+        return None
+    if qualified_name in {"os.replace", "os.rename"}:
+        return call.args[1] if len(call.args) > 1 else None
+    if name in {"replace", "rename"}:
+        if isinstance(call.func, ast.Attribute):
+            return call.func.value
+        return None
+    return call.args[0] if call.args else None
+
+
+def _target_names(node: ast.AST | None) -> set[str]:
+    if node is None:
+        return set()
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Call) and node.args:
+        return _target_names(node.args[0])
+    return set()
+
+
+def _looks_private_or_temporary(target_text: str) -> bool:
+    normalized = target_text.replace("\\", "/").casefold()
+    return any(marker in normalized for marker in _PRIVATE_WRITE_MARKERS)
+
+
+def _is_canonical_target(
+    target_text: str,
+    target_names: set[str],
+    canonical_names: set[str] | None = None,
+) -> bool:
+    normalized = target_text.replace("\\", "/").casefold()
+    if _looks_private_or_temporary(normalized):
+        return False
+    canonical_markers = (
+        "canonical",
+        "review_draft",
+        "citation_manifest",
+        "review_docx",
+        "job_outcome",
+        "current_artifact",
+        "current_set",
+        "stage_terminal",
+        "source_bundle",
+        "summary_file",
+        "provider_receipt",
+        "evidence_manifest",
+    )
+    return bool(target_names.intersection(canonical_names or set())) or any(
+        marker in normalized for marker in canonical_markers
+    )
+
+
+def _has_exception_marker(source_lines: Sequence[str], line_number: int) -> bool:
+    start = max(0, line_number - 2)
+    end = min(len(source_lines), line_number + 1)
+    return any(_PUBLICATION_EXCEPTION_MARKER in source_lines[index] for index in range(start, end))
+
+
+def _has_implementation_marker(source_lines: Sequence[str], line_number: int) -> bool:
+    start = max(0, line_number - 2)
+    end = min(len(source_lines), line_number + 1)
+    return any(_PUBLICATION_IMPLEMENTATION_MARKER in source_lines[index] for index in range(start, end))
+
+
+_CANONICAL_PATH_MARKERS = (
+    "canonical",
+    "review_draft",
+    "citation_manifest",
+    "review_docx",
+    "job_outcome",
+    "current_artifact",
+    "current_set",
+    "stage_terminal",
+    "source_bundle",
+    "summary_file",
+    "provider_receipt",
+    "evidence_manifest",
+)
+
+
+def _assignment_targets(node: ast.Assign | ast.AnnAssign | ast.NamedExpr) -> list[ast.AST]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    return [node.target]
+
+
+def _contains_canonical_marker(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        values: list[str] = []
+        if isinstance(child, ast.Name):
+            values.append(child.id)
+        elif isinstance(child, ast.Attribute):
+            values.append(child.attr)
+        elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+            values.append(child.value)
+        for value in values:
+            normalized = value.replace("\\", "/").casefold()
+            if any(marker in normalized for marker in _CANONICAL_PATH_MARKERS):
+                return True
+    return False
+
+
+def _scan_function_publication_bypasses(
+    tree: ast.AST,
+    *,
+    path: Path,
+    source: str,
+) -> list[tuple[str, str]]:
+    """Scan all function scopes in one AST traversal.
+
+    Nested functions are isolated from their parent scope so a helper's
+    private staging write cannot be paired with a caller's Registry call.
+    """
+
+    source_lines = source.splitlines()
+    findings: set[tuple[str, str]] = set()
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.scopes: list[dict[str, Any]] = []
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            state: dict[str, Any] = {
+                "canonical_names": set(),
+                "writes": [],
+                "registrations": [],
+            }
+            self.scopes.append(state)
+            for statement in node.body:
+                self.visit(statement)
+            self.scopes.pop()
+            for write_line, target_text, target_names in state["writes"]:
+                for register_line, register_names in state["registrations"]:
+                    if register_line <= write_line:
+                        continue
+                    if target_names and register_names and not target_names.intersection(register_names):
+                        continue
+                    if not _is_canonical_target(target_text, target_names, state["canonical_names"]):
+                        continue
+                    if _has_exception_marker(source_lines, write_line) or _has_implementation_marker(
+                        source_lines, write_line
+                    ):
+                        continue
+                    findings.add((str(path), "canonical_publication_boundary_bypass"))
+                    break
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            # Methods own their publication scopes; decorators and bases do
+            # not contain a canonical writer body.
+            for statement in node.body:
+                self.visit(statement)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if self.scopes:
+                if _contains_canonical_marker(node.value):
+                    for target in _assignment_targets(node):
+                        self.scopes[-1]["canonical_names"].update(_target_names(target))
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if self.scopes and node.value is not None:
+                if _contains_canonical_marker(node.value):
+                    self.scopes[-1]["canonical_names"].update(_target_names(node.target))
+            self.generic_visit(node)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            if self.scopes:
+                if _contains_canonical_marker(node.value):
+                    self.scopes[-1]["canonical_names"].update(_target_names(node.target))
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if self.scopes:
+                name = _call_name(node)
+                if name in _PUBLICATION_WRITE_CALLS:
+                    target = _write_target(node)
+                    self.scopes[-1]["writes"].append(
+                        (
+                            int(getattr(node, "lineno", 0) or 0),
+                            _expression_text(target, source) if target is not None else "",
+                            _target_names(target),
+                        )
+                    )
+                elif name in _PUBLICATION_REGISTRY_CALLS:
+                    path_nodes = [keyword.value for keyword in node.keywords if keyword.arg == "path"]
+                    names = set().union(*(_target_names(value) for value in path_nodes)) if path_nodes else set()
+                    self.scopes[-1]["registrations"].append(
+                        (int(getattr(node, "lineno", 0) or 0), names)
+                    )
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+    return sorted(findings)
+
+
+def scan_paths_for_publication_boundary_bypasses(paths: Iterable[Path]) -> list[tuple[str, str]]:
+    """Find canonical writes followed by a separate Registry registration.
+
+    The check is intentionally syntax-based and conservative.  A writer may
+    opt out only on the exact write line with a narrowly documented exception
+    marker for private staging, caches, temporary rendering sources, or
+    read-only legacy compatibility code.
+    """
+
+    findings: list[tuple[str, str]] = []
+    for path in sorted(paths, key=lambda value: str(value)):
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            tree = ast.parse(source, filename=str(path))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        findings.extend(_scan_function_publication_bypasses(tree, path=path, source=source))
+    return sorted(set(findings))
+
+
 @dataclass(frozen=True)
 class ArchitectureGateScope:
     extra_canonical_roots: Sequence[str] = field(default_factory=tuple)
@@ -204,9 +483,11 @@ def scan_paths_for_forbidden_patterns(
 ) -> list[tuple[str, str]]:
     patterns = dict(forbidden_patterns or DEFAULT_FORBIDDEN_PATTERNS)
     findings: list[tuple[str, str]] = []
-    for path in sorted(paths, key=lambda value: str(value)):
+    path_list = list(paths)
+    for path in sorted(path_list, key=lambda value: str(value)):
         text = path.read_text(encoding="utf-8", errors="ignore")
         for needle, label in patterns.items():
             if needle in text:
                 findings.append((str(path), label))
+    findings.extend(scan_paths_for_publication_boundary_bypasses(path_list))
     return findings

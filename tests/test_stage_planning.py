@@ -69,6 +69,20 @@ def test_optional_explicit_validation_is_removed_when_disabled() -> None:
     assert plan.validation_status == "not_requested"
 
 
+def test_optional_disabled_validation_without_unvalidated_permission_is_not_publishable() -> None:
+    plan = build_stage_plan(
+        action="run_all",
+        requested_stages=None,
+        validation_enabled=False,
+        validation_required=False,
+        allow_unvalidated_when_validation_optional=False,
+    )
+
+    assert plan.validation_status == "not_requested"
+    assert plan.allow_unvalidated_when_validation_optional is False
+    assert plan.current_artifact_set_required is True
+
+
 def test_required_policy_without_validate_stage_is_rejected() -> None:
     with pytest.raises(StagePlanError, match="no validate stage"):
         build_stage_plan(

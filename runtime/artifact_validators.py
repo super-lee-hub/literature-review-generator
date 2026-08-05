@@ -532,10 +532,19 @@ def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: 
             "attempt_id",
             "reused_summary_artifact_id",
             "reused_summary_artifact_hash",
+            "summary_payload_hash",
+            "registered_source_artifact_id",
+            "registered_source_artifact_hash",
+            "registry_file_hash",
+            "source_summary_manifest_id",
+            "source_summary_manifest_hash",
             "source_bundle_paper_identity",
             "input_manifest_hashes",
             "original_provider_receipt_ids",
+            "current_runtime_spec_id",
             "current_runtime_spec_hash",
+            "current_evidence_manifest_id",
+            "current_evidence_manifest_hash",
             "reuse_policy",
             "reuse_decision_reason",
             "created_at",
@@ -552,10 +561,31 @@ def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: 
         raise ArtifactSchemaError("stage1_summary_reuse_record input manifests are invalid")
     if not isinstance(receipt_ids, list):
         raise ArtifactSchemaError("stage1_summary_reuse_record original receipt IDs must be an array")
-    for label in ("reused_summary_artifact_hash", "current_runtime_spec_hash", "content_hash"):
+    for label in (
+        "reused_summary_artifact_hash",
+        "summary_payload_hash",
+        "registered_source_artifact_hash",
+        "registry_file_hash",
+        "source_summary_manifest_hash",
+        "current_runtime_spec_hash",
+        "current_evidence_manifest_hash",
+        "content_hash",
+    ):
         value = str(root.get(label) or "")
         if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
             raise ArtifactSchemaError(f"stage1_summary_reuse_record.{label} is not a SHA-256 hex digest")
+    if str(root.get("registered_source_artifact_id") or "") != str(
+        root.get("reused_summary_artifact_id") or ""
+    ):
+        raise ArtifactSchemaError(
+            "stage1_summary_reuse_record source artifact ID is not bound to reused summary"
+        )
+    if str(root.get("registered_source_artifact_hash") or "") != str(
+        root.get("reused_summary_artifact_hash") or ""
+    ):
+        raise ArtifactSchemaError(
+            "stage1_summary_reuse_record source artifact hash is not bound to reused summary"
+        )
     if str(root.get("reuse_policy") or "") != "exact_summary_reuse_v1":
         raise ArtifactSchemaError("stage1_summary_reuse_record reuse policy is invalid")
     from runtime.provider_runtime import hash_json
@@ -903,6 +933,15 @@ def _validate_export_bundle(record: Any, path: str | Path, _root: Mapping[str, A
             "requested_stages",
             "spec_hash",
             "issues",
+            "validation_status",
+            "validation_required",
+            "validation_enabled",
+            "allow_unvalidated",
+            "validation_disposition_artifact_id",
+            "validation_disposition_artifact_hash",
+            "stage_plan_hash",
+            "runtime_spec_hash",
+            "validation_warning",
         ),
         "export_bundle.provenance_manifest",
     )
@@ -918,6 +957,25 @@ def _validate_export_bundle(record: Any, path: str | Path, _root: Mapping[str, A
         or not isinstance(manifest.get("spec_hash"), str)
     ):
         raise ArtifactSchemaError("export_bundle records/issues must be arrays")
+    status = str(manifest.get("status") or "")
+    validation_status = str(manifest.get("validation_status") or "")
+    if status not in {"canonical_verified", "canonical_unvalidated", "forensic_untrusted", "manual_repaired", "untrusted"}:
+        raise ArtifactSchemaError("export_bundle status is invalid")
+    if validation_status not in {"clean", "findings", "not_requested", "unknown"}:
+        raise ArtifactSchemaError("export_bundle validation_status is invalid")
+    if status == "canonical_unvalidated":
+        if (
+            validation_status != "not_requested"
+            or manifest.get("validation_required") is not False
+            or manifest.get("validation_enabled") is not False
+            or manifest.get("allow_unvalidated") is not True
+            or not str(manifest.get("validation_disposition_artifact_id") or "")
+            or len(str(manifest.get("validation_disposition_artifact_hash") or "")) != 64
+            or len(str(manifest.get("stage_plan_hash") or "")) != 64
+            or len(str(manifest.get("runtime_spec_hash") or "")) != 64
+            or "semantic validation was not performed" not in str(manifest.get("validation_warning") or "").lower()
+        ):
+            raise ArtifactSchemaError("canonical_unvalidated export does not carry its optional-validation attestation")
 
 
 def _validate_forensic_attestation(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+import zipfile
 
 import pytest
 
@@ -17,6 +18,7 @@ from services.artifact_registry import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from validation.repair_transaction import RepairTransactionService
+from runtime.provider_receipt_closure import ProviderReceiptClosure
 from validation.run_result import (
     ClaimValidationResultV1,
     ClaimVerdict,
@@ -373,15 +375,78 @@ def _install_atomic_registry_set(
 ) -> tuple[ArtifactRecord, CurrentArtifactSetV1]:
     target_records: dict[str, ArtifactRecord] = {}
     for role in ("draft", "manifest", "docx", "validation", "closure"):
-        path = _write(
-            Path(workspace.artifact_path(f"atomic/{suffix}/{role}.json")),
-            {"role": role, "suffix": suffix},
-        )
+        if role == "draft":
+            path = _write(
+                Path(workspace.artifact_path(f"atomic/{suffix}/{role}.json")),
+                {
+                    "artifact_type": "review_draft",
+                    "artifact_version": "v3",
+                    "created_from_job_id": workspace.job_id,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "draft_identity": {"draft_id": f"draft-{suffix}"},
+                    "generation_context": {"source": "tests"},
+                    "content": {"sections": []},
+                    "projections": {},
+                },
+            )
+        elif role == "manifest":
+            path = _write(
+                Path(workspace.artifact_path(f"atomic/{suffix}/{role}.json")),
+                {
+                    "artifact_type": "citation_manifest",
+                    "artifact_version": "v3",
+                    "created_from_job_id": workspace.job_id,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "manifest_identity": {"manifest_id": f"manifest-{suffix}"},
+                    "review_reference": {},
+                    "occurrences": [],
+                    "citation_sets": [],
+                    "bibliography": [],
+                },
+            )
+        elif role == "docx":
+            path = Path(workspace.artifact_path(f"atomic/{suffix}/{role}.docx"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("[Content_Types].xml", "<Types/>")
+                archive.writestr("word/document.xml", "<document/>")
+        elif role == "validation":
+            validation = ValidationRunResultV1.create(
+                job_id=workspace.job_id,
+                execution_status="failed",
+                input_artifacts=ValidationInputArtifactsV1(),
+                expected_claim_count=0,
+                review_has_citations=False,
+                evidence_complete=False,
+            )
+            path = _write(
+                Path(workspace.artifact_path(f"atomic/{suffix}/{role}.json")),
+                validation.to_dict(),
+            )
+        else:
+            closure = ProviderReceiptClosure.evaluate([], [])
+            path = _write(
+                Path(workspace.artifact_path(f"atomic/{suffix}/{role}.json")),
+                {
+                    "artifact_type": "provider_receipt_closure",
+                    "artifact_version": "v1",
+                    "job_id": workspace.job_id,
+                    "payload": closure.to_dict(),
+                },
+            )
+        artifact_types = {
+            "draft": ("review_draft", "v3"),
+            "manifest": ("citation_manifest", "v3"),
+            "docx": ("review_docx", "v1"),
+            "validation": ("validation_run_result", "v1"),
+            "closure": ("provider_receipt_closure", "v1"),
+        }
+        artifact_type, artifact_version = artifact_types[role]
         target_records[role] = registry.register_file(
             artifact_id=f"{role}:{suffix}",
             artifact_role="test_target",
-            artifact_type="test_target",
-            artifact_version="v1",
+            artifact_type=artifact_type,
+            artifact_version=artifact_version,
             path=path,
             producer="tests.atomic",
         )
@@ -493,7 +558,19 @@ def test_atomic_repair_pointer_remains_unchanged_across_prepared_and_cas_faults(
         raise OSError("injected current-set CAS failure")
 
     monkeypatch.setattr(registry, "_write_registry_unlocked", fail_cas)
-    staged_promotion = replace(prepared_promotion, artifact_id="repair-promotion:staged-only")
+    staged_promotion_path = _write(
+        Path(workspace.artifact_path("atomic/second/staged_promotion.json")),
+        {
+            **json.loads(Path(prepared_promotion.path).read_text(encoding="utf-8")),
+            "transaction_id": "repair-promotion:staged-only",
+        },
+    )
+    staged_promotion = replace(
+        prepared_promotion,
+        artifact_id="repair-promotion:staged-only",
+        path=str(staged_promotion_path),
+        content_hash=file_sha256(staged_promotion_path),
+    )
     # The set ID is content addressed by the builder; construct the exact
     # staged set rather than accepting a hand-edited identity.
     staged_set = registry.build_current_artifact_set(

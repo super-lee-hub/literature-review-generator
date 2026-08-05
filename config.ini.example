@@ -179,14 +179,19 @@ max_outline_retry_count = 2
 [OutlineStability]
 mode = smoke
 max_provider_calls = 24
-max_estimated_cost = 5.0
-pricing_source = config:OutlineStability-v1
-estimated_cost_per_1k_tokens = 0.001
-input_cost_per_1k_tokens = 0.0
-output_cost_per_1k_tokens = 0.001
-reasoning_cost_per_1k_tokens = 0.001
-cache_read_cost_per_1k_tokens = 0.0
-cache_write_cost_per_1k_tokens = 0.0
+max_estimated_cost =
+max_estimated_total_tokens = 5000000
+pricing_source =
+pricing_provider =
+pricing_model =
+pricing_version =
+pricing_effective_date =
+estimated_cost_per_1k_tokens =
+input_cost_per_1k_tokens =
+output_cost_per_1k_tokens =
+reasoning_cost_per_1k_tokens =
+cache_read_cost_per_1k_tokens =
+cache_write_cost_per_1k_tokens =
 max_smoke_overhead_ratio = 2.0
 max_source_prompt_tokens = 0
 

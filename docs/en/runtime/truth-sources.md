@@ -13,6 +13,11 @@ cannot satisfy a readiness or completion gate.
 - `artifact_registry.json` is the artifact/dependency graph. Registry writes
   use a workspace lease, revisioned transaction, atomic replacement, and
   fail-closed corruption handling.
+- A publication that creates more than one authoritative record uses one typed
+  multi-record Registry transaction. Queue publication commits the target
+  artifact and its `lease_publication_manifest` together or commits neither;
+  a transaction failure after byte finalization may leave only an immutable,
+  unreferenced orphan, never a READY target without its evidence manifest.
 - Queue-owned canonical bytes are published through a lease-generation-aware
   staging context. The publication boundary takes the queue store lock first,
   rechecks lease/worker/generation/fence, then registers the immutable
@@ -20,6 +25,10 @@ cannot satisfy a readiness or completion gate.
   is not allowed. A successful byte publication also records an immutable
   `lease_publication_manifest`; a Registry failure leaves the immutable orphan
   for diagnosis rather than restoring a mutable fixed target.
+- Direct publication tracks whether the content-addressed final path was
+  created by the current publication. An existing file with the same hash is
+  reused and is never deleted if an alias registration fails; an existing file
+  with different bytes fails before any Registry mutation.
 - `job_outcome_v1.json` is the job-head projection: lifecycle status,
   disposition, readiness policy, required/completed stages, and
   `canonical_ready`.
@@ -36,8 +45,13 @@ cannot satisfy a readiness or completion gate.
   changes the set and pointer inside one Registry OS-lock/CAS boundary. A
   failed validation, registration, or CAS leaves the previous pointer and
   current set unchanged; a staged set file may remain quarantined for
-  diagnosis. READY promotion transactions are immutable and are never mutated
-  in place.
+  diagnosis. Each target is checked by both artifact ID/hash and its accepted
+  type/version: `review_draft/v3`, `citation_manifest/v3`, `review_docx/v1`,
+  `validation_run_result/v1` for `clean` or `findings`,
+  `validation_disposition/v1` for `not_requested`, and
+  `provider_receipt_closure/v1`. The prepared promotion transaction must name
+  the same conditional validation evidence as the set. READY promotion
+  transactions are immutable and are never mutated in place.
 
 `artifacts/runtime_job_spec_v1.json` also stores the durable `StagePlan`. For
 `run_all`, validation-enabled jobs request `analyze`, `outline`, `review`, and
@@ -55,10 +69,10 @@ source of truth.
 | Stage | Canonical truth | Projections / exports |
 |---|---|---|
 | Source intake | `source_inventory_v1.json`, `source_bundle.json` | parser diagnostics and read-only paper views |
-| Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, source lineage, expected-call closure, reuse records, and current-epoch receipt ledger | Excel and display summaries |
+| Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, source lineage, expected-call closure, typed reuse records, and current-epoch receipt evidence | Excel and display summaries |
 | Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, typed quality gate, exact execution bindings, node DAG, receipts, full-decision stability audit, final outline, stage health, versioned adoption record, and current adoption pointer | Markdown or human-readable outline displays |
 | Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog, resolved through the current artifact set | DOCX and text reports |
-| Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; when optional validation is disabled, typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` plus an empty receipt closure binds the current set; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
+| Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; when optional validation is disabled, typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` plus a zero-call closure binds the current set; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
 | Stage plan | durable `stage_plan` inside `runtime_job_spec_v1.json`, including requested/required stages, validation policy, current-set requirement, and completion policy | job outcome and UI status projections |
 | Repair | typed repair issues/actions/patches, quarantined derived inputs, current-service revalidation and receipt closure, and explicit versioned promotion transaction with atomic current-set switching | human-readable repair summaries |
 
@@ -68,6 +82,19 @@ type fail closed; they are not silently treated as legacy. The canonical
 export type is `export_bundle` (`v1`), not `export_manifest`. Review, citation,
 DOCX, validation, receipt, repair, promotion, lineage, current-set, pointer,
 export, and forensic artifacts each have an explicit versioned validator.
+
+Stage 1 provider closure is conditional on the expected transport count. When
+the count is positive, a current, hash-valid receipt ledger and an exact
+expected/observed call set are mandatory. When the count is zero, observed
+receipt IDs and terminal model calls must both be zero, the expected-call graph
+and its dependencies must still verify, and no empty receipt ledger may be
+fabricated. All-reuse runs additionally require one unique reuse record for
+each SourceBundle paper identity. A reuse record must point to a registered
+source artifact and preserve separate `summary_payload_hash`,
+`registered_source_artifact_hash`, and `registry_file_hash` fields, plus source
+manifest, runtime-spec, evidence, and available original-receipt dependencies.
+Summary-source zero-call stages use typed summary-source evidence instead of an
+empty provider ledger.
 
 ## Public outcomes
 
@@ -140,16 +167,18 @@ The stability policy is explicit: `off`, `smoke` (the default), or `full`.
 Smoke executes one additional full reversed-summary decision chain plus exact
 replay; full executes the comprehensive release/audit matrix. Stability writes
 per-node call/token/cost plans and a preflight estimate before transport and
-rejects a configured `max_provider_calls` or `max_estimated_cost` breach before
-any provider call. Monetary admission is enforced only when a named pricing
-source and complete rates are present; otherwise `cost_status=unknown` keeps
-call/token ceilings but does not claim a monetary ceiling. Reported provider
-usage is calculated locally and is explicitly not billing data. Subruns are
-checkpointed. Candidate order, source order, and alternative shard size are
-represented in the execution input; exact replay uses a fresh executor and
-records zero provider transport calls. Natural-language outputs are compared
-through documented semantic thresholds, not byte identity unless the replay
-contract explicitly requires it.
+rejects a configured provider-call, context-input, per-call prompt, or hard
+`max_estimated_total_tokens` breach before any provider call. Monetary
+admission is enforced only when a named provider/model-bound pricing source
+and every required rate are present; otherwise `cost_status=unknown` keeps
+call and token ceilings but does not claim a monetary ceiling. An estimated
+cost and a locally calculated usage cost are local evidence only, never
+provider billing or an invoice. Subruns are checkpointed. Candidate order,
+source order, and alternative shard size are represented in the execution
+input; exact replay uses a fresh executor and records zero provider transport
+calls. Natural-language outputs are compared through documented semantic
+thresholds, not byte identity unless the replay contract explicitly requires
+it.
 
 `reviewctl` is the single control plane. `status`, `next-action`,
 `validation-status`, `inspect`, and `attest` are provider-free reads.
@@ -193,9 +222,35 @@ validation against those exact files, and records receipt closure. Only
 never replaces an older canonical READY file in place. Adoption never silently
 promotes an intermediate candidate.
 
+Completion and export consume `CurrentStageClosureMapV1` for every required
+provider stage. A zero-call stage is complete only with a valid expected-call
+graph, zero terminal model calls, zero observed receipts, and the correct typed
+source evidence. A missing or unexpected receipt, stale identity/hash, missing
+dependency, or unbound stage blocks completion even when a historical READY
+artifact exists.
+
 Export bundles contain verified files, provenance, checksums, completion
-evidence, and validation-closure evidence. If canonical registration fails,
-the export is marked `untrusted`, its ZIP path and artifact ID are empty, and
-the temporary bundle is removed. `canonical_verified`,
-`manual_repaired`, and `untrusted` are attestation labels, not aliases for job
-success. A DOCX alone is never an export or completion proof.
+evidence, and validation-closure evidence. `canonical_verified` is admitted
+only with clean validation. `canonical_unvalidated` is admitted only when the
+typed current `ValidationDispositionV1` is hash-valid and bound to the exact
+current set, `validation_status=not_requested`,
+`validation_required=false`, `validation_enabled=false`,
+`allow_unvalidated=true`, all requested provider closures are complete, and
+the outline is explicitly adopted. The ZIP provenance and `EXPORT_STATUS.txt`
+repeat that policy, the disposition ID/hash, stage-plan hash, runtime-spec
+hash, and a warning that semantic validation was not performed. If canonical
+registration fails, the export is marked `untrusted`, its ZIP path and artifact
+ID are empty, and the temporary bundle is removed. `canonical_verified`,
+`canonical_unvalidated`, `manual_repaired`, and `untrusted` are attestation
+labels, not aliases for job success. A DOCX alone is never an export or
+completion proof.
+
+## Canonical publication boundary
+
+Current production writers must publish canonical bytes through the typed
+publication context before Registry registration. The architecture gate
+rejects the unsafe sequence "write or replace a canonical artifact path, then
+call `Registry.register_file` separately". Private staging files, never-
+canonical caches, temporary rendering sources, and read-only legacy
+compatibility code are the only documented exceptions; they cannot enter
+current completion.

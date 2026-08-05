@@ -316,11 +316,24 @@ class JobRunner:
             if bundle.source_snapshot.get("missing_titles"):
                 degradation.append("missing_source_identity")
         if stage1_required:
-            canonical_ready = bool(ready_pdfs and not errors) and not any(
-                item in {"ambiguous", "mismatch"} for item in identity_verdicts
-            )
-            if not ready_pdfs:
-                degradation.append("no_ready_pdf_sources")
+            # A Stage 1 run may intentionally consume an already verified
+            # canonical summary source without re-ingesting PDFs.  Keep the
+            # normal PDF-backed identity gate when PDFs are present, but let
+            # the runtime's summary-only branch reach its explicit zero-call
+            # closure contract when the external source is the only input.
+            summary_only_stage1 = bool(summary_paths and not ready_pdfs)
+            if summary_only_stage1:
+                canonical_ready = bool(
+                    not errors and ready_summaries == len(summary_paths)
+                )
+                if not canonical_ready:
+                    degradation.append("no_ready_summary_sources")
+            else:
+                canonical_ready = bool(ready_pdfs and not errors) and not any(
+                    item in {"ambiguous", "mismatch"} for item in identity_verdicts
+                )
+                if not ready_pdfs:
+                    degradation.append("no_ready_pdf_sources")
         elif summary_paths:
             canonical_ready = bool(not errors and ready_summaries == len(summary_paths))
         else:

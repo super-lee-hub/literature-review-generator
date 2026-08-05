@@ -11,11 +11,18 @@
   或年份匹配。只有标题的观察必须 quarantine。
 - `artifact_registry.json` 是 artifact/dependency 图。Registry 写入使用
   workspace lease、revisioned transaction、原子替换和损坏时 fail-closed。
+- 产生多个规范记录的发布必须使用一个 typed multi-record Registry transaction。
+  Queue target artifact 与 `lease_publication_manifest` 必须一起提交或一起不提交；
+  transaction 在字节落盘后失败时，最多留下不可变且未被引用的 orphan，不能留下
+  没有证据 manifest 的 READY target。
 - Queue-owned canonical bytes 必须经过带 lease generation 的 staging context。
   发布边界先取得 queue store lock，再复核 lease/worker/generation/fence，随后
   进入 Registry transaction；禁止反向锁顺序。成功的字节发布还会写入不可变的
   `lease_publication_manifest`；若 Registry 注册失败，immutable orphan 保留为
   诊断证据，不恢复可变 fixed target。
+- Direct publication 会记录最终 content-addressed path 是否由本次发布创建。若
+  已有文件 hash 相同，则复用且 alias 注册失败时不得删除；若已有文件字节不同，
+  必须在 Registry mutation 之前 fail-closed。
 - `job_outcome_v1.json` 是 job head 投影，记录生命周期、disposition、
   readiness policy、必需/完成阶段和 `canonical_ready`。
 - `artifacts/job_attempts/snapshot-*.json` 是 append-only attempt history。
@@ -26,7 +33,12 @@
   `CurrentArtifactSetV1`，其中包含五个精确的当前目标（draft、citation
   manifest、DOCX、validation result、validation receipt closure）及其 hash。
   pointer 通过 compare-and-swap 推进；未被该 set 引用的旧 READY 产物只保留
-  为历史或 quarantine 状态。
+  为历史或 quarantine 状态。每个 target 都必须同时校验 artifact ID/hash 和
+  类型/版本：`review_draft/v3`、`citation_manifest/v3`、`review_docx/v1`；
+  `clean` 或 `findings` 使用 `validation_run_result/v1`，`not_requested` 使用
+  `validation_disposition/v1`，receipt closure 使用 `provider_receipt_closure/v1`。
+  prepared promotion transaction 必须命名与 current set 相同的条件 validation
+  evidence；switch 和 resolve 两个入口都执行这些检查。
 
 `artifacts/runtime_job_spec_v1.json` 同时保存规范 `StagePlan`。`run_all` 在
 validation 启用时固定请求 `analyze`、`outline`、`review`、`validate`；只有在
@@ -42,12 +54,22 @@ Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是�
 | 阶段 | 规范真相源 | 投影/导出 |
 |---|---|---|
 | Source intake | `source_inventory_v1.json`、`source_bundle.json` | parser 诊断和只读 paper view |
-| Stage 1 | 不可变 content-addressed 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest、来源链、expected-call closure、reuse record 和当前 epoch receipt ledger | Excel 与显示用 summary |
+| Stage 1 | 不可变 content-addressed 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest、来源链、expected-call closure、typed reuse record 和当前 epoch receipt evidence | Excel 与显示用 summary |
 | Outline Intelligence v3 | 已注册 evidence views、corpus ledger、multi-view matrix、review intent、coverage contract、relation map、candidate plan、node DAG、receipts、final outline、stage health 和 adoption record | Markdown 或人类可读 outline 展示 |
 | Review | `review_draft.json`（`artifact_version=v3`）、`citation_manifest_v3.json` 和 citation-reference catalog，并通过 current artifact set 解析 | DOCX 与文本报告 |
-| Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包；optional validation 禁用时用 typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` 和空 receipt closure 绑定 current set；`CurrentStageClosureMapV1` 只解析 current set | TXT、manual-review JSON、alignment audit 和 completion projection |
+| Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包；optional validation 禁用时用 typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` 和 zero-call closure 绑定 current set；`CurrentStageClosureMapV1` 只解析 current set | TXT、manual-review JSON、alignment audit 和 completion projection |
 | Stage plan | `runtime_job_spec_v1.json` 内持久化的 `stage_plan`，包含 requested/required stages、validation policy、current-set requirement 和 completion policy | job outcome 与 GUI 状态投影 |
 | Repair | typed repair issue/action/patch、quarantine 派生输入、current service 重新验证及 receipt 闭包、带原子 current-set 切换的显式 versioned promotion transaction | 人类可读 repair 摘要 |
+
+Stage 1 provider closure 按 expected transport count 条件化：count 大于零时，必须
+存在当前且 hash-valid 的 receipt ledger，expected/observed call set 必须精确一致；
+count 等于零时，observed receipt ID 和 terminal model call 都必须为零，expected-call
+graph 及其依赖仍须有效，不能伪造空 ledger。all-reuse 还必须为每个 SourceBundle
+paper identity 提供唯一 reuse record。reuse record 必须绑定真实已注册 source artifact，
+并分别保存 `summary_payload_hash`、`registered_source_artifact_hash` 和
+`registry_file_hash`，以及 source manifest、runtime spec、current evidence 和可用的
+原始 receipt 依赖。summary-source zero-call 阶段使用 typed summary-source evidence，
+不能用空 provider ledger 代替。
 
 ## 公开状态
 
@@ -105,10 +127,12 @@ hash，保留 replay receipt，并且 resume 只重跑失败节点的依赖闭�
 Stability policy 为 `off`、默认的 `smoke` 和 `full`。Smoke 执行一个额外的完整
 reversed-summary decision chain 加 exact replay；full 执行完整 release/audit
 矩阵。每个 node 都持久化 call/token/cost plan，并在 transport 前进行 preflight。
-只有存在命名 pricing source 且五类 rate 齐全时才执行 monetary ceiling；否则
-`cost_status=unknown`，仍执行 call/token ceiling，但不声称 monetary ceiling。
-Provider 报告的 usage 只按本地 rate 计算，绝不冒充账单。Fresh executor 的
-exact replay 必须记录 zero provider transport calls。
+必须在 transport 前执行 provider-call、context input、per-call prompt 和硬性的
+`max_estimated_total_tokens` admission。只有存在绑定 provider/model 的命名 pricing
+source 且全部必需 rate 齐全时才执行 monetary ceiling；否则 `cost_status=unknown`，
+仍执行 call/token ceiling，但不声称 monetary ceiling。estimated cost 和本地按 rate
+计算的 usage cost 都只是本地证据，绝不冒充 Provider billing 或 invoice。Fresh executor
+的 exact replay 必须记录 zero provider transport calls。
 
 `reviewctl` 是唯一控制面。`status`、`next-action`、`validation-status`、
 `inspect`、`attest` 是无 provider 的读取。`validate` 会真正执行当前
@@ -126,6 +150,10 @@ Completion map 会聚合所有 required provider stage；validation 不是 analy
 outline 或 review 的替代闭包。只要任一 stage-indexed closure 缺失，即使存在
 历史 READY 产物或人类可读报告，也必须 fail-closed。
 
+Zero-call stage 只有在 expected-call graph 有效、terminal model call 为零、observed
+receipt 为零且 typed source evidence 正确时才算 complete。缺失或意外 receipt、
+过期 identity/hash、缺失依赖或未绑定 stage 都会阻断 completion。
+
 Validation closure 要求当前 review draft、citation manifest 与
 `ValidationRunResultV1` 的输入 ID/hash 一致。若 validation 明确 optional 且禁用，
 必须存在 `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)`、
@@ -136,6 +164,21 @@ stage/spec/current-artifact hashes 和空 receipt closure；它只证明未请�
 不会原地覆盖旧 canonical READY 文件。Adoption 不会静默提升中间 candidate。
 
 Export bundle 包含已验证文件、provenance、checksum、completion evidence 和
-validation-closure evidence。若 canonical 注册失败，导出状态为 `untrusted`，
-ZIP path 和 artifact ID 都为空，并删除临时 bundle。`canonical_verified`、`manual_repaired`、
+validation-closure evidence。`canonical_verified` 只允许 clean validation。
+`canonical_unvalidated` 只有在当前 typed `ValidationDispositionV1` hash-valid 且
+绑定 exact current set、`validation_status=not_requested`、
+`validation_required=false`、`validation_enabled=false`、`allow_unvalidated=true`、
+所有 requested provider closure 完成且 outline 已显式 adoption 时才允许。ZIP
+provenance 和 `EXPORT_STATUS.txt` 必须重复该 policy、disposition ID/hash、stage-plan
+hash、runtime-spec hash，并明确警告 semantic validation was not performed。若
+canonical 注册失败，导出状态为 `untrusted`，ZIP path 和 artifact ID 都为空，并删除
+临时 bundle。`canonical_verified`、`canonical_unvalidated`、`manual_repaired`、
 `untrusted` 是 attestation 标签，不是 job 成功别名；只有 DOCX 不能证明完成。
+
+## Canonical publication boundary
+
+当前生产 writer 必须先通过 typed publication context 发布 canonical bytes，再注册
+Registry。architecture gate 会拒绝“写入或替换 canonical artifact path 后再单独调用
+`Registry.register_file`”的顺序。private staging、永不成为 canonical 的 cache、临时
+rendering source 和不能进入当前 completion 的只读 legacy compatibility code 才是允许
+的例外。

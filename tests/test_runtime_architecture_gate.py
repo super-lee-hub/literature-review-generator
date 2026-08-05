@@ -42,3 +42,45 @@ def test_architecture_gate_scan_reports_forbidden_patterns(tmp_path: Path) -> No
     findings = scan_paths_for_forbidden_patterns([bad_file])
 
     assert findings == [(str(bad_file), "legacy_cli_dispatch")]
+
+
+def test_architecture_gate_rejects_canonical_write_then_separate_registry_registration(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    bad_file = runtime_dir / "writer.py"
+    bad_file.write_text(
+        "from services.job_workspace import atomic_write_json\n"
+        "\n"
+        "def publish(registry, workspace):\n"
+        "    path = workspace.artifact_path('review_draft.json')\n"
+        "    atomic_write_json(str(path), {'artifact_type': 'review_draft'})\n"
+        "    return registry.register_file(path=path, artifact_id='draft', artifact_type='review_draft', artifact_version='v3', producer='test')\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_paths_for_forbidden_patterns([bad_file])
+
+    assert findings == [(str(bad_file), "canonical_publication_boundary_bypass")]
+
+
+def test_architecture_gate_recognizes_os_replace_destination_as_canonical(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    bad_file = runtime_dir / "writer.py"
+    bad_file.write_text(
+        "import os\n"
+        "\n"
+        "def publish(registry, workspace, staging):\n"
+        "    canonical_path = workspace.artifact_path('review_draft.json')\n"
+        "    os.replace(str(staging), str(canonical_path))\n"
+        "    return registry.register_file(path=canonical_path, artifact_id='draft', artifact_type='review_draft', artifact_version='v3', producer='test')\n",
+        encoding="utf-8",
+    )
+
+    findings = scan_paths_for_forbidden_patterns([bad_file])
+
+    assert findings == [(str(bad_file), "canonical_publication_boundary_bypass")]

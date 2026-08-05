@@ -1,4 +1,10 @@
-from services.configuration_service import ensure_config_sections, normalize_api_base, write_env_file
+from services.configuration_service import (
+    default_config_sections,
+    ensure_config_sections,
+    normalize_api_base,
+    write_env_file,
+)
+from services.settings import ApplicationSettings
 
 
 def test_normalize_api_base_strips_chat_completion_suffix() -> None:
@@ -41,6 +47,22 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert config['Validator_API']['reasoning_effort'] == 'max'
     assert config['OutlineQualityGate']['coverage_scope'] == 'full'
     assert config['OutlineQualityGate']['min_effective_sections'] == '3'
+
+
+def test_production_outline_defaults_leave_pricing_unknown_but_keep_hard_token_ceiling() -> None:
+    config = default_config_sections()
+    settings = ApplicationSettings.from_mutable_config(config)
+    stability = settings.outline_stability
+
+    assert stability.pricing_source == ""
+    assert stability.input_cost_per_1k_tokens is None
+    assert stability.output_cost_per_1k_tokens is None
+    assert stability.reasoning_cost_per_1k_tokens is None
+    assert stability.cache_read_cost_per_1k_tokens is None
+    assert stability.cache_write_cost_per_1k_tokens is None
+    assert stability.max_estimated_cost is None
+    assert stability.max_estimated_total_tokens > 0
+    assert stability.max_source_prompt_tokens == 0
 
 
 def test_write_env_file_allows_clearing_existing_keys(tmp_path) -> None:

@@ -10,7 +10,7 @@ from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Mapping, Optional, Sequence
 
 from services.job_workspace import utc_now_iso
 
@@ -67,6 +67,19 @@ def file_sha256(path: str | os.PathLike[str]) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _current_artifact_set_id(fields: Mapping[str, Any]) -> str:
+    """Return the content-addressed identity for a CurrentArtifactSet payload."""
+
+    return "current-artifact-set:" + hashlib.sha256(
+        json.dumps(
+            dict(fields),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -168,6 +181,10 @@ class CurrentArtifactSetV1:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "CurrentArtifactSetV1":
+        if str(payload.get("artifact_type") or "") != "current_artifact_set":
+            raise RegistryCorruption("current artifact set artifact_type is invalid")
+        if str(payload.get("artifact_version") or "") != "v1":
+            raise RegistryCorruption("current artifact set artifact_version is invalid")
         required = (
             "artifact_type",
             "artifact_version",
@@ -198,10 +215,18 @@ class CurrentArtifactSetV1:
                 "validation_disposition_artifact_id",
                 "validation_disposition_artifact_hash",
             )
+            mutually_exclusive = (
+                "validation_run_result_artifact_id",
+                "validation_run_result_artifact_hash",
+            )
         else:
             conditional = (
                 "validation_run_result_artifact_id",
                 "validation_run_result_artifact_hash",
+            )
+            mutually_exclusive = (
+                "validation_disposition_artifact_id",
+                "validation_disposition_artifact_hash",
             )
         conditional_missing = [key for key in conditional if not str(payload.get(key) or "").strip()]
         if conditional_missing:
@@ -209,6 +234,24 @@ class CurrentArtifactSetV1:
                 "current artifact set is missing validation evidence: "
                 + ", ".join(conditional_missing)
             )
+        if any(str(payload.get(key) or "").strip() for key in mutually_exclusive):
+            raise RegistryCorruption(
+                "current artifact set contains validation evidence for both conditional states"
+            )
+        digest_fields = (
+            "promotion_transaction_hash",
+            "review_draft_artifact_hash",
+            "citation_manifest_artifact_hash",
+            "review_docx_artifact_hash",
+            "validation_receipt_closure_artifact_hash",
+            conditional[1],
+        )
+        for field_name in digest_fields:
+            value = str(payload.get(field_name) or "")
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
+                raise RegistryCorruption(
+                    f"current artifact set {field_name} must be a SHA-256 hex digest"
+                )
         return cls(
             set_id=str(payload["set_id"]),
             job_id=str(payload["job_id"]),
@@ -253,6 +296,12 @@ class CurrentArtifactSetV1:
             validation_pair,
             (self.validation_receipt_closure_artifact_id, self.validation_receipt_closure_artifact_hash),
         )
+
+    def content_addressed_id(self) -> str:
+        fields = asdict(self)
+        fields.pop("set_id", None)
+        fields.pop("created_at", None)
+        return _current_artifact_set_id(fields)
 
 
 _PROCESS_LOCKS_GUARD = threading.Lock()
@@ -474,23 +523,52 @@ class ArtifactRegistry:
 
         directory = os.path.dirname(self.registry_path) or os.curdir
         os.makedirs(directory, exist_ok=True)
+        previous_exists = os.path.isfile(self.registry_path)
+        previous_bytes: bytes | None = None
+        if previous_exists:
+            try:
+                previous_bytes = Path(self.registry_path).read_bytes()
+            except OSError:
+                previous_bytes = None
         fd, temp_path = tempfile.mkstemp(
             prefix=f".{os.path.basename(self.registry_path)}.",
             suffix=".tmp",
             dir=directory,
         )
+        replaced = False
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.registry_path)
+            replaced = True
             self._fsync_directory(directory)
         except Exception:
             try:
                 os.unlink(temp_path)
             except FileNotFoundError:
                 pass
+            if replaced:
+                # Directory durability can fail after the replace. Restore
+                # the prior registry so a failed transaction never exposes a
+                # half-committed target, manifest, or current pointer.
+                try:
+                    if previous_exists and previous_bytes is not None:
+                        rollback_fd, rollback_path = tempfile.mkstemp(
+                            prefix=f".{os.path.basename(self.registry_path)}.rollback.",
+                            suffix=".tmp",
+                            dir=directory,
+                        )
+                        with os.fdopen(rollback_fd, "wb") as rollback_handle:
+                            rollback_handle.write(previous_bytes)
+                            rollback_handle.flush()
+                            os.fsync(rollback_handle.fileno())
+                        os.replace(rollback_path, self.registry_path)
+                    else:
+                        os.unlink(self.registry_path)
+                except (FileNotFoundError, OSError):
+                    pass
             raise
 
     @staticmethod
@@ -985,6 +1063,95 @@ class ArtifactRegistry:
 
         return self._register_transaction(build_record, expected_revision=expected_revision)
 
+    def register_files_atomic(
+        self,
+        records: Sequence[Mapping[str, Any]],
+        *,
+        expected_revision: int | None = None,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+    ) -> List[ArtifactRecord]:
+        """Register a dependency-ordered group in one durable Registry write.
+
+        Later records may depend on earlier records in the same group.  No
+        in-memory or on-disk Registry state is changed until every record,
+        dependency, schema, and ready-file check succeeds.
+        """
+
+        if not records:
+            raise ValueError("atomic Registry registration requires at least one record")
+        with self._transaction_lock():
+            disk_revision, artifacts = self._read_registry_unlocked()
+            if expected_revision is not None and disk_revision != expected_revision:
+                raise RegistryRevisionConflict(
+                    f"expected registry revision {expected_revision}, found {disk_revision}"
+                )
+            merged = dict(artifacts)
+            candidates: list[ArtifactRecord] = []
+            for spec in records:
+                artifact_id = str(spec.get("artifact_id") or "").strip()
+                artifact_type = str(spec.get("artifact_type") or "").strip()
+                artifact_version = str(spec.get("artifact_version") or "").strip()
+                artifact_role = str(spec.get("artifact_role") or artifact_type).strip()
+                producer = str(spec.get("producer") or "").strip()
+                status = str(spec.get("status") or "ready").strip()
+                job_id = str(spec.get("job_id") or self.job_id)
+                if not artifact_id or not artifact_type or not artifact_version or not producer:
+                    raise ArtifactConflict("atomic Registry records require ID, type, version, and producer")
+                if job_id != self.job_id:
+                    raise ArtifactConflict(
+                        f"artifact {artifact_id!r} belongs to {job_id!r}, not registry owner {self.job_id!r}"
+                    )
+                abs_path = self._validate_ready_path(os.fspath(spec.get("path") or ""), status)
+                content_hash = file_sha256(abs_path) if os.path.exists(abs_path) else ""
+                candidate = ArtifactRecord(
+                    artifact_id=artifact_id,
+                    artifact_role=artifact_role,
+                    artifact_type=artifact_type,
+                    artifact_version=artifact_version,
+                    path=abs_path,
+                    producer=producer,
+                    job_id=job_id,
+                    status=status,
+                    content_hash=content_hash,
+                    depends_on=self._normalize_dependencies(
+                        spec.get("depends_on") or (),
+                        merged,
+                        owner_job_id=self.job_id,
+                        require_ready=status == "ready",
+                        external_registry_resolver=external_registry_resolver,
+                    ),
+                    metadata=deepcopy(dict(spec.get("metadata") or {})),
+                    created_at=str(spec.get("created_at") or utc_now_iso()),
+                )
+                existing = merged.get(candidate.artifact_id)
+                self._validate_artifact_merge(existing, candidate)
+                if existing is not None and existing.created_at:
+                    candidate = replace(candidate, created_at=existing.created_at)
+                if candidate.status == "ready":
+                    self._verify_ready_artifact(candidate)
+                merged[candidate.artifact_id] = candidate
+                candidates.append(candidate)
+
+            publication_metadata = self._publication_metadata()
+            if publication_metadata:
+                candidates = [
+                    self._with_publication_metadata(
+                        candidate,
+                        publication_metadata,
+                        existing=artifacts.get(candidate.artifact_id),
+                    )
+                    for candidate in candidates
+                ]
+                merged = dict(artifacts)
+                for candidate in candidates:
+                    self._validate_artifact_merge(artifacts.get(candidate.artifact_id), candidate)
+                    merged[candidate.artifact_id] = candidate
+            next_revision = disk_revision + 1
+            self._write_registry_unlocked(merged, next_revision)
+            self._artifacts = merged
+            self._revision = next_revision
+            return [self._copy_record(candidate) for candidate in candidates]
+
     @staticmethod
     def _write_json_atomic(path: str | os.PathLike[str], payload: Mapping[str, Any]) -> None:
         target = os.path.abspath(os.fspath(path))
@@ -1051,9 +1218,17 @@ class ArtifactRegistry:
                 raise ArtifactConflict(
                     "not_requested current artifact set requires a typed validation disposition"
                 )
+            if validation_run_result_artifact_id or validation_run_result_artifact_hash:
+                raise ArtifactConflict(
+                    "not_requested current artifact set cannot also contain a validation run result"
+                )
         elif not validation_run_result_artifact_id or len(validation_run_result_artifact_hash) != 64:
             raise ArtifactConflict(
                 "validated current artifact set requires a validation run result"
+            )
+        elif validation_disposition_artifact_id or validation_disposition_artifact_hash:
+            raise ArtifactConflict(
+                "validated current artifact set cannot also contain a validation disposition"
             )
         created_at = utc_now_iso()
         fields = {
@@ -1077,10 +1252,145 @@ class ArtifactRegistry:
             "actor": actor,
             "reason": reason,
         }
-        set_id = "current-artifact-set:" + hashlib.sha256(
-            json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        set_id = _current_artifact_set_id(fields)
         return CurrentArtifactSetV1(set_id=set_id, created_at=created_at, **fields)
+
+    def _validate_current_artifact_set_targets(
+        self,
+        current_set: CurrentArtifactSetV1,
+        artifacts: Mapping[str, ArtifactRecord],
+        *,
+        error_type: type[RegistryError],
+    ) -> list[ArtifactRecord]:
+        """Validate every current-set slot as a typed artifact contract."""
+
+        if current_set.validation_status not in {"clean", "findings", "not_requested"}:
+            raise error_type(f"unknown current artifact set validation status: {current_set.validation_status}")
+        validation_target = (
+            "validation_disposition",
+            "v1",
+            current_set.validation_disposition_artifact_id,
+            current_set.validation_disposition_artifact_hash,
+        ) if current_set.validation_status == "not_requested" else (
+            "validation_run_result",
+            "v1",
+            current_set.validation_run_result_artifact_id,
+            current_set.validation_run_result_artifact_hash,
+        )
+        targets = (
+            ("review draft", "review_draft", "v3", current_set.review_draft_artifact_id, current_set.review_draft_artifact_hash),
+            ("citation manifest", "citation_manifest", "v3", current_set.citation_manifest_artifact_id, current_set.citation_manifest_artifact_hash),
+            ("review DOCX", "review_docx", "v1", current_set.review_docx_artifact_id, current_set.review_docx_artifact_hash),
+            ("validation evidence", validation_target[0], validation_target[1], validation_target[2], validation_target[3]),
+            ("validation receipt closure", "provider_receipt_closure", "v1", current_set.validation_receipt_closure_artifact_id, current_set.validation_receipt_closure_artifact_hash),
+        )
+        resolved: list[ArtifactRecord] = []
+        for label, expected_type, expected_version, artifact_id, expected_hash in targets:
+            record = artifacts.get(artifact_id)
+            if record is None:
+                raise error_type(f"current artifact set {label} is not registered: {artifact_id}")
+            if record.status != "ready":
+                raise error_type(f"current artifact set {label} is not ready: {artifact_id}")
+            if record.job_id != self.job_id:
+                raise error_type(f"current artifact set {label} belongs to another job: {artifact_id}")
+            if record.artifact_type != expected_type or record.artifact_version != expected_version:
+                raise error_type(
+                    f"current artifact set {label} has wrong artifact type/version: "
+                    f"{record.artifact_type}/{record.artifact_version}; "
+                    f"expected {expected_type}/{expected_version}"
+                )
+            if not expected_hash or record.content_hash != expected_hash:
+                raise error_type(f"current artifact set {label} hash mismatch: {artifact_id}")
+            if current_set.validation_status == "not_requested" and label == "validation evidence":
+                try:
+                    payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+                    from validation.disposition import ValidationDispositionV1
+
+                    disposition = ValidationDispositionV1.from_dict(payload)
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                    raise error_type(f"current artifact set validation disposition is invalid: {artifact_id}") from exc
+                if (
+                    disposition.job_id != self.job_id
+                    or disposition.status != "not_requested"
+                    or disposition.validation_enabled
+                    or disposition.validation_required
+                    or not disposition.allow_unvalidated
+                ):
+                    raise error_type("current artifact set validation disposition policy is invalid")
+            self._verify_ready_artifact(record)
+            resolved.append(record)
+        return resolved
+
+    def _validate_current_artifact_set_dependencies(
+        self,
+        *,
+        label: str,
+        actual: Sequence[ArtifactDependencyRefV2],
+        expected_records: Sequence[ArtifactRecord],
+        artifacts: Mapping[str, ArtifactRecord],
+        error_type: type[RegistryError],
+    ) -> None:
+        expected = [ArtifactDependencyRefV2.from_record(record) for record in expected_records]
+        if list(actual) != expected:
+            raise error_type(f"current artifact set {label} dependencies are incomplete or inconsistent")
+        for dependency in actual:
+            self._verify_ready_dependency(
+                dependency,
+                artifacts=artifacts,
+                owner_job_id=self.job_id,
+                external_registry_resolver=None,
+            )
+
+    def _validate_promotion_target_bindings(
+        self,
+        current_set: CurrentArtifactSetV1,
+        promotion_payload: Mapping[str, Any],
+        target_records: Sequence[ArtifactRecord],
+        *,
+        error_type: type[RegistryError],
+    ) -> None:
+        if str(promotion_payload.get("transaction_id") or "") != current_set.promotion_transaction_id:
+            raise error_type("promotion transaction identity does not match current artifact set")
+        if str(promotion_payload.get("job_id") or "") != self.job_id:
+            raise error_type("promotion transaction job identity does not match current artifact set")
+
+        named_targets = (
+            ("review_draft_artifact_id", current_set.review_draft_artifact_id),
+            ("citation_manifest_artifact_id", current_set.citation_manifest_artifact_id),
+            ("review_docx_artifact_id", current_set.review_docx_artifact_id),
+        )
+        for field_name, expected_id in named_targets:
+            if str(promotion_payload.get(field_name) or "") != expected_id:
+                raise error_type(
+                    f"promotion transaction target mismatch for {field_name}: "
+                    f"expected {expected_id}"
+                )
+
+        if current_set.validation_status == "not_requested":
+            selected_field = "validation_disposition_artifact_id"
+            other_field = "validation_run_result_artifact_id"
+            selected_id = current_set.validation_disposition_artifact_id
+        else:
+            selected_field = "validation_run_result_artifact_id"
+            other_field = "validation_disposition_artifact_id"
+            selected_id = current_set.validation_run_result_artifact_id
+        if str(promotion_payload.get(selected_field) or "") != selected_id:
+            raise error_type(
+                f"promotion transaction validation target mismatch for {selected_field}"
+            )
+        if str(promotion_payload.get(other_field) or ""):
+            raise error_type(
+                "promotion transaction contains validation evidence for both conditional states"
+            )
+
+        output_hashes = promotion_payload.get("output_hashes")
+        if not isinstance(output_hashes, Mapping):
+            raise error_type("promotion transaction output hashes are missing")
+        for record in target_records:
+            if str(output_hashes.get(record.artifact_id) or "") != record.content_hash:
+                raise error_type(
+                    f"promotion transaction output hash does not bind current target: {record.artifact_id}"
+                )
 
     def switch_current_artifact_set(
         self,
@@ -1102,6 +1412,8 @@ class ArtifactRegistry:
             raise ArtifactConflict("current artifact set ID must be content addressed")
         if current_set.set_id == "current-artifact-set:pointer":
             raise ArtifactConflict("current artifact set ID is reserved for the pointer")
+        if current_set.content_addressed_id() != current_set.set_id:
+            raise ArtifactConflict("current artifact set ID is not content addressed by its fields")
 
         with self._transaction_lock():
             disk_revision, artifacts = self._read_registry_unlocked()
@@ -1144,6 +1456,7 @@ class ArtifactRegistry:
                 )
             if (
                 promotion_record.artifact_id != current_set.promotion_transaction_id
+                or promotion_record.artifact_role != "repair_promotion_transaction"
                 or promotion_record.artifact_type != "repair_promotion_transaction"
                 or promotion_record.artifact_version != "v1"
                 or promotion_record.status != "ready"
@@ -1159,20 +1472,21 @@ class ArtifactRegistry:
                     prepared_promotion_record,
                 )
             self._verify_ready_artifact(promotion_record)
-
-            target_records: list[ArtifactRecord] = []
-            for artifact_id, expected_hash in current_set.target_artifact_pairs():
-                record = artifacts.get(artifact_id)
-                if record is None:
-                    raise UnverifiedDependency(f"current artifact target is not registered: {artifact_id}")
-                if record.status != "ready":
-                    raise UnverifiedDependency(f"current artifact target is not ready: {artifact_id}")
-                if record.job_id != self.job_id:
-                    raise UnverifiedDependency(f"current artifact target belongs to another job: {artifact_id}")
-                if not expected_hash or record.content_hash != expected_hash:
-                    raise UnverifiedDependency(f"current artifact target hash mismatch: {artifact_id}")
-                self._verify_ready_artifact(record)
-                target_records.append(record)
+            target_records = self._validate_current_artifact_set_targets(
+                current_set,
+                artifacts,
+                error_type=UnverifiedDependency,
+            )
+            try:
+                promotion_payload = json.loads(Path(promotion_record.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise UnverifiedDependency("current artifact set promotion transaction is unreadable") from exc
+            self._validate_promotion_target_bindings(
+                current_set,
+                promotion_payload,
+                target_records,
+                error_type=UnverifiedDependency,
+            )
 
             set_path = os.path.join(
                 os.path.dirname(self.registry_path),
@@ -1272,12 +1586,39 @@ class ArtifactRegistry:
             pointer = artifacts.get("current-artifact-set:pointer")
             if pointer is None:
                 return None
+            if (
+                pointer.artifact_id != "current-artifact-set:pointer"
+                or pointer.artifact_role != "current_artifact_set_pointer"
+                or pointer.artifact_type != "current_artifact_set_pointer"
+                or pointer.artifact_version != "v1"
+                or pointer.status != "ready"
+                or pointer.job_id != self.job_id
+            ):
+                raise UnverifiedArtifact("current artifact set pointer identity is invalid")
+            self._verify_ready_artifact(pointer)
             set_id = str(pointer.metadata.get("current_set_id") or "")
             set_record = artifacts.get(set_id)
             if not set_id or set_record is None or set_record.status != "ready":
                 raise UnverifiedArtifact("current artifact set pointer targets a missing or non-ready set")
-            if not os.path.isfile(set_record.path) or file_sha256(set_record.path) != set_record.content_hash:
-                raise UnverifiedArtifact("current artifact set bytes do not match the registry")
+            if (
+                set_record.artifact_id != set_id
+                or set_record.artifact_role != "current_artifact_set"
+                or set_record.artifact_type != "current_artifact_set"
+                or set_record.artifact_version != "v1"
+                or set_record.status != "ready"
+                or set_record.job_id != self.job_id
+            ):
+                raise UnverifiedArtifact("current artifact set record identity is invalid")
+            expected_set_path = os.path.join(
+                os.path.dirname(self.registry_path),
+                f"{set_id.replace(':', '-')}.json",
+            )
+            if os.path.normcase(os.path.abspath(set_record.path)) != os.path.normcase(
+                os.path.abspath(expected_set_path)
+            ):
+                raise UnverifiedArtifact("current artifact set record path is not content addressed")
+            if pointer.path != set_record.path or pointer.content_hash != set_record.content_hash:
+                raise UnverifiedArtifact("current artifact set pointer bytes do not match the set record")
             try:
                 payload = json.loads(Path(set_record.path).read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -1287,21 +1628,81 @@ class ArtifactRegistry:
             resolved = CurrentArtifactSetV1.from_dict(payload)
             if resolved.set_id != set_id or resolved.job_id != self.job_id:
                 raise UnverifiedArtifact("current artifact set identity does not match pointer")
+            if resolved.content_addressed_id() != set_id:
+                raise UnverifiedArtifact("current artifact set ID is not content addressed by its fields")
+            if (
+                str(pointer.metadata.get("current_set_id") or "") != resolved.set_id
+                or str(pointer.metadata.get("current_set_hash") or "") != set_record.content_hash
+                or str(pointer.metadata.get("previous_set_id") or "") != resolved.previous_set_id
+                or str(pointer.metadata.get("promotion_transaction_id") or "")
+                != resolved.promotion_transaction_id
+                or str(pointer.metadata.get("promotion_transaction_hash") or "")
+                != resolved.promotion_transaction_hash
+                or str(pointer.metadata.get("validation_status") or "") != resolved.validation_status
+            ):
+                raise UnverifiedArtifact("current artifact set pointer metadata does not bind the set")
+            self._verify_ready_artifact(set_record)
+            target_records = self._validate_current_artifact_set_targets(
+                resolved,
+                artifacts,
+                error_type=UnverifiedArtifact,
+            )
+            if (
+                str(set_record.metadata.get("promotion_transaction_id") or "")
+                != resolved.promotion_transaction_id
+                or str(set_record.metadata.get("promotion_transaction_hash") or "")
+                != resolved.promotion_transaction_hash
+                or str(set_record.metadata.get("validation_status") or "") != resolved.validation_status
+                or list(set_record.metadata.get("target_artifact_ids") or [])
+                != [artifact_id for artifact_id, _artifact_hash in resolved.target_artifact_pairs()]
+            ):
+                raise UnverifiedArtifact("current artifact set record metadata does not bind the set")
             promotion = artifacts.get(resolved.promotion_transaction_id)
             if (
                 promotion is None
+                or promotion.artifact_id != resolved.promotion_transaction_id
+                or promotion.artifact_role != "repair_promotion_transaction"
                 or promotion.status != "ready"
                 or promotion.content_hash != resolved.promotion_transaction_hash
                 or promotion.artifact_type != "repair_promotion_transaction"
                 or promotion.artifact_version != "v1"
+                or promotion.job_id != self.job_id
             ):
                 raise UnverifiedArtifact(
                     "current artifact set promotion transaction ID/hash binding is invalid"
                 )
             self._verify_ready_artifact(promotion)
-            for artifact_id, expected_hash in resolved.target_artifact_pairs():
-                record = artifacts.get(artifact_id)
-                if record is None or record.status != "ready" or record.content_hash != expected_hash:
-                    raise UnverifiedArtifact(f"current artifact set target is not current: {artifact_id}")
-                self._verify_ready_artifact(record)
+            self._validate_current_artifact_set_dependencies(
+                label="record",
+                actual=set_record.depends_on,
+                expected_records=[*target_records, promotion],
+                artifacts=artifacts,
+                error_type=UnverifiedArtifact,
+            )
+            self._validate_current_artifact_set_dependencies(
+                label="pointer",
+                actual=pointer.depends_on,
+                expected_records=[set_record],
+                artifacts=artifacts,
+                error_type=UnverifiedArtifact,
+            )
+            self._normalize_dependencies(
+                promotion.depends_on,
+                artifacts,
+                owner_job_id=self.job_id,
+                require_ready=True,
+                external_registry_resolver=None,
+            )
+            try:
+                promotion_payload = json.loads(Path(promotion.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise UnverifiedArtifact("current artifact set promotion transaction is unreadable") from exc
+            if not isinstance(promotion_payload, Mapping):
+                raise UnverifiedArtifact("current artifact set promotion transaction is not an object")
+            self._validate_promotion_target_bindings(
+                resolved,
+                promotion_payload,
+                target_records,
+                error_type=UnverifiedArtifact,
+            )
             return resolved

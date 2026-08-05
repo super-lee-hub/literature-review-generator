@@ -5,8 +5,10 @@ import json
 import re
 from pathlib import Path
 from typing import Any, Mapping
+import zipfile
 
 import fitz  # type: ignore
+import pytest
 
 from runtime.control_plane import ReviewControlPlane
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
@@ -378,3 +380,163 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     export = control.export(workspace=first.workspace_path)
     assert export["status"] == "canonical_verified", export
     assert Path(export["bundle_path"]).is_file()
+
+
+@pytest.mark.parametrize("allow_unvalidated", [True, False], ids=["allowed", "policy-blocked"])
+def test_current_runtime_optional_validation_policy_and_export(
+    tmp_path: Path,
+    monkeypatch: Any,
+    allow_unvalidated: bool,
+) -> None:
+    """Exercise optional validation admission and the fail-closed policy branch."""
+
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    papers = [
+        ("optional-a", "Optional Study A", "The treatment improved the outcome."),
+        ("optional-b", "Optional Study B", "The treatment improved the outcome in a second context."),
+        ("optional-c", "Optional Study C", "The treatment improved the outcome under a third condition."),
+    ]
+    for key, title, finding in papers:
+        _write_pdf(pdf_dir / f"{key}.pdf", title, finding)
+
+    reader_index = 0
+
+    def configured_reader(*_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        nonlocal reader_index
+        paper_key, title, finding = papers[reader_index]
+        reader_index += 1
+        return {"status": "success", "content": _reader_summary(paper_key, title, finding)}
+
+    def configured_outline(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        prompt = str(args[0] if args else kwargs.get("prompt") or "")
+        envelope = json.loads(prompt)
+        return _outline_provider_response(str(envelope["node_id"]), dict(envelope["request"]))
+
+    def configured_writer(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        prompt = str(args[0] if args else kwargs.get("prompt") or "")
+        ref_ids = re.findall(r"R\d{3,}", prompt)
+        ref_id = ref_ids[0] if ref_ids else "R001"
+        return _provider_response(
+            {"blocks": [{"text": f"The evidence supports the bounded synthesis [[cite_ref:{ref_id}]]."}]}
+        )
+
+    monkeypatch.setattr("ai_interface.get_summary_from_ai_with_fallback", configured_reader)
+    monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
+    monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
+
+    config_path = _test_config(tmp_path)
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    parser["Validation"]["review_enabled"] = "false"
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+
+    spec = RuntimeJobSpec(
+        project_name="optional-validation-e2e",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+        job_id=f"optional-validation-e2e-job-{('allowed' if allow_unvalidated else 'blocked')}",
+        config=str(config_path),
+        action="run_all",
+        queue_file=str(tmp_path / "queue.json"),
+        metadata={
+            "requested_stages": ["analyze", "outline", "review"],
+            "validation_required": False,
+            "require_clean_validation": False,
+            "allow_unvalidated_when_validation_optional": allow_unvalidated,
+        },
+    )
+
+    first = AgentRuntimeRunner(spec).run()
+    assert first.job_status == "completed", first
+    if allow_unvalidated:
+        assert first.job_disposition == "needs_review", first
+    control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
+    inspection = control.inspect(workspace=first.workspace_path)
+    final_outline = next(
+        artifact
+        for artifact in inspection["artifacts"]
+        if artifact["artifact_id"] == "outline-v3:final_outline"
+    )
+    adoption = control.adopt(
+        workspace=first.workspace_path,
+        artifact_id="outline-v3:final_outline",
+        actor="tests.current_runtime_full_e2e.optional",
+        reason="explicitly approve the optional-validation outline",
+        expected_hash=str(final_outline["content_hash"]),
+    )
+    assert adoption["status"] == "succeeded", adoption
+
+    completed = control.resume(workspace=first.workspace_path)
+    if allow_unvalidated:
+        assert completed["completion_status"] == "complete", completed
+        assert completed["canonical_ready"] is True, completed
+    else:
+        assert completed["completion_status"] == "blocked", completed
+        assert completed["canonical_ready"] is False, completed
+    assert completed["completed_stages"] == ("source_intake", "analyze", "outline", "review"), completed
+
+    status = control.validation_status(workspace=first.workspace_path)
+    assert status["status"] == "not_requested", status
+
+    workspace, registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+    current_set = registry.resolve_current_artifact_set()
+    assert current_set is not None
+    assert current_set.validation_status == "not_requested"
+    disposition = registry.get(current_set.validation_disposition_artifact_id)
+    assert disposition is not None
+    assert disposition.artifact_type == "validation_disposition"
+    assert disposition.artifact_version == "v1"
+
+    if not allow_unvalidated:
+        assert completed["completion_status"] != "complete", completed
+        assert completed["canonical_ready"] is False, completed
+        blocked_export = control.export(workspace=workspace.root_dir)
+        assert blocked_export["status"] == "untrusted", blocked_export
+        assert blocked_export["bundle_path"] == "", blocked_export
+        return
+
+    stage_map = resolve_current_stage_closure_map(registry)
+    assert stage_map.blocking_issues == ()
+    assert all(
+        bool(entry.get("complete"))
+        for entry in stage_map.provider_closures_by_stage.values()
+    )
+
+    export = control.export(workspace=workspace.root_dir)
+    assert export["status"] == "canonical_unvalidated", export
+    bundle_path = Path(export["bundle_path"])
+    assert bundle_path.is_file()
+    with zipfile.ZipFile(bundle_path) as archive:
+        manifest = json.loads(archive.read("provenance_manifest.json").decode("utf-8"))
+        status_text = archive.read("EXPORT_STATUS.txt").decode("utf-8")
+    assert manifest["status"] == "canonical_unvalidated"
+    assert manifest["validation_status"] == "not_requested"
+    assert manifest["validation_required"] is False
+    assert manifest["validation_enabled"] is False
+    assert manifest["allow_unvalidated"] is True
+    assert manifest["validation_disposition_artifact_id"] == disposition.artifact_id
+    assert manifest["validation_disposition_artifact_hash"] == disposition.content_hash
+    assert "semantic validation was not performed" in manifest["validation_warning"]
+    assert "status=canonical_unvalidated" in status_text
+    assert "validation_status=not_requested" in status_text
+    assert "allow_unvalidated=true" in status_text
+
+    disposition_path = Path(disposition.path)
+    original_disposition_bytes = disposition_path.read_bytes()
+    disposition_payload = json.loads(original_disposition_bytes.decode("utf-8"))
+    for mutation in (
+        {"allow_unvalidated": False},
+        {"stage_plan_hash": "f" * 64},
+    ):
+        tampered_payload = {**disposition_payload, **mutation}
+        disposition_path.write_text(
+            json.dumps(tampered_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tampered_export = control.export(workspace=workspace.root_dir)
+        assert tampered_export["status"] == "untrusted", tampered_export
+        assert tampered_export["bundle_path"] == ""
+        tampered_completion = AgentRuntimeRunner.status(workspace.root_dir)
+        assert tampered_completion.completion_status != "complete" or not tampered_completion.canonical_ready
+        disposition_path.write_bytes(original_disposition_bytes)

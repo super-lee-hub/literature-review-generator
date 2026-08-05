@@ -1265,26 +1265,44 @@ class LocalPublicationContext:
         target = Path(staged.target_path).expanduser().resolve()
         final_path = _immutable_publication_path(target, staged.content_hash)
         final_path.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(staged.staging_path, final_path)
-        artifact = None
-        if register_kwargs is not None:
-            if registry is None:
-                raise PublicationFenceRejected("artifact registration requires an explicit registry")
-            kwargs = dict(register_kwargs)
-            kwargs["path"] = str(final_path)
+        created_by_publication = False
+        if final_path.exists():
+            if not final_path.is_file() or _sha256_bytes(final_path.read_bytes()) != staged.content_hash:
+                raise PublicationFenceRejected(
+                    f"immutable publication target already contains different bytes: {final_path}"
+                )
+            Path(staged.staging_path).unlink(missing_ok=True)
+        else:
             try:
+                # A hard-link create is exclusive on Windows and POSIX.  It
+                # lets a concurrent publisher win the race without making
+                # this publisher responsible for deleting the winner's file.
+                os.link(staged.staging_path, final_path)
+            except FileExistsError:
+                if not final_path.is_file() or _sha256_bytes(final_path.read_bytes()) != staged.content_hash:
+                    raise PublicationFenceRejected(
+                        f"immutable publication target already contains different bytes: {final_path}"
+                    )
+            else:
+                created_by_publication = True
+            Path(staged.staging_path).unlink(missing_ok=True)
+        artifact = None
+        try:
+            if register_kwargs is not None:
+                if registry is None:
+                    raise PublicationFenceRejected("artifact registration requires an explicit registry")
+                kwargs = dict(register_kwargs)
+                kwargs["path"] = str(final_path)
                 artifact = registry.register_file(**kwargs)
-            except Exception:
-                # Direct execution has no queue-owned forensic orphan policy.
-                # If Registry registration fails after the immutable rename,
-                # remove only this publication and leave no misleading export
-                # artifact behind. QueuePublicationContext intentionally keeps
-                # its immutable orphan for later reconciliation.
+        except Exception:
+            # A pre-existing content-addressed file belongs to an earlier
+            # publication and must survive an alias registration failure.
+            if created_by_publication:
                 try:
                     final_path.unlink(missing_ok=True)
                 except OSError:
                     pass
-                raise
+            raise
         return PublishedArtifactPublication(
             target_path=str(target),
             final_path=str(final_path),
@@ -1401,7 +1419,8 @@ class QueuePublicationContext:
         *,
         staged: StagedArtifactPublication,
         final_path: Path,
-        artifact: Any,
+        artifact_id: str,
+        artifact_hash: str,
     ) -> dict[str, Any]:
         return {
             "artifact_type": "lease_publication_manifest",
@@ -1416,41 +1435,35 @@ class QueuePublicationContext:
             "staging_path": staged.staging_path,
             "content_hash": staged.content_hash,
             "size_bytes": staged.size_bytes,
-            "registered_artifact_id": str(getattr(artifact, "artifact_id", "")),
-            "registered_artifact_hash": str(getattr(artifact, "content_hash", "")),
+            "registered_artifact_id": artifact_id,
+            "registered_artifact_hash": artifact_hash,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
-    def _register_publication_manifest_unlocked(
+    def _prepare_publication_manifest_unlocked(
         self,
         *,
         staged: StagedArtifactPublication,
         final_path: Path,
-        artifact: Any,
-        registry: ArtifactRegistry,
-    ) -> Any:
-        """Persist exact lease/fence evidence without entering a mutable path.
-
-        This is intentionally performed after the target artifact registration,
-        while the queue lock is still held.  If either Registry write fails,
-        the finalized bytes remain immutable but unreferenced; no fixed target
-        or current pointer can be changed by that failure.
-        """
+        artifact_id: str,
+        artifact_hash: str,
+    ) -> tuple[Path, dict[str, Any]]:
+        """Materialize lease evidence before one atomic target/manifest commit."""
 
         payload = self._manifest_payload(
             staged=staged,
             final_path=final_path,
-            artifact=artifact,
+            artifact_id=artifact_id,
+            artifact_hash=artifact_hash,
         )
         encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         manifest_hash = _sha256_bytes(encoded)
-        artifact_id = _safe_publication_component(
-            str(getattr(artifact, "artifact_id", "published-artifact"))
-        )
+        target_artifact_id = str(artifact_id or "published-artifact")
+        safe_artifact_id = _safe_publication_component(target_artifact_id)
         manifest_target = (
             final_path.parent
             / ".publication-manifests"
-            / f"{artifact_id}__{manifest_hash[:24]}.json"
+            / f"{safe_artifact_id}__{manifest_hash[:24]}.json"
         )
         manifest_staging = (
             self._staging_directory(manifest_target)
@@ -1467,21 +1480,19 @@ class QueuePublicationContext:
             manifest_staging.unlink(missing_ok=True)
         else:
             os.replace(str(manifest_staging), str(manifest_final))
-        return ArtifactRegistry.register_file(
-            registry,
-            artifact_role="lease_publication_manifest",
-            artifact_type="lease_publication_manifest",
-            artifact_version="v1",
-            path=str(manifest_final),
-            producer="services.queue_service.QueuePublicationContext",
-            artifact_id=f"lease-publication:{artifact_id}:{manifest_hash[:24]}",
-            depends_on=[ArtifactDependencyRefV2.from_record(artifact)],
-            metadata={
-                "target_artifact_id": str(getattr(artifact, "artifact_id", "")),
-                "target_artifact_hash": str(getattr(artifact, "content_hash", "")),
+        return manifest_final, {
+            "artifact_role": "lease_publication_manifest",
+            "artifact_type": "lease_publication_manifest",
+            "artifact_version": "v1",
+            "path": str(manifest_final),
+            "producer": "services.queue_service.QueuePublicationContext",
+            "artifact_id": f"lease-publication:{safe_artifact_id}:{manifest_hash[:24]}",
+            "metadata": {
+                "target_artifact_id": target_artifact_id,
+                "target_artifact_hash": artifact_hash,
                 "immutable": True,
             },
-        )
+        }
 
     def finalize_staged(
         self,
@@ -1492,10 +1503,9 @@ class QueuePublicationContext:
     ) -> PublishedArtifactPublication:
         """Finalize bytes and registry mutations under ``queue -> Registry``.
 
-        If the registry write fails after the immutable rename, the finalized
-        file is intentionally retained without a Registry reference.  It is
-        therefore an immutable orphan and cannot replace the previous current
-        bytes or pointer.
+        The target and its lease publication evidence are committed by one
+        Registry transaction.  A Registry failure therefore leaves only
+        immutable, unreferenced bytes.
         """
 
         if (
@@ -1525,6 +1535,9 @@ class QueuePublicationContext:
                 except OSError:
                     pass
             else:
+                # publication-boundary-implementation: this is the one
+                # immutable byte move inside QueuePublicationContext; its
+                # target and lease evidence are registered atomically below.
                 os.replace(str(staging), str(final_path))
             artifact = None
             if register_kwargs is not None:
@@ -1532,17 +1545,43 @@ class QueuePublicationContext:
                     raise QueuePublicationRejected("artifact registration requires an explicit registry")
                 kwargs = dict(register_kwargs)
                 kwargs["path"] = str(final_path)
-                # The facade's public override would reacquire the non-
-                # reentrant queue lock.  Calling the base implementation here
-                # preserves the documented queue -> Registry lock order.
-                artifact = ArtifactRegistry.register_file(registry, **kwargs)
                 if str(kwargs.get("artifact_type") or "") != "lease_publication_manifest":
-                    self._register_publication_manifest_unlocked(
+                    target_id = str(kwargs.get("artifact_id") or "").strip()
+                    if not target_id:
+                        target_id = f"{kwargs.get('artifact_type', 'artifact')}:{final_path.name}"
+                    target_type = str(kwargs.get("artifact_type") or "")
+                    target_version = str(kwargs.get("artifact_version") or "")
+                    target_ref = ArtifactDependencyRefV2(
+                        dependency_kind="local_job",
+                        job_id=registry.job_id,
+                        artifact_id=target_id,
+                        artifact_type=target_type,
+                        path=str(final_path),
+                        content_hash=staged.content_hash,
+                    )
+                    _manifest_path, manifest_kwargs = self._prepare_publication_manifest_unlocked(
                         staged=staged,
                         final_path=final_path,
-                        artifact=artifact,
-                        registry=registry,
+                        artifact_id=target_id,
+                        artifact_hash=staged.content_hash,
                     )
+                    manifest_kwargs["depends_on"] = [target_ref]
+                    kwargs["artifact_id"] = target_id
+                    kwargs["artifact_type"] = target_type
+                    kwargs["artifact_version"] = target_version
+                    # The target must precede its lease evidence so the
+                    # in-transaction dependency resolver can verify it.
+                    # The queue lock is already held by this publication
+                    # boundary.  Bypass the lease facade's outer lock here;
+                    # the base transaction still runs the publication guard
+                    # without reacquiring the queue lock.
+                    artifact_records = ArtifactRegistry.register_files_atomic(
+                        registry,
+                        [kwargs, manifest_kwargs],
+                    )
+                    artifact = artifact_records[0]
+                else:
+                    artifact = ArtifactRegistry.register_file(registry, **kwargs)
             return PublishedArtifactPublication(
                 target_path=str(target),
                 final_path=str(final_path),
@@ -1649,6 +1688,10 @@ class QueueOwnedArtifactRegistry(ArtifactRegistry):
     def register_file(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         with self._queue_write_lock():
             return super().register_file(*args, **kwargs)
+
+    def register_files_atomic(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().register_files_atomic(*args, **kwargs)
 
     def register(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         with self._queue_write_lock():

@@ -27,6 +27,7 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from runtime.provider_runtime import hash_json
 from validation.run_result import (
     ValidationRunResultError,
     ValidationRunResultV1,
@@ -493,19 +494,31 @@ def _provider_closure_entry(
     # A closure artifact normally depends on a durable receipt ledger.  Copy
     # the stage-bound receipt facts into the stage descriptor so the map does
     # not reduce input/config/schema provenance to a closure hash alone.
+    dependency_epoch = str(
+        closure.get("closure_epoch_id")
+        or (raw_envelope or {}).get("closure_epoch_id")
+        or record.metadata.get("closure_epoch_id")
+        or ""
+    )
     dependency_receipts: list[Mapping[str, Any]] = []
+    historical_dependency_receipts: list[Mapping[str, Any]] = []
     for dependency in record.depends_on:
         dependency_record = registry.get(dependency.artifact_id)
         if dependency_record is None or dependency_record.status != "ready":
             continue
         _dependency_payload, dependency_rows = _payload_for_record(dependency_record)
-        dependency_receipts.extend(
-            row
-            for row in dependency_rows
-            if not row.get("stage_name") or str(row.get("stage_name")) == expected_receipt_stage_name
-        )
+        for row in dependency_rows:
+            if row.get("stage_name") and str(row.get("stage_name")) != expected_receipt_stage_name:
+                continue
+            row_epoch = str(row.get("closure_epoch_id") or "")
+            if row_epoch and row_epoch != dependency_epoch:
+                historical_dependency_receipts.append(row)
+            else:
+                dependency_receipts.append(row)
     if dependency_receipts:
         receipt_rows = dependency_receipts
+    if historical_dependency_receipts:
+        blocking.append(f"provider_closure_historical_receipts:{stage}")
     if raw_envelope is None:
         blocking.append(f"provider_closure_envelope_unreadable:{stage}")
     outer_job_id = str((raw_envelope or {}).get("job_id") or "")
@@ -547,6 +560,7 @@ def _provider_closure_entry(
     if not isinstance(raw_expected_calls, list) or len(expected_call_payloads) != len(raw_expected_calls):
         blocking.append(f"provider_closure_expected_calls_missing:{stage}")
     expected_payload_ids = [str(item.get("call_id") or "") for item in expected_call_payloads]
+    expected_call_count = len(expected_call_payloads)
     if any(not item for item in expected_payload_ids) or len(set(expected_payload_ids)) != len(expected_payload_ids):
         blocking.append(f"provider_closure_expected_call_identity_invalid:{stage}")
     expected_graph_hashes = {
@@ -556,12 +570,85 @@ def _provider_closure_entry(
     }
     if expected_graph_hash and expected_graph_hashes and expected_graph_hashes != {expected_graph_hash}:
         blocking.append(f"provider_closure_expected_graph_mismatch:{stage}")
+    expected_attempt_ids = {
+        str(item.get("attempt_id") or "")
+        for item in expected_call_payloads
+        if str(item.get("attempt_id") or "")
+    }
+    expected_logical_attempts = {
+        str(item.get("logical_attempt_identity") or "")
+        for item in expected_call_payloads
+        if str(item.get("logical_attempt_identity") or "")
+    }
+    closure_attempt_id = str(closure.get("attempt_id") or "")
+    closure_logical_attempt = str(closure.get("logical_attempt_identity") or "")
+    # ``attempt_id`` is call-scoped for Outline v3 and review DAG entries,
+    # while the closure envelope binds the stage-level attempt.  The shared
+    # logical attempt identity is the durable stage binding in that layout;
+    # Stage 1 may use the same value for both fields.  Keep the per-receipt
+    # call-level attempt checks below so accepting the stage binding cannot
+    # weaken call identity validation.
+    if expected_call_count and closure_attempt_id not in (
+        expected_attempt_ids | expected_logical_attempts
+    ):
+        blocking.append(f"provider_closure_attempt_binding_mismatch:{stage}")
+    if expected_call_count and closure_logical_attempt not in expected_logical_attempts:
+        blocking.append(f"provider_closure_logical_attempt_binding_mismatch:{stage}")
     dependency_records = [
         dependency_record
         for dependency in record.depends_on
         if (dependency_record := registry.get(dependency.artifact_id)) is not None
         and dependency_record.status == "ready"
     ]
+    # Stage 1 publishes a separate, typed expected-call graph because its
+    # closure is assembled from paper-level reuse/generation work.  Outline,
+    # review, and validation persist their expected calls in their own
+    # stage-specific call-plan/closure contracts and do not publish this
+    # Stage-1 artifact type.  Keep the common hash and expected-call checks
+    # below for every stage, but require the separate Registry graph only for
+    # the stage that owns that contract.
+    if stage == "analyze":
+        expected_graph_records = [
+            dependency_record
+            for dependency_record in dependency_records
+            if dependency_record.artifact_type == "provider_expected_call_graph"
+            and dependency_record.artifact_version == "v1"
+        ]
+        if not expected_graph_records:
+            blocking.append(f"provider_closure_expected_graph_dependency_missing:{stage}")
+        else:
+            for graph_record in expected_graph_records:
+                graph_payload = _json_object(graph_record.path)
+                if str(graph_record.metadata.get("expected_call_graph_hash") or "") != expected_graph_hash:
+                    blocking.append(f"provider_closure_expected_graph_dependency_hash_mismatch:{stage}")
+                if str((graph_payload or {}).get("expected_call_graph_hash") or "") != expected_graph_hash:
+                    blocking.append(f"provider_closure_expected_graph_file_hash_mismatch:{stage}")
+                source_bundle_record = next(
+                    (
+                        dependency_record
+                        for dependency_record in dependency_records
+                        if dependency_record.artifact_type == "source_bundle"
+                        and dependency_record.artifact_version == "v1"
+                    ),
+                    None,
+                )
+                runtime_spec_record = next(
+                    (
+                        dependency_record
+                        for dependency_record in dependency_records
+                        if dependency_record.artifact_type == "runtime_job_spec"
+                        and dependency_record.artifact_version == "v1"
+                    ),
+                    None,
+                )
+                if source_bundle_record is None:
+                    blocking.append(f"provider_closure_source_bundle_dependency_missing:{stage}")
+                elif str((graph_payload or {}).get("source_bundle_hash") or "") != source_bundle_record.content_hash:
+                    blocking.append(f"provider_closure_expected_graph_source_bundle_mismatch:{stage}")
+                if runtime_spec_record is None:
+                    blocking.append(f"provider_closure_runtime_spec_dependency_missing:{stage}")
+                elif str((graph_payload or {}).get("runtime_spec_hash") or "") != runtime_spec_record.content_hash:
+                    blocking.append(f"provider_closure_expected_graph_runtime_spec_mismatch:{stage}")
     dependency_paths = {
         str(Path(dependency_record.path).resolve()): dependency_record
         for dependency_record in dependency_records
@@ -608,6 +695,13 @@ def _provider_closure_entry(
             blocking.append(
                 f"provider_closure_expected_artifact_dependency_hash_mismatch:{stage}:{call_id}"
             )
+        elif stage == "analyze":
+            try:
+                registry.verify_ready_dependencies(dependency_record.depends_on)
+            except (OSError, RegistryError, ValueError, TypeError) as exc:
+                blocking.append(
+                    f"provider_closure_expected_artifact_dependency_untrusted:{stage}:{call_id}:{exc}"
+                )
         try:
             if file_sha256(artifact_path) != registry_file_hash:
                 blocking.append(f"provider_closure_expected_file_hash_mismatch:{stage}:{call_id}")
@@ -630,11 +724,169 @@ def _provider_closure_entry(
         blocking.append(f"provider_closure_observed_call_set_mismatch:{stage}")
     if entry["closure_epoch_id"] != closure_epoch_id:
         blocking.append(f"provider_closure_epoch_mismatch:{stage}")
-    if not any(
-        dependency_record.artifact_type == "provider_receipt_ledger"
-        for dependency_record in record.depends_on
-    ):
-        blocking.append(f"provider_closure_receipt_ledger_dependency_missing:{stage}")
+    ledger_records = [
+        dependency_record
+        for dependency_record in dependency_records
+        if dependency_record.artifact_type == "provider_receipt_ledger"
+    ]
+    if expected_call_count > 0:
+        if not ledger_records:
+            blocking.append(f"provider_closure_receipt_ledger_dependency_missing:{stage}")
+        else:
+            for ledger_record in ledger_records:
+                try:
+                    ArtifactRegistry._verify_ready_artifact(ledger_record)
+                except (OSError, RegistryError, ValueError, TypeError) as exc:
+                    blocking.append(f"provider_closure_receipt_ledger_untrusted:{stage}:{exc}")
+    else:
+        if terminal_model_calls != 0:
+            blocking.append(f"provider_closure_zero_call_terminal_model_count:{stage}")
+        if observed_ids or receipt_rows:
+            blocking.append(f"provider_closure_zero_call_observed_receipts:{stage}")
+        if ledger_records:
+            blocking.append(f"provider_closure_zero_call_receipt_ledger_present:{stage}")
+        source_evidence_records = [
+            dependency_record
+            for dependency_record in dependency_records
+            if dependency_record.artifact_type in {
+                "summary_source_manifest",
+                "stage1_summary_reuse_record",
+            }
+        ]
+        if not source_evidence_records:
+            blocking.append(f"provider_closure_zero_call_source_evidence_missing:{stage}")
+    reuse_records = [
+        dependency_record
+        for dependency_record in dependency_records
+        if dependency_record.artifact_type == "stage1_summary_reuse_record"
+        and dependency_record.artifact_version == "v1"
+    ]
+    if stage == "analyze" and (reuse_records or expected_call_count == 0):
+        source_record = next(
+            (
+                dependency_record
+                for dependency_record in dependency_records
+                if dependency_record.artifact_type == "source_bundle"
+                and dependency_record.artifact_version == "v1"
+            ),
+            None,
+        )
+        source_payload = _json_object(source_record.path) if source_record is not None else None
+        source_items_value = (
+            (source_payload or {}).get("paper_work_items")
+            if isinstance(source_payload, Mapping)
+            else []
+        )
+        source_items = source_items_value if isinstance(source_items_value, list) else []
+        expected_papers = {
+            str(item.get("canonical_paper_key") or "")
+            for item in source_items
+            if isinstance(item, Mapping) and str(item.get("canonical_paper_key") or "")
+        }
+        generated_papers = {
+            str(item.get("node_id") or "")
+            for item in expected_call_payloads
+            if str(item.get("node_id") or "")
+        }
+        expected_reused_papers = expected_papers - generated_papers
+        reused_papers: list[str] = []
+        for reuse_record in reuse_records:
+            reuse_payload = _json_object(reuse_record.path) or {}
+            identity = reuse_payload.get("source_bundle_paper_identity")
+            paper_key = str(identity.get("canonical_paper_key") or "") if isinstance(identity, Mapping) else ""
+            if not paper_key or paper_key in reused_papers or (expected_papers and paper_key not in expected_papers):
+                blocking.append(f"provider_closure_reuse_identity_invalid:{stage}")
+            else:
+                reused_papers.append(paper_key)
+            try:
+                registry.verify_ready_dependencies(reuse_record.depends_on)
+            except (OSError, RegistryError, ValueError, TypeError) as exc:
+                blocking.append(f"provider_closure_reuse_dependency_invalid:{stage}")
+            dependency_by_id = {
+                dependency.artifact_id: dependency
+                for dependency in reuse_record.depends_on
+                if dependency.artifact_id
+            }
+            source_id = str(reuse_payload.get("registered_source_artifact_id") or "")
+            source_hash = str(reuse_payload.get("registered_source_artifact_hash") or "")
+            manifest_id = str(reuse_payload.get("source_summary_manifest_id") or "")
+            manifest_hash = str(reuse_payload.get("source_summary_manifest_hash") or "")
+            evidence_id = str(reuse_payload.get("current_evidence_manifest_id") or "")
+            evidence_hash = str(reuse_payload.get("current_evidence_manifest_hash") or "")
+            runtime_id = str(reuse_payload.get("current_runtime_spec_id") or "")
+            runtime_hash = str(reuse_payload.get("current_runtime_spec_hash") or "")
+            for label, artifact_id, content_hash in (
+                ("source", source_id, source_hash),
+                ("source_manifest", manifest_id, manifest_hash),
+                ("evidence_manifest", evidence_id, evidence_hash),
+                ("runtime_spec", runtime_id, runtime_hash),
+                (
+                    "source_provider_receipt_closure",
+                    str(reuse_payload.get("source_provider_receipt_closure_id") or ""),
+                    str(reuse_payload.get("source_provider_receipt_closure_hash") or ""),
+                ),
+                (
+                    "source_provider_receipt_ledger",
+                    str(reuse_payload.get("source_provider_receipt_ledger_id") or ""),
+                    str(reuse_payload.get("source_provider_receipt_ledger_hash") or ""),
+                ),
+            ):
+                if not artifact_id and not content_hash:
+                    continue
+                dependency = dependency_by_id.get(artifact_id)
+                if dependency is None or dependency.content_hash != content_hash:
+                    blocking.append(f"provider_closure_reuse_{label}_binding_invalid:{stage}")
+                else:
+                    dependency_record = registry.get(artifact_id)
+                    if dependency_record is None or dependency_record.content_hash != content_hash:
+                        blocking.append(f"provider_closure_reuse_{label}_record_invalid:{stage}")
+                    elif label == "source_provider_receipt_closure" and (
+                        dependency_record.artifact_type != "provider_receipt_closure"
+                        or dependency_record.artifact_version != "v1"
+                    ):
+                        blocking.append(f"provider_closure_reuse_{label}_type_invalid:{stage}")
+                    elif label == "source_provider_receipt_ledger" and (
+                        dependency_record.artifact_type != "provider_receipt_ledger"
+                        or dependency_record.artifact_version != "v1"
+                    ):
+                        blocking.append(f"provider_closure_reuse_{label}_type_invalid:{stage}")
+            source_record = registry.get(source_id) if source_id else None
+            if source_record is None or source_record.status != "ready":
+                blocking.append(f"provider_closure_reuse_source_artifact_missing:{stage}")
+            else:
+                try:
+                    ArtifactRegistry._verify_ready_artifact(source_record)
+                    source_payload = json.loads(Path(source_record.path).read_text(encoding="utf-8"))
+                    source_payload_items = (
+                        source_payload
+                        if isinstance(source_payload, list)
+                        else [source_payload]
+                        if isinstance(source_payload, Mapping)
+                        else []
+                    )
+                    found_payload = next(
+                        (
+                            item
+                            for item in source_payload_items
+                            if isinstance(item, Mapping)
+                            and isinstance(item.get("ai_summary"), Mapping)
+                            and str(
+                                (item.get("paper_info") or {}).get("canonical_paper_key")
+                                if isinstance(item.get("paper_info"), Mapping)
+                                else ""
+                            ) == paper_key
+                        ),
+                        None,
+                    )
+                    summary_payload_hash = str(reuse_payload.get("summary_payload_hash") or "")
+                    if found_payload is None or hash_json(found_payload.get("ai_summary")) != summary_payload_hash:
+                        blocking.append(f"provider_closure_reuse_source_payload_mismatch:{stage}")
+                except (OSError, RegistryError, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                    blocking.append(f"provider_closure_reuse_source_artifact_untrusted:{stage}:{exc}")
+        if expected_reused_papers and set(reused_papers) != expected_reused_papers:
+            blocking.append(f"provider_closure_reuse_identity_coverage_incomplete:{stage}")
+        if not expected_reused_papers and reused_papers:
+            blocking.append(f"provider_closure_reuse_identity_unexpected:{stage}")
     terminal_output_ids = {
         str(item.get("artifact_id") or "")
         for item in (terminal_payload or {}).get("output_artifact_refs") or ()
@@ -663,7 +915,15 @@ def _provider_closure_entry(
         expected_row = expected_by_id.get(str(row.get("call_id") or ""))
         if expected_row is None:
             continue
-        for field_name in ("prompt_hash", "input_hash", "config_hash", "schema_hash"):
+        for field_name in (
+            "attempt_id",
+            "node_id",
+            "logical_attempt_identity",
+            "prompt_hash",
+            "input_hash",
+            "config_hash",
+            "schema_hash",
+        ):
             expected_value = str(expected_row.get(field_name) or "")
             if not expected_value or str(row.get(field_name) or "") != expected_value:
                 blocking.append(f"provider_closure_receipt_binding_mismatch:{stage}:{field_name}")
@@ -967,6 +1227,8 @@ class ValidationClosureService:
                         "status": disposition.status,
                         "validation_disposition": disposition.status,
                         "contract_satisfied": True,
+                        "validation_enabled": disposition.validation_enabled,
+                        "validation_required": disposition.validation_required,
                         "allow_unvalidated": disposition.allow_unvalidated,
                         "actor": disposition.actor,
                         "reason": disposition.reason,

@@ -518,7 +518,10 @@ class Stage1AnalysisService:
         """Persist typed evidence for a zero-transport exact summary reuse."""
 
         previous = dict(prepared.previous or {})
-        previous_hash = hash_json(previous)
+        summary_payload = previous.get("ai_summary")
+        if not isinstance(summary_payload, Mapping):
+            raise RuntimeError("reused Stage 1 summary has no canonical summary payload")
+        summary_payload_hash = hash_json(summary_payload)
         source_paper_id = str(prepared.item.source_paper_id or "").strip()
         provider_payload = previous.get("provider")
         source_receipt_ids = list(
@@ -527,16 +530,142 @@ class Stage1AnalysisService:
             else []
         )
         runtime_record = self.registry.get("runtime_job_spec")
+        if runtime_record is None or runtime_record.status != "ready":
+            raise RuntimeError("reused Stage 1 summary requires a registered runtime_job_spec")
+
+        # Snapshot the exact input bytes before the current run can rewrite a
+        # mutable summary/paper projection.  The snapshot is itself a real
+        # Registry file, so a logical payload hash or synthetic ID can never
+        # satisfy reuse closure by itself.
+        source_snapshot_payload = [previous]
+        source_snapshot_digest = hash_json(source_snapshot_payload)
+        source_snapshot = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.workspace.artifact_path(
+                f"stage1/reuse_sources/summary_{source_snapshot_digest[:24]}.json"
+            ),
+            source_snapshot_payload,
+            artifact_role="summary_source",
+            artifact_type="summary_file",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"stage1:reuse_source_summary:{source_snapshot_digest[:24]}",
+            depends_on=(ArtifactDependencyRefV2.from_record(runtime_record),),
+            metadata={
+                "immutable": True,
+                "summary_payload_hash": summary_payload_hash,
+                "source_paper_key": self._paper_key(prepared.item),
+            },
+        )
+        ArtifactRegistry._verify_ready_artifact(source_snapshot)
+
+        source_manifest = self.registry.get("summary_source_manifest")
+        source_manifest_payload: Mapping[str, Any] | None = None
+        if source_manifest is not None and source_manifest.status == "ready":
+            try:
+                raw_manifest = json.loads(Path(source_manifest.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("registered summary source manifest is unreadable") from exc
+            if isinstance(raw_manifest, Mapping):
+                source_manifest_payload = raw_manifest
+        if source_manifest_payload is None:
+            source_manifest_payload = {
+                "artifact_type": "summary_source_manifest",
+                "artifact_version": "v2",
+                "created_at": utc_now_iso(),
+                "project_name": self.job_id,
+                "source_kind": "stage1_reuse_source_snapshot",
+                "source_path": source_snapshot.path,
+                "source_items": [
+                    {
+                        "canonical_paper_key": self._paper_key(prepared.item),
+                        "source_paper_id": source_paper_id,
+                        "source_path": source_snapshot.path,
+                        "disposition": "reused",
+                    }
+                ],
+                "rejected_candidates": [],
+                "materialized_summary_file": source_snapshot.path,
+                "summary_count": 1,
+            }
+        source_manifest_digest = hash_json(source_manifest_payload)
+        source_manifest_snapshot = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.workspace.artifact_path(
+                f"stage1/reuse_sources/manifest_{source_manifest_digest[:24]}.json"
+            ),
+            source_manifest_payload,
+            artifact_role="summary_source",
+            artifact_type="summary_source_manifest",
+            artifact_version="v2",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"stage1:reuse_source_manifest:{source_manifest_digest[:24]}",
+            depends_on=(
+                ArtifactDependencyRefV2.from_record(source_snapshot),
+                ArtifactDependencyRefV2.from_record(runtime_record),
+            ),
+            metadata={"immutable": True, "source_snapshot": True},
+        )
+
+        evidence_manifest = self.registry.get(
+            f"evidence_manifest:{self._paper_key(prepared.item)}"
+        )
+        if evidence_manifest is None or evidence_manifest.status != "ready":
+            raise RuntimeError("reused Stage 1 summary requires a registered current evidence manifest")
+
+        source_paper_record = self.registry.get(self._paper_artifact_id(prepared.item))
+        if source_paper_record is not None and source_paper_record.status != "ready":
+            raise RuntimeError("registered source paper artifact is not ready")
+
+        source_ledger = None
+        source_closure = None
+        if isinstance(provider_payload, Mapping):
+            source_ledger_path = str(provider_payload.get("receipt_ledger_path") or "").strip()
+            if source_ledger_path:
+                source_ledger = next(
+                    (
+                        record
+                        for record in self.registry.list_records()
+                        if record.status == "ready"
+                        and record.artifact_type == "provider_receipt_ledger"
+                        and Path(record.path).resolve() == Path(source_ledger_path).resolve()
+                    ),
+                    None,
+                )
+        source_closure = next(
+            (
+                record
+                for record in self.registry.list_records()
+                if record.status == "ready"
+                and record.artifact_type == "provider_receipt_closure"
+                and str(record.metadata.get("stage_name") or "") in {"", "stage1_analyze"}
+                and record.artifact_id != "stage1:provider_receipt_closure"
+            ),
+            None,
+        )
+
         evidence = {
             "artifact_type": "stage1_summary_reuse_record",
             "artifact_version": "v1",
             "job_id": self.job_id,
             "stage_name": "stage1_analyze",
             "attempt_id": self.attempt_id,
-            "reused_summary_artifact_id": str(
-                previous.get("artifact_id") or f"summary:{previous_hash}"
-            ),
-            "reused_summary_artifact_hash": previous_hash,
+            "reused_summary_artifact_id": source_snapshot.artifact_id,
+            "reused_summary_artifact_hash": source_snapshot.content_hash,
+            "summary_payload_hash": summary_payload_hash,
+            "registered_source_artifact_id": source_snapshot.artifact_id,
+            "registered_source_artifact_hash": source_snapshot.content_hash,
+            "registry_file_hash": file_sha256(source_snapshot.path),
+            "source_summary_manifest_id": source_manifest_snapshot.artifact_id,
+            "source_summary_manifest_hash": source_manifest_snapshot.content_hash,
+            "source_paper_artifact_id": source_paper_record.artifact_id if source_paper_record else "",
+            "source_paper_artifact_hash": source_paper_record.content_hash if source_paper_record else "",
+            "source_provider_receipt_closure_id": source_closure.artifact_id if source_closure else "",
+            "source_provider_receipt_closure_hash": source_closure.content_hash if source_closure else "",
+            "source_provider_receipt_ledger_id": source_ledger.artifact_id if source_ledger else "",
+            "source_provider_receipt_ledger_hash": source_ledger.content_hash if source_ledger else "",
             "source_bundle_paper_identity": {
                 "canonical_paper_key": self._paper_key(prepared.item),
                 "source_paper_id": source_paper_id,
@@ -549,7 +678,10 @@ class Stage1AnalysisService:
                 "stage1_input": hash_json(prepared.built_input.to_metadata_dict()),
             },
             "original_provider_receipt_ids": source_receipt_ids,
-            "current_runtime_spec_hash": str(runtime_record.content_hash if runtime_record else ""),
+            "current_runtime_spec_id": runtime_record.artifact_id,
+            "current_runtime_spec_hash": runtime_record.content_hash,
+            "current_evidence_manifest_id": evidence_manifest.artifact_id,
+            "current_evidence_manifest_hash": evidence_manifest.content_hash,
             "reuse_policy": "exact_summary_reuse_v1",
             "reuse_decision_reason": "exact_summary_reuse",
             "created_at": utc_now_iso(),
@@ -557,13 +689,19 @@ class Stage1AnalysisService:
         evidence["content_hash"] = hash_json(evidence)
         digest = str(evidence["content_hash"])[:24]
         path = self.workspace.artifact_path(f"stage1/reuse_records/{digest}.json")
-        dependencies: list[ArtifactDependencyRefV2] = []
-        manifest_record = self.registry.get(
-            f"evidence_manifest:{self._paper_key(prepared.item)}"
-        )
-        for record in (manifest_record, runtime_record):
-            if record is not None and record.status == "ready":
-                dependencies.append(ArtifactDependencyRefV2.from_record(record))
+        dependencies = [
+            ArtifactDependencyRefV2.from_record(record)
+            for record in (
+                source_snapshot,
+                source_manifest_snapshot,
+                runtime_record,
+                evidence_manifest,
+                source_paper_record,
+                source_closure,
+                source_ledger,
+            )
+            if record is not None and record.status == "ready"
+        ]
         return publish_json_artifact(
             self.publication_context,
             self.registry,
@@ -578,7 +716,9 @@ class Stage1AnalysisService:
             metadata={
                 "reuse_policy": "exact_summary_reuse_v1",
                 "transport_count": 0,
-                "reused_summary_artifact_hash": previous_hash,
+                "reused_summary_artifact_hash": source_snapshot.content_hash,
+                "summary_payload_hash": summary_payload_hash,
+                "registered_source_artifact_id": source_snapshot.artifact_id,
             },
         )
 
@@ -666,6 +806,7 @@ class Stage1AnalysisService:
             "job_id": self.job_id,
             "stage_name": "stage1_analyze",
             "attempt_id": self.attempt_id,
+            "logical_attempt_identity": self.attempt_id,
             "closure_epoch_id": self.closure_epoch_id,
             "expected_call_graph_hash": self.expected_call_graph_hash,
             "expected_calls": [asdict(item) for item in bound],
@@ -689,14 +830,17 @@ class Stage1AnalysisService:
             if str(receipt.closure_epoch_id or "") == self.closure_epoch_id
         )
         dependency_records = []
-        for artifact_id in (
+        dependency_ids = (
             "source_bundle",
             "runtime_job_spec",
             "stage1:provider_expected_call_graph",
-            "stage1_provider_receipts",
+            "summary_source_manifest",
             *sorted(set(paper_ids)),
             *[record.artifact_id for record in reuse_records],
-        ):
+        )
+        if self.expected_calls:
+            dependency_ids = (*dependency_ids, "stage1_provider_receipts")
+        for artifact_id in dependency_ids:
             candidate = self.registry.get(artifact_id)
             if candidate is not None and candidate.status == "ready":
                 dependency_records.append(candidate)
@@ -718,6 +862,7 @@ class Stage1AnalysisService:
             depends_on=[ArtifactDependencyRefV2.from_record(item) for item in dependency_records],
             metadata={
                 "closure_epoch_id": self.closure_epoch_id,
+                "stage_name": "stage1_analyze",
                 "expected_call_graph_hash": self.expected_call_graph_hash,
                 "complete": closure.complete,
                 "depends_on_expected_graph": "stage1:provider_expected_call_graph",
@@ -1051,7 +1196,11 @@ class Stage1AnalysisService:
             artifact_version="v1",
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id="stage1_provider_receipts",
-            metadata={"receipt_count": len(current_receipts)},
+            metadata={
+                "receipt_count": len(current_receipts),
+                "stage_name": "stage1_analyze",
+                "closure_epoch_id": self.closure_epoch_id,
+            },
         )
         self.receipt_ledger_path = record.path
 

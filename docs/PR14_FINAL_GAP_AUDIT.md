@@ -1,6 +1,6 @@
 # PR #14 Final Gap Audit
 
-Date: 2026-08-04 (Asia/Shanghai)
+Date: 2026-08-05 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 PR: #14 (`Draft` / `Open` / `Unmerged`)
@@ -21,22 +21,27 @@ cannot independently verify local read access.
 | Atomic repair promotion | Immutable prepared promotion transaction, output/hash/lineage binding, one Registry OS lock/CAS for transaction + `CurrentArtifactSet` + pointer, unchanged pointer on validation/CAS failure, and immutable READY transaction checks | `E2E_VERIFIED` | No live-provider run |
 | Version-aware validation | Dispatch keyed by `(artifact_type, artifact_version)` for current production and Outline artifacts; explicit known compatibility projections; malformed fixtures and unknown current versions fail closed | `E2E_VERIFIED` | Historical compatibility versions remain explicitly readable |
 | Outline stability | `off`/`smoke`/`full`, one additional full reversed-summary smoke chain, comprehensive full perturbations, checkpointed subruns, explicit order, thresholds, exact replay, zero-transport fresh executor, and typed critic retry scope | `E2E_VERIFIED` | No live-provider run |
-| Call/cost admission | Per-node `OutlineProviderCallPlan` with conservative critic/arbitration input bounds, call/token preflight, explicit pricing-source policy, persisted actual usage/cost when rates and usage are known | `E2E_VERIFIED` | Calculated cost is local policy evidence, never provider billing; unknown pricing disables only the monetary ceiling |
+| Call/cost admission | Per-node `OutlineProviderCallPlan` with conservative critic/arbitration input bounds, hard call/token preflight, provider/model-bound pricing only when all rates are explicit, and persisted usage/cost evidence | `E2E_VERIFIED` | Default pricing is unknown; calculated cost is local policy evidence, never provider billing |
 | Stage-indexed provider closure | Durable requested-stage spec drives analyze/outline/review/validate closure entries with epoch, graph, input, config, schema, status, artifact identity/hash, and Registry dependencies; `CurrentArtifactSet` remains authoritative | `E2E_VERIFIED` | No external-provider evidence |
 | Stage plan and `run_all` completion | Durable stage plan normalizes `run_all` to analyze/outline/review/validate when validation is enabled, omits only optional validation when disabled, still requires a current set, and blocks derivation/outline-only canonical readiness without that set | `E2E_VERIFIED` | Validation is still provider-free only when explicitly disabled or not requested |
-| Optional validation disposition | Typed `ValidationDispositionV1` with `status=not_requested`, `allow_unvalidated=true`, stage/spec hashes, review/citation/DOCX identities, an empty validation receipt closure, and current-set binding | `E2E_VERIFIED` | It records intentional non-requesting; it does not claim validation passed |
-| Receipt closure | Fully bound calls, expected/missing/unexpected/out-of-scope/hash mismatch cases, same-epoch checks, and historical isolation | `E2E_VERIFIED` | No live-provider run |
-| Queue fencing | Lease-generation staging, queue-lock -> Registry publication order, immutable byte finalization, lease publication manifests, Windows `spawn` stale-worker races, and Registry-failure orphan tests | `E2E_VERIFIED` | No production multi-host run |
+| Optional validation disposition/export | Typed `ValidationDispositionV1` with `status=not_requested`, `allow_unvalidated=true`, stage/spec hashes, review/citation/DOCX identities, a zero-call validation receipt closure, current-set binding, and a generated `canonical_unvalidated` ZIP | `E2E_VERIFIED` | It records intentional non-requesting; it does not claim validation passed |
+| Receipt closure | Fully bound calls, expected/missing/unexpected/out-of-scope/hash mismatch cases, zero-call/all-reuse and summary-source paths, same-epoch checks, and historical isolation | `E2E_VERIFIED` | No live-provider run |
+| Queue fencing/publication | Lease-generation staging, queue-lock -> Registry publication order, one atomic target-plus-manifest Registry commit, manifest/fsync/CAS failure orphan tests, immutable byte finalization, and Windows `spawn` stale-worker current-set race | `E2E_VERIFIED` | No production multi-host run |
 | Negative/UI boundary coverage | Focused malformed-artifact, closure, promotion, export-failure, queue, GUI-controller, and label/status tests | `CONTROLLER_VERIFIED` | Playwright was not run in the offline gate; no single umbrella failure-chain suite |
-| Trust-bound export | Versioned `export_bundle` validator, stage/receipt/current-set evidence, registration-failure cleanup, and forensic read-back | `E2E_VERIFIED` | Future work may add more checksum/read-failure permutations |
+| Trust-bound export | Versioned `export_bundle` validator, typed current-set targets, stage/receipt/current-set evidence, canonical verified and canonical unvalidated admission, registration-failure cleanup, and forensic read-back | `E2E_VERIFIED` | Future work may add more checksum/read-failure permutations |
 
 ## Fresh local evidence
 
 - Focused queue, closure, repair, export, Stage 1, validation, GUI-controller,
   adoption, multimodal, and Outline regressions passed during implementation;
-  the strict full gate below is the authoritative aggregate.
-- `726 passed, 22 deselected` from `748 collected` under
-  `--strict-markers -m "not live_api and not playwright and not heavy_ocr"`.
+  the strict aggregate was attempted separately and is reported below without
+  converting a timeout or early exit into a pass.
+- `774 collected`; the strict marker selection is `752 selected / 22 deselected`.
+  The exact strict command was run twice with
+  `--strict-markers -m "not live_api and not playwright and not heavy_ocr"`:
+  the first run hit the 30-minute command timeout, and the second exited 1 at
+  9% without an aggregate summary. The affected current-runtime test passes
+  independently (`1 passed in 87.29s`), but no aggregate pass count is claimed.
 - `python -m compileall -q .`: passed.
 - `python -m pyright`: `0 errors, 0 warnings, 0 informations`.
 - `python -m reviewctl doctor --config config.ini.example`: `ok=true`,
@@ -49,9 +54,13 @@ cannot independently verify local read access.
 - A three-paper Stage 1 graph predeclares the complete `stage1_analyze`
   expected-call set, binds each call to job/attempt/node/epoch/graph/config/
   schema/input identities, then finalizes the receipt closure after transport.
-  Reused summaries remain explicit `reused` nodes with reuse evidence and do
-  not create provider calls or synthetic receipts; an adversarial missing-paper
-  closure remains blocked.
+  The adversarial matrix covers missing/unexpected/historical receipts, all
+  identity/hash bindings, expected-graph and dependency loss, paper/evidence
+  loss, duplicate/unknown reuse identities, mixed reuse/generation, all reuse,
+  and zero-call terminal/receipt violations. Reused summaries remain explicit
+  `reused` nodes with real Registry source-artifact, source-manifest, runtime,
+  and evidence dependencies; they do not create provider calls or synthetic
+  receipts.
 - With candidate count `c`, the Outline v3 core provider call count is
   `c + 5` (relation adjudication, `c` candidate generations, three critics,
   and arbitration). The default `c=5` therefore has 10 core calls: `off=10`,
@@ -59,14 +68,16 @@ cannot independently verify local read access.
   replay with zero transport), and `full=60` (five additional full chains plus
   exact replay). The configured smoke admission ceiling is 24 calls. Monetary
   admission is enforced only when the durable configuration supplies a named
-  pricing source and complete rates; otherwise the persisted `cost_status` is
-  `unknown` and only call/token ceilings apply.
-- The executor-level failure/resume regression injects a failed
-  `candidate_2_provider_generation`, then records the exact resumed transport
-  sequence (`candidate_2_provider_generation`, `structure_critique`,
-  `coverage_critique`, `evidence_critique`, `arbitration`) while reusing
-  unaffected candidates. The DAG planning test is not used as executor E2E
-  evidence.
+  provider/model-bound pricing source and complete rates; otherwise the
+  persisted `cost_status` is `unknown` and hard call/context/prompt/total-token
+  ceilings still apply.
+- The executor-level failure/resume regression separately injects a failed
+  `coverage_critique` after relation adjudication, both candidate generations,
+  and structure critique have durable receipts. Resume performs exactly
+  `coverage_critique`, `evidence_critique`, and `arbitration`; candidate and
+  structure hashes/receipt IDs remain unchanged. A separate binding-change
+  test reruns only candidate 2 and its dependent critics/arbitration. The
+  candidate-generation failure test remains a separate regression.
 
 ## Explicit non-claims
 

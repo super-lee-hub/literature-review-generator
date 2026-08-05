@@ -111,7 +111,12 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "mode",
             "max_provider_calls",
             "max_estimated_cost",
+            "max_estimated_total_tokens",
             "pricing_source",
+            "pricing_provider",
+            "pricing_model",
+            "pricing_version",
+            "pricing_effective_date",
             "estimated_cost_per_1k_tokens",
             "input_cost_per_1k_tokens",
             "output_cost_per_1k_tokens",
@@ -193,6 +198,16 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -284,14 +299,19 @@ class OutlineSettings:
 class OutlineStabilitySettings:
     mode: str = "smoke"
     max_provider_calls: int = 24
-    max_estimated_cost: float = 5.0
-    pricing_source: str = "config:OutlineStability-v1"
-    estimated_cost_per_1k_tokens: float = 0.001
-    input_cost_per_1k_tokens: float = 0.0
-    output_cost_per_1k_tokens: float = 0.001
-    reasoning_cost_per_1k_tokens: float = 0.001
-    cache_read_cost_per_1k_tokens: float = 0.0
-    cache_write_cost_per_1k_tokens: float = 0.0
+    max_estimated_cost: float | None = None
+    max_estimated_total_tokens: int = 5_000_000
+    pricing_source: str = ""
+    pricing_provider: str = ""
+    pricing_model: str = ""
+    pricing_version: str = ""
+    pricing_effective_date: str = ""
+    estimated_cost_per_1k_tokens: float | None = None
+    input_cost_per_1k_tokens: float | None = None
+    output_cost_per_1k_tokens: float | None = None
+    reasoning_cost_per_1k_tokens: float | None = None
+    cache_read_cost_per_1k_tokens: float | None = None
+    cache_write_cost_per_1k_tokens: float | None = None
     max_smoke_overhead_ratio: float = 2.0
     max_source_prompt_tokens: int = 0
 
@@ -304,14 +324,21 @@ class OutlineStabilitySettings:
         return cls(
             mode=mode,
             max_provider_calls=max(0, _int(section.get("max_provider_calls"), 24)),
-            max_estimated_cost=max(0.0, _float(section.get("max_estimated_cost"), 5.0)),
-            pricing_source=str(section.get("pricing_source") or "config:OutlineStability-v1").strip(),
-            estimated_cost_per_1k_tokens=max(0.0, _float(section.get("estimated_cost_per_1k_tokens"), 0.001)),
-            input_cost_per_1k_tokens=max(0.0, _float(section.get("input_cost_per_1k_tokens"), 0.0)),
-            output_cost_per_1k_tokens=max(0.0, _float(section.get("output_cost_per_1k_tokens"), 0.001)),
-            reasoning_cost_per_1k_tokens=max(0.0, _float(section.get("reasoning_cost_per_1k_tokens"), 0.001)),
-            cache_read_cost_per_1k_tokens=max(0.0, _float(section.get("cache_read_cost_per_1k_tokens"), 0.0)),
-            cache_write_cost_per_1k_tokens=max(0.0, _float(section.get("cache_write_cost_per_1k_tokens"), 0.0)),
+            max_estimated_cost=_optional_float(section.get("max_estimated_cost")),
+            max_estimated_total_tokens=max(
+                0, _int(section.get("max_estimated_total_tokens"), 5_000_000)
+            ),
+            pricing_source=str(section.get("pricing_source") or "").strip(),
+            pricing_provider=str(section.get("pricing_provider") or "").strip(),
+            pricing_model=str(section.get("pricing_model") or "").strip(),
+            pricing_version=str(section.get("pricing_version") or "").strip(),
+            pricing_effective_date=str(section.get("pricing_effective_date") or "").strip(),
+            estimated_cost_per_1k_tokens=_optional_float(section.get("estimated_cost_per_1k_tokens")),
+            input_cost_per_1k_tokens=_optional_float(section.get("input_cost_per_1k_tokens")),
+            output_cost_per_1k_tokens=_optional_float(section.get("output_cost_per_1k_tokens")),
+            reasoning_cost_per_1k_tokens=_optional_float(section.get("reasoning_cost_per_1k_tokens")),
+            cache_read_cost_per_1k_tokens=_optional_float(section.get("cache_read_cost_per_1k_tokens")),
+            cache_write_cost_per_1k_tokens=_optional_float(section.get("cache_write_cost_per_1k_tokens")),
             max_smoke_overhead_ratio=max(1.0, _float(section.get("max_smoke_overhead_ratio"), 2.0)),
             max_source_prompt_tokens=max(0, _int(section.get("max_source_prompt_tokens"), 0)),
         )

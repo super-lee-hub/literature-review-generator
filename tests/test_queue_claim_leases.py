@@ -11,7 +11,7 @@ import zipfile
 
 import pytest
 
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactRegistry, CurrentArtifactSetV1
 from services.job_workspace import atomic_write_json
 from services.queue_service import PersistentQueueService, QueueJobSpec, QueueLease, QueueState
 from services.queue_service import QueueRunner
@@ -158,6 +158,49 @@ def _spawn_stale_registry_mutator(
         except QueuePublicationRejected:
             switch_rejected = True
         result_queue.put({"register_rejected": register_rejected, "switch_rejected": switch_rejected})
+    except BaseException as exc:  # pragma: no cover - surfaced through the parent assertion
+        result_queue.put({"error": f"{type(exc).__name__}: {exc}"})
+
+
+def _spawn_stale_current_set_switch(
+    queue_file: str,
+    job_id: str,
+    registry_path: str,
+    lease_id: str,
+    worker_id: str,
+    lease_generation: int,
+    fence_token: str,
+    current_set_payload: dict[str, Any],
+    promotion_id: str,
+    result_queue: Any,
+) -> None:
+    """Attempt a valid-but-stale CurrentArtifactSet switch in a spawn child."""
+
+    try:
+        service = PersistentQueueService(queue_file)
+        stale_lease = QueueLease(
+            job_id=job_id,
+            lease_id=lease_id,
+            worker_id=worker_id,
+            expires_at="",
+            revision=0,
+            lease_generation=lease_generation,
+            fence_token=fence_token,
+        )
+        registry = service.publication_context(stale_lease).registry(registry_path, job_id)
+        current_set = CurrentArtifactSetV1.from_dict(current_set_payload)
+        promotion = registry.get(promotion_id)
+        if promotion is None:
+            raise RuntimeError(f"stale promotion is missing: {promotion_id}")
+        try:
+            registry.switch_current_artifact_set(
+                current_set,
+                prepared_promotion_record=promotion,
+            )
+        except QueuePublicationRejected as exc:
+            result_queue.put({"rejected": True, "reason": str(exc)})
+        else:
+            result_queue.put({"rejected": False})
     except BaseException as exc:  # pragma: no cover - surfaced through the parent assertion
         result_queue.put({"error": f"{type(exc).__name__}: {exc}"})
 
@@ -479,6 +522,113 @@ def test_stale_spawned_worker_cannot_publish_through_queue_owned_registry(tmp_pa
     assert PersistentQueueService(queue_file).get_job_runtime("spawn-registry-fenced-job").fence_token == current_lease.fence_token
 
 
+def test_spawned_stale_worker_cannot_switch_valid_current_set_after_new_generation(
+    tmp_path,
+) -> None:
+    """A valid stale set cannot overwrite the set published by generation N+1."""
+
+    from services.job_workspace import JobWorkspace
+    from tests.test_repair_promotion import _install_atomic_registry_set
+
+    queue_file = tmp_path / "queue.json"
+    workspace = JobWorkspace.create(str(tmp_path / "workspace"), "stale-set", "stale-set-job")
+    registry_path = Path(workspace.paths.registry_path)
+    service = PersistentQueueService(queue_file)
+    _add_job(service, "stale-set-job")
+
+    stale_lease = service.claim_job("stale-set-job", worker_id="worker-a", lease_seconds=1)
+    assert stale_lease is not None
+    registry_a = service.publication_context(stale_lease).registry(
+        registry_path,
+        "stale-set-job",
+    )
+    promotion_a, current_set_a = _install_atomic_registry_set(
+        registry_a,
+        workspace,
+        "generation-a",
+        install_current=False,
+    )
+    assert current_set_a.previous_set_id == ""
+
+    time.sleep(1.1)
+    assert service.recover_expired_leases() == ["stale-set-job"]
+    current_lease = service.claim_job("stale-set-job", worker_id="worker-b", lease_seconds=30)
+    assert current_lease is not None
+    assert current_lease.lease_generation == stale_lease.lease_generation + 1
+
+    registry_b = service.publication_context(current_lease).registry(
+        registry_path,
+        "stale-set-job",
+    )
+    promotion_b, current_set_b = _install_atomic_registry_set(
+        registry_b,
+        workspace,
+        "generation-b",
+        install_current=False,
+    )
+    registry_b.switch_current_artifact_set(
+        current_set_b,
+        prepared_promotion_record=promotion_b,
+    )
+    before = ArtifactRegistry(registry_path, "stale-set-job").resolve_current_artifact_set()
+    assert before is not None
+    assert before.set_id == current_set_b.set_id
+    before_pointer = ArtifactRegistry(registry_path, "stale-set-job").current_artifact_set_pointer()
+    assert before_pointer is not None
+
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_spawn_stale_current_set_switch,
+        args=(
+            str(queue_file),
+            "stale-set-job",
+            str(registry_path),
+            stale_lease.lease_id,
+            stale_lease.worker_id,
+            stale_lease.lease_generation,
+            stale_lease.fence_token,
+            current_set_a.to_dict(),
+            promotion_a.artifact_id,
+            result_queue,
+        ),
+    )
+    try:
+        process.start()
+        process.join(30)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        result = result_queue.get(timeout=5)
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=5)
+        result_queue.close()
+        result_queue.join_thread()
+
+    assert result.get("error") is None, result
+    assert result["rejected"] is True, result
+    after_registry = ArtifactRegistry(registry_path, "stale-set-job")
+    after = after_registry.resolve_current_artifact_set()
+    assert after is not None
+    assert after.set_id == before.set_id
+    after_pointer = after_registry.current_artifact_set_pointer()
+    assert after_pointer is not None
+    assert after_pointer.content_hash == before_pointer.content_hash
+    assert after.target_artifact_pairs() == before.target_artifact_pairs()
+    assert after_registry.get(current_set_a.set_id) is None
+    assert after_registry.get(promotion_a.artifact_id) is not None
+
+    assert service.release_lease(
+        "stale-set-job",
+        lease_id=current_lease.lease_id,
+        worker_id=current_lease.worker_id,
+        lease_generation=current_lease.lease_generation,
+        fence_token=current_lease.fence_token,
+        state=QueueState.COMPLETED,
+    )
+
+
 def test_spawned_staging_cannot_finalize_after_recovery_for_json_docx_and_export_zip(tmp_path) -> None:
     """A staged byte set stays private when recovery changes the lease fence."""
 
@@ -588,7 +738,7 @@ def test_queue_publication_keeps_immutable_orphan_when_registry_fails_after_rena
     def fail_register(*args: Any, **kwargs: Any) -> Any:
         raise OSError("injected Registry failure after byte finalization")
 
-    monkeypatch.setattr(ArtifactRegistry, "register_file", fail_register)
+    monkeypatch.setattr(ArtifactRegistry, "register_files_atomic", fail_register)
     with pytest.raises(OSError, match="injected Registry failure"):
         context.finalize_staged(
             staged,

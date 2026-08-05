@@ -14,7 +14,7 @@ from services.artifact_registry import (
 )
 from services.audit_record import AuditArtifactRefV1, AuditRecordV1
 from services.job_outcome import JobOutcomeV1
-from services.job_workspace import atomic_write_json, utc_now_iso
+from services.job_workspace import atomic_write_json, publish_json_artifact, utc_now_iso
 
 
 class DependencyLifecycleError(RuntimeError):
@@ -93,7 +93,9 @@ def _audit_path(registry_path: Path, audit_id: str) -> Path:
 
 
 def _invalidate_job_outcome(registry: ArtifactRegistry, registry_path: Path, audit_id: str) -> None:
-    outcome_path = registry_path.parent / "artifacts" / "job_outcome_v1.json"
+    outcome_base_path = registry_path.parent / "artifacts" / "job_outcome_v1.json"
+    existing = registry.get("job_outcome")
+    outcome_path = Path(existing.path) if existing is not None else outcome_base_path
     if not outcome_path.is_file():
         return
     payload = json.loads(outcome_path.read_text(encoding="utf-8"))
@@ -119,17 +121,20 @@ def _invalidate_job_outcome(registry: ArtifactRegistry, registry_path: Path, aud
         updated_at=utc_now_iso(),
         outcome_revision=outcome.outcome_revision + 1,
     )
-    atomic_write_json(str(outcome_path), updated.to_dict())
-    existing = next(
-        (record for record in registry.list_records() if Path(record.path).resolve() == outcome_path.resolve()),
-        None,
-    )
     if existing is not None:
-        registry.register_file(
+        publication_context = getattr(registry, "publication_context", None)
+        if publication_context is None:
+            from services.queue_service import LocalPublicationContext
+
+            publication_context = LocalPublicationContext()
+        publish_json_artifact(
+            publication_context,
+            registry,
+            outcome_base_path,
+            updated.to_dict(),
             artifact_role=existing.artifact_role,
             artifact_type=existing.artifact_type,
             artifact_version=existing.artifact_version,
-            path=outcome_path,
             producer="services.dependency_lifecycle.force_dependency_break",
             artifact_id=existing.artifact_id,
             depends_on=existing.depends_on,

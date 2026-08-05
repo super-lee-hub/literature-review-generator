@@ -11,6 +11,7 @@ a receipt.
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -580,6 +581,7 @@ class ProviderRuntimeLedger:
             with self.path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(encoded + "\n")
                 handle.flush()
+                os.fsync(handle.fileno())
         return receipt
 
     def list_receipts(self) -> tuple[ProviderCallReceiptV1, ...]:

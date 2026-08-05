@@ -109,6 +109,7 @@ def _executor(
     stability_mode: str = "smoke",
     max_provider_calls: int | None = None,
     max_estimated_cost: float | None = None,
+    max_estimated_total_tokens: int | None = 5_000_000,
     pricing_source: str | None = "tests:explicit-rates-v1",
     candidate_count: int = 2,
 ) -> OutlineV3Executor:
@@ -127,6 +128,7 @@ def _executor(
         stability_mode=stability_mode,
         max_provider_calls=max_provider_calls,
         max_estimated_cost=max_estimated_cost,
+        max_estimated_total_tokens=max_estimated_total_tokens,
         pricing_source=pricing_source,
         input_cost_per_1k_tokens=0.0,
         output_cost_per_1k_tokens=0.001,
@@ -231,6 +233,65 @@ def test_outline_v3_unknown_pricing_does_not_claim_a_monetary_ceiling(tmp_path: 
     assert preflight["estimated_cost"] is None
     assert preflight["monetary_ceiling_enforced"] is False
     assert "monetary ceiling was not enforced" in preflight["cost_ceiling_note"]
+
+
+def test_outline_v3_generic_pricing_source_without_provider_binding_is_unknown(tmp_path: Path) -> None:
+    result = _executor(
+        tmp_path,
+        pricing_source="config:OutlineStability-v1",
+    ).run()
+
+    assert result.ok is True
+    preflight = json.loads(
+        next(tmp_path.rglob("stability_preflight_*.json")).read_text(encoding="utf-8")
+    )
+    assert preflight["cost_status"] == "unknown"
+    assert preflight["estimated_cost"] is None
+    assert preflight["monetary_ceiling_enforced"] is False
+
+
+def test_outline_v3_total_token_ceiling_is_enforced_even_when_pricing_is_unknown(
+    tmp_path: Path,
+) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        pricing_source=None,
+        max_estimated_cost=0.0,
+        max_estimated_total_tokens=1,
+    ).run()
+
+    assert result.ok is False
+    assert transport_calls == []
+    assert any("max_estimated_total_tokens_exceeded" in item for item in result.diagnostics)
+    preflight = json.loads(
+        next(tmp_path.rglob("stability_preflight_*.json")).read_text(encoding="utf-8")
+    )
+    assert preflight["preflight_status"] == "rejected"
+    assert preflight["rejection_reason"] == "max_estimated_total_tokens_exceeded"
+
+
+def test_outline_v3_explicit_pricing_estimate_changes_with_input_volume(tmp_path: Path) -> None:
+    short = _executor(tmp_path / "short")
+    short.input_cost_per_1k_tokens = 0.001
+    short._preflight_stability_budget()
+    short_estimate = short.stability_preflight["estimated_cost"]
+
+    long = _executor(tmp_path / "long")
+    long.input_cost_per_1k_tokens = 0.001
+    long.summaries[0]["core_analysis"]["summary"] += " long-evidence " * 4000
+    long._preflight_stability_budget()
+    long_estimate = long.stability_preflight["estimated_cost"]
+
+    assert short_estimate is not None
+    assert long_estimate is not None
+    assert long_estimate > short_estimate
 
 
 @pytest.mark.parametrize(

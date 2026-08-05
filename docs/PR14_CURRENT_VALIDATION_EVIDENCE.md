@@ -1,6 +1,6 @@
 # PR14 Current Validation Evidence
 
-Date: 2026-08-04 (Asia/Shanghai)
+Date: 2026-08-05 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 Code/test verification: refreshed at the final pre-publication branch tip; the
@@ -30,6 +30,10 @@ The current path persists and checks:
   analyze/outline/review but still require the current artifact set;
 - derivation and outline-only jobs cannot become canonical-ready without a
   current artifact set, and review requires explicit adoption where applicable;
+- typed `CurrentArtifactSetV1` target/version checks at both switch and resolve;
+  optional disabled validation uses `ValidationDispositionV1/v1` plus a
+  zero-call validation closure, while canonical-unvalidated export repeats its
+  policy and warning in the ZIP provenance;
 - reports and manual-review projections without treating closure inspection as
   validation execution.
 
@@ -38,22 +42,23 @@ The current path persists and checks:
 | Evidence | Result |
 |---|---|
 | Focused boundary regressions | passed; queue, closure, repair, export, Stage 1, validation, GUI-controller, adoption, multimodal, and Outline groups |
-| Strict offline full gate | `726 passed, 22 deselected` from `748 collected` |
+| Strict offline full gate | not accepted as an aggregate: `752 selected, 22 deselected` from `774 collected`; one run timed out after 30 minutes and a second exited 1 before an aggregate summary |
 | `python -m compileall -q .` | passed |
 | `python -m pyright` | `0 errors, 0 warnings, 0 informations` |
 | Current production-shaped three-PDF chain | passed; explicit adoption, current validation, export, and attestation |
 | Current repair control-plane E2E | passed; revalidation, DOCX rebuild, audit promotion, and atomic current-set switch |
 | Full stability and replay | passed; full perturbation path and zero-transport exact replay |
 | Queue Windows `spawn` fencing | passed; stale-worker publication rejected |
-| Current runtime-shaped E2E | passed; `1 passed` |
-| Current production-shaped E2E | passed; `1 passed` |
+| Current runtime-shaped E2E | passed; current optional-policy file `3 passed` |
+| Current production-shaped E2E | passed; verified and optional `canonical_unvalidated` paths |
 
 Outline stability admission is persisted before transport. For candidate count
 `c`, core calls are `c+5`; with the default `c=5`, `off/smoke/full` estimate
 10/20/60 provider calls. Smoke contains one non-replay perturbation plus a
 zero-transport exact replay; full contains five non-replay perturbations plus
-that replay. The example policy is 24 calls and estimated cost 5.0, with
-rejection before any provider transport. Critic retry preserves completed
+that replay. The default policy is 24 calls and a 5,000,000 total-token hard
+ceiling; default pricing is unknown and the monetary ceiling is disabled until
+provider/model-bound rates are supplied. Critic retry preserves completed
 candidate nodes and reruns the failed critic plus its downstream closure.
 
 The production-shaped chain injects deterministic responses at the configured

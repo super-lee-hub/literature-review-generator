@@ -8,8 +8,10 @@ only cross-paper synthesis and outline decisions use the provider boundary.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -201,7 +203,8 @@ class OutlineV3Executor:
         stability_mode: str = "smoke",
         max_provider_calls: int | None = None,
         max_estimated_cost: float | None = None,
-        estimated_cost_per_1k_tokens: float = 0.001,
+        max_estimated_total_tokens: int | None = 5_000_000,
+        estimated_cost_per_1k_tokens: float | None = None,
         input_cost_per_1k_tokens: float | None = None,
         output_cost_per_1k_tokens: float | None = None,
         reasoning_cost_per_1k_tokens: float | None = None,
@@ -210,6 +213,10 @@ class OutlineV3Executor:
         max_smoke_overhead_ratio: float | None = None,
         max_source_prompt_tokens: int | None = None,
         pricing_source: str | None = None,
+        pricing_provider: str | None = None,
+        pricing_model: str | None = None,
+        pricing_version: str | None = None,
+        pricing_effective_date: str | None = None,
         pricing_policy: str = "estimate_only_not_billing_v1",
         publication_context: Any | None = None,
         _skip_exact_replay_verification: bool = False,
@@ -225,6 +232,8 @@ class OutlineV3Executor:
             raise ValueError("max_provider_calls cannot be negative")
         if max_estimated_cost is not None and float(max_estimated_cost) < 0:
             raise ValueError("max_estimated_cost cannot be negative")
+        if max_estimated_total_tokens is not None and int(max_estimated_total_tokens) < 0:
+            raise ValueError("max_estimated_total_tokens cannot be negative")
         for name, value in {
             "estimated_cost_per_1k_tokens": estimated_cost_per_1k_tokens,
             "input_cost_per_1k_tokens": input_cost_per_1k_tokens,
@@ -262,9 +271,31 @@ class OutlineV3Executor:
         self.stability_mode = normalized_stability_mode
         self.max_provider_calls = int(max_provider_calls) if max_provider_calls is not None else None
         self.max_estimated_cost = float(max_estimated_cost) if max_estimated_cost is not None else None
-        self.estimated_cost_per_1k_tokens = float(estimated_cost_per_1k_tokens)
+        self.max_estimated_total_tokens = (
+            int(max_estimated_total_tokens) if max_estimated_total_tokens is not None else None
+        )
+        self.estimated_cost_per_1k_tokens = (
+            float(estimated_cost_per_1k_tokens)
+            if estimated_cost_per_1k_tokens is not None
+            else None
+        )
+        self.pricing_source = str(pricing_source or "").strip()
+        self.pricing_provider = str(pricing_provider or self.profile.provider or "").strip()
+        self.pricing_model = str(pricing_model or self.profile.model or "").strip()
+        self.pricing_version = str(pricing_version or "").strip()
+        self.pricing_effective_date = str(pricing_effective_date or "").strip()
+        source_lower = self.pricing_source.casefold()
+        source_has_version = bool(re.search(r"(?:^|[-_:])v[0-9][a-z0-9._-]*$", source_lower))
+        source_is_generic = source_lower.startswith("config:") or "generic" in source_lower
+        pricing_identity_bound = bool(
+            self.pricing_provider
+            and self.pricing_model
+            and (self.pricing_version or self.pricing_effective_date or source_has_version)
+            and not source_is_generic
+        )
         self._pricing_is_explicit = bool(
-            str(pricing_source or "").strip()
+            self.pricing_source
+            and pricing_identity_bound
             and all(
                 value is not None
                 for value in (
@@ -276,22 +307,27 @@ class OutlineV3Executor:
                 )
             )
         )
-        self.input_cost_per_1k_tokens = float(input_cost_per_1k_tokens or 0.0)
-        self.output_cost_per_1k_tokens = float(
-            estimated_cost_per_1k_tokens if output_cost_per_1k_tokens is None else output_cost_per_1k_tokens
+        self.input_cost_per_1k_tokens = (
+            float(input_cost_per_1k_tokens) if input_cost_per_1k_tokens is not None else None
         )
-        self.reasoning_cost_per_1k_tokens = float(
-            estimated_cost_per_1k_tokens if reasoning_cost_per_1k_tokens is None else reasoning_cost_per_1k_tokens
+        self.output_cost_per_1k_tokens = (
+            float(output_cost_per_1k_tokens) if output_cost_per_1k_tokens is not None else None
         )
-        self.cache_read_cost_per_1k_tokens = float(cache_read_cost_per_1k_tokens or 0.0)
-        self.cache_write_cost_per_1k_tokens = float(cache_write_cost_per_1k_tokens or 0.0)
+        self.reasoning_cost_per_1k_tokens = (
+            float(reasoning_cost_per_1k_tokens) if reasoning_cost_per_1k_tokens is not None else None
+        )
+        self.cache_read_cost_per_1k_tokens = (
+            float(cache_read_cost_per_1k_tokens) if cache_read_cost_per_1k_tokens is not None else None
+        )
+        self.cache_write_cost_per_1k_tokens = (
+            float(cache_write_cost_per_1k_tokens) if cache_write_cost_per_1k_tokens is not None else None
+        )
         self.max_smoke_overhead_ratio = (
             float(max_smoke_overhead_ratio) if max_smoke_overhead_ratio is not None else None
         )
         self.max_source_prompt_tokens = (
             int(max_source_prompt_tokens) if max_source_prompt_tokens is not None else None
         )
-        self.pricing_source = str(pricing_source or "")
         self.pricing_policy = str(pricing_policy or "estimate_only_not_billing_v1")
         self.review_intent_input = dict(review_intent or {})
         self.quality_gate = quality_gate if isinstance(quality_gate, OutlineQualityGate) else OutlineQualityGate.from_mapping(quality_gate)
@@ -349,7 +385,22 @@ class OutlineV3Executor:
             closure_epoch_id=self.closure_epoch_id,
         )
         self.receipt_ledger_target_path = self._path("outline_v3_provider_receipts.jsonl")
-        existing_ledger = self.registry.get("outline_v3_provider_receipts")
+        # A retry may register the same epoch under the stable ledger ID or a
+        # content-addressed suffix.  Resume must hydrate the newest durable
+        # ledger for this epoch, regardless of which alias was used.
+        epoch_ledgers = [
+            record
+            for record in self.registry.list_records()
+            if record.status == "ready"
+            and record.artifact_type == "provider_receipt_ledger"
+            and str(record.metadata.get("stage_name") or "") == "outline_v3"
+            and str(record.metadata.get("closure_epoch_id") or "") == self.closure_epoch_id
+        ]
+        existing_ledger = max(
+            epoch_ledgers,
+            key=lambda record: (record.created_at, record.artifact_id),
+            default=None,
+        )
         if existing_ledger is not None and existing_ledger.status == "ready":
             try:
                 self._receipt_ledger.path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,11 +616,11 @@ class OutlineV3Executor:
                 estimated_cache_write = 0
                 total = estimated_input + estimated_output + estimated_reasoning
                 cost = (
-                    estimated_input / 1000.0 * self.input_cost_per_1k_tokens
-                    + estimated_output / 1000.0 * self.output_cost_per_1k_tokens
-                    + estimated_reasoning / 1000.0 * self.reasoning_cost_per_1k_tokens
-                    + estimated_cached / 1000.0 * self.cache_read_cost_per_1k_tokens
-                    + estimated_cache_write / 1000.0 * self.cache_write_cost_per_1k_tokens
+                    estimated_input / 1000.0 * float(self.input_cost_per_1k_tokens or 0.0)
+                    + estimated_output / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
+                    + estimated_reasoning / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
+                    + estimated_cached / 1000.0 * float(self.cache_read_cost_per_1k_tokens or 0.0)
+                    + estimated_cache_write / 1000.0 * float(self.cache_write_cost_per_1k_tokens or 0.0)
                     if self._pricing_is_explicit
                     else None
                 )
@@ -686,6 +737,7 @@ class OutlineV3Executor:
             "provider_call_plans": [item.to_dict() for item in self.provider_call_plans],
             "max_provider_calls": self.max_provider_calls,
             "max_estimated_cost": self.max_estimated_cost,
+            "max_estimated_total_tokens": self.max_estimated_total_tokens,
             "estimated_cost_per_1k_tokens": self.estimated_cost_per_1k_tokens,
             "input_cost_per_1k_tokens": self.input_cost_per_1k_tokens,
             "output_cost_per_1k_tokens": self.output_cost_per_1k_tokens,
@@ -693,6 +745,10 @@ class OutlineV3Executor:
             "cache_read_cost_per_1k_tokens": self.cache_read_cost_per_1k_tokens,
             "cache_write_cost_per_1k_tokens": self.cache_write_cost_per_1k_tokens,
             "max_source_prompt_tokens": self.max_source_prompt_tokens,
+            "pricing_provider": self.pricing_provider,
+            "pricing_model": self.pricing_model,
+            "pricing_version": self.pricing_version,
+            "pricing_effective_date": self.pricing_effective_date,
             "provider_configured": self.provider is not None,
             "preflight_status": "accepted",
         }
@@ -712,10 +768,12 @@ class OutlineV3Executor:
         ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_estimated_cost_exceeded"
-        elif self.max_estimated_cost is not None and estimated_cost is None:
-            self.stability_preflight["cost_ceiling_note"] = (
-                "monetary ceiling was not enforced because pricing status is unknown"
-            )
+        elif (
+            self.max_estimated_total_tokens is not None
+            and estimated_total_tokens > self.max_estimated_total_tokens
+        ):
+            self.stability_preflight["preflight_status"] = "rejected"
+            self.stability_preflight["rejection_reason"] = "max_estimated_total_tokens_exceeded"
         elif estimated_input_per_call > self.profile.input_budget:
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_input_budget"
@@ -733,6 +791,10 @@ class OutlineV3Executor:
         ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "smoke_overhead_ratio_exceeded"
+        if self.max_estimated_cost is not None and estimated_cost is None:
+            self.stability_preflight["cost_ceiling_note"] = (
+                "monetary ceiling was not enforced because pricing status is unknown"
+            )
         plan_record = publish_json_artifact(
             self.publication_context,
             self.registry,
@@ -773,10 +835,10 @@ class OutlineV3Executor:
         if self._pricing_is_explicit and receipts and input_known and output_known and reasoning_known:
             actual_cost = 0.0
             for receipt in receipts:
-                actual_cost += int(receipt.input_tokens or 0) / 1000.0 * self.input_cost_per_1k_tokens
-                actual_cost += int(receipt.output_tokens or 0) / 1000.0 * self.output_cost_per_1k_tokens
-                actual_cost += int(receipt.reasoning_tokens or 0) / 1000.0 * self.reasoning_cost_per_1k_tokens
-                actual_cost += int(receipt.cached_input_tokens or 0) / 1000.0 * self.cache_read_cost_per_1k_tokens
+                actual_cost += int(receipt.input_tokens or 0) / 1000.0 * float(self.input_cost_per_1k_tokens or 0.0)
+                actual_cost += int(receipt.output_tokens or 0) / 1000.0 * float(self.output_cost_per_1k_tokens or 0.0)
+                actual_cost += int(receipt.reasoning_tokens or 0) / 1000.0 * float(self.reasoning_cost_per_1k_tokens or 0.0)
+                actual_cost += int(receipt.cached_input_tokens or 0) / 1000.0 * float(self.cache_read_cost_per_1k_tokens or 0.0)
         estimated_cost = self.stability_preflight.get("estimated_cost")
         variance = (
             float(actual_cost) - float(estimated_cost)
@@ -1041,11 +1103,14 @@ class OutlineV3Executor:
         )
         return call_id
 
-    def _check(self, node_id: str) -> None:
+    def _check(self, node_id: str, *, phase: str = "before") -> None:
         if self.cancellation_checker is not None:
             self.cancellation_checker()
         if self.fault_injector is not None:
-            self.fault_injector(node_id, {"job_id": self.job_id, "node_id": node_id})
+            self.fault_injector(
+                node_id,
+                {"job_id": self.job_id, "node_id": node_id, "phase": phase},
+            )
 
     def _dependency_refs(self, dependency_ids: Sequence[str]) -> list[ArtifactDependencyRefV2]:
         refs: list[ArtifactDependencyRefV2] = []
@@ -1670,6 +1735,10 @@ class OutlineV3Executor:
 
     def _run_provider_node(self, node_id: str, request: Mapping[str, Any], cls: type[OutlineArtifact], deps: Mapping[str, str], *, minimum_output: int = 2) -> tuple[OutlineArtifact, Sequence[str], str, str]:
         content = self._provider_call(node_id, request, expect_json=True, input_artifact_hashes=tuple(deps.values()))
+        # The provider receipt has already been appended when this hook runs.
+        # Recovery tests use it to model a worker failure after transport
+        # success but before the node output is persisted.
+        self._check(node_id, phase="provider_success")
         return self._artifact(cls, content, deps), tuple(deps), self.profile.model, self.profile.provider
 
     def _validate_candidate_payload(
@@ -1710,6 +1779,13 @@ class OutlineV3Executor:
         payload = path.read_bytes()
         if not payload.strip():
             return
+        # Registry content_hash is the SHA-256 of the exact registered bytes;
+        # do not use the provider-runtime domain hash of the decoded text.
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        existing = self.registry.get("outline_v3_provider_receipts")
+        artifact_id = "outline_v3_provider_receipts"
+        if existing is not None and existing.content_hash != payload_hash:
+            artifact_id = f"outline_v3_provider_receipts:{payload_hash[:24]}"
         record = publish_bytes_artifact(
             self.publication_context,
             self.registry,
@@ -1719,8 +1795,12 @@ class OutlineV3Executor:
             artifact_type="provider_receipt_ledger",
             artifact_version="v1",
             producer="outline.v3_executor.OutlineV3Executor",
-            artifact_id="outline_v3_provider_receipts",
-            metadata={"receipt_count": len(self._receipt_ledger.list_receipts())},
+            artifact_id=artifact_id,
+            metadata={
+                "receipt_count": len(self._receipt_ledger.list_receipts()),
+                "stage_name": "outline_v3",
+                "closure_epoch_id": self.closure_epoch_id,
+            },
         )
         self.artifact_paths["provider_receipts"] = record.path
         self.artifact_records["provider_receipts"] = record

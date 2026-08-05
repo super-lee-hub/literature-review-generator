@@ -14,6 +14,7 @@ import zipfile
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry, RegistryError
 from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
 from services.queue_service import LocalPublicationContext
+from runtime.provider_runtime import hash_json
 
 
 EXPORT_BUNDLE_ARTIFACT_TYPE = "export_bundle"
@@ -249,6 +250,55 @@ def _derive_current_evidence(
         closure = {"status": "blocked", "blocking_issues": [str(exc)]}
         issues.append(f"validation_closure_unavailable:{exc}")
 
+    current_set_payload: Mapping[str, Any] = {}
+    try:
+        current_set = registry.resolve_current_artifact_set()
+        if current_set is not None:
+            current_set_payload = current_set.to_dict()
+            if str(closure.get("status") or "") == "not_requested":
+                semantic = closure.get("semantic")
+                disposition_id = str(semantic.get("artifact_id") or "") if isinstance(semantic, Mapping) else ""
+                disposition = registry.get(disposition_id) if disposition_id else None
+                disposition_record_id = disposition.artifact_id if disposition is not None else ""
+                disposition_record_hash = disposition.content_hash if disposition is not None else ""
+                disposition_valid = False
+                if disposition is not None and disposition.status == "ready":
+                    try:
+                        from validation.disposition import ValidationDispositionV1
+
+                        disposition_payload = json.loads(Path(disposition.path).read_text(encoding="utf-8"))
+                        typed_disposition = ValidationDispositionV1.from_dict(disposition_payload)
+                        runtime_spec = registry.get("runtime_job_spec")
+                        raw_spec = (
+                            json.loads(Path(runtime_spec.path).read_text(encoding="utf-8"))
+                            if runtime_spec is not None
+                            else None
+                        )
+                        stage_plan = raw_spec.get("metadata", {}).get("stage_plan") if isinstance(raw_spec, Mapping) else None
+                        disposition_valid = bool(
+                            typed_disposition.job_id == registry.job_id
+                            and typed_disposition.validation_enabled is False
+                            and typed_disposition.validation_required is False
+                            and typed_disposition.allow_unvalidated is True
+                            and typed_disposition.status == "not_requested"
+                            and runtime_spec is not None
+                            and typed_disposition.spec_hash == runtime_spec.content_hash
+                            and isinstance(stage_plan, Mapping)
+                            and typed_disposition.stage_plan_hash == hash_json(stage_plan)
+                            and typed_disposition.disposition_hash == typed_disposition.computed_hash()
+                        )
+                    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+                        disposition_valid = False
+                if (
+                    not disposition_valid
+                    or current_set.validation_status != "not_requested"
+                    or current_set.validation_disposition_artifact_id != disposition_record_id
+                    or current_set.validation_disposition_artifact_hash != disposition_record_hash
+                ):
+                    issues.append("validation_disposition_current_set_binding_mismatch")
+    except (OSError, RegistryError, ValueError, TypeError, RuntimeError) as exc:
+        issues.append(f"current_artifact_set_unavailable:{exc}")
+
     closure_records: list[ArtifactRecord] = []
     closure_payloads: list[Mapping[str, Any]] = []
     stage_map_payload: Mapping[str, Any] = {
@@ -278,6 +328,12 @@ def _derive_current_evidence(
                 closure_payloads = [payload]
         if stage_map.blocking_issues:
             issues.extend(f"current_stage_closure_map:{item}" for item in stage_map.blocking_issues)
+        if str(closure.get("status") or "") == "not_requested" and "validate" in {
+            str(item).strip()
+            for item in (stage_map_payload.get("requested_stages") or ())
+            if str(item).strip()
+        }:
+            issues.append("validation_disposition_stage_plan_requests_validation")
     except (OSError, RegistryError, ValueError, TypeError) as exc:
         issues.append(f"current_stage_closure_map_unavailable:{exc}")
     receipt_complete = bool(closure_payloads) and bool(closure_payloads[0].get("complete"))
@@ -336,6 +392,7 @@ def _derive_current_evidence(
         "current_stage_closure_map": stage_map_payload,
         "requested_stages": list(stage_map_payload.get("requested_stages") or ()),
         "spec_hash": str(stage_map_payload.get("spec_hash") or ""),
+        "current_artifact_set": dict(current_set_payload),
         "adoption": adoption,
         "issues": sorted(set(issues)),
     }
@@ -462,7 +519,10 @@ class ExportBundleService:
             closure_status == "not_requested"
             and isinstance(validation_semantic, Mapping)
             and validation_semantic.get("allow_unvalidated", False)
+            and validation_semantic.get("validation_disposition") == "not_requested"
             and not bool(closure_manifest.get("validation_required", False))
+            and not bool(validation_semantic.get("validation_enabled", False))
+            and not bool(validation_semantic.get("validation_required", False))
         )
         closure_trust_ready = closure_status == "clean" or (
             closure_status == "not_requested" and unvalidated_allowed
@@ -537,7 +597,36 @@ class ExportBundleService:
             "manual_repaired": bool(manual_modified),
             "issues": sorted(set(issues)),
         }
-        if export_spec.export_mode == "canonical" and bundle_status != "canonical_verified":
+        disposition_record = closure_manifest.get("validation_artifact")
+        disposition_record = disposition_record if isinstance(disposition_record, Mapping) else {}
+        semantic = validation_semantic if isinstance(validation_semantic, Mapping) else {}
+        disposition_id = str(disposition_record.get("artifact_id") or semantic.get("artifact_id") or "")
+        disposition_hash = str(
+            disposition_record.get("content_hash") or semantic.get("disposition_hash") or ""
+        )
+        validation_required = bool(closure_manifest.get("validation_required", False))
+        validation_enabled = bool(semantic.get("validation_enabled", False))
+        unvalidated_warning = (
+            "WARNING: semantic validation was not performed; this bundle is canonical_unvalidated."
+            if bundle_status == "canonical_unvalidated"
+            else ""
+        )
+        manifest.update(
+            {
+                "validation_required": validation_required,
+                "validation_enabled": validation_enabled,
+                "allow_unvalidated": unvalidated_allowed,
+                "validation_disposition_artifact_id": disposition_id,
+                "validation_disposition_artifact_hash": disposition_hash,
+                "stage_plan_hash": str(semantic.get("stage_plan_hash") or ""),
+                "runtime_spec_hash": str(derived["spec_hash"]),
+                "validation_warning": unvalidated_warning,
+            }
+        )
+        if export_spec.export_mode == "canonical" and bundle_status not in {
+            "canonical_verified",
+            "canonical_unvalidated",
+        }:
             return ExportBundleResultV1(
                 job_id=self.workspace.job_id,
                 status="untrusted",
@@ -575,7 +664,13 @@ class ExportBundleService:
                 "status=" + str(manifest["status"]) + "\n"
                 + "validation_status=" + closure_status + "\n"
                 + "validation_required=" + str(bool(closure_manifest.get("validation_required", False))).lower() + "\n"
-                + "allow_unvalidated=" + str(unvalidated_allowed).lower() + "\n",
+                + "validation_enabled=" + str(validation_enabled).lower() + "\n"
+                + "allow_unvalidated=" + str(unvalidated_allowed).lower() + "\n"
+                + "validation_disposition_artifact_id=" + disposition_id + "\n"
+                + "validation_disposition_artifact_hash=" + disposition_hash + "\n"
+                + "stage_plan_hash=" + str(manifest.get("stage_plan_hash") or "") + "\n"
+                + "runtime_spec_hash=" + str(manifest.get("runtime_spec_hash") or "") + "\n"
+                + (unvalidated_warning + "\n" if unvalidated_warning else ""),
             )
         bundle_payload = bundle_buffer.getvalue()
         if not zipfile.is_zipfile(io.BytesIO(bundle_payload)):
