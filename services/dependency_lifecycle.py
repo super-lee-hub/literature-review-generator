@@ -140,6 +140,11 @@ def _invalidate_job_outcome(registry: ArtifactRegistry, registry_path: Path, aud
             depends_on=existing.depends_on,
             metadata={**existing.metadata, "force_delete_audit_id": audit_id},
         )
+        if outcome_path.resolve() == outcome_base_path.resolve():
+            # publication-boundary-exception: retain the legacy fixed-path
+            # job-outcome projection for compatibility readers after the
+            # immutable Registry file has been published.
+            atomic_write_json(str(outcome_base_path), updated.to_dict())
 
 
 def guard_artifact_delete(
