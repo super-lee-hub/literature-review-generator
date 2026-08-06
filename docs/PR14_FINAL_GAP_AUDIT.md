@@ -1,6 +1,6 @@
 # PR #14 Final Gap Audit
 
-Date: 2026-08-05 (Asia/Shanghai)
+Date: 2026-08-06 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 PR: #14 (`Draft` / `Open` / `Unmerged`)
@@ -32,22 +32,23 @@ cannot independently verify local read access.
 
 ## Fresh local evidence
 
-- Focused queue, closure, repair, export, Stage 1, validation, GUI-controller,
-  adoption, multimodal, and Outline regressions passed during implementation;
-  the strict aggregate was attempted separately and is reported below without
-  converting a timeout or early exit into a pass.
-- `774 collected`; the strict marker selection is `752 selected / 22 deselected`.
-  The exact strict command was run twice with
-  `--strict-markers -m "not live_api and not playwright and not heavy_ocr"`:
-  the first run hit the 30-minute command timeout, and the second exited 1 at
-  9% without an aggregate summary. The affected current-runtime test passes
-  independently (`1 passed in 87.29s`), but no aggregate pass count is claimed.
+- `python -m pytest --collect-only -q`: `780` tests collected; the strict marker
+  selection is `758 selected / 22 deselected`.
+- The exact strict command
+  `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"`
+  passed: `758 passed, 22 deselected` in `3246.48s` (`54:06`).
+- Focused evidence also passed for the required paths: PR14 remediation `12`,
+  Stage1 closure matrix `1`, all/mixed-reuse and summary-source zero-call `1`,
+  Stage1 contracts `5`, critic/invalidation `8`, semantic pricing/token `24`,
+  DAG replay `3`, queue/lease `14`, current runtime/export `3`, and
+  stage-planning/GUI/controller/queue `39` tests.
 - `python -m compileall -q .`: passed.
 - `python -m pyright`: `0 errors, 0 warnings, 0 informations`.
 - `python -m reviewctl doctor --config config.ini.example`: `ok=true`,
   read-only, zero provider network calls; status warning only reports the
   repository's pre-existing stale locks.
-- `git diff --check`: passed before commit.
+- `git diff --check`: passed before final staging; rerun after staging is
+  required before commit.
 
 ## Stage, stability, and retry evidence
 

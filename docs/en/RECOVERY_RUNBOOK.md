@@ -29,7 +29,10 @@ The status and attestation outputs identify the job state, failed node, provider
   verify, terminal model calls are zero, observed receipts are empty, and the
   typed source evidence is present. Do not create an empty receipt ledger to make
   the stage look complete. For all-reuse Stage 1, check unique SourceBundle
-  identities and real Registry source-artifact bindings.
+  identities, real Registry source-artifact bindings, and no current-epoch
+  provider receipts. For mixed reuse/generation, verify that only generated
+  papers appear in the expected call graph; summary-source zero-call stages use
+  typed summary-source evidence.
 
 ## 3. Resume
 

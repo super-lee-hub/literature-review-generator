@@ -130,11 +130,6 @@ class RuntimeJobSpec:
             if requested_stages_raw is not None
             else None
         )
-        validation_default = (
-            "validate" in requested_stages
-            if requested_stages is not None
-            else self.action == "validate_review"
-        )
         return JobRunRequest(
             config=self.config,
             project_name=self.project_name,
@@ -161,20 +156,13 @@ class RuntimeJobSpec:
             queue_file=self.queue_file,
             workspace_path=self.workspace_path or None,
             requested_stages=requested_stages,
-            validation_required=(
-                self.metadata["validation_required"]
-                if "validation_required" in self.metadata
-                else validation_default
-            ),
-            require_clean_validation=(
-                self.metadata["require_clean_validation"]
-                if "require_clean_validation" in self.metadata
-                else validation_default
-            ),
-            allow_unvalidated_when_validation_optional=(
-                self.metadata["allow_unvalidated_when_validation_optional"]
-                if "allow_unvalidated_when_validation_optional" in self.metadata
-                else not validation_default
+            # Keep omitted policy fields tri-state.  The durable StagePlan
+            # builder is the only layer allowed to derive defaults from the
+            # action, validation setting, and requested stages.
+            validation_required=self.metadata.get("validation_required"),
+            require_clean_validation=self.metadata.get("require_clean_validation"),
+            allow_unvalidated_when_validation_optional=self.metadata.get(
+                "allow_unvalidated_when_validation_optional"
             ),
             derived_summary_source=bool(self.metadata.get("review_batch_spec")),
         )

@@ -45,6 +45,25 @@ _RENDER_POLICY_FIELDS = (
     "narrative_parenthetical_policy",
 )
 
+_ZERO_CALL_EVIDENCE_POLICY: dict[str, tuple[str, ...]] = {
+    "analyze": (
+        "summary_source_manifest",
+        "stage1_summary_reuse_record",
+    ),
+    "outline": (
+        "outline_call_plan",
+        "outline_replay_evidence",
+    ),
+    "review": ("review_replay_evidence",),
+    "validate": ("validation_disposition",),
+}
+
+
+def zero_call_evidence_policy(stage: str) -> tuple[str, ...]:
+    """Return the typed evidence accepted for a provider-free stage."""
+
+    return _ZERO_CALL_EVIDENCE_POLICY.get(str(stage or "").strip(), ())
+
 
 def _stable_hash(value: Any) -> str:
     encoded = json.dumps(
@@ -561,6 +580,7 @@ def _provider_closure_entry(
         blocking.append(f"provider_closure_expected_calls_missing:{stage}")
     expected_payload_ids = [str(item.get("call_id") or "") for item in expected_call_payloads]
     expected_call_count = len(expected_call_payloads)
+    entry["provider_closure_required"] = expected_call_count > 0
     if any(not item for item in expected_payload_ids) or len(set(expected_payload_ids)) != len(expected_payload_ids):
         blocking.append(f"provider_closure_expected_call_identity_invalid:{stage}")
     expected_graph_hashes = {
@@ -718,9 +738,16 @@ def _provider_closure_entry(
     entry["config_hashes"] = sorted({str(item.get("config_hash") or "") for item in receipt_rows if str(item.get("config_hash") or "")})
     entry["schema_hashes"] = sorted({str(item.get("schema_hash") or "") for item in receipt_rows if str(item.get("schema_hash") or "")})
     entry["call_graph_hash"] = expected_graph_hash
-    if set(expected_ids) != set(expected_payload_ids):
+    if (
+        len(expected_ids) != len(set(expected_ids))
+        or set(expected_ids) != set(expected_payload_ids)
+    ):
         blocking.append(f"provider_closure_expected_call_set_mismatch:{stage}")
-    if set(observed_ids) != set(expected_ids):
+    if (
+        len(observed_ids) != len(set(observed_ids))
+        or len(observed_ids) != expected_call_count
+        or set(observed_ids) != set(expected_ids)
+    ):
         blocking.append(f"provider_closure_observed_call_set_mismatch:{stage}")
     if entry["closure_epoch_id"] != closure_epoch_id:
         blocking.append(f"provider_closure_epoch_mismatch:{stage}")
@@ -748,10 +775,7 @@ def _provider_closure_entry(
         source_evidence_records = [
             dependency_record
             for dependency_record in dependency_records
-            if dependency_record.artifact_type in {
-                "summary_source_manifest",
-                "stage1_summary_reuse_record",
-            }
+            if dependency_record.artifact_type in set(zero_call_evidence_policy(stage))
         ]
         if not source_evidence_records:
             blocking.append(f"provider_closure_zero_call_source_evidence_missing:{stage}")
@@ -1412,6 +1436,7 @@ __all__ = [
     "ValidationClosureResult",
     "CurrentStageClosureMapV1",
     "ValidationClosureService",
+    "zero_call_evidence_policy",
     "persist_validation_closure",
     "resolve_current_stage_closure_map",
 ]

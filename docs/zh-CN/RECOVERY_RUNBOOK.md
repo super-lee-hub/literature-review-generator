@@ -35,8 +35,10 @@ python -m reviewctl attest --workspace <workspace>
   validation 是 required，则必须补跑缺失的 `validate` 阶段。
 - zero-call 阶段只有在 expected-call graph 及依赖有效、terminal model call 和
   observed receipt 都为零、且 typed source evidence 存在时才算完成；不能伪造空
-  receipt ledger。all-reuse Stage 1 还要检查 SourceBundle identity 唯一覆盖和真实
-  Registry source-artifact 绑定。
+  receipt ledger。all-reuse Stage 1 还要检查 SourceBundle identity 唯一覆盖、真实
+  Registry source-artifact 绑定和当前 epoch 没有 provider receipt。mixed reuse/generation
+  必须确认 expected call graph 只包含新生成 paper；summary-source zero-call 必须使用
+  typed summary-source evidence。
 
 ```text
 python -m reviewctl resume --workspace <workspace>

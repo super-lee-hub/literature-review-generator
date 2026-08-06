@@ -68,6 +68,11 @@ hash-valid receipt ledger 和精确 call set；count 等于零必须有有效 ex
 Stage 1 reuse record 必须绑定真实已注册 source artifact，并分别保留 summary payload
 hash 与 Registry file hash。
 
+Stage 1 all-reuse 必须没有当前 epoch 的 provider receipt，并为每个 SourceBundle
+paper 保留一个唯一 reuse record；mixed run 只能为新生成 paper 产生 provider call；
+summary-source zero-call 必须使用 typed summary-source 依赖。单独的逻辑 summary hash
+或 synthetic artifact ID 不能充当 provenance。
+
 `adopt --artifact <final_outline_id> --actor <actor>` 是显式采用操作，要求 final outline、coverage audit、stage health、哈希和 blocking critique 门禁全部通过；Outline v3 candidate plan 不会被静默提升。`export` 和 `attest` 会生成 provenance、checksum、completion、validation closure 与依赖图证据；canonical 注册失败会返回 `untrusted`、空 path/id，并删除临时 ZIP。
 
 Outline stability 有 `off`、`smoke`、`full` 三种模式：smoke 增加一个完整

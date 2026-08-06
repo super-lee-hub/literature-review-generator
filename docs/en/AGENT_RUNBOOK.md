@@ -70,6 +70,11 @@ Use `--workspace <workspace_path>` when the job ID cannot be resolved. All comma
   and typed source evidence, without a fabricated empty ledger. Stage 1 reuse
   records must point to real registered source artifacts and preserve payload
   and Registry file hashes separately.
+- For a Stage 1 all-reuse run, expect no current-epoch provider receipts and
+  one unique reuse record per SourceBundle paper. A mixed run must show provider
+  calls only for generated papers; a summary-source zero-call run must use its
+  typed summary-source dependency. A logical summary hash or synthetic artifact
+  ID is never sufficient provenance.
 - `repair-plan` is report-first. It may persist a hash-bound plan and transaction record, but it does not edit canonical artifacts.
 - `repair-apply` accepts only an explicitly `auto_apply_safe` plan. Its outputs are registered as `quarantined` derived versions; canonical READY draft, manifest, outline, and DOCX artifacts are not replaced.
 - `repair-promote --transaction <id> --actor <actor> --reason <reason>` revalidates the quarantined derived inputs through the current service, requires a complete closure, and only then creates a new version and advances current pointers.

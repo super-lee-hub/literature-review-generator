@@ -8,6 +8,10 @@ the controller/label boundary is covered without claiming browser automation;
 `LIVE_VERIFIED` is reserved for an actual external-provider run; `NOT_VERIFIED`
 means the required live or UI evidence was not run.
 
+The current offline collection is `780`; the strict marker gate selected `758`
+and deselected `22`, with the exact aggregate finishing `758 passed, 22
+deselected`. Live API, Playwright, and heavy OCR remain unrun.
+
 The current offline collection is 774 tests; the strict marker selection is 752
 selected and 22 deselected. The aggregate strict run was attempted but did not
 produce a final pass summary in this environment. Live API, Playwright, and

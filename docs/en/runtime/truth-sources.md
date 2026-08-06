@@ -96,6 +96,14 @@ manifest, runtime-spec, evidence, and available original-receipt dependencies.
 Summary-source zero-call stages use typed summary-source evidence instead of an
 empty provider ledger.
 
+Stage1 reuse compares the registered source binding against the current source,
+preprocess, input, prompt, model, schema, and visual-provenance facts before a
+summary is reused. A missing or changed required fact fails closed; an omitted
+optional provider name is reusable only when both the prior and current
+configuration omit it. All-reuse and mixed-reuse closure must still cover the
+SourceBundle identities exactly and preserve one Registry-verifiable reuse
+record per reused paper.
+
 ## Public outcomes
 
 `job_status` is `pending | running | completed | failed | cancelled`.

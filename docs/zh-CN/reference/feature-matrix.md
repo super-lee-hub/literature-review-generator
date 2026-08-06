@@ -6,9 +6,9 @@
 `E2E_VERIFIED` 表示当前生产形状链路实际跑过，`LIVE_VERIFIED` 只保留给真实
 外部 Provider 运行，`NOT_VERIFIED` 表示所需 live 或 UI 证据尚未运行。
 
-当前离线 collection 为 774；严格 marker 选择为 selected 752、deselected 22。
-严格 aggregate 已实际尝试，但本环境没有得到最终 pass 汇总。Live API、Playwright
-和 heavy OCR 本轮均为 `NOT_RUN`。
+当前离线 collection 为 780；严格 marker 选择为 selected 758、deselected 22，
+严格 aggregate 已通过（`758 passed, 22 deselected`，约 54:06）。Live API、
+Playwright 和 heavy OCR 本轮仍为 `NOT_RUN`。
 
 | 功能 | 状态 | 规范实现 |
 |---|---|---|

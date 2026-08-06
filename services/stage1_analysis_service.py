@@ -44,6 +44,12 @@ from services.job_workspace import (
 from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
+from services.stage1_reuse import (
+    STAGE1_REUSE_POLICY,
+    Stage1ReusableSummaryBindingV1,
+    Stage1ReuseEligibilityV1,
+    evaluate_stage1_reuse,
+)
 from summary_schema import is_canonical_ai_summary, normalize_ai_summary
 
 
@@ -80,6 +86,8 @@ class _PreparedStage1Item:
     built_input: Any
     primary_config: dict[str, Any]
     backup_config: dict[str, Any]
+    reuse_eligibility: Stage1ReuseEligibilityV1 | None = None
+    current_binding: Stage1ReusableSummaryBindingV1 = Stage1ReusableSummaryBindingV1()
 
 
 class Stage1AnalysisService:
@@ -157,6 +165,10 @@ class Stage1AnalysisService:
             for item in bundle.paper_work_items
         ]
         self._predeclare_expected_calls(bundle, prepared)
+        prepared = [
+            replace(item, current_binding=self._bind_execution_provenance(item.current_binding))
+            for item in prepared
+        ]
         for item in prepared:
             self._check_cancelled()
             summary, receipt_ids = self._execute_prepared(item)
@@ -287,13 +299,211 @@ class Stage1AnalysisService:
             stage1_input_settings=stage1_settings,
             preprocess_metadata=preprocess_metadata,
         )
+        current_binding = self._build_current_binding(
+            item=item,
+            preprocess_metadata=preprocess_metadata,
+            built_input=built_input,
+            primary_config=primary_config,
+            evidence_record=evidence_record,
+            visual_bundle=visual_bundle,
+        )
+        reuse_eligibility = (
+            evaluate_stage1_reuse(
+                previous,
+                current_binding,
+                registry=self.registry,
+            )
+            if previous is not None
+            else None
+        )
         return _PreparedStage1Item(
             item=item,
-            previous=previous,
+            previous=previous if reuse_eligibility is None or reuse_eligibility.reusable else None,
             preprocess_metadata=preprocess_metadata,
             built_input=built_input,
             primary_config=primary_config,
             backup_config=dict(self.settings.section("Backup_Reader_API")),
+            reuse_eligibility=reuse_eligibility,
+            current_binding=current_binding,
+        )
+
+    def _build_current_binding(
+        self,
+        *,
+        item: PaperWorkItem,
+        preprocess_metadata: Mapping[str, Any],
+        built_input: Any,
+        primary_config: Mapping[str, Any],
+        evidence_record: ArtifactRecord,
+        visual_bundle: Mapping[str, Any],
+    ) -> Stage1ReusableSummaryBindingV1:
+        evidence_files = {}
+        for field_name in (
+            "markdown_path",
+            "plain_text_path",
+            "page_index_path",
+            "chunks_path",
+            "stage1_input_path",
+            "stage1_input_manifest_path",
+            "stage1_quality_report_path",
+        ):
+            path = str(preprocess_metadata.get(field_name) or "").strip()
+            if path:
+                evidence_files[field_name] = file_sha256(path) if Path(path).is_file() else ""
+        semantic_source_hash = hash_json(
+            {
+                "stage1_input_text": hash_text(
+                    str(preprocess_metadata.get("stage1_input_text") or "")
+                ),
+                "page_index": preprocess_metadata.get("page_index") or [],
+                "page_count": int(preprocess_metadata.get("stage1_page_count") or 0),
+            }
+        )
+        preprocess_hash = hash_json(
+            {
+                "stage1_input_text_hash": hash_text(
+                    str(preprocess_metadata.get("stage1_input_text") or "")
+                ),
+                "selected_text_source": str(preprocess_metadata.get("selected_text_source") or ""),
+                "quality_level": str(preprocess_metadata.get("stage1_quality_level") or ""),
+                "quality_reasons": list(preprocess_metadata.get("stage1_quality_reasons") or []),
+                "page_count": int(preprocess_metadata.get("stage1_page_count") or 0),
+                "chunk_count": int(preprocess_metadata.get("chunk_count") or 0),
+                "evidence_files": {
+                    key: value
+                    for key, value in evidence_files.items()
+                    if key in {"markdown_path", "plain_text_path", "page_index_path", "chunks_path"}
+                },
+            }
+        )
+        runtime = self.registry.get("runtime_job_spec")
+        return Stage1ReusableSummaryBindingV1(
+            canonical_paper_key=str(item.canonical_paper_key or ""),
+            source_paper_id=str(item.source_paper_id or ""),
+            source_mode=str(item.source_mode or ""),
+            source_pdf=str(item.source_pdf or ""),
+            source_pdf_hash=semantic_source_hash,
+            source_pdf_fingerprint=semantic_source_hash,
+            preprocess_hash=preprocess_hash,
+            stage1_input_hash=hash_json(
+                {
+                    "source_text_hash": hash_text(
+                        str(preprocess_metadata.get("stage1_input_text") or "")
+                    ),
+                    "input_mode": str(built_input.input_mode or ""),
+                    "selected_visual_refs": list(built_input.selected_visual_refs or []),
+                    "visual_selection_policy_snapshot": dict(
+                        built_input.visual_selection_policy_snapshot or {}
+                    ),
+                    "multimodal_capability": dict(built_input.multimodal_capability or {}),
+                    "pdf_attachment_status": str(built_input.pdf_attachment_status or ""),
+                }
+            ),
+            prompt_hash=hash_json(
+                {
+                    "prompt_template_hash": hash_text(self._prompt_template()),
+                    "source_text_hash": hash_text(
+                        str(preprocess_metadata.get("stage1_input_text") or "")
+                    ),
+                    "visual_provenance_hash": hash_json(dict(visual_bundle or {})),
+                }
+            ),
+            builder_version="Stage1InputBuilder:v1",
+            provider=str(
+                primary_config.get("provider")
+                or primary_config.get("provider_name")
+                or primary_config.get("name")
+                or ""
+            ),
+            model=str(primary_config.get("model") or ""),
+            endpoint_type=str(primary_config.get("endpoint_type") or "chat_completions"),
+            provider_config_hash=hash_json(_redact_mapping(primary_config)),
+            schema_hash=self._schema_hash(),
+            visual_provenance_hash=hash_json(dict(visual_bundle or {})),
+            evidence_manifest_id=evidence_record.artifact_id,
+            evidence_manifest_hash=evidence_record.content_hash,
+            current_evidence_manifest_id=evidence_record.artifact_id,
+            current_evidence_manifest_hash=evidence_record.content_hash,
+            runtime_spec_id=runtime.artifact_id if runtime is not None else "",
+            runtime_spec_hash=runtime.content_hash if runtime is not None else "",
+            current_runtime_spec_id=runtime.artifact_id if runtime is not None else "",
+            current_runtime_spec_hash=runtime.content_hash if runtime is not None else "",
+            extra={
+                "evidence_file_hashes": evidence_files,
+                "source_pdf_file_hash": file_sha256(item.source_pdf),
+            },
+        )
+
+    def _bind_execution_provenance(
+        self,
+        binding: Stage1ReusableSummaryBindingV1,
+    ) -> Stage1ReusableSummaryBindingV1:
+        runtime = self.registry.get("runtime_job_spec")
+        graph = self.registry.get("stage1:provider_expected_call_graph")
+        return replace(
+            binding,
+            runtime_spec_id=runtime.artifact_id if runtime is not None else binding.runtime_spec_id,
+            runtime_spec_hash=runtime.content_hash if runtime is not None else binding.runtime_spec_hash,
+            current_runtime_spec_id=runtime.artifact_id if runtime is not None else binding.current_runtime_spec_id,
+            current_runtime_spec_hash=runtime.content_hash if runtime is not None else binding.current_runtime_spec_hash,
+            expected_call_graph_id=graph.artifact_id if graph is not None else "",
+            expected_call_graph_hash=graph.content_hash if graph is not None else self.expected_call_graph_hash,
+        )
+
+    def _publish_generated_source_artifact(
+        self,
+        prepared: _PreparedStage1Item,
+        *,
+        paper_info: Mapping[str, Any],
+        ai_summary: Mapping[str, Any],
+    ) -> tuple[ArtifactRecord, Stage1ReusableSummaryBindingV1]:
+        summary_payload_hash = hash_json(ai_summary)
+        provisional = replace(prepared.current_binding, summary_payload_hash=summary_payload_hash)
+        payload = {
+            "artifact_type": "summary_file",
+            "artifact_version": "v1",
+            "source_kind": "stage1_provider_generated",
+            "job_id": self.job_id,
+            "paper_info": dict(paper_info),
+            "ai_summary": dict(ai_summary),
+            "summary_payload_hash": summary_payload_hash,
+            "binding": provisional.to_dict(),
+        }
+        digest = hash_json(payload)
+        path = self.workspace.artifact_path(f"stage1/reuse_sources/generated_{digest[:24]}.json")
+        dependencies = []
+        for artifact_id in (
+            "source_bundle",
+            "runtime_job_spec",
+            f"evidence_manifest:{prepared.item.canonical_paper_key}",
+        ):
+            record = self.registry.get(artifact_id)
+            if record is not None and record.status == "ready":
+                dependencies.append(ArtifactDependencyRefV2.from_record(record))
+        record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            path,
+            payload,
+            artifact_role="summary_source",
+            artifact_type="summary_file",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"stage1:summary_source:{digest[:24]}",
+            depends_on=dependencies,
+            metadata={
+                "immutable": True,
+                "summary_payload_hash": summary_payload_hash,
+                "source_paper_key": prepared.item.canonical_paper_key,
+                "reuse_policy": STAGE1_REUSE_POLICY,
+            },
+        )
+        return record, replace(
+            provisional,
+            registered_source_artifact_id=record.artifact_id,
+            registered_source_artifact_hash=record.content_hash,
+            registered_source_artifact_path=record.path,
+            registry_file_hash=file_sha256(record.path),
         )
 
     def _ensure_durable_input_records(self, bundle: SourceBundle) -> tuple[str, str]:
@@ -460,6 +670,51 @@ class Stage1AnalysisService:
             summary = dict(prepared.previous)
             reuse_record = self._persist_reuse_evidence(prepared)
             self.reuse_evidence_ids.append(reuse_record.artifact_id)
+            reuse_payload = json.loads(Path(reuse_record.path).read_text(encoding="utf-8"))
+            reuse_binding = replace(
+                prepared.current_binding,
+                summary_payload_hash=str(reuse_payload.get("summary_payload_hash") or ""),
+                registered_source_artifact_id=str(
+                    reuse_payload.get("registered_source_artifact_id") or ""
+                ),
+                registered_source_artifact_hash=str(
+                    reuse_payload.get("registered_source_artifact_hash") or ""
+                ),
+                registered_source_artifact_path=str(
+                    reuse_payload.get("registered_source_artifact_path") or ""
+                ),
+                registry_file_hash=str(reuse_payload.get("registry_file_hash") or ""),
+                source_summary_manifest_id=str(
+                    reuse_payload.get("source_summary_manifest_id") or ""
+                ),
+                source_summary_manifest_hash=str(
+                    reuse_payload.get("source_summary_manifest_hash") or ""
+                ),
+                source_provider_receipt_closure_id=str(
+                    reuse_payload.get("source_provider_receipt_closure_id") or ""
+                ),
+                source_provider_receipt_closure_hash=str(
+                    reuse_payload.get("source_provider_receipt_closure_hash") or ""
+                ),
+                source_provider_receipt_ledger_id=str(
+                    reuse_payload.get("source_provider_receipt_ledger_id") or ""
+                ),
+                source_provider_receipt_ledger_hash=str(
+                    reuse_payload.get("source_provider_receipt_ledger_hash") or ""
+                ),
+                extra={
+                    **dict(prepared.current_binding.extra),
+                    "source_authority_artifact_id": str(
+                        reuse_payload.get("source_authority_artifact_id") or ""
+                    ),
+                    "source_authority_artifact_hash": str(
+                        reuse_payload.get("source_authority_artifact_hash") or ""
+                    ),
+                    "source_authority_artifact_path": str(
+                        reuse_payload.get("source_authority_artifact_path") or ""
+                    ),
+                },
+            )
             summary["provider"] = {
                 **dict(summary.get("provider") or {}),
                 "route": "Stage1Reuse",
@@ -472,6 +727,12 @@ class Stage1AnalysisService:
                 "reused": True,
                 "reuse_evidence_id": reuse_record.artifact_id,
                 "reason": "exact_summary_reuse",
+            }
+            summary["stage1_reuse"] = {
+                "decision": "exact_summary_reuse",
+                "reason": "registered_prior_binding_matches_current_source",
+                "policy": STAGE1_REUSE_POLICY,
+                "binding": reuse_binding.to_dict(),
             }
             return summary, ()
 
@@ -490,6 +751,12 @@ class Stage1AnalysisService:
             result=provider_result,
         )
         ai_summary = self._canonical_substantive_summary(provider_result)
+        source_record, generated_binding = self._publish_generated_source_artifact(
+            prepared,
+            paper_info=item.paper_info,
+            ai_summary=ai_summary,
+        )
+        eligibility = prepared.reuse_eligibility
         summary = {
             "status": "success",
             "paper_info": {
@@ -511,6 +778,22 @@ class Stage1AnalysisService:
                 "receipt_ids": [receipt.receipt_id for receipt in runtime.receipts],
                 "receipt_ledger_path": self.receipt_ledger_path,
             },
+            "stage1_reuse": {
+                "decision": (
+                    eligibility.decision
+                    if eligibility is not None
+                    else "provider_generated"
+                ),
+                "reason": (
+                    eligibility.reason
+                    if eligibility is not None
+                    else "no_prior_summary_supplied"
+                ),
+                "policy": STAGE1_REUSE_POLICY,
+                "binding": generated_binding.to_dict(),
+                "source_artifact_id": source_record.artifact_id,
+                "source_artifact_hash": source_record.content_hash,
+            },
         }
         return summary, tuple(receipt.receipt_id for receipt in runtime.receipts)
 
@@ -523,6 +806,12 @@ class Stage1AnalysisService:
             raise RuntimeError("reused Stage 1 summary has no canonical summary payload")
         summary_payload_hash = hash_json(summary_payload)
         source_paper_id = str(prepared.item.source_paper_id or "").strip()
+        prior_reuse_metadata = prepared.previous.get("stage1_reuse") if isinstance(prepared.previous, Mapping) else None
+        prior_binding = Stage1ReusableSummaryBindingV1.from_mapping(
+            prior_reuse_metadata.get("binding")
+            if isinstance(prior_reuse_metadata, Mapping)
+            else None
+        )
         provider_payload = previous.get("provider")
         source_receipt_ids = list(
             provider_payload.get("receipt_ids", [])
@@ -657,7 +946,11 @@ class Stage1AnalysisService:
             "summary_payload_hash": summary_payload_hash,
             "registered_source_artifact_id": source_snapshot.artifact_id,
             "registered_source_artifact_hash": source_snapshot.content_hash,
+            "registered_source_artifact_path": source_snapshot.path,
             "registry_file_hash": file_sha256(source_snapshot.path),
+            "source_authority_artifact_id": prior_binding.registered_source_artifact_id,
+            "source_authority_artifact_hash": prior_binding.registered_source_artifact_hash,
+            "source_authority_artifact_path": prior_binding.registered_source_artifact_path,
             "source_summary_manifest_id": source_manifest_snapshot.artifact_id,
             "source_summary_manifest_hash": source_manifest_snapshot.content_hash,
             "source_paper_artifact_id": source_paper_record.artifact_id if source_paper_record else "",
@@ -719,6 +1012,7 @@ class Stage1AnalysisService:
                 "reused_summary_artifact_hash": source_snapshot.content_hash,
                 "summary_payload_hash": summary_payload_hash,
                 "registered_source_artifact_id": source_snapshot.artifact_id,
+                "source_authority_artifact_id": prior_binding.registered_source_artifact_id,
             },
         )
 

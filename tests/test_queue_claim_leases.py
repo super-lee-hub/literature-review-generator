@@ -536,7 +536,9 @@ def test_spawned_stale_worker_cannot_switch_valid_current_set_after_new_generati
     service = PersistentQueueService(queue_file)
     _add_job(service, "stale-set-job")
 
-    stale_lease = service.claim_job("stale-set-job", worker_id="worker-a", lease_seconds=1)
+    # Keep the lease alive while the fixture publishes A's complete valid
+    # promotion/current-set records, then expire it explicitly below.
+    stale_lease = service.claim_job("stale-set-job", worker_id="worker-a", lease_seconds=10)
     assert stale_lease is not None
     registry_a = service.publication_context(stale_lease).registry(
         registry_path,
@@ -550,7 +552,7 @@ def test_spawned_stale_worker_cannot_switch_valid_current_set_after_new_generati
     )
     assert current_set_a.previous_set_id == ""
 
-    time.sleep(1.1)
+    time.sleep(10.1)
     assert service.recover_expired_leases() == ["stale-set-job"]
     current_lease = service.claim_job("stale-set-job", worker_id="worker-b", lease_seconds=30)
     assert current_lease is not None

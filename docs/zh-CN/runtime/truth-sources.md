@@ -71,6 +71,12 @@ paper identity 提供唯一 reuse record。reuse record 必须绑定真实已注
 原始 receipt 依赖。summary-source zero-call 阶段使用 typed summary-source evidence，
 不能用空 provider ledger 代替。
 
+Stage 1 reuse 必须在复用前比较已注册 source binding 与当前 source、preprocess、
+input、prompt、model、schema 和 visual-provenance 事实；必需事实缺失或变化时
+必须 fail-closed。可选 provider 名称只有在前一轮和当前配置都省略时才可视为一致。
+all-reuse 和 mixed-reuse 仍必须精确覆盖 SourceBundle identity，并为每个复用 paper
+保留一个可由 Registry 验证的 reuse record。
+
 ## 公开状态
 
 `job_status` 为 `pending | running | completed | failed | cancelled`。
