@@ -169,6 +169,22 @@ def test_runtime_job_spec_round_trip(tmp_path: Path) -> None:
     assert loaded.metadata == spec.metadata
 
 
+def test_runtime_job_spec_from_mapping_preserves_workspace_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "output" / "demo__job-1"
+
+    spec = RuntimeJobSpec.from_mapping(
+        {
+            "project_name": "demo",
+            "source_mode": "direct",
+            "pdf_folder": str(tmp_path / "papers"),
+            "workspace_path": str(workspace),
+        }
+    )
+
+    assert spec.workspace_path == str(workspace)
+    assert spec.to_job_request().workspace_path == str(workspace)
+
+
 def test_runtime_job_spec_paths_are_resolved_from_spec_not_cwd(tmp_path: Path, monkeypatch) -> None:
     from runtime.job_spec import load_runtime_job_spec
 

@@ -1,6 +1,6 @@
 # PR14 Current Validation Evidence
 
-Date: 2026-08-05 (Asia/Shanghai)
+Date: 2026-08-06 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 Code/test verification: refreshed at the final pre-publication branch tip; the
@@ -25,6 +25,8 @@ The current path persists and checks:
   unexpected, out-of-scope, usage, retry, and hash mismatches;
 - immutable `ValidationRunResultV1` plus exact Registry dependency closure;
 - stage-indexed provider closure derived from the durable requested-stage spec;
+- typed `stage1_reusable_summary_manifest/v1` source-manifest validation and
+  canonical one-item-array `summary_file` payloads for per-paper reuse sources;
 - durable stage-plan policy for `run_all`: validation-enabled runs request
   analyze/outline/review/validate; optional validation-disabled runs request
   analyze/outline/review but still require the current artifact set;
@@ -42,7 +44,7 @@ The current path persists and checks:
 | Evidence | Result |
 |---|---|
 | Focused boundary regressions | passed; queue, closure, repair, export, Stage 1, validation, GUI-controller, adoption, multimodal, and Outline groups |
-| Strict offline full gate | not accepted as an aggregate: `752 selected, 22 deselected` from `774 collected`; one run timed out after 30 minutes and a second exited 1 before an aggregate summary |
+| Strict offline full gate | passed: `762 selected, 22 deselected` from `784 collected` in `1010.96s` |
 | `python -m compileall -q .` | passed |
 | `python -m pyright` | `0 errors, 0 warnings, 0 informations` |
 | Current production-shaped three-PDF chain | passed; explicit adoption, current validation, export, and attestation |

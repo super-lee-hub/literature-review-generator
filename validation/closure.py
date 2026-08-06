@@ -17,7 +17,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from services.artifact_registry import (
     ArtifactRecord,
@@ -51,7 +51,7 @@ _ZERO_CALL_EVIDENCE_POLICY: dict[str, tuple[str, ...]] = {
         "stage1_summary_reuse_record",
     ),
     "outline": (
-        "outline_call_plan",
+        "outline_provider_call_plan",
         "outline_replay_evidence",
     ),
     "review": ("review_replay_evidence",),
@@ -361,6 +361,55 @@ def _payload_for_record(record: ArtifactRecord) -> tuple[Mapping[str, Any] | Non
     return (payload if isinstance(payload, Mapping) else value), []
 
 
+def _external_registry_resolver_from_payloads(
+    registry: ArtifactRegistry,
+    payloads: Iterable[Mapping[str, Any] | None],
+) -> Callable[[str], ArtifactRegistry | None] | None:
+    """Resolve external dependencies only through a typed authority registry path."""
+
+    paths: dict[str, str] = {}
+    for payload in payloads:
+        if not isinstance(payload, Mapping):
+            continue
+        job_id = str(payload.get("source_authority_job_id") or "").strip()
+        registry_path = str(payload.get("source_authority_registry_path") or "").strip()
+        if job_id and registry_path and job_id != registry.job_id:
+            paths[job_id] = registry_path
+    if not paths:
+        return None
+
+    def resolve(job_id: str) -> ArtifactRegistry | None:
+        path = paths.get(str(job_id or ""))
+        if not path:
+            return None
+        try:
+            return ArtifactRegistry(path, str(job_id))
+        except (OSError, TypeError, ValueError, RuntimeError):
+            return None
+
+    return resolve
+
+
+def _dependency_record(
+    registry: ArtifactRegistry,
+    dependency: Any,
+    *,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None,
+) -> ArtifactRecord | None:
+    record = registry.get(str(getattr(dependency, "artifact_id", "") or ""))
+    if record is not None:
+        return record
+    if str(getattr(dependency, "dependency_kind", "") or "") != "external_job":
+        return None
+    if external_registry_resolver is None:
+        return None
+    target = external_registry_resolver(str(getattr(dependency, "job_id", "") or ""))
+    if target is None:
+        return None
+    target.reload()
+    return target.get(str(getattr(dependency, "artifact_id", "") or ""))
+
+
 def _provider_record_for_stage(
     stage: str,
     records: Sequence[ArtifactRecord],
@@ -485,13 +534,25 @@ def _provider_closure_entry(
             "registry_dependency_hashes": [dependency.content_hash for dependency in record.depends_on],
         }
     )
+    raw_envelope = _json_object(record.path)
+    payload, receipt_rows = _payload_for_record(record)
+    reuse_payloads = [
+        _json_object(dependency.path)
+        for dependency in record.depends_on
+        if dependency.artifact_type == "stage1_summary_reuse_record"
+    ]
+    external_registry_resolver = _external_registry_resolver_from_payloads(
+        registry,
+        [raw_envelope, payload, *reuse_payloads],
+    )
     try:
         ArtifactRegistry._verify_ready_artifact(record)
-        registry.verify_ready_dependencies(record.depends_on)
+        registry.verify_ready_dependencies(
+            record.depends_on,
+            external_registry_resolver=external_registry_resolver,
+        )
     except (OSError, RegistryError, ValueError, TypeError) as exc:
         blocking.append(f"provider_closure_untrusted:{stage}:{exc}")
-    payload, receipt_rows = _payload_for_record(record)
-    raw_envelope = _json_object(record.path)
     closure = dict(payload) if isinstance(payload, Mapping) else {}
     # Stage 1 keeps the closure result under ``payload`` and the predeclared
     # call graph in the outer envelope; review/validation embed the full
@@ -617,7 +678,13 @@ def _provider_closure_entry(
     dependency_records = [
         dependency_record
         for dependency in record.depends_on
-        if (dependency_record := registry.get(dependency.artifact_id)) is not None
+        if (
+            dependency_record := _dependency_record(
+                registry,
+                dependency,
+                external_registry_resolver=external_registry_resolver,
+            )
+        ) is not None
         and dependency_record.status == "ready"
     ]
     # Stage 1 publishes a separate, typed expected-call graph because its
@@ -779,6 +846,41 @@ def _provider_closure_entry(
         ]
         if not source_evidence_records:
             blocking.append(f"provider_closure_zero_call_source_evidence_missing:{stage}")
+        else:
+            accepted_versions = {
+                "summary_source_manifest": {"v1", "v2"},
+                "stage1_summary_reuse_record": {"v1"},
+                "outline_provider_call_plan": {"v1"},
+                "outline_replay_evidence": {"v1"},
+                "review_replay_evidence": {"v1"},
+                "validation_disposition": {"v1"},
+            }
+            for evidence_record in source_evidence_records:
+                if evidence_record.artifact_version not in accepted_versions.get(
+                    evidence_record.artifact_type,
+                    set(),
+                ):
+                    blocking.append(
+                        f"provider_closure_zero_call_source_evidence_version_invalid:{stage}"
+                    )
+                    continue
+                try:
+                    ArtifactRegistry._verify_ready_artifact(evidence_record)
+                    registry.verify_ready_dependencies(
+                        evidence_record.depends_on,
+                        external_registry_resolver=external_registry_resolver,
+                    )
+                except (OSError, RegistryError, ValueError, TypeError) as exc:
+                    blocking.append(
+                        f"provider_closure_zero_call_source_evidence_untrusted:{stage}:{exc}"
+                    )
+                evidence_payload = _json_object(evidence_record.path)
+                if evidence_payload is not None and str(
+                    evidence_payload.get("job_id") or ""
+                ) not in {"", registry.job_id}:
+                    blocking.append(
+                        f"provider_closure_zero_call_source_evidence_job_mismatch:{stage}"
+                    )
     reuse_records = [
         dependency_record
         for dependency_record in dependency_records
@@ -816,6 +918,10 @@ def _provider_closure_entry(
         reused_papers: list[str] = []
         for reuse_record in reuse_records:
             reuse_payload = _json_object(reuse_record.path) or {}
+            reuse_external_registry_resolver = _external_registry_resolver_from_payloads(
+                registry,
+                [reuse_payload],
+            )
             identity = reuse_payload.get("source_bundle_paper_identity")
             paper_key = str(identity.get("canonical_paper_key") or "") if isinstance(identity, Mapping) else ""
             if not paper_key or paper_key in reused_papers or (expected_papers and paper_key not in expected_papers):
@@ -823,13 +929,27 @@ def _provider_closure_entry(
             else:
                 reused_papers.append(paper_key)
             try:
-                registry.verify_ready_dependencies(reuse_record.depends_on)
+                registry.verify_ready_dependencies(
+                    reuse_record.depends_on,
+                    external_registry_resolver=reuse_external_registry_resolver,
+                )
             except (OSError, RegistryError, ValueError, TypeError) as exc:
                 blocking.append(f"provider_closure_reuse_dependency_invalid:{stage}")
             dependency_by_id = {
                 dependency.artifact_id: dependency
                 for dependency in reuse_record.depends_on
                 if dependency.artifact_id
+            }
+            dependency_records_by_id = {
+                dependency.artifact_id: dependency_record
+                for dependency in reuse_record.depends_on
+                if (
+                    dependency_record := _dependency_record(
+                        registry,
+                        dependency,
+                        external_registry_resolver=reuse_external_registry_resolver,
+                    )
+                ) is not None
             }
             source_id = str(reuse_payload.get("registered_source_artifact_id") or "")
             source_hash = str(reuse_payload.get("registered_source_artifact_hash") or "")
@@ -861,7 +981,7 @@ def _provider_closure_entry(
                 if dependency is None or dependency.content_hash != content_hash:
                     blocking.append(f"provider_closure_reuse_{label}_binding_invalid:{stage}")
                 else:
-                    dependency_record = registry.get(artifact_id)
+                    dependency_record = dependency_records_by_id.get(artifact_id)
                     if dependency_record is None or dependency_record.content_hash != content_hash:
                         blocking.append(f"provider_closure_reuse_{label}_record_invalid:{stage}")
                     elif label == "source_provider_receipt_closure" and (
@@ -874,7 +994,7 @@ def _provider_closure_entry(
                         or dependency_record.artifact_version != "v1"
                     ):
                         blocking.append(f"provider_closure_reuse_{label}_type_invalid:{stage}")
-            source_record = registry.get(source_id) if source_id else None
+            source_record = dependency_records_by_id.get(source_id) if source_id else None
             if source_record is None or source_record.status != "ready":
                 blocking.append(f"provider_closure_reuse_source_artifact_missing:{stage}")
             else:

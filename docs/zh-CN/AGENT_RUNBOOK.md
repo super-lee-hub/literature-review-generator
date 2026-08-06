@@ -66,7 +66,9 @@ Stage closure 按 expected transport count 条件化：count 大于零必须有�
 hash-valid receipt ledger 和精确 call set；count 等于零必须有有效 expected graph、
 零 terminal model call、零 observed receipt 及 typed source evidence，不能伪造空 ledger。
 Stage 1 reuse record 必须绑定真实已注册 source artifact，并分别保留 summary payload
-hash 与 Registry file hash。
+hash 与 Registry file hash。单篇 `summary_file` 必须是 canonical 单元素数组，且有
+typed `stage1_reusable_summary_manifest/v1`；外部 source authority（如存在）是独立的
+依赖和身份。
 
 Stage 1 all-reuse 必须没有当前 epoch 的 provider receipt，并为每个 SourceBundle
 paper 保留一个唯一 reuse record；mixed run 只能为新生成 paper 产生 provider call；

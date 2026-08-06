@@ -616,6 +616,7 @@ class InternalStageExecutorRegistry:
         bundle: SourceBundle,
         results: Mapping[str, StageResult],
         attempt_id: str,
+        external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
         summaries = self._load_summary_payloads(session, results)
         if bundle.paper_work_items:
@@ -627,6 +628,7 @@ class InternalStageExecutorRegistry:
                 config=session.stage_host.config,
                 settings=session.context.settings,
                 cancellation_checker=session.stage_host.check_cancelled,
+                external_registry_resolver=external_registry_resolver,
                 publication_context=session.context.publication_context,
                 logger=session.stage_host.logger,
             )
@@ -660,6 +662,7 @@ class InternalStageExecutorRegistry:
             config=session.stage_host.config,
             settings=session.context.settings,
             cancellation_checker=session.stage_host.check_cancelled,
+            external_registry_resolver=external_registry_resolver,
             publication_context=session.context.publication_context,
             logger=session.stage_host.logger,
         )
@@ -923,13 +926,14 @@ class InternalStageExecutorRegistry:
         attempt_id: str,
         external_registry_resolver: Callable[[str], Any | None] | None = None,
     ) -> tuple[StageResult, int]:
-        del spec, external_registry_resolver
+        del spec
         executors: dict[str, Callable[[], tuple[StageResult, int]]] = {
             "analyze": lambda: self._execute_analyze(
                 session=session,
                 bundle=bundle,
                 results=results,
                 attempt_id=attempt_id,
+                external_registry_resolver=external_registry_resolver,
             ),
             "outline": lambda: self._execute_outline(session=session, results=results),
             "review": lambda: self._execute_review(

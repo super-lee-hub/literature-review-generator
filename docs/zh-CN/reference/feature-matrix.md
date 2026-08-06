@@ -6,8 +6,8 @@
 `E2E_VERIFIED` 表示当前生产形状链路实际跑过，`LIVE_VERIFIED` 只保留给真实
 外部 Provider 运行，`NOT_VERIFIED` 表示所需 live 或 UI 证据尚未运行。
 
-当前离线 collection 为 780；严格 marker 选择为 selected 758、deselected 22，
-严格 aggregate 已通过（`758 passed, 22 deselected`，约 54:06）。Live API、
+当前离线 collection 为 784；严格 marker 选择为 selected 762、deselected 22，
+严格 aggregate 已通过（`762 passed, 22 deselected`，约 16:50）。Live API、
 Playwright 和 heavy OCR 本轮仍为 `NOT_RUN`。
 
 | 功能 | 状态 | 规范实现 |
@@ -16,7 +16,7 @@ Playwright 和 heavy OCR 本轮仍为 `NOT_RUN`。
 | Zotero 与 FileIndex | IMPLEMENTED | 带诊断解析、按 root 隔离、只读、多候选 |
 | Artifact Registry v2 | E2E_VERIFIED | revision 锁事务、typed multi-record 原子保存、READY 本地/跨 job 依赖即时 fail-closed 校验，以及对既有相同 hash immutable publication target 的保护 |
 | Job outcome 与 attempts | E2E_VERIFIED | job outcome、append-only attempts、pointer 所有权 |
-| Stage 1 与证据 | E2E_VERIFIED | 不可变 content-addressed summaries、paper artifact、evidence manifest、edge checkpoint；zero-call closure、all-reuse/mixed-reuse provenance、真实 Registry source-artifact binding，且不伪造 receipt ledger；summary -> source_bundle -> 来源 PDF 依赖链 |
+| Stage 1 与证据 | E2E_VERIFIED | 不可变 content-addressed summaries、paper artifact、evidence manifest、typed `stage1_reusable_summary_manifest/v1` source manifest、edge checkpoint；zero-call closure、all-reuse/mixed-reuse provenance、真实 Registry source-artifact binding，且不伪造 receipt ledger；summary -> source_bundle -> 来源 PDF 依赖链 |
 | ReviewBatch 派生 | INTEGRATED | 固定父 hash、child Stage 1 调用为零、derivation/coordinator lease、单调 generation、immutable max-head projection receipt |
 | Outline Intelligence v3 | E2E_VERIFIED | 已注册 artifact validation surface、确定性 node DAG、精确 execution/replay 闭包、typed quality gate、`off`/`smoke`/`full` stability、调用/成本 preflight、checkpointed subruns、health、critic retry scope 和显式 versioned adoption |
 | Review/Citation/DOCX | E2E_VERIFIED | 当前 review draft v3、完整 section binding、manifest v3、token spans、实际引用 bibliography、DOCX |

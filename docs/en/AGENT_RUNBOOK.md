@@ -69,7 +69,10 @@ Use `--workspace <workspace_path>` when the job ID cannot be resolved. All comma
   stages require a valid expected graph, zero terminal model calls and receipts,
   and typed source evidence, without a fabricated empty ledger. Stage 1 reuse
   records must point to real registered source artifacts and preserve payload
-  and Registry file hashes separately.
+  and Registry file hashes separately. Per-paper `summary_file` authorities are
+  canonical one-item arrays and are accompanied by a typed
+  `stage1_reusable_summary_manifest/v1`; an external source authority, when
+  present, is a separate dependency and identity.
 - For a Stage 1 all-reuse run, expect no current-epoch provider receipts and
   one unique reuse record per SourceBundle paper. A mixed run must show provider
   calls only for generated papers; a summary-source zero-call run must use its

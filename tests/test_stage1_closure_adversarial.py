@@ -22,7 +22,12 @@ def _stage1_papers(root: Path, prefix: str = "paper") -> list[tuple[str, str, st
     ]
     root.mkdir(parents=True, exist_ok=True)
     for key, title, finding in papers:
-        _write_pdf(root / f"{key}.pdf", title, finding)
+        pdf_path = root / f"{key}.pdf"
+        # Keep the same immutable PDF bytes across repeated runtime setup.
+        # PyMuPDF embeds creation metadata when it rewrites an existing file;
+        # rewriting here would turn an all-reuse fixture into a new source.
+        if not pdf_path.exists():
+            _write_pdf(pdf_path, title, finding)
     return papers
 
 

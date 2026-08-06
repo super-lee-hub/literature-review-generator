@@ -281,6 +281,68 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         raise ReconcileValidationError("summary manifest summary_count is inconsistent")
 
 
+def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    _require_contract_header(
+        record,
+        payload,
+        artifact_type="stage1_reusable_summary_manifest",
+        versions=("v1",),
+    )
+    _require_owned_job(record, payload, field="job_id")
+    _require_fields(
+        payload,
+        (
+            "stage_name",
+            "canonical_paper_key",
+            "source_paper_id",
+            "source_summary_artifact_id",
+            "source_summary_artifact_hash",
+            "summary_payload_hash",
+            "binding_hash",
+            "runtime_spec_id",
+            "runtime_spec_hash",
+            "evidence_manifest_id",
+            "evidence_manifest_hash",
+            "source_bundle_id",
+            "source_bundle_hash",
+            "created_at",
+            "producer",
+        ),
+        label="stage1_reusable_summary_manifest",
+    )
+    for label in (
+        "source_summary_artifact_hash",
+        "summary_payload_hash",
+        "binding_hash",
+        "runtime_spec_hash",
+        "evidence_manifest_hash",
+        "source_bundle_hash",
+    ):
+        value = str(payload.get(label) or "")
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
+            raise ReconcileValidationError(
+                f"stage1_reusable_summary_manifest.{label} is not a SHA-256 digest"
+            )
+    for id_label, hash_label in (
+        ("provider_receipt_closure_id", "provider_receipt_closure_hash"),
+        ("provider_receipt_ledger_id", "provider_receipt_ledger_hash"),
+    ):
+        identifier = str(payload.get(id_label) or "")
+        digest = str(payload.get(hash_label) or "")
+        if bool(identifier) != bool(digest):
+            raise ReconcileValidationError(
+                f"stage1_reusable_summary_manifest {id_label}/{hash_label} must be paired"
+            )
+        if digest and (
+            len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest.lower())
+        ):
+            raise ReconcileValidationError(
+                f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 digest"
+            )
+
+
 def _validate_nonempty_text(_record: ArtifactRecord, path: Path) -> None:
     try:
         text = path.read_text(encoding="utf-8")
@@ -1513,6 +1575,7 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "runtime_job_spec": _validate_json_object,
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_summary_source_manifest,
+    "stage1_reusable_summary_manifest": _validate_stage1_reusable_summary_manifest,
     "summary_selection": _validate_summary_selection,
     "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,

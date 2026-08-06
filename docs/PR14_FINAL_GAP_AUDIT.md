@@ -10,6 +10,12 @@ final commit SHA is recorded in the PR description and delivery report.
 This audit covers the requested current-path remediation. It does not promote
 deterministic provider injection to live-provider verification.
 
+Continuation verification added the explicit `summary_file` array contract for
+per-paper Stage 1 reuse sources and registered a versioned
+`stage1_reusable_summary_manifest/v1` validator. The all-reuse, mixed-reuse,
+summary-source zero-call, and Stage 1 adversarial production-shaped paths were
+rerun after that change.
+
 The ZIP files are absent from the committed diff and remote branch. The local
 operator reports that they were not read or staged; remote GitHub evidence
 cannot independently verify local read access.
@@ -32,11 +38,11 @@ cannot independently verify local read access.
 
 ## Fresh local evidence
 
-- `python -m pytest --collect-only -q`: `780` tests collected; the strict marker
-  selection is `758 selected / 22 deselected`.
+- `python -m pytest --collect-only -q`: `784` tests collected; the strict marker
+  selection is `762 selected / 22 deselected`.
 - The exact strict command
   `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"`
-  passed: `758 passed, 22 deselected` in `3246.48s` (`54:06`).
+  passed: `762 passed, 22 deselected` in `1010.96s` (`16:50`).
 - Focused evidence also passed for the required paths: PR14 remediation `12`,
   Stage1 closure matrix `1`, all/mixed-reuse and summary-source zero-call `1`,
   Stage1 contracts `5`, critic/invalidation `8`, semantic pricing/token `24`,

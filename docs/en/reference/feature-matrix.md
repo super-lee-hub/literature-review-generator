@@ -8,14 +8,10 @@ the controller/label boundary is covered without claiming browser automation;
 `LIVE_VERIFIED` is reserved for an actual external-provider run; `NOT_VERIFIED`
 means the required live or UI evidence was not run.
 
-The current offline collection is `780`; the strict marker gate selected `758`
-and deselected `22`, with the exact aggregate finishing `758 passed, 22
-deselected`. Live API, Playwright, and heavy OCR remain unrun.
-
-The current offline collection is 774 tests; the strict marker selection is 752
-selected and 22 deselected. The aggregate strict run was attempted but did not
-produce a final pass summary in this environment. Live API, Playwright, and
-heavy OCR are `NOT_RUN` in this pass.
+The current offline collection is `784`; the strict marker gate selected `762`
+and deselected `22`, with the exact aggregate finishing `762 passed, 22
+deselected` in `1010.96s` (`16:50`). Live API, Playwright, and heavy OCR remain
+unrun.
 
 | Feature | Status | Canonical implementation |
 |---|---|---|
@@ -24,7 +20,7 @@ heavy OCR are `NOT_RUN` in this pass.
 | Artifact Registry v2 | E2E_VERIFIED | revisioned locked transactions, typed multi-record atomic save, version-aware READY validation, immediate fail-closed verification of READY local/external dependencies, and protection for pre-existing identical immutable publication targets |
 | Version-aware artifact validators | E2E_VERIFIED | `(artifact_type, artifact_version)` dispatch for current production and Outline artifacts, explicit known compatibility projections, malformed-fixture rejection, and fail-closed unknown current versions |
 | Job outcome and attempts | E2E_VERIFIED | `job_outcome_v1.json`, append-only attempts, pointer ownership |
-| Stage 1 summaries and paper evidence | E2E_VERIFIED | immutable content-addressed summaries, paper artifacts, evidence manifests and edge checkpoints; conditional zero-call closure, all-reuse/mixed-reuse provenance, real Registry source-artifact bindings, and no fabricated receipt ledger; summary -> source_bundle -> source PDF lineage |
+| Stage 1 summaries and paper evidence | E2E_VERIFIED | immutable content-addressed summaries, paper artifacts, evidence manifests, typed `stage1_reusable_summary_manifest/v1` source manifests and edge checkpoints; conditional zero-call closure, all-reuse/mixed-reuse provenance, real Registry source-artifact bindings, and no fabricated receipt ledger; summary -> source_bundle -> source PDF lineage |
 | ReviewBatch derivation | INTEGRATED | deterministic parent-hash subsets, zero child Stage 1 calls, derivation/coordinator leases, monotonic generation, immutable max-head projection receipts |
 | Outline Intelligence v3 | E2E_VERIFIED | registered artifact validation surface, deterministic node DAG, exact execution-binding/replay closure, typed quality gate, `off`/`smoke`/`full` stability modes, preflight call/cost budgets, checkpointed subruns, health, critic retry scope, and explicit versioned adoption pointer |
 | Review and citation chain | E2E_VERIFIED | current review draft v3, complete section binding, citation manifest v3, token spans, cited bibliography, DOCX |

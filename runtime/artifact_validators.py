@@ -68,6 +68,7 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "provider_receipt_closure",
         "provider_expected_call_graph",
         "stage1_summary_reuse_record",
+        "stage1_reusable_summary_manifest",
         "validation_disposition",
         "lease_publication_manifest",
         "repair_plan",
@@ -574,18 +575,21 @@ def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: 
         value = str(root.get(label) or "")
         if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
             raise ArtifactSchemaError(f"stage1_summary_reuse_record.{label} is not a SHA-256 hex digest")
-    if str(root.get("registered_source_artifact_id") or "") != str(
-        root.get("reused_summary_artifact_id") or ""
-    ):
-        raise ArtifactSchemaError(
-            "stage1_summary_reuse_record source artifact ID is not bound to reused summary"
-        )
-    if str(root.get("registered_source_artifact_hash") or "") != str(
-        root.get("reused_summary_artifact_hash") or ""
-    ):
-        raise ArtifactSchemaError(
-            "stage1_summary_reuse_record source artifact hash is not bound to reused summary"
-        )
+    registered_id = str(root.get("registered_source_artifact_id") or "")
+    registered_hash = str(root.get("registered_source_artifact_hash") or "")
+    reused_id = str(root.get("reused_summary_artifact_id") or "")
+    reused_hash = str(root.get("reused_summary_artifact_hash") or "")
+    if registered_id != reused_id or registered_hash != reused_hash:
+        # The current-run summary snapshot is derived evidence.  A reusable
+        # summary must also name the immutable source authority that supplied
+        # it; older records where the snapshot was the authority remain valid
+        # through the equality branch above.
+        authority_id = str(root.get("source_authority_artifact_id") or "")
+        authority_hash = str(root.get("source_authority_artifact_hash") or "")
+        if authority_id != registered_id or authority_hash != registered_hash:
+            raise ArtifactSchemaError(
+                "stage1_summary_reuse_record source authority is not bound to registered source"
+            )
     if str(root.get("reuse_policy") or "") != "exact_summary_reuse_v1":
         raise ArtifactSchemaError("stage1_summary_reuse_record reuse policy is invalid")
     from runtime.provider_runtime import hash_json
@@ -594,6 +598,70 @@ def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: 
     expected_hash = str(canonical.pop("content_hash") or "")
     if hash_json(canonical) != expected_hash:
         raise ArtifactSchemaError("stage1_summary_reuse_record.content_hash does not match content")
+
+
+def _validate_stage1_reusable_summary_manifest(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_reusable_summary_manifest",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "stage_name",
+            "canonical_paper_key",
+            "source_paper_id",
+            "source_summary_artifact_id",
+            "source_summary_artifact_hash",
+            "summary_payload_hash",
+            "binding_hash",
+            "runtime_spec_id",
+            "runtime_spec_hash",
+            "evidence_manifest_id",
+            "evidence_manifest_hash",
+            "source_bundle_id",
+            "source_bundle_hash",
+            "created_at",
+            "producer",
+        ),
+        "stage1_reusable_summary_manifest",
+    )
+    for label in (
+        "source_summary_artifact_hash",
+        "summary_payload_hash",
+        "binding_hash",
+        "runtime_spec_hash",
+        "evidence_manifest_hash",
+        "source_bundle_hash",
+    ):
+        value = str(root.get(label) or "")
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
+            raise ArtifactSchemaError(
+                f"stage1_reusable_summary_manifest.{label} is not a SHA-256 hex digest"
+            )
+    for id_label, hash_label in (
+        ("provider_receipt_closure_id", "provider_receipt_closure_hash"),
+        ("provider_receipt_ledger_id", "provider_receipt_ledger_hash"),
+    ):
+        identifier = str(root.get(id_label) or "")
+        digest = str(root.get(hash_label) or "")
+        if bool(identifier) != bool(digest):
+            raise ArtifactSchemaError(
+                f"stage1_reusable_summary_manifest {id_label}/{hash_label} must be paired"
+            )
+        if digest and (
+            len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest.lower())
+        ):
+            raise ArtifactSchemaError(
+                f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 hex digest"
+            )
 
 
 def _validate_outline_provider_call_plan(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -1000,6 +1068,7 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("provider_receipt_closure", "v1"): _validate_receipt_closure,
         ("provider_expected_call_graph", "v1"): _validate_provider_expected_call_graph,
         ("stage1_summary_reuse_record", "v1"): _validate_stage1_summary_reuse_record,
+        ("stage1_reusable_summary_manifest", "v1"): _validate_stage1_reusable_summary_manifest,
         ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
         ("validation_disposition", "v1"): _validate_validation_disposition,
         ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,

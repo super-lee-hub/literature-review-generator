@@ -54,7 +54,7 @@ Queue 生命周期只读取 `job_status`；人类可读的 success 标志不是�
 | 阶段 | 规范真相源 | 投影/导出 |
 |---|---|---|
 | Source intake | `source_inventory_v1.json`、`source_bundle.json` | parser 诊断和只读 paper view |
-| Stage 1 | 不可变 content-addressed 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest、来源链、expected-call closure、typed reuse record 和当前 epoch receipt evidence | Excel 与显示用 summary |
+| Stage 1 | 不可变 content-addressed 规范 `*_summaries.json`、已注册 `paper_artifacts/*.json`、evidence manifest、typed `stage1_reusable_summary_manifest/v1` source manifest、来源链、expected-call closure、typed reuse record 和当前 epoch receipt evidence | Excel 与显示用 summary |
 | Outline Intelligence v3 | 已注册 evidence views、corpus ledger、multi-view matrix、review intent、coverage contract、relation map、candidate plan、node DAG、receipts、final outline、stage health 和 adoption record | Markdown 或人类可读 outline 展示 |
 | Review | `review_draft.json`（`artifact_version=v3`）、`citation_manifest_v3.json` 和 citation-reference catalog，并通过 current artifact set 解析 | DOCX 与文本报告 |
 | Validation | `validation_run_result_v1.json` 及其对 review draft、citation manifest、evidence manifest 的精确 Registry `depends_on` 闭包；optional validation 禁用时用 typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` 和 zero-call closure 绑定 current set；`CurrentStageClosureMapV1` 只解析 current set | TXT、manual-review JSON、alignment audit 和 completion projection |
@@ -75,7 +75,10 @@ Stage 1 reuse 必须在复用前比较已注册 source binding 与当前 source�
 input、prompt、model、schema 和 visual-provenance 事实；必需事实缺失或变化时
 必须 fail-closed。可选 provider 名称只有在前一轮和当前配置都省略时才可视为一致。
 all-reuse 和 mixed-reuse 仍必须精确覆盖 SourceBundle identity，并为每个复用 paper
-保留一个可由 Registry 验证的 reuse record。
+保留一个可由 Registry 验证的 reuse record。单篇 `summary_file` 来源必须是
+canonical 的单元素 summary 数组，并同时有 typed
+`stage1_reusable_summary_manifest/v1`；本地快照 hash、原始 source authority、
+逻辑 summary payload hash 和 Registry file hash 必须分开保存。
 
 ## 公开状态
 

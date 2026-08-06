@@ -69,7 +69,7 @@ source of truth.
 | Stage | Canonical truth | Projections / exports |
 |---|---|---|
 | Source intake | `source_inventory_v1.json`, `source_bundle.json` | parser diagnostics and read-only paper views |
-| Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, source lineage, expected-call closure, typed reuse records, and current-epoch receipt evidence | Excel and display summaries |
+| Stage 1 | immutable content-addressed canonical `*_summaries.json`, registered `paper_artifacts/*.json`, evidence manifests, typed `stage1_reusable_summary_manifest/v1` source manifests, source lineage, expected-call closure, typed reuse records, and current-epoch receipt evidence | Excel and display summaries |
 | Outline Intelligence v3 | registered evidence views, corpus ledger, multi-view matrix, review intent, coverage contract, relation map, candidate plan, typed quality gate, exact execution bindings, node DAG, receipts, full-decision stability audit, final outline, stage health, versioned adoption record, and current adoption pointer | Markdown or human-readable outline displays |
 | Review | `review_draft.json` with `artifact_version=v3`, `citation_manifest_v3.json`, and the citation-reference catalog, resolved through the current artifact set | DOCX and text reports |
 | Validation | `validation_run_result_v1.json` plus its exact Registry `depends_on` closure over the review draft, citation manifest, and evidence manifests; when optional validation is disabled, typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` plus a zero-call closure binds the current set; `CurrentStageClosureMapV1` resolves only the current set | TXT report, manual-review JSON, alignment audit, and completion projection |
@@ -102,7 +102,11 @@ summary is reused. A missing or changed required fact fails closed; an omitted
 optional provider name is reusable only when both the prior and current
 configuration omit it. All-reuse and mixed-reuse closure must still cover the
 SourceBundle identities exactly and preserve one Registry-verifiable reuse
-record per reused paper.
+record per reused paper. Per-paper `summary_file` reuse sources are stored as a
+one-item canonical summary array; their source-manifest envelope has its own
+typed `stage1_reusable_summary_manifest/v1` record. The local snapshot hash,
+original source-authority identity, logical summary payload hash, and Registry
+file hash remain separate fields.
 
 ## Public outcomes
 

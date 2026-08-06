@@ -38,7 +38,8 @@ python -m reviewctl attest --workspace <workspace>
   receipt ledger。all-reuse Stage 1 还要检查 SourceBundle identity 唯一覆盖、真实
   Registry source-artifact 绑定和当前 epoch 没有 provider receipt。mixed reuse/generation
   必须确认 expected call graph 只包含新生成 paper；summary-source zero-call 必须使用
-  typed summary-source evidence。
+  typed summary-source evidence。单篇复用 `summary_file` 必须是 canonical 单元素数组，
+  并通过 `stage1_reusable_summary_manifest/v1` 校验；不能用 JSON 对象 envelope 或未注册路径替代。
 
 ```text
 python -m reviewctl resume --workspace <workspace>

@@ -32,7 +32,9 @@ The status and attestation outputs identify the job state, failed node, provider
   identities, real Registry source-artifact bindings, and no current-epoch
   provider receipts. For mixed reuse/generation, verify that only generated
   papers appear in the expected call graph; summary-source zero-call stages use
-  typed summary-source evidence.
+  typed summary-source evidence. A per-paper reused `summary_file` must be a
+  canonical one-item array with a valid `stage1_reusable_summary_manifest/v1`;
+  do not substitute a JSON object envelope or an unregistered path.
 
 ## 3. Resume
 

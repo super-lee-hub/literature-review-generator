@@ -12,6 +12,7 @@ from services.stage1_analysis_service import Stage1AnalysisService
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
 from services.settings import ApplicationSettings
+from services.stage1_reuse import Stage1ReusableSummaryBindingV1
 from runtime.stage_contracts import build_source_bundle
 
 
@@ -193,3 +194,126 @@ def test_reuse_binding_allows_provider_to_be_omitted_on_both_runs() -> None:
 
     assert comparison["equal"] is True
     assert comparison["missing_fields"] == []
+
+
+def test_reuse_binding_separates_pdf_bytes_from_semantic_input_and_ignores_direct_path_move() -> None:
+    common = {
+        "canonical_paper_key": "10.1000/verified",
+        "source_mode": "direct",
+        "source_pdf_content_sha256": "a" * 64,
+        "stage1_extracted_text_hash": "b" * 64,
+        "stage1_semantic_input_hash": "c" * 64,
+        "preprocess_contract_hash": "d" * 64,
+        "prompt_template_hash": "e" * 64,
+        "input_builder_policy_hash": "f" * 64,
+        "provider_config_hash": "1" * 64,
+        "summary_schema_hash": "2" * 64,
+        "visual_input_manifest_hash": "3" * 64,
+    }
+    original = Stage1ReusableSummaryBindingV1(
+        **common,
+        source_paper_id=r"D:\papers\a.pdf",
+        source_pdf=r"D:\papers\a.pdf",
+        original_source_location=r"D:\papers\a.pdf",
+        current_source_location=r"D:\papers\a.pdf",
+    )
+    moved = Stage1ReusableSummaryBindingV1(
+        **common,
+        source_paper_id=r"E:\library\a.pdf",
+        source_pdf=r"E:\library\a.pdf",
+        original_source_location=r"D:\papers\a.pdf",
+        current_source_location=r"E:\library\a.pdf",
+        location_changed=True,
+    )
+
+    comparison = original.compare(moved)
+
+    assert comparison["equal"] is True
+    assert original.source_pdf_content_sha256 != original.stage1_semantic_input_hash
+    assert comparison["current"]["source_pdf_content_sha256"] == "a" * 64
+
+
+def test_reuse_binding_invalidates_different_pdf_bytes_with_same_semantic_input() -> None:
+    common = {
+        "canonical_paper_key": "10.1000/verified",
+        "source_mode": "direct",
+        "source_pdf_content_sha256": "a" * 64,
+        "stage1_extracted_text_hash": "b" * 64,
+        "stage1_semantic_input_hash": "c" * 64,
+        "preprocess_contract_hash": "d" * 64,
+        "prompt_template_hash": "e" * 64,
+        "input_builder_policy_hash": "f" * 64,
+        "provider_config_hash": "1" * 64,
+        "summary_schema_hash": "2" * 64,
+        "visual_input_manifest_hash": "3" * 64,
+    }
+    original = Stage1ReusableSummaryBindingV1(**common)
+    changed = Stage1ReusableSummaryBindingV1(**{**common, "source_pdf_content_sha256": "9" * 64})
+
+    comparison = original.compare(changed)
+
+    assert comparison["equal"] is False
+    assert "source_pdf_content_sha256" in comparison["mismatches"]
+
+
+def test_reuse_requires_authority_payload_to_match_imported_summary(tmp_path: Path) -> None:
+    from services.stage1_reuse import evaluate_stage1_reuse
+
+    authority_path = tmp_path / "authority.json"
+    authority_payload = {
+        "artifact_type": "summary_file",
+        "artifact_version": "v1",
+        "source_kind": "stage1_provider_generated",
+        "job_id": "parent-job",
+        "paper_info": {"canonical_paper_key": "10.1000/verified"},
+        "ai_summary": {"summary": "authoritative"},
+    }
+    authority_path.write_text(json.dumps([authority_payload]), encoding="utf-8")
+    registry = ArtifactRegistry(str(tmp_path / "registry.json"), "child-job")
+    # The authority is intentionally represented as a parent-owned record;
+    # evaluate_stage1_reuse must inspect its payload rather than trust a path.
+    parent_registry = ArtifactRegistry(str(tmp_path / "parent-registry.json"), "parent-job")
+    authority_record = parent_registry.register_file(
+        artifact_role="summary_source",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=authority_path,
+        producer="test",
+        artifact_id="parent:summary",
+    )
+    binding = Stage1ReusableSummaryBindingV1(
+        canonical_paper_key="10.1000/verified",
+        source_mode="direct",
+        source_pdf_content_sha256="a" * 64,
+        stage1_extracted_text_hash="b" * 64,
+        stage1_semantic_input_hash="c" * 64,
+        preprocess_contract_hash="d" * 64,
+        prompt_template_hash="e" * 64,
+        input_builder_policy_hash="f" * 64,
+        provider_config_hash="1" * 64,
+        summary_schema_hash="2" * 64,
+        visual_input_manifest_hash="3" * 64,
+        source_authority_job_id="parent-job",
+        source_authority_artifact_id=authority_record.artifact_id,
+        source_authority_artifact_hash=authority_record.content_hash,
+        source_authority_artifact_path=str(authority_path),
+        source_authority_registry_path=str(parent_registry.registry_path),
+    )
+    imported = {
+        "status": "success",
+        "paper_info": {"canonical_paper_key": "10.1000/verified"},
+        "ai_summary": {"summary": "tampered import"},
+        "stage1_reuse": {"binding": binding.to_dict()},
+    }
+    current = binding
+
+    result = evaluate_stage1_reuse(
+        imported,
+        current,
+        registry=registry,
+        external_registry_resolver=lambda job_id: parent_registry if job_id == "parent-job" else None,
+    )
+
+    assert result.reusable is False
+    assert result.decision == "identity_match_unverified"
+    assert "payload" in result.reason

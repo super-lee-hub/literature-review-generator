@@ -287,6 +287,7 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
+            workspace_path=str(payload.get("workspace_path") or ""),
             metadata=dict(payload.get("metadata") or {}),
         )
 
