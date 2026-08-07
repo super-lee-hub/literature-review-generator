@@ -1,6 +1,6 @@
 # PR14 Current Validation Evidence
 
-Date: 2026-08-07 (Asia/Shanghai)
+Date: 2026-08-08 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 Code/test verification: refreshed at the final pre-publication branch tip; the
@@ -27,6 +27,12 @@ The current path persists and checks:
 - stage-indexed provider closure derived from the durable requested-stage spec;
 - typed `stage1_reusable_summary_manifest/v1` source-manifest validation and
   canonical one-item-array `summary_file` payloads for per-paper reuse sources;
+- Registry-detached typed-manifest verification that still requires the
+  referenced source summary, provider closure, and provider ledger when calls
+  occurred to remain available and hash-valid;
+- path-independent multimodal Stage 1 equality over visual content bytes,
+  page/range/region, type, rank, policy, caption/context semantics, score,
+  dedupe identity, and bundle counts while excluding machine-local paths;
 - durable stage-plan policy for `run_all`: validation-enabled runs request
   analyze/outline/review/validate; optional validation-disabled runs request
   analyze/outline/review but still require the current artifact set;
@@ -43,8 +49,10 @@ The current path persists and checks:
 
 | Evidence | Result |
 |---|---|
-| Focused boundary regressions | passed: `147 passed` in `693.64s`; queue, closure, lease publication, repair, export, Stage 1, validation parity, JobOutcome projection, zero-call, and architecture groups |
-| Strict offline full gate | passed: `833 passed, 22 deselected` from `855 collected` in `2644.77s` (`44:04`) |
+| Changed Stage 1 generation/reuse module | passed: `22 passed` in `185.84s`; supported preprocess settings, moved-path multimodal reuse, visual invalidation, and missing typed-manifest authority blobs |
+| Consolidated frozen-contract suite | passed: `204 passed` in `1844.75s`; Stage 1 trust boundaries, Queue/Registry publication, JobOutcome projection, stage-specific zero-call, Outline v3, and architecture guards |
+| Validation policy/parity suite | passed: `13 passed` in `438.33s`; direct, CLI, GUI, queue, resume, required, findings, and optional-validation behavior |
+| Strict offline full gate | passed: `843 passed, 22 deselected` from `865 collected` in `3251.61s` (`54:11`) |
 | `python -m compileall -q .` | passed |
 | `python -m pyright` | `0 errors, 0 warnings, 0 informations` |
 | `python -m reviewctl doctor --config config.ini.example` | exit `0`, `ok=true`, read-only, zero provider calls; `status=warn` only for pre-existing stale locks |
@@ -68,7 +76,7 @@ candidate nodes and reruns the failed critic plus its downstream closure.
 The production-shaped chain injects deterministic responses at the configured
 transport boundary. It is `E2E_VERIFIED`, not `LIVE_VERIFIED`.
 
-`2644.77s` is the local pytest duration. The final GitHub Actions run/job IDs,
+`3251.61s` is the local pytest duration. The final GitHub Actions run/job IDs,
 conclusion, and CI duration are reported separately in the PR description for
 the final remote SHA; the local duration is not reused as CI timing evidence.
 
@@ -79,6 +87,4 @@ the final remote SHA; the local duration is not reused as CI timing evidence.
 - Multi-host publication and fencing were not run.
 - Focused negative tests cover the requested boundaries, but are not one
   monolithic failure-chain suite.
-- The ZIP files are absent from the committed diff and remote branch. The local
-  operator reports that they were not read or staged; remote GitHub evidence
-  cannot independently verify local read access.
+> The ZIP files are absent from the committed diff and remote branch. The local operator reports that they were not read or staged; remote GitHub evidence cannot independently verify local read access.

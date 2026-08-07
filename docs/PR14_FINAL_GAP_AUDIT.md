@@ -1,6 +1,6 @@
 # PR #14 Final Gap Audit
 
-Date: 2026-08-07 (Asia/Shanghai)
+Date: 2026-08-08 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 PR: #14 (`Draft` / `Open` / `Unmerged`)
@@ -10,15 +10,13 @@ final commit SHA is recorded in the PR description and delivery report.
 This audit covers the requested current-path remediation. It does not promote
 deterministic provider injection to live-provider verification.
 
-Continuation verification added the explicit `summary_file` array contract for
-per-paper Stage 1 reuse sources and registered a versioned
-`stage1_reusable_summary_manifest/v1` validator. The all-reuse, mixed-reuse,
-summary-source zero-call, and Stage 1 adversarial production-shaped paths were
-rerun after that change.
+Continuation verification replaced a synthetic preprocess setting with supported
+`strategy_policy`, `parser_mode`, and `primary_parser` cases; added path-independent
+multimodal exact reuse plus visual-content/policy/selection invalidation; and
+verified that Registry-detached typed manifests reject missing source-summary,
+provider-closure, and required provider-ledger authority blobs.
 
-The ZIP files are absent from the committed diff and remote branch. The local
-operator reports that they were not read or staged; remote GitHub evidence
-cannot independently verify local read access.
+> The ZIP files are absent from the committed diff and remote branch. The local operator reports that they were not read or staged; remote GitHub evidence cannot independently verify local read access.
 
 ## Requirement matrix
 
@@ -32,20 +30,21 @@ cannot independently verify local read access.
 | Stage plan and `run_all` completion | Durable stage plan normalizes `run_all` to analyze/outline/review/validate when validation is enabled, omits only optional validation when disabled, still requires a current set, and blocks derivation/outline-only canonical readiness without that set | `E2E_VERIFIED` | Validation is still provider-free only when explicitly disabled or not requested |
 | Optional validation disposition/export | Typed `ValidationDispositionV1` with `status=not_requested`, `allow_unvalidated=true`, stage/spec hashes, review/citation/DOCX identities, a zero-call validation receipt closure, current-set binding, and a generated `canonical_unvalidated` ZIP | `E2E_VERIFIED` | It records intentional non-requesting; it does not claim validation passed |
 | Receipt closure | Fully bound calls, expected/missing/unexpected/out-of-scope/hash mismatch cases, zero-call/all-reuse and summary-source paths, same-epoch checks, and historical isolation | `E2E_VERIFIED` | No live-provider run |
+| Stage 1 exact reuse and detached authority | Real supported preprocess settings invalidate reuse; equivalent visual evidence survives a path move; visual bytes, policy, or selection changes regenerate; missing referenced authority blobs fail closed | `E2E_VERIFIED` | The typed manifest is not a signed, self-contained, single-file, or cross-host portable archive |
 | Queue fencing/publication | Lease-generation staging, queue-lock -> Registry publication order, one atomic target-plus-manifest Registry commit, manifest/fsync/CAS failure orphan tests, immutable byte finalization, and Windows `spawn` stale-worker current-set race | `E2E_VERIFIED` | No production multi-host run |
 | Negative/UI boundary coverage | Focused malformed-artifact, closure, promotion, export-failure, queue, GUI-controller, and label/status tests | `CONTROLLER_VERIFIED` | Playwright was not run in the offline gate; no single umbrella failure-chain suite |
 | Trust-bound export | Versioned `export_bundle` validator, typed current-set targets, stage/receipt/current-set evidence, canonical verified and canonical unvalidated admission, registration-failure cleanup, and forensic read-back | `E2E_VERIFIED` | Future work may add more checksum/read-failure permutations |
 
 ## Fresh local evidence
 
-- `python -m pytest --collect-only -q`: `855` tests collected; the strict marker
-  selection is `833 selected / 22 deselected`.
+- `python -m pytest --collect-only -q`: `865` tests collected; the strict marker
+  selection is `843 selected / 22 deselected`.
 - The exact strict command
   `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"`
-  passed: `833 passed, 22 deselected` in `2644.77s` (`44:04`).
-- The formerly failing all-reuse zero-call regression passed independently:
-  `1 passed in 70.08s`. The combined Stage1/Registry/lease/validation parity/
-  JobOutcome/zero-call/architecture suite then passed: `147 passed in 693.64s`.
+  passed: `843 passed, 22 deselected` in `3251.61s` (`54:11`).
+- The changed Stage 1 module passed: `22 passed in 185.84s`. The consolidated
+  frozen-contract suite passed: `204 passed in 1844.75s`. The validation-policy/
+  parity suite passed separately: `13 passed in 438.33s`.
 - `python -m compileall -q .`: passed.
 - `python -m pyright`: `0 errors, 0 warnings, 0 informations`.
 - `python -m reviewctl doctor --config config.ini.example`: `ok=true`,
@@ -53,7 +52,7 @@ cannot independently verify local read access.
   the repository's pre-existing stale locks. Artifact-integrity and running-job
   checks are skipped because no workspace was supplied.
 - `git diff --check`: passed on the final working tree and explicit staged diff.
-- `2644.77s` is the local pytest duration. Final-SHA GitHub Actions run/job IDs,
+- `3251.61s` is the local pytest duration. Final-SHA GitHub Actions run/job IDs,
   conclusion, and CI duration are reported separately in the PR description.
 
 ## Stage, stability, and retry evidence
@@ -95,3 +94,12 @@ cannot independently verify local read access.
   this task.
 - Remote SHA, fresh GitHub Actions result, final PR body, and final PR state
   are verified after the final push rather than inferred from older evidence.
+
+## Non-blocking polish
+
+- There is no isolated page-metadata-only mutation test. Production equality
+  already binds page number, page range, and bounding box, and the multimodal
+  positive/negative matrix exercises the complete visual identity.
+- There is no post-import deletion test for the typed manifest file itself. The
+  current verifier's unreadable-manifest branch fails closed, while the new tests
+  directly cover deletion of every referenced authority blob.

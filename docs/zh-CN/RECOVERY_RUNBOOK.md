@@ -55,6 +55,10 @@ python -m reviewctl attest --workspace <workspace>
   summary payload hash。相同字节换路径可复用并记录位置；PDF 字节不同即使 text hash 相同也
   必须失效。provider-generated source 只要有 call，就必须有 Registry 验证的原始 receipt
   closure 与 ledger。
+  使用 Registry-detached typed manifest 恢复时，必须保留其引用的 source summary、provider
+  receipt closure 和发生 call 时所需的 receipt ledger blob，并校验各自 hash。manifest 本身
+  不是自包含且经过密码学认证的 archive、signed provenance、单文件 portable bundle 或
+  cross-host portability 证明。
 
 ```text
 python -m reviewctl resume --workspace <workspace>

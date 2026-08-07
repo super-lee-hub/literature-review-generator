@@ -443,16 +443,21 @@ class Stage1AnalysisService:
             str(preprocess_metadata.get("stage1_input_text") or "")
         )
         prompt_template_hash = hash_text(self._prompt_template())
-        visual_input_manifest_hash = hash_json(dict(visual_bundle or {}))
+        visual_identity = self._build_visual_semantic_identity(
+            visual_bundle=visual_bundle,
+            selected_visual_refs=built_input.selected_visual_refs,
+            selection_policy_snapshot=built_input.visual_selection_policy_snapshot,
+        )
+        semantic_visual_refs = list(visual_identity.get("selected_visuals") or [])
+        semantic_visual_policy = dict(visual_identity.get("selection_policy") or {})
+        visual_input_manifest_hash = hash_json(visual_identity)
         input_builder_policy_hash = hash_json(
             {
                 "builder_version": "Stage1InputBuilder:v1",
                 "stage1_input_policy": _redact_mapping(stage1_input_settings),
                 "input_mode": str(built_input.input_mode or ""),
-                "selected_visual_refs": list(built_input.selected_visual_refs or []),
-                "visual_selection_policy_snapshot": dict(
-                    built_input.visual_selection_policy_snapshot or {}
-                ),
+                "selected_visual_refs": semantic_visual_refs,
+                "visual_selection_policy_snapshot": semantic_visual_policy,
                 "multimodal_capability": dict(built_input.multimodal_capability or {}),
                 "pdf_attachment_status": str(built_input.pdf_attachment_status or ""),
             }
@@ -485,10 +490,8 @@ class Stage1AnalysisService:
                         str(preprocess_metadata.get("stage1_input_text") or "")
                     ),
                     "input_mode": str(built_input.input_mode or ""),
-                    "selected_visual_refs": list(built_input.selected_visual_refs or []),
-                    "visual_selection_policy_snapshot": dict(
-                        built_input.visual_selection_policy_snapshot or {}
-                    ),
+                    "selected_visual_refs": semantic_visual_refs,
+                    "visual_selection_policy_snapshot": semantic_visual_policy,
                     "multimodal_capability": dict(built_input.multimodal_capability or {}),
                     "pdf_attachment_status": str(built_input.pdf_attachment_status or ""),
                 }
@@ -499,7 +502,7 @@ class Stage1AnalysisService:
                     "source_text_hash": hash_text(
                         str(preprocess_metadata.get("stage1_input_text") or "")
                     ),
-                    "visual_provenance_hash": hash_json(dict(visual_bundle or {})),
+                    "visual_provenance_hash": visual_input_manifest_hash,
                 }
             ),
             builder_version="Stage1InputBuilder:v1",
@@ -513,7 +516,7 @@ class Stage1AnalysisService:
             endpoint_type=str(primary_config.get("endpoint_type") or "chat_completions"),
             provider_config_hash=hash_json(_redact_mapping(primary_config)),
             schema_hash=self._schema_hash(),
-            visual_provenance_hash=hash_json(dict(visual_bundle or {})),
+            visual_provenance_hash=visual_input_manifest_hash,
             source_kind="stage1_provider_generated",
             evidence_manifest_id=evidence_record.artifact_id,
             evidence_manifest_hash=evidence_record.content_hash,
@@ -530,6 +533,74 @@ class Stage1AnalysisService:
                 "provider_transport_count": 1,
             },
         )
+
+    @staticmethod
+    def _build_visual_semantic_identity(
+        *,
+        visual_bundle: Mapping[str, Any],
+        selected_visual_refs: Sequence[Mapping[str, Any]],
+        selection_policy_snapshot: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Project visual evidence into a path-independent reuse identity."""
+
+        refs = [dict(item) for item in selected_visual_refs if isinstance(item, Mapping)]
+        policy = dict(selection_policy_snapshot or {})
+        if not refs and not policy:
+            return {}
+
+        selected_visuals: list[dict[str, Any]] = []
+        for selection_rank, visual in enumerate(refs, start=1):
+            image_path = str(visual.get("image_path") or "").strip()
+            image_content_sha256 = (
+                file_sha256(image_path) if image_path and Path(image_path).is_file() else ""
+            )
+            bbox: list[float] = []
+            raw_bbox = visual.get("bbox")
+            if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
+                try:
+                    bbox = [round(float(value), 2) for value in raw_bbox]
+                except (TypeError, ValueError):
+                    bbox = []
+            page_range = []
+            raw_page_range = visual.get("page_range")
+            if isinstance(raw_page_range, (list, tuple)):
+                try:
+                    page_range = [int(value) for value in raw_page_range]
+                except (TypeError, ValueError):
+                    page_range = []
+
+            selected_visuals.append(
+                {
+                    "selection_rank": selection_rank,
+                    "visual_id": str(visual.get("visual_id") or ""),
+                    "page_no": int(visual.get("page_no") or 0),
+                    "page_range": page_range,
+                    "bbox": bbox,
+                    "artifact_type": str(visual.get("artifact_type") or ""),
+                    "source_type": str(visual.get("source_type") or ""),
+                    "image_content_sha256": image_content_sha256,
+                    "caption_excerpt_hash": hash_text(
+                        " ".join(str(visual.get("caption_excerpt") or "").split())
+                    ),
+                    "nearby_text_excerpt_hash": hash_text(
+                        " ".join(str(visual.get("nearby_text_excerpt") or "").split())
+                    ),
+                    "selection_reason_hash": hash_text(
+                        " ".join(str(visual.get("selection_reason") or "").split())
+                    ),
+                    "selection_score": float(visual.get("selection_score") or 0.0),
+                    "dedupe_group_id": str(visual.get("dedupe_group_id") or ""),
+                }
+            )
+
+        return {
+            "identity_version": "stage1_visual_semantic_identity/v1",
+            "artifact_type": str(visual_bundle.get("artifact_type") or ""),
+            "artifact_version": str(visual_bundle.get("artifact_version") or ""),
+            "selection_policy": policy,
+            "bundle_metadata": dict(visual_bundle.get("bundle_metadata") or {}),
+            "selected_visuals": selected_visuals,
+        }
 
     def _preprocess_policy_fingerprint(self) -> Mapping[str, Any]:
         """Return the semantic preprocessing policy without machine-local paths.

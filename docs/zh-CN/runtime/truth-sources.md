@@ -87,6 +87,12 @@ Registry 解析 source artifact，或使用自绑定的 typed
 `current_snapshot_derived_from_external_authority=true`，它只是派生证据，永远不是
 authority。仅有 path、current snapshot、bare summary 或 synthetic ID/hash 都不能授权复用。
 
+typed manifest authority 路径属于 Registry-detached 验证：manifest 可以跨 Registry
+边界使用，但它不是自包含且经过密码学认证的 archive。其引用的 source summary
+artifact、provider receipt closure，以及所需的 provider receipt ledger 必须持续可用且
+hash-valid。这不代表单文件完整 portable bundle、signed provenance 或 cross-host
+portability。
+
 精确 equality 包含真实 PDF 字节 SHA（`source_pdf_content_sha256`）、extracted text 与
 semantic input hash（`stage1_extracted_text_hash`、`stage1_semantic_input_hash`）、
 preprocess/input policy hash、prompt hash、provider/model binding、schema hash、visual

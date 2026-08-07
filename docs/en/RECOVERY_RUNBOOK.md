@@ -53,6 +53,11 @@ the Registry record is absent.
   are allowed with location tracing; different bytes invalidate reuse even when
   text hashes match. Provider-generated sources with calls require the original
   Registry-verified receipt closure and ledger.
+  During Registry-detached typed-manifest recovery, retain the referenced source
+  summary, provider receipt closure, and receipt ledger required when calls occurred,
+  and verify their hashes. The manifest alone is not a self-contained
+  cryptographically authenticated archive, signed provenance, single-file portable
+  bundle, or cross-host portability proof.
 
 ## 3. Resume
 

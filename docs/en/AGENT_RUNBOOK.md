@@ -77,6 +77,11 @@ Use `--workspace <workspace_path>` when the job ID cannot be resolved. All comma
   accepts only a parent/current Registry source resolved by the external resolver
   or a self-binding typed `stage1_reusable_summary_manifest/v1`; a current snapshot
   is `current_snapshot_derived_from_external_authority=true` and never authority.
+  This typed-manifest path is Registry-detached, not a self-contained
+  cryptographically authenticated archive: its referenced summary, receipt closure,
+  and receipt ledger required when calls occurred must remain available and
+  hash-valid. It does not provide a single-file
+  portable bundle, signed provenance, or cross-host portability.
   Path-only/current-snapshot/bare-summary inputs and synthetic IDs/hashes are
   insufficient. Exact equality covers the real PDF byte SHA, extracted/semantic
   hashes, preprocess/input/prompt/provider/model/schema/visual hashes, and normalized

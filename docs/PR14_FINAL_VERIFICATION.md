@@ -1,14 +1,14 @@
 # PR #14 Final Verification
 
-Verification date: 2026-08-07 (Asia/Shanghai)
+Verification date: 2026-08-08 (Asia/Shanghai)
 Branch: `codex/platform-hardening-outline-v3`
 Target: existing PR #14, kept Draft/Open/Unmerged
 Code/test verification: refreshed at the final pre-publication branch tip; the
 final commit SHA is recorded in the PR description and delivery report.
 
-This refresh includes the typed Stage 1 reusable-summary source-manifest
-validator and the canonical one-item-array representation for per-paper
-`summary_file` reuse sources.
+This refresh includes supported preprocess invalidation, path-independent
+multimodal exact reuse, visual semantic invalidation, and Registry-detached
+typed-manifest authority-blob failure coverage.
 
 ## Local acceptance
 
@@ -16,11 +16,13 @@ validator and the canonical one-item-array representation for per-paper
 |---|---|
 | `python -m compileall -q .` | PASS |
 | `python -m pyright` | PASS: 0 errors, 0 warnings, 0 informations |
-| `python -m pytest --collect-only -q` | PASS: 855 tests collected; filtered gate selects 833 and deselects 22 |
-| Strict offline gate | PASS: `833 passed, 22 deselected` in `2644.77s` (`44:04`) |
-| Focused boundary regressions | PASS: `147 passed in 693.64s` across Stage1 closure/reuse, Registry/lease publication, dependency lifecycle, validation parity, JobOutcome projection, zero-call, and architecture guards |
+| `python -m pytest --collect-only -q` | PASS: 865 tests collected; filtered gate selects 843 and deselects 22 |
+| Strict offline gate | PASS: `843 passed, 22 deselected` in `3251.61s` (`54:11`) |
+| Changed Stage 1 module | PASS: `22 passed in 185.84s` for supported preprocess settings, multimodal path portability/invalidation, and missing detached-authority blobs |
+| Consolidated frozen-contract suite | PASS: `204 passed in 1844.75s` across Stage 1 trust boundaries, Registry/lease publication, JobOutcome projection, zero-call, Outline v3, and architecture guards |
+| Validation policy/parity suite | PASS: `13 passed in 438.33s` across direct, CLI, GUI, queue, resume, required, findings, and optional-validation behavior |
 | Current production-shaped chain | PASS: three-PDF runner through validation, export, and attestation |
-| Stage 1 reuse/closure | PASS: production-shaped all-reuse, mixed-reuse, summary-source zero-call, adversarial identity/hash/dependency matrix, and real Registry source-artifact provenance; zero-call paths do not create synthetic receipts |
+| Stage 1 reuse/closure | PASS: production-shaped all-reuse, mixed-reuse, summary-source zero-call, supported preprocess invalidation, moved-path multimodal reuse, visual semantic invalidation, missing authority-blob failure, and adversarial identity/hash/dependency coverage; zero-call paths do not create synthetic receipts |
 | Atomic repair promotion | PASS: prepared transaction/hash/current-set/pointer fault boundaries |
 | Provider receipt closure | PASS: binding, historical isolation, unexpected/out-of-scope/hash cases |
 | Stability/replay | PASS: `off`/`smoke`/`full` contracts, coverage-critic failure/resume exact descendant sequence, candidate-specific invalidation, per-node call/token/cost plans, explicit pricing status, checkpoints, zero-transport replay |
@@ -37,15 +39,13 @@ validator and the canonical one-item-array representation for per-paper
 - Deterministic provider injection is reported as `E2E_VERIFIED`, not live
   provider verification.
 - Playwright, heavy OCR, live API, and multi-host tests were not run.
-- The exact strict offline aggregate completed with `833 passed, 22 deselected`
-  in `2644.77s`; no live-provider, Playwright, heavy-OCR, or multi-host result is
+- The exact strict offline aggregate completed with `843 passed, 22 deselected`
+  in `3251.61s`; no live-provider, Playwright, heavy-OCR, or multi-host result is
   included.
 - No merge, main update, Ready-for-review transition, or auto-merge is part of
   this task.
-- The ZIP files are absent from the committed diff and remote branch. The local
-  operator reports that they were not read or staged; remote GitHub evidence
-  cannot independently verify local read access.
+> The ZIP files are absent from the committed diff and remote branch. The local operator reports that they were not read or staged; remote GitHub evidence cannot independently verify local read access.
 - Final remote SHA, fresh CI result, and PR state are added to the PR
   description after the final push; older CI is not reused as evidence.
-- `2644.77s` is local pytest time. The final GitHub Actions duration is recorded
+- `3251.61s` is local pytest time. The final GitHub Actions duration is recorded
   separately with its run/job IDs and is not inferred from local timing.

@@ -71,7 +71,11 @@ hash-valid receipt ledger 和精确 call set；count 等于零必须有有效 ex
 零 terminal model call、零 observed receipt 及 typed source evidence，不能伪造空 ledger。
 Stage 1 reuse 只接受 external resolver 从 parent/current Registry 解析的 source，或
 自绑定 typed `stage1_reusable_summary_manifest/v1`；当前 snapshot 必须标记
-`current_snapshot_derived_from_external_authority=true`，永远不是 authority。仅有 path、
+`current_snapshot_derived_from_external_authority=true`，永远不是 authority。
+该 typed manifest 路径是 Registry-detached，而不是自包含且经过密码学认证的 archive；
+其引用的 summary、receipt closure 和发生 call 时所需的 receipt ledger blob 必须持续可用且
+hash-valid。它不提供
+单文件 portable bundle、signed provenance 或 cross-host portability。仅有 path、
 current snapshot、bare summary 或 synthetic ID/hash 都不够。精确 equality 包含真实 PDF
 字节 SHA、extracted/semantic hash、preprocess/input/prompt/provider/model/schema/visual
 hash 和 normalized summary payload hash。相同字节换路径可复用，但须记录原始/当前位置和

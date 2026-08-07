@@ -115,6 +115,13 @@ summary bytes all verify. A current-run snapshot is marked
 never authority. Path-only input, a current snapshot, a bare summary, or
 synthetic IDs/hashes cannot authorize reuse.
 
+The typed-manifest authority path is Registry-detached: the manifest is portable
+across Registry boundaries, but it is not a self-contained cryptographically
+authenticated archive. Its referenced source summary artifact, provider receipt
+closure, and required provider receipt ledger must remain available and
+hash-valid. This does not claim a single-file portable bundle, signed provenance,
+or cross-host portability.
+
 Exact reuse equality includes the real PDF byte SHA
 (`source_pdf_content_sha256`), extracted-text and semantic-input hashes
 (`stage1_extracted_text_hash`, `stage1_semantic_input_hash`), preprocess/input
