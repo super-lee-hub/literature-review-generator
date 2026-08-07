@@ -379,7 +379,7 @@ def _derive_current_evidence(
             continue
         try:
             ArtifactRegistry._verify_ready_artifact(record)
-            registry.verify_ready_dependencies(record.depends_on)
+            registry.verify_ready_dependencies(record.depends_on, owner_record=record)
         except (OSError, RegistryError, ValueError, TypeError) as exc:
             dependency_issues.append(f"{record.artifact_id}:{exc}")
     if dependency_issues:

@@ -13,6 +13,14 @@ python -m reviewctl attest --workspace <workspace>
 
 The status and attestation outputs identify the job state, failed node, provider error kind, Registry integrity, dependency graph, and preserved completed nodes.
 
+Treat the Registry record with `artifact_id=job_outcome` as the sole canonical
+`JobOutcomeV1` authority. Validate any fixed `job_outcome_v1.json` file as the
+mutable `job_outcome_compatibility_projection/v1` against that Registry ID/hash;
+a projection write failure is only a warning/reconcile issue. Treat the immutable
+Registry-owned `resume_state_report/v1` as the resume-report authority. Use the
+fixed `resume_state_report.json` path only as the explicit legacy fallback when
+the Registry record is absent.
+
 ## 2. Choose the smallest safe action
 
 - Provider quota, retryable HTTP, transient network, or invalid-response failure: inspect the provider receipt and retry only the failed node when `next-action.safe_to_retry` is true.
@@ -34,7 +42,17 @@ The status and attestation outputs identify the job state, failed node, provider
   papers appear in the expected call graph; summary-source zero-call stages use
   typed summary-source evidence. A per-paper reused `summary_file` must be a
   canonical one-item array with a valid `stage1_reusable_summary_manifest/v1`;
-  do not substitute a JSON object envelope or an unregistered path.
+  do not substitute a JSON object envelope or an unregistered path. Stage 1 reuse
+  must resolve authority from the parent/current Registry through the external
+  resolver or from a self-binding typed manifest. A current snapshot marked
+  `current_snapshot_derived_from_external_authority=true` is derived evidence,
+  never authority; path-only/current-snapshot/bare-summary inputs and synthetic
+  IDs/hashes are insufficient. Exact equality includes the real PDF byte SHA,
+  extracted/semantic hashes, preprocess/input/prompt/provider/model/schema/visual
+  hashes, and normalized summary payload hash. Same bytes moved to another path
+  are allowed with location tracing; different bytes invalidate reuse even when
+  text hashes match. Provider-generated sources with calls require the original
+  Registry-verified receipt closure and ledger.
 
 ## 3. Resume
 

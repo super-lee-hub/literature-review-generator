@@ -1,6 +1,6 @@
 # PR #14 Final Gap Audit
 
-Date: 2026-08-06 (Asia/Shanghai)
+Date: 2026-08-07 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 PR: #14 (`Draft` / `Open` / `Unmerged`)
@@ -38,23 +38,23 @@ cannot independently verify local read access.
 
 ## Fresh local evidence
 
-- `python -m pytest --collect-only -q`: `784` tests collected; the strict marker
-  selection is `762 selected / 22 deselected`.
+- `python -m pytest --collect-only -q`: `855` tests collected; the strict marker
+  selection is `833 selected / 22 deselected`.
 - The exact strict command
   `python -m pytest -q --strict-markers -m "not live_api and not playwright and not heavy_ocr"`
-  passed: `762 passed, 22 deselected` in `1010.96s` (`16:50`).
-- Focused evidence also passed for the required paths: PR14 remediation `12`,
-  Stage1 closure matrix `1`, all/mixed-reuse and summary-source zero-call `1`,
-  Stage1 contracts `5`, critic/invalidation `8`, semantic pricing/token `24`,
-  DAG replay `3`, queue/lease `14`, current runtime/export `3`, and
-  stage-planning/GUI/controller/queue `39` tests.
+  passed: `833 passed, 22 deselected` in `2644.77s` (`44:04`).
+- The formerly failing all-reuse zero-call regression passed independently:
+  `1 passed in 70.08s`. The combined Stage1/Registry/lease/validation parity/
+  JobOutcome/zero-call/architecture suite then passed: `147 passed in 693.64s`.
 - `python -m compileall -q .`: passed.
 - `python -m pyright`: `0 errors, 0 warnings, 0 informations`.
 - `python -m reviewctl doctor --config config.ini.example`: `ok=true`,
-  read-only, zero provider network calls; status warning only reports the
-  repository's pre-existing stale locks.
-- `git diff --check`: passed before final staging; rerun after staging is
-  required before commit.
+  exit `0`, read-only, zero provider network calls; `status=warn` only reports
+  the repository's pre-existing stale locks. Artifact-integrity and running-job
+  checks are skipped because no workspace was supplied.
+- `git diff --check`: passed on the final working tree and explicit staged diff.
+- `2644.77s` is the local pytest duration. Final-SHA GitHub Actions run/job IDs,
+  conclusion, and CI duration are reported separately in the PR description.
 
 ## Stage, stability, and retry evidence
 
@@ -88,7 +88,7 @@ cannot independently verify local read access.
 
 ## Explicit non-claims
 
-- No external live API, Playwright, or heavy OCR result is claimed.
+- No external live API, Playwright, heavy OCR, or multi-host result is claimed.
 - The deterministic three-PDF production-shaped chain is `E2E_VERIFIED`, not
   `LIVE_VERIFIED`.
 - No merge, main update, Ready-for-review transition, or auto-merge is part of

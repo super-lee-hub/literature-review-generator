@@ -1,6 +1,6 @@
 # PR14 Current Validation Evidence
 
-Date: 2026-08-06 (Asia/Shanghai)
+Date: 2026-08-07 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
 Code/test verification: refreshed at the final pre-publication branch tip; the
@@ -43,10 +43,12 @@ The current path persists and checks:
 
 | Evidence | Result |
 |---|---|
-| Focused boundary regressions | passed; queue, closure, repair, export, Stage 1, validation, GUI-controller, adoption, multimodal, and Outline groups |
-| Strict offline full gate | passed: `762 selected, 22 deselected` from `784 collected` in `1010.96s` |
+| Focused boundary regressions | passed: `147 passed` in `693.64s`; queue, closure, lease publication, repair, export, Stage 1, validation parity, JobOutcome projection, zero-call, and architecture groups |
+| Strict offline full gate | passed: `833 passed, 22 deselected` from `855 collected` in `2644.77s` (`44:04`) |
 | `python -m compileall -q .` | passed |
 | `python -m pyright` | `0 errors, 0 warnings, 0 informations` |
+| `python -m reviewctl doctor --config config.ini.example` | exit `0`, `ok=true`, read-only, zero provider calls; `status=warn` only for pre-existing stale locks |
+| `git diff --check` | passed on the final working tree and explicit staged diff |
 | Current production-shaped three-PDF chain | passed; explicit adoption, current validation, export, and attestation |
 | Current repair control-plane E2E | passed; revalidation, DOCX rebuild, audit promotion, and atomic current-set switch |
 | Full stability and replay | passed; full perturbation path and zero-transport exact replay |
@@ -66,10 +68,15 @@ candidate nodes and reruns the failed critic plus its downstream closure.
 The production-shaped chain injects deterministic responses at the configured
 transport boundary. It is `E2E_VERIFIED`, not `LIVE_VERIFIED`.
 
+`2644.77s` is the local pytest duration. The final GitHub Actions run/job IDs,
+conclusion, and CI duration are reported separately in the PR description for
+the final remote SHA; the local duration is not reused as CI timing evidence.
+
 ## Remaining limits
 
 - No external live-provider call was made.
 - Playwright and heavy OCR were excluded by the offline gate.
+- Multi-host publication and fencing were not run.
 - Focused negative tests cover the requested boundaries, but are not one
   monolithic failure-chain suite.
 - The ZIP files are absent from the committed diff and remote branch. The local

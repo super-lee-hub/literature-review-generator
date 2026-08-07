@@ -23,10 +23,19 @@
 - Direct publication 会记录最终 content-addressed path 是否由本次发布创建。若
   已有文件 hash 相同，则复用且 alias 注册失败时不得删除；若已有文件字节不同，
   必须在 Registry mutation 之前 fail-closed。
-- `job_outcome_v1.json` 是 job head 投影，记录生命周期、disposition、
-  readiness policy、必需/完成阶段和 `canonical_ready`。
+- Registry 中 `artifact_id=job_outcome`、`artifact_type=job_outcome`、
+  `artifact_version=v1` 的不可变 record 是唯一规范 `JobOutcomeV1` authority。读取时必须经 Registry 校验 job ID、
+  ready 状态、内容 hash、payload 契约和镜像 metadata。
+- 固定路径 `job_outcome_v1.json` 只是可变的
+  `job_outcome_compatibility_projection/v1`。它记录规范 `job_outcome` 的 ID/hash
+  与 outcome revision；读取时必须与 Registry head 校验一致。规范 commit 完成后，
+  projection 写失败只产生 warning/reconcile issue，不能改变规范 outcome。
 - `artifacts/job_attempts/snapshot-*.json` 是 append-only attempt history。
   过期的 running attempt 变为 `interrupted`，不会被下一次运行改写。
+- `resume_state_report` 是不可变的 Registry-owned `resume_state_report/v1` artifact，
+  是 resume report 的 authority。只有在 Registry 没有该 record 的旧工作区，reconcile
+  才能使用固定 `resume_state_report.json` 路径作为明确的 legacy fallback，且仍须校验
+  typed payload。
 - `runtime_stage_terminals/*/*.json` 只有在 output、hash、schema、dependency
   和 terminal record 全部通过校验时，才证明阶段完成。
 - `current-artifact-set:pointer` 解析出一个不可变的
@@ -71,14 +80,24 @@ paper identity 提供唯一 reuse record。reuse record 必须绑定真实已注
 原始 receipt 依赖。summary-source zero-call 阶段使用 typed summary-source evidence，
 不能用空 provider ledger 代替。
 
-Stage 1 reuse 必须在复用前比较已注册 source binding 与当前 source、preprocess、
-input、prompt、model、schema 和 visual-provenance 事实；必需事实缺失或变化时
-必须 fail-closed。可选 provider 名称只有在前一轮和当前配置都省略时才可视为一致。
-all-reuse 和 mixed-reuse 仍必须精确覆盖 SourceBundle identity，并为每个复用 paper
-保留一个可由 Registry 验证的 reuse record。单篇 `summary_file` 来源必须是
-canonical 的单元素 summary 数组，并同时有 typed
-`stage1_reusable_summary_manifest/v1`；本地快照 hash、原始 source authority、
-逻辑 summary payload hash 和 Registry file hash 必须分开保存。
+Stage 1 reuse 只有两条 authority 路径：通过 external resolver 从 parent/current
+Registry 解析 source artifact，或使用自绑定的 typed
+`stage1_reusable_summary_manifest/v1`，并校验 manifest ID/hash 与规范 summary bytes。
+当前运行的 snapshot 必须标记
+`current_snapshot_derived_from_external_authority=true`，它只是派生证据，永远不是
+authority。仅有 path、current snapshot、bare summary 或 synthetic ID/hash 都不能授权复用。
+
+精确 equality 包含真实 PDF 字节 SHA（`source_pdf_content_sha256`）、extracted text 与
+semantic input hash（`stage1_extracted_text_hash`、`stage1_semantic_input_hash`）、
+preprocess/input policy hash、prompt hash、provider/model binding、schema hash、visual
+input hash 和 normalized summary payload hash。相同 PDF 字节移动到新路径仍可复用，并记录
+原始/当前位置及 `location_changed`；即使 extracted 或 semantic text hash 相同，只要 PDF
+字节不同也必须 fail-closed。provider-generated source 只要 transport call 大于零，就必须
+同时有原始 provider receipt closure 与 receipt ledger，且二者均由 Registry 验证。
+all-reuse 与 mixed-reuse 仍须精确覆盖 SourceBundle identity，并为每个复用 paper 保留
+Registry 可验证的 reuse record。单篇 `summary_file` 必须是 canonical 单元素 summary 数组，
+并带 typed manifest；snapshot、source authority、summary payload 和 Registry file hash
+必须分开保存。
 
 ## 公开状态
 
@@ -166,7 +185,7 @@ receipt 为零且 typed source evidence 正确时才算 complete。缺失或意�
 Validation closure 要求当前 review draft、citation manifest 与
 `ValidationRunResultV1` 的输入 ID/hash 一致。若 validation 明确 optional 且禁用，
 必须存在 `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)`、
-stage/spec/current-artifact hashes 和空 receipt closure；它只证明未请求，不能证明
+stage/spec/current-artifact hashes 和 typed zero-call receipt closure；它只证明未请求，不能证明
 验证通过。Repair 默认 `report_only`；显式
 安全事务只创建 quarantine 的派生产物，并用当前 service 对精确文件重新验证
 且闭合 receipt。只有 `repair-promote` 能创建新版本并推进 current pointer，

@@ -3,8 +3,14 @@
 `reviewctl` is the control surface for an existing job workspace. Read commands
 are provider-free; `validate` is the explicit command that executes the current
 `ValidationExecutionService` and persists a new validation attempt. The control
-plane reads the durable Registry, job outcome, stage terminals, provider
-receipts, and Outline v3 DAG/replay state.
+plane reads the durable Registry, canonical `job_outcome` record, stage terminals,
+provider receipts, and Outline v3 DAG/replay state. The Registry record with
+`artifact_id=job_outcome` is the sole `JobOutcomeV1` authority; fixed
+`job_outcome_v1.json` is only the mutable `job_outcome_compatibility_projection/v1`
+and must validate its canonical ID/hash. A projection write failure is only a
+warning/reconcile issue. `resume_state_report/v1` is Registry-owned and immutable;
+the fixed resume-report path is a legacy fallback only when that Registry record is
+absent.
 
 Completion and export resolve the atomic `CurrentArtifactSetV1` through
 `current-artifact-set:pointer` and then build `CurrentStageClosureMapV1`; a
@@ -68,11 +74,18 @@ Use `--workspace <workspace_path>` when the job ID cannot be resolved. All comma
   require a current hash-valid receipt ledger with an exact call set; zero-call
   stages require a valid expected graph, zero terminal model calls and receipts,
   and typed source evidence, without a fabricated empty ledger. Stage 1 reuse
-  records must point to real registered source artifacts and preserve payload
-  and Registry file hashes separately. Per-paper `summary_file` authorities are
-  canonical one-item arrays and are accompanied by a typed
-  `stage1_reusable_summary_manifest/v1`; an external source authority, when
-  present, is a separate dependency and identity.
+  accepts only a parent/current Registry source resolved by the external resolver
+  or a self-binding typed `stage1_reusable_summary_manifest/v1`; a current snapshot
+  is `current_snapshot_derived_from_external_authority=true` and never authority.
+  Path-only/current-snapshot/bare-summary inputs and synthetic IDs/hashes are
+  insufficient. Exact equality covers the real PDF byte SHA, extracted/semantic
+  hashes, preprocess/input/prompt/provider/model/schema/visual hashes, and normalized
+  summary payload hash. Same bytes at a moved path are allowed with original/current
+  locations and `location_changed` traced; different bytes invalidate reuse even if
+  text hashes match. Provider-generated sources with calls require the original
+  Registry-verified receipt closure and ledger. Per-paper `summary_file` authorities
+  remain canonical one-item arrays with the typed manifest; payload and Registry
+  file hashes stay separate.
 - For a Stage 1 all-reuse run, expect no current-epoch provider receipts and
   one unique reuse record per SourceBundle paper. A mixed run must show provider
   calls only for generated papers; a summary-source zero-call run must use its

@@ -21,9 +21,15 @@ from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRecord,
     ArtifactRegistry,
+    RegistryError,
     file_sha256,
 )
-from services.job_outcome import JobOutcomeV1
+from services.job_outcome import (
+    JobOutcomeV1,
+    load_canonical_job_outcome,
+    publish_job_outcome_compatibility_projection,
+    validate_job_outcome_compatibility_projection,
+)
 from runtime.artifact_validators import (
     ArtifactSchemaError,
     CURRENT_PRODUCTION_ARTIFACT_TYPES,
@@ -1669,7 +1675,16 @@ class RuntimeReconciler:
         visited: set[tuple[str, str]] | None = None,
         registry: ArtifactRegistry | None = None,
         refreshed_registries: set[tuple[str, str]] | None = None,
+        owner_record: ArtifactRecord | None = None,
     ) -> ArtifactRecord:
+        if owner_record is not None and owner_record.artifact_type == "lease_publication_manifest":
+            return self._validate_historical_lease_manifest_dependency(
+                owner_record,
+                ref,
+                registry=registry or self.registry,
+                visited=visited,
+                refreshed_registries=refreshed_registries,
+            )
         target_registry = self._registry_for_ref(ref, local_registry=registry)
         active_refreshed = refreshed_registries if refreshed_registries is not None else set()
         registry_key = (
@@ -1699,6 +1714,106 @@ class RuntimeReconciler:
             refreshed_registries=active_refreshed,
         )
         return record
+
+    def _validate_historical_lease_manifest_dependency(
+        self,
+        owner_record: ArtifactRecord,
+        ref: ArtifactDependencyRefV2,
+        *,
+        registry: ArtifactRegistry,
+        visited: set[tuple[str, str]] | None = None,
+        refreshed_registries: set[tuple[str, str]] | None = None,
+    ) -> ArtifactRecord:
+        """Validate an immutable queue publication against its historical target.
+
+        Queue manifests intentionally retain the immutable publication path even
+        when the pointer artifact ID later advances during resume. Resolve the
+        manifest's declared final path and hash directly, while still requiring
+        the dependency identity and bytes to match exactly.
+        """
+
+        if (
+            owner_record.job_id != registry.job_id
+            or ref.dependency_kind != "local_job"
+            or ref.job_id != owner_record.job_id
+        ):
+            raise ReconcileValidationError(
+                f"lease publication dependency identity is invalid: {owner_record.artifact_id}"
+            )
+        registry_key = (
+            os.path.normcase(os.path.abspath(registry.registry_path)),
+            registry.job_id,
+        )
+        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
+        if registry_key not in active_refreshed:
+            registry.reload()
+            active_refreshed.add(registry_key)
+        registered = registry.get(ref.artifact_id)
+        if (
+            registered is None
+            or registered.job_id != owner_record.job_id
+            or registered.status != "ready"
+            or registered.artifact_id != ref.artifact_id
+            or registered.artifact_type != ref.artifact_type
+            or not registered.artifact_version
+        ):
+            raise ReconcileValidationError(
+                f"lease publication target Registry identity is invalid: {owner_record.artifact_id}"
+            )
+        try:
+            ArtifactRegistry._verify_ready_artifact(registered)
+            ArtifactRegistry._verify_ready_artifact(owner_record)
+            payload = json.loads(Path(owner_record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError) as exc:
+            raise ReconcileValidationError(
+                f"lease publication manifest is unreadable: {owner_record.artifact_id}"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ReconcileValidationError(
+                f"lease publication manifest payload is invalid: {owner_record.artifact_id}"
+            )
+        declared_id = str(payload.get("registered_artifact_id") or "")
+        declared_type = str(payload.get("registered_artifact_type") or "")
+        declared_version = str(payload.get("registered_artifact_version") or "")
+        declared_path = str(payload.get("final_path") or "")
+        declared_hash = str(payload.get("registered_artifact_hash") or "")
+        staged_hash = str(payload.get("content_hash") or "")
+        if (
+            str(payload.get("job_id") or "") != owner_record.job_id
+            or declared_id != ref.artifact_id
+            or declared_type != ref.artifact_type
+            or registered.artifact_type != declared_type
+            or registered.artifact_version != declared_version
+            or not declared_hash
+            or declared_hash != ref.content_hash
+            or staged_hash != declared_hash
+        ):
+            raise ReconcileValidationError(
+                f"lease publication target identity mismatch: {owner_record.artifact_id}"
+            )
+        if not declared_path or os.path.normcase(os.path.abspath(declared_path)) != os.path.normcase(
+            os.path.abspath(ref.path)
+        ):
+            raise ReconcileValidationError(
+                f"lease publication target path mismatch: {owner_record.artifact_id}"
+            )
+        target = Path(declared_path)
+        if not target.is_file():
+            raise ReconcileValidationError(
+                f"lease publication target file is missing: {owner_record.artifact_id}"
+            )
+        actual_hash = file_sha256(target)
+        if not declared_hash or actual_hash != declared_hash or ref.content_hash != declared_hash:
+            raise ReconcileValidationError(
+                f"lease publication target hash mismatch: {owner_record.artifact_id}"
+            )
+        self.validate_record(
+            registered,
+            registry=registry,
+            visited=visited,
+            refreshed_registries=active_refreshed,
+        )
+        return registered
 
     def validate_record(
         self,
@@ -1746,6 +1861,7 @@ class RuntimeReconciler:
                     visited=active_visited,
                     registry=active_registry,
                     refreshed_registries=active_refreshed,
+                    owner_record=record,
                 )
         finally:
             active_visited.remove(key)
@@ -1879,61 +1995,54 @@ class RuntimeReconciler:
             metadata=metadata,
         )
 
-    def _repair_outcome_registration(self) -> tuple[bool, str | None, JobOutcomeV1 | None]:
-        path = Path(str(getattr(self.workspace, "artifact_path")("job_outcome_v1.json")))
-        if not path.is_file():
-            return False, None, None
-        synthetic = ArtifactRecord(
-            artifact_id="job_outcome",
-            artifact_role="job_outcome",
-            artifact_type="job_outcome",
-            artifact_version="v1",
-            path=str(path.resolve()),
-            producer="runtime.reconcile.RuntimeReconciler",
-            job_id=self.registry.job_id,
-            status="ready",
-            content_hash=file_sha256(path),
+    def _repair_outcome_projection(
+        self,
+    ) -> tuple[
+        bool,
+        str | None,
+        JobOutcomeV1,
+        tuple[ReconcileIssue, ...],
+    ]:
+        try:
+            outcome, canonical_record = load_canonical_job_outcome(self.registry)
+        except (OSError, TypeError, ValueError) as exc:
+            raise ReconcileValidationError(
+                f"canonical Registry job outcome is invalid: {exc}"
+            ) from exc
+
+        projection_path = Path(
+            str(getattr(self.workspace, "artifact_path")("job_outcome_v1.json"))
         )
         try:
-            _validate_job_outcome(synthetic, path)
-            outcome = JobOutcomeV1.from_dict(_read_json_object(path))
-        except (TypeError, ValueError) as exc:
-            raise ReconcileValidationError(f"job outcome is not repairable: {exc}") from exc
-        if outcome.job_id != self.registry.job_id:
-            raise ReconcileValidationError("job outcome belongs to another job")
-        current = self.registry.get("job_outcome")
-        if current is not None:
-            if current.job_id != self.registry.job_id or current.artifact_type != "job_outcome":
-                raise ReconcileValidationError("job outcome Registry identity conflicts with this workspace")
-            if (
-                current.artifact_role != "job_outcome"
-                or current.artifact_version != "v1"
-                or Path(current.path).resolve() != path.resolve()
-            ):
-                raise ReconcileValidationError("job outcome Registry projection is inconsistent")
-            if current.status != "ready":
-                raise ReconcileValidationError(
-                    f"job outcome Registry record is not ready: {current.status}"
+            validate_job_outcome_compatibility_projection(
+                projection_path,
+                self.registry,
+            )
+            return False, None, outcome, ()
+        except (OSError, TypeError, ValueError) as projection_error:
+            publication_context = getattr(self.registry, "publication_context", None)
+            result = publish_job_outcome_compatibility_projection(
+                path=projection_path,
+                registry=self.registry,
+                canonical_record=canonical_record,
+                outcome=outcome,
+                producer="runtime.reconcile.RuntimeReconciler",
+                publication_context=publication_context,
+            )
+            if not result.written:
+                return (
+                    False,
+                    None,
+                    outcome,
+                    (
+                        ReconcileIssue(
+                            "job_outcome_projection_write_failed",
+                            f"{projection_error}; {result.warning}",
+                            artifact_id="job_outcome_compatibility_projection",
+                        ),
+                    ),
                 )
-            if current.content_hash == synthetic.content_hash:
-                self.validate_record(current)
-                return False, None, outcome
-        self.registry.register_file(
-            artifact_role="job_outcome",
-            artifact_type="job_outcome",
-            artifact_version="v1",
-            path=path,
-            producer="runtime.reconcile.RuntimeReconciler",
-            artifact_id="job_outcome",
-            metadata={
-                "job_status": outcome.job_status,
-                "job_disposition": outcome.job_disposition,
-                "canonical_ready": outcome.canonical_ready,
-                "requires_attention": outcome.requires_attention,
-                "outcome_revision": outcome.outcome_revision,
-            },
-        )
-        return True, "job_outcome", outcome
+        return True, "job_outcome_compatibility_projection", outcome, ()
 
     def _repair_terminal_registration(
         self,
@@ -2014,9 +2123,44 @@ class RuntimeReconciler:
         if not isinstance(payload, dict) or str(payload.get("job_id") or "") != self.registry.job_id:
             return False, ()
 
-        resume_report_path = Path(
-            str(getattr(self.workspace, "artifact_path")("resume_state_report.json"))
-        )
+        resume_report_record = self.registry.get("resume_state_report")
+        resume_record_errors: list[str] = []
+        if resume_report_record is None:
+            # Legacy workspaces predate immutable Registry-owned resume reports.
+            resume_report_path = Path(
+                str(getattr(self.workspace, "artifact_path")("resume_state_report.json"))
+            )
+        else:
+            resume_report_path = Path(resume_report_record.path)
+            if resume_report_record.artifact_id != "resume_state_report":
+                resume_record_errors.append("artifact_id")
+            if resume_report_record.job_id != self.registry.job_id:
+                resume_record_errors.append("job_id")
+            if resume_report_record.status != "ready":
+                resume_record_errors.append("status")
+            if resume_report_record.artifact_type != "resume_state_report":
+                resume_record_errors.append("artifact_type")
+            if resume_report_record.artifact_version != "v1":
+                resume_record_errors.append("artifact_version")
+            if not resume_report_record.content_hash:
+                resume_record_errors.append("content_hash")
+            else:
+                try:
+                    actual_resume_hash = file_sha256(resume_report_path)
+                except OSError:
+                    resume_record_errors.append("path")
+                else:
+                    if actual_resume_hash != resume_report_record.content_hash:
+                        resume_record_errors.append("content_hash")
+        if resume_record_errors:
+            return False, (
+                ReconcileIssue(
+                    "invalid_resume_state_report_identity",
+                    "resume state report Registry identity is invalid: "
+                    + ", ".join(resume_record_errors),
+                    artifact_id="resume_state_report",
+                ),
+            )
         try:
             resume_report = _read_json_object(resume_report_path)
         except ReconcileValidationError as exc:
@@ -2030,6 +2174,10 @@ class RuntimeReconciler:
 
         project_name = str(getattr(self.workspace, "project_name", "") or "")
         resume_identity_errors: list[str] = []
+        if str(resume_report.get("artifact_type") or "") != "resume_state_report":
+            resume_identity_errors.append("artifact_type")
+        if str(resume_report.get("artifact_version") or "") != "v1":
+            resume_identity_errors.append("artifact_version")
         if str(resume_report.get("job_id") or "") != self.registry.job_id:
             resume_identity_errors.append("job_id")
         if str(resume_report.get("created_from_job_id") or "") != self.registry.job_id:
@@ -2114,9 +2262,15 @@ class RuntimeReconciler:
         outcome_repaired = False
         outcome: JobOutcomeV1 | None = None
         try:
-            outcome_repaired, repaired_outcome_id, outcome = self._repair_outcome_registration()
+            (
+                outcome_repaired,
+                repaired_outcome_id,
+                outcome,
+                outcome_issues,
+            ) = self._repair_outcome_projection()
             if repaired_outcome_id:
                 repaired.append(repaired_outcome_id)
+            issues.extend(outcome_issues)
         except ReconcileValidationError as exc:
             issues.append(ReconcileIssue("invalid_job_outcome", str(exc), artifact_id="job_outcome"))
 

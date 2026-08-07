@@ -58,6 +58,9 @@ def test_review_replay_ledger_validates_jsonl_records(tmp_path: Path) -> None:
         json.dumps(
             {
                 "replay_version": "review-section-replay-v1",
+                "job_id": "job-1",
+                "stage_name": "stage3_review",
+                "closure_epoch_id": "review-epoch",
                 "section_id": "candidate_1_section_1",
                 "binding_hash": "b" * 64,
                 "artifact_id": "review-section:candidate_1_section_1",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -197,6 +198,20 @@ def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_pa
     assert first_calls == [1, 2]
     assert registry.get("review-section:section_1") is not None
     assert registry.get("review-section:section_2") is None
+    first_replay = registry.get("review_replay")
+    assert first_replay is not None
+    first_replay_rows = [
+        json.loads(line)
+        for line in Path(first_replay.path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(first_replay_rows) == 1
+    assert first_replay_rows[0]["job_id"] == workspace.job_id
+    assert first_replay_rows[0]["stage_name"] == "stage3_review"
+    assert first_replay_rows[0]["closure_epoch_id"] == first_service.closure_epoch_id
+    assert first_replay_rows[0]["artifact_id"] in {
+        dependency.artifact_id for dependency in first_replay.depends_on
+    }
 
     retry_calls: list[int] = []
 
@@ -232,3 +247,19 @@ def test_current_review_resume_after_section_two_crash_reuses_section_one(tmp_pa
     assert [item["section_number"] for item in resumed.sections] == [1, 2]
     assert registry.get("review-section:section_1") is not None
     assert registry.get("review-section:section_2") is not None
+    replay = registry.get("review_replay")
+    assert replay is not None
+    replay_rows = [
+        json.loads(line)
+        for line in Path(replay.path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert {row["section_id"] for row in replay_rows} == {"section_1", "section_2"}
+    assert {row["job_id"] for row in replay_rows} == {workspace.job_id}
+    assert {row["stage_name"] for row in replay_rows} == {"stage3_review"}
+    assert {row["closure_epoch_id"] for row in replay_rows} == {
+        retry_service.closure_epoch_id
+    }
+    assert {row["artifact_id"] for row in replay_rows}.issubset(
+        {dependency.artifact_id for dependency in replay.depends_on}
+    )

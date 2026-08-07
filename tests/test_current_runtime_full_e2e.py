@@ -12,9 +12,11 @@ import pytest
 
 from runtime.control_plane import ReviewControlPlane
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
-from runtime.runner import AgentRuntimeRunner
+from runtime.runner import AgentRuntimeRunner, RuntimeRunnerError
+from services.job_outcome import load_canonical_job_outcome
 from summary_schema import normalize_ai_summary
 from validation.closure import resolve_current_stage_closure_map
+from validation.disposition import ValidationDispositionV1
 
 
 def _write_pdf(path: Path, title: str, finding: str) -> None:
@@ -220,6 +222,24 @@ def _adjudicator_response(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
     }
 
 
+def _findings_adjudicator_response(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    return {
+        "status": "unsupported",
+        "confidence": 0.99,
+        "repair_scope": "claim",
+        "disposition": "manual_review",
+        "low_confidence": False,
+        "reasoning": "The injected validator found a source-grounded unsupported claim.",
+        "repair_hint": "Remove or qualify the unsupported claim.",
+        "summary_paper_ids": [],
+        "manual_review_reason": "The claim is not supported by the cited evidence.",
+        "claim_type": "result",
+        "claim_type_confidence": 1.0,
+        "claim_type_rationale": "The claim is a bounded empirical result.",
+        "adjudication_status": "unsupported",
+    }
+
+
 def _test_config(tmp_path: Path) -> Path:
     source = Path(__file__).resolve().parents[1] / "config.ini.example"
     target = tmp_path / "config.ini"
@@ -253,9 +273,32 @@ def _test_config(tmp_path: Path) -> Path:
     return target
 
 
+@pytest.mark.parametrize(
+    ("adjudicator", "expected_disposition", "expected_completion", "expected_export"),
+    [
+        pytest.param(
+            _adjudicator_response,
+            "clean",
+            "complete",
+            "canonical_verified",
+            id="clean",
+        ),
+        pytest.param(
+            _findings_adjudicator_response,
+            "findings",
+            "blocked",
+            "untrusted",
+            id="findings",
+        ),
+    ],
+)
 def test_current_three_pdf_runtime_chain_reaches_verified_export(
     tmp_path: Path,
     monkeypatch: Any,
+    adjudicator: Any,
+    expected_disposition: str,
+    expected_completion: str,
+    expected_export: str,
 ) -> None:
     pdf_dir = tmp_path / "papers"
     pdf_dir.mkdir()
@@ -303,8 +346,8 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     monkeypatch.setattr("ai_interface.get_summary_from_ai_with_fallback", configured_reader)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
-    monkeypatch.setattr("ai_interface._call_ai_api", _adjudicator_response)
-    monkeypatch.setattr("validation.llm_adjudicator._call_ai_api", _adjudicator_response)
+    monkeypatch.setattr("ai_interface._call_ai_api", adjudicator)
+    monkeypatch.setattr("validation.llm_adjudicator._call_ai_api", adjudicator)
 
     spec = RuntimeJobSpec(
         project_name="current-e2e",
@@ -313,12 +356,7 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
         config=str(_test_config(tmp_path)),
         action="run_all",
         queue_file=str(tmp_path / "queue.json"),
-        metadata={
-            "requested_stages": ["analyze", "outline", "review", "validate"],
-            "validation_required": True,
-            "require_clean_validation": True,
-            "allow_unvalidated_when_validation_optional": False,
-        },
+        metadata={},
     )
 
     # Production orchestration reaches the explicit adoption boundary and
@@ -329,6 +367,26 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     assert first.failed_stage is None, first
     assert first.completed_stages == ("source_intake", "analyze", "outline"), first
     assert "explicit adoption" in first.message, first
+
+    _workspace, first_registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+    persisted_spec_record = first_registry.get("runtime_job_spec")
+    assert persisted_spec_record is not None
+    persisted_spec_payload = json.loads(
+        Path(persisted_spec_record.path).read_text(encoding="utf-8")
+    )
+    stage_plan = persisted_spec_payload["metadata"]["stage_plan"]
+    assert stage_plan == {
+        "version": "stage-plan-v1",
+        "action": "run_all",
+        "requested_stages": ["analyze", "outline", "review", "validate"],
+        "required_stages": ["source_intake", "analyze", "outline", "review", "validate"],
+        "validation_enabled": True,
+        "validation_required": True,
+        "require_clean_validation": True,
+        "allow_unvalidated_when_validation_optional": False,
+        "current_artifact_set_required": True,
+        "validation_status": "required",
+    }
 
     control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
     inspection = control.inspect(workspace=first.workspace_path)
@@ -349,8 +407,8 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
 
     completed = control.resume(workspace=first.workspace_path)
     assert completed["job_status"] == "completed", completed
-    assert completed["completion_status"] == "complete", completed
-    assert completed["canonical_ready"] is True, completed
+    assert completed["completion_status"] == expected_completion, completed
+    assert completed["canonical_ready"] is (expected_completion == "complete"), completed
     assert completed["completed_stages"] == (
         "source_intake",
         "analyze",
@@ -360,12 +418,29 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     ), completed
 
     validation_status = control.validation_status(workspace=first.workspace_path)
-    assert validation_status["status"] == "clean", validation_status
+    assert validation_status["status"] == expected_disposition, validation_status
     assert validation_status["read_only"] is True
 
     completed_inspection = control.inspect(workspace=first.workspace_path)
     _workspace, completed_registry = AgentRuntimeRunner._open_workspace(first.workspace_path)
+    persisted_after_resume = completed_registry.get("runtime_job_spec")
+    assert persisted_after_resume is not None
+    assert persisted_after_resume.content_hash == persisted_spec_record.content_hash
+    outcome, _outcome_record = load_canonical_job_outcome(completed_registry)
+    assert outcome.job_disposition == expected_disposition
+    assert outcome.canonical_ready is (expected_completion == "complete")
+    assert outcome.to_dict()["readiness_policy_snapshot"]["stage_plan"] == stage_plan
+    current_set = completed_registry.resolve_current_artifact_set()
+    assert current_set is not None
+    assert current_set.validation_status == expected_disposition
     current_stage_map = resolve_current_stage_closure_map(completed_registry)
+    assert current_stage_map.requested_stages == (
+        "analyze",
+        "outline",
+        "review",
+        "validate",
+    )
+    assert current_stage_map.blocking_issues == ()
     validation_closure_id = str(
         current_stage_map.stages["validation_receipt_closure"]["artifact_id"]
     )
@@ -378,15 +453,16 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
     assert closure_payload["payload"]["complete"] is True
 
     export = control.export(workspace=first.workspace_path)
-    assert export["status"] == "canonical_verified", export
-    assert Path(export["bundle_path"]).is_file()
+    assert export["status"] == expected_export, export
+    if expected_export == "canonical_verified":
+        assert Path(export["bundle_path"]).is_file()
+    else:
+        assert export["bundle_path"] == ""
 
 
-@pytest.mark.parametrize("allow_unvalidated", [True, False], ids=["allowed", "policy-blocked"])
 def test_current_runtime_optional_validation_policy_and_export(
     tmp_path: Path,
     monkeypatch: Any,
-    allow_unvalidated: bool,
 ) -> None:
     """Exercise optional validation admission and the fail-closed policy branch."""
 
@@ -425,6 +501,19 @@ def test_current_runtime_optional_validation_policy_and_export(
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
 
+    validation_transport_count = 0
+
+    def forbidden_validation_transport(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal validation_transport_count
+        validation_transport_count += 1
+        raise AssertionError("validation transport must not run when review_enabled=false")
+
+    monkeypatch.setattr("ai_interface._call_ai_api", forbidden_validation_transport)
+    monkeypatch.setattr(
+        "validation.llm_adjudicator._call_ai_api",
+        forbidden_validation_transport,
+    )
+
     config_path = _test_config(tmp_path)
     parser = configparser.ConfigParser()
     parser.read(config_path, encoding="utf-8")
@@ -435,22 +524,16 @@ def test_current_runtime_optional_validation_policy_and_export(
     spec = RuntimeJobSpec(
         project_name="optional-validation-e2e",
         source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
-        job_id=f"optional-validation-e2e-job-{('allowed' if allow_unvalidated else 'blocked')}",
+        job_id="optional-validation-e2e-job",
         config=str(config_path),
         action="run_all",
         queue_file=str(tmp_path / "queue.json"),
-        metadata={
-            "requested_stages": ["analyze", "outline", "review"],
-            "validation_required": False,
-            "require_clean_validation": False,
-            "allow_unvalidated_when_validation_optional": allow_unvalidated,
-        },
+        metadata={},
     )
 
     first = AgentRuntimeRunner(spec).run()
     assert first.job_status == "completed", first
-    if allow_unvalidated:
-        assert first.job_disposition == "needs_review", first
+    assert first.job_disposition == "needs_review", first
     control = ReviewControlPlane(repo_root=Path(__file__).resolve().parents[1])
     inspection = control.inspect(workspace=first.workspace_path)
     final_outline = next(
@@ -468,13 +551,10 @@ def test_current_runtime_optional_validation_policy_and_export(
     assert adoption["status"] == "succeeded", adoption
 
     completed = control.resume(workspace=first.workspace_path)
-    if allow_unvalidated:
-        assert completed["completion_status"] == "complete", completed
-        assert completed["canonical_ready"] is True, completed
-    else:
-        assert completed["completion_status"] == "blocked", completed
-        assert completed["canonical_ready"] is False, completed
+    assert completed["completion_status"] == "complete", completed
+    assert completed["canonical_ready"] is True, completed
     assert completed["completed_stages"] == ("source_intake", "analyze", "outline", "review"), completed
+    assert validation_transport_count == 0
 
     status = control.validation_status(workspace=first.workspace_path)
     assert status["status"] == "not_requested", status
@@ -487,16 +567,29 @@ def test_current_runtime_optional_validation_policy_and_export(
     assert disposition is not None
     assert disposition.artifact_type == "validation_disposition"
     assert disposition.artifact_version == "v1"
+    typed_disposition = ValidationDispositionV1.from_dict(
+        json.loads(Path(disposition.path).read_text(encoding="utf-8"))
+    )
+    assert typed_disposition.validation_enabled is False
+    assert typed_disposition.validation_required is False
+    assert typed_disposition.allow_unvalidated is True
 
-    if not allow_unvalidated:
-        assert completed["completion_status"] != "complete", completed
-        assert completed["canonical_ready"] is False, completed
-        blocked_export = control.export(workspace=workspace.root_dir)
-        assert blocked_export["status"] == "untrusted", blocked_export
-        assert blocked_export["bundle_path"] == "", blocked_export
-        return
+    runtime_spec_record = registry.get("runtime_job_spec")
+    assert runtime_spec_record is not None
+    runtime_spec_payload = json.loads(Path(runtime_spec_record.path).read_text(encoding="utf-8"))
+    stage_plan = runtime_spec_payload["metadata"]["stage_plan"]
+    assert stage_plan["requested_stages"] == ["analyze", "outline", "review"]
+    assert stage_plan["validation_enabled"] is False
+    assert stage_plan["validation_required"] is False
+    assert stage_plan["require_clean_validation"] is False
+    assert stage_plan["allow_unvalidated_when_validation_optional"] is True
+    assert stage_plan["validation_status"] == "not_requested"
+    outcome, _outcome_record = load_canonical_job_outcome(registry)
+    assert outcome.to_dict()["readiness_policy_snapshot"]["stage_plan"] == stage_plan
+    assert outcome.canonical_ready is True
 
     stage_map = resolve_current_stage_closure_map(registry)
+    assert stage_map.requested_stages == ("analyze", "outline", "review")
     assert stage_map.blocking_issues == ()
     assert all(
         bool(entry.get("complete"))
@@ -540,3 +633,53 @@ def test_current_runtime_optional_validation_policy_and_export(
         tampered_completion = AgentRuntimeRunner.status(workspace.root_dir)
         assert tampered_completion.completion_status != "complete" or not tampered_completion.canonical_ready
         disposition_path.write_bytes(original_disposition_bytes)
+
+
+def test_required_validation_disabled_fails_before_provider_transport(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    config_path = _test_config(tmp_path)
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    parser["Validation"]["review_enabled"] = "false"
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+
+    transport_count = 0
+
+    def forbidden_transport(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal transport_count
+        transport_count += 1
+        raise AssertionError("provider transport occurred before validation-policy preflight")
+
+    monkeypatch.setattr("ai_interface.get_summary_from_ai_with_fallback", forbidden_transport)
+    monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", forbidden_transport)
+    monkeypatch.setattr("ai_interface._call_ai_api_detailed", forbidden_transport)
+    monkeypatch.setattr("ai_interface._call_ai_api", forbidden_transport)
+    monkeypatch.setattr("validation.llm_adjudicator._call_ai_api", forbidden_transport)
+
+    spec = RuntimeJobSpec(
+        project_name="required-validation-disabled",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+        job_id="required-validation-disabled-job",
+        config=str(config_path),
+        action="run_all",
+        queue_file=str(tmp_path / "queue.json"),
+        metadata={
+            "requested_stages": ["analyze", "outline", "review", "validate"],
+            "validation_required": True,
+        },
+    )
+
+    with pytest.raises(RuntimeRunnerError, match="validation is required.*review_enabled is false"):
+        AgentRuntimeRunner(spec).run()
+
+    assert transport_count == 0
+    assert not (
+        tmp_path
+        / "output"
+        / "required-validation-disabled__required-validation-disabled-job"
+    ).exists()

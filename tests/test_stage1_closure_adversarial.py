@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping
 import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+from runtime.provider_runtime import ProviderRuntimeLedger
 from runtime.runner import AgentRuntimeRunner
 from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace
@@ -376,16 +377,20 @@ def test_stage1_all_reuse_mixed_reuse_and_summary_source_zero_call_paths(
         assert record.depends_on
         assert all(dependency.content_hash for dependency in record.depends_on)
         reuse_payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
-        source_id = str(reuse_payload["registered_source_artifact_id"])
-        source_record = all_registry.get(source_id)
-        assert source_record is not None
-        assert reuse_payload["registered_source_artifact_hash"] == source_record.content_hash
-        assert reuse_payload["registry_file_hash"] == file_sha256(source_record.path)
+        assert not reuse_payload.get("registered_source_artifact_id")
+        assert not reuse_payload.get("registered_source_artifact_hash")
+        assert reuse_payload["source_authority_artifact_id"]
+        assert reuse_payload["source_authority_artifact_hash"]
+        assert reuse_payload["source_authority_job_id"] == "stage1-reuse-seed"
+        assert reuse_payload["source_authority_artifact_id"] != reuse_payload.get(
+            "current_snapshot_artifact_id"
+        )
         assert reuse_payload["summary_payload_hash"]
         assert reuse_payload["source_summary_manifest_id"]
         assert reuse_payload["source_summary_manifest_hash"]
         assert reuse_payload["current_runtime_spec_id"] == "runtime_job_spec"
         assert reuse_payload["current_evidence_manifest_id"]
+        assert reuse_payload["current_snapshot_derived_from_external_authority"] is True
 
     # Exercise the common closure reader against the production-shaped
     # all-reuse workspace, where no receipt ledger exists by design.
@@ -417,6 +422,13 @@ def test_stage1_all_reuse_mixed_reuse_and_summary_source_zero_call_paths(
             current,
             terminal_id,
             mark_zero_call_terminal_work,
+        )),
+        ("external_snapshot_derivation_missing", lambda current: _rewrite_json_artifact(
+            current,
+            reuse_records[0].artifact_id,
+            lambda envelope: envelope.pop(
+                "current_snapshot_derived_from_external_authority", None
+            ),
         )),
     ):
         _restore_workspace(
@@ -468,6 +480,9 @@ def test_stage1_all_reuse_mixed_reuse_and_summary_source_zero_call_paths(
         ),
         encoding="utf-8",
     )
+    changed_pdf = Path(tmp_path / "source" / "reuse-b.pdf")
+    with changed_pdf.open("ab") as handle:
+        handle.write(b"\nbyte-change-for-mixed-run\n")
 
     mixed_result, _mixed_workspace, mixed_registry = _run_stage1(
         tmp_path,
@@ -478,6 +493,7 @@ def test_stage1_all_reuse_mixed_reuse_and_summary_source_zero_call_paths(
         reuse_stage1=True,
     )
     assert mixed_result.job_status == "completed", mixed_result
+    assert mixed_result.completion_status == "complete", mixed_result
     mixed_map = resolve_current_stage_closure_map(mixed_registry)
     assert mixed_map.blocking_issues == (), mixed_map.to_dict()
     mixed_entry = mixed_map.provider_closures_by_stage["analyze"]
@@ -490,6 +506,21 @@ def test_stage1_all_reuse_mixed_reuse_and_summary_source_zero_call_paths(
         if record.artifact_type == "stage1_summary_reuse_record"
     ]
     assert len(mixed_reuse_records) == 1
+    assert len(mixed_entry["expected_call_ids"]) == 2  # generated B/C
+    assert len(mixed_reuse_records) == 1  # reused A
+    from runtime.control_plane import ReviewControlPlane
+
+    mixed_export = ReviewControlPlane(
+        repo_root=Path(__file__).resolve().parents[1]
+    ).export(workspace=_mixed_workspace.root_dir)
+    assert mixed_export["status"] == "untrusted", mixed_export
+    ledger_record = next(
+        record
+        for record in mixed_registry.list_records()
+        if record.artifact_type == "provider_receipt_ledger"
+        and record.status == "ready"
+    )
+    assert len(ProviderRuntimeLedger(ledger_record.path).list_receipts()) == 2
 
     zero_result, _zero_workspace, zero_registry = _run_stage1(
         tmp_path,
@@ -510,3 +541,338 @@ def test_stage1_all_reuse_mixed_reuse_and_summary_source_zero_call_paths(
     assert zero_entry["observed_call_ids"] == []
     assert zero_entry["model_call_count"] == 0
     assert zero_result.completion_status == "complete", zero_result
+
+
+def test_stage1_typed_manifest_portable_authority_closes_and_tampering_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_papers = _stage1_papers(tmp_path / "typed-source", prefix="typed")
+    seed_result, _seed_workspace, seed_registry = _run_stage1(
+        tmp_path,
+        monkeypatch,
+        job_id="stage1-typed-seed",
+        papers=source_papers,
+    )
+    manifest_paths = tuple(
+        record.path
+        for record in seed_registry.list_records()
+        if record.status == "ready"
+        and record.artifact_type == "stage1_reusable_summary_manifest"
+        and record.artifact_version == "v1"
+    )
+    assert len(manifest_paths) == 3
+
+    result, workspace, registry = _run_stage1(
+        tmp_path,
+        monkeypatch,
+        job_id="stage1-typed-child",
+        papers=source_papers,
+        reuse_summary_files=manifest_paths,
+        reuse_stage1=True,
+    )
+    assert seed_result.completion_status == "complete", seed_result
+    assert result.job_status == "completed", result
+    assert result.completion_status == "complete", result
+    baseline_map = resolve_current_stage_closure_map(registry)
+    assert baseline_map.blocking_issues == (), baseline_map.to_dict()
+    baseline_entry = baseline_map.provider_closures_by_stage["analyze"]
+    assert baseline_entry["complete"] is True
+    assert baseline_entry["expected_call_ids"] == []
+    assert baseline_entry["observed_call_ids"] == []
+
+    reuse_records = [
+        record
+        for record in registry.list_records()
+        if record.artifact_type == "stage1_summary_reuse_record"
+    ]
+    assert len(reuse_records) == 3
+    first_reuse_payload = json.loads(
+        Path(reuse_records[0].path).read_text(encoding="utf-8")
+    )
+    portable_ids = {
+        "portable_summary_bytes": str(
+            first_reuse_payload["portable_source_artifact_id"]
+        ),
+        "portable_manifest_bytes": str(
+            first_reuse_payload["portable_source_summary_manifest_id"]
+        ),
+        "portable_closure_bytes": str(
+            first_reuse_payload["portable_source_provider_receipt_closure_id"]
+        ),
+        "portable_ledger_bytes": str(
+            first_reuse_payload["portable_source_provider_receipt_ledger_id"]
+        ),
+    }
+    assert all(portable_ids.values())
+
+    workspace_root = Path(workspace.root_dir)
+    original_files = {
+        path: path.read_bytes()
+        for path in workspace_root.rglob("*")
+        if path.is_file()
+    }
+    original_registry = Path(registry.registry_path).read_bytes()
+    cases: list[tuple[str, Callable[[ArtifactRegistry], None]]] = [
+        (
+            label,
+            lambda current, artifact_id=artifact_id: _modify_record_file(
+                current,
+                artifact_id,
+            ),
+        )
+        for label, artifact_id in portable_ids.items()
+    ]
+    cases.append(
+        (
+            "portable_dependency_missing",
+            lambda current: _remove_dependency(
+                current,
+                reuse_records[0].artifact_id,
+                portable_ids["portable_summary_bytes"],
+            ),
+        )
+    )
+    def tamper_manifest_pdf_hash(envelope: dict[str, Any]) -> None:
+        envelope["source_pdf_content_sha256"] = "f" * 64
+        binding = envelope.get("binding")
+        if isinstance(binding, dict):
+            binding["source_pdf_content_sha256"] = "f" * 64
+
+    def tamper_manifest_summary_payload(envelope: dict[str, Any]) -> None:
+        payload = envelope.get("summary_payload")
+        assert isinstance(payload, dict)
+        core = payload.get("core_analysis")
+        assert isinstance(core, dict)
+        core["summary"] = "typed manifest payload tampered"
+
+    cases.extend(
+        [
+            (
+                "manifest_pdf_content_hash_tampered",
+                lambda current: _rewrite_json_artifact(
+                    current,
+                    portable_ids["portable_manifest_bytes"],
+                    tamper_manifest_pdf_hash,
+                ),
+            ),
+            (
+                "manifest_typed_summary_payload_tampered",
+                lambda current: _rewrite_json_artifact(
+                    current,
+                    portable_ids["portable_manifest_bytes"],
+                    tamper_manifest_summary_payload,
+                ),
+            ),
+        ]
+    )
+
+    from runtime.control_plane import ReviewControlPlane
+
+    for label, mutate in cases:
+        _restore_workspace(workspace_root, original_files, original_registry, registry)
+        current = ArtifactRegistry(registry.registry_path, registry.job_id)
+        mutate(current)
+        mutated_registry = ArtifactRegistry(registry.registry_path, registry.job_id)
+        stage_map = resolve_current_stage_closure_map(mutated_registry)
+        reuse_issues = tuple(
+            issue
+            for issue in stage_map.blocking_issues
+            if issue.startswith("provider_closure_reuse_")
+        )
+        assert reuse_issues, (label, stage_map.to_dict())
+        status = AgentRuntimeRunner.status(workspace.root_dir)
+        assert status.completion_status != "complete", (label, status)
+        exported = ReviewControlPlane(
+            repo_root=Path(__file__).resolve().parents[1]
+        ).export(workspace=workspace.root_dir)
+        assert exported["status"] not in {
+            "canonical_verified",
+            "canonical_unvalidated",
+        }, (label, exported)
+
+
+def test_stage1_tampered_import_regenerates_only_changed_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_papers = _stage1_papers(tmp_path / "tamper-source", prefix="tamper")
+    seed_result, _seed_workspace, _seed_registry = _run_stage1(
+        tmp_path,
+        monkeypatch,
+        job_id="stage1-tamper-seed",
+        papers=source_papers,
+    )
+    seed_summary = next(
+        Path(seed_result.workspace_path, "artifacts", "stage1", "inputs").glob(
+            "stage1_summaries_*.json"
+        )
+    )
+    seed_payload = json.loads(seed_summary.read_text(encoding="utf-8"))
+    seed_summaries = (
+        seed_payload.get("summaries")
+        if isinstance(seed_payload, dict)
+        else seed_payload
+    )
+    assert isinstance(seed_summaries, list) and len(seed_summaries) == 3
+    tampered_summaries = [dict(item) for item in seed_summaries]
+    tampered_summaries[0] = {
+        **tampered_summaries[0],
+        "ai_summary": {
+            **dict(tampered_summaries[0]["ai_summary"]),
+            "core_analysis": {
+                **dict(tampered_summaries[0]["ai_summary"]["core_analysis"]),
+                "summary": "tampered imported payload",
+            },
+        },
+    }
+    tampered_path = tmp_path / "tampered-stage1-summaries.json"
+    tampered_path.write_text(
+        json.dumps(tampered_summaries, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    result, _workspace, registry = _run_stage1(
+        tmp_path,
+        monkeypatch,
+        job_id="stage1-tampered-import-child",
+        papers=source_papers,
+        reuse_summary_files=(str(tampered_path),),
+        reuse_stage1=True,
+    )
+    assert result.job_status == "completed", result
+    assert result.completion_status == "complete", result
+    stage_map = resolve_current_stage_closure_map(registry)
+    assert stage_map.blocking_issues == (), stage_map.to_dict()
+    analyze = stage_map.provider_closures_by_stage["analyze"]
+    assert len(analyze["expected_call_ids"]) == 1
+    assert len(analyze["observed_call_ids"]) == 1
+    assert len(
+        [
+            record
+            for record in registry.list_records()
+            if record.artifact_type == "stage1_summary_reuse_record"
+        ]
+    ) == 2
+
+
+def test_stage1_bare_summary_without_pdf_or_authority_is_noncanonical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bare_path = tmp_path / "bare-stage1-summary.json"
+    bare_path.write_text(
+        json.dumps(
+            [
+                {
+                    "status": "success",
+                    "paper_info": {
+                        "canonical_paper_key": "bare_unknown_author",
+                        "source_paper_id": "bare",
+                        "title": "bare",
+                    },
+                    "ai_summary": _reader_summary(
+                        "bare_unknown_author",
+                        "Bare summary",
+                        "A finding with no authority or PDF.",
+                    ),
+                }
+            ],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    result, workspace, registry = _run_stage1(
+        tmp_path,
+        monkeypatch,
+        job_id="stage1-bare-no-source",
+        papers=[],
+        reuse_summary_files=(str(bare_path),),
+        reuse_stage1=True,
+        requested_stages=("analyze",),
+        action="analyze",
+    )
+    assert result.completion_status != "complete", result
+    assert not any(
+        record.artifact_type == "stage1_summary_reuse_record"
+        for record in registry.list_records()
+    )
+    from runtime.control_plane import ReviewControlPlane
+
+    exported = ReviewControlPlane(
+        repo_root=Path(__file__).resolve().parents[1]
+    ).export(workspace=workspace.root_dir)
+    assert exported["status"] not in {
+        "canonical_verified",
+        "canonical_unvalidated",
+    }, exported
+
+
+def test_stage1_bare_summary_with_pdf_regenerates_in_production_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_papers = _stage1_papers(tmp_path / "bare-with-pdf", prefix="barepdf")
+    seed_result, _seed_workspace, _seed_registry = _run_stage1(
+        tmp_path,
+        monkeypatch,
+        job_id="stage1-bare-pdf-seed",
+        papers=source_papers,
+    )
+    seed_summary_path = next(
+        Path(seed_result.workspace_path, "artifacts", "stage1", "inputs").glob(
+            "stage1_summaries_*.json"
+        )
+    )
+    seed_payload = json.loads(seed_summary_path.read_text(encoding="utf-8"))
+    seed_summaries = (
+        seed_payload.get("summaries")
+        if isinstance(seed_payload, dict)
+        else seed_payload
+    )
+    assert isinstance(seed_summaries, list) and len(seed_summaries) == 3
+    first = seed_summaries[0]
+    assert isinstance(first, dict)
+    bare_path = tmp_path / "bare-with-pdf.json"
+    bare_path.write_text(
+        json.dumps(
+            [
+                {
+                    "status": "success",
+                    "paper_info": dict(first["paper_info"]),
+                    "ai_summary": dict(first["ai_summary"]),
+                }
+            ],
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    result, workspace, registry = _run_stage1(
+        tmp_path,
+        monkeypatch,
+        job_id="stage1-bare-pdf-child",
+        papers=source_papers,
+        reuse_summary_files=(str(bare_path),),
+        reuse_stage1=True,
+    )
+    assert result.job_status == "completed", result
+    assert result.completion_status == "complete", result
+    stage_map = resolve_current_stage_closure_map(registry)
+    assert stage_map.blocking_issues == (), stage_map.to_dict()
+    entry = stage_map.provider_closures_by_stage["analyze"]
+    assert len(entry["expected_call_ids"]) == 3
+    assert len(entry["observed_call_ids"]) == 3
+    assert entry["complete"] is True
+    assert not any(
+        record.artifact_type == "stage1_summary_reuse_record"
+        for record in registry.list_records()
+    )
+    from runtime.control_plane import ReviewControlPlane
+
+    exported = ReviewControlPlane(
+        repo_root=Path(__file__).resolve().parents[1]
+    ).export(workspace=workspace.root_dir)
+    assert exported["status"] == "untrusted", exported

@@ -630,6 +630,8 @@ class ArtifactRegistry:
         owner_job_id: str,
         require_ready: bool = False,
         external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+        owner_record: ArtifactRecord | None = None,
+        _dependency_stack: set[tuple[str, str]] | None = None,
     ) -> List[ArtifactDependencyRefV2]:
         normalized: List[ArtifactDependencyRefV2] = []
         for dependency in dependencies:
@@ -641,7 +643,104 @@ class ArtifactRegistry:
                 raise TypeError(f"unsupported dependency reference: {type(dependency).__name__}")
 
             ref = ArtifactDependencyRefV2.from_dict(ref.to_dict())
-            registered = artifacts.get(ref.artifact_id) if ref.artifact_id else None
+            dependency_kind: DependencyKind = ref.dependency_kind
+            if ref.job_id and ref.job_id != owner_job_id:
+                dependency_kind = "external_job"
+            if owner_record is not None and owner_record.artifact_type == "lease_publication_manifest":
+                if owner_record.job_id != owner_job_id:
+                    raise UnverifiedDependency(
+                        f"lease publication manifest owner mismatch: {owner_record.artifact_id}"
+                    )
+                if dependency_kind != "local_job" or ref.job_id != owner_record.job_id:
+                    raise UnverifiedDependency(
+                        f"lease publication dependency must be local to its owner: {ref.artifact_id}"
+                    )
+                registered = artifacts.get(ref.artifact_id) if ref.artifact_id else None
+                if registered is None:
+                    raise UnverifiedDependency(
+                        f"lease publication target is not registered: {ref.artifact_id}"
+                    )
+                if (
+                    registered.job_id != owner_record.job_id
+                    or registered.status != "ready"
+                    or registered.artifact_id != ref.artifact_id
+                    or registered.artifact_type != ref.artifact_type
+                    or not registered.artifact_version
+                ):
+                    raise UnverifiedDependency(
+                        f"lease publication target Registry identity is invalid: {ref.artifact_id}"
+                    )
+                try:
+                    self._verify_ready_artifact(registered)
+                    self._verify_ready_artifact(owner_record)
+                    manifest_payload = json.loads(
+                        Path(owner_record.path).read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError) as exc:
+                    raise UnverifiedDependency(
+                        f"lease publication manifest authority is invalid: {owner_record.artifact_id}"
+                    ) from exc
+                if not isinstance(manifest_payload, Mapping):
+                    raise UnverifiedDependency(
+                        f"lease publication manifest payload is invalid: {owner_record.artifact_id}"
+                    )
+                declared_id = str(manifest_payload.get("registered_artifact_id") or "")
+                declared_type = str(manifest_payload.get("registered_artifact_type") or "")
+                declared_version = str(manifest_payload.get("registered_artifact_version") or "")
+                declared_path = str(manifest_payload.get("final_path") or "")
+                declared_hash = str(manifest_payload.get("registered_artifact_hash") or "")
+                staged_hash = str(manifest_payload.get("content_hash") or "")
+                if (
+                    str(manifest_payload.get("job_id") or "") != owner_record.job_id
+                    or declared_id != ref.artifact_id
+                    or declared_type != ref.artifact_type
+                    or registered.artifact_type != declared_type
+                    or registered.artifact_version != declared_version
+                    or not declared_path
+                    or os.path.normcase(os.path.abspath(declared_path))
+                    != os.path.normcase(os.path.abspath(ref.path))
+                    or not declared_hash
+                    or declared_hash != ref.content_hash
+                    or staged_hash != declared_hash
+                ):
+                    raise UnverifiedDependency(
+                        f"lease publication manifest target binding is invalid: {owner_record.artifact_id}"
+                    )
+                historical_path = os.path.abspath(os.fspath(ref.path))
+                if not os.path.isfile(historical_path):
+                    raise UnverifiedDependency(
+                        f"lease publication target file is missing: {ref.artifact_id}"
+                    )
+                historical_hash = file_sha256(historical_path)
+                if historical_hash != ref.content_hash:
+                    raise UnverifiedDependency(
+                        f"lease publication target content hash changed: {ref.artifact_id}"
+                    )
+                dependency_stack = set(_dependency_stack or ())
+                owner_key = (owner_record.job_id, owner_record.artifact_id)
+                dependency_stack.add(owner_key)
+                self._verify_ready_dependency_closure(
+                    registered,
+                    artifacts=artifacts,
+                    external_registry_resolver=external_registry_resolver,
+                    dependency_stack=dependency_stack,
+                )
+                normalized.append(
+                    ArtifactDependencyRefV2(
+                        dependency_kind="local_job",
+                        job_id=owner_record.job_id,
+                        artifact_id=ref.artifact_id,
+                        artifact_type=registered.artifact_type,
+                        path=historical_path,
+                        content_hash=historical_hash,
+                    )
+                )
+                continue
+            registered = (
+                artifacts.get(ref.artifact_id)
+                if dependency_kind == "local_job" and ref.artifact_id
+                else None
+            )
             if registered is not None:
                 if registered.job_id != ref.job_id:
                     raise UnverifiedDependency(f"dependency job_id mismatch: {ref.artifact_id}")
@@ -656,9 +755,6 @@ class ArtifactRegistry:
             artifact_id = ref.artifact_id
             job_id = ref.job_id
             content_hash = ref.content_hash
-            dependency_kind: DependencyKind = ref.dependency_kind
-            if job_id and job_id != owner_job_id:
-                dependency_kind = "external_job"
             normalized_ref = ArtifactDependencyRefV2(
                 dependency_kind=dependency_kind,
                 job_id=job_id,
@@ -676,6 +772,65 @@ class ArtifactRegistry:
                 )
             normalized.append(normalized_ref)
         return normalized
+
+    def _verify_ready_dependency_closure(
+        self,
+        record: ArtifactRecord,
+        *,
+        artifacts: Mapping[str, ArtifactRecord],
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None,
+        dependency_stack: set[tuple[str, str]],
+    ) -> None:
+        key = (record.job_id, record.artifact_id)
+        if key in dependency_stack:
+            raise UnverifiedDependency(
+                f"artifact dependency cycle detected at {record.artifact_id}"
+            )
+        dependency_stack.add(key)
+        try:
+            self._verify_ready_artifact(record)
+            normalized = self._normalize_dependencies(
+                record.depends_on,
+                artifacts,
+                owner_job_id=record.job_id,
+                require_ready=True,
+                external_registry_resolver=external_registry_resolver,
+                owner_record=record,
+                _dependency_stack=dependency_stack,
+            )
+            for dependency in normalized:
+                if dependency.dependency_kind == "local_job":
+                    target_artifacts = artifacts
+                    target = artifacts.get(dependency.artifact_id)
+                else:
+                    if external_registry_resolver is None:
+                        raise UnverifiedDependency(
+                            "external dependency cannot be verified without a resolver: "
+                            f"{dependency.job_id}/{dependency.artifact_id}"
+                        )
+                    target_registry = external_registry_resolver(dependency.job_id)
+                    if target_registry is None or target_registry.job_id != dependency.job_id:
+                        raise UnverifiedDependency(
+                            "external dependency Registry is unavailable or has the wrong owner: "
+                            f"{dependency.job_id}/{dependency.artifact_id}"
+                        )
+                    target_registry.reload()
+                    target_artifacts = {
+                        item.artifact_id: item for item in target_registry.list_records()
+                    }
+                    target = target_artifacts.get(dependency.artifact_id)
+                if target is None:
+                    raise UnverifiedDependency(
+                        f"dependency is not registered: {dependency.job_id}/{dependency.artifact_id}"
+                    )
+                self._verify_ready_dependency_closure(
+                    target,
+                    artifacts=target_artifacts,
+                    external_registry_resolver=external_registry_resolver,
+                    dependency_stack=dependency_stack,
+                )
+        finally:
+            dependency_stack.remove(key)
 
     def _verify_ready_dependency(
         self,
@@ -891,11 +1046,12 @@ class ArtifactRegistry:
                         record,
                         depends_on=self._normalize_dependencies(
                             record.depends_on,
-                            self._artifacts,
-                            owner_job_id=record.job_id,
-                            require_ready=True,
-                            external_registry_resolver=external_registry_resolver,
-                        ),
+                        self._artifacts,
+                        owner_job_id=record.job_id,
+                        require_ready=True,
+                        external_registry_resolver=external_registry_resolver,
+                        owner_record=record,
+                    ),
                     )
                 snapshot[record.artifact_id] = record
             next_revision = disk_revision + 1
@@ -925,6 +1081,7 @@ class ArtifactRegistry:
         dependencies: Iterable[ArtifactDependencyRefV2 | Mapping[str, Any]],
         *,
         external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+        owner_record: ArtifactRecord | None = None,
     ) -> List[ArtifactDependencyRefV2]:
         """Validate dependencies against the latest durable Registry state."""
 
@@ -936,6 +1093,7 @@ class ArtifactRegistry:
                 owner_job_id=self.job_id,
                 require_ready=True,
                 external_registry_resolver=external_registry_resolver,
+                owner_record=owner_record,
             )
 
     def register_file(

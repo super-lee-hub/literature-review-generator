@@ -7,7 +7,12 @@ from typing import Any
 
 import pytest
 
-from services.artifact_registry import ArtifactRegistry, UnverifiedArtifact, file_sha256
+from services.artifact_registry import (
+    ArtifactRegistry,
+    UnverifiedArtifact,
+    UnverifiedDependency,
+    file_sha256,
+)
 from services.job_workspace import JobWorkspace
 from services.queue_service import (
     LocalPublicationContext,
@@ -163,6 +168,67 @@ def test_queue_target_and_publication_manifest_are_one_registry_transaction(
         fence_token=lease.fence_token,
         state=QueueState.COMPLETED,
     )
+
+
+@pytest.mark.parametrize("mutation", ("dependency_kind", "artifact_type", "path"))
+def test_queue_publication_manifest_dependency_tampering_fails_closed(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    service, lease = _claim(tmp_path, job_id=f"manifest-tamper-{mutation}")
+    registry_path = tmp_path / "workspace" / "registry.json"
+    registry_path.parent.mkdir()
+    registry = ArtifactRegistry(registry_path, lease.job_id)
+    context = service.publication_context(lease)
+    staged = context.stage_bytes(tmp_path / "workspace" / "target.json", b"target")
+    context.finalize_staged(
+        staged,
+        registry=registry,
+        register_kwargs={
+            "artifact_id": "target",
+            "artifact_role": "target",
+            "artifact_type": "test_artifact",
+            "artifact_version": "v1",
+            "producer": "tests",
+        },
+    )
+    manifest_id = next(
+        record.artifact_id
+        for record in registry.list_records()
+        if record.artifact_type == "lease_publication_manifest"
+    )
+    original_registry = registry_path.read_bytes()
+    alternate_path = tmp_path / "workspace" / "same-bytes.json"
+    alternate_path.write_bytes(b"target")
+    try:
+        payload = json.loads(original_registry.decode("utf-8"))
+        manifest_entry = next(
+            item for item in payload["artifacts"] if item["artifact_id"] == manifest_id
+        )
+        dependency = manifest_entry["depends_on"][0]
+        if mutation == "dependency_kind":
+            dependency["dependency_kind"] = "external_job"
+            dependency["job_id"] = "other-job"
+        elif mutation == "artifact_type":
+            dependency["artifact_type"] = "wrong_type"
+        else:
+            dependency["path"] = str(alternate_path.resolve())
+        registry_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tampered = ArtifactRegistry(registry_path, lease.job_id)
+        manifest = tampered.get(manifest_id)
+        assert manifest is not None
+        with pytest.raises(UnverifiedDependency):
+            tampered.verify_ready_dependencies(manifest.depends_on, owner_record=manifest)
+    finally:
+        registry_path.write_bytes(original_registry)
+        service.release_lease(
+            lease.job_id,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+            state=QueueState.COMPLETED,
+        )
 
 
 @pytest.mark.parametrize(

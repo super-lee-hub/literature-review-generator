@@ -2,8 +2,12 @@
 
 `reviewctl` 是现有任务工作区的控制面。读取命令无 Provider；`validate` 是
 明确执行当前 `ValidationExecutionService` 并持久化新的 validation attempt 的
-命令。控制面读取 Registry、job outcome、stage terminal、API receipt 以及
-Outline v3 DAG/replay。
+命令。控制面读取 Registry、规范 `job_outcome` record、stage terminal、API receipt 以及
+Outline v3 DAG/replay。Registry 中 `artifact_id=job_outcome` 的 record 是唯一
+`JobOutcomeV1` authority；固定 `job_outcome_v1.json` 只是可变的
+`job_outcome_compatibility_projection/v1`，必须校验其规范 ID/hash。projection 写失败
+只产生 warning/reconcile issue。`resume_state_report/v1` 由 Registry 持有且不可变；
+固定 resume-report 路径只有在 Registry record 缺失时才是 legacy fallback。
 
 完成与导出先通过 `current-artifact-set:pointer` 解析原子
 `CurrentArtifactSetV1`，再构建 `CurrentStageClosureMapV1`；历史 READY 产物
@@ -65,10 +69,16 @@ current pointer。
 Stage closure 按 expected transport count 条件化：count 大于零必须有当前且
 hash-valid receipt ledger 和精确 call set；count 等于零必须有有效 expected graph、
 零 terminal model call、零 observed receipt 及 typed source evidence，不能伪造空 ledger。
-Stage 1 reuse record 必须绑定真实已注册 source artifact，并分别保留 summary payload
-hash 与 Registry file hash。单篇 `summary_file` 必须是 canonical 单元素数组，且有
-typed `stage1_reusable_summary_manifest/v1`；外部 source authority（如存在）是独立的
-依赖和身份。
+Stage 1 reuse 只接受 external resolver 从 parent/current Registry 解析的 source，或
+自绑定 typed `stage1_reusable_summary_manifest/v1`；当前 snapshot 必须标记
+`current_snapshot_derived_from_external_authority=true`，永远不是 authority。仅有 path、
+current snapshot、bare summary 或 synthetic ID/hash 都不够。精确 equality 包含真实 PDF
+字节 SHA、extracted/semantic hash、preprocess/input/prompt/provider/model/schema/visual
+hash 和 normalized summary payload hash。相同字节换路径可复用，但须记录原始/当前位置和
+`location_changed`；PDF 字节不同即使 text hash 相同也使复用失效。provider-generated
+source 只要有 call，就必须有 Registry 验证的原始 receipt closure 与 ledger。单篇
+`summary_file` 仍须是 canonical 单元素数组并带 typed manifest；payload hash 与 Registry
+file hash 分开保存。
 
 Stage 1 all-reuse 必须没有当前 epoch 的 provider receipt，并为每个 SourceBundle
 paper 保留一个唯一 reuse record；mixed run 只能为新生成 paper 产生 provider call；

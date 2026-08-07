@@ -11,6 +11,13 @@ python -m reviewctl attest --workspace <workspace>
 
 这些输出会显示任务状态、失败节点、Provider error kind、Registry 完整性、依赖图以及已保留的完成节点。
 
+恢复时必须把 Registry 中 `artifact_id=job_outcome` 的 record 视为唯一规范
+`JobOutcomeV1` authority。固定 `job_outcome_v1.json` 只能按可变的
+`job_outcome_compatibility_projection/v1` 读取，并与 Registry ID/hash 校验；projection
+写失败只产生 warning/reconcile issue。resume report 的 authority 是不可变的 Registry-owned
+`resume_state_report/v1`；只有在 Registry record 缺失的旧工作区，固定
+`resume_state_report.json` 才能作为明确的 legacy fallback。
+
 - quota、可重试 HTTP、临时网络或 invalid response：先看 receipt；只有 `safe_to_retry=true` 才重试失败节点。
 - artifact 过期或篡改：不要从它 resume；先运行 `reconcile --dry-run`，保留证据，再生成 report-only repair plan。
 - validation closure 缺失：运行 `validate` 执行当前 Validation service，再用
@@ -40,6 +47,14 @@ python -m reviewctl attest --workspace <workspace>
   必须确认 expected call graph 只包含新生成 paper；summary-source zero-call 必须使用
   typed summary-source evidence。单篇复用 `summary_file` 必须是 canonical 单元素数组，
   并通过 `stage1_reusable_summary_manifest/v1` 校验；不能用 JSON 对象 envelope 或未注册路径替代。
+  Stage 1 reuse 必须通过 external resolver 从 parent/current Registry 解析 authority，或
+  使用自绑定 typed manifest。`current_snapshot_derived_from_external_authority=true` 的
+  current snapshot 只是派生证据，不能成为 authority；仅有 path/current snapshot/bare
+  summary 或 synthetic ID/hash 都不足。精确 equality 包含真实 PDF 字节 SHA、extracted/
+  semantic hash、preprocess/input/prompt/provider/model/schema/visual hash 和 normalized
+  summary payload hash。相同字节换路径可复用并记录位置；PDF 字节不同即使 text hash 相同也
+  必须失效。provider-generated source 只要有 call，就必须有 Registry 验证的原始 receipt
+  closure 与 ledger。
 
 ```text
 python -m reviewctl resume --workspace <workspace>

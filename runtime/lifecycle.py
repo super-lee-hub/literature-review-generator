@@ -5,16 +5,22 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, cast
+import warnings
 
 from services.artifact_registry import ArtifactRegistry
 from services.job_fingerprint import FingerprintInputs, build_fingerprint_bundle, sanitize_config_for_fingerprint
-from services.job_outcome import JobDisposition, JobOutcomeV1, JobStatus
-from services.job_workspace import JobWorkspace, atomic_write_json, publish_json_artifact
+from services.job_outcome import (
+    JobDisposition,
+    JobOutcomeV1,
+    JobStatus,
+    publish_job_outcome_compatibility_projection,
+)
+from services.job_workspace import JobWorkspace, publish_json_artifact
 from services.progress_state import determine_resume_state
 from services.settings import ApplicationSettings
 from services.source_inventory import SourceInventoryV1
 from services.queue_service import LocalPublicationContext
-from runtime.stage_planning import StagePlanError, build_stage_plan
+from runtime.stage_planning import build_stage_plan
 
 
 ResumeReportWriter = Callable[[JobWorkspace, Any], str]
@@ -375,10 +381,11 @@ def publish_running_job_runtime(
         completed_stages=("source_intake",) if context.source_canonical_ready else (),
         degradation_reasons=context.source_degradation_reasons,
     )
+    compatibility_path = context.workspace.artifact_path("job_outcome_v1.json")
     outcome_record = publish_json_artifact(
         context.publication_context,
         context.registry,
-        context.job_outcome_path,
+        compatibility_path,
         running_outcome.to_dict(),
         artifact_role="job_outcome",
         artifact_type="job_outcome",
@@ -389,13 +396,23 @@ def publish_running_job_runtime(
             "job_status": running_outcome.job_status,
             "job_disposition": running_outcome.job_disposition,
             "canonical_ready": running_outcome.canonical_ready,
+            "requires_attention": running_outcome.requires_attention,
             "outcome_revision": running_outcome.outcome_revision,
         },
     )
-    # The context is frozen to make lifecycle inputs explicit, but the
-    # selected outcome path is a durable Registry projection.  Keep the
-    # compatibility field pointed at the immutable version actually published
-    # so existing callers cannot accidentally read a stale fixed-path file.
+    projection_result = publish_job_outcome_compatibility_projection(
+        path=compatibility_path,
+        registry=context.registry,
+        canonical_record=outcome_record,
+        outcome=running_outcome,
+        producer="runtime.lifecycle.publish_running_job_runtime",
+        publication_context=context.publication_context,
+    )
+    if projection_result.warning:
+        warnings.warn(projection_result.warning, RuntimeWarning, stacklevel=2)
+    # The context is frozen to make lifecycle inputs explicit. Keep its
+    # compatibility field pointed at the immutable Registry artifact so
+    # existing callers cannot accidentally read a stale fixed-path projection.
     object.__setattr__(context, "job_outcome_path", outcome_record.path)
     pointer_writer = (
         context.workspace.write_latest_pointer
@@ -431,7 +448,7 @@ def finalize_job_runtime(
         checkpoint_file=context.checkpoint_path,
         expected_fingerprint_bundle=context.fingerprint_bundle,
     )
-    final_resume_report_path = _publish_resume_report(
+    _publish_resume_report(
         context=context,
         workspace=context.workspace,
         registry=context.registry,
@@ -487,10 +504,11 @@ def finalize_job_runtime(
         degradation_reasons=merged_reasons,
         outcome_revision=2,
     )
+    compatibility_path = context.workspace.artifact_path("job_outcome_v1.json")
     outcome_record = publish_json_artifact(
         context.publication_context,
         context.registry,
-        context.job_outcome_path,
+        compatibility_path,
         outcome.to_dict(),
         artifact_role="job_outcome",
         artifact_type="job_outcome",
@@ -501,9 +519,20 @@ def finalize_job_runtime(
             "job_status": outcome.job_status,
             "job_disposition": outcome.job_disposition,
             "canonical_ready": outcome.canonical_ready,
+            "requires_attention": outcome.requires_attention,
             "outcome_revision": outcome.outcome_revision,
         },
     )
+    projection_result = publish_job_outcome_compatibility_projection(
+        path=compatibility_path,
+        registry=context.registry,
+        canonical_record=outcome_record,
+        outcome=outcome,
+        producer="runtime.lifecycle.finalize_job_runtime",
+        publication_context=context.publication_context,
+    )
+    if projection_result.warning:
+        warnings.warn(projection_result.warning, RuntimeWarning, stacklevel=2)
     object.__setattr__(context, "job_outcome_path", outcome_record.path)
     if before_latest_pointer is not None:
         before_latest_pointer(outcome)

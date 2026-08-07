@@ -30,7 +30,7 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
-from services.job_outcome import JobOutcomeV1
+from services.job_outcome import JobOutcomeV1, load_canonical_job_outcome
 from services.job_workspace import JobWorkspace, publish_json_artifact, utc_now_iso
 from services.queue_service import JobCancelledError
 from services.queue_service import CancelToken
@@ -1195,11 +1195,12 @@ class AgentRuntimeRunner:
                 status=status,
             ),
         )
-        outcome_record = session.context.registry.get("job_outcome")
-        if outcome_record is None or outcome_record.status != "ready":
-            raise RuntimeRunnerError("job outcome is not registered after finalization")
-        payload = json.loads(Path(outcome_record.path).read_text(encoding="utf-8"))
-        outcome = JobOutcomeV1.from_dict(payload)
+        try:
+            outcome, outcome_record = load_canonical_job_outcome(session.context.registry)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeRunnerError(
+                f"canonical job outcome is invalid after finalization: {exc}"
+            ) from exc
         evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
@@ -1285,17 +1286,11 @@ class AgentRuntimeRunner:
         """Read the canonical job head without mutating workspace state."""
 
         workspace, _registry = cls._open_workspace(workspace_path)
-        outcome_record = _registry.get("job_outcome")
-        outcome_path = Path(outcome_record.path) if outcome_record is not None else Path(
-            workspace.artifact_path("job_outcome_v1.json")
-        )
-        if outcome_record is None or outcome_record.status != "ready" or not outcome_path.is_file():
-            raise RuntimeRunnerError(f"job outcome is missing: {outcome_path}")
-        else:
-            payload = json.loads(outcome_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, Mapping):
-                raise RuntimeRunnerError("job outcome must be a JSON object")
-            outcome = JobOutcomeV1.from_dict(payload)
+        try:
+            outcome, outcome_record = load_canonical_job_outcome(_registry)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeRunnerError(f"canonical job outcome is invalid: {exc}") from exc
+        outcome_path = Path(outcome_record.path)
         if outcome.job_id != workspace.job_id:
             raise RuntimeRunnerError("job outcome belongs to another workspace")
         evaluation = _evaluate_runtime_completion(outcome, _registry)

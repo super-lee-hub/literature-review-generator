@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping
 import zipfile
@@ -85,6 +86,10 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "forensic_attestation",
         "provider_receipt_ledger",
         "review_section",
+        "stage1_portable_summary_source",
+        "stage1_portable_summary_manifest",
+        "stage1_portable_provider_closure",
+        "stage1_portable_provider_ledger",
     }
 )
 
@@ -565,7 +570,6 @@ def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: 
     for label in (
         "reused_summary_artifact_hash",
         "summary_payload_hash",
-        "registered_source_artifact_hash",
         "registry_file_hash",
         "source_summary_manifest_hash",
         "current_runtime_spec_hash",
@@ -579,17 +583,32 @@ def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: 
     registered_hash = str(root.get("registered_source_artifact_hash") or "")
     reused_id = str(root.get("reused_summary_artifact_id") or "")
     reused_hash = str(root.get("reused_summary_artifact_hash") or "")
-    if registered_id != reused_id or registered_hash != reused_hash:
-        # The current-run summary snapshot is derived evidence.  A reusable
-        # summary must also name the immutable source authority that supplied
-        # it; older records where the snapshot was the authority remain valid
-        # through the equality branch above.
-        authority_id = str(root.get("source_authority_artifact_id") or "")
-        authority_hash = str(root.get("source_authority_artifact_hash") or "")
-        if authority_id != registered_id or authority_hash != registered_hash:
+    if bool(registered_id) != bool(registered_hash):
+        raise ArtifactSchemaError(
+            "stage1_summary_reuse_record registered source identity must be paired"
+        )
+    if registered_id and (registered_id != reused_id or registered_hash != reused_hash):
+        raise ArtifactSchemaError(
+            "stage1_summary_reuse_record registered source is not bound to reused summary"
+        )
+    # New records distinguish the immutable parent authority from the current
+    # run's derived snapshot.  The legacy registered_source fields are kept in
+    # the schema for compatibility, but may intentionally be empty.
+    authority_id = str(root.get("source_authority_artifact_id") or "")
+    authority_hash = str(root.get("source_authority_artifact_hash") or "")
+    if bool(authority_id) != bool(authority_hash):
+        raise ArtifactSchemaError(
+            "stage1_summary_reuse_record source authority identity must be paired"
+        )
+    if authority_id or authority_hash:
+        if authority_id != reused_id or authority_hash != reused_hash:
             raise ArtifactSchemaError(
-                "stage1_summary_reuse_record source authority is not bound to registered source"
+                "stage1_summary_reuse_record source authority is not bound to reused summary"
             )
+    elif not registered_id:
+        raise ArtifactSchemaError(
+            "stage1_summary_reuse_record has no registered source authority"
+        )
     if str(root.get("reuse_policy") or "") != "exact_summary_reuse_v1":
         raise ArtifactSchemaError("stage1_summary_reuse_record reuse policy is invalid")
     from runtime.provider_runtime import hash_json
@@ -662,6 +681,211 @@ def _validate_stage1_reusable_summary_manifest(
             raise ArtifactSchemaError(
                 f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 hex digest"
             )
+
+
+def _validate_stage1_portable_metadata(record: Any, *, expected_type: str) -> Mapping[str, Any]:
+    if (
+        str(getattr(record, "artifact_type", "") or "") != expected_type
+        or str(getattr(record, "artifact_version", "") or "") != "v1"
+    ):
+        raise ArtifactSchemaError(f"{expected_type} Registry identity is invalid")
+    metadata_value = getattr(record, "metadata", None)
+    metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+    _require_fields(
+        metadata,
+        (
+            "authority_kind",
+            "stage_name",
+            "source_authority_job_id",
+            "original_artifact_id",
+            "original_artifact_hash",
+            "typed_manifest_artifact_id",
+            "typed_manifest_artifact_hash",
+        ),
+        f"{expected_type}.metadata",
+    )
+    if (
+        metadata.get("authority_kind") != "typed_manifest"
+        or str(metadata.get("stage_name") or "") != "stage1_analyze"
+        or not str(metadata.get("source_authority_job_id") or "")
+        or not str(metadata.get("original_artifact_id") or "")
+        or not str(metadata.get("typed_manifest_artifact_id") or "")
+    ):
+        raise ArtifactSchemaError(f"{expected_type} portable authority metadata is invalid")
+    for label in (
+        "original_artifact_hash",
+        "typed_manifest_artifact_hash",
+    ):
+        digest = str(metadata.get(label) or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
+            raise ArtifactSchemaError(f"{expected_type}.metadata.{label} is not SHA-256")
+    if str(metadata.get("original_artifact_hash") or "") != str(
+        getattr(record, "content_hash", "") or ""
+    ):
+        raise ArtifactSchemaError(f"{expected_type} original byte hash is inconsistent")
+    if expected_type == "stage1_portable_summary_manifest" and (
+        str(metadata.get("typed_manifest_artifact_id") or "")
+        != str(metadata.get("original_artifact_id") or "")
+        or str(metadata.get("typed_manifest_artifact_hash") or "")
+        != str(getattr(record, "content_hash", "") or "")
+    ):
+        raise ArtifactSchemaError(
+            "stage1 portable summary manifest metadata is not self-bound"
+        )
+    return metadata
+
+
+def _validate_stage1_portable_summary_source(
+    record: Any,
+    path: str | Path,
+    _root: Mapping[str, Any] | None = None,
+) -> None:
+    _validate_stage1_portable_metadata(
+        record,
+        expected_type="stage1_portable_summary_source",
+    )
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ArtifactSchemaError("stage1 portable summary source is not valid JSON") from exc
+    items = raw if isinstance(raw, list) else [raw] if isinstance(raw, Mapping) else []
+    if not items:
+        raise ArtifactSchemaError("stage1 portable summary source is empty")
+    for index, item in enumerate(items):
+        if (
+            not isinstance(item, Mapping)
+            or not isinstance(item.get("ai_summary"), Mapping)
+            or not isinstance(item.get("paper_info"), Mapping)
+            or not str(item["paper_info"].get("canonical_paper_key") or "")
+        ):
+            raise ArtifactSchemaError(
+                f"stage1 portable summary source item {index} is not canonical"
+            )
+
+
+def _validate_stage1_portable_summary_manifest(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    metadata = _validate_stage1_portable_metadata(
+        record,
+        expected_type="stage1_portable_summary_manifest",
+    )
+    _require_fields(
+        root,
+        (
+            "artifact_type",
+            "artifact_version",
+            "job_id",
+            "stage_name",
+            "canonical_paper_key",
+            "source_summary_artifact_id",
+            "source_summary_artifact_hash",
+            "summary_payload",
+            "summary_payload_hash",
+            "normalized_summary_payload_hash",
+            "binding",
+            "binding_hash",
+            "manifest_content_hash",
+            "provider_receipt_closure_id",
+            "provider_receipt_closure_hash",
+            "provider_receipt_ledger_id",
+            "provider_receipt_ledger_hash",
+        ),
+        "stage1_portable_summary_manifest",
+    )
+    if (
+        root.get("artifact_type") != "stage1_reusable_summary_manifest"
+        or root.get("artifact_version") != "v1"
+        or str(root.get("job_id") or "")
+        != str(metadata.get("source_authority_job_id") or "")
+        or str(root.get("stage_name") or "") != "stage1_analyze"
+        or not isinstance(root.get("summary_payload"), Mapping)
+        or not isinstance(root.get("binding"), Mapping)
+    ):
+        raise ArtifactSchemaError("stage1 portable summary manifest identity is invalid")
+    from runtime.provider_runtime import hash_json
+
+    manifest_content_hash = str(root.get("manifest_content_hash") or "")
+    normalized_manifest = dict(root)
+    normalized_manifest["manifest_content_hash"] = ""
+    if hash_json(normalized_manifest) != manifest_content_hash:
+        raise ArtifactSchemaError("stage1 portable summary manifest self hash is invalid")
+    summary_hash = hash_json(root["summary_payload"])
+    if any(
+        str(root.get(label) or "") != summary_hash
+        for label in ("summary_payload_hash", "normalized_summary_payload_hash")
+    ):
+        raise ArtifactSchemaError("stage1 portable summary manifest summary hash is invalid")
+    normalized_binding = dict(root["binding"])
+    normalized_binding.pop("source_summary_manifest_id", None)
+    normalized_binding.pop("source_summary_manifest_hash", None)
+    if hash_json(normalized_binding) != str(root.get("binding_hash") or ""):
+        raise ArtifactSchemaError("stage1 portable summary manifest binding hash is invalid")
+    for label in (
+        "source_summary_artifact_hash",
+        "binding_hash",
+        "manifest_content_hash",
+        "provider_receipt_closure_hash",
+        "provider_receipt_ledger_hash",
+    ):
+        digest = str(root.get(label) or "")
+        if digest and (
+            len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest.lower())
+        ):
+            raise ArtifactSchemaError(f"stage1 portable summary manifest {label} is invalid")
+
+
+def _validate_stage1_portable_provider_closure(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    metadata = _validate_stage1_portable_metadata(
+        record,
+        expected_type="stage1_portable_provider_closure",
+    )
+    if (
+        root.get("artifact_type") != "provider_receipt_closure"
+        or root.get("artifact_version") != "v1"
+        or str(root.get("job_id") or "")
+        != str(metadata.get("source_authority_job_id") or "")
+        or str(root.get("stage_name") or "") != "stage1_analyze"
+        or not isinstance(root.get("expected_calls"), list)
+    ):
+        raise ArtifactSchemaError("stage1 portable provider closure identity is invalid")
+    payload_value = root.get("payload")
+    if not isinstance(payload_value, Mapping):
+        raise ArtifactSchemaError("stage1 portable provider closure payload is invalid")
+    _require_fields(
+        payload_value,
+        (
+            "closure_epoch_id",
+            "expected_call_ids",
+            "observed_call_ids",
+            "missing_call_ids",
+            "hash_mismatches",
+            "complete",
+            "closure_hash",
+        ),
+        "stage1_portable_provider_closure.payload",
+    )
+    if payload_value.get("complete") is not True:
+        raise ArtifactSchemaError("stage1 portable provider closure is incomplete")
+
+
+def _validate_stage1_portable_provider_ledger(
+    record: Any,
+    path: str | Path,
+    _root: Mapping[str, Any] | None = None,
+) -> None:
+    _validate_stage1_portable_metadata(
+        record,
+        expected_type="stage1_portable_provider_ledger",
+    )
+    _validate_receipt_ledger(record, path)
 
 
 def _validate_outline_provider_call_plan(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -803,6 +1027,9 @@ def _validate_lease_publication_manifest(record: Any, _path: str | Path, root: M
             "content_hash",
             "size_bytes",
             "registered_artifact_id",
+            "registered_artifact_type",
+            "registered_artifact_version",
+            "registered_artifact_hash",
         ),
         "lease_publication_manifest",
     )
@@ -814,6 +1041,45 @@ def _validate_lease_publication_manifest(record: Any, _path: str | Path, root: M
         raise ArtifactSchemaError("lease_publication_manifest.size_bytes is invalid")
     if len(str(root.get("content_hash") or "")) != 64:
         raise ArtifactSchemaError("lease_publication_manifest.content_hash is invalid")
+    if len(str(root.get("registered_artifact_hash") or "")) != 64:
+        raise ArtifactSchemaError("lease_publication_manifest.registered_artifact_hash is invalid")
+    if not str(root.get("registered_artifact_type") or ""):
+        raise ArtifactSchemaError("lease_publication_manifest.registered_artifact_type is invalid")
+    if not str(root.get("registered_artifact_version") or ""):
+        raise ArtifactSchemaError("lease_publication_manifest.registered_artifact_version is invalid")
+    if str(root.get("content_hash") or "") != str(root.get("registered_artifact_hash") or ""):
+        raise ArtifactSchemaError("lease_publication_manifest target hash is inconsistent")
+    dependencies = list(getattr(record, "depends_on", ()) or ())
+    if len(dependencies) != 1:
+        raise ArtifactSchemaError("lease_publication_manifest must have exactly one target dependency")
+    dependency = dependencies[0]
+    if (
+        str(getattr(dependency, "dependency_kind", "") or "") != "local_job"
+        or str(getattr(dependency, "job_id", "") or "") != str(root.get("job_id") or "")
+        or str(getattr(dependency, "artifact_id", "") or "")
+        != str(root.get("registered_artifact_id") or "")
+        or str(getattr(dependency, "artifact_type", "") or "")
+        != str(root.get("registered_artifact_type") or "")
+        or os.path.normcase(os.path.abspath(os.fspath(getattr(dependency, "path", "") or "")))
+        != os.path.normcase(os.path.abspath(os.fspath(root.get("final_path") or "")))
+        or str(getattr(dependency, "content_hash", "") or "")
+        != str(root.get("registered_artifact_hash") or "")
+    ):
+        raise ArtifactSchemaError("lease_publication_manifest target dependency is inconsistent")
+    metadata = getattr(record, "metadata", {}) or {}
+    if (
+        not isinstance(metadata, Mapping)
+        or str(metadata.get("target_artifact_id") or "")
+        != str(root.get("registered_artifact_id") or "")
+        or str(metadata.get("target_artifact_type") or "")
+        != str(root.get("registered_artifact_type") or "")
+        or str(metadata.get("target_artifact_version") or "")
+        != str(root.get("registered_artifact_version") or "")
+        or str(metadata.get("target_artifact_hash") or "")
+        != str(root.get("registered_artifact_hash") or "")
+        or metadata.get("immutable") is not True
+    ):
+        raise ArtifactSchemaError("lease_publication_manifest Registry metadata is inconsistent")
 
 
 def _validate_receipt_ledger(record: Any, path: str | Path, _root: Mapping[str, Any] | None = None) -> None:
@@ -1069,6 +1335,10 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("provider_expected_call_graph", "v1"): _validate_provider_expected_call_graph,
         ("stage1_summary_reuse_record", "v1"): _validate_stage1_summary_reuse_record,
         ("stage1_reusable_summary_manifest", "v1"): _validate_stage1_reusable_summary_manifest,
+        ("stage1_portable_summary_source", "v1"): _validate_stage1_portable_summary_source,
+        ("stage1_portable_summary_manifest", "v1"): _validate_stage1_portable_summary_manifest,
+        ("stage1_portable_provider_closure", "v1"): _validate_stage1_portable_provider_closure,
+        ("stage1_portable_provider_ledger", "v1"): _validate_stage1_portable_provider_ledger,
         ("outline_provider_call_plan", "v1"): _validate_outline_provider_call_plan,
         ("validation_disposition", "v1"): _validate_validation_disposition,
         ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,
@@ -1123,6 +1393,8 @@ def validate_registered_artifact(record: Any, path: str | Path) -> None:
             "export_bundle",
             "provider_receipt_ledger",
             "review_replay_ledger",
+            "stage1_portable_summary_source",
+            "stage1_portable_provider_ledger",
         }:
             root = None
         else:

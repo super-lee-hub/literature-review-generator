@@ -31,7 +31,6 @@ from services.artifact_registry import (
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
 from services.job_workspace import (
     JobWorkspace,
-    atomic_write_json,
     publish_bytes_artifact,
     publish_json_artifact,
     utc_now_iso,
@@ -533,6 +532,74 @@ class InternalStageExecutorRegistry:
             payload = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot load canonical summary source: {target}") from exc
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("artifact_type") == "stage1_reusable_summary_manifest"
+            and payload.get("artifact_version") == "v1"
+        ):
+            summary_payload = payload.get("summary_payload")
+            binding = payload.get("binding")
+            paper_info = payload.get("paper_info")
+            if not isinstance(summary_payload, Mapping) or not summary_payload:
+                raise RuntimeError(
+                    f"typed Stage1 reusable summary manifest has no summary payload: {target}"
+                )
+            if not isinstance(binding, Mapping) or not binding:
+                raise RuntimeError(
+                    f"typed Stage1 reusable summary manifest has no binding: {target}"
+                )
+            manifest_file_hash = file_sha256(target)
+            manifest_artifact_id = (
+                f"stage1:portable_summary_manifest:{manifest_file_hash[:24]}"
+            )
+            normalized_binding = dict(binding)
+            normalized_binding["source_summary_manifest_id"] = manifest_artifact_id
+            normalized_binding["source_summary_manifest_hash"] = manifest_file_hash
+            normalized_paper_info = (
+                dict(paper_info) if isinstance(paper_info, Mapping) else {}
+            )
+            normalized_paper_info.setdefault(
+                "canonical_paper_key",
+                str(payload.get("canonical_paper_key") or ""),
+            )
+            normalized_paper_info.setdefault(
+                "source_paper_id",
+                str(payload.get("source_paper_id") or ""),
+            )
+            normalized_paper_info.setdefault(
+                "source_mode",
+                str(binding.get("source_mode") or ""),
+            )
+            extra = normalized_binding.get("extra")
+            provider_transport_count = (
+                int(extra.get("provider_transport_count") or 0)
+                if isinstance(extra, Mapping)
+                else 0
+            )
+            return [
+                {
+                    "status": "success",
+                    "paper_info": normalized_paper_info,
+                    "source_mode": str(normalized_paper_info.get("source_mode") or ""),
+                    "ai_summary": dict(summary_payload),
+                    "provider": {
+                        "transport_count": provider_transport_count,
+                        "receipt_ids": [],
+                    },
+                    "stage1_reuse": {
+                        "decision": "exact_summary_reuse",
+                        "reason": "typed_stage1_reusable_summary_manifest",
+                        "policy": "exact_summary_reuse_v1",
+                        "authority_kind": "typed_manifest",
+                        "typed_manifest_path": str(target),
+                        "typed_manifest_artifact_id": manifest_artifact_id,
+                        "typed_manifest_artifact_hash": manifest_file_hash,
+                        "binding": normalized_binding,
+                        "source_artifact_id": str(payload.get("source_summary_artifact_id") or ""),
+                        "source_artifact_hash": str(payload.get("source_summary_artifact_hash") or ""),
+                    },
+                }
+            ]
         if isinstance(payload, list):
             raw_summaries = payload
         elif isinstance(payload, Mapping) and isinstance(payload.get("summaries"), list):
@@ -594,7 +661,19 @@ class InternalStageExecutorRegistry:
             source_paper_id = str(paper_info.get("source_paper_id") or "").strip()
             if paper_key not in expected or paper_key in seen:
                 raise RuntimeError(f"canonical summary[{index}] has an unknown or duplicate identity")
-            if source_paper_id != expected[paper_key].source_paper_id:
+            expected_item = expected[paper_key]
+            summary_source_mode = str(
+                paper_info.get("source_mode") or summary.get("source_mode") or ""
+            ).strip().lower()
+            expected_source_mode = str(expected_item.source_mode or "").strip().lower()
+            # Direct-mode source_paper_id is an absolute file location, not a
+            # stable paper identity.  Exact reuse binds the PDF bytes and
+            # semantic input in Stage1ReusableSummaryBindingV1; requiring the
+            # old path here would reject a legitimate library move.
+            if not (
+                summary_source_mode == "direct"
+                and expected_source_mode == "direct"
+            ) and source_paper_id != expected_item.source_paper_id:
                 raise RuntimeError(f"canonical summary[{index}] source_paper_id does not match the source bundle")
             try:
                 validate_canonical_ai_summary(
@@ -1938,6 +2017,11 @@ class AgentRuntimeBridge:
                 validation_run_result_artifact_hash=canonical_record.content_hash,
                 validation_receipt_closure_artifact_id=validation_closure_record.artifact_id,
                 validation_receipt_closure_artifact_hash=validation_closure_record.content_hash,
+                validation_status=(
+                    "clean"
+                    if validation_run_result.validation_disposition.value == "clean"
+                    else "findings"
+                ),
                 actor=producer,
                 reason="validation completed and established the verified current artifact set",
                 previous_set_id=previous_set.set_id if previous_set is not None else "",

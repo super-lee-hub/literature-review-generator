@@ -29,12 +29,23 @@ cannot satisfy a readiness or completion gate.
   created by the current publication. An existing file with the same hash is
   reused and is never deleted if an alias registration fails; an existing file
   with different bytes fails before any Registry mutation.
-- `job_outcome_v1.json` is the job-head projection: lifecycle status,
-  disposition, readiness policy, required/completed stages, and
-  `canonical_ready`.
+- The immutable Registry record with `artifact_id=job_outcome`,
+  `artifact_type=job_outcome`, and `artifact_version=v1` is the sole canonical `JobOutcomeV1`
+  authority. Readers load it through the Registry and verify its job ID,
+  ready status, content hash, payload contract, and mirrored metadata.
+- The fixed path `job_outcome_v1.json` is only the mutable
+  `job_outcome_compatibility_projection/v1`. It records the canonical
+  `job_outcome` ID/hash and outcome revision; readers must validate those
+  fields against the Registry head. A projection write failure produces only
+  a warning/reconcile issue after the canonical commit and never changes the
+  canonical outcome.
 - `artifacts/job_attempts/snapshot-*.json` is append-only attempt history.
   A stale running attempt becomes `interrupted`; it is never rewritten as the
   next attempt.
+- `resume_state_report` is an immutable Registry-owned `resume_state_report/v1`
+  artifact and is the resume-report authority. Reconciliation may use the
+  fixed `resume_state_report.json` path only as an explicit legacy fallback
+  when no Registry record exists, and still validates its typed payload.
 - `runtime_stage_terminals/*/*.json` proves stage completion only when every
   output, hash, schema, dependency, and terminal record validates.
 - `current-artifact-set:pointer` resolves one immutable `CurrentArtifactSetV1`
@@ -96,17 +107,28 @@ manifest, runtime-spec, evidence, and available original-receipt dependencies.
 Summary-source zero-call stages use typed summary-source evidence instead of an
 empty provider ledger.
 
-Stage1 reuse compares the registered source binding against the current source,
-preprocess, input, prompt, model, schema, and visual-provenance facts before a
-summary is reused. A missing or changed required fact fails closed; an omitted
-optional provider name is reusable only when both the prior and current
-configuration omit it. All-reuse and mixed-reuse closure must still cover the
+Stage1 reuse has two admissible authority paths: a source artifact resolved from
+the parent/current Registry through the external resolver, or a self-binding
+typed `stage1_reusable_summary_manifest/v1` whose manifest ID/hash and canonical
+summary bytes all verify. A current-run snapshot is marked
+`current_snapshot_derived_from_external_authority=true` and is derived evidence,
+never authority. Path-only input, a current snapshot, a bare summary, or
+synthetic IDs/hashes cannot authorize reuse.
+
+Exact reuse equality includes the real PDF byte SHA
+(`source_pdf_content_sha256`), extracted-text and semantic-input hashes
+(`stage1_extracted_text_hash`, `stage1_semantic_input_hash`), preprocess/input
+policy hashes, prompt hash, provider/model binding, schema hash, visual-input
+hash, and normalized summary payload hash. The same PDF bytes moved to another
+path remain reusable and the original/current locations plus `location_changed`
+are traced; different PDF bytes fail closed even when extracted or semantic text
+hashes match. A provider-generated source with any transport calls additionally
+requires its original provider receipt closure and receipt ledger, both
+Registry-verified. All-reuse and mixed-reuse closure must still cover the
 SourceBundle identities exactly and preserve one Registry-verifiable reuse
 record per reused paper. Per-paper `summary_file` reuse sources are stored as a
-one-item canonical summary array; their source-manifest envelope has its own
-typed `stage1_reusable_summary_manifest/v1` record. The local snapshot hash,
-original source-authority identity, logical summary payload hash, and Registry
-file hash remain separate fields.
+one-item canonical summary array with the typed manifest envelope; snapshot,
+source-authority, summary-payload, and Registry-file hashes remain separate.
 
 ## Public outcomes
 

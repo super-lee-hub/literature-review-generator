@@ -256,6 +256,125 @@ def test_reuse_binding_invalidates_different_pdf_bytes_with_same_semantic_input(
     assert "source_pdf_content_sha256" in comparison["mismatches"]
 
 
+def test_reuse_binding_compares_authority_payload_and_provider_closure_facts() -> None:
+    common = {
+        "canonical_paper_key": "10.1000/verified",
+        "source_mode": "direct",
+        "source_pdf_content_sha256": "a" * 64,
+        "stage1_extracted_text_hash": "b" * 64,
+        "stage1_semantic_input_hash": "c" * 64,
+        "preprocess_contract_hash": "d" * 64,
+        "prompt_template_hash": "e" * 64,
+        "input_builder_policy_hash": "f" * 64,
+        "provider_config_hash": "1" * 64,
+        "summary_schema_hash": "2" * 64,
+        "visual_input_manifest_hash": "3" * 64,
+        "normalized_summary_payload_hash": "4" * 64,
+        "summary_payload_hash": "4" * 64,
+        "source_authority_job_id": "parent-job",
+        "source_authority_registry_id": "parent-registry",
+        "source_authority_registry_revision": "7",
+        "source_authority_artifact_id": "parent:summary",
+        "source_authority_artifact_hash": "5" * 64,
+        "source_summary_manifest_id": "parent:manifest",
+        "source_summary_manifest_hash": "6" * 64,
+        "source_provider_receipt_closure_id": "parent:closure",
+        "source_provider_receipt_closure_hash": "7" * 64,
+        "source_provider_receipt_ledger_id": "parent:ledger",
+        "source_provider_receipt_ledger_hash": "8" * 64,
+    }
+    original = Stage1ReusableSummaryBindingV1(
+        **common,
+        extra={"source_kind": "stage1_provider_generated", "provider_transport_count": 1},
+    )
+    changed = Stage1ReusableSummaryBindingV1(
+        **{**common, "source_provider_receipt_closure_hash": "9" * 64}
+    )
+
+    comparison = original.compare(changed)
+
+    assert comparison["equal"] is False
+    assert "source_provider_receipt_closure_hash" in comparison["mismatches"]
+
+
+def test_provider_generated_authority_without_original_closure_is_not_exact_reuse(
+    tmp_path: Path,
+) -> None:
+    from runtime.provider_runtime import hash_json
+    from services.stage1_reuse import evaluate_stage1_reuse
+
+    ai_summary = {"summary": "authoritative"}
+    authority_path = tmp_path / "authority.json"
+    authority_path.write_text(
+        json.dumps(
+            [
+                {
+                    "artifact_type": "summary_file",
+                    "artifact_version": "v1",
+                    "source_kind": "stage1_provider_generated",
+                    "job_id": "parent-job",
+                    "paper_info": {"canonical_paper_key": "10.1000/verified"},
+                    "ai_summary": ai_summary,
+                    "summary_payload_hash": hash_json(ai_summary),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    parent_registry = ArtifactRegistry(str(tmp_path / "parent-registry.json"), "parent-job")
+    authority_record = parent_registry.register_file(
+        artifact_role="summary_source",
+        artifact_type="summary_file",
+        artifact_version="v1",
+        path=authority_path,
+        producer="test",
+        artifact_id="parent:summary",
+    )
+    binding = Stage1ReusableSummaryBindingV1(
+        canonical_paper_key="10.1000/verified",
+        source_mode="direct",
+        source_pdf_content_sha256="a" * 64,
+        stage1_extracted_text_hash="b" * 64,
+        stage1_semantic_input_hash="c" * 64,
+        preprocess_contract_hash="d" * 64,
+        prompt_template_hash="e" * 64,
+        input_builder_policy_hash="f" * 64,
+        provider_config_hash="1" * 64,
+        summary_schema_hash="2" * 64,
+        visual_input_manifest_hash="3" * 64,
+        normalized_summary_payload_hash=hash_json(ai_summary),
+        summary_payload_hash=hash_json(ai_summary),
+        source_authority_job_id="parent-job",
+        source_authority_registry_id="parent-registry",
+        source_authority_registry_revision=str(parent_registry.revision),
+        source_authority_artifact_id=authority_record.artifact_id,
+        source_authority_artifact_hash=authority_record.content_hash,
+        source_authority_artifact_path=str(authority_path),
+        source_authority_registry_path=str(parent_registry.registry_path),
+        extra={"source_kind": "stage1_provider_generated", "provider_transport_count": 1},
+    )
+    imported = {
+        "status": "success",
+        "paper_info": {"canonical_paper_key": "10.1000/verified"},
+        "ai_summary": ai_summary,
+        "provider": {"transport_count": 1},
+        "stage1_reuse": {"binding": binding.to_dict()},
+    }
+
+    result = evaluate_stage1_reuse(
+        imported,
+        binding,
+        registry=ArtifactRegistry(str(tmp_path / "child-registry.json"), "child-job"),
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == "parent-job" else None
+        ),
+    )
+
+    assert result.reusable is False
+    assert result.decision == "identity_match_unverified"
+    assert "closure" in result.reason or "provider" in result.reason
+
+
 def test_reuse_requires_authority_payload_to_match_imported_summary(tmp_path: Path) -> None:
     from services.stage1_reuse import evaluate_stage1_reuse
 

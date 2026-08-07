@@ -52,10 +52,19 @@ _ZERO_CALL_EVIDENCE_POLICY: dict[str, tuple[str, ...]] = {
     ),
     "outline": (
         "outline_provider_call_plan",
-        "outline_replay_evidence",
+        "outline_v3_model_call_replay",
     ),
-    "review": ("review_replay_evidence",),
+    "review": ("review_replay_ledger",),
     "validate": ("validation_disposition",),
+}
+
+_ZERO_CALL_EVIDENCE_VERSIONS: dict[str, frozenset[str]] = {
+    "summary_source_manifest": frozenset({"v1", "v2"}),
+    "stage1_summary_reuse_record": frozenset({"v1"}),
+    "outline_provider_call_plan": frozenset({"v1"}),
+    "outline_v3_model_call_replay": frozenset({"v1"}),
+    "review_replay_ledger": frozenset({"v1"}),
+    "validation_disposition": frozenset({"v1"}),
 }
 
 
@@ -396,18 +405,645 @@ def _dependency_record(
     *,
     external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None,
 ) -> ArtifactRecord | None:
-    record = registry.get(str(getattr(dependency, "artifact_id", "") or ""))
-    if record is not None:
-        return record
-    if str(getattr(dependency, "dependency_kind", "") or "") != "external_job":
-        return None
+    artifact_id = str(getattr(dependency, "artifact_id", "") or "")
+    job_id = str(getattr(dependency, "job_id", "") or "")
+    dependency_kind = str(getattr(dependency, "dependency_kind", "") or "")
+    is_external = dependency_kind == "external_job" or bool(
+        job_id and job_id != registry.job_id
+    )
+    if not is_external:
+        return registry.get(artifact_id)
     if external_registry_resolver is None:
         return None
-    target = external_registry_resolver(str(getattr(dependency, "job_id", "") or ""))
-    if target is None:
+    target = external_registry_resolver(job_id)
+    if target is None or target.job_id != job_id:
         return None
     target.reload()
-    return target.get(str(getattr(dependency, "artifact_id", "") or ""))
+    return target.get(artifact_id)
+
+
+def _paths_match(left: str | Path, right: str | Path) -> bool:
+    try:
+        left_path = str(Path(left).resolve()).casefold()
+        right_path = str(Path(right).resolve()).casefold()
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(left_path and right_path and left_path == right_path)
+
+
+def _dependency_ref_matches_record(dependency: Any, record: ArtifactRecord) -> bool:
+    return (
+        str(getattr(dependency, "dependency_kind", "") or "") == "local_job"
+        and str(getattr(dependency, "job_id", "") or "") == record.job_id
+        and str(getattr(dependency, "artifact_id", "") or "") == record.artifact_id
+        and str(getattr(dependency, "artifact_type", "") or "") == record.artifact_type
+        and str(getattr(dependency, "content_hash", "") or "") == record.content_hash
+        and _paths_match(str(getattr(dependency, "path", "") or ""), record.path)
+    )
+
+
+def _stage1_reuse_authority_dependency(
+    *,
+    stage: str,
+    label: str,
+    reuse_payload: Mapping[str, Any],
+    dependency_by_id: Mapping[str, Any],
+    dependency_records_by_id: Mapping[str, ArtifactRecord],
+    registry: ArtifactRegistry,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None,
+    original_id_field: str,
+    original_hash_field: str,
+    portable_id_field: str,
+    portable_hash_field: str,
+    original_artifact_type: str,
+    portable_artifact_type: str,
+    required: bool,
+) -> tuple[ArtifactRecord | None, bool, list[str]]:
+    """Resolve a Stage 1 authority through a verified child-local byte copy."""
+
+    blocking: list[str] = []
+    original_id = str(reuse_payload.get(original_id_field) or "")
+    original_hash = str(reuse_payload.get(original_hash_field) or "")
+    portable_id = str(reuse_payload.get(portable_id_field) or "")
+    portable_hash = str(reuse_payload.get(portable_hash_field) or "")
+    portable = bool(portable_id or portable_hash)
+
+    if not original_id and not original_hash and not portable:
+        if required:
+            blocking.append(f"provider_closure_reuse_{label}_binding_invalid:{stage}")
+        return None, False, blocking
+    if not original_id or not original_hash:
+        blocking.append(f"provider_closure_reuse_{label}_authority_incomplete:{stage}")
+        return None, portable, blocking
+    if portable:
+        if not portable_id or not portable_hash:
+            blocking.append(f"provider_closure_reuse_{label}_portable_incomplete:{stage}")
+            return None, True, blocking
+        if str(reuse_payload.get("source_authority_kind") or "") != "typed_manifest":
+            blocking.append(f"provider_closure_reuse_{label}_portable_kind_invalid:{stage}")
+        if portable_hash != original_hash:
+            blocking.append(f"provider_closure_reuse_{label}_portable_hash_mismatch:{stage}")
+
+    artifact_id = portable_id if portable else original_id
+    content_hash = portable_hash if portable else original_hash
+    dependency = dependency_by_id.get(artifact_id)
+    if dependency is None or str(getattr(dependency, "content_hash", "") or "") != content_hash:
+        blocking.append(f"provider_closure_reuse_{label}_binding_invalid:{stage}")
+        return None, portable, blocking
+
+    record = dependency_records_by_id.get(artifact_id)
+    if record is None or record.status != "ready" or record.content_hash != content_hash:
+        blocking.append(f"provider_closure_reuse_{label}_record_invalid:{stage}")
+        return None, portable, blocking
+    expected_type = portable_artifact_type if portable else original_artifact_type
+    source_authority_job_id = str(
+        reuse_payload.get("source_authority_job_id") or ""
+    )
+    expected_job_id = (
+        registry.job_id
+        if portable
+        else source_authority_job_id
+    )
+    if (
+        record.artifact_type != expected_type
+        or record.artifact_version != "v1"
+        or not expected_job_id
+        or record.job_id != expected_job_id
+    ):
+        blocking.append(f"provider_closure_reuse_{label}_type_invalid:{stage}")
+    if (
+        str(getattr(dependency, "artifact_type", "") or "") != record.artifact_type
+        or str(getattr(dependency, "job_id", "") or "") != record.job_id
+        or not _paths_match(str(getattr(dependency, "path", "") or ""), record.path)
+    ):
+        blocking.append(f"provider_closure_reuse_{label}_dependency_mismatch:{stage}")
+    try:
+        ArtifactRegistry._verify_ready_artifact(record)
+        dependency_registry = registry
+        if not portable and source_authority_job_id != registry.job_id:
+            dependency_registry = (
+                external_registry_resolver(source_authority_job_id)
+                if external_registry_resolver is not None
+                else None
+            )
+            if dependency_registry is None:
+                raise RegistryError(
+                    f"source authority Registry is unavailable: {source_authority_job_id}"
+                )
+            dependency_registry.reload()
+        dependency_registry.verify_ready_dependencies(
+            record.depends_on,
+            external_registry_resolver=external_registry_resolver,
+        )
+    except (OSError, RegistryError, ValueError, TypeError) as exc:
+        blocking.append(f"provider_closure_reuse_{label}_untrusted:{stage}:{exc}")
+
+    if portable:
+        metadata = record.metadata if isinstance(record.metadata, Mapping) else {}
+        expected_manifest_id = str(reuse_payload.get("typed_manifest_artifact_id") or "")
+        expected_manifest_hash = str(reuse_payload.get("typed_manifest_artifact_hash") or "")
+        if (
+            metadata.get("authority_kind") != "typed_manifest"
+            or str(metadata.get("stage_name") or "") != "stage1_analyze"
+            or str(metadata.get("source_authority_job_id") or "")
+            != source_authority_job_id
+            or str(metadata.get("original_artifact_id") or "") != original_id
+            or str(metadata.get("original_artifact_hash") or "") != original_hash
+            or not expected_manifest_id
+            or not expected_manifest_hash
+            or str(metadata.get("typed_manifest_artifact_id") or "") != expected_manifest_id
+            or str(metadata.get("typed_manifest_artifact_hash") or "") != expected_manifest_hash
+        ):
+            blocking.append(f"provider_closure_reuse_{label}_portable_metadata_invalid:{stage}")
+    return record, portable, blocking
+
+
+def _stage1_typed_manifest_authority_issues(
+    *,
+    stage: str,
+    paper_key: str,
+    reuse_payload: Mapping[str, Any],
+    source_record: ArtifactRecord | None,
+    manifest_record: ArtifactRecord | None,
+    closure_record: ArtifactRecord | None,
+    ledger_record: ArtifactRecord | None,
+) -> list[str]:
+    """Re-validate portable Stage 1 authority bytes at completion time."""
+
+    if str(reuse_payload.get("source_authority_kind") or "") != "typed_manifest":
+        return []
+    blocking: list[str] = []
+    if source_record is None or manifest_record is None:
+        return [f"provider_closure_reuse_typed_manifest_dependencies_missing:{stage}"]
+    manifest_payload = _json_object(manifest_record.path)
+    if manifest_payload is None:
+        return [f"provider_closure_reuse_typed_manifest_invalid:{stage}"]
+
+    declared_content_hash = str(manifest_payload.get("manifest_content_hash") or "")
+    normalized_manifest = dict(manifest_payload)
+    normalized_manifest["manifest_content_hash"] = ""
+    expected_facts = (
+        ("job_id", "source_authority_job_id"),
+        ("source_summary_artifact_id", "source_authority_artifact_id"),
+        ("source_summary_artifact_hash", "source_authority_artifact_hash"),
+        ("provider_receipt_closure_id", "source_provider_receipt_closure_id"),
+        ("provider_receipt_closure_hash", "source_provider_receipt_closure_hash"),
+        ("provider_receipt_ledger_id", "source_provider_receipt_ledger_id"),
+        ("provider_receipt_ledger_hash", "source_provider_receipt_ledger_hash"),
+    )
+    if (
+        manifest_payload.get("artifact_type") != "stage1_reusable_summary_manifest"
+        or manifest_payload.get("artifact_version") != "v1"
+        or str(manifest_payload.get("stage_name") or "") != "stage1_analyze"
+        or str(manifest_payload.get("canonical_paper_key") or "") != paper_key
+        or not declared_content_hash
+        or hash_json(normalized_manifest) != declared_content_hash
+        or declared_content_hash
+        != str(reuse_payload.get("typed_manifest_content_hash") or "")
+        or manifest_record.content_hash
+        != str(reuse_payload.get("typed_manifest_artifact_hash") or "")
+        or manifest_record.artifact_id
+        != str(reuse_payload.get("typed_manifest_artifact_id") or "")
+    ):
+        blocking.append(f"provider_closure_reuse_typed_manifest_binding_invalid:{stage}")
+    for manifest_field, reuse_field in expected_facts:
+        if str(manifest_payload.get(manifest_field) or "") != str(
+            reuse_payload.get(reuse_field) or ""
+        ):
+            blocking.append(
+                f"provider_closure_reuse_typed_manifest_{manifest_field}_mismatch:{stage}"
+            )
+
+    manifest_binding = manifest_payload.get("binding")
+    if not isinstance(manifest_binding, Mapping):
+        blocking.append(f"provider_closure_reuse_typed_manifest_nested_binding_invalid:{stage}")
+    else:
+        for binding_field, reuse_field in (
+            ("source_authority_job_id", "source_authority_job_id"),
+            ("source_authority_artifact_id", "source_authority_artifact_id"),
+            ("source_authority_artifact_hash", "source_authority_artifact_hash"),
+            ("source_provider_receipt_closure_id", "source_provider_receipt_closure_id"),
+            ("source_provider_receipt_closure_hash", "source_provider_receipt_closure_hash"),
+            ("source_provider_receipt_ledger_id", "source_provider_receipt_ledger_id"),
+            ("source_provider_receipt_ledger_hash", "source_provider_receipt_ledger_hash"),
+        ):
+            if str(manifest_binding.get(binding_field) or "") != str(
+                reuse_payload.get(reuse_field) or ""
+            ):
+                blocking.append(
+                    f"provider_closure_reuse_typed_manifest_nested_{binding_field}_mismatch:{stage}"
+                )
+
+    summary_hash = str(reuse_payload.get("summary_payload_hash") or "")
+    normalized_summary_hash = str(
+        reuse_payload.get("normalized_summary_payload_hash") or ""
+    )
+    manifest_summary = manifest_payload.get("summary_payload")
+    if (
+        not isinstance(manifest_summary, Mapping)
+        or not summary_hash
+        or summary_hash != normalized_summary_hash
+        or hash_json(manifest_summary) != summary_hash
+        or str(manifest_payload.get("summary_payload_hash") or "") != summary_hash
+        or str(manifest_payload.get("normalized_summary_payload_hash") or "")
+        != summary_hash
+    ):
+        blocking.append(f"provider_closure_reuse_typed_manifest_summary_mismatch:{stage}")
+
+    raw_closure = _json_object(closure_record.path) if closure_record is not None else None
+    provider_generated = str(manifest_payload.get("source_kind") or "") in {
+        "stage1_provider_generated",
+        "provider_generated",
+        "runtime_stage1",
+    }
+    if raw_closure is None:
+        if provider_generated:
+            blocking.append(f"provider_closure_reuse_typed_manifest_closure_missing:{stage}")
+        return blocking
+    declared_closure = raw_closure.get("payload")
+    expected_calls = raw_closure.get("expected_calls")
+    expected_calls = expected_calls if isinstance(expected_calls, list) else []
+    if (
+        raw_closure.get("artifact_type") != "provider_receipt_closure"
+        or raw_closure.get("artifact_version") != "v1"
+        or str(raw_closure.get("job_id") or "")
+        != str(reuse_payload.get("source_authority_job_id") or "")
+        or str(raw_closure.get("stage_name") or "") != "stage1_analyze"
+        or not isinstance(declared_closure, Mapping)
+        or declared_closure.get("complete") is not True
+        or (provider_generated and not expected_calls)
+    ):
+        blocking.append(f"provider_closure_reuse_typed_manifest_closure_invalid:{stage}")
+    if expected_calls:
+        if ledger_record is None:
+            blocking.append(f"provider_closure_reuse_typed_manifest_ledger_missing:{stage}")
+        elif isinstance(declared_closure, Mapping):
+            try:
+                from runtime.provider_receipt_closure import ProviderReceiptClosure
+                from runtime.provider_runtime import ProviderRuntimeLedger
+
+                receipts = ProviderRuntimeLedger(ledger_record.path).list_receipts()
+                recomputed = ProviderReceiptClosure.evaluate(expected_calls, receipts)
+                if not recomputed.complete or recomputed.to_dict() != dict(declared_closure):
+                    blocking.append(
+                        f"provider_closure_reuse_typed_manifest_closure_recompute_mismatch:{stage}"
+                    )
+            except (OSError, UnicodeError, TypeError, ValueError, RuntimeError) as exc:
+                blocking.append(
+                    f"provider_closure_reuse_typed_manifest_ledger_invalid:{stage}:{exc}"
+                )
+
+    manifest_dependency_ids = {
+        str(getattr(item, "artifact_id", "") or "")
+        for item in manifest_record.depends_on
+    }
+    required_manifest_dependencies = {source_record.artifact_id}
+    if closure_record is not None:
+        required_manifest_dependencies.add(closure_record.artifact_id)
+    if ledger_record is not None:
+        required_manifest_dependencies.add(ledger_record.artifact_id)
+    if not required_manifest_dependencies.issubset(manifest_dependency_ids):
+        blocking.append(f"provider_closure_reuse_typed_manifest_dependency_missing:{stage}")
+    if closure_record is not None and ledger_record is not None:
+        closure_dependency_ids = {
+            str(getattr(item, "artifact_id", "") or "")
+            for item in closure_record.depends_on
+        }
+        if ledger_record.artifact_id not in closure_dependency_ids:
+            blocking.append(
+                f"provider_closure_reuse_typed_manifest_closure_dependency_missing:{stage}"
+            )
+    return blocking
+
+
+def _read_jsonl_objects(path: str | Path) -> list[Mapping[str, Any]]:
+    rows: list[Mapping[str, Any]] = []
+    for line_number, line in enumerate(
+        Path(path).read_text(encoding="utf-8").splitlines(),
+        start=1,
+    ):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"line {line_number} is not valid JSON") from exc
+        if not isinstance(value, Mapping):
+            raise ValueError(f"line {line_number} is not an object")
+        rows.append(value)
+    if not rows:
+        raise ValueError("ledger contains no records")
+    return rows
+
+
+def _zero_call_referenced_record(
+    *,
+    stage: str,
+    label: str,
+    evidence_record: ArtifactRecord,
+    artifact_id: str,
+    expected_path: str,
+    expected_registry_hash: str,
+    registry: ArtifactRegistry,
+    blocking: list[str],
+) -> ArtifactRecord | None:
+    dependency = next(
+        (
+            item
+            for item in evidence_record.depends_on
+            if item.artifact_id == artifact_id
+        ),
+        None,
+    )
+    record = registry.get(artifact_id)
+    suffix = f"{stage}:{evidence_record.artifact_id}:{artifact_id or 'missing'}"
+    if dependency is None:
+        blocking.append(f"provider_closure_zero_call_{label}_dependency_missing:{suffix}")
+        return None
+    if record is None or record.status != "ready":
+        blocking.append(f"provider_closure_zero_call_{label}_artifact_missing:{suffix}")
+        return None
+    if record.job_id != registry.job_id:
+        blocking.append(f"provider_closure_zero_call_{label}_job_mismatch:{suffix}")
+    if not _dependency_ref_matches_record(dependency, record):
+        blocking.append(f"provider_closure_zero_call_{label}_dependency_mismatch:{suffix}")
+    if expected_path and not _paths_match(expected_path, record.path):
+        blocking.append(f"provider_closure_zero_call_{label}_path_mismatch:{suffix}")
+    if not expected_registry_hash or expected_registry_hash != record.content_hash:
+        blocking.append(f"provider_closure_zero_call_{label}_hash_mismatch:{suffix}")
+    try:
+        ArtifactRegistry._verify_ready_artifact(record)
+    except (OSError, RegistryError, ValueError, TypeError) as exc:
+        blocking.append(f"provider_closure_zero_call_{label}_untrusted:{suffix}:{exc}")
+    return record
+
+
+def _zero_call_type_specific_issues(
+    *,
+    stage: str,
+    closure_epoch_id: str,
+    evidence_record: ArtifactRecord,
+    registry: ArtifactRegistry,
+    current_set: CurrentArtifactSetV1 | None,
+) -> list[str]:
+    blocking: list[str] = []
+    artifact_type = evidence_record.artifact_type
+    suffix = f"{stage}:{evidence_record.artifact_id}"
+
+    if artifact_type == "outline_provider_call_plan":
+        payload = _json_object(evidence_record.path)
+        if payload is None:
+            return [f"provider_closure_zero_call_outline_plan_invalid:{suffix}"]
+        if str(payload.get("job_id") or "") != registry.job_id:
+            blocking.append(f"provider_closure_zero_call_outline_plan_job_mismatch:{suffix}")
+        if str(payload.get("stage_name") or "") != "outline_v3":
+            blocking.append(f"provider_closure_zero_call_outline_plan_stage_mismatch:{suffix}")
+        if str(payload.get("closure_epoch_id") or "") != closure_epoch_id:
+            blocking.append(f"provider_closure_zero_call_outline_plan_epoch_mismatch:{suffix}")
+
+    elif artifact_type == "outline_v3_model_call_replay":
+        try:
+            rows = _read_jsonl_objects(evidence_record.path)
+        except (OSError, UnicodeError, ValueError) as exc:
+            return [f"provider_closure_zero_call_outline_replay_invalid:{suffix}:{exc}"]
+        for index, row in enumerate(rows, start=1):
+            row_suffix = f"{suffix}:{index}"
+            if (
+                str(row.get("artifact_type") or "") != "outline_v3_model_call_replay"
+                or str(row.get("artifact_version") or "") != "v1"
+                or str(row.get("status") or "") != "succeeded"
+            ):
+                blocking.append(
+                    f"provider_closure_zero_call_outline_replay_identity_mismatch:{row_suffix}"
+                )
+            if str(row.get("closure_epoch_id") or "") != closure_epoch_id:
+                blocking.append(
+                    f"provider_closure_zero_call_outline_replay_epoch_mismatch:{row_suffix}"
+                )
+            output_ids = row.get("output_artifact_ids")
+            if not isinstance(output_ids, list) or not output_ids or any(
+                not str(item or "").strip() for item in output_ids
+            ):
+                blocking.append(
+                    f"provider_closure_zero_call_outline_replay_outputs_invalid:{row_suffix}"
+                )
+                continue
+            registered_hash = str(row.get("registered_artifact_hash") or "")
+            for output_id in dict.fromkeys(str(item) for item in output_ids):
+                _zero_call_referenced_record(
+                    stage=stage,
+                    label="outline_replay_output",
+                    evidence_record=evidence_record,
+                    artifact_id=output_id,
+                    expected_path="",
+                    expected_registry_hash=registered_hash,
+                    registry=registry,
+                    blocking=blocking,
+                )
+
+    elif artifact_type == "review_replay_ledger":
+        try:
+            rows = _read_jsonl_objects(evidence_record.path)
+        except (OSError, UnicodeError, ValueError) as exc:
+            return [f"provider_closure_zero_call_review_replay_invalid:{suffix}:{exc}"]
+        for index, row in enumerate(rows, start=1):
+            row_suffix = f"{suffix}:{index}"
+            if str(row.get("replay_version") or "") != "review-section-replay-v1":
+                blocking.append(
+                    f"provider_closure_zero_call_review_replay_version_mismatch:{row_suffix}"
+                )
+            if str(row.get("job_id") or "") != registry.job_id:
+                blocking.append(
+                    f"provider_closure_zero_call_review_replay_job_mismatch:{row_suffix}"
+                )
+            if str(row.get("stage_name") or "") != "stage3_review":
+                blocking.append(
+                    f"provider_closure_zero_call_review_replay_stage_mismatch:{row_suffix}"
+                )
+            if str(row.get("closure_epoch_id") or "") != closure_epoch_id:
+                blocking.append(
+                    f"provider_closure_zero_call_review_replay_epoch_mismatch:{row_suffix}"
+                )
+            artifact_id = str(row.get("artifact_id") or "")
+            semantic_hash = str(row.get("artifact_content_hash") or "")
+            section_record = _zero_call_referenced_record(
+                stage=stage,
+                label="review_replay_section",
+                evidence_record=evidence_record,
+                artifact_id=artifact_id,
+                expected_path=str(row.get("artifact_path") or ""),
+                expected_registry_hash=str(row.get("registry_file_hash") or ""),
+                registry=registry,
+                blocking=blocking,
+            )
+            if section_record is None:
+                continue
+            section_payload = _json_object(section_record.path)
+            section = section_payload.get("section") if isinstance(section_payload, Mapping) else None
+            if (
+                section_record.artifact_type != "review_section"
+                or section_record.artifact_version != "v3"
+                or not isinstance(section, Mapping)
+                or str((section_payload or {}).get("content_hash") or "") != semantic_hash
+                or hash_json(section) != semantic_hash
+            ):
+                blocking.append(
+                    f"provider_closure_zero_call_review_replay_semantic_hash_mismatch:{row_suffix}"
+                )
+
+    elif artifact_type == "validation_disposition":
+        from validation.disposition import ValidationDispositionV1
+
+        payload = _json_object(evidence_record.path)
+        try:
+            disposition = ValidationDispositionV1.from_dict(payload or {})
+        except (TypeError, ValueError, KeyError) as exc:
+            return [f"provider_closure_zero_call_validation_disposition_invalid:{suffix}:{exc}"]
+        if disposition.job_id != registry.job_id:
+            blocking.append(
+                f"provider_closure_zero_call_validation_disposition_job_mismatch:{suffix}"
+            )
+        if current_set is None:
+            blocking.append(
+                f"provider_closure_zero_call_validation_disposition_current_set_missing:{suffix}"
+            )
+        else:
+            if current_set.job_id != registry.job_id or current_set.validation_status != "not_requested":
+                blocking.append(
+                    f"provider_closure_zero_call_validation_disposition_current_set_status_mismatch:{suffix}"
+                )
+            if (
+                current_set.validation_disposition_artifact_id != evidence_record.artifact_id
+                or current_set.validation_disposition_artifact_hash != evidence_record.content_hash
+            ):
+                blocking.append(
+                    f"provider_closure_zero_call_validation_disposition_current_set_mismatch:{suffix}"
+                )
+            current_inputs = (
+                (
+                    "review_draft",
+                    disposition.review_draft_artifact_id,
+                    disposition.review_draft_artifact_hash,
+                    current_set.review_draft_artifact_id,
+                    current_set.review_draft_artifact_hash,
+                ),
+                (
+                    "citation_manifest",
+                    disposition.citation_manifest_artifact_id,
+                    disposition.citation_manifest_artifact_hash,
+                    current_set.citation_manifest_artifact_id,
+                    current_set.citation_manifest_artifact_hash,
+                ),
+                (
+                    "review_docx",
+                    disposition.review_docx_artifact_id,
+                    disposition.review_docx_artifact_hash,
+                    current_set.review_docx_artifact_id,
+                    current_set.review_docx_artifact_hash,
+                ),
+            )
+            for label, artifact_id, content_hash, current_id, current_hash in current_inputs:
+                if artifact_id != current_id or content_hash != current_hash:
+                    blocking.append(
+                        f"provider_closure_zero_call_validation_disposition_{label}_current_mismatch:{suffix}"
+                    )
+                _zero_call_referenced_record(
+                    stage=stage,
+                    label=f"validation_disposition_{label}",
+                    evidence_record=evidence_record,
+                    artifact_id=artifact_id,
+                    expected_path="",
+                    expected_registry_hash=content_hash,
+                    registry=registry,
+                    blocking=blocking,
+                )
+        runtime_spec = registry.get("runtime_job_spec")
+        if runtime_spec is None or runtime_spec.content_hash != disposition.spec_hash:
+            blocking.append(
+                f"provider_closure_zero_call_validation_disposition_spec_mismatch:{suffix}"
+            )
+        else:
+            _zero_call_referenced_record(
+                stage=stage,
+                label="validation_disposition_spec",
+                evidence_record=evidence_record,
+                artifact_id=runtime_spec.artifact_id,
+                expected_path="",
+                expected_registry_hash=disposition.spec_hash,
+                registry=registry,
+                blocking=blocking,
+            )
+
+    return blocking
+
+
+def _zero_call_source_evidence_issues(
+    *,
+    stage: str,
+    closure_epoch_id: str,
+    closure_record: ArtifactRecord,
+    registry: ArtifactRegistry,
+    current_set: CurrentArtifactSetV1 | None,
+    external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None,
+) -> list[str]:
+    blocking: list[str] = []
+    allowed_types = set(zero_call_evidence_policy(stage))
+    evidence_dependencies = [
+        dependency
+        for dependency in closure_record.depends_on
+        if dependency.artifact_type in allowed_types
+    ]
+    if not evidence_dependencies:
+        return [f"provider_closure_zero_call_source_evidence_missing:{stage}"]
+
+    for dependency in evidence_dependencies:
+        artifact_id = str(dependency.artifact_id or "")
+        suffix = f"{stage}:{artifact_id or 'missing'}"
+        evidence_record = registry.get(artifact_id)
+        if evidence_record is None:
+            blocking.append(
+                f"provider_closure_zero_call_source_evidence_dependency_missing:{suffix}"
+            )
+            continue
+        if evidence_record.status != "ready":
+            blocking.append(f"provider_closure_zero_call_source_evidence_not_ready:{suffix}")
+            continue
+        if evidence_record.job_id != registry.job_id:
+            blocking.append(f"provider_closure_zero_call_source_evidence_job_mismatch:{suffix}")
+        if (
+            evidence_record.artifact_type not in allowed_types
+            or dependency.artifact_type != evidence_record.artifact_type
+        ):
+            blocking.append(f"provider_closure_zero_call_source_evidence_type_invalid:{suffix}")
+        if evidence_record.artifact_version not in _ZERO_CALL_EVIDENCE_VERSIONS.get(
+            evidence_record.artifact_type,
+            frozenset(),
+        ):
+            blocking.append(f"provider_closure_zero_call_source_evidence_version_invalid:{suffix}")
+        if not _dependency_ref_matches_record(dependency, evidence_record):
+            blocking.append(
+                f"provider_closure_zero_call_source_evidence_dependency_mismatch:{suffix}"
+            )
+        try:
+            ArtifactRegistry._verify_ready_artifact(evidence_record)
+            registry.verify_ready_dependencies(
+                evidence_record.depends_on,
+                external_registry_resolver=external_registry_resolver,
+            )
+        except (OSError, RegistryError, ValueError, TypeError) as exc:
+            blocking.append(
+                f"provider_closure_zero_call_source_evidence_untrusted:{suffix}:{exc}"
+            )
+        blocking.extend(
+            _zero_call_type_specific_issues(
+                stage=stage,
+                closure_epoch_id=closure_epoch_id,
+                evidence_record=evidence_record,
+                registry=registry,
+                current_set=current_set,
+            )
+        )
+    return blocking
 
 
 def _provider_record_for_stage(
@@ -436,7 +1072,6 @@ def _provider_record_for_stage(
         if candidate is not None:
             return candidate
     expected_stage_name = _PROVIDER_STAGE_NAMES.get(stage, stage)
-    expected_receipt_stage_name = _PROVIDER_RECEIPT_STAGE_NAMES.get(stage, expected_stage_name)
     candidates: list[ArtifactRecord] = []
     for item in ready:
         metadata_stage = str(item.metadata.get("stage_name") or "")
@@ -478,6 +1113,8 @@ def _provider_closure_entry(
     terminal_record: ArtifactRecord | None,
     terminal_payload: Mapping[str, Any] | None,
     registry: ArtifactRegistry,
+    *,
+    current_set: CurrentArtifactSetV1 | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Build a stage-indexed, hash-bound closure descriptor."""
 
@@ -585,6 +1222,8 @@ def _provider_closure_entry(
     for dependency in record.depends_on:
         dependency_record = registry.get(dependency.artifact_id)
         if dependency_record is None or dependency_record.status != "ready":
+            continue
+        if dependency_record.artifact_type != "provider_receipt_ledger":
             continue
         _dependency_payload, dependency_rows = _payload_for_record(dependency_record)
         for row in dependency_rows:
@@ -839,55 +1478,26 @@ def _provider_closure_entry(
             blocking.append(f"provider_closure_zero_call_observed_receipts:{stage}")
         if ledger_records:
             blocking.append(f"provider_closure_zero_call_receipt_ledger_present:{stage}")
-        source_evidence_records = [
-            dependency_record
-            for dependency_record in dependency_records
-            if dependency_record.artifact_type in set(zero_call_evidence_policy(stage))
-        ]
-        if not source_evidence_records:
-            blocking.append(f"provider_closure_zero_call_source_evidence_missing:{stage}")
-        else:
-            accepted_versions = {
-                "summary_source_manifest": {"v1", "v2"},
-                "stage1_summary_reuse_record": {"v1"},
-                "outline_provider_call_plan": {"v1"},
-                "outline_replay_evidence": {"v1"},
-                "review_replay_evidence": {"v1"},
-                "validation_disposition": {"v1"},
-            }
-            for evidence_record in source_evidence_records:
-                if evidence_record.artifact_version not in accepted_versions.get(
-                    evidence_record.artifact_type,
-                    set(),
-                ):
-                    blocking.append(
-                        f"provider_closure_zero_call_source_evidence_version_invalid:{stage}"
-                    )
-                    continue
-                try:
-                    ArtifactRegistry._verify_ready_artifact(evidence_record)
-                    registry.verify_ready_dependencies(
-                        evidence_record.depends_on,
-                        external_registry_resolver=external_registry_resolver,
-                    )
-                except (OSError, RegistryError, ValueError, TypeError) as exc:
-                    blocking.append(
-                        f"provider_closure_zero_call_source_evidence_untrusted:{stage}:{exc}"
-                    )
-                evidence_payload = _json_object(evidence_record.path)
-                if evidence_payload is not None and str(
-                    evidence_payload.get("job_id") or ""
-                ) not in {"", registry.job_id}:
-                    blocking.append(
-                        f"provider_closure_zero_call_source_evidence_job_mismatch:{stage}"
-                    )
+        blocking.extend(
+            _zero_call_source_evidence_issues(
+                stage=stage,
+                closure_epoch_id=closure_epoch_id,
+                closure_record=record,
+                registry=registry,
+                current_set=current_set,
+                external_registry_resolver=external_registry_resolver,
+            )
+        )
     reuse_records = [
         dependency_record
         for dependency_record in dependency_records
         if dependency_record.artifact_type == "stage1_summary_reuse_record"
         and dependency_record.artifact_version == "v1"
     ]
-    if stage == "analyze" and (reuse_records or expected_call_count == 0):
+    expected_papers: set[str] = set()
+    primary_summary_manifest: Mapping[str, Any] | None = None
+    declared_summary_count: int | None = None
+    if stage == "analyze":
         source_record = next(
             (
                 dependency_record
@@ -904,11 +1514,48 @@ def _provider_closure_entry(
             else []
         )
         source_items = source_items_value if isinstance(source_items_value, list) else []
+        summary_source_records = [
+            dependency_record
+            for dependency_record in dependency_records
+            if dependency_record.artifact_type == "summary_source_manifest"
+            and dependency_record.artifact_version in {"v1", "v2"}
+        ]
+        summary_source_entries = [
+            (dependency_record, payload)
+            for dependency_record in summary_source_records
+            if (payload := _json_object(dependency_record.path)) is not None
+        ]
+        summary_source_payloads = [payload for _record, payload in summary_source_entries]
+        manifest_paper_keys = {
+            str(item.get("canonical_paper_key") or "")
+            for manifest_payload in summary_source_payloads
+            for item in manifest_payload.get("source_items") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("canonical_paper_key") or "")
+        }
+        primary_summary_manifest = next(
+            (
+                payload
+                for dependency_record, payload in summary_source_entries
+                if dependency_record.artifact_id == "summary_source_manifest"
+            ),
+            summary_source_payloads[0] if summary_source_payloads else None,
+        )
+        if primary_summary_manifest is not None:
+            raw_summary_count = primary_summary_manifest.get("summary_count")
+            if (
+                isinstance(raw_summary_count, bool)
+                or not isinstance(raw_summary_count, int)
+                or raw_summary_count < 0
+            ):
+                blocking.append(f"provider_closure_summary_source_count_invalid:{stage}")
+            else:
+                declared_summary_count = raw_summary_count
         expected_papers = {
             str(item.get("canonical_paper_key") or "")
             for item in source_items
             if isinstance(item, Mapping) and str(item.get("canonical_paper_key") or "")
-        }
+        } | manifest_paper_keys
         generated_papers = {
             str(item.get("node_id") or "")
             for item in expected_call_payloads
@@ -933,7 +1580,7 @@ def _provider_closure_entry(
                     reuse_record.depends_on,
                     external_registry_resolver=reuse_external_registry_resolver,
                 )
-            except (OSError, RegistryError, ValueError, TypeError) as exc:
+            except (OSError, RegistryError, ValueError, TypeError):
                 blocking.append(f"provider_closure_reuse_dependency_invalid:{stage}")
             dependency_by_id = {
                 dependency.artifact_id: dependency
@@ -951,50 +1598,137 @@ def _provider_closure_entry(
                     )
                 ) is not None
             }
-            source_id = str(reuse_payload.get("registered_source_artifact_id") or "")
-            source_hash = str(reuse_payload.get("registered_source_artifact_hash") or "")
-            manifest_id = str(reuse_payload.get("source_summary_manifest_id") or "")
-            manifest_hash = str(reuse_payload.get("source_summary_manifest_hash") or "")
-            evidence_id = str(reuse_payload.get("current_evidence_manifest_id") or "")
-            evidence_hash = str(reuse_payload.get("current_evidence_manifest_hash") or "")
-            runtime_id = str(reuse_payload.get("current_runtime_spec_id") or "")
-            runtime_hash = str(reuse_payload.get("current_runtime_spec_hash") or "")
-            for label, artifact_id, content_hash in (
-                ("source", source_id, source_hash),
-                ("source_manifest", manifest_id, manifest_hash),
-                ("evidence_manifest", evidence_id, evidence_hash),
-                ("runtime_spec", runtime_id, runtime_hash),
+            provider_generated = str(reuse_payload.get("source_kind") or "") in {
+                "stage1_provider_generated",
+                "provider_generated",
+                "runtime_stage1",
+            }
+            source_record, _source_portable, issues = _stage1_reuse_authority_dependency(
+                stage=stage,
+                label="source",
+                reuse_payload=reuse_payload,
+                dependency_by_id=dependency_by_id,
+                dependency_records_by_id=dependency_records_by_id,
+                registry=registry,
+                external_registry_resolver=reuse_external_registry_resolver,
+                original_id_field="source_authority_artifact_id",
+                original_hash_field="source_authority_artifact_hash",
+                portable_id_field="portable_source_artifact_id",
+                portable_hash_field="portable_source_artifact_hash",
+                original_artifact_type="summary_file",
+                portable_artifact_type="stage1_portable_summary_source",
+                required=True,
+            )
+            blocking.extend(issues)
+            manifest_record, _manifest_portable, issues = _stage1_reuse_authority_dependency(
+                stage=stage,
+                label="source_manifest",
+                reuse_payload=reuse_payload,
+                dependency_by_id=dependency_by_id,
+                dependency_records_by_id=dependency_records_by_id,
+                registry=registry,
+                external_registry_resolver=reuse_external_registry_resolver,
+                original_id_field="source_summary_manifest_id",
+                original_hash_field="source_summary_manifest_hash",
+                portable_id_field="portable_source_summary_manifest_id",
+                portable_hash_field="portable_source_summary_manifest_hash",
+                original_artifact_type="stage1_reusable_summary_manifest",
+                portable_artifact_type="stage1_portable_summary_manifest",
+                required=True,
+            )
+            blocking.extend(issues)
+            source_closure_record, _closure_portable, issues = (
+                _stage1_reuse_authority_dependency(
+                    stage=stage,
+                    label="source_provider_receipt_closure",
+                    reuse_payload=reuse_payload,
+                    dependency_by_id=dependency_by_id,
+                    dependency_records_by_id=dependency_records_by_id,
+                    registry=registry,
+                    external_registry_resolver=reuse_external_registry_resolver,
+                    original_id_field="source_provider_receipt_closure_id",
+                    original_hash_field="source_provider_receipt_closure_hash",
+                    portable_id_field="portable_source_provider_receipt_closure_id",
+                    portable_hash_field="portable_source_provider_receipt_closure_hash",
+                    original_artifact_type="provider_receipt_closure",
+                    portable_artifact_type="stage1_portable_provider_closure",
+                    required=provider_generated,
+                )
+            )
+            blocking.extend(issues)
+            source_ledger_record, _ledger_portable, issues = (
+                _stage1_reuse_authority_dependency(
+                    stage=stage,
+                    label="source_provider_receipt_ledger",
+                    reuse_payload=reuse_payload,
+                    dependency_by_id=dependency_by_id,
+                    dependency_records_by_id=dependency_records_by_id,
+                    registry=registry,
+                    external_registry_resolver=reuse_external_registry_resolver,
+                    original_id_field="source_provider_receipt_ledger_id",
+                    original_hash_field="source_provider_receipt_ledger_hash",
+                    portable_id_field="portable_source_provider_receipt_ledger_id",
+                    portable_hash_field="portable_source_provider_receipt_ledger_hash",
+                    original_artifact_type="provider_receipt_ledger",
+                    portable_artifact_type="stage1_portable_provider_ledger",
+                    required=False,
+                )
+            )
+            blocking.extend(issues)
+
+            for label, artifact_id, content_hash, artifact_type in (
                 (
-                    "source_provider_receipt_closure",
-                    str(reuse_payload.get("source_provider_receipt_closure_id") or ""),
-                    str(reuse_payload.get("source_provider_receipt_closure_hash") or ""),
+                    "current_snapshot",
+                    str(reuse_payload.get("current_snapshot_artifact_id") or ""),
+                    str(reuse_payload.get("current_snapshot_artifact_hash") or ""),
+                    "summary_file",
                 ),
                 (
-                    "source_provider_receipt_ledger",
-                    str(reuse_payload.get("source_provider_receipt_ledger_id") or ""),
-                    str(reuse_payload.get("source_provider_receipt_ledger_hash") or ""),
+                    "evidence_manifest",
+                    str(reuse_payload.get("current_evidence_manifest_id") or ""),
+                    str(reuse_payload.get("current_evidence_manifest_hash") or ""),
+                    "evidence_manifest",
+                ),
+                (
+                    "runtime_spec",
+                    str(reuse_payload.get("current_runtime_spec_id") or ""),
+                    str(reuse_payload.get("current_runtime_spec_hash") or ""),
+                    "runtime_job_spec",
                 ),
             ):
-                if not artifact_id and not content_hash:
-                    continue
                 dependency = dependency_by_id.get(artifact_id)
-                if dependency is None or dependency.content_hash != content_hash:
+                dependency_record = dependency_records_by_id.get(artifact_id)
+                if (
+                    not artifact_id
+                    or not content_hash
+                    or dependency is None
+                    or str(getattr(dependency, "content_hash", "") or "") != content_hash
+                ):
                     blocking.append(f"provider_closure_reuse_{label}_binding_invalid:{stage}")
-                else:
-                    dependency_record = dependency_records_by_id.get(artifact_id)
-                    if dependency_record is None or dependency_record.content_hash != content_hash:
-                        blocking.append(f"provider_closure_reuse_{label}_record_invalid:{stage}")
-                    elif label == "source_provider_receipt_closure" and (
-                        dependency_record.artifact_type != "provider_receipt_closure"
-                        or dependency_record.artifact_version != "v1"
-                    ):
-                        blocking.append(f"provider_closure_reuse_{label}_type_invalid:{stage}")
-                    elif label == "source_provider_receipt_ledger" and (
-                        dependency_record.artifact_type != "provider_receipt_ledger"
-                        or dependency_record.artifact_version != "v1"
-                    ):
-                        blocking.append(f"provider_closure_reuse_{label}_type_invalid:{stage}")
-            source_record = dependency_records_by_id.get(source_id) if source_id else None
+                elif (
+                    dependency_record is None
+                    or dependency_record.status != "ready"
+                    or dependency_record.job_id != registry.job_id
+                    or dependency_record.artifact_type != artifact_type
+                    or dependency_record.artifact_version != "v1"
+                    or dependency_record.content_hash != content_hash
+                ):
+                    blocking.append(f"provider_closure_reuse_{label}_record_invalid:{stage}")
+
+            source_authority_job_id = str(reuse_payload.get("source_authority_job_id") or "")
+            authority_kind = str(reuse_payload.get("source_authority_kind") or "")
+            derived_snapshot = reuse_payload.get(
+                "current_snapshot_derived_from_external_authority"
+            )
+            if (
+                source_authority_job_id != registry.job_id
+                and authority_kind in {"parent_registry", "typed_manifest"}
+                and derived_snapshot is not True
+            ):
+                blocking.append(
+                    f"provider_closure_reuse_current_snapshot_external_derivation_missing:{stage}"
+                )
+
             if source_record is None or source_record.status != "ready":
                 blocking.append(f"provider_closure_reuse_source_artifact_missing:{stage}")
             else:
@@ -1023,10 +1757,29 @@ def _provider_closure_entry(
                         None,
                     )
                     summary_payload_hash = str(reuse_payload.get("summary_payload_hash") or "")
-                    if found_payload is None or hash_json(found_payload.get("ai_summary")) != summary_payload_hash:
+                    normalized_payload_hash = str(
+                        reuse_payload.get("normalized_summary_payload_hash") or ""
+                    )
+                    if (
+                        found_payload is None
+                        or not summary_payload_hash
+                        or summary_payload_hash != normalized_payload_hash
+                        or hash_json(found_payload.get("ai_summary")) != summary_payload_hash
+                    ):
                         blocking.append(f"provider_closure_reuse_source_payload_mismatch:{stage}")
                 except (OSError, RegistryError, ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
                     blocking.append(f"provider_closure_reuse_source_artifact_untrusted:{stage}:{exc}")
+            blocking.extend(
+                _stage1_typed_manifest_authority_issues(
+                    stage=stage,
+                    paper_key=paper_key,
+                    reuse_payload=reuse_payload,
+                    source_record=source_record,
+                    manifest_record=manifest_record,
+                    closure_record=source_closure_record,
+                    ledger_record=source_ledger_record,
+                )
+            )
         if expected_reused_papers and set(reused_papers) != expected_reused_papers:
             blocking.append(f"provider_closure_reuse_identity_coverage_incomplete:{stage}")
         if not expected_reused_papers and reused_papers:
@@ -1042,6 +1795,78 @@ def _provider_closure_entry(
         if isinstance(item, Mapping)
     ):
         blocking.append(f"provider_closure_terminal_dependency_missing:{stage}")
+    if stage == "analyze":
+        terminal_paper_refs = [
+            item
+            for item in (terminal_payload or {}).get("output_artifact_refs") or ()
+            if isinstance(item, Mapping) and item.get("artifact_type") == "paper_artifact"
+        ]
+        terminal_paper_ids = {
+            str(item.get("artifact_id") or "")
+            for item in terminal_paper_refs
+            if str(item.get("artifact_id") or "")
+        }
+        expected_paper_artifact_ids = {
+            f"paper:{hashlib.sha256(paper_key.encode('utf-8')).hexdigest()[:24]}"
+            for paper_key in expected_papers
+        }
+        if expected_papers:
+            paper_coverage_matches = terminal_paper_ids == expected_paper_artifact_ids
+        elif primary_summary_manifest is not None and declared_summary_count is not None:
+            expected_paper_artifact_ids = set(terminal_paper_ids)
+            paper_coverage_matches = (
+                len(terminal_paper_refs) == len(terminal_paper_ids)
+                and len(terminal_paper_ids) == declared_summary_count
+            )
+        else:
+            paper_coverage_matches = not terminal_paper_ids
+        if not paper_coverage_matches:
+            blocking.append(f"provider_closure_paper_artifact_identity_coverage_incomplete:{stage}")
+        for paper_artifact_id in sorted(expected_paper_artifact_ids):
+            dependency = next(
+                (
+                    item
+                    for item in terminal_paper_refs
+                    if str(item.get("artifact_id") or "") == paper_artifact_id
+                ),
+                None,
+            )
+            paper_record = registry.get(paper_artifact_id) if dependency is not None else None
+            if dependency is None or paper_record is None or paper_record.status != "ready":
+                blocking.append(f"provider_closure_paper_artifact_missing:{stage}:{paper_artifact_id}")
+                continue
+            if (
+                str(dependency.get("content_hash") or "") != paper_record.content_hash
+                or str(dependency.get("artifact_type") or "") != "paper_artifact"
+                or paper_record.artifact_type != "paper_artifact"
+                or str(dependency.get("job_id") or "") != paper_record.job_id
+            ):
+                blocking.append(
+                    f"provider_closure_paper_artifact_terminal_ref_mismatch:{stage}:{paper_artifact_id}"
+                )
+                continue
+            try:
+                ArtifactRegistry._verify_ready_artifact(paper_record)
+                paper_payload = _json_object(paper_record.path) or {}
+                identity = paper_payload.get("paper_identity")
+                paper_key = (
+                    str(identity.get("canonical_paper_key") or "")
+                    if isinstance(identity, Mapping)
+                    else ""
+                )
+                derived_artifact_id = (
+                    f"paper:{hashlib.sha256(paper_key.encode('utf-8')).hexdigest()[:24]}"
+                    if paper_key
+                    else ""
+                )
+                if (
+                    not paper_key
+                    or derived_artifact_id != paper_artifact_id
+                    or (expected_papers and paper_key not in expected_papers)
+                ):
+                    blocking.append(f"provider_closure_paper_artifact_identity_mismatch:{stage}")
+            except (OSError, RegistryError, ValueError, TypeError) as exc:
+                blocking.append(f"provider_closure_paper_artifact_untrusted:{stage}:{exc}")
     expected_by_id = {
         str(item.get("call_id") or ""): item
         for item in expected_call_payloads
@@ -1147,6 +1972,7 @@ def resolve_current_stage_closure_map(
             terminal_record,
             terminal_payload,
             registry,
+            current_set=current_set,
         )
         provider_closures[logical_stage] = entry
         blocking.extend(entry_blocking)

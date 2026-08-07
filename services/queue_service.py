@@ -1338,6 +1338,18 @@ class LocalPublicationContext:
             register_kwargs=register_kwargs,
         )
 
+    def write_compatibility_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+    ) -> str:
+        """Atomically update a non-authoritative local compatibility file."""
+
+        target = Path(target_path).expanduser().resolve()
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        _write_staged_bytes(target, encoded)
+        return str(target)
+
 
 class QueuePublicationContext:
     """Lease-bound factory for queue-owned ArtifactRegistry facades."""
@@ -1420,6 +1432,8 @@ class QueuePublicationContext:
         staged: StagedArtifactPublication,
         final_path: Path,
         artifact_id: str,
+        artifact_type: str,
+        artifact_version: str,
         artifact_hash: str,
     ) -> dict[str, Any]:
         return {
@@ -1436,6 +1450,8 @@ class QueuePublicationContext:
             "content_hash": staged.content_hash,
             "size_bytes": staged.size_bytes,
             "registered_artifact_id": artifact_id,
+            "registered_artifact_type": artifact_type,
+            "registered_artifact_version": artifact_version,
             "registered_artifact_hash": artifact_hash,
             "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
@@ -1446,6 +1462,8 @@ class QueuePublicationContext:
         staged: StagedArtifactPublication,
         final_path: Path,
         artifact_id: str,
+        artifact_type: str,
+        artifact_version: str,
         artifact_hash: str,
     ) -> tuple[Path, dict[str, Any]]:
         """Materialize lease evidence before one atomic target/manifest commit."""
@@ -1454,6 +1472,8 @@ class QueuePublicationContext:
             staged=staged,
             final_path=final_path,
             artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            artifact_version=artifact_version,
             artifact_hash=artifact_hash,
         )
         encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1489,6 +1509,8 @@ class QueuePublicationContext:
             "artifact_id": f"lease-publication:{safe_artifact_id}:{manifest_hash[:24]}",
             "metadata": {
                 "target_artifact_id": target_artifact_id,
+                "target_artifact_type": artifact_type,
+                "target_artifact_version": artifact_version,
                 "target_artifact_hash": artifact_hash,
                 "immutable": True,
             },
@@ -1563,6 +1585,8 @@ class QueuePublicationContext:
                         staged=staged,
                         final_path=final_path,
                         artifact_id=target_id,
+                        artifact_type=target_type,
+                        artifact_version=target_version,
                         artifact_hash=staged.content_hash,
                     )
                     manifest_kwargs["depends_on"] = [target_ref]
@@ -1616,6 +1640,20 @@ class QueuePublicationContext:
             registry=registry,
             register_kwargs=register_kwargs,
         )
+
+    def write_compatibility_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+    ) -> str:
+        """Update a mutable projection only while this lease still owns the job."""
+
+        target = Path(target_path).expanduser().resolve()
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        with self.queue_service._store_lock():
+            self._assert_live_unlocked()
+            _write_staged_bytes(target, encoded)
+        return str(target)
 
 
 class QueueOwnedArtifactRegistry(ArtifactRegistry):
@@ -1754,7 +1792,14 @@ class QueueRunner:
             return False
         workspace_path = Path(runtime_workspace).expanduser().resolve()
         project_name = workspace_path.name.rsplit("__", 1)[0]
-        workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
+        # Cancellation probes must be read-only. ``from_workspace_path`` calls
+        # ``ensure_exists`` and would reserve a fresh queue workspace before
+        # AgentRuntimeRunner can claim it for a new run.
+        workspace = JobWorkspace(
+            str(workspace_path.parent),
+            project_name,
+            job_spec.job_id,
+        )
         return CancellationRequestStore(workspace).is_requested()
 
     @staticmethod
@@ -1767,7 +1812,11 @@ class QueueRunner:
             return
         workspace_path = Path(runtime_workspace).expanduser().resolve()
         project_name = workspace_path.name.rsplit("__", 1)[0]
-        workspace = JobWorkspace.from_workspace_path(str(workspace_path), project_name, job_spec.job_id)
+        workspace = JobWorkspace(
+            str(workspace_path.parent),
+            project_name,
+            job_spec.job_id,
+        )
         store = CancellationRequestStore(workspace)
         if store.read() is not None:
             store.clear(cleared_by="queue_runner", reason="retry")

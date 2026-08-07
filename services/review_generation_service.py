@@ -469,6 +469,9 @@ class ReviewGenerationService:
         existing = self._load_review_replay(section_id=section_id, binding=binding)
         payload = {
             "replay_version": "review-section-replay-v1",
+            "job_id": self.job_id,
+            "stage_name": "stage3_review",
+            "closure_epoch_id": self.closure_epoch_id,
             "section_id": section_id,
             "binding_hash": binding_hash,
             "artifact_id": section_record.artifact_id,
@@ -492,6 +495,12 @@ class ReviewGenerationService:
                 existing_bytes = path.read_bytes()
             except OSError:
                 existing_bytes = b""
+        dependencies = list(current.depends_on) if current is not None else []
+        if all(
+            dependency.artifact_id != section_record.artifact_id
+            for dependency in dependencies
+        ):
+            dependencies.append(ArtifactDependencyRefV2.from_record(section_record))
         line = (
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             + "\n"
@@ -506,6 +515,7 @@ class ReviewGenerationService:
             artifact_version="v1",
             producer="services.review_generation_service.ReviewGenerationService",
             artifact_id="review_replay",
+            depends_on=dependencies,
             metadata={"binding_version": "review-section-binding-v1"},
         )
         del record
@@ -717,6 +727,7 @@ class ReviewGenerationService:
 
         ledger = self.registry.get("review_provider_receipts")
         add_dependency(ledger)
+        add_dependency(self.registry.get("review_replay"))
         for artifact_id in (
             "citation_ref_catalog",
             "outline-v3:final_outline",
