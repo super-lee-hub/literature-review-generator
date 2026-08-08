@@ -33,6 +33,14 @@ from services.job_workspace import (
     publish_bytes_artifact,
     publish_json_artifact,
 )
+from validation.adjudication_reuse import (
+    ADJUDICATION_REUSE_ARTIFACT_TYPE,
+    ADJUDICATION_REUSE_ARTIFACT_VERSION,
+    build_reuse_key,
+    build_reuse_record_payload,
+    reuse_record_artifact_id,
+    verify_reuse_record,
+)
 
 
 @dataclass
@@ -74,6 +82,16 @@ class ValidationExecutionService:
         init=False,
         repr=False,
     )
+    _adjudication_reuse_records: dict[str, Any] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _input_dependency_hashes: dict[str, str] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     closure_epoch_id: str = field(default="", init=False)
     expected_call_graph_hash: str = field(default="", init=False)
 
@@ -95,6 +113,10 @@ class ValidationExecutionService:
             "citation_manifest": self.citation_manifest_record.content_hash if self.citation_manifest_record else "",
             "papers": hash_json([record.content_hash for record in self.paper_artifact_records]),
             "visuals": hash_json([record.content_hash for record in self.visual_artifact_records]),
+        }
+        self._input_dependency_hashes = {
+            str(key): str(value)
+            for key, value in sorted(input_hashes.items(), key=lambda item: str(item[0]))
         }
         self.expected_call_graph_hash = hash_json(
             {
@@ -321,6 +343,189 @@ class ValidationExecutionService:
             registered_artifact_hash=normalized_hash,
             node_output_hash=normalized_hash,
         )
+
+    @staticmethod
+    def _load_json(path: str) -> dict[str, Any]:
+        import json
+
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, Mapping):
+            raise RuntimeError(f"artifact is not a JSON object: {path}")
+        return dict(raw)
+
+    def publish_adjudication_reuse_record(
+        self,
+        *,
+        packet: Any,
+        api_config: Mapping[str, Any],
+        output_record: Any,
+        receipt: Any,
+    ) -> Any:
+        from validation.adjudication_reuse import (
+            build_reuse_record_payload,
+            build_reuse_key,
+            reuse_record_artifact_id,
+        )
+
+        reuse_key = build_reuse_key(
+            packet=packet,
+            api_config=api_config,
+            input_dependency_hashes=self._input_dependency_hashes,
+        )
+        payload = build_reuse_record_payload(
+            packet=packet,
+            api_config=api_config,
+            service=self,
+            output_record=output_record,
+            receipt=receipt,
+            reuse_key=reuse_key,
+            input_dependency_hashes=self._input_dependency_hashes,
+        )
+        artifact_id = reuse_record_artifact_id(reuse_key)
+        path = self.workspace.artifact_path(f"validation_reuse/{reuse_key}.json")
+        record = publish_json_artifact(
+            self.publication_context,
+            self.artifact_registry,
+            path,
+            payload,
+            artifact_role="validation_adjudication_reuse_record",
+            artifact_type=ADJUDICATION_REUSE_ARTIFACT_TYPE,
+            artifact_version=ADJUDICATION_REUSE_ARTIFACT_VERSION,
+            producer="validation.execution_service.ValidationExecutionService.publish_adjudication_reuse_record",
+            artifact_id=artifact_id,
+            depends_on=[ArtifactDependencyRefV2.from_record(output_record)],
+            metadata={"reuse_key": reuse_key, "closure_bound": False},
+        )
+        self._adjudication_reuse_records[reuse_key] = record
+        return record
+
+    def register_verified_reuse_call(
+        self,
+        *,
+        packet: Any,
+        api_config: Mapping[str, Any],
+        reuse_record: Any,
+        output_record: Any,
+        output_payload: Mapping[str, Any],
+    ) -> str:
+        from validation.adjudication_reuse import (
+            adjudication_call_id,
+            adjudication_node_id,
+            adjudication_schema_hash,
+        )
+
+        raw = self._load_json(reuse_record.path)
+        call_id = adjudication_call_id(packet)
+        normalized_hash = hash_json(output_payload)
+        expected = ExpectedProviderCall(
+            call_id=call_id,
+            job_id=self.job_id,
+            attempt_id=self.attempt_id,
+            stage_name="stage4_validate",
+            node_id=adjudication_node_id(packet),
+            closure_epoch_id=self.closure_epoch_id,
+            logical_attempt_identity=self.attempt_id,
+            expected_call_graph_hash=self.expected_call_graph_hash,
+            prompt_hash=str(raw.get("prompt_hash") or ""),
+            input_hash=str(raw.get("input_hash") or ""),
+            config_hash=str(raw.get("redacted_provider_config_hash") or ""),
+            schema_hash=adjudication_schema_hash(packet),
+            provider_response_hash=normalized_hash,
+            normalized_output_hash=normalized_hash,
+            artifact_payload_hash=normalized_hash,
+            artifact_content_hash=normalized_hash,
+            registry_file_hash=output_record.content_hash,
+            artifact_path=output_record.path,
+            registered_artifact_hash=normalized_hash,
+            node_output_hash=normalized_hash,
+            replay_output_hash=normalized_hash,
+            max_attempts=1,
+            verified_reuse=True,
+            reuse_evidence_artifact_id=reuse_record.artifact_id,
+            reuse_evidence_artifact_hash=reuse_record.content_hash,
+            reuse_evidence_record_hash=reuse_record.content_hash,
+        )
+        self._expected_provider_calls[call_id] = expected
+        return call_id
+
+    def publish_closure_bound_reuse_records(
+        self,
+        *,
+        closure_record: Any,
+        ledger_record: Any | None,
+    ) -> list[Any]:
+        records: list[Any] = []
+        for reuse_key, original in list(self._adjudication_reuse_records.items()):
+            if str(original.metadata.get("closure_bound") or "") == "true":
+                continue
+            payload = self._load_json(original.path)
+            payload["source_receipt_ledger_artifact_id"] = (
+                str(ledger_record.artifact_id) if ledger_record is not None else ""
+            )
+            payload["source_receipt_ledger_artifact_hash"] = (
+                str(ledger_record.content_hash) if ledger_record is not None else ""
+            )
+            payload["source_provider_closure_artifact_id"] = closure_record.artifact_id
+            payload["source_provider_closure_artifact_hash"] = closure_record.content_hash
+            artifact_id = reuse_record_artifact_id(reuse_key, closure_bound=True)
+            path = self.workspace.artifact_path(
+                f"validation_reuse/{reuse_key}.closure-bound.json"
+            )
+            dependencies = [ArtifactDependencyRefV2.from_record(original)]
+            if ledger_record is not None:
+                dependencies.append(ArtifactDependencyRefV2.from_record(ledger_record))
+            dependencies.append(ArtifactDependencyRefV2.from_record(closure_record))
+            record = publish_json_artifact(
+                self.publication_context,
+                self.artifact_registry,
+                path,
+                payload,
+                artifact_role="validation_adjudication_reuse_record",
+                artifact_type=ADJUDICATION_REUSE_ARTIFACT_TYPE,
+                artifact_version=ADJUDICATION_REUSE_ARTIFACT_VERSION,
+                producer="validation.execution_service.ValidationExecutionService.publish_closure_bound_reuse_records",
+                artifact_id=artifact_id,
+                depends_on=dependencies,
+                metadata={"reuse_key": reuse_key, "closure_bound": "true"},
+            )
+            self._adjudication_reuse_records[f"{reuse_key}:closure-bound"] = record
+            records.append(record)
+        return records
+
+    def find_verified_adjudication_reuse(
+        self,
+        *,
+        packet: Any,
+        api_config: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any] | None, Any | None, str]:
+        from validation.adjudication_reuse import (
+            build_reuse_key,
+            reuse_record_artifact_id,
+        )
+
+        reuse_key = build_reuse_key(
+            packet=packet,
+            api_config=api_config,
+            input_dependency_hashes=self._input_dependency_hashes,
+        )
+        closure_bound_id = reuse_record_artifact_id(reuse_key, closure_bound=True)
+        candidate = self.artifact_registry.get(closure_bound_id)
+        if candidate is None or candidate.status != "ready":
+            candidate = self.artifact_registry.get(reuse_record_artifact_id(reuse_key))
+        if candidate is None or candidate.status != "ready":
+            return None, None, ""
+        report, error = verify_reuse_record(
+            self.artifact_registry,
+            candidate,
+            packet=packet,
+            api_config=api_config,
+            input_dependency_hashes=self._input_dependency_hashes,
+            current_epoch=self.closure_epoch_id,
+            service=self,
+        )
+        if error:
+            return None, candidate, error
+        return report, candidate, ""
 
     def persist_summaries(self) -> bool:
         summary_set_hash = hash_json(self.summaries)
@@ -610,6 +815,8 @@ class ValidationExecutionService:
                     None,
                 )
             )
+        for reuse_record in list(self._adjudication_reuse_records.values()):
+            add_dependency(reuse_record)
         closure_record = publish_json_artifact(
             self.publication_context,
             self.artifact_registry,
@@ -640,11 +847,21 @@ class ValidationExecutionService:
                 "closure_epoch_id": resolved_epoch,
             },
         )
+        closure_bound_records = self.publish_closure_bound_reuse_records(
+            closure_record=closure_record,
+            ledger_record=ledger_record,
+        )
         return {
             "ledger": ledger_record,
             "closure": closure,
             "closure_record": closure_record,
             "expected_call_ids": tuple(sorted(expected.call_id for expected in expected_calls)),
+            "adjudication_reuse_records": tuple(
+                record.artifact_id for record in self._adjudication_reuse_records.values()
+            ),
+            "closure_bound_reuse_records": tuple(
+                record.artifact_id for record in closure_bound_records
+            ),
         }
 
     def run_review_validation(self) -> dict[str, Any]:

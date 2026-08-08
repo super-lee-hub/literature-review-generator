@@ -1107,6 +1107,170 @@ def _terminal_for_stage(
     return max(candidates, key=lambda item: (item[0].created_at, item[0].artifact_id), default=(None, None))
 
 
+def _adjudication_reuse_receipt_verified(
+    registry: ArtifactRegistry,
+    payload: Mapping[str, Any],
+    dependency_records: Sequence[ArtifactRecord],
+) -> bool:
+    receipt_id = str(payload.get("source_receipt_id") or "")
+    receipt_hash = str(payload.get("source_receipt_hash") or "")
+    if not receipt_id or not receipt_hash:
+        return False
+    ledger_records = [
+        record
+        for record in dependency_records
+        if record.artifact_type == "provider_receipt_ledger"
+    ]
+    source_closure_id = str(payload.get("source_provider_closure_artifact_id") or "")
+    if source_closure_id:
+        source_closure = registry.get(source_closure_id)
+        if source_closure is not None and source_closure.status == "ready":
+            for dependency in source_closure.depends_on:
+                candidate = registry.get(dependency.artifact_id)
+                if (
+                    candidate is not None
+                    and candidate.status == "ready"
+                    and candidate.artifact_type == "provider_receipt_ledger"
+                ):
+                    ledger_records.append(candidate)
+    for ledger_record in ledger_records:
+        for row in _read_jsonl_objects(ledger_record.path):
+            if (
+                str(row.get("receipt_id") or "") == receipt_id
+                and hash_json(row) == receipt_hash
+            ):
+                return True
+    return False
+
+
+def _adjudication_reuse_closure_verified(
+    registry: ArtifactRegistry,
+    payload: Mapping[str, Any],
+    *,
+    closure_epoch_id: str,
+) -> bool:
+    source_epoch = str(payload.get("source_provider_closure_epoch_id") or "")
+    closure_id = str(payload.get("source_provider_closure_artifact_id") or "")
+    closure_hash = str(payload.get("source_provider_closure_artifact_hash") or "")
+    if not source_epoch:
+        return False
+    if not closure_id or not closure_hash:
+        return source_epoch == closure_epoch_id
+    record = registry.get(closure_id)
+    if record is None or record.status != "ready" or record.content_hash != closure_hash:
+        return False
+    raw = _json_object(record.path)
+    if raw is None:
+        return False
+    payload_value = raw.get("payload")
+    closure_payload = payload_value if isinstance(payload_value, Mapping) else raw
+    return (
+        str(closure_payload.get("closure_epoch_id") or "") == source_epoch
+        and bool(closure_payload.get("complete"))
+    )
+
+
+def _adjudication_reuse_call_issues(
+    *,
+    stage: str,
+    expected_call: Mapping[str, Any],
+    registry: ArtifactRegistry,
+    dependency_records: Sequence[ArtifactRecord],
+    closure_epoch_id: str,
+) -> list[str]:
+    call_id = str(expected_call.get("call_id") or "unknown")
+    issues: list[str] = []
+    if not expected_call.get("verified_reuse"):
+        return issues
+    artifact_id = str(expected_call.get("reuse_evidence_artifact_id") or "")
+    artifact_hash = str(expected_call.get("reuse_evidence_artifact_hash") or "")
+    record_hash = str(expected_call.get("reuse_evidence_record_hash") or "")
+    if not artifact_id or not artifact_hash or not record_hash or artifact_hash != record_hash:
+        issues.append(
+            f"provider_closure_adjudication_reuse_evidence_incomplete:{stage}:{call_id}"
+        )
+        return issues
+    reuse_record = next(
+        (
+            record
+            for record in dependency_records
+            if record.artifact_id == artifact_id
+        ),
+        None,
+    )
+    if reuse_record is None or reuse_record.status != "ready":
+        issues.append(
+            f"provider_closure_adjudication_reuse_record_missing:{stage}:{call_id}"
+        )
+        return issues
+    if (
+        reuse_record.artifact_type != "validation_adjudication_reuse_record"
+        or reuse_record.artifact_version != "v1"
+    ):
+        issues.append(
+            f"provider_closure_adjudication_reuse_record_type_invalid:{stage}:{call_id}"
+        )
+    if reuse_record.content_hash != artifact_hash:
+        issues.append(
+            f"provider_closure_adjudication_reuse_record_hash_mismatch:{stage}:{call_id}"
+        )
+    payload = _json_object(reuse_record.path)
+    if payload is None:
+        issues.append(
+            f"provider_closure_adjudication_reuse_record_unreadable:{stage}:{call_id}"
+        )
+        return issues
+    for field in (
+        "call_id",
+        "node_id",
+        "prompt_hash",
+        "input_hash",
+        "schema_hash",
+        "redacted_provider_config_hash",
+    ):
+        if str(expected_call.get(field) or "") != str(payload.get(field) or ""):
+            issues.append(
+                f"provider_closure_adjudication_reuse_{field}_mismatch:{stage}:{call_id}"
+            )
+    output_id = str(payload.get("provider_output_artifact_id") or "")
+    output_hash = str(payload.get("provider_output_artifact_hash") or "")
+    output_record = registry.get(output_id)
+    if output_record is None or output_record.status != "ready":
+        issues.append(
+            f"provider_closure_adjudication_reuse_provider_output_missing:{stage}:{call_id}"
+        )
+    else:
+        if output_record.content_hash != output_hash:
+            issues.append(
+                f"provider_closure_adjudication_reuse_provider_output_hash_mismatch:{stage}:{call_id}"
+            )
+        output_payload = _json_object(output_record.path)
+        if output_payload is None:
+            issues.append(
+                f"provider_closure_adjudication_reuse_provider_output_unreadable:{stage}:{call_id}"
+            )
+        else:
+            inner = output_payload.get("payload")
+            inner = inner if isinstance(inner, Mapping) else output_payload
+            if hash_json(inner) != str(payload.get("normalized_result_hash") or ""):
+                issues.append(
+                    f"provider_closure_adjudication_reuse_normalized_result_mismatch:{stage}:{call_id}"
+                )
+    if not _adjudication_reuse_receipt_verified(registry, payload, dependency_records):
+        issues.append(
+            f"provider_closure_adjudication_reuse_source_receipt_missing:{stage}:{call_id}"
+        )
+    if not _adjudication_reuse_closure_verified(
+        registry,
+        payload,
+        closure_epoch_id=closure_epoch_id,
+    ):
+        issues.append(
+            f"provider_closure_adjudication_reuse_source_closure_missing:{stage}:{call_id}"
+        )
+    return issues
+
+
 def _provider_closure_entry(
     stage: str,
     record: ArtifactRecord | None,
@@ -1280,6 +1444,11 @@ def _provider_closure_entry(
         blocking.append(f"provider_closure_expected_calls_missing:{stage}")
     expected_payload_ids = [str(item.get("call_id") or "") for item in expected_call_payloads]
     expected_call_count = len(expected_call_payloads)
+    reuse_call_ids = {
+        str(item.get("call_id") or "")
+        for item in expected_call_payloads
+        if bool(item.get("verified_reuse"))
+    }
     entry["provider_closure_required"] = expected_call_count > 0
     if any(not item for item in expected_payload_ids) or len(set(expected_payload_ids)) != len(expected_payload_ids):
         blocking.append(f"provider_closure_expected_call_identity_invalid:{stage}")
@@ -1433,6 +1602,16 @@ def _provider_closure_entry(
                 blocking.append(f"provider_closure_expected_file_hash_mismatch:{stage}:{call_id}")
         except (OSError, TypeError, ValueError):
             blocking.append(f"provider_closure_expected_artifact_unreadable:{stage}:{call_id}")
+        if bool(expected_call.get("verified_reuse")):
+            blocking.extend(
+                _adjudication_reuse_call_issues(
+                    stage=stage,
+                    expected_call=expected_call,
+                    registry=registry,
+                    dependency_records=dependency_records,
+                    closure_epoch_id=closure_epoch_id,
+                )
+            )
     expected_ids = [str(item) for item in closure.get("expected_call_ids") or () if str(item)]
     observed_ids = [str(item) for item in closure.get("observed_call_ids") or () if str(item)]
     # Never derive the expected set from the receipt ledger.  The closure
@@ -1449,10 +1628,17 @@ def _provider_closure_entry(
         or set(expected_ids) != set(expected_payload_ids)
     ):
         blocking.append(f"provider_closure_expected_call_set_mismatch:{stage}")
+    fresh_expected_ids = set(expected_ids) - reuse_call_ids
+    closure_reuse_ids = {
+        str(item)
+        for item in closure.get("verified_reuse_call_ids") or ()
+        if str(item)
+    }
+    if closure_reuse_ids != reuse_call_ids:
+        blocking.append(f"provider_closure_verified_reuse_call_set_mismatch:{stage}")
     if (
         len(observed_ids) != len(set(observed_ids))
-        or len(observed_ids) != expected_call_count
-        or set(observed_ids) != set(expected_ids)
+        or set(observed_ids) != fresh_expected_ids
     ):
         blocking.append(f"provider_closure_observed_call_set_mismatch:{stage}")
     if entry["closure_epoch_id"] != closure_epoch_id:
@@ -1462,7 +1648,7 @@ def _provider_closure_entry(
         for dependency_record in dependency_records
         if dependency_record.artifact_type == "provider_receipt_ledger"
     ]
-    if expected_call_count > 0:
+    if fresh_expected_ids:
         if not ledger_records:
             blocking.append(f"provider_closure_receipt_ledger_dependency_missing:{stage}")
         else:
@@ -1471,6 +1657,14 @@ def _provider_closure_entry(
                     ArtifactRegistry._verify_ready_artifact(ledger_record)
                 except (OSError, RegistryError, ValueError, TypeError) as exc:
                     blocking.append(f"provider_closure_receipt_ledger_untrusted:{stage}:{exc}")
+    elif expected_call_count > 0:
+        # All expected validation calls are verified adjudication reuse.  The
+        # closure still carries the reuse records and provider output
+        # dependencies; it does not require a receipt ledger for this attempt.
+        if terminal_model_calls != 0:
+            blocking.append(f"provider_closure_all_reuse_terminal_model_count:{stage}")
+        if receipt_rows:
+            blocking.append(f"provider_closure_all_reuse_observed_receipts:{stage}")
     else:
         if terminal_model_calls != 0:
             blocking.append(f"provider_closure_zero_call_terminal_model_count:{stage}")

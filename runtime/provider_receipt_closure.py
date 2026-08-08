@@ -49,6 +49,10 @@ class ExpectedProviderCall:
     node_output_hash: str = ""
     max_attempts: int = 0
     usage_required: bool = False
+    verified_reuse: bool = False
+    reuse_evidence_artifact_id: str = ""
+    reuse_evidence_artifact_hash: str = ""
+    reuse_evidence_record_hash: str = ""
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ExpectedProviderCall":
@@ -77,6 +81,10 @@ class ExpectedProviderCall:
             node_output_hash=str(payload.get("node_output_hash") or ""),
             max_attempts=max(0, int(payload.get("max_attempts") or 0)),
             usage_required=bool(payload.get("usage_required", False)),
+            verified_reuse=bool(payload.get("verified_reuse", False)),
+            reuse_evidence_artifact_id=str(payload.get("reuse_evidence_artifact_id") or ""),
+            reuse_evidence_artifact_hash=str(payload.get("reuse_evidence_artifact_hash") or ""),
+            reuse_evidence_record_hash=str(payload.get("reuse_evidence_record_hash") or ""),
         )
 
     def __post_init__(self) -> None:
@@ -102,6 +110,7 @@ class ReceiptClosureResult:
     historical_receipts: tuple[str, ...] = ()
     retry_exceeded_call_ids: tuple[str, ...] = ()
     usage_incomplete_call_ids: tuple[str, ...] = ()
+    verified_reuse_call_ids: tuple[str, ...] = ()
     complete: bool = False
     closure_hash: str = ""
 
@@ -119,6 +128,7 @@ class ReceiptClosureResult:
             "historical_receipts",
             "retry_exceeded_call_ids",
             "usage_incomplete_call_ids",
+            "verified_reuse_call_ids",
         ):
             object.__setattr__(self, name, tuple(dict.fromkeys(str(item) for item in getattr(self, name) if str(item))))
         object.__setattr__(self, "hash_mismatches", {
@@ -141,6 +151,7 @@ class ReceiptClosureResult:
             "historical_receipts",
             "retry_exceeded_call_ids",
             "usage_incomplete_call_ids",
+            "verified_reuse_call_ids",
         ):
             payload[key] = list(getattr(self, key))
         payload["hash_mismatches"] = {key: list(value) for key, value in self.hash_mismatches.items()}
@@ -213,6 +224,13 @@ class ProviderReceiptClosure:
 
         expected_ids = tuple(sorted(expected_by_id))
         observed_ids = tuple(sorted(receipts_by_id))
+        verified_reuse_ids = tuple(
+            sorted(
+                call_id
+                for call_id, contract in expected_by_id.items()
+                if contract.verified_reuse
+            )
+        )
         missing: list[str] = []
         stale: list[str] = []
         failed: list[str] = []
@@ -222,6 +240,20 @@ class ProviderReceiptClosure:
         mismatches: dict[str, tuple[str, ...]] = {}
 
         for call_id, contract in expected_by_id.items():
+            if contract.verified_reuse:
+                if (
+                    not contract.reuse_evidence_artifact_id
+                    or not contract.reuse_evidence_artifact_hash
+                    or not contract.reuse_evidence_record_hash
+                    or not contract.artifact_path
+                    or not contract.registry_file_hash
+                    or not contract.artifact_payload_hash
+                    or not contract.normalized_output_hash
+                    or not contract.provider_response_hash
+                ):
+                    stale.append(call_id)
+                    mismatches[call_id] = ("reuse_evidence_incomplete",)
+                continue
             candidates = receipts_by_id.get(call_id, [])
             if not candidates:
                 missing.append(call_id)
@@ -359,6 +391,7 @@ class ProviderReceiptClosure:
             "historical_receipts": historical_receipts,
             "retry_exceeded_call_ids": tuple(sorted(retry_exceeded)),
             "usage_incomplete_call_ids": tuple(sorted(usage_incomplete)),
+            "verified_reuse_call_ids": verified_reuse_ids,
             "complete": complete,
         }
         return ReceiptClosureResult(**payload, closure_hash=_hash(payload))
