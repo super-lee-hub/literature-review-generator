@@ -88,8 +88,8 @@ def _packet_builder(result, stage="primary"):
         evidence_excerpt_list=result.evidence_excerpt_list,
         trimmed_candidate_counts={},
         citation_set_key=result.citation_set_key,
-        legacy_evidence_status=result.evidence_status,
-        legacy_disposition=result.disposition,
+        evidence_status=result.evidence_status,
+        disposition=result.disposition,
     )
 
 
@@ -247,7 +247,7 @@ def test_get_validation_max_workers_reads_configparser_section():
     assert validator._get_validation_max_workers(generator) == 4
 
 
-def test_get_validation_max_workers_falls_back_to_performance_when_validation_is_invalid():
+def test_get_validation_max_workers_uses_current_default_when_validation_is_invalid():
     generator = types.SimpleNamespace(
         config={
             "Performance": {"max_workers": "3"},
@@ -255,4 +255,4 @@ def test_get_validation_max_workers_falls_back_to_performance_when_validation_is
         }
     )
 
-    assert validator._get_validation_max_workers(generator) == 3
+    assert validator._get_validation_max_workers(generator) == 1

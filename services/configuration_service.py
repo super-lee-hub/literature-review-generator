@@ -8,9 +8,19 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Mapping, MutableMapping
 
-from outline.v2_config import OUTLINE_QUALITY_GATE_DEFAULTS
 from config_validator import test_api_connection
-from services.config_compat import apply_validation_compat_sections
+from services.settings import ApplicationSettings, CONFIG_SCHEMA_VERSION, validate_config_keys
+
+
+OUTLINE_QUALITY_GATE_DEFAULTS: Dict[str, str] = {
+    "coverage_scope": "full",
+    "min_canonical_coverage_full": "0.50",
+    "min_canonical_coverage_local": "0.25",
+    "min_effective_sections": "3",
+    "max_duplicate_assignments": "0",
+    "block_placeholder_sections": "true",
+    "block_empty_research_streams": "true",
+}
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,9 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
     """Return a config layout that includes all new sections."""
 
     return {
+        "Application": {
+            "config_schema": str(CONFIG_SCHEMA_VERSION),
+        },
         "Paths": {
             "zotero_report": "",
             "library_path": "",
@@ -75,6 +88,15 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "thinking": "enabled",
             "reasoning_effort": "max",
             "max_context_tokens": "1000000",
+            "max_output_tokens": "3000",
+            "temperature": "0.3",
+            "connect_timeout_seconds": "30",
+            "read_timeout_seconds": "600",
+            "total_timeout_seconds": "600",
+            "first_token_timeout_seconds": "120",
+            "transport_retries": "2",
+            "reasoning_reserve_tokens": "2048",
+            "safety_margin_tokens": "1024",
             "force_highest_reasoning": "true",
             "omit_temperature_when_reasoning": "true",
         },
@@ -83,6 +105,18 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "model": "",
             "api_base": PROVIDER_PRESETS["videocaptioner"].default_api_base,
             "proxy_mode": "environment",
+            "endpoint_type": "chat_completions",
+            "provider_family": "generic",
+            "max_context_tokens": "128000",
+            "max_output_tokens": "8192",
+            "temperature": "0.3",
+            "connect_timeout_seconds": "30",
+            "read_timeout_seconds": "600",
+            "total_timeout_seconds": "600",
+            "first_token_timeout_seconds": "120",
+            "transport_retries": "2",
+            "reasoning_reserve_tokens": "0",
+            "safety_margin_tokens": "1024",
         },
         "Writer_API": {
             "api_key": "loaded_from_.env_file",
@@ -94,7 +128,16 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "reasoning_effort": "high",
             "force_highest_reasoning": "true",
             "text_verbosity": "high",
+            "max_context_tokens": "128000",
             "max_output_tokens": "32000",
+            "temperature": "0.0",
+            "connect_timeout_seconds": "30",
+            "read_timeout_seconds": "900",
+            "total_timeout_seconds": "900",
+            "first_token_timeout_seconds": "180",
+            "transport_retries": "2",
+            "reasoning_reserve_tokens": "4096",
+            "safety_margin_tokens": "2048",
             "omit_temperature_when_reasoning": "true",
         },
         "Outline_API": {
@@ -106,6 +149,16 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "provider_family": "aihubmix_claude",
             "reasoning_effort": "xhigh",
             "reasoning_display": "summarized",
+            "max_context_tokens": "200000",
+            "max_output_tokens": "16000",
+            "temperature": "0.0",
+            "connect_timeout_seconds": "30",
+            "read_timeout_seconds": "900",
+            "total_timeout_seconds": "900",
+            "first_token_timeout_seconds": "180",
+            "transport_retries": "2",
+            "reasoning_reserve_tokens": "4096",
+            "safety_margin_tokens": "2048",
             "force_highest_reasoning": "true",
         },
         "Free_Mode_API": {
@@ -113,16 +166,30 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "model": "",
             "api_base": "",
             "proxy_mode": "environment",
+            "endpoint_type": "chat_completions",
+            "provider_family": "generic",
+            "max_context_tokens": "128000",
+            "max_output_tokens": "6000",
+            "temperature": "0.4",
+            "connect_timeout_seconds": "30",
+            "read_timeout_seconds": "600",
+            "total_timeout_seconds": "600",
+            "first_token_timeout_seconds": "120",
+            "transport_retries": "2",
+            "reasoning_reserve_tokens": "0",
+            "safety_margin_tokens": "1024",
         },
-        "Performance": {
+        "Runtime": {
             "max_workers": "3",
-            "api_retry_attempts": "5",
-            "primary_tpm_limit": "900000",
-            "primary_rpm_limit": "9000",
-            "backup_tpm_limit": "2000000",
-            "backup_rpm_limit": "9000",
-            "enable_stage1_validation": "false",
-            "enable_stage2_validation": "true",
+            "transport_retries": "2",
+            "node_retry_limit": "2",
+            "stage1_retry_limit": "2",
+            "review_section_retry_limit": "2",
+            "validation_retry_limit": "1",
+            "retry_base_delay_seconds": "30",
+            "retry_max_delay_seconds": "120",
+            "total_job_deadline_seconds": "0",
+            "retain_checkpoints_after_completion": "false",
         },
         "Preprocess": {
             "enabled": "true",
@@ -141,17 +208,6 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "enable_local_rag": "false",
             "rag_backend": "chroma",
         },
-        "Retry_Settings": {
-            "max_retry_rounds": "2",
-            "base_retry_delay": "30",
-            "max_retry_delay": "120",
-        },
-        "Stage2_Retry": {
-            "enabled": "true",
-            "max_retry_rounds": "2",
-            "base_retry_delay": "30",
-            "max_retry_delay": "120",
-        },
         "Styling": {
             "font_name": "Times New Roman",
             "font_size_body": "12",
@@ -160,26 +216,6 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "GUI": {
             "language": "zh-CN",
-        },
-        "API_Parameters": {
-            "primary_max_tokens": "3000",
-            "primary_temperature": "0.3",
-            "timeout_seconds": "600",
-            "backup_max_tokens": "8192",
-            "backup_temperature": "0.3",
-            "concept_max_tokens": "4000",
-            "concept_temperature": "0.3",
-            "writer_max_tokens": "32000",
-            "writer_temperature": "0.5",
-            "outline_max_tokens": "16000",
-            "outline_temperature": "0.4",
-            "free_mode_max_tokens": "6000",
-            "free_mode_temperature": "0.4",
-            "validator_max_tokens": "4096",
-            "validator_temperature": "0.3",
-            "validator_context_max_tokens": "1000000",
-            "claims_max_tokens": "8192",
-            "claims_temperature": "0.3",
         },
         "Validator_API": {
             "api_key": "loaded_from_.env_file",
@@ -191,41 +227,67 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "thinking": "enabled",
             "reasoning_effort": "max",
             "max_context_tokens": "1000000",
+            "max_output_tokens": "4096",
+            "temperature": "0.3",
+            "connect_timeout_seconds": "30",
+            "read_timeout_seconds": "900",
+            "total_timeout_seconds": "900",
+            "first_token_timeout_seconds": "180",
+            "transport_retries": "2",
+            "reasoning_reserve_tokens": "2048",
+            "safety_margin_tokens": "1024",
             "force_highest_reasoning": "true",
             "omit_temperature_when_reasoning": "true",
         },
         "Validation": {
             "stage1_enabled": "false",
-            "stage2_enabled": "true",
-            "keep_checkpoints_after_completion": "false",
+            "review_enabled": "true",
             "repair_policy": "report_only",
-            "legacy_citation_policy": "report_only",
             "evidence_resolver_enabled": "true",
             "visual_refs_enabled": "true",
             "review_drift_threshold": "0.3",
             "summary_drift_threshold": "0.2",
         },
         "Outline": {
-            "enable_outline_intelligence_v2": "false",
-            "enable_literature_map": "true",
-            "enable_synthesis_flow": "true",
-            "candidate_count": "3",
-            "enable_multi_model_critique": "true",
-            "enable_coverage_audit": "true",
-            "require_explicit_adopt": "true",
+            "candidate_count": "5",
+            "relation_adjudication_enabled": "true",
+            "structure_critique_enabled": "true",
+            "coverage_critique_enabled": "true",
+            "evidence_critique_enabled": "true",
+            "require_explicit_adoption": "true",
+            "technical_shard_target_tokens": "0",
             "allow_bibliometric_provider": "false",
         },
         "OutlineModels": {
             "outline_model": "Outline_API",
             "structure_critic_model": "Writer_API",
             "coverage_critic_model": "Primary_Reader_API",
+            "evidence_critic_model": "Primary_Reader_API",
             "arbitrator_model": "Outline_API",
         },
         "OutlineCostControl": {
-            "max_candidate_count": "3",
             "max_critique_models": "2",
             "max_summary_refs_per_prompt": "80",
             "max_outline_retry_count": "2",
+        },
+        "OutlineStability": {
+            "mode": "smoke",
+            "max_provider_calls": "24",
+            "max_estimated_cost": "",
+            "max_estimated_total_tokens": "5000000",
+            "pricing_source": "",
+            "pricing_provider": "",
+            "pricing_model": "",
+            "pricing_version": "",
+            "pricing_effective_date": "",
+            "estimated_cost_per_1k_tokens": "",
+            "input_cost_per_1k_tokens": "",
+            "output_cost_per_1k_tokens": "",
+            "reasoning_cost_per_1k_tokens": "",
+            "cache_read_cost_per_1k_tokens": "",
+            "cache_write_cost_per_1k_tokens": "",
+            "max_smoke_overhead_ratio": "2.0",
+            "max_source_prompt_tokens": "0",
         },
         "OutlineQualityGate": dict(OUTLINE_QUALITY_GATE_DEFAULTS),
     }
@@ -258,11 +320,19 @@ def normalize_api_base(raw_value: str, provider: str = "custom") -> str:
 def ensure_config_sections(
     existing: Mapping[str, Mapping[str, str]] | None = None,
 ) -> Dict[str, Dict[str, str]]:
-    """Merge defaults with an existing config-like mapping."""
+    """Merge current defaults with an existing config-like mapping.
+
+    Unknown sections and keys are rejected instead of being silently carried
+    forward into a new file.
+    """
 
     merged = default_config_sections()
     if not existing:
-        return apply_validation_compat_sections(merged)
+        return merged
+
+    key_errors = validate_config_keys(existing)
+    if key_errors:
+        raise ValueError("; ".join(key_errors))
 
     for section, values in existing.items():
         merged.setdefault(section, {})
@@ -278,7 +348,8 @@ def ensure_config_sections(
     if not merged["Free_Mode_API"].get("api_base"):
         merged["Free_Mode_API"]["api_base"] = merged["Outline_API"].get("api_base", "")
 
-    return apply_validation_compat_sections(merged)
+    ApplicationSettings.from_mutable_config(merged)
+    return merged
 
 
 def read_env_file(env_path: str = ".env") -> Dict[str, str]:

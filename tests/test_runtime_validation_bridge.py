@@ -8,21 +8,49 @@ import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
+from validation.execution_service import ValidationExecutionService
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRegistry,
     file_sha256,
 )
 from services.job_workspace import JobWorkspace
-from tests.test_runtime_bridge_helpers import build_legacy_main, write_json
+from tests.test_runtime_bridge_helpers import current_config, write_json
 from validation.run_result import (
+    ClaimValidationResultV1,
+    ClaimVerdict,
     ValidationExecutionStatus,
     ValidationInputArtifactsV1,
     ValidationRunResultV1,
 )
 
 
-def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
+def _supported_claim() -> ClaimValidationResultV1:
+    return ClaimValidationResultV1(
+        claim_result_id="claim:bridge-supported",
+        claim_unit_ids=(),
+        citation_set_key="citation-set-1",
+        paper_ids=("paper-alpha",),
+        block_ids=("block-1",),
+        claim_text="The evidence supports the bounded claim.",
+        claim_context="",
+        verdict=ClaimVerdict.SUPPORTED,
+        reasoning_summary="The registered evidence supports the claim.",
+        repair_hint="",
+        root_causes=(),
+        span_start=0,
+        span_end=10,
+        alignment_status="aligned",
+        alignment_confidence=1.0,
+        low_confidence=False,
+        details={"evidence_status": "clean_supported"},
+        evidence_candidates=(),
+    )
+
+
+def test_runtime_validation_bridge_registers_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pdf_dir = tmp_path / "papers"
     pdf_dir.mkdir()
     (pdf_dir / "alpha.pdf").write_bytes(b"%PDF-1.4\n%alpha\n")
@@ -35,13 +63,14 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
             project_name="demo-ai",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(queue_file),
         )
     )
-    session = bridge.bootstrap(build_legacy_main())
+    session = bridge.bootstrap()
 
-    review_draft_path = Path(session.generator._review_draft_v2_path())
-    citation_manifest_path = Path(session.generator._citation_manifest_path())
+    review_draft_path = Path(session.stage_host._review_draft_path())
+    citation_manifest_path = Path(session.stage_host._citation_manifest_path())
     parent_workspace = JobWorkspace.create(
         str(tmp_path),
         "validation-parent",
@@ -60,28 +89,47 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
 
     write_json(
         review_draft_path,
-        {"artifact_type": "review_draft", "artifact_version": "v2", "content": {"sections": []}},
+        {
+            "artifact_type": "review_draft",
+            "artifact_version": "v3",
+            "created_from_job_id": session.context.workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "draft_identity": {"draft_id": "review-draft"},
+            "generation_context": {"mode": "test"},
+            "content": {"sections": []},
+            "projections": {},
+        },
     )
     write_json(
         citation_manifest_path,
-        {"artifact_type": "citation_manifest", "artifact_version": "v3", "occurrences": [], "citation_sets": []},
+        {
+            "artifact_type": "citation_manifest",
+            "artifact_version": "v3",
+            "created_from_job_id": session.context.workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "manifest_identity": {"manifest_id": "citation_manifest_v3"},
+            "review_reference": {"artifact_id": "review-draft"},
+            "occurrences": [],
+            "citation_sets": [],
+            "bibliography": [],
+        },
     )
     write_json(
         evidence_manifest_path,
         {"artifact_type": "evidence_manifest", "artifact_version": "v1"},
     )
     review_record = session.context.registry.register_file(
-        artifact_id="review-draft-v2",
+        artifact_id="review_draft",
         artifact_role="review_draft",
-        artifact_type=session.generator.REVIEW_DRAFT_V2_ARTIFACT_TYPE,
-        artifact_version="v2",
+        artifact_type=session.stage_host.REVIEW_DRAFT_ARTIFACT_TYPE,
+        artifact_version="v3",
         path=review_draft_path,
         producer="tests",
     )
     citation_record = session.context.registry.register_file(
-        artifact_id="citation-manifest-v3",
+        artifact_id="citation_manifest_v3",
         artifact_role="citation_manifest",
-        artifact_type=session.generator.CITATION_MANIFEST_ARTIFACT_TYPE,
+        artifact_type=session.stage_host.CITATION_MANIFEST_ARTIFACT_TYPE,
         artifact_version="v3",
         path=citation_manifest_path,
         producer="tests",
@@ -118,6 +166,23 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
         depends_on=[external_evidence],
         external_registry_resolver=external_registry_resolver,
     )
+    from docx import Document
+
+    review_docx_path = Path(session.stage_host._get_review_word_file_path())
+    review_docx_path.parent.mkdir(parents=True, exist_ok=True)
+    Document().save(str(review_docx_path))
+    session.context.registry.register_file(
+        artifact_id="review_docx",
+        artifact_role="review_docx",
+        artifact_type="review_docx",
+        artifact_version="v1",
+        path=review_docx_path,
+        producer="tests",
+        depends_on=[
+            ArtifactDependencyRefV2.from_record(review_record),
+            ArtifactDependencyRefV2.from_record(citation_record),
+        ],
+    )
     report_file.parent.mkdir(parents=True, exist_ok=True)
     report_file.write_text("ok", encoding="utf-8")
     manual_report_file.write_text(json.dumps({"items": []}), encoding="utf-8")
@@ -134,8 +199,10 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
             evidence_manifest_ids=(evidence_record.artifact_id,),
             evidence_manifest_hashes=(evidence_record.content_hash,),
         ),
-        review_has_citations=False,
         evidence_complete=True,
+        claim_results=(_supported_claim(),),
+        expected_claim_count=1,
+        review_has_citations=True,
     )
     write_json(validation_run_result_file, canonical_result.to_dict())
 
@@ -149,10 +216,10 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
             "manual_report_file": str(manual_report_file),
         }
 
+    monkeypatch.setattr(ValidationExecutionService, "run_review_validation", _fake_run_review_validation)
     validation_result = bridge.run_validation(
         session,
         attempt_id="attempt-1",
-        validator_module=SimpleNamespace(run_review_validation=_fake_run_review_validation),
         external_registry_resolver=external_registry_resolver,
     )
 
@@ -198,16 +265,18 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
         session.context.workspace.report_path("validation_run_result_mismatch.json")
     )
     write_json(mismatched_path, mismatched_result.to_dict())
+    monkeypatch.setattr(
+        ValidationExecutionService,
+        "run_review_validation",
+        lambda _adapter: {
+            "success": True,
+            "validation_run_result": mismatched_result,
+            "validation_run_result_file": str(mismatched_path),
+        },
+    )
     mismatched_stage = bridge.run_validation(
         session,
         attempt_id="attempt-1",
-        validator_module=SimpleNamespace(
-            run_review_validation=lambda _adapter: {
-                "success": True,
-                "validation_run_result": mismatched_result,
-                "validation_run_result_file": str(mismatched_path),
-            }
-        ),
         external_registry_resolver=external_registry_resolver,
     )
 
@@ -216,7 +285,7 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
     assert mismatched_stage.metadata["execution_status"] == "failed"
     assert mismatched_stage.metadata["validation_disposition"] == "unvalidated"
     assert mismatched_stage.metadata["declared_execution_status"] == "succeeded"
-    assert mismatched_stage.metadata["declared_validation_disposition"] == "clean"
+    assert mismatched_stage.metadata["declared_validation_disposition"] == "needs_review"
     assert mismatched_stage.metadata["failure_reason"] == (
         "validation_input_dependencies_unverified"
     )
@@ -224,7 +293,9 @@ def test_runtime_validation_bridge_registers_reports(tmp_path: Path) -> None:
     assert mismatched_record.status == "quarantined"
 
 
-def test_runtime_validation_bridge_rejects_legacy_report_as_verified(tmp_path: Path) -> None:
+def test_runtime_validation_bridge_rejects_legacy_report_as_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pdf_dir = tmp_path / "papers"
     pdf_dir.mkdir()
     (pdf_dir / "alpha.pdf").write_bytes(b"%PDF-1.4\n%alpha\n")
@@ -235,27 +306,30 @@ def test_runtime_validation_bridge_rejects_legacy_report_as_verified(tmp_path: P
             project_name="legacy-validation",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(queue_file),
         )
     )
-    session = bridge.bootstrap(build_legacy_main())
+    session = bridge.bootstrap()
 
-    result = bridge.run_validation(
-        session,
-        validator_module=SimpleNamespace(
-            run_review_validation=lambda _adapter: {
-                "success": True,
-                "report": SimpleNamespace(report_id="legacy"),
-            }
-        ),
+    monkeypatch.setattr(
+        ValidationExecutionService,
+        "run_review_validation",
+        lambda _adapter: {
+            "success": True,
+            "report": SimpleNamespace(report_id="legacy"),
+        },
     )
+    result = bridge.run_validation(session)
 
     assert result.success is False
-    assert result.metadata["execution_status"] == "skipped"
+    assert result.metadata["execution_status"] == "failed"
     assert result.metadata["validation_disposition"] == "unvalidated"
 
 
-def test_runtime_validation_bridge_rejects_success_without_canonical_file(tmp_path: Path) -> None:
+def test_runtime_validation_bridge_rejects_success_without_canonical_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pdf_dir = tmp_path / "papers"
     pdf_dir.mkdir()
     (pdf_dir / "alpha.pdf").write_bytes(b"%PDF-1.4\n%alpha\n")
@@ -264,10 +338,11 @@ def test_runtime_validation_bridge_rejects_success_without_canonical_file(tmp_pa
             project_name="missing-canonical-validation",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(tmp_path / "queue.json"),
         )
     )
-    session = bridge.bootstrap(build_legacy_main())
+    session = bridge.bootstrap()
     in_memory = ValidationRunResultV1.create(
         job_id=session.context.workspace.job_id,
         attempt_id="attempt-1",
@@ -276,16 +351,15 @@ def test_runtime_validation_bridge_rejects_success_without_canonical_file(tmp_pa
         evidence_complete=True,
     )
 
-    result = bridge.run_validation(
-        session,
-        attempt_id="attempt-1",
-        validator_module=SimpleNamespace(
-            run_review_validation=lambda _adapter: {
-                "success": True,
-                "validation_run_result": in_memory,
-            }
-        ),
+    monkeypatch.setattr(
+        ValidationExecutionService,
+        "run_review_validation",
+        lambda _adapter: {
+            "success": True,
+            "validation_run_result": in_memory,
+        },
     )
+    result = bridge.run_validation(session, attempt_id="attempt-1")
 
     assert result.success is False
     assert result.metadata["execution_status"] == "failed"
@@ -305,6 +379,7 @@ def test_runtime_validation_bridge_rejects_canonical_identity_mismatch(
     persisted_job_id: str,
     persisted_attempt_id: str,
     failure_reason: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pdf_dir = tmp_path / "papers"
     pdf_dir.mkdir()
@@ -314,10 +389,11 @@ def test_runtime_validation_bridge_rejects_canonical_identity_mismatch(
             project_name="identity-validation",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="validate_review",
+            config=str(current_config(tmp_path)),
             queue_file=str(tmp_path / "queue.json"),
         )
     )
-    session = bridge.bootstrap(build_legacy_main())
+    session = bridge.bootstrap()
     expected_job_id = session.context.workspace.job_id
     canonical = ValidationRunResultV1.create(
         job_id=(expected_job_id if persisted_job_id == "expected-job" else persisted_job_id),
@@ -329,23 +405,22 @@ def test_runtime_validation_bridge_rejects_canonical_identity_mismatch(
     canonical_path = Path(session.context.workspace.report_path("validation_run_result_v1.json"))
     write_json(canonical_path, canonical.to_dict())
 
-    result = bridge.run_validation(
-        session,
-        attempt_id="attempt-1",
-        validator_module=SimpleNamespace(
-            run_review_validation=lambda _adapter: {
-                "success": True,
-                "validation_run_result": ValidationRunResultV1.create(
-                    job_id=expected_job_id,
-                    attempt_id="attempt-1",
-                    execution_status="succeeded",
-                    review_has_citations=False,
-                    evidence_complete=True,
-                ),
-                "validation_run_result_file": str(canonical_path),
-            }
-        ),
+    monkeypatch.setattr(
+        ValidationExecutionService,
+        "run_review_validation",
+        lambda _adapter: {
+            "success": True,
+            "validation_run_result": ValidationRunResultV1.create(
+                job_id=expected_job_id,
+                attempt_id="attempt-1",
+                execution_status="succeeded",
+                review_has_citations=False,
+                evidence_complete=True,
+            ),
+            "validation_run_result_file": str(canonical_path),
+        },
     )
+    result = bridge.run_validation(session, attempt_id="attempt-1")
 
     assert result.success is False
     assert result.metadata["failure_reason"] == failure_reason

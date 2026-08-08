@@ -5,7 +5,7 @@ from pathlib import Path
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
-from tests.test_runtime_bridge_helpers import build_legacy_main
+from tests.test_runtime_bridge_helpers import current_config
 
 
 def test_ai_runtime_remains_out_of_queue_but_workspace_compatible(tmp_path: Path) -> None:
@@ -22,10 +22,11 @@ def test_ai_runtime_remains_out_of_queue_but_workspace_compatible(tmp_path: Path
             project_name="demo-ai",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="analyze",
+            config=str(current_config(tmp_path)),
             queue_file=str(queue_file),
         )
     )
-    session = bridge.bootstrap(build_legacy_main())
+    session = bridge.bootstrap()
 
     queue_payload = json.loads(queue_file.read_text(encoding="utf-8"))
 

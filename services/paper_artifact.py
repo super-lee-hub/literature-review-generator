@@ -98,5 +98,7 @@ def build_paper_artifact_v1(
             "stage1_input_path": str(preprocess.get("stage1_input_path") or ""),
             "stage1_input_manifest_path": str(preprocess.get("stage1_input_manifest_path") or ""),
             "stage1_quality_report_path": str(preprocess.get("stage1_quality_report_path") or ""),
+            "evidence_manifest_path": str(preprocess.get("evidence_manifest_path") or ""),
+            "evidence_manifest_hash": str(preprocess.get("evidence_manifest_hash") or ""),
         },
     )

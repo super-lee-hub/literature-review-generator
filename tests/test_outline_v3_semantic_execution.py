@@ -1,0 +1,487 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Mapping
+
+import pytest
+
+from outline.v3_executor import OutlineV3Executor
+from runtime.provider_runtime import ProviderRuntimeLedger
+from services.artifact_registry import ArtifactRegistry
+from services.job_workspace import JobWorkspace
+from summary_schema import normalize_ai_summary
+
+
+def _summary(paper_key: str, title: str, finding: str) -> dict[str, Any]:
+    summary = normalize_ai_summary(
+        {
+            "routing": {
+                "paper_type": "empirical",
+                "paper_subtype_raw": "quantitative",
+                "paper_subtype_normalized": "quantitative",
+                "classification_status": "resolved",
+                "route_confidence": "high",
+                "classification_rationale": "controlled empirical design",
+                "secondary_candidates": [],
+            },
+            "paper_metadata": {
+                "title": title,
+                "authors": ["Author"],
+                "year": "2025",
+                "journal": "Example Journal",
+                "doi": "10.1000/example",
+            },
+            "core_analysis": {
+                "summary": finding,
+                "key_points": [finding],
+                "methodology": "Controlled empirical study",
+                "findings": finding,
+                "conclusions": finding,
+                "relevance": "The result informs the research question.",
+                "limitations": "The result is bounded by the tested context.",
+                "research_gap": "Further replication is needed.",
+                "theoretical_framework": None,
+                "future_research_directions": [],
+            },
+            "specialized_details": {
+                "empirical": {
+                    "research_questions_or_hypotheses": [],
+                    "data_source_and_size": "Two controlled samples",
+                    "analysis_technique": "Regression analysis",
+                    "core_variables": {"independent": ["treatment"], "dependent": ["outcome"]},
+                    "sample_characteristics_or_context": "Controlled context.",
+                },
+                "review": None,
+                "conceptual": None,
+            },
+        }
+    )
+    summary["status"] = "success"
+    summary["paper_info"] = {
+        "canonical_paper_key": paper_key,
+        "source_paper_id": paper_key,
+        "title": title,
+        "authors": ["Author"],
+        "year": 2025,
+        "classification": "core",
+        "must_use": True,
+    }
+    return summary
+
+
+def _configured_test_provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+    if node_id == "relation_adjudication":
+        candidates = [
+            dict(item) for item in request.get("relation_candidates") or ()
+            if isinstance(item, Mapping)
+        ]
+        confirmed = [
+            str(item.get("relation_id") or "")
+            for item in candidates
+            if item.get("relation_id") and item.get("evidence_fields")
+        ]
+        return {"status": "success", "content": {"confirmed_relation_ids": confirmed, "rejected_relations": []}}
+    if node_id.endswith("_provider_generation"):
+        candidate_id = node_id.removesuffix("_provider_generation")
+        paper_keys = [str(item) for item in request.get("paper_keys") or ()]
+        logic = str(request.get("organizing_logic") or "evidence")
+        return {"status": "success", "content": {"candidate_id": candidate_id, "organizing_logic": logic, "sections": [{
+            "section_id": f"{candidate_id}_section_1",
+            "title": f"{logic} synthesis",
+            "goal": "Integrate evidence",
+            "paper_keys": paper_keys,
+            "relation_ids": list(request.get("relation_ids") or ()),
+            "claims": ["The provider-bound evidence supports this synthesis."],
+        }]}}
+    if node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
+        return {"status": "success", "content": {"passed": True, "blocking_diagnostics": [], "recommendations": []}}
+    if node_id == "arbitration":
+        candidate_ids = [str(item) for item in request.get("candidate_ids") or ()]
+        return {"status": "success", "content": {"selected_candidate_id": sorted(candidate_ids)[0] if candidate_ids else ""}}
+    return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
+
+
+def _executor(
+    tmp_path: Path,
+    *,
+    provider: Any = None,
+    stability_mode: str = "smoke",
+    max_provider_calls: int | None = None,
+    max_estimated_cost: float | None = None,
+    max_estimated_total_tokens: int | None = 5_000_000,
+    pricing_source: str | None = "tests:explicit-rates-v1",
+    candidate_count: int = 2,
+) -> OutlineV3Executor:
+    workspace = JobWorkspace.create(str(tmp_path), "outline", job_id="outline-job")
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    return OutlineV3Executor(
+        job_id=workspace.job_id,
+        summaries=[
+            _summary("paper-a", "Study A", "The treatment improved the outcome."),
+            _summary("paper-b", "Study B", "The treatment improved the outcome under a different context."),
+        ],
+        workspace=workspace,
+        artifact_registry=registry,
+        provider=provider or _configured_test_provider,
+        candidate_count=candidate_count,
+        stability_mode=stability_mode,
+        max_provider_calls=max_provider_calls,
+        max_estimated_cost=max_estimated_cost,
+        max_estimated_total_tokens=max_estimated_total_tokens,
+        pricing_source=pricing_source,
+        input_cost_per_1k_tokens=0.0,
+        output_cost_per_1k_tokens=0.001,
+        reasoning_cost_per_1k_tokens=0.001,
+        cache_read_cost_per_1k_tokens=0.0,
+        cache_write_cost_per_1k_tokens=0.0,
+    )
+
+
+def test_outline_v3_fixture_executes_evidence_bound_adoption(tmp_path: Path) -> None:
+    executor = _executor(tmp_path)
+    result = executor.run()
+
+    assert result.ok is True
+    assert result.status == "ready_for_adoption"
+    assert result.adopted is False
+
+    packet_path = Path(result.artifacts["section_evidence_packets"])
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))["payload"]
+    first = packet["packets"][0]
+    assert first["paper_keys"] == ["paper-a", "paper-b"]
+    assert first["evidence_items"]
+    assert first["findings"]
+    assert first["source_summary_hashes"]
+    assert first["retrieval_provenance"]["source_artifacts"]
+
+    ledger = ProviderRuntimeLedger(result.artifacts["provider_receipts"])
+    assert ledger.list_receipts()
+
+
+def test_outline_v3_without_explicit_adoption_stops_at_ready_for_adoption(tmp_path: Path) -> None:
+    result = _executor(tmp_path).run()
+
+    assert result.ok is True
+    assert result.status == "ready_for_adoption"
+    assert result.adopted is False
+    assert "adoption" not in result.artifacts
+
+
+def test_outline_v3_stability_provider_call_budget_rejects_before_transport(tmp_path: Path) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="smoke",
+        max_provider_calls=1,
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert transport_calls == []
+    assert any("max_provider_calls_exceeded" in item for item in result.diagnostics)
+    preflight_paths = list(tmp_path.rglob("stability_preflight_*.json"))
+    assert preflight_paths
+    preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
+    assert preflight["preflight_status"] == "rejected"
+    assert preflight["rejection_reason"] == "max_provider_calls_exceeded"
+
+
+def test_outline_v3_stability_cost_budget_rejects_before_transport(tmp_path: Path) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode="smoke",
+        max_estimated_cost=0.0,
+    ).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert transport_calls == []
+    assert any("max_estimated_cost_exceeded" in item for item in result.diagnostics)
+    preflight_paths = list(tmp_path.rglob("stability_preflight_*.json"))
+    assert preflight_paths
+    preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
+    assert preflight["preflight_status"] == "rejected"
+    assert preflight["rejection_reason"] == "max_estimated_cost_exceeded"
+
+
+def test_outline_v3_unknown_pricing_does_not_claim_a_monetary_ceiling(tmp_path: Path) -> None:
+    result = _executor(
+        tmp_path,
+        pricing_source=None,
+        max_estimated_cost=0.0,
+    ).run()
+
+    assert result.ok is True
+    preflight_paths = list(tmp_path.rglob("stability_preflight_*.json"))
+    assert preflight_paths
+    preflight = json.loads(preflight_paths[0].read_text(encoding="utf-8"))
+    assert preflight["cost_status"] == "unknown"
+    assert preflight["estimated_cost"] is None
+    assert preflight["monetary_ceiling_enforced"] is False
+    assert "monetary ceiling was not enforced" in preflight["cost_ceiling_note"]
+
+
+def test_outline_v3_generic_pricing_source_without_provider_binding_is_unknown(tmp_path: Path) -> None:
+    result = _executor(
+        tmp_path,
+        pricing_source="config:OutlineStability-v1",
+    ).run()
+
+    assert result.ok is True
+    preflight = json.loads(
+        next(tmp_path.rglob("stability_preflight_*.json")).read_text(encoding="utf-8")
+    )
+    assert preflight["cost_status"] == "unknown"
+    assert preflight["estimated_cost"] is None
+    assert preflight["monetary_ceiling_enforced"] is False
+
+
+def test_outline_v3_total_token_ceiling_is_enforced_even_when_pricing_is_unknown(
+    tmp_path: Path,
+) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        pricing_source=None,
+        max_estimated_cost=0.0,
+        max_estimated_total_tokens=1,
+    ).run()
+
+    assert result.ok is False
+    assert transport_calls == []
+    assert any("max_estimated_total_tokens_exceeded" in item for item in result.diagnostics)
+    preflight = json.loads(
+        next(tmp_path.rglob("stability_preflight_*.json")).read_text(encoding="utf-8")
+    )
+    assert preflight["preflight_status"] == "rejected"
+    assert preflight["rejection_reason"] == "max_estimated_total_tokens_exceeded"
+
+
+def test_outline_v3_explicit_pricing_estimate_changes_with_input_volume(tmp_path: Path) -> None:
+    short = _executor(tmp_path / "short")
+    short.input_cost_per_1k_tokens = 0.001
+    short._preflight_stability_budget()
+    short_estimate = short.stability_preflight["estimated_cost"]
+
+    long = _executor(tmp_path / "long")
+    long.input_cost_per_1k_tokens = 0.001
+    long.summaries[0]["core_analysis"]["summary"] += " long-evidence " * 4000
+    long._preflight_stability_budget()
+    long_estimate = long.stability_preflight["estimated_cost"]
+
+    assert short_estimate is not None
+    assert long_estimate is not None
+    assert long_estimate > short_estimate
+
+
+@pytest.mark.parametrize(
+    ("candidate_count", "stability_mode", "expected_transport_calls"),
+    [
+        (1, "off", 6),
+        (2, "off", 7),
+        (5, "off", 10),
+        (1, "smoke", 12),
+        (2, "smoke", 14),
+        (5, "smoke", 20),
+        (1, "full", 36),
+        (2, "full", 42),
+        (5, "full", 60),
+    ],
+)
+def test_outline_v3_call_plan_has_exact_transport_count(
+    tmp_path: Path,
+    candidate_count: int,
+    stability_mode: str,
+    expected_transport_calls: int,
+) -> None:
+    executor = _executor(
+        tmp_path,
+        candidate_count=candidate_count,
+        stability_mode=stability_mode,
+    )
+
+    executor._preflight_stability_budget()
+
+    transport_plans = [item for item in executor.provider_call_plans if item.transport_expected]
+    replay_plans = [item for item in executor.provider_call_plans if not item.transport_expected]
+    assert len(transport_plans) == expected_transport_calls
+    assert len(replay_plans) == (0 if stability_mode == "off" else candidate_count + 5)
+    assert executor.stability_preflight["estimated_provider_calls"] == expected_transport_calls
+    assert all(item.cost_status == "estimate" for item in transport_plans)
+
+
+@pytest.mark.parametrize(
+    ("stability_mode", "expected_transport_calls"),
+    [("off", 7), ("smoke", 14), ("full", 42)],
+)
+def test_outline_v3_transport_trace_matches_call_plan(
+    tmp_path: Path,
+    stability_mode: str,
+    expected_transport_calls: int,
+) -> None:
+    transport_calls: list[str] = []
+
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        transport_calls.append(node_id)
+        return _configured_test_provider(node_id, request)
+
+    result = _executor(
+        tmp_path,
+        provider=provider,
+        stability_mode=stability_mode,
+        candidate_count=2,
+    ).run()
+
+    assert result.ok is True
+    assert len(transport_calls) == expected_transport_calls
+    stability = json.loads(
+        Path(result.artifacts["stability_audit"]).read_text(encoding="utf-8")
+    )["payload"]
+    assert stability["preflight"]["estimated_provider_calls"] == expected_transport_calls
+    assert stability["provider_call_count_total"] == expected_transport_calls
+    assert stability["transport_call_count_after_stability"] == expected_transport_calls
+
+
+def test_outline_v3_actual_usage_and_cost_are_reported_without_billing_claim(tmp_path: Path) -> None:
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        response = dict(_configured_test_provider(node_id, request))
+        response.update(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "reasoning_tokens": 5,
+                "cached_input_tokens": 3,
+                "usage_status": "reported",
+            }
+        )
+        return response
+
+    result = _executor(tmp_path, provider=provider, stability_mode="smoke").run()
+
+    assert result.ok is True
+    stability = json.loads(
+        Path(result.artifacts["stability_audit"]).read_text(encoding="utf-8")
+    )["payload"]
+    usage = stability["actual_usage_totals"]
+    assert usage["provider_calls"] == 14
+    assert usage["usage_status"] == "reported"
+    assert usage["input_tokens"] == 14 * 100
+    assert usage["output_tokens"] == 14 * 20
+    assert usage["reasoning_tokens"] == 14 * 5
+    assert usage["actual_cost"] is not None
+    assert usage["actual_cost"] > 0
+    assert usage["cost_status"] == "calculated"
+    assert usage["pricing_source"] == "tests:explicit-rates-v1"
+    assert usage["pricing_policy"] == "estimate_only_not_billing_v1"
+
+
+def test_outline_v3_relation_adjudication_unknown_id_is_fail_closed(tmp_path: Path) -> None:
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        if node_id == "relation_adjudication":
+            return {
+                "status": "success",
+                "content": {
+                    "confirmed_relation_ids": ["relation-not-in-candidates"],
+                    "rejected_relations": [],
+                    "method": "invalid-test-provider",
+                },
+            }
+        return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
+
+    result = _executor(tmp_path, provider=provider).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert any("unknown relation" in item for item in result.diagnostics)
+
+
+def test_outline_v3_relation_adjudication_rejected_unknown_id_is_fail_closed(tmp_path: Path) -> None:
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        if node_id == "relation_adjudication":
+            return {
+                "status": "success",
+                "content": {
+                    "confirmed_relation_ids": [],
+                    "rejected_relations": [{"relation_id": "relation-not-in-candidates", "reason": "invalid test"}],
+                    "method": "invalid-test-provider",
+                },
+            }
+        return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
+
+    result = _executor(tmp_path, provider=provider).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert any("rejected an unknown relation" in item for item in result.diagnostics)
+
+
+def test_outline_v3_invalid_arbitration_selection_is_fail_closed(tmp_path: Path) -> None:
+    def provider(node_id: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        if node_id == "relation_adjudication":
+            candidates = [dict(item) for item in request["relation_candidates"]]
+            return {
+                "status": "success",
+                "content": {
+                    "confirmed_relation_ids": [str(item["relation_id"]) for item in candidates],
+                    "rejected_relations": [],
+                    "method": "valid-test-provider",
+                },
+            }
+        if node_id.endswith("_provider_generation"):
+            candidate_id = node_id.removesuffix("_provider_generation")
+            papers = list(request["paper_keys"])
+            return {
+                "status": "success",
+                "content": {
+                    "candidate_id": candidate_id,
+                    "organizing_logic": str(request["organizing_logic"]),
+                    "sections": [{
+                        "section_id": f"{candidate_id}_section_1",
+                        "goal": "Integrate evidence",
+                        "paper_keys": papers,
+                        "relation_ids": list(request["relation_ids"]),
+                        "claims": ["The provider-bound evidence supports this synthesis."],
+                    }],
+                },
+            }
+        if node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
+            return {
+                "status": "success",
+                "content": {"passed": True, "blocking_diagnostics": [], "recommendations": []},
+            }
+        if node_id == "arbitration":
+            return {
+                "status": "success",
+                "content": {
+                    "selected_candidate_id": "candidate-not-in-request",
+                    "accepted_recommendations": [],
+                    "rejected_recommendations": [],
+                },
+            }
+        return {"status": "success", "content": {"node_id": node_id, "accepted": True}}
+
+    result = _executor(tmp_path, provider=provider).run()
+
+    assert result.ok is False
+    assert result.status == "blocked"
+    assert any("selected an unknown candidate" in item for item in result.diagnostics)

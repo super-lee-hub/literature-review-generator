@@ -2,37 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.orchestrator import AgentRuntimeBridge
-
-
-class _FakeGenerator:
-    def __init__(
-        self,
-        config_file: str,
-        project_name: str,
-        pdf_folder: str | None,
-        queue_file: str,
-        zotero_report: str | None,
-        library_path: str | None,
-    ) -> None:
-        self.config_file = config_file
-        self.project_name = project_name
-        self.pdf_folder = pdf_folder
-        self.queue_file = queue_file
-        self.zotero_report = zotero_report
-        self.library_path = library_path
-        self.config = {"Paths": {"output_path": str(Path(queue_file).parent.parent.parent / "output")}}
-        self.bound_workspace = None
-        self.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
-
-    def load_configuration(self) -> bool:
-        return True
-
-    def bind_job_workspace(self, **kwargs):
-        self.bound_workspace = kwargs["workspace"]
+from tests.test_runtime_bridge_helpers import current_config
 
 
 def test_agent_runtime_bridge_bootstrap_and_trace(tmp_path: Path) -> None:
@@ -47,12 +20,11 @@ def test_agent_runtime_bridge_bootstrap_and_trace(tmp_path: Path) -> None:
             project_name="demo-ai",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="run_all",
+            config=str(current_config(tmp_path)),
             queue_file=str(skill_output),
         )
     )
-    legacy_main = SimpleNamespace(LiteratureReviewGenerator=_FakeGenerator)
-
-    session = bridge.bootstrap(legacy_main)
+    session = bridge.bootstrap()
     source_bundle = bridge.build_source_bundle()
     source_ref = bridge.persist_source_bundle(session, source_bundle)
     trace_ref = bridge.write_stage_trace(session)

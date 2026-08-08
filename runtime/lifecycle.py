@@ -1,17 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import json
 import os
+from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Sequence, cast
+import warnings
 
 from services.artifact_registry import ArtifactRegistry
-from services.config_compat import CompatConfigView
 from services.job_fingerprint import FingerprintInputs, build_fingerprint_bundle, sanitize_config_for_fingerprint
-from services.job_outcome import JobDisposition, JobOutcomeV1, JobStatus
-from services.job_workspace import JobWorkspace, atomic_write_json
+from services.job_outcome import (
+    JobDisposition,
+    JobOutcomeV1,
+    JobStatus,
+    publish_job_outcome_compatibility_projection,
+)
+from services.job_workspace import JobWorkspace, publish_json_artifact
 from services.progress_state import determine_resume_state
+from services.settings import ApplicationSettings
 from services.source_inventory import SourceInventoryV1
+from services.queue_service import LocalPublicationContext
+from runtime.stage_planning import build_stage_plan
 
 
 ResumeReportWriter = Callable[[JobWorkspace, Any], str]
@@ -26,7 +35,7 @@ class BootstrappedRuntimeContext:
     pointer_path: str
     workspace: JobWorkspace
     registry: ArtifactRegistry
-    compat_view: CompatConfigView
+    settings: ApplicationSettings
     summary_path: str
     progress_path: str
     checkpoint_path: str
@@ -40,6 +49,7 @@ class BootstrappedRuntimeContext:
     readiness_policy_snapshot: Dict[str, Any]
     required_stages: tuple[str, ...]
     job_outcome_path: str
+    publication_context: Any
     attempt_number: int = 1
     resumed_from_attempt: int | None = None
 
@@ -48,35 +58,26 @@ def _required_stages_for_request(
     request: Any,
     *,
     validation_required: bool,
+    validation_enabled: bool = True,
 ) -> tuple[str, ...]:
-    requested_stages = getattr(request, "requested_stages", None)
-    action = str(getattr(request, "action", "analyze") or "analyze")
-    if action == "derive_review_batch":
-        return ("source_intake", "derive_review_batch")
-    if requested_stages is not None:
-        stages = tuple(dict.fromkeys((
-            "source_intake",
-            *(str(item) for item in requested_stages if str(item) != "source_intake"),
-        )))
-        return tuple(
-            stage for stage in stages if validation_required or stage != "validate"
-        )
-    mapping = {
-        "analyze": ("source_intake", "analyze"),
-        "derive_review_batch": ("source_intake", "derive_review_batch"),
-        "retry_failed": ("source_intake", "analyze"),
-        "generate_outline": ("source_intake", "outline"),
-        "generate_review": ("source_intake", "outline", "review"),
-        "generate_section": ("source_intake", "outline", "review"),
-        "retry_review_failed": ("source_intake", "outline", "review"),
-        "validate_review": ("source_intake", "validate"),
-        "run_all": ("source_intake", "analyze", "outline", "review"),
-    }
-    stages = mapping.get(action, ("source_intake", action))
-    return tuple(stage for stage in stages if validation_required or stage != "validate")
+    plan = build_stage_plan(
+        action=str(getattr(request, "action", "analyze") or "analyze"),
+        requested_stages=getattr(request, "requested_stages", None),
+        validation_enabled=validation_enabled,
+        validation_required=validation_required,
+        require_clean_validation=getattr(request, "require_clean_validation", None),
+        allow_unvalidated_when_validation_optional=getattr(
+            request, "allow_unvalidated_when_validation_optional", None
+        ),
+    )
+    return plan.required_stages
 
 
-def _readiness_policy_for_request(request: Any) -> dict[str, Any]:
+def _readiness_policy_for_request(
+    request: Any,
+    *,
+    validation_enabled: bool = True,
+) -> dict[str, Any]:
     def configured_bool(field_name: str) -> bool | None:
         value = getattr(request, field_name, None)
         if value is None:
@@ -86,33 +87,26 @@ def _readiness_policy_for_request(request: Any) -> dict[str, Any]:
         return value
 
     action = str(getattr(request, "action", "analyze") or "analyze")
-    requested_stages = getattr(request, "requested_stages", None)
-    default_validation_required = (
-        "validate" in requested_stages
-        if requested_stages is not None
-        else action == "validate_review"
-    )
     configured_validation_required = configured_bool("validation_required")
-    validation_required = (
-        default_validation_required
-        if configured_validation_required is None
-        else configured_validation_required
-    )
     configured_require_clean = configured_bool("require_clean_validation")
-    require_clean_validation = (
-        validation_required if configured_require_clean is None else configured_require_clean
-    )
     configured_allow_unvalidated = configured_bool("allow_unvalidated_when_validation_optional")
-    allow_unvalidated = (
-        not validation_required
-        if configured_allow_unvalidated is None
-        else configured_allow_unvalidated
+    plan = build_stage_plan(
+        action=action,
+        requested_stages=getattr(request, "requested_stages", None),
+        validation_enabled=validation_enabled,
+        validation_required=configured_validation_required,
+        require_clean_validation=configured_require_clean,
+        allow_unvalidated_when_validation_optional=configured_allow_unvalidated,
     )
     return {
-        "validation_required": validation_required,
-        "require_clean_validation": require_clean_validation,
+        "validation_enabled": bool(validation_enabled),
+        "validation_required": plan.validation_required,
+        "require_clean_validation": plan.require_clean_validation,
         "source_identity_required": str(getattr(request, "source_mode", "direct")) == "zotero",
-        "allow_unvalidated_when_validation_optional": allow_unvalidated,
+        "allow_unvalidated_when_validation_optional": plan.allow_unvalidated_when_validation_optional,
+        "current_artifact_set_required": plan.current_artifact_set_required,
+        "validation_status": plan.validation_status,
+        "stage_plan": plan.to_dict(),
     }
 
 
@@ -124,6 +118,44 @@ def _coerce_inventory(
     if isinstance(source_inventory, SourceInventoryV1):
         return source_inventory
     return SourceInventoryV1.from_dict(source_inventory)
+
+
+def _resume_report_payload(report: Any) -> dict[str, Any]:
+    if hasattr(report, "to_dict") and callable(report.to_dict):
+        payload = report.to_dict()
+    elif is_dataclass(report):
+        payload = asdict(cast(Any, report))
+    elif isinstance(report, Mapping):
+        payload = dict(report)
+    else:
+        raise TypeError("resume report must be serializable")
+    if not isinstance(payload, Mapping):
+        raise TypeError("resume report payload must be an object")
+    return dict(payload)
+
+
+def _publish_resume_report(
+    *,
+    context: BootstrappedRuntimeContext | None,
+    workspace: JobWorkspace,
+    registry: ArtifactRegistry,
+    report: Any,
+    publication_context: Any,
+    producer: str,
+) -> str:
+    target = workspace.artifact_path("resume_state_report.json")
+    record = publish_json_artifact(
+        publication_context,
+        registry,
+        target,
+        _resume_report_payload(report),
+        artifact_role="resume",
+        artifact_type="resume_state_report",
+        artifact_version="v1",
+        producer=producer,
+        artifact_id="resume_state_report",
+    )
+    return record.path
 
 
 def bootstrap_job_runtime(
@@ -142,24 +174,20 @@ def bootstrap_job_runtime(
     resume_requested: bool = False,
     resume_preflight: ResumePreflight | None = None,
     publish_running_state: bool = True,
+    publication_context: Any | None = None,
 ) -> BootstrappedRuntimeContext:
     generator_config = cast(MutableMapping[str, Dict[str, str]], generator.config)
-    compat_view = CompatConfigView.from_config(generator_config)
+    settings = ApplicationSettings.from_config(generator_config)
     output_base_dir = generator_config.get("Paths", {}).get("output_path", "./output")
 
     inventory = _coerce_inventory(source_inventory)
-    inventory_payload = inventory.to_dict() if inventory is not None else {}
-    fingerprint_source_snapshot = (
-        {
-            "source_inventory_hash": inventory.fingerprint(),
-            "source_inventory": inventory.fingerprint_payload(),
-        }
-        if inventory is not None
-        else {
-            "compatibility_status": "legacy_unverified",
-            "legacy_source_snapshot": dict(source_snapshot),
-        }
-    )
+    if inventory is None:
+        raise RuntimeError("current runtime requires a verified source inventory")
+    inventory_payload = inventory.to_dict()
+    fingerprint_source_snapshot = {
+        "source_inventory_hash": inventory.fingerprint(),
+        "source_inventory": inventory.fingerprint_payload(),
+    }
     fingerprint_bundle = build_fingerprint_bundle(
         FingerprintInputs(
             config_snapshot=sanitize_config_for_fingerprint(generator_config),
@@ -198,10 +226,32 @@ def bootstrap_job_runtime(
         fingerprint_bundle=fingerprint_bundle_dict,
         request=request,
     )
-    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    active_publication_context = publication_context or LocalPublicationContext()
+    # Direct execution uses an explicit local context. Queue workers inject a
+    # lease-bound context and therefore never silently fall back to an
+    # unrestricted registry facade.
+    registry = active_publication_context.registry(workspace.paths.registry_path, workspace.job_id)
 
-    summary_path = workspace.artifact_path(f"{project_name}_summaries.json")
-    progress_path = workspace.artifact_path("stage1_progress_snapshot.json")
+    # Stage 1 summaries are content-addressed now.  On resume the durable
+    # ``summary_file`` record is the current pointer; falling back to the
+    # historical project-named path would incorrectly declare a resumable job
+    # non-resumable even though the registered summary bytes are present.
+    current_summary = registry.get("summary_file")
+    summary_path = (
+        current_summary.path
+        if current_summary is not None
+        and current_summary.status == "ready"
+        and Path(current_summary.path).is_file()
+        else workspace.artifact_path(f"{project_name}_summaries.json")
+    )
+    current_progress = registry.get("stage1_progress_snapshot")
+    progress_path = (
+        current_progress.path
+        if current_progress is not None
+        and current_progress.status == "ready"
+        and Path(current_progress.path).is_file()
+        else workspace.artifact_path("stage1_progress_snapshot.json")
+    )
     checkpoint_path = workspace.checkpoint_path(f"{project_name}_checkpoint.json")
     resume_report = determine_resume_state(
         project_name=project_name,
@@ -213,7 +263,12 @@ def bootstrap_job_runtime(
     )
 
     if resume_requested:
-        persisted_report_path = workspace.artifact_path("resume_state_report.json")
+        persisted_report_record = registry.get("resume_state_report")
+        persisted_report_path = (
+            persisted_report_record.path
+            if persisted_report_record is not None and persisted_report_record.status == "ready"
+            else workspace.artifact_path("resume_state_report.json")
+        )
         try:
             with open(persisted_report_path, "r", encoding="utf-8") as handle:
                 persisted_report = json.load(handle)
@@ -228,22 +283,28 @@ def bootstrap_job_runtime(
         if resume_preflight is not None:
             resume_preflight(workspace)
 
-    readiness_policy_snapshot = _readiness_policy_for_request(request)
+    readiness_policy_snapshot = _readiness_policy_for_request(
+        request,
+        validation_enabled=settings.review_validation_enabled(),
+    )
     required_stages = _required_stages_for_request(
         request,
         validation_required=bool(readiness_policy_snapshot["validation_required"]),
+        validation_enabled=settings.review_validation_enabled(),
     )
 
     effective_source_ready = bool(source_canonical_ready) if source_canonical_ready is not None else inventory is not None
     source_inventory_path = ""
     if inventory is not None:
         source_inventory_path = workspace.artifact_path("source_inventory_v1.json")
-        atomic_write_json(source_inventory_path, inventory_payload)
-        registry.register_file(
+        inventory_record = publish_json_artifact(
+            active_publication_context,
+            registry,
+            source_inventory_path,
+            inventory_payload,
             artifact_role="source_inventory",
             artifact_type="source_inventory",
             artifact_version="v1",
-            path=source_inventory_path,
             producer="runtime.lifecycle.bootstrap_job_runtime",
             artifact_id="source_inventory",
             status="ready" if effective_source_ready else "quarantined",
@@ -252,21 +313,21 @@ def bootstrap_job_runtime(
                 "canonical_ready": effective_source_ready,
             },
         )
+        source_inventory_path = inventory_record.path
 
-    resume_report_path = write_resume_report(workspace, resume_report)
-    registry.register_file(
-        artifact_role="resume",
-        artifact_type="resume_state_report",
-        artifact_version="v1",
-        path=resume_report_path,
+    resume_report_path = _publish_resume_report(
+        context=None,
+        workspace=workspace,
+        registry=registry,
+        report=resume_report,
+        publication_context=active_publication_context,
         producer="runtime.lifecycle.bootstrap_job_runtime",
-        artifact_id="resume_state_report",
     )
 
     generator.bind_job_workspace(
         workspace=workspace,
         artifact_registry=registry,
-        compat_config=compat_view,
+        settings=settings,
         fingerprint_bundle=fingerprint_bundle_dict,
         resume_state_report=resume_report,
     )
@@ -278,7 +339,7 @@ def bootstrap_job_runtime(
         pointer_path=pointer_path,
         workspace=workspace,
         registry=registry,
-        compat_view=compat_view,
+        settings=settings,
         summary_path=summary_path,
         progress_path=progress_path,
         checkpoint_path=checkpoint_path,
@@ -292,6 +353,7 @@ def bootstrap_job_runtime(
         readiness_policy_snapshot=readiness_policy_snapshot,
         required_stages=required_stages,
         job_outcome_path=job_outcome_path,
+        publication_context=active_publication_context,
     )
     if publish_running_state:
         publish_running_job_runtime(
@@ -319,21 +381,39 @@ def publish_running_job_runtime(
         completed_stages=("source_intake",) if context.source_canonical_ready else (),
         degradation_reasons=context.source_degradation_reasons,
     )
-    atomic_write_json(context.job_outcome_path, running_outcome.to_dict())
-    context.registry.register_file(
+    compatibility_path = context.workspace.artifact_path("job_outcome_v1.json")
+    outcome_record = publish_json_artifact(
+        context.publication_context,
+        context.registry,
+        compatibility_path,
+        running_outcome.to_dict(),
         artifact_role="job_outcome",
         artifact_type="job_outcome",
         artifact_version="v1",
-        path=context.job_outcome_path,
         producer="runtime.lifecycle.publish_running_job_runtime",
         artifact_id="job_outcome",
         metadata={
             "job_status": running_outcome.job_status,
             "job_disposition": running_outcome.job_disposition,
             "canonical_ready": running_outcome.canonical_ready,
+            "requires_attention": running_outcome.requires_attention,
             "outcome_revision": running_outcome.outcome_revision,
         },
     )
+    projection_result = publish_job_outcome_compatibility_projection(
+        path=compatibility_path,
+        registry=context.registry,
+        canonical_record=outcome_record,
+        outcome=running_outcome,
+        producer="runtime.lifecycle.publish_running_job_runtime",
+        publication_context=context.publication_context,
+    )
+    if projection_result.warning:
+        warnings.warn(projection_result.warning, RuntimeWarning, stacklevel=2)
+    # The context is frozen to make lifecycle inputs explicit. Keep its
+    # compatibility field pointed at the immutable Registry artifact so
+    # existing callers cannot accidentally read a stale fixed-path projection.
+    object.__setattr__(context, "job_outcome_path", outcome_record.path)
     pointer_writer = (
         context.workspace.write_latest_pointer
         if claim_latest_pointer
@@ -368,14 +448,13 @@ def finalize_job_runtime(
         checkpoint_file=context.checkpoint_path,
         expected_fingerprint_bundle=context.fingerprint_bundle,
     )
-    final_resume_report_path = write_resume_report(context.workspace, final_resume_report)
-    context.registry.register_file(
-        artifact_role="resume",
-        artifact_type="resume_state_report",
-        artifact_version="v1",
-        path=final_resume_report_path,
+    _publish_resume_report(
+        context=context,
+        workspace=context.workspace,
+        registry=context.registry,
+        report=final_resume_report,
+        publication_context=context.publication_context,
         producer="runtime.lifecycle.finalize_job_runtime",
-        artifact_id="resume_state_report",
     )
     if status not in {"pending", "running", "completed", "failed", "cancelled"}:
         raise ValueError(f"unsupported job status: {status}")
@@ -425,21 +504,36 @@ def finalize_job_runtime(
         degradation_reasons=merged_reasons,
         outcome_revision=2,
     )
-    atomic_write_json(context.job_outcome_path, outcome.to_dict())
-    context.registry.register_file(
+    compatibility_path = context.workspace.artifact_path("job_outcome_v1.json")
+    outcome_record = publish_json_artifact(
+        context.publication_context,
+        context.registry,
+        compatibility_path,
+        outcome.to_dict(),
         artifact_role="job_outcome",
         artifact_type="job_outcome",
         artifact_version="v1",
-        path=context.job_outcome_path,
         producer="runtime.lifecycle.finalize_job_runtime",
         artifact_id="job_outcome",
         metadata={
             "job_status": outcome.job_status,
             "job_disposition": outcome.job_disposition,
             "canonical_ready": outcome.canonical_ready,
+            "requires_attention": outcome.requires_attention,
             "outcome_revision": outcome.outcome_revision,
         },
     )
+    projection_result = publish_job_outcome_compatibility_projection(
+        path=compatibility_path,
+        registry=context.registry,
+        canonical_record=outcome_record,
+        outcome=outcome,
+        producer="runtime.lifecycle.finalize_job_runtime",
+        publication_context=context.publication_context,
+    )
+    if projection_result.warning:
+        warnings.warn(projection_result.warning, RuntimeWarning, stacklevel=2)
+    object.__setattr__(context, "job_outcome_path", outcome_record.path)
     if before_latest_pointer is not None:
         before_latest_pointer(outcome)
     context.workspace.write_latest_pointer_if_owned(

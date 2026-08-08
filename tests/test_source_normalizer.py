@@ -1,4 +1,4 @@
-from services.source_normalizer import normalize_source_papers, project_descriptors_to_legacy_papers
+from services.source_normalizer import normalize_source_papers
 
 
 def test_source_normalizer_aligns_direct_pdf_inputs(tmp_path) -> None:
@@ -15,13 +15,9 @@ def test_source_normalizer_aligns_direct_pdf_inputs(tmp_path) -> None:
     ]
 
     descriptors = normalize_source_papers("direct", papers)
-    projected = project_descriptors_to_legacy_papers(papers, descriptors)
-
     assert descriptors[0].source_mode == "direct"
     assert descriptors[0].source_pdf == str(pdf_path)
     assert descriptors[0].source_pdf_fingerprint
-    assert projected[0].get("source_mode") == "direct"
-    assert projected[0].get("source_descriptor", {}).get("source_pdf") == str(pdf_path)
 
 
 def test_source_normalizer_aligns_zotero_inputs() -> None:

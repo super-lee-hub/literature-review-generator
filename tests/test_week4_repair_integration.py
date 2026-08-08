@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from services.job_workspace import JobWorkspace
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.repair_integration import (
     persist_repair_plan,
     persist_repair_report,
@@ -42,6 +42,32 @@ from validation.review_validator import (
     RootCause,
     ValidationConclusion,
 )
+from validation.run_result import ValidationRunResultV1
+
+
+def _register_validation_fixture(workspace: JobWorkspace, registry: ArtifactRegistry, artifact_id: str = "val-001") -> None:
+    path = Path(workspace.artifact_path(f"validation/{artifact_id}.json"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            ValidationRunResultV1.create(
+                job_id=workspace.job_id,
+                attempt_id=f"{artifact_id}:attempt",
+                execution_status="failed",
+                review_has_citations=False,
+                evidence_complete=False,
+            ).to_dict()
+        ),
+        encoding="utf-8",
+    )
+    registry.register_file(
+        artifact_id=artifact_id,
+        artifact_role="validation_run_result",
+        artifact_type="validation_run_result",
+        artifact_version="v1",
+        path=path,
+        producer="tests",
+    )
 
 
 class TestArtifactRegistryRegister:
@@ -106,7 +132,7 @@ class TestArtifactRegistryRegister:
                 path=main_file,
                 producer="test",
                 job_id="job-001",
-                depends_on=[{"artifact_id": "dep-001", "role": "dependency"}],
+                depends_on=[ArtifactDependencyRefV2.from_record(dep_record).to_dict()],
             )
             
             assert len(main_record.depends_on) == 1
@@ -121,6 +147,7 @@ class TestPersistRepairPlan:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
             
             plan = RepairPlan(
                 plan_id="plan-001",
@@ -147,6 +174,7 @@ class TestPersistRepairPlan:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
             
             bundle = DependencyHashBundle(
                 summary_hash="abc123",
@@ -200,6 +228,19 @@ class TestPersistRepairReport:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
+            persist_repair_plan(
+                RepairPlan(
+                    plan_id="plan-001",
+                    created_at=datetime.now().isoformat(),
+                    created_from_job_id="job-001",
+                    validation_report_id="val-001",
+                    proposals=[],
+                    policy=RepairPolicy.REPORT_FIRST,
+                ),
+                workspace,
+                registry,
+            )
             
             report = RepairReport(
                 report_id="report-001",
@@ -230,6 +271,19 @@ class TestPersistRepairApplyResult:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
+            persist_repair_plan(
+                RepairPlan(
+                    plan_id="plan-001",
+                    created_at=datetime.now().isoformat(),
+                    created_from_job_id="job-001",
+                    validation_report_id="val-001",
+                    proposals=[],
+                    policy=RepairPolicy.REPORT_FIRST,
+                ),
+                workspace,
+                registry,
+            )
             
             apply_result = RepairApplyResult(
                 success=True,
@@ -288,6 +342,7 @@ class TestLoadRepairPlan:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
             
             # Create and persist a plan
             bundle = DependencyHashBundle(
@@ -314,7 +369,7 @@ class TestLoadRepairPlan:
                 confidence=0.85,
                 fix_strategy="manifest_fix_rerender",
                 dependency_bundle=bundle,
-                metadata={"paper_id": "paper-001"},
+                metadata={"paper_ids": ["paper-001"]},
             )
             
             original_plan = RepairPlan(
@@ -344,7 +399,7 @@ class TestLoadRepairPlan:
             assert loaded_proposal.target.span_start == 10
             assert loaded_proposal.target.span_end == 50
             assert loaded_proposal.dependency_bundle.summary_hash == "abc123"
-            assert loaded_proposal.metadata.get("paper_id") == "paper-001"
+            assert loaded_proposal.metadata.get("paper_ids") == ["paper-001"]
 
 
 class TestRepairPipelineIntegration:
@@ -355,6 +410,7 @@ class TestRepairPipelineIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
             
             # Create validation report with one non-supported citation
             citation_result = CitationValidationResult(
@@ -363,12 +419,14 @@ class TestRepairPipelineIntegration:
                 conclusion=ValidationConclusion.WRONG_SOURCE,
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
-                details={"block_id": "s1_b1"},
+                details={"block_ids": ["s1_b1"]},
                 claim_text="Test claim",
                 claim_context="Test context",
                 evidence_excerpt_list=[],
                 reasoning_summary="Test reasoning",
                 repair_hint="Test repair hint",
+                paper_ids=["paper-001"],
+                block_ids=["s1_b1"],
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",
@@ -435,6 +493,7 @@ class TestRepairPipelineIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
             
             citation_result = CitationValidationResult(
                 citation_id="cite-001",
@@ -442,12 +501,14 @@ class TestRepairPipelineIntegration:
                 conclusion=ValidationConclusion.WRONG_SOURCE,
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
-                details={"block_id": "s1_b1"},
+                details={"block_ids": ["s1_b1"]},
                 claim_text="Test claim",
                 claim_context="Test context",
                 evidence_excerpt_list=[],
                 reasoning_summary="Test reasoning",
                 repair_hint="Test repair hint",
+                paper_ids=["paper-001"],
+                block_ids=["s1_b1"],
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",
@@ -511,6 +572,7 @@ class TestRepairPipelineIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
 
             citation_result = CitationValidationResult(
                 citation_id="cite-001",
@@ -518,12 +580,14 @@ class TestRepairPipelineIntegration:
                 conclusion=ValidationConclusion.WRONG_SOURCE,
                 root_causes=[RootCause.CITATION_MAPPING_ERROR],
                 evidence_candidates=[],
-                details={"block_id": "s1_b1"},
+                details={"block_ids": ["s1_b1"]},
                 claim_text="Test claim",
                 claim_context="Test context",
                 evidence_excerpt_list=[],
                 reasoning_summary="Test reasoning",
                 repair_hint="Test repair hint",
+                paper_ids=["paper-001"],
+                block_ids=["s1_b1"],
             )
             validation_report = ReviewValidationReport(
                 report_id="val-001",
@@ -569,6 +633,7 @@ class TestRepairPipelineIntegration:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
             block_text = "Test paragraph with citation."
             citation_manifest = {
                 "artifact_type": "citation_manifest",
@@ -649,7 +714,7 @@ class TestRepairPipelineIntegration:
             )
             review_draft = {
                 "artifact_type": "review_draft",
-                "artifact_version": "v2",
+                "artifact_version": "v3",
                 "content": {"sections": [{"blocks": [{"block_id": "s1_b1", "text": block_text}]}]},
             }
             paper_artifact = {
@@ -684,6 +749,7 @@ class TestRepairArtifactsDurability:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = JobWorkspace(tmpdir, "test_project", "job-001")
             registry = ArtifactRegistry(workspace.paths.registry_path, "job-001")
+            _register_validation_fixture(workspace, registry)
             
             # Create a full repair pipeline result
             plan = RepairPlan(

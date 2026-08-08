@@ -1,4 +1,4 @@
-from report_generator import _canonical_paper_type, _flatten_type_specific_details
+from report_generator import _canonical_paper_type, _flatten_specialized_details
 
 
 def _build_canonical_summary() -> dict:
@@ -54,8 +54,8 @@ def _build_canonical_summary() -> dict:
     }
 
 
-def test_flatten_type_specific_details_exposes_router_summary_fields() -> None:
-    flattened = _flatten_type_specific_details(_build_canonical_summary())
+def test_flatten_specialized_details_exposes_router_summary_fields() -> None:
+    flattened = _flatten_specialized_details(_build_canonical_summary())
 
     assert flattened["论文类型"] == "empirical"
     assert flattened["论文子类型"] == "survey"

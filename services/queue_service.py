@@ -1,23 +1,115 @@
 from __future__ import annotations
 
+import configparser
+import hashlib
 import json
+import os
+import re
 import threading
+import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Mapping, Optional, TypeGuard, TypeVar
+
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRegistry,
+    PublicationFenceRejected,
+    RegistryError,
+)
 
 T = TypeVar("T")
+
+_QUEUE_PROCESS_LOCKS_GUARD = threading.Lock()
+_QUEUE_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _queue_process_lock(path: Path) -> threading.RLock:
+    key = os.path.normcase(str(path.resolve()))
+    with _QUEUE_PROCESS_LOCKS_GUARD:
+        return _QUEUE_PROCESS_LOCKS.setdefault(key, threading.RLock())
 
 
 class JobCancelledError(RuntimeError):
     pass
 
 
+class QueuePublicationRejected(PublicationFenceRejected):
+    """Raised when a queue-owned canonical publication loses its lease fence."""
+
+
+@dataclass(frozen=True)
+class StagedArtifactPublication:
+    """One lease-private byte set waiting for the short publication boundary."""
+
+    target_path: str
+    staging_path: str
+    content_hash: str
+    size_bytes: int
+    job_id: str
+    lease_id: str
+    worker_id: str
+    lease_generation: int
+    fence_token: str
+
+
+@dataclass(frozen=True)
+class PublishedArtifactPublication:
+    """The immutable file identity produced by a guarded publication."""
+
+    target_path: str
+    final_path: str
+    content_hash: str
+    staged_path: str
+    artifact: Any | None = None
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _safe_publication_component(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._") or "publication"
+
+
+def _write_staged_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def _immutable_publication_path(target: Path, content_hash: str) -> Path:
+    """Return a deterministic versioned sibling, never a mutable fixed path."""
+
+    marker = content_hash[:24]
+    if marker and marker in target.stem:
+        return target
+    suffix = target.suffix
+    stem = target.name[: -len(suffix)] if suffix else target.name
+    return target.with_name(f"{stem}__{marker}{suffix}")
+
+
 class QueueState(Enum):
     PENDING = "pending"
     RUNNING = "running"
+    CANCEL_REQUESTED = "cancel_requested"
+    CANCEL_ACKNOWLEDGED = "cancel_acknowledged"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -54,6 +146,7 @@ class QueueJobSpec:
     config_fingerprint: str = ""
     current_stage: str = ""
     workspace_path: str = ""
+    canonical_output_root: str = ""
     log_path: str = ""
     produced_artifacts: List[str] = field(default_factory=list)
 
@@ -73,6 +166,7 @@ class QueueJobSpec:
         data.setdefault('config_fingerprint', '')
         data.setdefault('current_stage', '')
         data.setdefault('workspace_path', '')
+        data.setdefault('canonical_output_root', '')
         data.setdefault('log_path', '')
         data.setdefault('produced_artifacts', [])
         return cls(**data)
@@ -89,9 +183,20 @@ class QueueJobRuntime:
     retry_count: int = 0
     current_stage: str = ""
     workspace_path: str = ""
+    canonical_output_root: str = ""
     log_path: str = ""
     produced_artifacts: List[str] = field(default_factory=list)
     progress_snapshot: Dict[str, Any] = field(default_factory=dict)
+    cancel_requested: bool = False
+    cancel_requested_at: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    lease_id: str = ""
+    worker_id: str = ""
+    lease_expires_at: Optional[str] = None
+    heartbeat_at: Optional[str] = None
+    revision: int = 0
+    lease_generation: int = 0
+    fence_token: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -104,9 +209,20 @@ class QueueJobRuntime:
             "retry_count": self.retry_count,
             "current_stage": self.current_stage,
             "workspace_path": self.workspace_path,
+            "canonical_output_root": self.canonical_output_root,
             "log_path": self.log_path,
             "produced_artifacts": self.produced_artifacts,
             "progress_snapshot": self.progress_snapshot,
+            "cancel_requested": self.cancel_requested,
+            "cancel_requested_at": self.cancel_requested_at,
+            "cancel_reason": self.cancel_reason,
+            "lease_id": self.lease_id,
+            "worker_id": self.worker_id,
+            "lease_expires_at": self.lease_expires_at,
+            "heartbeat_at": self.heartbeat_at,
+            "revision": self.revision,
+            "lease_generation": self.lease_generation,
+            "fence_token": self.fence_token,
         }
 
     @classmethod
@@ -121,10 +237,34 @@ class QueueJobRuntime:
             retry_count=data.get("retry_count", 0),
             current_stage=data.get("current_stage", ""),
             workspace_path=data.get("workspace_path", ""),
+            canonical_output_root=data.get("canonical_output_root", ""),
             log_path=data.get("log_path", ""),
             produced_artifacts=data.get("produced_artifacts", []),
             progress_snapshot=data.get("progress_snapshot", {}),
+            cancel_requested=bool(data.get("cancel_requested", False)),
+            cancel_requested_at=data.get("cancel_requested_at"),
+            cancel_reason=data.get("cancel_reason"),
+            lease_id=str(data.get("lease_id") or ""),
+            worker_id=str(data.get("worker_id") or ""),
+            lease_expires_at=data.get("lease_expires_at"),
+            heartbeat_at=data.get("heartbeat_at"),
+            revision=max(0, int(data.get("revision") or 0)),
+            lease_generation=max(0, int(data.get("lease_generation") or 0)),
+            fence_token=str(data.get("fence_token") or ""),
         )
+
+
+@dataclass(frozen=True)
+class QueueLease:
+    """Cross-process claim returned by the queue's compare-and-swap boundary."""
+
+    job_id: str
+    lease_id: str
+    worker_id: str
+    expires_at: str
+    revision: int
+    lease_generation: int = 0
+    fence_token: str = ""
 
 
 @dataclass
@@ -190,13 +330,67 @@ class InProcessQueueService:
 
 class PersistentQueueService:
     def __init__(self, queue_file_path: str | Path) -> None:
-        self.queue_file_path = Path(queue_file_path)
+        self.queue_file_path = Path(queue_file_path).expanduser().resolve()
+        queue_parent = self.queue_file_path.parent
+        self._canonical_output_root = (
+            queue_parent.parent
+            if queue_parent.name.casefold() == "_queue"
+            else queue_parent
+        ).resolve()
         self._lock = threading.Lock()
         self._jobs: Dict[str, QueueJobSpec] = {}
         self._runtimes: Dict[str, QueueJobRuntime] = {}
+        self._revision = 0
+        self._lock_path = self.queue_file_path.with_name(self.queue_file_path.name + ".lock")
         self._load()
 
+    @contextmanager
+    def _store_lock(self):
+        """Hold the process and OS lock for one read/modify/write transaction."""
+
+        self.queue_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            with _queue_process_lock(self._lock_path):
+                with self._lock_path.open("a+b") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"persistent queue lock\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        acquired = False
+                        while not acquired:
+                            try:
+                                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                                acquired = True
+                            except OSError:
+                                time.sleep(0.01)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        self._load_unlocked()
+                        yield
+                    finally:
+                        handle.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _load(self) -> None:
+        with self._store_lock():
+            return
+
+    def _load_unlocked(self) -> None:
         if self.queue_file_path.exists():
             try:
                 data = json.loads(self.queue_file_path.read_text(encoding="utf-8"))
@@ -208,15 +402,102 @@ class PersistentQueueService:
                     job_id: QueueJobRuntime.from_dict(runtime_data)
                     for job_id, runtime_data in data.get("runtimes", {}).items()
                 }
-            except (json.JSONDecodeError, KeyError):
+                self._revision = max(0, int(data.get("revision") or 0))
+                self._normalize_loaded_jobs()
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 self._jobs = {}
                 self._runtimes = {}
+                self._revision = 0
+        else:
+            self._jobs = {}
+            self._runtimes = {}
+            self._revision = 0
+
+    def _resolve_path(self, raw_path: Any, *, base: Path | None = None) -> str:
+        value = str(raw_path or "").strip()
+        if not value:
+            return ""
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = (base or self._canonical_output_root) / path
+        return str(path.resolve())
+
+    def _config_output_root(self, parameters: Dict[str, Any]) -> str:
+        config_path_raw = str(parameters.get("config") or "").strip()
+        if not config_path_raw:
+            return ""
+        config_path = Path(self._resolve_path(config_path_raw))
+        if not config_path.is_file():
+            return ""
+        try:
+            parser = configparser.ConfigParser()
+            parser.read(config_path, encoding="utf-8")
+            raw_output = parser.get("Paths", "output_path", fallback="").strip()
+        except (OSError, configparser.Error):
+            return ""
+        return self._resolve_path(raw_output, base=config_path.parent)
+
+    def _normalize_job_spec(self, job_spec: QueueJobSpec) -> QueueJobSpec:
+        parameters = dict(job_spec.parameters or {})
+        explicit_workspace = self._resolve_path(
+            job_spec.workspace_path or parameters.get("workspace_path")
+        )
+        canonical_root = self._resolve_path(job_spec.canonical_output_root)
+        if explicit_workspace:
+            canonical_root = str(Path(explicit_workspace).parent.resolve())
+        if not canonical_root:
+            for candidate in (
+                parameters.get("output_dir"),
+                parameters.get("output_path"),
+            ):
+                candidate_root = self._resolve_path(candidate)
+                if candidate_root:
+                    canonical_root = candidate_root
+                    break
+        if not canonical_root:
+            canonical_root = self._config_output_root(parameters) or str(self._canonical_output_root)
+
+        project_name = str(job_spec.project_name or parameters.get("project_name") or "project").strip()
+        if not explicit_workspace:
+            explicit_workspace = str(
+                (Path(canonical_root) / f"{project_name}__{job_spec.job_id}").resolve()
+            )
+        parameters.setdefault("project_name", project_name)
+        parameters["job_id"] = job_spec.job_id
+        parameters["workspace_path"] = explicit_workspace
+        parameters.setdefault("queue_file", str(self.queue_file_path))
+        return replace(
+            job_spec,
+            parameters=parameters,
+            workspace_path=explicit_workspace,
+            canonical_output_root=canonical_root,
+            log_path=str(Path(explicit_workspace) / "logs" / "job.log"),
+        )
+
+    def _normalize_loaded_jobs(self) -> None:
+        self._jobs = {
+            job_id: self._normalize_job_spec(job)
+            for job_id, job in self._jobs.items()
+        }
+        for job_id, job in self._jobs.items():
+            runtime = self._runtimes.get(job_id)
+            if runtime is not None:
+                runtime.workspace_path = runtime.workspace_path or job.workspace_path
+                runtime.canonical_output_root = (
+                    runtime.canonical_output_root or job.canonical_output_root
+                )
+                runtime.log_path = runtime.log_path or job.log_path
 
     def _save(self) -> None:
+        """Write the already-locked in-memory snapshot atomically."""
+
         self.queue_file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._revision += 1
         data = {
             "jobs": {job_id: job.to_dict() for job_id, job in self._jobs.items()},
             "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
+            "schema_version": "queue-v2",
+            "revision": self._revision,
             "last_updated": self._utc_now(),
         }
         temp_path = self.queue_file_path.with_suffix(".tmp")
@@ -224,32 +505,154 @@ class PersistentQueueService:
         temp_path.replace(self.queue_file_path)
 
     @staticmethod
+    def _now_datetime() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @classmethod
+    def _lease_expiry(cls, lease_seconds: int) -> str:
+        return (cls._now_datetime() + timedelta(seconds=max(1, int(lease_seconds)))).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    @classmethod
+    def _lease_is_expired(cls, expires_at: str | None) -> bool:
+        if not expires_at:
+            return True
+        try:
+            raw = str(expires_at).replace("Z", "+00:00")
+            expiry = datetime.fromisoformat(raw)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return expiry <= cls._now_datetime()
+        except (TypeError, ValueError):
+            return True
+
+    @classmethod
+    def _lease_owned(
+        cls,
+        runtime: QueueJobRuntime | None,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> TypeGuard[QueueJobRuntime]:
+        if runtime is None or runtime.state != QueueState.RUNNING:
+            return False
+        if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
+            return False
+        if runtime.lease_generation != int(lease_generation):
+            return False
+        if not fence_token or runtime.fence_token != str(fence_token):
+            return False
+        return not cls._lease_is_expired(runtime.lease_expires_at)
+
+    @staticmethod
     def _utc_now() -> str:
         from services.job_workspace import utc_now_iso
         return utc_now_iso()
 
     def add_job(self, job_spec: QueueJobSpec) -> str:
-        with self._lock:
-            self._jobs[job_spec.job_id] = job_spec
-            if job_spec.job_id not in self._runtimes:
-                self._runtimes[job_spec.job_id] = QueueJobRuntime(job_id=job_spec.job_id)
+        with self._store_lock():
+            normalized = self._normalize_job_spec(job_spec)
+            previous = self._jobs.get(normalized.job_id)
+            fingerprints_changed = bool(
+                previous is not None
+                and (
+                    str(previous.input_fingerprint or "") != str(normalized.input_fingerprint or "")
+                    or str(previous.config_fingerprint or "") != str(normalized.config_fingerprint or "")
+                )
+            )
+            self._jobs[normalized.job_id] = normalized
+            if normalized.job_id not in self._runtimes or fingerprints_changed:
+                self._runtimes[normalized.job_id] = QueueJobRuntime(
+                    job_id=normalized.job_id,
+                    workspace_path=normalized.workspace_path,
+                    canonical_output_root=normalized.canonical_output_root,
+                    log_path=normalized.log_path,
+                )
+            else:
+                runtime = self._runtimes[normalized.job_id]
+                runtime.workspace_path = normalized.workspace_path
+                runtime.canonical_output_root = normalized.canonical_output_root
+                runtime.log_path = normalized.log_path
             self._save()
-        return job_spec.job_id
+        return normalized.job_id
 
     def get_job(self, job_id: str) -> Optional[QueueJobSpec]:
-        with self._lock:
+        with self._store_lock():
             return self._jobs.get(job_id)
 
     def get_job_runtime(self, job_id: str) -> Optional[QueueJobRuntime]:
-        with self._lock:
-            return self._runtimes.get(job_id)
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return None
+            return replace(
+                runtime,
+                result_summary=dict(runtime.result_summary) if runtime.result_summary else None,
+                produced_artifacts=list(runtime.produced_artifacts),
+                progress_snapshot=dict(runtime.progress_snapshot),
+            )
+
+    def list_job_runtimes(self) -> List[QueueJobRuntime]:
+        """Return runtime snapshots for read-only observers."""
+
+        with self._store_lock():
+            return [
+                replace(
+                    runtime,
+                    result_summary=dict(runtime.result_summary) if runtime.result_summary else None,
+                    produced_artifacts=list(runtime.produced_artifacts),
+                    progress_snapshot=dict(runtime.progress_snapshot),
+                )
+                for runtime in self._runtimes.values()
+            ]
+
+    def update_job_stage(self, job_id: str, stage: str) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
+                return False
+            runtime.current_stage = str(stage or "")
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
+                return False
+            if "workspace_path" in info:
+                runtime.workspace_path = str(info["workspace_path"] or "")
+            if "canonical_output_root" in info:
+                runtime.canonical_output_root = str(info["canonical_output_root"] or "")
+            if "log_path" in info:
+                runtime.log_path = str(info["log_path"] or "")
+            if "produced_artifacts" in info:
+                runtime.produced_artifacts = [str(item) for item in info["produced_artifacts"] or []]
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
+                return False
+            runtime.progress_snapshot = dict(snapshot)
+            stage = str(snapshot.get("stage") or "").strip()
+            if stage:
+                runtime.current_stage = stage
+            runtime.revision += 1
+            self._save()
+            return True
 
     def list_jobs(self) -> List[QueueJobSpec]:
-        with self._lock:
+        with self._store_lock():
             return list(self._jobs.values())
 
     def list_jobs_by_state(self, state: QueueState) -> List[QueueJobSpec]:
-        with self._lock:
+        with self._store_lock():
             return [
                 job
                 for job_id, job in self._jobs.items()
@@ -257,52 +660,490 @@ class PersistentQueueService:
             ]
 
     def update_job_state(self, job_id: str, state: QueueState) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return False
             runtime = self._runtimes[job_id]
+            if runtime.state == QueueState.RUNNING and runtime.lease_id:
+                return False
+            allowed = {
+                QueueState.PENDING: {QueueState.RUNNING, QueueState.CANCEL_REQUESTED, QueueState.CANCELLED},
+                QueueState.RUNNING: {QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCEL_REQUESTED, QueueState.CANCELLED},
+                QueueState.CANCEL_REQUESTED: {QueueState.CANCEL_ACKNOWLEDGED, QueueState.CANCELLED},
+                QueueState.CANCEL_ACKNOWLEDGED: {QueueState.CANCELLED},
+                QueueState.COMPLETED: set(),
+                QueueState.FAILED: set(),
+                QueueState.CANCELLED: set(),
+            }
+            if state != runtime.state and state not in allowed.get(runtime.state, set()):
+                return False
+            if state in {QueueState.COMPLETED, QueueState.FAILED} and runtime.cancel_requested:
+                return False
             runtime.state = state
             if state == QueueState.RUNNING and not runtime.started_at:
                 runtime.started_at = self._utc_now()
-            if state in (QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCELLED):
+            if state in (QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCEL_ACKNOWLEDGED, QueueState.CANCELLED):
                 runtime.completed_at = self._utc_now()
+                runtime.lease_id = ""
+                runtime.worker_id = ""
+                runtime.lease_expires_at = None
+                runtime.heartbeat_at = None
+                runtime.fence_token = ""
+            runtime.revision += 1
             self._save()
         return True
 
-    def set_job_error(self, job_id: str, error_message: str) -> bool:
-        with self._lock:
-            if job_id not in self._runtimes:
+    def claim_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+    ) -> QueueLease | None:
+        """Atomically claim a pending job or recover an expired worker lease."""
+
+        resolved_worker = str(worker_id or "").strip()
+        if not resolved_worker:
+            raise ValueError("worker_id is required for a queue claim")
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state in {
+                QueueState.COMPLETED,
+                QueueState.FAILED,
+                QueueState.CANCELLED,
+                QueueState.CANCEL_ACKNOWLEDGED,
+                QueueState.CANCEL_REQUESTED,
+            }:
+                return None
+            if runtime.state == QueueState.RUNNING and not self._lease_is_expired(runtime.lease_expires_at):
+                return None
+            if runtime.state == QueueState.RUNNING:
+                runtime.state = QueueState.PENDING
+                runtime.error_message = "worker lease expired; job reclaimed"
+                runtime.lease_id = ""
+                runtime.worker_id = ""
+                runtime.lease_expires_at = None
+                runtime.heartbeat_at = None
+                runtime.fence_token = ""
+            if runtime.state != QueueState.PENDING or runtime.cancel_requested:
+                return None
+            lease_id = f"{resolved_worker}:{uuid.uuid4().hex}"
+            expires_at = self._lease_expiry(lease_seconds)
+            now = self._utc_now()
+            runtime.lease_generation = max(0, int(runtime.lease_generation)) + 1
+            fence_token = f"{job_id}:{runtime.lease_generation}:{lease_id}"
+            runtime.state = QueueState.RUNNING
+            runtime.started_at = runtime.started_at or now
+            runtime.worker_id = resolved_worker
+            runtime.lease_id = lease_id
+            runtime.lease_expires_at = expires_at
+            runtime.heartbeat_at = now
+            runtime.fence_token = fence_token
+            runtime.revision += 1
+            self._save()
+            return QueueLease(
+                job_id,
+                lease_id,
+                resolved_worker,
+                expires_at,
+                runtime.revision,
+                runtime.lease_generation,
+                fence_token,
+            )
+
+    def heartbeat(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int | None = None,
+        fence_token: str | None = None,
+        lease_seconds: int = 60,
+    ) -> bool:
+        """Extend a claim only when its worker/lease pair still owns it."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state != QueueState.RUNNING:
                 return False
-            self._runtimes[job_id].error_message = error_message
+            if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
+                return False
+            if lease_generation is not None and runtime.lease_generation != int(lease_generation):
+                return False
+            if fence_token is not None and runtime.fence_token != str(fence_token):
+                return False
+            if self._lease_is_expired(runtime.lease_expires_at):
+                return False
+            runtime.heartbeat_at = self._utc_now()
+            runtime.lease_expires_at = self._lease_expiry(lease_seconds)
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_stage_with_lease(
+        self,
+        job_id: str,
+        stage: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.current_stage = str(stage or "")
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_runtime_info_with_lease(
+        self,
+        job_id: str,
+        info: Dict[str, Any],
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            if "workspace_path" in info:
+                runtime.workspace_path = str(info["workspace_path"] or "")
+            if "canonical_output_root" in info:
+                runtime.canonical_output_root = str(info["canonical_output_root"] or "")
+            if "log_path" in info:
+                runtime.log_path = str(info["log_path"] or "")
+            if "produced_artifacts" in info:
+                runtime.produced_artifacts = [str(item) for item in info["produced_artifacts"] or []]
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def update_job_progress_snapshot_with_lease(
+        self,
+        job_id: str,
+        snapshot: Dict[str, Any],
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.progress_snapshot = dict(snapshot)
+            stage = str(snapshot.get("stage") or "").strip()
+            if stage:
+                runtime.current_stage = stage
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def register_canonical_artifact_with_lease(
+        self,
+        job_id: str,
+        artifact_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+        registry_path: str | Path | None = None,
+    ) -> bool:
+        """Fence produced-artifact claims and verify the canonical Registry."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            value = str(artifact_id or "").strip()
+            if not value:
+                return False
+            if registry_path is not None:
+                candidate_registry_path = Path(registry_path).expanduser().resolve()
+                if not candidate_registry_path.is_file():
+                    return False
+                try:
+                    registry = ArtifactRegistry(candidate_registry_path, job_id)
+                    record = registry.get(value)
+                    if record is None:
+                        candidate_path = Path(value).expanduser().resolve()
+                        record = next(
+                            (
+                                item
+                                for item in registry.list_records()
+                                if Path(item.path).expanduser().resolve() == candidate_path
+                            ),
+                            None,
+                        )
+                    if record is None or record.status != "ready":
+                        return False
+                    ArtifactRegistry._verify_ready_artifact(record)
+                    registry.verify_ready_dependencies(record.depends_on)
+                except (OSError, RegistryError, TypeError, ValueError):
+                    return False
+            if value not in runtime.produced_artifacts:
+                runtime.produced_artifacts.append(value)
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def set_job_result_with_lease(
+        self,
+        job_id: str,
+        result_summary: Dict[str, Any],
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.result_summary = dict(result_summary)
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def set_job_error_with_lease(
+        self,
+        job_id: str,
+        error_message: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int,
+        fence_token: str,
+    ) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if not self._lease_owned(
+                runtime,
+                lease_id=lease_id,
+                worker_id=worker_id,
+                lease_generation=lease_generation,
+                fence_token=fence_token,
+            ):
+                return False
+            runtime.error_message = str(error_message or "")
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def release_lease(
+        self,
+        job_id: str,
+        *,
+        lease_id: str,
+        worker_id: str,
+        lease_generation: int | None = None,
+        fence_token: str | None = None,
+        state: QueueState,
+        error_message: str | None = None,
+    ) -> bool:
+        """CAS-release a worker lease and persist the terminal queue state."""
+
+        if state not in {QueueState.COMPLETED, QueueState.FAILED, QueueState.CANCELLED}:
+            raise ValueError("lease release requires a terminal queue state")
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return False
+            if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
+                return False
+            if lease_generation is not None and runtime.lease_generation != int(lease_generation):
+                return False
+            if fence_token is not None and runtime.fence_token != str(fence_token):
+                return False
+            if self._lease_is_expired(runtime.lease_expires_at):
+                return False
+            if state in {QueueState.COMPLETED, QueueState.FAILED} and runtime.cancel_requested:
+                return False
+            runtime.state = state
+            runtime.completed_at = self._utc_now()
+            runtime.error_message = error_message if error_message is not None else runtime.error_message
+            runtime.lease_id = ""
+            runtime.worker_id = ""
+            runtime.lease_expires_at = None
+            runtime.heartbeat_at = None
+            runtime.fence_token = ""
+            runtime.revision += 1
+            self._save()
+            return True
+
+    def recover_expired_leases(self) -> list[str]:
+        """Move crashed workers' expired RUNNING jobs back to PENDING."""
+
+        recovered: list[str] = []
+        with self._store_lock():
+            for job_id, runtime in self._runtimes.items():
+                if runtime.state != QueueState.RUNNING or not self._lease_is_expired(runtime.lease_expires_at):
+                    continue
+                runtime.state = QueueState.PENDING
+                runtime.error_message = "worker lease expired; job available for recovery"
+                runtime.lease_id = ""
+                runtime.worker_id = ""
+                runtime.lease_expires_at = None
+                runtime.heartbeat_at = None
+                runtime.fence_token = ""
+                runtime.revision += 1
+                recovered.append(job_id)
+            if recovered:
+                self._save()
+        return recovered
+
+    def set_job_error(self, job_id: str, error_message: str) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
+                return False
+            runtime.error_message = error_message
+            runtime.revision += 1
             self._save()
         return True
 
     def set_job_result(self, job_id: str, result_summary: Dict[str, Any]) -> bool:
-        with self._lock:
-            if job_id not in self._runtimes:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or (runtime.state == QueueState.RUNNING and runtime.lease_id):
                 return False
-            self._runtimes[job_id].result_summary = result_summary
+            runtime.result_summary = result_summary
+            runtime.revision += 1
             self._save()
         return True
 
     def increment_retry_count(self, job_id: str) -> int:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return 0
             self._runtimes[job_id].retry_count += 1
+            self._runtimes[job_id].revision += 1
             self._save()
             return self._runtimes[job_id].retry_count
 
     def reset_job(self, job_id: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id not in self._runtimes:
                 return False
-            self._runtimes[job_id] = QueueJobRuntime(job_id=job_id)
+            previous = self._runtimes[job_id]
+            self._runtimes[job_id] = QueueJobRuntime(
+                job_id=job_id,
+                retry_count=previous.retry_count,
+                workspace_path=self._jobs[job_id].workspace_path if job_id in self._jobs else "",
+                canonical_output_root=(
+                    self._jobs[job_id].canonical_output_root if job_id in self._jobs else ""
+                ),
+                log_path=self._jobs[job_id].log_path if job_id in self._jobs else "",
+            )
             self._save()
         return True
 
+    def request_cancel(self, job_id: str, *, reason: str = "user_requested") -> bool:
+        """Persist a cooperative cancellation request for a live job."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state in (
+                QueueState.COMPLETED,
+                QueueState.FAILED,
+                QueueState.CANCEL_ACKNOWLEDGED,
+                QueueState.CANCELLED,
+            ):
+                return False
+            runtime.cancel_requested = True
+            runtime.cancel_requested_at = self._utc_now()
+            runtime.cancel_reason = reason
+            if runtime.state == QueueState.PENDING:
+                # A pending job has no worker checkpoint to wait for.  Mark it
+                # cancelled atomically so it cannot become runnable after the
+                # request is persisted.
+                runtime.state = QueueState.CANCELLED
+                runtime.completed_at = self._utc_now()
+            else:
+                runtime.state = QueueState.CANCEL_REQUESTED
+            runtime.revision += 1
+            self._save()
+        return True
+
+    def acknowledge_cancel(self, job_id: str, *, worker: str = "queue-worker") -> bool:
+        """Record that the worker observed and stopped at a safe checkpoint."""
+
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state != QueueState.CANCEL_REQUESTED:
+                return False
+            runtime.state = QueueState.CANCEL_ACKNOWLEDGED
+            runtime.error_message = f"cancellation acknowledged by {worker}"
+            runtime.completed_at = self._utc_now()
+            runtime.lease_id = ""
+            runtime.worker_id = ""
+            runtime.lease_expires_at = None
+            runtime.heartbeat_at = None
+            runtime.fence_token = ""
+            runtime.revision += 1
+            self._save()
+        return True
+
+    def clear_cancel_request(self, job_id: str) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None:
+                return False
+            runtime.cancel_requested = False
+            runtime.cancel_requested_at = None
+            runtime.cancel_reason = None
+            runtime.revision += 1
+            self._save()
+        return True
+
+    def is_cancel_requested(self, job_id: str) -> bool:
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            return bool(runtime and runtime.cancel_requested)
+
     def remove_job(self, job_id: str) -> bool:
-        with self._lock:
+        with self._store_lock():
             if job_id in self._jobs:
                 del self._jobs[job_id]
             if job_id in self._runtimes:
@@ -325,15 +1166,18 @@ class PersistentQueueService:
     def save_queue(self, file_path: str | Path) -> None:
         """保存队列到文件"""
         save_path = Path(file_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "jobs": {job_id: job.to_dict() for job_id, job in self._jobs.items()},
-            "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
-            "last_updated": self._utc_now(),
-        }
-        temp_path = save_path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(save_path)
+        with self._store_lock():
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "schema_version": "queue-v2",
+                "revision": self._revision,
+                "jobs": {job_id: job.to_dict() for job_id, job in self._jobs.items()},
+                "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
+                "last_updated": self._utc_now(),
+            }
+            temp_path = save_path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(save_path)
 
     def load_queue(self, file_path: str | Path) -> None:
         """从文件加载队列"""
@@ -341,22 +1185,25 @@ class PersistentQueueService:
         if load_path.exists():
             try:
                 data = json.loads(load_path.read_text(encoding="utf-8"))
-                with self._lock:
+                if not isinstance(data, dict):
+                    raise ValueError("queue export must be an object")
+                with self._store_lock():
                     # 加载任务
                     for job_id, job_data in data.get("jobs", {}).items():
                         self._jobs[job_id] = QueueJobSpec.from_dict(job_data)
                     # 加载运行时信息
                     for job_id, runtime_data in data.get("runtimes", {}).items():
                         self._runtimes[job_id] = QueueJobRuntime.from_dict(runtime_data)
+                    self._normalize_loaded_jobs()
                     # 保存到当前队列文件
                     self._save()
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 pass
 
     def reorder_jobs(self, job_ids: List[str]) -> None:
         """重排任务顺序"""
         # 按指定顺序重新排列任务
-        with self._lock:
+        with self._store_lock():
             ordered_jobs = {}
             for job_id in job_ids:
                 if job_id in self._jobs:
@@ -367,6 +1214,538 @@ class PersistentQueueService:
                     ordered_jobs[job_id] = job
             self._jobs = ordered_jobs
             self._save()
+
+    def publication_context(self, lease: QueueLease) -> "QueuePublicationContext":
+        """Return the only canonical publication surface available to a worker."""
+
+        return QueuePublicationContext(self, lease)
+
+
+class LocalPublicationContext:
+    """Explicit publication context for non-queue/direct execution.
+
+    Direct execution has no cross-process lease to fence, but it still uses the
+    same staged-then-registered API.  Keeping this context explicit prevents a
+    queue worker from accidentally acquiring an unrestricted ``ArtifactRegistry``
+    when a publication context was expected.
+    """
+
+    def registry(
+        self,
+        registry_path: str | Path,
+        job_id: str,
+    ) -> ArtifactRegistry:
+        return ArtifactRegistry(registry_path, job_id)
+
+    def stage_bytes(self, target_path: str | Path, payload: bytes) -> StagedArtifactPublication:
+        target = Path(target_path).expanduser().resolve()
+        content_hash = _sha256_bytes(payload)
+        staging_dir = target.parent / ".publication-staging" / "local"
+        staging_path = staging_dir / f"{_safe_publication_component(target.name)}.{uuid.uuid4().hex}.stage"
+        _write_staged_bytes(staging_path, payload)
+        return StagedArtifactPublication(
+            target_path=str(target),
+            staging_path=str(staging_path),
+            content_hash=content_hash,
+            size_bytes=len(payload),
+            job_id="local",
+            lease_id="local",
+            worker_id="local",
+            lease_generation=0,
+            fence_token="local",
+        )
+
+    def finalize_staged(
+        self,
+        staged: StagedArtifactPublication,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        target = Path(staged.target_path).expanduser().resolve()
+        final_path = _immutable_publication_path(target, staged.content_hash)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        created_by_publication = False
+        if final_path.exists():
+            if not final_path.is_file() or _sha256_bytes(final_path.read_bytes()) != staged.content_hash:
+                raise PublicationFenceRejected(
+                    f"immutable publication target already contains different bytes: {final_path}"
+                )
+            Path(staged.staging_path).unlink(missing_ok=True)
+        else:
+            try:
+                # A hard-link create is exclusive on Windows and POSIX.  It
+                # lets a concurrent publisher win the race without making
+                # this publisher responsible for deleting the winner's file.
+                os.link(staged.staging_path, final_path)
+            except FileExistsError:
+                if not final_path.is_file() or _sha256_bytes(final_path.read_bytes()) != staged.content_hash:
+                    raise PublicationFenceRejected(
+                        f"immutable publication target already contains different bytes: {final_path}"
+                    )
+            else:
+                created_by_publication = True
+            Path(staged.staging_path).unlink(missing_ok=True)
+        artifact = None
+        try:
+            if register_kwargs is not None:
+                if registry is None:
+                    raise PublicationFenceRejected("artifact registration requires an explicit registry")
+                kwargs = dict(register_kwargs)
+                kwargs["path"] = str(final_path)
+                artifact = registry.register_file(**kwargs)
+        except Exception:
+            # A pre-existing content-addressed file belongs to an earlier
+            # publication and must survive an alias registration failure.
+            if created_by_publication:
+                try:
+                    final_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        return PublishedArtifactPublication(
+            target_path=str(target),
+            final_path=str(final_path),
+            content_hash=staged.content_hash,
+            staged_path=staged.staging_path,
+            artifact=artifact,
+        )
+
+    def publish_bytes(
+        self,
+        target_path: str | Path,
+        payload: bytes,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        staged = self.stage_bytes(target_path, payload)
+        return self.finalize_staged(staged, registry=registry, register_kwargs=register_kwargs)
+
+    def publish_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        return self.publish_bytes(
+            target_path,
+            encoded,
+            registry=registry,
+            register_kwargs=register_kwargs,
+        )
+
+    def write_compatibility_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+    ) -> str:
+        """Atomically update a non-authoritative local compatibility file."""
+
+        target = Path(target_path).expanduser().resolve()
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        _write_staged_bytes(target, encoded)
+        return str(target)
+
+
+class QueuePublicationContext:
+    """Lease-bound factory for queue-owned ArtifactRegistry facades."""
+
+    def __init__(self, queue_service: PersistentQueueService, lease: QueueLease) -> None:
+        self.queue_service = queue_service
+        self.lease = lease
+
+    def registry(
+        self,
+        registry_path: str | Path,
+        job_id: str | None = None,
+    ) -> "QueueOwnedArtifactRegistry":
+        target_job_id = str(job_id or self.lease.job_id)
+        if target_job_id != self.lease.job_id:
+            raise QueuePublicationRejected(
+                f"publication job {target_job_id!r} does not match lease job {self.lease.job_id!r}"
+            )
+        return QueueOwnedArtifactRegistry(
+            self.queue_service,
+            self.lease,
+            registry_path=registry_path,
+            job_id=target_job_id,
+        )
+
+    def _staging_directory(self, target: Path) -> Path:
+        return (
+            target.parent
+            / ".publication-staging"
+            / _safe_publication_component(self.lease.job_id)
+            / (
+                f"generation-{int(self.lease.lease_generation)}-"
+                f"{_safe_publication_component(self.lease.lease_id)}"
+            )
+        )
+
+    def stage_bytes(self, target_path: str | Path, payload: bytes) -> StagedArtifactPublication:
+        """Write only to a lease-generation-private staging path.
+
+        Staging is deliberately allowed to finish after a lease expires; the
+        final boundary below is what makes the bytes canonical (or leaves them
+        as an unreferenced orphan).
+        """
+
+        target = Path(target_path).expanduser().resolve()
+        content_hash = _sha256_bytes(payload)
+        staging_dir = self._staging_directory(target)
+        staging_path = staging_dir / (
+            f"{_safe_publication_component(target.name)}.{uuid.uuid4().hex}.stage"
+        )
+        _write_staged_bytes(staging_path, payload)
+        return StagedArtifactPublication(
+            target_path=str(target),
+            staging_path=str(staging_path),
+            content_hash=content_hash,
+            size_bytes=len(payload),
+            job_id=self.lease.job_id,
+            lease_id=self.lease.lease_id,
+            worker_id=self.lease.worker_id,
+            lease_generation=self.lease.lease_generation,
+            fence_token=self.lease.fence_token,
+        )
+
+    def _assert_live_unlocked(self) -> None:
+        runtime = self.queue_service._runtimes.get(self.lease.job_id)
+        if not self.queue_service._lease_owned(
+            runtime,
+            lease_id=self.lease.lease_id,
+            worker_id=self.lease.worker_id,
+            lease_generation=self.lease.lease_generation,
+            fence_token=self.lease.fence_token,
+        ):
+            raise QueuePublicationRejected(
+                f"queue lease is no longer current for byte publication: {self.lease.job_id}"
+            )
+
+    @staticmethod
+    def _manifest_payload(
+        *,
+        staged: StagedArtifactPublication,
+        final_path: Path,
+        artifact_id: str,
+        artifact_type: str,
+        artifact_version: str,
+        artifact_hash: str,
+    ) -> dict[str, Any]:
+        return {
+            "artifact_type": "lease_publication_manifest",
+            "artifact_version": "v1",
+            "job_id": staged.job_id,
+            "lease_id": staged.lease_id,
+            "worker_id": staged.worker_id,
+            "lease_generation": staged.lease_generation,
+            "fence_token": staged.fence_token,
+            "target_path": staged.target_path,
+            "final_path": str(final_path),
+            "staging_path": staged.staging_path,
+            "content_hash": staged.content_hash,
+            "size_bytes": staged.size_bytes,
+            "registered_artifact_id": artifact_id,
+            "registered_artifact_type": artifact_type,
+            "registered_artifact_version": artifact_version,
+            "registered_artifact_hash": artifact_hash,
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+
+    def _prepare_publication_manifest_unlocked(
+        self,
+        *,
+        staged: StagedArtifactPublication,
+        final_path: Path,
+        artifact_id: str,
+        artifact_type: str,
+        artifact_version: str,
+        artifact_hash: str,
+    ) -> tuple[Path, dict[str, Any]]:
+        """Materialize lease evidence before one atomic target/manifest commit."""
+
+        payload = self._manifest_payload(
+            staged=staged,
+            final_path=final_path,
+            artifact_id=artifact_id,
+            artifact_type=artifact_type,
+            artifact_version=artifact_version,
+            artifact_hash=artifact_hash,
+        )
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        manifest_hash = _sha256_bytes(encoded)
+        target_artifact_id = str(artifact_id or "published-artifact")
+        safe_artifact_id = _safe_publication_component(target_artifact_id)
+        manifest_target = (
+            final_path.parent
+            / ".publication-manifests"
+            / f"{safe_artifact_id}__{manifest_hash[:24]}.json"
+        )
+        manifest_staging = (
+            self._staging_directory(manifest_target)
+            / f"{_safe_publication_component(manifest_target.name)}.{uuid.uuid4().hex}.stage"
+        )
+        _write_staged_bytes(manifest_staging, encoded)
+        manifest_final = _immutable_publication_path(manifest_target, manifest_hash)
+        manifest_final.parent.mkdir(parents=True, exist_ok=True)
+        if manifest_final.exists():
+            if _sha256_bytes(manifest_final.read_bytes()) != manifest_hash:
+                raise QueuePublicationRejected(
+                    f"lease publication manifest already contains different bytes: {manifest_final}"
+                )
+            manifest_staging.unlink(missing_ok=True)
+        else:
+            os.replace(str(manifest_staging), str(manifest_final))
+        return manifest_final, {
+            "artifact_role": "lease_publication_manifest",
+            "artifact_type": "lease_publication_manifest",
+            "artifact_version": "v1",
+            "path": str(manifest_final),
+            "producer": "services.queue_service.QueuePublicationContext",
+            "artifact_id": f"lease-publication:{safe_artifact_id}:{manifest_hash[:24]}",
+            "metadata": {
+                "target_artifact_id": target_artifact_id,
+                "target_artifact_type": artifact_type,
+                "target_artifact_version": artifact_version,
+                "target_artifact_hash": artifact_hash,
+                "immutable": True,
+            },
+        }
+
+    def finalize_staged(
+        self,
+        staged: StagedArtifactPublication,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        """Finalize bytes and registry mutations under ``queue -> Registry``.
+
+        The target and its lease publication evidence are committed by one
+        Registry transaction.  A Registry failure therefore leaves only
+        immutable, unreferenced bytes.
+        """
+
+        if (
+            staged.job_id != self.lease.job_id
+            or staged.lease_id != self.lease.lease_id
+            or staged.worker_id != self.lease.worker_id
+            or staged.lease_generation != self.lease.lease_generation
+            or staged.fence_token != self.lease.fence_token
+        ):
+            raise QueuePublicationRejected("staged artifact does not belong to this lease")
+        target = Path(staged.target_path).expanduser().resolve()
+        staging = Path(staged.staging_path).expanduser().resolve()
+        if not staging.is_file() or _sha256_bytes(staging.read_bytes()) != staged.content_hash:
+            raise QueuePublicationRejected("staged artifact bytes are missing or changed")
+        with self.queue_service._store_lock():
+            # Lock order is deliberately queue store -> Registry transaction.
+            self._assert_live_unlocked()
+            final_path = _immutable_publication_path(target, staged.content_hash)
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                if not final_path.is_file() or _sha256_bytes(final_path.read_bytes()) != staged.content_hash:
+                    raise QueuePublicationRejected(
+                        f"immutable publication target already contains different bytes: {final_path}"
+                    )
+                try:
+                    staging.unlink()
+                except OSError:
+                    pass
+            else:
+                # publication-boundary-implementation: this is the one
+                # immutable byte move inside QueuePublicationContext; its
+                # target and lease evidence are registered atomically below.
+                os.replace(str(staging), str(final_path))
+            artifact = None
+            if register_kwargs is not None:
+                if registry is None:
+                    raise QueuePublicationRejected("artifact registration requires an explicit registry")
+                kwargs = dict(register_kwargs)
+                kwargs["path"] = str(final_path)
+                if str(kwargs.get("artifact_type") or "") != "lease_publication_manifest":
+                    target_id = str(kwargs.get("artifact_id") or "").strip()
+                    if not target_id:
+                        target_id = f"{kwargs.get('artifact_type', 'artifact')}:{final_path.name}"
+                    target_type = str(kwargs.get("artifact_type") or "")
+                    target_version = str(kwargs.get("artifact_version") or "")
+                    target_ref = ArtifactDependencyRefV2(
+                        dependency_kind="local_job",
+                        job_id=registry.job_id,
+                        artifact_id=target_id,
+                        artifact_type=target_type,
+                        path=str(final_path),
+                        content_hash=staged.content_hash,
+                    )
+                    _manifest_path, manifest_kwargs = self._prepare_publication_manifest_unlocked(
+                        staged=staged,
+                        final_path=final_path,
+                        artifact_id=target_id,
+                        artifact_type=target_type,
+                        artifact_version=target_version,
+                        artifact_hash=staged.content_hash,
+                    )
+                    manifest_kwargs["depends_on"] = [target_ref]
+                    kwargs["artifact_id"] = target_id
+                    kwargs["artifact_type"] = target_type
+                    kwargs["artifact_version"] = target_version
+                    # The target must precede its lease evidence so the
+                    # in-transaction dependency resolver can verify it.
+                    # The queue lock is already held by this publication
+                    # boundary.  Bypass the lease facade's outer lock here;
+                    # the base transaction still runs the publication guard
+                    # without reacquiring the queue lock.
+                    artifact_records = ArtifactRegistry.register_files_atomic(
+                        registry,
+                        [kwargs, manifest_kwargs],
+                    )
+                    artifact = artifact_records[0]
+                else:
+                    artifact = ArtifactRegistry.register_file(registry, **kwargs)
+            return PublishedArtifactPublication(
+                target_path=str(target),
+                final_path=str(final_path),
+                content_hash=staged.content_hash,
+                staged_path=str(staging),
+                artifact=artifact,
+            )
+
+    def publish_bytes(
+        self,
+        target_path: str | Path,
+        payload: bytes,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        staged = self.stage_bytes(target_path, payload)
+        return self.finalize_staged(staged, registry=registry, register_kwargs=register_kwargs)
+
+    def publish_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+        *,
+        registry: ArtifactRegistry | None = None,
+        register_kwargs: Mapping[str, Any] | None = None,
+    ) -> PublishedArtifactPublication:
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        return self.publish_bytes(
+            target_path,
+            encoded,
+            registry=registry,
+            register_kwargs=register_kwargs,
+        )
+
+    def write_compatibility_json(
+        self,
+        target_path: str | Path,
+        payload: Any,
+    ) -> str:
+        """Update a mutable projection only while this lease still owns the job."""
+
+        target = Path(target_path).expanduser().resolve()
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        with self.queue_service._store_lock():
+            self._assert_live_unlocked()
+            _write_staged_bytes(target, encoded)
+        return str(target)
+
+
+class QueueOwnedArtifactRegistry(ArtifactRegistry):
+    """ArtifactRegistry whose writes are owned by one live queue lease.
+
+    Lock order is fixed at ``queue store -> Registry``.  The publication guard
+    runs while both locks are held and only inspects the already-loaded queue
+    runtime; it never reacquires the queue lock.
+    """
+
+    def __init__(
+        self,
+        queue_service: PersistentQueueService,
+        lease: QueueLease,
+        *,
+        registry_path: str | Path,
+        job_id: str,
+    ) -> None:
+        self._queue_service = queue_service
+        self._queue_lease = lease
+        # Expose the same lease-bound byte publisher to downstream services
+        # (export, forensic reports, and stage persistence) instead of letting
+        # them fall back to an unrestricted fixed-path write.
+        self.publication_context = QueuePublicationContext(queue_service, lease)
+        super().__init__(
+            registry_path,
+            job_id,
+            publication_guard=self._publication_metadata_unlocked,
+        )
+
+    @contextmanager
+    def _queue_write_lock(self):
+        with self._queue_service._store_lock():
+            runtime = self._queue_service._runtimes.get(self._queue_lease.job_id)
+            if not self._queue_service._lease_owned(
+                runtime,
+                lease_id=self._queue_lease.lease_id,
+                worker_id=self._queue_lease.worker_id,
+                lease_generation=self._queue_lease.lease_generation,
+                fence_token=self._queue_lease.fence_token,
+            ):
+                raise QueuePublicationRejected(
+                    f"queue lease is not current for canonical publication: {self._queue_lease.job_id}"
+                )
+            yield
+
+    def _publication_metadata_unlocked(self) -> Mapping[str, Any]:
+        """Recheck the fence without acquiring the queue lock recursively."""
+
+        runtime = self._queue_service._runtimes.get(self._queue_lease.job_id)
+        if not self._queue_service._lease_owned(
+            runtime,
+            lease_id=self._queue_lease.lease_id,
+            worker_id=self._queue_lease.worker_id,
+            lease_generation=self._queue_lease.lease_generation,
+            fence_token=self._queue_lease.fence_token,
+        ):
+            raise QueuePublicationRejected(
+                f"queue lease expired or was reclaimed during canonical publication: "
+                f"{self._queue_lease.job_id}"
+            )
+        return {
+            "job_id": self._queue_lease.job_id,
+            "lease_id": self._queue_lease.lease_id,
+            "worker_id": self._queue_lease.worker_id,
+            "lease_generation": self._queue_lease.lease_generation,
+            "fence_token": self._queue_lease.fence_token,
+        }
+
+    def register_file(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().register_file(*args, **kwargs)
+
+    def register_files_atomic(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().register_files_atomic(*args, **kwargs)
+
+    def register(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().register(*args, **kwargs)
+
+    def update_record(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().update_record(*args, **kwargs)
+
+    def save(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().save(*args, **kwargs)
+
+    def switch_current_artifact_set(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        with self._queue_write_lock():
+            return super().switch_current_artifact_set(*args, **kwargs)
 
 
 def create_queue_job_id() -> str:
@@ -381,6 +1760,14 @@ class QueueRunner:
         self._lock = threading.Lock()
         self._cancel_tokens: Dict[str, CancelToken] = {}
         self._workspace_locks: Dict[str, threading.Lock] = {}
+        self._worker_id = f"queue-runner:{uuid.uuid4().hex}"
+        self._leases: Dict[str, QueueLease] = {}
+        self._heartbeat_stops: Dict[str, threading.Event] = {}
+        self._heartbeat_threads: Dict[str, threading.Thread] = {}
+        self._lease_lost: Dict[str, threading.Event] = {}
+        # The durable lease is 120 seconds; keep the cross-process heartbeat
+        # comfortably below that window even while a provider call is quiet.
+        self._heartbeat_interval_seconds = 30.0
 
     def is_running(self) -> bool:
         with self._lock:
@@ -393,15 +1780,157 @@ class QueueRunner:
                 self._workspace_locks[workspace_path] = threading.Lock()
             return self._workspace_locks[workspace_path]
 
+    @staticmethod
+    def _external_cancel_requested(job_spec: QueueJobSpec) -> bool:
+        """Read a cross-process cancellation marker without mutating state."""
+
+        from runtime.cancellation import CancellationRequestStore
+        from services.job_workspace import JobWorkspace
+
+        runtime_workspace = str(job_spec.workspace_path or "").strip()
+        if not runtime_workspace:
+            return False
+        workspace_path = Path(runtime_workspace).expanduser().resolve()
+        project_name = workspace_path.name.rsplit("__", 1)[0]
+        # Cancellation probes must be read-only. ``from_workspace_path`` calls
+        # ``ensure_exists`` and would reserve a fresh queue workspace before
+        # AgentRuntimeRunner can claim it for a new run.
+        workspace = JobWorkspace(
+            str(workspace_path.parent),
+            project_name,
+            job_spec.job_id,
+        )
+        return CancellationRequestStore(workspace).is_requested()
+
+    @staticmethod
+    def _clear_external_cancel(job_spec: QueueJobSpec) -> None:
+        from runtime.cancellation import CancellationRequestStore
+        from services.job_workspace import JobWorkspace
+
+        runtime_workspace = str(job_spec.workspace_path or "").strip()
+        if not runtime_workspace:
+            return
+        workspace_path = Path(runtime_workspace).expanduser().resolve()
+        project_name = workspace_path.name.rsplit("__", 1)[0]
+        workspace = JobWorkspace(
+            str(workspace_path.parent),
+            project_name,
+            job_spec.job_id,
+        )
+        store = CancellationRequestStore(workspace)
+        if store.read() is not None:
+            store.clear(cleared_by="queue_runner", reason="retry")
+
+    def _acknowledge_cancelled(self, job_id: str) -> None:
+        runtime = self.queue_service.get_job_runtime(job_id)
+        if runtime is None:
+            return
+        if self._lease_is_lost(job_id):
+            return
+        lease = self._leases.get(job_id)
+        if lease is not None and runtime.state in {QueueState.CANCEL_REQUESTED, QueueState.RUNNING}:
+            if self.queue_service.release_lease(
+                job_id,
+                lease_id=lease.lease_id,
+                worker_id=lease.worker_id,
+                lease_generation=lease.lease_generation,
+                fence_token=lease.fence_token,
+                state=QueueState.CANCELLED,
+            ):
+                return
+        if runtime.state == QueueState.CANCEL_REQUESTED:
+            self.queue_service.acknowledge_cancel(job_id)
+            self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
+        elif runtime.state == QueueState.PENDING:
+            self.queue_service.request_cancel(job_id, reason="queue_runner_checkpoint")
+
+    def _mark_lease_lost(self, job_id: str) -> None:
+        with self._lock:
+            event = self._lease_lost.get(job_id)
+            if event is None:
+                event = threading.Event()
+                self._lease_lost[job_id] = event
+            event.set()
+            cancel_token = self._cancel_tokens.get(job_id)
+        if cancel_token is not None:
+            cancel_token.request_cancel()
+
+    def _lease_is_lost(self, job_id: str) -> bool:
+        with self._lock:
+            event = self._lease_lost.get(job_id)
+            return bool(event and event.is_set())
+
+    def _start_heartbeat(self, job_id: str, lease: QueueLease, cancel_token: CancelToken) -> None:
+        stop_event = threading.Event()
+        lost_event = threading.Event()
+        interval = max(
+            0.1,
+            min(float(self._heartbeat_interval_seconds), 120.0 / 3.0),
+        )
+        with self._lock:
+            self._heartbeat_stops[job_id] = stop_event
+            self._lease_lost[job_id] = lost_event
+
+        def heartbeat_loop() -> None:
+            while not stop_event.wait(interval):
+                if self.queue_service.heartbeat(
+                    job_id,
+                    lease_id=lease.lease_id,
+                    worker_id=lease.worker_id,
+                    lease_generation=lease.lease_generation,
+                    fence_token=lease.fence_token,
+                    lease_seconds=120,
+                ):
+                    continue
+                self._mark_lease_lost(job_id)
+                cancel_token.request_cancel()
+                return
+
+        thread = threading.Thread(
+            target=heartbeat_loop,
+            name=f"queue-heartbeat:{job_id}",
+            daemon=True,
+        )
+        with self._lock:
+            self._heartbeat_threads[job_id] = thread
+        thread.start()
+
+    def _stop_heartbeat(self, job_id: str) -> bool:
+        with self._lock:
+            stop_event = self._heartbeat_stops.get(job_id)
+            thread = self._heartbeat_threads.get(job_id)
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        return self._lease_is_lost(job_id)
+
+    def _clear_heartbeat(self, job_id: str) -> None:
+        self._stop_heartbeat(job_id)
+        with self._lock:
+            self._heartbeat_stops.pop(job_id, None)
+            self._heartbeat_threads.pop(job_id, None)
+            self._lease_lost.pop(job_id, None)
+
     def _process_job(self, job_spec: QueueJobSpec) -> None:
         cancel_token = CancelToken()
         with self._lock:
             self._cancel_tokens[job_spec.job_id] = cancel_token
 
         try:
+            if self._external_cancel_requested(job_spec):
+                cancel_token.request_cancel()
+                self.queue_service.request_cancel(job_spec.job_id, reason="external_cancel_request")
+                self._acknowledge_cancelled(job_spec.job_id)
+                return
             # 检查任务是否已经被取消
+            if self.queue_service.is_cancel_requested(job_spec.job_id):
+                cancel_token.request_cancel()
+                self._acknowledge_cancelled(job_spec.job_id)
+                return
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
 
             # 检查依赖任务状态 — 严格优先级: missing → failed → cancelled → not-completed → completed
@@ -437,32 +1966,48 @@ class QueueRunner:
                     return
             
             # 更新任务状态为运行中
-            self.queue_service.update_job_state(job_spec.job_id, QueueState.RUNNING)
+            lease = self.queue_service.claim_job(
+                job_spec.job_id,
+                worker_id=self._worker_id,
+                lease_seconds=120,
+            )
+            if lease is None:
+                return
+            with self._lock:
+                self._leases[job_spec.job_id] = lease
+            self._start_heartbeat(job_spec.job_id, lease, cancel_token)
             
             # 再次检查任务状态，确保没有被取消
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                cancel_token.request_cancel()
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
             
             # 更新当前阶段
             self._update_job_stage(job_spec.job_id, "initializing")
             
             # 从job_spec参数构建JobRunRequest
-            params = job_spec.parameters
-            project_name = params.get("project_name")
+            params = dict(job_spec.parameters)
+            params.setdefault("project_name", job_spec.project_name)
+            params.setdefault("job_id", job_spec.job_id)
+            params["workspace_path"] = job_spec.workspace_path
+            params["queue_file"] = str(self.queue_service.queue_file_path)
             # Build JobRunRequest from queued parameters
             from services.job_runner import build_job_request_from_mapping
             request = build_job_request_from_mapping(params)
             progress_tracker = QueueRuntimeProgressTracker(
                 lambda snapshot, jid=job_spec.job_id: self._update_job_progress_snapshot(jid, snapshot)
             )
-            request = replace(request, progress_tracker=progress_tracker)
+            request = replace(
+                request,
+                progress_tracker=progress_tracker,
+                publication_context=self.queue_service.publication_context(lease),
+            )
             
             
             # 计算工作区路径（基于项目名称和任务ID）
-            import os
-            base_output_dir = os.path.join(os.getcwd(), "output")
-            workspace_path = os.path.join(base_output_dir, f"{project_name}__{job_spec.job_id}")
+            workspace_path = str(Path(job_spec.workspace_path).expanduser().resolve())
             
             # 获取工作区锁
             workspace_lock = self._get_workspace_lock(workspace_path)
@@ -476,24 +2021,27 @@ class QueueRunner:
                 result = self.job_runner.run(request, cancel_token=cancel_token)
             
             # 最后检查一次任务状态
+            if self._lease_is_lost(job_spec.job_id):
+                raise RuntimeError(f"queue lease lost for job {job_spec.job_id}")
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
             
             # 更新当前阶段
             self._update_job_stage(job_spec.job_id, "completing")
             self._update_job_runtime_info(job_spec.job_id, {
                 "workspace_path": result.workspace_path,
+                "canonical_output_root": job_spec.canonical_output_root,
                 "log_path": result.log_path if hasattr(result, 'log_path') else job_spec.log_path,
                 "produced_artifacts": result.produced_artifacts if hasattr(result, 'produced_artifacts') else [],
             })
             
             job_status = str(getattr(result, "job_status", "failed") or "failed")
             if job_status == "completed":
-                # 更新任务状态为完成
-                self.queue_service.update_job_state(job_spec.job_id, QueueState.COMPLETED)
-                
-                # 更新任务结果和工件信息
+                # Persist the result while the producing worker still owns
+                # the lease; a reclaimed worker must not publish a late
+                # result after the terminal transition.
                 result_summary = {
                     "exit_code": result.exit_code,
                     "message": result.message,
@@ -501,60 +2049,146 @@ class QueueRunner:
                     "job_id": result.job_id,
                     "resume_state": result.resume_state,
                 }
-                self.queue_service.set_job_result(job_spec.job_id, result_summary)
+                if not self._set_job_result(job_spec.job_id, result_summary):
+                    raise RuntimeError(f"queue lease lost before result publication for {job_spec.job_id}")
+                # 更新任务状态为完成
+                self._release_job(job_spec.job_id, QueueState.COMPLETED)
             else:
                 # 检查是否因为取消而失败
                 # Queue lifecycle follows canonical execution status.  The
                 # legacy success projection describes canonical readiness.
                 if job_status == "cancelled":
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+                    self._release_job(job_spec.job_id, QueueState.CANCELLED)
                 else:
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                    self.queue_service.set_job_error(job_spec.job_id, result.message)
+                    self._release_job(
+                        job_spec.job_id,
+                        QueueState.FAILED,
+                        error_message=str(getattr(result, "message", "") or ""),
+                    )
         except JobCancelledError:
-            self.queue_service.update_job_state(job_spec.job_id, QueueState.CANCELLED)
+            self._acknowledge_cancelled(job_spec.job_id)
         except Exception as e:
+            if self._lease_is_lost(job_spec.job_id):
+                # The old worker no longer owns the durable lease.  Leaving
+                # the runtime RUNNING lets another process recover it after
+                # expiry; this worker must not release or complete it.
+                return
             # 检查是否是因为取消而导致的异常
             runtime = self.queue_service.get_job_runtime(job_spec.job_id)
-            if runtime and runtime.state == QueueState.CANCELLED:
+            if runtime and (runtime.state == QueueState.CANCELLED or runtime.cancel_requested):
+                self._acknowledge_cancelled(job_spec.job_id)
                 return
-            self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-            self.queue_service.set_job_error(job_spec.job_id, str(e))
+            self._release_job(job_spec.job_id, QueueState.FAILED, error_message=str(e))
         finally:
+            self._clear_heartbeat(job_spec.job_id)
             with self._lock:
                 if job_spec.job_id in self._cancel_tokens:
                     del self._cancel_tokens[job_spec.job_id]
+                self._leases.pop(job_spec.job_id, None)
     
     def _update_job_stage(self, job_id: str, stage: str) -> None:
         """更新任务的当前阶段"""
-        with self._lock:
-            if job_id in self.queue_service._runtimes:
-                self.queue_service._runtimes[job_id].current_stage = stage
-                self.queue_service._save()
+        self._heartbeat(job_id)
+        lease = self._leases.get(job_id)
+        if lease is None or not self.queue_service.update_job_stage_with_lease(
+            job_id,
+            stage,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        ):
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while updating stage for {job_id}")
+
+    def _heartbeat(self, job_id: str) -> None:
+        if self._lease_is_lost(job_id):
+            raise RuntimeError(f"queue lease lost for job {job_id}")
+        lease = self._leases.get(job_id)
+        if lease is None:
+            return
+        if not self.queue_service.heartbeat(
+            job_id,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+            lease_seconds=120,
+        ):
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost for job {job_id}")
+
+    def _release_job(
+        self,
+        job_id: str,
+        state: QueueState,
+        *,
+        error_message: str | None = None,
+    ) -> None:
+        lease_lost = self._stop_heartbeat(job_id)
+        if lease_lost:
+            raise RuntimeError(f"queue lease lost for job {job_id}")
+        lease = self._leases.get(job_id)
+        if lease is None:
+            self.queue_service.update_job_state(job_id, state)
+            if error_message:
+                self.queue_service.set_job_error(job_id, error_message)
+            return
+        if not self.queue_service.release_lease(
+            job_id,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+            state=state,
+            error_message=error_message,
+        ):
+            raise RuntimeError(f"queue lease release lost for job {job_id}")
     
     def _update_job_runtime_info(self, job_id: str, info: Dict[str, Any]) -> None:
         """更新任务的运行时信息"""
-        with self._lock:
-            if job_id in self.queue_service._runtimes:
-                runtime = self.queue_service._runtimes[job_id]
-                if 'workspace_path' in info:
-                    runtime.workspace_path = info['workspace_path']
-                if 'log_path' in info:
-                    runtime.log_path = info['log_path']
-                if 'produced_artifacts' in info:
-                    runtime.produced_artifacts = info['produced_artifacts']
-                self.queue_service._save()
+        self._heartbeat(job_id)
+        lease = self._leases.get(job_id)
+        if lease is None:
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while publishing runtime info for {job_id}")
+        if not self.queue_service.update_job_runtime_info_with_lease(
+            job_id,
+            info,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        ):
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while updating runtime info for {job_id}")
 
     def _update_job_progress_snapshot(self, job_id: str, snapshot: Dict[str, Any]) -> None:
         """Persist the latest workflow progress snapshot for GUI queue inspection."""
-        with self._lock:
-            if job_id in self.queue_service._runtimes:
-                runtime = self.queue_service._runtimes[job_id]
-                runtime.progress_snapshot = dict(snapshot)
-                stage = str(snapshot.get("stage") or "").strip()
-                if stage:
-                    runtime.current_stage = stage
-                self.queue_service._save()
+        lease = self._leases.get(job_id)
+        if lease is None or not self.queue_service.update_job_progress_snapshot_with_lease(
+            job_id,
+            snapshot,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        ):
+            self._mark_lease_lost(job_id)
+            raise RuntimeError(f"queue lease lost while updating progress for {job_id}")
+
+    def _set_job_result(self, job_id: str, result_summary: Dict[str, Any]) -> bool:
+        lease = self._leases.get(job_id)
+        if lease is None:
+            return False
+        return self.queue_service.set_job_result_with_lease(
+            job_id,
+            result_summary,
+            lease_id=lease.lease_id,
+            worker_id=lease.worker_id,
+            lease_generation=lease.lease_generation,
+            fence_token=lease.fence_token,
+        )
 
     def run(self) -> None:
         with self._lock:
@@ -563,8 +2197,9 @@ class QueueRunner:
             self._running = True
 
         try:
+            self.queue_service.recover_expired_leases()
             processed_ids: set = set()
-            max_passes = len(self.queue_service._jobs) * 2 + 10  # safety bound
+            max_passes = len(self.queue_service.list_jobs()) * 2 + 10  # safety bound
             passes = 0
             while passes < max_passes:
                 passes += 1
@@ -610,6 +2245,9 @@ class QueueRunner:
     def stop(self) -> None:
         with self._lock:
             self._running = False
+            heartbeat_stops = list(self._heartbeat_stops.values())
+        for stop_event in heartbeat_stops:
+            stop_event.set()
 
     def cancel_job(self, job_id: str) -> bool:
         """取消指定的任务
@@ -620,12 +2258,11 @@ class QueueRunner:
         Returns:
             是否成功取消
         """
-        # 先标记任务状态为CANCELLED
         runtime = self.queue_service.get_job_runtime(job_id)
-        if not runtime or runtime.state != QueueState.RUNNING:
+        if not runtime or runtime.state not in (QueueState.PENDING, QueueState.RUNNING):
             return False
-        
-        self.queue_service.update_job_state(job_id, QueueState.CANCELLED)
+
+        self.queue_service.request_cancel(job_id, reason="queue_runner_cancel")
         
         # 如果任务正在运行，请求取消令牌
         with self._lock:
@@ -640,10 +2277,12 @@ class QueueRunner:
             return False
         
         runtime = self.queue_service.get_job_runtime(job_id)
-        if not runtime or runtime.state not in (QueueState.PENDING, QueueState.FAILED):
+        if not runtime or runtime.state not in (QueueState.PENDING, QueueState.FAILED, QueueState.CANCELLED):
             return False
         
         # 重置任务状态
         self.queue_service.reset_job(job_id)
+        self.queue_service.clear_cancel_request(job_id)
+        self._clear_external_cancel(job)
         self._process_job(job)
         return True

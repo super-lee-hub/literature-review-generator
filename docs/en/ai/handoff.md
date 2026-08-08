@@ -22,7 +22,7 @@ Current documentation division:
 - PDF folder input
 - Zotero report + Zotero library input
 - CLI, GUI, and repo-local Codex skill — three entry points
-- Stage 1 summaries / Stage 2 outline / Stage 3 review draft
+- Stage 1 summaries / Outline Intelligence v3 / Stage 3 review draft
 - GUI background queue, checkpoint resume, summary reuse, preprocess cache, validation/repair, optional local RAG
 
 It should no longer be understood as a "single-script literature review generator" but as a local workbench with workspace / artifact / GUI background queue infrastructure.
@@ -56,7 +56,7 @@ Key notes: `summary_schema.py` is the canonical summary fact source; `services/j
 
 Recommended convention: secrets in `.env`, non-sensitive parameters in `config.ini`.
 
-Key config sections: `Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Retry_Settings`, `Stage2_Retry`, `Validation`, `Styling`, `GUI`, `API_Parameters`
+Key config sections: `Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Runtime`, `Validation`, `Styling`, `GUI`. Provider-owned output limits, context limits, timeouts, and transport retry ceilings live in the relevant provider section.
 
 Key environment variables: `LLM_PRIMARY_READER_API`, `LLM_BACKUP_READER_API`, `LLM_WRITER_API`, `LLM_OUTLINE_API`, `LLM_FREE_MODE_API`, `LLM_VALIDATOR_API`, `MINERU_*`
 
@@ -72,7 +72,7 @@ When updating README or introducing the project, at minimum cover:
 - partial rerun / failed retry
 - preprocess cache + OCR fallback
 - free mode profile / idea
-- review_draft_v2 + citation_manifest_v3
+- review_draft (artifact_version=v3) + citation_manifest_v3
 - optional validation / repair
 - optional local RAG
 - AI-native runtime bridge + `source_bundle.json` / `runtime_stage_trace.json`
@@ -83,7 +83,7 @@ Default understanding of this project:
 
 - A local AI literature analysis / review-writing workbench built on job workspace / artifact / GUI background queue infrastructure
 - Entry points: `main.py` CLI, `launch_gui.py` + `gui/app.py` GUI, and repo-local Codex skill
-- Stage 1 truth is canonical summaries; Stage 3 truth is `review_draft_v2 + citation_manifest_v3`
+- Stage 1 truth is canonical summaries; Stage 3 truth is `review_draft (artifact_version=v3) + citation_manifest_v3`
 - `README.md` is now only a router page; user details in `README.zh-CN.md` / `README.en.md`
 - For deeper artifact / compatibility details, see `docs/en/runtime/`
 

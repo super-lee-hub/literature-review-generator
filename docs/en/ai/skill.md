@@ -5,17 +5,17 @@
 
 ## Intent
 
-- Add a third entry surface alongside CLI and GUI
+- Provide the Codex/OMX entry surface alongside the single `reviewctl` control plane and GUI
 - Reuse the current durable substrate (`services/job_runner.py`, `services/job_workspace.py`, `services/artifact_registry.py`, `services/progress_state.py`, `validator.py`)
 - Keep deterministic lifecycle / persistence / render / validation transitions local
-- Route generation stages through subagents, not legacy CLI shelling or external-API wrappers
+- Route generation stages through the internal runtime executor, not shelling or external stage wrappers
 
 ## Canonical Constraints
 
 1. `services.job_runner.JobRunRequest` remains the canonical request model
 2. CLI and GUI remain first-class human surfaces; do not replace them
-3. AI mode is additive and out-of-queue for MVP, but must remain workspace-compatible
-4. Canonical downstream artifacts remain: summaries, markdown outline, `review_draft_v2`, `citation_manifest_v3`, docx, validation/repair artifacts
+3. AI mode is bound to the current durable job workspace and internal executor registry
+4. Canonical downstream artifacts are summaries, registered Outline v3 artifacts, `review_draft` (artifact_version=v3), `citation_manifest_v3`, docx, and validation/repair artifacts
 
 ## Primary Runtime Helpers
 
@@ -32,7 +32,7 @@
 2. Compile it into canonical `JobRunRequest`
 3. Build source intake bundles locally
 4. Bootstrap workspace / registry / resume state locally
-5. Delegate generation stages to subagents: Stage 1 analyze, Stage 2 outline, Stage 3 review
+5. Delegate generation stages through the internal Stage 1, Outline v3, and Stage 3 executors
 6. Persist outputs through existing canonical artifact helpers
 7. Run validation locally through existing validation seams
 8. Register runtime stage trace artifacts so execution mode is observable
@@ -42,5 +42,5 @@
 - Do not shell out to `python main.py ...` as the canonical AI runtime
 - Do not introduce a second peer request model
 - Do not bypass latest-pointer / artifact-registry / resume-state behavior
-- Do not replace `review_draft_v2` / `citation_manifest_v3` with alternate canonical schemas
+- Do not replace the current `review_draft` / `citation_manifest_v3` contracts with alternate schemas
 - Do not treat summary-only evidence as validation truth when richer artifact evidence exists

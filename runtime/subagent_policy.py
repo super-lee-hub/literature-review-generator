@@ -17,7 +17,6 @@ class StageExecutionPolicy:
     max_concurrency: int
     total_attempt_budget: int
     quality_retry_budget: int = 0
-    legacy_api_path_allowed: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -44,7 +43,6 @@ DEFAULT_STAGE_POLICIES: dict[str, StageExecutionPolicy] = {
         execution_mode=ExecutionMode.LOCAL,
         max_concurrency=1,
         total_attempt_budget=1,
-        legacy_api_path_allowed=False,
     ),
     "stage2_outline": StageExecutionPolicy(
         stage_name="stage2_outline",
@@ -95,7 +93,6 @@ def build_runtime_stage_trace_entry(
     step_name: str,
     producer: str,
     subagent_run_id: str | None = None,
-    legacy_api_path_used: bool = False,
     metadata: Dict[str, Any] | None = None,
     execution_mode: ExecutionMode | str | None = None,
 ) -> Dict[str, Any]:
@@ -107,6 +104,5 @@ def build_runtime_stage_trace_entry(
         "execution_mode": resolved_execution_mode or policy.execution_mode.value,
         "producer": producer,
         "subagent_run_id": subagent_run_id,
-        "legacy_api_path_used": legacy_api_path_used,
         "metadata": dict(metadata or {}),
     }

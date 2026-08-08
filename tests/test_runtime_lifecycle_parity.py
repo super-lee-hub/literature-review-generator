@@ -15,6 +15,7 @@ from runtime.lifecycle import (
 )
 from services.job_runner import JobRunRequest, JobRunner
 from services.job_workspace import JobWorkspace, atomic_write_json
+from services.source_inventory import build_source_inventory
 
 
 class _DummyGenerator:
@@ -24,6 +25,18 @@ class _DummyGenerator:
 
     def bind_job_workspace(self, **kwargs: Any) -> None:
         self.bound = dict(kwargs)
+
+
+def _source_inventory(root: Path) -> Any:
+    pdf = root / "papers" / "fixture.pdf"
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.4\nfixture")
+    return build_source_inventory(
+        source_mode="direct",
+        project_name="demo",
+        pdf_root=pdf.parent,
+        pdf_paths=[pdf],
+    )
 
 
 def _write_resume_report(workspace: JobWorkspace, report: Any) -> str:
@@ -64,6 +77,7 @@ def _concurrent_explicit_bootstrap_worker(
             project_name="demo",
             source_snapshot={"pdf_folder": str(root / "papers")},
             request_snapshot={"action": "run_all"},
+            source_inventory=_source_inventory(root),
             build_workspace=blocking_build_workspace,
             write_resume_report=_write_resume_report,
             publish_running_state=False,
@@ -89,6 +103,7 @@ def test_bootstrap_and_finalize_runtime_match_pointer_contract(tmp_path: Path) -
         project_name="demo",
         source_snapshot={"pdf_folder": str(tmp_path / "papers")},
         request_snapshot={"action": "run_all"},
+        source_inventory=_source_inventory(tmp_path),
         build_workspace=runner._build_workspace,
         write_resume_report=_write_resume_report,
     )
@@ -181,6 +196,7 @@ def test_resume_does_not_steal_latest_pointer_from_newer_job(tmp_path: Path) -> 
         project_name="demo",
         source_snapshot={"pdf_folder": str(tmp_path / "papers")},
         request_snapshot={"action": "run_all", "attempt": "resume"},
+        source_inventory=_source_inventory(tmp_path),
         build_workspace=runner._build_workspace,
         write_resume_report=_write_resume_report,
         claim_latest_pointer=False,
@@ -214,6 +230,7 @@ def test_running_outcome_is_durable_before_latest_pointer_update(
         project_name="demo",
         source_snapshot={"pdf_folder": str(tmp_path / "papers")},
         request_snapshot={"action": "run_all"},
+        source_inventory=_source_inventory(tmp_path),
         build_workspace=runner._build_workspace,
         write_resume_report=_write_resume_report,
         publish_running_state=False,
@@ -256,6 +273,7 @@ def test_bootstrap_rejects_non_boolean_readiness_policy(tmp_path: Path) -> None:
             project_name="demo",
             source_snapshot={"pdf_folder": str(tmp_path / "papers")},
             request_snapshot={"action": "run_all"},
+            source_inventory=_source_inventory(tmp_path),
             build_workspace=runner._build_workspace,
             write_resume_report=_write_resume_report,
         )

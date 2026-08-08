@@ -19,7 +19,11 @@ from services.dependency_lifecycle import (
     guard_artifact_delete,
     materialize_external_dependency,
 )
-from services.job_outcome import JobOutcomeV1
+from services.job_outcome import (
+    JobOutcomeV1,
+    load_canonical_job_outcome,
+    validate_job_outcome_compatibility_projection,
+)
 from services.job_workspace import JobWorkspace, atomic_write_json
 
 
@@ -101,6 +105,13 @@ def test_force_break_writes_child_audit_and_invalidates_artifact_and_outcome(tmp
         path=outcome_path,
         producer="test",
         artifact_id="job_outcome",
+        metadata={
+            "job_status": outcome.job_status,
+            "job_disposition": outcome.job_disposition,
+            "canonical_ready": outcome.canonical_ready,
+            "requires_attention": outcome.requires_attention,
+            "outcome_revision": outcome.outcome_revision,
+        },
     )
 
     audit_paths = guard_artifact_delete(
@@ -121,11 +132,21 @@ def test_force_break_writes_child_audit_and_invalidates_artifact_and_outcome(tmp
     assert child is not None
     assert child.status == "invalid"
     assert child.metadata["requires_attention"] is True
-    updated_outcome = JobOutcomeV1.from_dict(json.loads(outcome_path.read_text(encoding="utf-8")))
+    updated_outcome, updated_record = load_canonical_job_outcome(child_registry)
+    projection = validate_job_outcome_compatibility_projection(
+        outcome_path,
+        child_registry,
+    )
+    assert Path(updated_record.path).resolve() != outcome_path.resolve()
+    assert projection.canonical_job_outcome_artifact_hash == updated_record.content_hash
     assert updated_outcome.job_disposition == "needs_review"
     assert updated_outcome.canonical_ready is False
     assert updated_outcome.requires_attention is True
     assert updated_outcome.outcome_revision == 2
+    assert updated_record.metadata["job_disposition"] == "needs_review"
+    assert updated_record.metadata["canonical_ready"] is False
+    assert updated_record.metadata["requires_attention"] is True
+    assert updated_record.metadata["outcome_revision"] == 2
     assert find_external_dependents(output, external) == ()
 
 

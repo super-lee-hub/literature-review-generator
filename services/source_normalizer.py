@@ -3,9 +3,8 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Mapping, cast
+from typing import Any, Dict, Iterable, List, Mapping
 
-from models import PaperInfo
 from services.paper_identity import build_paper_key, normalize_doi
 
 
@@ -81,23 +80,3 @@ def normalize_source_papers(source_mode: str, papers: Iterable[Mapping[str, Any]
             )
         )
     return normalized
-
-
-def project_descriptors_to_legacy_papers(
-    papers: Iterable[Mapping[str, Any]],
-    descriptors: Iterable[SourcePaperDescriptor],
-) -> List[PaperInfo]:
-    projected: List[PaperInfo] = []
-    for paper, descriptor in zip(papers, descriptors):
-        enriched = dict(paper)
-        enriched["source_mode"] = descriptor.source_mode
-        enriched["source_paper_id"] = descriptor.source_paper_id
-        enriched["canonical_paper_key"] = descriptor.canonical_paper_key
-        enriched["paper_key_aliases"] = list(descriptor.paper_key_aliases)
-        enriched["source_pdf"] = descriptor.source_pdf
-        enriched["source_pdf_fingerprint"] = descriptor.source_pdf_fingerprint
-        enriched["metadata_confidence"] = descriptor.metadata_confidence
-        enriched["metadata_source_priority_snapshot"] = list(descriptor.metadata_source_priority_snapshot)
-        enriched["source_descriptor"] = descriptor.to_dict()
-        projected.append(cast(PaperInfo, enriched))
-    return projected

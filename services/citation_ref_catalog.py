@@ -384,7 +384,7 @@ def validate_citation_refs(
 
 
 def validate_raw_citation_text(catalog: Mapping[str, Any], text: str) -> Dict[str, Any]:
-    """Validate raw Stage 2 text before it becomes canonical review_draft_v2."""
+    """Validate raw outline text before it becomes the canonical review draft."""
 
     raw_text = str(text or "")
     active_ids = {

@@ -5,13 +5,17 @@ import json
 import math
 import os
 import re
-from dataclasses import asdict, dataclass
+import shutil
+import tempfile
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import fitz  # type: ignore
 
-from services.artifact_registry import ArtifactDependencyRef, ArtifactRegistry, file_sha256
-from services.job_workspace import atomic_write_json, utc_now_iso
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from services.job_workspace import publish_bytes_artifact, publish_json_artifact, utc_now_iso
+from services.queue_service import LocalPublicationContext
 
 
 _VISUAL_KEYWORDS = (
@@ -186,6 +190,10 @@ class Stage1VisualArtifactBuilder:
         os.makedirs(bundle_dir, exist_ok=True)
         bundle_path = os.path.join(bundle_dir, "visual_bundle.json")
         manifest_path = os.path.join(bundle_dir, "visual_manifest.json")
+        publication_context = (
+            getattr(artifact_registry, "publication_context", None)
+            or LocalPublicationContext()
+        )
 
         page_index = self._load_page_index(preprocess_metadata)
         page_blocks = self._load_page_blocks(preprocess_metadata)
@@ -206,113 +214,119 @@ class Stage1VisualArtifactBuilder:
         page_candidates = self._select_page_candidates(page_index, policy)
         figure_candidates = self._select_figure_candidates(page_blocks, page_index, policy)
 
-        selected_visuals = self._materialize_visuals(
-            source_pdf=source_pdf,
-            page_candidates=page_candidates,
-            figure_candidates=figure_candidates,
-            policy=policy,
-            bundle_dir=bundle_dir,
-            paper_key=paper_key,
-            artifact_hash=artifact_hash,
-        )
-
-        created_at = utc_now_iso()
-        budget_decisions = {
-            "candidate_counts": {
-                "page_snapshot": len(page_candidates),
-                "figure_crop": len(figure_candidates),
-                "table_crop": 0,
-            },
-            "selected_counts": {
-                "page_snapshot": sum(1 for item in selected_visuals if item.artifact_type == "page_snapshot"),
-                "figure_crop": sum(1 for item in selected_visuals if item.artifact_type == "figure_crop"),
-                "table_crop": 0,
-                "total": len(selected_visuals),
-            },
-            "deferred_artifact_types": ["table_crop"],
-        }
-
-        manifest_payload = {
-            "artifact_type": "visual_manifest",
-            "artifact_version": "v1",
-            "created_from_job_id": job_id,
-            "created_at": created_at,
-            "paper_key": paper_key,
-            "paper_title": str(paper_info.get("title") or ""),
-            "source_pdf": source_pdf,
-            "bundle_dir": bundle_dir,
-            "selection_policy": policy,
-            "budget_decisions": budget_decisions,
-            "visuals": [item.to_ref() for item in selected_visuals],
-        }
-        atomic_write_json(manifest_path, manifest_payload)
-
-        for visual in selected_visuals:
-            artifact_registry.register_file(
-                artifact_role=visual.artifact_type,
-                artifact_type=visual.artifact_type,
-                artifact_version="v1",
-                path=visual.image_path,
-                producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
-                depends_on=depends_on,
-                artifact_id=visual.artifact_id,
+        render_dir = tempfile.mkdtemp(prefix=".visual-render-", dir=bundle_dir)
+        try:
+            selected_visuals = self._materialize_visuals(
+                source_pdf=source_pdf,
+                page_candidates=page_candidates,
+                figure_candidates=figure_candidates,
+                policy=policy,
+                bundle_dir=render_dir,
+                paper_key=paper_key,
+                artifact_hash=artifact_hash,
             )
 
-        manifest_dependencies = list(depends_on)
-        for visual in selected_visuals:
-            manifest_dependencies.append(
-                ArtifactDependencyRef(
+            created_at = utc_now_iso()
+            budget_decisions = {
+                "candidate_counts": {
+                    "page_snapshot": len(page_candidates),
+                    "figure_crop": len(figure_candidates),
+                    "table_crop": 0,
+                },
+                "selected_counts": {
+                    "page_snapshot": sum(1 for item in selected_visuals if item.artifact_type == "page_snapshot"),
+                    "figure_crop": sum(1 for item in selected_visuals if item.artifact_type == "figure_crop"),
+                    "table_crop": 0,
+                    "total": len(selected_visuals),
+                },
+                "deferred_artifact_types": ["table_crop"],
+            }
+
+            published_visuals: list[VisualArtifactRecord] = []
+            visual_records: list[Any] = []
+            for visual in selected_visuals:
+                image_target = os.path.join(bundle_dir, os.path.basename(visual.image_path))
+                image_record = publish_bytes_artifact(
+                    publication_context,
+                    artifact_registry,
+                    image_target,
+                    Path(visual.image_path).read_bytes(),
+                    artifact_role=visual.artifact_type,
                     artifact_type=visual.artifact_type,
-                    path=visual.image_path,
+                    artifact_version="v1",
+                    producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+                    depends_on=depends_on,
+                    artifact_id=visual.artifact_id,
                 )
-            )
-        artifact_registry.register_file(
-            artifact_role="visual_manifest",
-            artifact_type="visual_manifest",
-            artifact_version="v1",
-            path=manifest_path,
-            producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
-            depends_on=manifest_dependencies,
-            artifact_id=f"visual_manifest:{artifact_hash}",
-        )
+                visual_records.append(image_record)
+                published_visuals.append(replace(visual, image_path=image_record.path))
 
-        bundle = Stage1VisualBundle(
-            artifact_type="stage1_visual_bundle",
-            artifact_version="v1",
-            created_from_job_id=job_id,
-            created_at=created_at,
-            paper_key=paper_key,
-            source_pdf=source_pdf,
-            bundle_path=bundle_path,
-            visual_manifest_path=manifest_path,
-            selected_visual_refs=[item.to_ref() for item in selected_visuals],
-            selection_policy_snapshot=policy,
-            bundle_metadata=budget_decisions,
-        )
-        atomic_write_json(bundle_path, bundle.to_dict())
-        bundle_dependencies = [
-            ArtifactDependencyRef(
+            manifest_payload = {
+                "artifact_type": "visual_manifest",
+                "artifact_version": "v1",
+                "created_from_job_id": job_id,
+                "created_at": created_at,
+                "paper_key": paper_key,
+                "paper_title": str(paper_info.get("title") or ""),
+                "source_pdf": source_pdf,
+                "bundle_dir": bundle_dir,
+                "selection_policy": policy,
+                "budget_decisions": budget_decisions,
+                "visuals": [item.to_ref() for item in published_visuals],
+            }
+            manifest_dependencies = [*depends_on, *(
+                ArtifactDependencyRefV2.from_record(record)
+                for record in visual_records
+            )]
+            manifest_record = publish_json_artifact(
+                publication_context,
+                artifact_registry,
+                manifest_path,
+                manifest_payload,
+                artifact_role="visual_manifest",
                 artifact_type="visual_manifest",
-                path=manifest_path,
+                artifact_version="v1",
+                producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+                depends_on=manifest_dependencies,
+                artifact_id=f"visual_manifest:{artifact_hash}",
             )
-        ]
-        for visual in selected_visuals:
-            bundle_dependencies.append(
-                ArtifactDependencyRef(
-                    artifact_type=visual.artifact_type,
-                    path=visual.image_path,
-                )
+
+            bundle = Stage1VisualBundle(
+                artifact_type="stage1_visual_bundle",
+                artifact_version="v1",
+                created_from_job_id=job_id,
+                created_at=created_at,
+                paper_key=paper_key,
+                source_pdf=source_pdf,
+                bundle_path=bundle_path,
+                visual_manifest_path=manifest_record.path,
+                selected_visual_refs=[item.to_ref() for item in published_visuals],
+                selection_policy_snapshot=policy,
+                bundle_metadata=budget_decisions,
             )
-        artifact_registry.register_file(
-            artifact_role="visual_bundle",
-            artifact_type="stage1_visual_bundle",
-            artifact_version="v1",
-            path=bundle_path,
-            producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
-            depends_on=bundle_dependencies,
-            artifact_id=f"stage1_visual_bundle:{artifact_hash}",
-        )
-        return bundle
+            bundle_dependencies = [ArtifactDependencyRefV2.from_record(manifest_record), *(
+                ArtifactDependencyRefV2.from_record(record)
+                for record in visual_records
+            )]
+            bundle_record = publish_json_artifact(
+                publication_context,
+                artifact_registry,
+                bundle_path,
+                bundle.to_dict(),
+                artifact_role="visual_bundle",
+                artifact_type="stage1_visual_bundle",
+                artifact_version="v1",
+                producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+                depends_on=bundle_dependencies,
+                artifact_id=f"stage1_visual_bundle:{artifact_hash}",
+            )
+            return replace(
+                bundle,
+                bundle_path=bundle_record.path,
+                visual_manifest_path=manifest_record.path,
+            )
+        finally:
+            shutil.rmtree(render_dir, ignore_errors=True)
 
     def _build_base_dependencies(
         self,
@@ -320,7 +334,7 @@ class Stage1VisualArtifactBuilder:
         pdf_hash: str,
         preprocess_metadata: Mapping[str, Any],
         artifact_registry: ArtifactRegistry,
-    ) -> List[ArtifactDependencyRef]:
+    ) -> List[ArtifactDependencyRefV2]:
         source_dependency = self._registered_input_dependency(
             artifact_registry,
             artifact_type="source_pdf",
@@ -351,7 +365,7 @@ class Stage1VisualArtifactBuilder:
         *,
         artifact_type: str,
         path: str,
-    ) -> ArtifactDependencyRef:
+    ) -> ArtifactDependencyRefV2:
         resolved_path = os.path.abspath(path)
         normalized_path = os.path.normcase(resolved_path)
         candidates = [
@@ -379,7 +393,7 @@ class Stage1VisualArtifactBuilder:
                 producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
                 artifact_id=f"visual-input:{artifact_type}:{path_hash}",
             )
-        return ArtifactDependencyRef(
+        return ArtifactDependencyRefV2(
             artifact_type=record.artifact_type,
             path=record.path,
             content_hash=record.content_hash,

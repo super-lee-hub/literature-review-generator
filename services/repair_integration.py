@@ -11,7 +11,7 @@ import os
 from typing import Any, Dict, List, Optional, Sequence
 
 from services.job_workspace import JobWorkspace, atomic_write_json
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.repair_policy import (
     ValidationRepairPolicy,
     auto_safe_apply_enabled,
@@ -33,6 +33,19 @@ APPLIED_PATCH_RECORD_ARTIFACT_TYPE = "applied_patch_record"
 CITATION_MANIFEST_ARTIFACT_TYPE = "citation_manifest"
 
 
+def _registered_dependency(
+    registry: ArtifactRegistry,
+    artifact_id: str,
+    *,
+    require_ready: bool = True,
+) -> ArtifactDependencyRefV2:
+    record = registry.get(str(artifact_id))
+    if record is None or (require_ready and record.status != "ready"):
+        expected = "ready current" if require_ready else "registered current"
+        raise ValueError(f"repair dependency is not a {expected} artifact: {artifact_id}")
+    return ArtifactDependencyRefV2.from_record(record)
+
+
 def persist_repair_plan(
     repair_plan: RepairPlan,
     workspace: JobWorkspace,
@@ -50,10 +63,8 @@ def persist_repair_plan(
         path=plan_path,
         producer="services.repair_integration.persist_repair_plan",
         job_id=repair_plan.created_from_job_id,
-        status="completed",
-        depends_on=[
-            {"artifact_id": repair_plan.validation_report_id, "role": "validation_report"},
-        ],
+        status="ready",
+        depends_on=[_registered_dependency(registry, repair_plan.validation_report_id)],
     )
     
     return plan_path
@@ -76,10 +87,8 @@ def persist_repair_report(
         path=report_path,
         producer="services.repair_integration.persist_repair_report",
         job_id=repair_report.created_from_job_id,
-        status="completed",
-        depends_on=[
-            {"artifact_id": repair_report.plan_id, "role": "repair_plan"},
-        ],
+        status="quarantined",
+        depends_on=[_registered_dependency(registry, f"repair_plan_{repair_report.plan_id}")],
     )
     
     return report_path
@@ -107,10 +116,8 @@ def persist_repair_apply_result(
         path=result_path,
         producer="services.repair_integration.persist_repair_apply_result",
         job_id=job_id,
-        status="completed",
-        depends_on=[
-            {"artifact_id": apply_result.plan_id, "role": "repair_plan"},
-        ],
+        status="quarantined",
+        depends_on=[_registered_dependency(registry, f"repair_plan_{apply_result.plan_id}")],
     )
     
     # Also persist individual patch records
@@ -125,10 +132,8 @@ def persist_repair_apply_result(
             path=record_path,
             producer="services.repair_integration.persist_repair_apply_result",
             job_id=job_id,
-            status="completed",
-            depends_on=[
-                {"artifact_id": apply_result.plan_id, "role": "repair_plan"},
-            ],
+            status="quarantined",
+            depends_on=[_registered_dependency(registry, f"repair_plan_{apply_result.plan_id}")],
         )
     
     return result_path
@@ -142,7 +147,7 @@ def persist_patched_citation_manifest(
     job_id: str,
 ) -> str:
     """Persist the manifest mutated by auto-safe structural repair."""
-    artifact_version = str(citation_manifest.get("artifact_version") or "v1")
+    artifact_version = str(citation_manifest.get("artifact_version") or "v3")
     manifest_path = workspace.artifact_path(f"citation_manifests/repaired_citation_manifest_{job_id}.json")
 
     atomic_write_json(manifest_path, citation_manifest)
@@ -154,9 +159,13 @@ def persist_patched_citation_manifest(
         path=manifest_path,
         producer="services.repair_integration.persist_patched_citation_manifest",
         job_id=job_id,
-        status="completed",
+        status="quarantined",
         depends_on=[
-            {"artifact_id": f"repair_apply_result_{apply_result.plan_id}", "role": "repair_apply_result"},
+            _registered_dependency(
+                registry,
+                f"repair_apply_result_{apply_result.plan_id}",
+                require_ready=False,
+            )
         ],
         artifact_role="citation_manifest",
     )
@@ -175,6 +184,7 @@ def run_repair_pipeline(
     visual_manifest: Optional[Dict[str, Any]] = None,
     auto_apply: bool = False,  # Default is report-first
     repair_policy: str | ValidationRepairPolicy | None = None,
+    validation_service: Any | None = None,
 ) -> Dict[str, Any]:
     """Run the full Week 4 repair pipeline.
     
@@ -191,8 +201,6 @@ def run_repair_pipeline(
     from dataclasses import replace
     from validation.repair_planner import RepairPlanner
     from services.citation_manifest import unresolved_occurrences
-    from docx_writer import create_word_document, generate_apa_references_from_manifest
-    from validator import run_review_validation
     
     # 检查 citation manifest 是否完整
     if citation_manifest:
@@ -289,7 +297,6 @@ def run_repair_pipeline(
         
         # Step 5: Persist repaired manifest and regenerate downstream artifacts.
         if apply_result.get("patched_review_draft"):
-            patched_review_draft = apply_result["patched_review_draft"]
             patched_citation_manifest = apply_result.get("patched_citation_manifest") or citation_manifest
             manifest_path = persist_patched_citation_manifest(
                 patched_citation_manifest,
@@ -300,92 +307,106 @@ def run_repair_pipeline(
             )
             result["patched_citation_manifest_path"] = manifest_path
             
-            # Generate new review docx
-            docx_path = workspace.artifact_path(f"review_{job_id}_repaired.docx")
-            create_word_document(
-                docx_path,
-                "Repaired Literature Review",
-                ["Introduction", "Methodology", "Results", "Discussion", "Conclusion"],
-                "",
-                []
-            )
-            
-            # Generate APA references from new citation manifest
-            # Create a simple generator instance mock
-            class MockLogger:
-                def info(self, *args):
-                    pass
-                def warning(self, *args):
-                    pass
-                def error(self, *args):
-                    pass
-                def success(self, *args):
-                    pass
-                def warn(self, *args):
-                    pass
-                def debug(self, *args):
-                    pass
-            
-            class MockGenerator:
-                def __init__(self, workspace):
-                    self.logger = MockLogger()
-                    self.config = {
-                        'Performance': {'enable_stage2_validation': 'True'},
-                        'Paths': {'output_path': workspace.base_output_dir},
-                        'Primary_Reader_API': {'api_key': 'mock_key'},
-                        'Writer_API': {'api_key': 'mock_key'}
+            # A repair result is never promoted on the strength of a placeholder
+            # DOCX or a legacy validator adapter.  Register both repaired inputs
+            # as quarantined artifacts, rebuild the DOCX through the current
+            # service, and run the current validator against those exact files.
+            if validation_service is None:
+                result.update(
+                    {
+                        "recheck_status": "blocked",
+                        "recheck_success": False,
+                        "recheck_error": "current validation service is required for repair revalidation",
                     }
-                    self.compat_config = None
-                    self.output_dir = workspace.base_output_dir
-                    self.project_name = "repair"
-                    self.summaries = []
-                    self.failed_papers = []
-                    self.processed_count = type('Counter', (), {'value': 0, 'get_value': lambda self: self.value, 'set': lambda self, val: setattr(self, 'value', val)})()
-                    self.failed_count = type('Counter', (), {'value': 0, 'get_value': lambda self: self.value, 'set': lambda self, val: setattr(self, 'value', val)})()
-                    self.progress_tracker = None
-                    self.free_mode_profile_path = None
-                    self.free_mode_profile = None
-                    self.free_mode_idea = None
-                    self.cancel_token = None
-                    self.job_workspace = workspace
-                    self.artifact_registry = None
-                    self.job_fingerprint_bundle = {}
-                    self.resume_state_report = None
-                    self.queue_service = None
-                    self.mode = "direct"
-                    self.pdf_folder = None
-                    self.zotero_report = None
-                    self.library_path = None
-                    self.summary_file = workspace.artifact_path("repair_summaries.json")
-                    self.papers = []
-                    self.source_descriptors = []
-                    self.preprocess_manager = None
-                    self.save_lock = None
-                
-                def _get_summary_file_path(self):
-                    return self.summary_file
-                
-                def _get_report_file_path(self, suffix):
-                    return self.job_workspace.artifact_path(f"repair{suffix}")
-                
-                def _stage2_validation_enabled(self):
-                    return True
-            
-            mock_generator = MockGenerator(workspace)
-            generate_apa_references_from_manifest(
-                patched_citation_manifest,
-                mock_generator,
-                allow_compat_fallback=True,
-            )
-            
-            # Step 6: Run review recheck
-            try:
-                recheck_result = run_review_validation(mock_generator)
-                result["recheck_result"] = recheck_result
-                result["recheck_success"] = recheck_result.get("success", False)
-            except Exception as recheck_error:
-                result["recheck_error"] = str(recheck_error)
-                result["recheck_success"] = False
+                )
+            else:
+                docx_path = workspace.artifact_path(f"review_{job_id}_repaired.docx")
+                try:
+                    patched_draft = dict(apply_result.get("patched_review_draft") or review_draft)
+                    patched_draft_path = workspace.artifact_path(
+                        f"review_drafts/repaired_review_draft_{job_id}.json"
+                    )
+                    atomic_write_json(patched_draft_path, patched_draft)
+                    draft_record = registry.register(
+                        artifact_id=f"repaired_review_draft_{job_id}",
+                        artifact_type="review_draft_repaired",
+                        artifact_version="v1",
+                        path=patched_draft_path,
+                        producer="services.repair_integration.run_repair_pipeline",
+                        job_id=job_id,
+                        status="quarantined",
+                        depends_on=[
+                            _registered_dependency(
+                                registry,
+                                f"repair_apply_result_{apply_result_obj.plan_id}",
+                                require_ready=False,
+                            )
+                        ],
+                        artifact_role="review_draft_repaired",
+                    )
+                    validation_service.rebuild_review_docx(
+                        patched_draft,
+                        dict(patched_citation_manifest),
+                        docx_path,
+                    )
+                    manifest_record = registry.get(f"repaired_citation_manifest_{job_id}")
+                    if manifest_record is None:
+                        raise ValueError("repaired citation manifest was not registered")
+                    docx_record = registry.register(
+                        artifact_id=f"repaired_review_docx_{job_id}",
+                        artifact_type="review_docx_repaired",
+                        artifact_version="v1",
+                        path=docx_path,
+                        producer="services.repair_integration.run_repair_pipeline",
+                        job_id=job_id,
+                        status="quarantined",
+                        depends_on=[
+                            ArtifactDependencyRefV2.from_record(draft_record),
+                            ArtifactDependencyRefV2.from_record(manifest_record),
+                        ],
+                        artifact_role="review_docx_repaired",
+                    )
+                    revalidation = validation_service.revalidate_review_artifacts(
+                        review_draft_record=draft_record,
+                        citation_manifest_record=manifest_record,
+                        output_dir=workspace.artifact_path(
+                            f"repair_revalidation/{apply_result_obj.plan_id}"
+                        ),
+                        result_artifact_id=f"validation_run_result_repaired:{apply_result_obj.plan_id}",
+                    )
+                    revalidation_model = revalidation.get("validation_run_result")
+                    recheck_success = bool(
+                        getattr(revalidation_model, "contract_satisfied", False)
+                        and str(revalidation.get("validation_disposition") or "") == "clean"
+                        and bool(
+                            (revalidation.get("provider_receipt_closure") or {}).get("complete")
+                        )
+                    )
+                    result.update(
+                        {
+                            "recheck_status": "passed" if recheck_success else "failed",
+                            "recheck_success": recheck_success,
+                            "recheck_error": "" if recheck_success else "current-service semantic revalidation did not produce a clean closed result",
+                            "repaired_docx_path": docx_path,
+                            "repaired_artifact_ids": [
+                                draft_record.artifact_id,
+                                manifest_record.artifact_id,
+                                docx_record.artifact_id,
+                                str(revalidation.get("provider_receipt_closure_record_id") or ""),
+                            ],
+                            "revalidation_artifact_id": str(
+                                revalidation.get("provider_receipt_closure_record_id") or ""
+                            ),
+                        }
+                    )
+                except (OSError, TypeError, ValueError, RuntimeError) as recheck_error:
+                    result.update(
+                        {
+                            "recheck_status": "blocked",
+                            "recheck_success": False,
+                            "recheck_error": str(recheck_error),
+                        }
+                    )
     else:
         # Report-only mode
         if not repair_plan.proposals:

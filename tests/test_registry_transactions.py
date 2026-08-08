@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from runtime.reconcile import ReconcileValidationError, RuntimeReconciler
 from services import artifact_registry as artifact_registry_module
 from services.artifact_registry import (
     ArtifactConflict,
@@ -19,13 +20,136 @@ from services.artifact_registry import (
     UnverifiedDependency,
     RegistryLockTimeout,
     RegistryRevisionConflict,
+    file_sha256,
 )
+from services.job_workspace import JobWorkspace
 
 
 def _write_artifact(path: Path, value: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"value": value}), encoding="utf-8")
     return path
+
+
+def _pointer_payload(job_id: str, value: str) -> dict[str, str]:
+    return {
+        "artifact_type": "current_artifact_pointer",
+        "artifact_version": "v1",
+        "job_id": job_id,
+        "pointer_kind": "review",
+        "pointer_role": "current",
+        "target_artifact_id": value,
+        "target_content_hash": "a" * 64,
+        "target_path": value,
+        "promotion_transaction_id": f"promotion-{value}",
+        "updated_at": "2026-08-07T00:00:00Z",
+    }
+
+
+def _lease_manifest_fixture(
+    tmp_path: Path,
+    *,
+    target_type: str = "test_artifact",
+) -> tuple[JobWorkspace, ArtifactRegistry, str, str, Path]:
+    job_id = "job-lease-history"
+    workspace = JobWorkspace.create(str(tmp_path), "lease-history", job_id=job_id)
+    registry = ArtifactRegistry(workspace.paths.registry_path, job_id)
+    parent_path = _write_artifact(tmp_path / "parent.json", "parent")
+    parent = registry.register_file(
+        artifact_id="parent",
+        artifact_role="parent",
+        artifact_type="test_artifact",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
+
+    historical_path = tmp_path / "target-v1.json"
+    if target_type == "current_artifact_pointer":
+        historical_path.write_text(
+            json.dumps(_pointer_payload(job_id, "historical")),
+            encoding="utf-8",
+        )
+    else:
+        _write_artifact(historical_path, "historical")
+    target_id = "mutable-pointer"
+    target = registry.register_file(
+        artifact_id=target_id,
+        artifact_role="pointer",
+        artifact_type=target_type,
+        artifact_version="v1",
+        path=historical_path,
+        producer="tests",
+        depends_on=[ArtifactDependencyRefV2.from_record(parent)],
+    )
+    manifest_payload = {
+        "artifact_type": "lease_publication_manifest",
+        "artifact_version": "v1",
+        "job_id": job_id,
+        "lease_id": "lease-1",
+        "worker_id": "worker-1",
+        "lease_generation": 1,
+        "fence_token": "fence-1",
+        "target_path": str(tmp_path / "target.json"),
+        "final_path": target.path,
+        "staging_path": str(tmp_path / "target.stage"),
+        "content_hash": target.content_hash,
+        "size_bytes": historical_path.stat().st_size,
+        "registered_artifact_id": target.artifact_id,
+        "registered_artifact_type": target.artifact_type,
+        "registered_artifact_version": target.artifact_version,
+        "registered_artifact_hash": target.content_hash,
+        "created_at": "2026-08-07T00:00:00Z",
+    }
+    manifest_path = tmp_path / "lease-manifest.json"
+    manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    manifest_id = "lease-publication:mutable-pointer:fixture"
+    registry.register_file(
+        artifact_id=manifest_id,
+        artifact_role="lease_publication_manifest",
+        artifact_type="lease_publication_manifest",
+        artifact_version="v1",
+        path=manifest_path,
+        producer="tests",
+        depends_on=[ArtifactDependencyRefV2.from_record(target)],
+        metadata={
+            "target_artifact_id": target.artifact_id,
+            "target_artifact_type": target.artifact_type,
+            "target_artifact_version": target.artifact_version,
+            "target_artifact_hash": target.content_hash,
+            "immutable": True,
+        },
+    )
+
+    current_path = tmp_path / "target-v2.json"
+    if target_type == "current_artifact_pointer":
+        current_path.write_text(
+            json.dumps(_pointer_payload(job_id, "current")),
+            encoding="utf-8",
+        )
+    else:
+        _write_artifact(current_path, "current")
+    registry.register_file(
+        artifact_id=target_id,
+        artifact_role="pointer",
+        artifact_type=target_type,
+        artifact_version="v1",
+        path=current_path,
+        producer="tests",
+        depends_on=[ArtifactDependencyRefV2.from_record(parent)],
+    )
+    return workspace, registry, manifest_id, target_id, current_path
+
+
+def _mutate_registry_record(
+    registry: ArtifactRegistry,
+    artifact_id: str,
+    mutation: Any,
+) -> None:
+    payload = json.loads(Path(registry.registry_path).read_text(encoding="utf-8"))
+    record = next(item for item in payload["artifacts"] if item["artifact_id"] == artifact_id)
+    mutation(record, payload)
+    Path(registry.registry_path).write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _concurrent_register_worker(
@@ -89,43 +213,12 @@ def test_v1_registry_is_read_additively_and_next_write_emits_v2(tmp_path: Path) 
     )
     legacy_bytes = registry_path.read_bytes()
 
-    registry = ArtifactRegistry(registry_path, "job-legacy")
+    with pytest.raises(RegistryCorruption, match="unsupported artifact_registry_version"):
+        ArtifactRegistry(registry_path, "job-legacy")
 
+    # A legacy registry is rejected before any compatibility projection or
+    # write can occur.
     assert registry_path.read_bytes() == legacy_bytes
-
-    legacy = registry.get("legacy-artifact")
-
-    assert registry.revision == 0
-    assert legacy is not None
-    assert legacy.depends_on[0].dependency_kind == "local_job"
-    assert legacy.depends_on[0].job_id == "job-legacy"
-    assert legacy.depends_on[0].artifact_id == "source_pdf:source.pdf"
-
-    new_path = _write_artifact(tmp_path / "new.json", "new")
-    registry.register_file(
-        artifact_id="new-artifact",
-        artifact_role="summary",
-        artifact_type="summary_file",
-        artifact_version="v2",
-        path=new_path,
-        producer="tests",
-    )
-
-    payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert payload["artifact_registry_version"] == "v2"
-    assert payload["revision"] == 1
-    assert {item["artifact_id"] for item in payload["artifacts"]} == {
-        "legacy-artifact",
-        "new-artifact",
-    }
-    assert set(payload["artifacts"][0]["depends_on"][0]) == {
-        "dependency_kind",
-        "job_id",
-        "artifact_id",
-        "artifact_type",
-        "path",
-        "content_hash",
-    }
 
 
 @pytest.mark.parametrize(
@@ -253,6 +346,63 @@ def test_dependency_v2_round_trip_preserves_external_identity(tmp_path: Path) ->
     assert loaded is not None
     assert loaded.depends_on == [dependency]
     assert loaded.metadata == {"identity_verdict": "match", "canonical_ready": True}
+
+
+def test_external_dependency_ignores_same_id_in_child_registry(tmp_path: Path) -> None:
+    shared_artifact_id = "stage1:provider_receipt_closure"
+    parent_registry = ArtifactRegistry(
+        tmp_path / "parent" / "artifact_registry.json",
+        "parent-job",
+    )
+    parent_path = _write_artifact(tmp_path / "parent" / "closure.json", "parent")
+    parent_record = parent_registry.register_file(
+        artifact_id=shared_artifact_id,
+        artifact_role="test_dependency",
+        artifact_type="test_dependency",
+        artifact_version="v1",
+        path=parent_path,
+        producer="tests",
+    )
+
+    child_registry = ArtifactRegistry(
+        tmp_path / "child" / "artifact_registry.json",
+        "child-job",
+    )
+    child_path = _write_artifact(tmp_path / "child" / "closure.json", "child")
+    child_registry.register_file(
+        artifact_id=shared_artifact_id,
+        artifact_role="test_dependency",
+        artifact_type="test_dependency",
+        artifact_version="v1",
+        path=child_path,
+        producer="tests",
+    )
+    reuse_path = _write_artifact(tmp_path / "child" / "reuse.json", "reuse")
+    dependency = ArtifactDependencyRefV2.from_record(
+        parent_record,
+        dependency_kind="external_job",
+    )
+
+    reuse_record = child_registry.register_file(
+        artifact_id="stage1:reuse:paper-1",
+        artifact_role="test_consumer",
+        artifact_type="test_consumer",
+        artifact_version="v1",
+        path=reuse_path,
+        producer="tests",
+        depends_on=[dependency],
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_registry.job_id else None
+        ),
+    )
+
+    assert reuse_record.depends_on == [dependency]
+    assert child_registry.verify_ready_dependencies(
+        reuse_record.depends_on,
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_registry.job_id else None
+        ),
+    ) == [dependency]
 
 
 def test_ready_registration_rejects_external_dependency_without_resolver(tmp_path: Path) -> None:
@@ -648,7 +798,7 @@ def test_save_revalidates_ready_artifact_and_local_dependency_hashes(tmp_path: P
     registry_path.write_text(json.dumps(payload), encoding="utf-8")
     registry = ArtifactRegistry(registry_path, "job-save-verify")
 
-    with pytest.raises(UnverifiedDependency, match="dependency declared hash mismatch: parent"):
+    with pytest.raises(UnverifiedDependency, match="dependency content hash mismatch: parent"):
         registry.save()
 
     assert registry.revision == ready_revision
@@ -857,3 +1007,185 @@ def test_lock_file_contents_do_not_grant_or_deny_lock_ownership(tmp_path: Path) 
     )
 
     assert record.artifact_id == "artifact"
+
+
+def test_lease_manifest_allows_live_pointer_to_advance_while_historical_bytes_remain(
+    tmp_path: Path,
+) -> None:
+    workspace, registry, manifest_id, target_id, current_path = _lease_manifest_fixture(
+        tmp_path,
+        target_type="current_artifact_pointer",
+    )
+    manifest = registry.get(manifest_id)
+    target = registry.get(target_id)
+    assert manifest is not None
+    assert target is not None
+    assert target.path == str(current_path.resolve())
+    assert manifest.depends_on[0].path != target.path
+    assert manifest.depends_on[0].content_hash != target.content_hash
+
+    assert registry.verify_ready_dependencies(
+        manifest.depends_on,
+        owner_record=manifest,
+    ) == manifest.depends_on
+    registry.save()
+    RuntimeReconciler(
+        workspace,
+        registry,
+        schema_validators={"test_artifact": lambda _record, _path: None},
+    ).validate_record(manifest)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "artifact_version",
+        "status",
+        "artifact_type",
+        "artifact_id",
+        "path",
+        "content_hash",
+        "missing_parent",
+        "dependency_hash",
+        "dependency_cycle",
+    ),
+)
+def test_lease_manifest_rejects_tampered_live_target_registry_identity_and_closure(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    _workspace, registry, manifest_id, target_id, _current_path = _lease_manifest_fixture(tmp_path)
+
+    def mutate(record: dict[str, Any], payload: dict[str, Any]) -> None:
+        if case == "artifact_version":
+            record["artifact_version"] = "v999"
+        elif case == "status":
+            record["status"] = "invalid"
+        elif case == "artifact_type":
+            record["artifact_type"] = "tampered_type"
+        elif case == "artifact_id":
+            record["artifact_id"] = "tampered-id"
+        elif case == "path":
+            record["path"] = str(tmp_path / "missing.json")
+        elif case == "content_hash":
+            record["content_hash"] = "0" * 64
+        elif case == "missing_parent":
+            payload["artifacts"] = [
+                item for item in payload["artifacts"] if item["artifact_id"] != "parent"
+            ]
+        elif case == "dependency_hash":
+            record["depends_on"][0]["content_hash"] = "0" * 64
+        elif case == "dependency_cycle":
+            manifest_record = next(
+                item for item in payload["artifacts"] if item["artifact_id"] == manifest_id
+            )
+            record["depends_on"] = [
+                {
+                    "dependency_kind": "local_job",
+                    "job_id": registry.job_id,
+                    "artifact_id": manifest_record["artifact_id"],
+                    "artifact_type": manifest_record["artifact_type"],
+                    "path": manifest_record["path"],
+                    "content_hash": manifest_record["content_hash"],
+                }
+            ]
+        else:  # pragma: no cover - parametrization is exhaustive
+            raise AssertionError(case)
+
+    _mutate_registry_record(registry, target_id, mutate)
+    tampered = ArtifactRegistry(registry.registry_path, registry.job_id)
+    manifest = tampered.get(manifest_id)
+    assert manifest is not None
+    with pytest.raises(UnverifiedDependency):
+        tampered.verify_ready_dependencies(
+            manifest.depends_on,
+            owner_record=manifest,
+        )
+
+
+def test_lease_manifest_rejects_live_target_with_wrong_registry_owner(tmp_path: Path) -> None:
+    _workspace, registry, _manifest_id, target_id, _current_path = _lease_manifest_fixture(tmp_path)
+    _mutate_registry_record(
+        registry,
+        target_id,
+        lambda record, _payload: record.__setitem__("job_id", "other-job"),
+    )
+
+    with pytest.raises(RegistryCorruption, match="does not match registry owner"):
+        ArtifactRegistry(registry.registry_path, registry.job_id)
+
+
+@pytest.mark.parametrize("field", ("path", "content_hash", "depends_on"))
+def test_lease_manifest_rejects_tampered_historical_dependency_binding(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    _workspace, registry, manifest_id, _target_id, _current_path = _lease_manifest_fixture(tmp_path)
+
+    def mutate(record: dict[str, Any], _payload: dict[str, Any]) -> None:
+        if field == "path":
+            record["depends_on"][0]["path"] = str(tmp_path / "other-history.json")
+        elif field == "content_hash":
+            record["depends_on"][0]["content_hash"] = "0" * 64
+        else:
+            record["depends_on"] = []
+
+    _mutate_registry_record(registry, manifest_id, mutate)
+    tampered = ArtifactRegistry(registry.registry_path, registry.job_id)
+    manifest = tampered.get(manifest_id)
+    assert manifest is not None
+    if field == "depends_on":
+        with pytest.raises(UnverifiedArtifact, match="must have exactly one target dependency"):
+            tampered.save()
+        return
+    with pytest.raises(UnverifiedDependency):
+        tampered.verify_ready_dependencies(
+            manifest.depends_on,
+            owner_record=manifest,
+        )
+
+
+def test_lease_manifest_rejects_live_target_schema_invalidity(tmp_path: Path) -> None:
+    _workspace, registry, manifest_id, target_id, current_path = _lease_manifest_fixture(
+        tmp_path,
+        target_type="current_artifact_pointer",
+    )
+    invalid_payload = _pointer_payload(registry.job_id, "current")
+    invalid_payload["pointer_role"] = "stale"
+    current_path.write_text(json.dumps(invalid_payload), encoding="utf-8")
+    _mutate_registry_record(
+        registry,
+        target_id,
+        lambda record, _payload: record.__setitem__("content_hash", file_sha256(current_path)),
+    )
+    tampered = ArtifactRegistry(registry.registry_path, registry.job_id)
+    manifest = tampered.get(manifest_id)
+    assert manifest is not None
+
+    with pytest.raises(UnverifiedDependency, match="manifest authority is invalid"):
+        tampered.verify_ready_dependencies(
+            manifest.depends_on,
+            owner_record=manifest,
+        )
+
+
+def test_reconcile_lease_manifest_rejects_tampered_live_target_version(tmp_path: Path) -> None:
+    workspace, registry, manifest_id, target_id, _current_path = _lease_manifest_fixture(
+        tmp_path,
+        target_type="current_artifact_pointer",
+    )
+    _mutate_registry_record(
+        registry,
+        target_id,
+        lambda record, _payload: record.__setitem__("artifact_version", "v999"),
+    )
+    tampered = ArtifactRegistry(registry.registry_path, registry.job_id)
+    manifest = tampered.get(manifest_id)
+    assert manifest is not None
+
+    with pytest.raises(ReconcileValidationError):
+        RuntimeReconciler(
+            workspace,
+            tampered,
+            schema_validators={"test_artifact": lambda _record, _path: None},
+        ).validate_record(manifest)

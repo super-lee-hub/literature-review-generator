@@ -294,7 +294,7 @@ def _unique_non_empty(values: Sequence[Any]) -> List[str]:
 
 def _claim_unit_alignment_status(claim_unit: Dict[str, Any]) -> str:
     status = str(claim_unit.get("alignment_status") or "").strip()
-    return status if status in {"explicit", "inferred", "ambiguous", "legacy_fallback"} else "legacy_fallback"
+    return status if status in {"explicit", "inferred", "ambiguous"} else "ambiguous"
 
 
 def _claim_unit_alignment_confidence(claim_unit: Dict[str, Any]) -> float:
@@ -312,13 +312,13 @@ def _paper_ids_for_claim_unit(
     alignment_status = _claim_unit_alignment_status(claim_unit)
     supporting_paper_ids = _unique_non_empty(claim_unit.get("supporting_paper_ids", []))
     if alignment_status == "ambiguous":
-        return _unique_non_empty(bundle_paper_ids), "bundle_fallback"
+        return _unique_non_empty(bundle_paper_ids), "bundle_paper_ids"
     if alignment_status in {"explicit", "inferred"} and supporting_paper_ids:
         return supporting_paper_ids, "claim_unit_supporting_paper_ids"
     claim_unit_paper_ids = _unique_non_empty(claim_unit.get("paper_ids", []))
     if claim_unit_paper_ids:
         return claim_unit_paper_ids, "claim_unit_paper_ids"
-    return _unique_non_empty(bundle_paper_ids), "bundle_fallback"
+    return _unique_non_empty(bundle_paper_ids), "bundle_paper_ids"
 
 
 def _source_grounded_excerpts_for_paper_packets(
@@ -387,7 +387,7 @@ def _build_claim_unit(
         "supporting_paper_ids": [],
         "supporting_paper_keys": [],
         "supporting_occurrence_ids": [],
-        "alignment_status": "legacy_fallback",
+        "alignment_status": "ambiguous",
         "alignment_confidence": 0.0,
     }
     return claim_unit
@@ -442,7 +442,7 @@ def _paper_identity_hint(
     }
 
 
-def _compat_conclusion_for_state(
+def _conclusion_for_state(
     evidence_status: str,
     disposition: str,
 ) -> ValidationConclusion:
@@ -1271,7 +1271,7 @@ class ReviewValidator:
             reasoning = "The available evidence is not strong enough for safe automatic narrowing."
             repair_hint = "Review the cited source manually or improve the evidence retrieval bundle."
 
-        conclusion = _compat_conclusion_for_state(evidence_status, disposition)
+        conclusion = _conclusion_for_state(evidence_status, disposition)
 
         return CitationValidationResult(
             citation_id=str(bundle.get("bundle_id") or citation_set_key),

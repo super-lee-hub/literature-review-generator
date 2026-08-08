@@ -25,6 +25,7 @@ from validation.repair_models import (
     RepairApplyResult,
     RepairPlan,
     RepairRootCause,
+    NOT_APPLICABLE,
 )
 from services.repair_policy import is_auto_safe_proposal
 
@@ -70,17 +71,12 @@ def _check_dependency_bundle(
     """Check if dependencies are still valid.
 
     Returns False if any dependency is missing or stale.
-    Supports multi-paper proposals via metadata.paper_ids (v3) with
-    fallback to metadata.paper_id (legacy).
+    Supports multi-paper proposals via the current metadata.paper_ids contract.
     """
     bundle = proposal.dependency_bundle
 
-    # Resolve target paper IDs: prefer paper_ids (plural, v3), then legacy paper_id
+    # Current repair proposals always carry the plural paper identity list.
     target_paper_ids: List[str] = list(proposal.metadata.get("paper_ids", []))
-    if not target_paper_ids:
-        legacy_paper_id = proposal.metadata.get("paper_id", "")
-        if legacy_paper_id:
-            target_paper_ids = [legacy_paper_id]
 
     if not target_paper_ids:
         return False
@@ -93,10 +89,18 @@ def _check_dependency_bundle(
             return False
         resolved_artifacts.append(artifact)
 
+    resolved_artifacts.sort(
+        key=lambda artifact: str(
+            artifact.get("paper_identity", {}).get("canonical_paper_key")
+            if isinstance(artifact.get("paper_identity"), dict)
+            else ""
+        )
+    )
+
     primary = resolved_artifacts[0]
 
     # Check aggregate summary hash across all papers
-    if bundle.summary_hash:
+    if bundle.summary_hash not in {"", NOT_APPLICABLE}:
         aggregate_summary: Dict[str, Any] = {}
         for artifact in resolved_artifacts:
             summary_data = artifact.get("analysis", {}).get("ai_summary", {})
@@ -107,20 +111,20 @@ def _check_dependency_bundle(
 
     # Check paper artifact hash — composite over all resolved artifacts
     # so that any artifact change is detected for multi-paper proposals.
-    if bundle.paper_artifact_hash:
+    if bundle.paper_artifact_hash not in {"", NOT_APPLICABLE}:
         composite = resolved_artifacts if len(resolved_artifacts) > 1 else primary
         current_artifact_hash = _compute_hash(composite)
         if current_artifact_hash != bundle.paper_artifact_hash:
             return False
 
     # Check visual manifest hash
-    if bundle.visual_manifest_hash:
+    if bundle.visual_manifest_hash not in {"", NOT_APPLICABLE}:
         current_visual_manifest_hash = _compute_hash(visual_manifest or {})
         if current_visual_manifest_hash != bundle.visual_manifest_hash:
             return False
 
     # Check visual refs hash (from primary artifact, matches plan-time)
-    if bundle.selected_visual_refs_hash:
+    if bundle.selected_visual_refs_hash not in {"", NOT_APPLICABLE}:
         selected_visual_refs = primary.get("stage1_inputs", {}).get("selected_visual_refs", [])
         current_visual_refs_hash = _compute_hash(selected_visual_refs)
         if current_visual_refs_hash != bundle.selected_visual_refs_hash:
@@ -130,12 +134,11 @@ def _check_dependency_bundle(
 
 
 def infer_expected_review_draft_version(review_draft: Dict[str, Any]) -> str:
-    """Return artifact_version from review_draft, defaulting to 'v2'.
-
-    The v2/v3 chain is now canonical; v1 is a compatibility fallback only.
-    """
+    """Return the required current review-draft artifact version."""
     version = str(review_draft.get("artifact_version", "") or "").strip()
-    return version if version else "v2"
+    if version != "v3":
+        raise ValueError("current review_draft artifact_version must be v3")
+    return version
 
 
 def check_apply_guards(
@@ -143,7 +146,7 @@ def check_apply_guards(
     review_draft: Dict[str, Any],
     paper_artifacts: Sequence[Dict[str, Any]],
     visual_manifest: Optional[Dict[str, Any]] = None,
-    expected_artifact_version: str = "v2",
+    expected_artifact_version: str = "v3",
     require_auto_safe: bool = False,
 ) -> ApplyGuardResult:
     """Check all guards before applying a patch.

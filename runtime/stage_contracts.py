@@ -8,7 +8,6 @@ from typing import Any, Dict, Iterable, List, Mapping
 from services.source_normalizer import (
     SourcePaperDescriptor,
     normalize_source_papers,
-    project_descriptors_to_legacy_papers,
 )
 
 
@@ -154,17 +153,27 @@ def build_source_bundle(
 ) -> SourceBundle:
     raw_papers = [dict(item) for item in papers]
     descriptors: List[SourcePaperDescriptor] = normalize_source_papers(source_mode, raw_papers)
-    projected = project_descriptors_to_legacy_papers(raw_papers, descriptors)
     work_items = [
         PaperWorkItem(
-            paper_info=dict(paper),
+            paper_info={
+                **dict(paper),
+                "source_mode": descriptor.source_mode,
+                "source_paper_id": descriptor.source_paper_id,
+                "canonical_paper_key": descriptor.canonical_paper_key,
+                "paper_key_aliases": list(descriptor.paper_key_aliases),
+                "source_pdf": descriptor.source_pdf,
+                "source_pdf_fingerprint": descriptor.source_pdf_fingerprint,
+                "metadata_confidence": descriptor.metadata_confidence,
+                "metadata_source_priority_snapshot": list(descriptor.metadata_source_priority_snapshot),
+                "source_descriptor": descriptor.to_dict(),
+            },
             source_descriptor=descriptor.to_dict(),
             source_mode=descriptor.source_mode,
             canonical_paper_key=descriptor.canonical_paper_key,
             source_paper_id=descriptor.source_paper_id,
             source_pdf=descriptor.source_pdf,
         )
-        for paper, descriptor in zip(projected, descriptors)
+        for paper, descriptor in zip(raw_papers, descriptors)
     ]
     bundle = SourceBundle(
         source_mode=source_mode,

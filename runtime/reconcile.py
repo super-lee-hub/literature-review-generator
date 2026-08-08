@@ -21,10 +21,22 @@ from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRecord,
     ArtifactRegistry,
+    RegistryError,
     file_sha256,
 )
-from services.job_outcome import JobOutcomeV1
-from services.job_workspace import atomic_write_json
+from services.job_outcome import (
+    JobOutcomeV1,
+    load_canonical_job_outcome,
+    publish_job_outcome_compatibility_projection,
+    validate_job_outcome_compatibility_projection,
+)
+from runtime.artifact_validators import (
+    ArtifactSchemaError,
+    CURRENT_PRODUCTION_ARTIFACT_TYPES,
+    OUTLINE_V3_ARTIFACT_TYPES as CURRENT_OUTLINE_V3_ARTIFACT_TYPES,
+    validate_registered_artifact,
+    validate_current_outline_artifact,
+)
 from summary_schema import (
     ROUTE_CONFIDENCE_VALUES,
     is_canonical_ai_summary,
@@ -72,22 +84,6 @@ class ReconcileResult:
     @property
     def clean(self) -> bool:
         return not self.issues
-
-
-@dataclass(frozen=True)
-class LegacyMigrationResult:
-    job_id: str
-    legacy_summary_path: str
-    job_outcome_path: str
-    audit_record_path: str
-    migrated_artifact_ids: tuple[str, ...]
-    compatibility_status: str
-    canonical_ready: bool
-    requires_attention: bool
-
-    @property
-    def migrated(self) -> bool:
-        return bool(self.migrated_artifact_ids)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -238,115 +234,6 @@ def _validate_summary_file(_record: ArtifactRecord, path: Path) -> None:
         paper_keys.add(paper_key)
 
 
-def _validate_recognizable_legacy_summary_file(path: Path) -> None:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ReconcileValidationError(f"invalid legacy summary JSON {path}: {exc}") from exc
-    if not isinstance(payload, list) or not payload:
-        raise ReconcileValidationError("legacy summary_file must contain summaries")
-    paper_keys: set[str] = set()
-    for index, item in enumerate(payload):
-        if not isinstance(item, Mapping):
-            raise ReconcileValidationError("legacy summary entries must be JSON objects")
-        if str(item.get("status") or "").strip().casefold() != "success":
-            raise ReconcileValidationError(f"legacy summary entry {index} is not successful")
-        paper_info = item.get("paper_info")
-        if not isinstance(paper_info, Mapping):
-            raise ReconcileValidationError(f"legacy summary entry {index} has no paper_info")
-        paper_key = _require_nonempty_string(
-            paper_info.get("canonical_paper_key"),
-            label=f"legacy summary entry {index} canonical_paper_key",
-        )
-        if paper_key in paper_keys:
-            raise ReconcileValidationError(
-                f"legacy summary_file has duplicate paper identity: {paper_key}"
-            )
-        ai_summary = item.get("ai_summary")
-        if not isinstance(ai_summary, Mapping) or not ai_summary:
-            raise ReconcileValidationError(f"legacy summary entry {index} has no ai_summary")
-        paper_keys.add(paper_key)
-
-
-def _validate_legacy_summary_file(_record: ArtifactRecord, path: Path) -> None:
-    _validate_recognizable_legacy_summary_file(path)
-
-
-def _validate_legacy_summary_source(_record: ArtifactRecord, path: Path) -> None:
-    from services.summary_reuse import SummaryCatalog, SummarySource
-
-    catalog = SummaryCatalog.from_sources(
-        [
-            SummarySource(
-                path=str(path.resolve()),
-                source_type="explicit",
-                priority=0,
-                label="legacy_summary_source",
-            )
-        ]
-    )
-    if not catalog.records:
-        raise ReconcileValidationError(
-            "legacy_summary_source has no reusable successful summary records"
-        )
-
-
-def _legacy_summary_path(workspace: object) -> Path:
-    project_name = str(getattr(workspace, "project_name", "") or "")
-    if not project_name:
-        raise ReconcileValidationError("legacy workspace has no project_name")
-    return Path(
-        str(getattr(workspace, "artifact_path")(f"{project_name}_summaries.json"))
-    )
-
-
-def project_legacy_workspace_outcome(workspace: object) -> JobOutcomeV1 | None:
-    """Read-only fail-closed projection for a summary-only legacy workspace."""
-
-    project_name = str(getattr(workspace, "project_name", "") or "")
-    job_id = str(getattr(workspace, "job_id", "") or "")
-    if not project_name or not job_id:
-        return None
-    summary_path = _legacy_summary_path(workspace)
-    if not summary_path.is_file():
-        return None
-    try:
-        _validate_recognizable_legacy_summary_file(summary_path)
-    except ReconcileValidationError:
-        return None
-    return JobOutcomeV1.legacy_unverified(
-        job_id=job_id,
-        required_stages=("source_intake", "analyze"),
-        degradation_reasons=("legacy_summary_without_runtime_contract",),
-    )
-
-
-def _detect_legacy_unverified_workspace(
-    workspace: object,
-) -> tuple[JobOutcomeV1, str] | None:
-    """Identify a legacy workspace without repairing any durable projection."""
-
-    outcome_path = Path(
-        str(getattr(workspace, "artifact_path")("job_outcome_v1.json"))
-    )
-    if outcome_path.is_file():
-        try:
-            outcome = JobOutcomeV1.from_dict(_read_json_object(outcome_path))
-        except (ReconcileValidationError, TypeError, ValueError):
-            outcome = project_legacy_workspace_outcome(workspace)
-            if outcome is None:
-                return None
-            return outcome, "invalid_job_outcome"
-        if outcome.compatibility_status == "legacy_unverified":
-            return outcome, "job_outcome"
-        return None
-
-    outcome = project_legacy_workspace_outcome(workspace)
-    if outcome is None:
-        return None
-    return outcome, "legacy_summary_file"
-
-
 def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> None:
     payload = _read_json_object(path)
     _require_contract_header(
@@ -398,6 +285,68 @@ def _validate_summary_source_manifest(record: ArtifactRecord, path: Path) -> Non
         raise ReconcileValidationError("summary manifest summary_count must be a non-negative integer")
     if summary_count != len(summaries):
         raise ReconcileValidationError("summary manifest summary_count is inconsistent")
+
+
+def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    _require_contract_header(
+        record,
+        payload,
+        artifact_type="stage1_reusable_summary_manifest",
+        versions=("v1",),
+    )
+    _require_owned_job(record, payload, field="job_id")
+    _require_fields(
+        payload,
+        (
+            "stage_name",
+            "canonical_paper_key",
+            "source_paper_id",
+            "source_summary_artifact_id",
+            "source_summary_artifact_hash",
+            "summary_payload_hash",
+            "binding_hash",
+            "runtime_spec_id",
+            "runtime_spec_hash",
+            "evidence_manifest_id",
+            "evidence_manifest_hash",
+            "source_bundle_id",
+            "source_bundle_hash",
+            "created_at",
+            "producer",
+        ),
+        label="stage1_reusable_summary_manifest",
+    )
+    for label in (
+        "source_summary_artifact_hash",
+        "summary_payload_hash",
+        "binding_hash",
+        "runtime_spec_hash",
+        "evidence_manifest_hash",
+        "source_bundle_hash",
+    ):
+        value = str(payload.get(label) or "")
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value.lower()):
+            raise ReconcileValidationError(
+                f"stage1_reusable_summary_manifest.{label} is not a SHA-256 digest"
+            )
+    for id_label, hash_label in (
+        ("provider_receipt_closure_id", "provider_receipt_closure_hash"),
+        ("provider_receipt_ledger_id", "provider_receipt_ledger_hash"),
+    ):
+        identifier = str(payload.get(id_label) or "")
+        digest = str(payload.get(hash_label) or "")
+        if bool(identifier) != bool(digest):
+            raise ReconcileValidationError(
+                f"stage1_reusable_summary_manifest {id_label}/{hash_label} must be paired"
+            )
+        if digest and (
+            len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest.lower())
+        ):
+            raise ReconcileValidationError(
+                f"stage1_reusable_summary_manifest.{hash_label} is not a SHA-256 digest"
+            )
 
 
 def _validate_nonempty_text(_record: ArtifactRecord, path: Path) -> None:
@@ -514,79 +463,95 @@ def _require_list(value: Any, *, label: str) -> list[Any]:
     return value
 
 
-def _validate_outline_stage_health(record: ArtifactRecord, path: Path) -> None:
-    from outline.stage_health import OutlineStageHealthV1
-
-    payload = _read_json_object(path)
-    _require_contract_header(
-        record,
-        payload,
-        artifact_type="outline_stage_health",
-        versions=("v1",),
-    )
-    health = OutlineStageHealthV1.from_dict(payload)
-    _require_owned_job(record, payload, field="job_id")
-    if health.execution_mode not in {"production", "test_dev"}:
-        raise ReconcileValidationError("outline_stage_health execution_mode is invalid")
-    if not health.stages:
-        raise ReconcileValidationError("outline_stage_health has no stage entries")
-    _require_nonempty_string(health.source_final_outline_hash, label="source_final_outline_hash")
-    _require_nonempty_string(health.source_coverage_audit_hash, label="source_coverage_audit_hash")
-    _require_nonempty_string(health.created_at, label="outline_stage_health created_at")
-    stage_names: set[str] = set()
-    for entry in health.stages:
-        stage_name = _require_nonempty_string(entry.stage_name, label="outline stage name")
-        if stage_name in stage_names:
-            raise ReconcileValidationError(f"duplicate outline stage health entry: {stage_name}")
-        stage_names.add(stage_name)
-        _require_nonempty_string(entry.provider_route, label=f"{stage_name} provider_route")
-        if entry.execution_status not in {"succeeded", "failed", "skipped"}:
-            raise ReconcileValidationError(f"invalid execution_status for outline stage {stage_name}")
-        if entry.attempts < 0:
-            raise ReconcileValidationError(f"negative attempt count for outline stage {stage_name}")
+_OUTLINE_V3_ARTIFACT_TYPES = frozenset(
+    {
+        "outline_artifact",
+        "relation_adjudication_result",
+        "confirmed_global_relation_map",
+        "outline_candidate",
+        "structure_critique",
+        "coverage_critique",
+        "evidence_critique",
+        "arbitration_decision",
+        "selected_outline_candidate",
+        "section_evidence_packet",
+        "section_evidence_packet_set",
+        "final_outline",
+        "coverage_audit",
+        "stability_audit",
+        "provider_receipt_closure",
+        "outline_stage_health",
+        "adopted_outline",
+    }
+)
 
 
-def _validate_final_outline_payload(
-    record: ArtifactRecord,
-    payload: Mapping[str, Any],
-    *,
-    require_owner: bool = True,
-) -> object:
-    from outline.v2_models import FinalOutline
-
-    _require_contract_header(
-        record,
-        payload,
-        artifact_type="final_outline",
-        versions=("v2",),
-    )
-    if require_owner:
-        _require_owned_job(record, payload, field="created_from_job_id")
-    outline = FinalOutline.from_dict(dict(payload))
-    for field_name in (
-        "outline_id",
-        "source_literature_map_id",
-        "source_synthesis_flow_id",
-        "source_arbitration_report_id",
-        "source_literature_map_hash",
-        "source_synthesis_flow_hash",
-    ):
-        _require_nonempty_string(getattr(outline, field_name), label=f"final_outline {field_name}")
-    if not outline.sections:
-        raise ReconcileValidationError("final_outline has no sections")
-
-    def validate_sections(sections: Sequence[object]) -> None:
-        for section in sections:
-            _require_nonempty_string(getattr(section, "section_id", ""), label="final section_id")
-            _require_nonempty_string(getattr(section, "title", ""), label="final section title")
-            validate_sections(getattr(section, "children", ()))
-
-    validate_sections(outline.sections)
-    return outline
+def _validate_outline_v3_artifact(record: ArtifactRecord, path: Path) -> None:
+    if record.artifact_version != "v3":
+        _validate_provider_receipt_closure(record, path)
+        return
+    try:
+        validate_current_outline_artifact(record, path)
+    except ArtifactSchemaError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_final_outline(record: ArtifactRecord, path: Path) -> None:
-    _validate_final_outline_payload(record, _read_json_object(path))
+    _validate_outline_v3_artifact(record, path)
+
+
+def _validate_outline_stage_health(record: ArtifactRecord, path: Path) -> None:
+    _validate_outline_v3_artifact(record, path)
+
+
+def _validate_provider_receipt_closure(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    if not str(payload.get("job_id") or "") or str(payload.get("job_id")) != record.job_id:
+        raise ReconcileValidationError("provider receipt closure job_id mismatch")
+    closure = payload.get("payload")
+    if not isinstance(closure, Mapping):
+        raise ReconcileValidationError("provider receipt closure payload must be an object")
+    _require_fields(closure, ("expected_call_ids", "observed_call_ids", "complete"), label="provider receipt closure")
+    if not isinstance(closure.get("expected_call_ids"), list) or not isinstance(closure.get("observed_call_ids"), list):
+        raise ReconcileValidationError("provider receipt closure call ids must be arrays")
+    if not isinstance(closure.get("complete"), bool):
+        raise ReconcileValidationError("provider receipt closure complete must be boolean")
+
+
+def _validate_outline_adoption_pointer(record: ArtifactRecord, path: Path) -> None:
+    payload = _read_json_object(path)
+    _require_fields(
+        payload,
+        (
+            "artifact_type",
+            "artifact_version",
+            "job_id",
+            "role",
+            "current_adoption_artifact_id",
+            "current_adoption_hash",
+            "adoption_identity",
+        ),
+        label="outline adoption pointer",
+    )
+    if payload.get("artifact_type") != "outline_adoption_pointer" or payload.get("artifact_version") != "v1":
+        raise ReconcileValidationError("outline adoption pointer contract header is invalid")
+    _require_owned_job(record, payload, field="job_id")
+    if payload.get("role") != "current":
+        raise ReconcileValidationError("outline adoption pointer role must be current")
+    target_id = _require_nonempty_string(
+        payload.get("current_adoption_artifact_id"),
+        label="outline adoption pointer target",
+    )
+    target_hash = _require_nonempty_string(
+        payload.get("current_adoption_hash"),
+        label="outline adoption pointer target hash",
+    )
+    if not target_id.startswith("outline-v3:adoption:"):
+        raise ReconcileValidationError("outline adoption pointer target must be versioned")
+    if len(target_hash) != 64 or any(char not in "0123456789abcdef" for char in target_hash.lower()):
+        raise ReconcileValidationError("outline adoption pointer target hash must be SHA-256")
+    if payload.get("adoption_identity") != target_id:
+        raise ReconcileValidationError("outline adoption pointer identity does not match target")
 
 
 def _validate_evidence_manifest(record: ArtifactRecord, path: Path) -> None:
@@ -662,14 +627,14 @@ def _validate_paper_artifact(record: ArtifactRecord, path: Path) -> None:
 
 
 def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
-    from services.review_draft import ReviewDraftV1, ReviewDraftV2
+    from services.review_draft import ReviewDraft
 
     payload = _read_json_object(path)
-    version = _require_contract_header(
+    _require_contract_header(
         record,
         payload,
         artifact_type="review_draft",
-        versions=("v1", "v2"),
+        versions=("v3",),
     )
     _require_fields(
         payload,
@@ -684,8 +649,7 @@ def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
         label="review_draft",
     )
     _require_owned_job(record, payload, field="created_from_job_id")
-    draft_class = ReviewDraftV1 if version == "v1" else ReviewDraftV2
-    draft = draft_class(
+    draft = ReviewDraft(
         artifact_type=str(payload["artifact_type"]),
         artifact_version=str(payload["artifact_version"]),
         created_from_job_id=str(payload["created_from_job_id"]),
@@ -712,12 +676,9 @@ def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
         if int(section_data.get("section_number") or 0) <= 0:
             raise ReconcileValidationError("review section_number must be positive")
         _require_nonempty_string(section_data.get("section_title"), label="review section title")
-        if version == "v1":
-            _require_nonempty_string(section_data.get("content"), label="review section content")
-            continue
         blocks = _require_list(section_data.get("blocks"), label="review section blocks")
         if not blocks:
-            raise ReconcileValidationError("review_draft v2 section has no blocks")
+            raise ReconcileValidationError("review_draft section has no blocks")
         for block in blocks:
             block_data = _require_mapping(block, label="review block")
             _require_nonempty_string(block_data.get("block_id"), label="review block_id")
@@ -725,14 +686,14 @@ def _validate_review_draft(record: ArtifactRecord, path: Path) -> None:
 
 
 def _validate_citation_manifest(record: ArtifactRecord, path: Path) -> None:
-    from services.citation_manifest import CitationManifestV2
+    from services.citation_manifest import CitationManifestV3
 
     payload = _read_json_object(path)
-    version = _require_contract_header(
+    _require_contract_header(
         record,
         payload,
         artifact_type="citation_manifest",
-        versions=("v1", "v2", "v3"),
+        versions=("v3",),
     )
     common_fields = (
         "created_from_job_id",
@@ -755,14 +716,7 @@ def _validate_citation_manifest(record: ArtifactRecord, path: Path) -> None:
     _require_nonempty_string(
         review_reference.get("review_word_path"), label="citation review_word_path"
     )
-    if version == "v1":
-        _require_list(payload.get("citations"), label="citation manifest citations")
-        return
-
-    CitationManifestV2.from_dict(dict(payload))
-    if version == "v2":
-        return
-
+    manifest = CitationManifestV3.from_dict(dict(payload))
     for field_name in (
         "paper_entries",
         "occurrences",
@@ -771,12 +725,8 @@ def _validate_citation_manifest(record: ArtifactRecord, path: Path) -> None:
         "bibliography",
     ):
         _require_list(payload.get(field_name), label=f"citation_manifest {field_name}")
-    migration = _require_mapping(payload.get("migration_report"), label="citation migration_report")
-    if str(migration.get("contract_version") or "") != "v3":
-        raise ReconcileValidationError("citation migration_report contract_version is invalid")
-    _require_nonempty_string(migration.get("load_source"), label="citation migration load_source")
-    if str(payload.get("review_draft_version") or "") != "v2":
-        raise ReconcileValidationError("citation_manifest v3 requires review_draft v2")
+    if manifest.review_draft_version != "v3":
+        raise ReconcileValidationError("citation_manifest v3 requires review_draft v3")
     _require_mapping(payload.get("dependencies"), label="citation dependencies")
 
 
@@ -794,169 +744,70 @@ def _validate_citation_ref_catalog(record: ArtifactRecord, path: Path) -> None:
     validate_document_ref_catalog(payload)
 
 
-def _validate_outline_model(
-    record: ArtifactRecord,
-    path: Path,
-    *,
-    artifact_type: str,
-    artifact_version: str,
-    model_type: type[Any],
-) -> Any:
-    payload = _read_json_object(path)
-    _require_contract_header(
-        record,
-        payload,
-        artifact_type=artifact_type,
-        versions=(artifact_version,),
-    )
-    return model_type.from_dict(payload)
-
-
-def _validate_literature_map(record: ArtifactRecord, path: Path) -> None:
-    from outline.v2_models import LiteratureMap
-
-    model = _validate_outline_model(
-        record,
-        path,
-        artifact_type="literature_map",
-        artifact_version="v1",
-        model_type=LiteratureMap,
-    )
-    if model.created_from_job_id != record.job_id:
-        raise ReconcileValidationError("literature_map does not belong to its Registry job")
-    _require_nonempty_string(model.created_at, label="literature_map created_at")
-    if not model.paper_nodes or not model.source_summary_hashes:
-        raise ReconcileValidationError("literature_map has no source papers")
-
-
-def _validate_synthesis_flow(record: ArtifactRecord, path: Path) -> None:
-    from outline.v2_models import SynthesisFlow
-
-    model = _validate_outline_model(
-        record,
-        path,
-        artifact_type="synthesis_flow",
-        artifact_version="v1",
-        model_type=SynthesisFlow,
-    )
-    if model.created_from_job_id != record.job_id:
-        raise ReconcileValidationError("synthesis_flow does not belong to its Registry job")
-    _require_nonempty_string(model.source_literature_map_id, label="source_literature_map_id")
-    _require_nonempty_string(model.flow_strategy, label="synthesis flow_strategy")
-    if not model.flow_steps:
-        raise ReconcileValidationError("synthesis_flow has no flow steps")
-
-
-def _validate_outline_candidates(record: ArtifactRecord, path: Path) -> None:
-    from outline.v2_models import OutlineCandidates
-
-    model = _validate_outline_model(
-        record,
-        path,
-        artifact_type="outline_candidates",
-        artifact_version="v1",
-        model_type=OutlineCandidates,
-    )
-    _require_nonempty_string(model.source_literature_map_id, label="candidate literature_map id")
-    _require_nonempty_string(model.source_synthesis_flow_id, label="candidate synthesis_flow id")
-    if model.candidate_count != len(model.candidates) or not model.candidates:
-        raise ReconcileValidationError("outline_candidates candidate_count is inconsistent")
-    for candidate in model.candidates:
-        _require_nonempty_string(candidate.candidate_id, label="outline candidate_id")
-        if not candidate.sections:
-            raise ReconcileValidationError("outline candidate has no sections")
-
-
-def _validate_outline_critiques(record: ArtifactRecord, path: Path) -> None:
-    from outline.v2_models import OutlineCritiquesV2
-
-    model = _validate_outline_model(
-        record,
-        path,
-        artifact_type="outline_critiques",
-        artifact_version="v1",
-        model_type=OutlineCritiquesV2,
-    )
-    if not model.source_candidate_ids or not model.critique_runs:
-        raise ReconcileValidationError("outline_critiques has no completed critique runs")
-    for run in model.critique_runs:
-        _require_nonempty_string(run.run_id, label="critique run_id")
-        if run.critic_role not in {"structure", "coverage"}:
-            raise ReconcileValidationError("outline critique role is invalid")
-
-
-def _validate_outline_arbitration(record: ArtifactRecord, path: Path) -> None:
-    from outline.v2_models import ArbitrationReport
-
-    model = _validate_outline_model(
-        record,
-        path,
-        artifact_type="outline_arbitration_report",
-        artifact_version="v1",
-        model_type=ArbitrationReport,
-    )
-    if not model.source_candidates or not model.final_decision:
-        raise ReconcileValidationError("outline arbitration has no final decision")
-    _require_nonempty_string(model.arbitrator_model, label="outline arbitrator_model")
-
-
-def _validate_outline_coverage_audit(record: ArtifactRecord, path: Path) -> None:
-    from outline.v2_models import CoverageAudit
-
-    model = _validate_outline_model(
-        record,
-        path,
-        artifact_type="outline_coverage_audit",
-        artifact_version="v1",
-        model_type=CoverageAudit,
-    )
-    _require_nonempty_string(model.source_final_outline_id, label="coverage source_final_outline_id")
-    _require_nonempty_string(model.source_final_outline_hash, label="coverage source_final_outline_hash")
-    _require_nonempty_string(model.source_literature_map_hash, label="coverage literature_map hash")
-    _require_nonempty_string(model.source_synthesis_flow_hash, label="coverage synthesis_flow hash")
-
-
-def _validate_adopted_final_outline(record: ArtifactRecord, path: Path) -> None:
-    from outline.v2_models import AdoptedFinalOutline
-
-    model = _validate_outline_model(
-        record,
-        path,
-        artifact_type="adopted_final_outline",
-        artifact_version="v1",
-        model_type=AdoptedFinalOutline,
-    )
-    if model.created_from_job_id != record.job_id:
-        raise ReconcileValidationError("adopted outline does not belong to its Registry job")
-    for field_name in (
-        "source_final_outline_id",
-        "source_final_outline_hash",
-        "source_coverage_audit_id",
-        "source_coverage_audit_hash",
-        "adopted_at",
-        "adopted_by",
-    ):
-        _require_nonempty_string(getattr(model, field_name), label=f"adopted outline {field_name}")
-    outline_payload = _require_mapping(_read_json_object(path).get("outline"), label="adopted outline")
-    synthetic_record = ArtifactRecord(
-        artifact_id=record.artifact_id,
-        artifact_role=record.artifact_role,
-        artifact_type="final_outline",
-        artifact_version="v2",
-        job_id=record.job_id,
-        path=record.path,
-        content_hash=record.content_hash,
-        producer=record.producer,
-        created_at=record.created_at,
-        status=record.status,
-        depends_on=record.depends_on,
-        metadata=record.metadata,
-    )
-    _validate_final_outline_payload(synthetic_record, outline_payload)
-
-
 def _validate_json_object(_record: ArtifactRecord, path: Path) -> None:
     _read_json_object(path)
+
+
+def _validate_provider_receipt_ledger(record: ArtifactRecord, path: Path) -> None:
+    from runtime.provider_runtime import ProviderRuntimeContractError, ProviderRuntimeLedger
+
+    try:
+        receipts = ProviderRuntimeLedger(path).list_receipts()
+    except ProviderRuntimeContractError as exc:
+        raise ReconcileValidationError(f"provider receipt ledger is invalid: {exc}") from exc
+    if not receipts:
+        raise ReconcileValidationError("provider receipt ledger must contain at least one receipt")
+    for receipt in receipts:
+        if receipt.job_id != record.job_id:
+            raise ReconcileValidationError(
+                "provider receipt job_id does not match its Registry owner"
+            )
+        if not receipt.receipt_id or not receipt.stage_name or not receipt.route:
+            raise ReconcileValidationError("provider receipt is missing its durable routing identity")
+
+
+def _validate_provider_output(record: ArtifactRecord, path: Path) -> None:
+    """Validate one durable normalized provider output referenced by a closure."""
+
+    from runtime.provider_runtime import hash_json
+
+    payload = _read_json_object(path)
+    required = {
+        "artifact_type",
+        "artifact_version",
+        "job_id",
+        "attempt_id",
+        "stage_name",
+        "call_id",
+        "content_hash",
+        "payload",
+    }
+    missing = sorted(field for field in required if field not in payload)
+    if missing:
+        raise ReconcileValidationError(
+            "provider output is missing required fields: " + ", ".join(missing)
+        )
+    if payload.get("artifact_type") != "validation_provider_output":
+        raise ReconcileValidationError("provider output artifact_type is invalid")
+    if payload.get("artifact_version") != "v1":
+        raise ReconcileValidationError("provider output artifact_version is invalid")
+    if str(payload.get("job_id") or "") != record.job_id:
+        raise ReconcileValidationError("provider output job_id does not match its Registry owner")
+    for field in ("attempt_id", "stage_name", "call_id"):
+        if not str(payload.get(field) or "").strip():
+            raise ReconcileValidationError(f"provider output {field} is empty")
+    content_hash = str(payload.get("content_hash") or "")
+    if content_hash != hash_json(payload.get("payload")):
+        raise ReconcileValidationError("provider output content_hash does not match payload")
+
+
+def _validate_current_production_artifact(record: ArtifactRecord, path: Path) -> None:
+    """Reuse the registry's strict validator for current production artifacts."""
+
+    try:
+        validate_registered_artifact(record, path)
+    except ArtifactSchemaError as exc:
+        raise ReconcileValidationError(str(exc)) from exc
 
 
 def _validate_json_array(_record: ArtifactRecord, path: Path) -> None:
@@ -1006,7 +857,6 @@ def _validate_audit_record(record: ArtifactRecord, path: Path) -> None:
         detached_audit_types = {
             "identity_override",
             "artifact_quarantine_release",
-            "legacy_reuse",
         }
         dependencies_match = audit_ref_identities == dependency_identities
         detached_audit = not record.depends_on and audit.audit_type in detached_audit_types
@@ -1719,20 +1569,19 @@ def validate_review_batch_manifest_for_bootstrap(
     return payload
 
 
-DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
+DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "job_outcome": _validate_job_outcome,
     STAGE_TERMINAL_ARTIFACT_TYPE: _validate_stage_terminal,
     "source_bundle": _validate_source_bundle,
     "summary_file": _validate_summary_file,
-    "legacy_summary_file": _validate_legacy_summary_file,
-    "legacy_summary_source": _validate_legacy_summary_source,
-    "literature_review_outline": _validate_nonempty_text,
     "review_docx": _validate_docx,
     "source_pdf": _validate_pdf,
     "validation_run_result": _validate_validation_run_result,
+    "validation_disposition": _validate_json_object,
     "runtime_job_spec": _validate_json_object,
     "stage1_progress_snapshot": _validate_json_object,
     "summary_source_manifest": _validate_summary_source_manifest,
+    "stage1_reusable_summary_manifest": _validate_stage1_reusable_summary_manifest,
     "summary_selection": _validate_summary_selection,
     "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,
@@ -1743,22 +1592,38 @@ DEFAULT_SCHEMA_VALIDATORS: Mapping[str, SchemaValidator] = {
     "review_draft": _validate_review_draft,
     "citation_manifest": _validate_citation_manifest,
     "citation_ref_catalog": _validate_citation_ref_catalog,
+    "provider_receipt_ledger": _validate_provider_receipt_ledger,
+    "validation_provider_output": _validate_provider_output,
+    "provider_receipt_closure": _validate_provider_receipt_closure,
+    "provider_expected_call_graph": _validate_json_object,
+    "stage1_canonical_summaries": _validate_json_object,
     "audit_record": _validate_audit_record,
     "validation_report_projection": _validate_nonempty_text,
     "manual_review_projection": _validate_json_object,
     "validation_completion_projection": _validate_json_object,
     "claim_alignment_audit_projection": _validate_json_object,
-    "literature_map": _validate_literature_map,
-    "synthesis_flow": _validate_synthesis_flow,
-    "candidate_generation_report": _validate_json_object,
-    "outline_candidates": _validate_outline_candidates,
-    "outline_critiques": _validate_outline_critiques,
-    "outline_arbitration_report": _validate_outline_arbitration,
     "final_outline": _validate_final_outline,
-    "outline_coverage_audit": _validate_outline_coverage_audit,
     "outline_stage_health": _validate_outline_stage_health,
-    "adopted_final_outline": _validate_adopted_final_outline,
+    "outline_adoption_pointer": _validate_outline_adoption_pointer,
 }
+
+for _current_production_artifact_type in CURRENT_PRODUCTION_ARTIFACT_TYPES:
+    DEFAULT_SCHEMA_VALIDATORS.setdefault(
+        _current_production_artifact_type,
+        _validate_current_production_artifact,
+    )
+
+for _current_outline_artifact_type in CURRENT_OUTLINE_V3_ARTIFACT_TYPES:
+    if _current_outline_artifact_type in {"stage1_canonical_summaries", "outline_v3_node_dag"}:
+        continue
+    if _current_outline_artifact_type in _OUTLINE_V3_ARTIFACT_TYPES:
+        continue
+    DEFAULT_SCHEMA_VALIDATORS[_current_outline_artifact_type] = validate_current_outline_artifact
+DEFAULT_SCHEMA_VALIDATORS["stage1_canonical_summaries"] = validate_current_outline_artifact
+DEFAULT_SCHEMA_VALIDATORS["outline_v3_node_dag"] = validate_current_outline_artifact
+
+for _outline_artifact_type in _OUTLINE_V3_ARTIFACT_TYPES:
+    DEFAULT_SCHEMA_VALIDATORS[_outline_artifact_type] = _validate_outline_v3_artifact
 
 
 class RuntimeReconciler:
@@ -1778,29 +1643,6 @@ class RuntimeReconciler:
         self.schema_validators = dict(DEFAULT_SCHEMA_VALIDATORS)
         self.schema_validators.update(dict(schema_validators or {}))
         self.stage_store = StageTerminalStore(workspace, registry)
-
-    def legacy_read_only_result(self) -> ReconcileResult | None:
-        """Return the fail-closed legacy result before any repair is attempted."""
-
-        detected = _detect_legacy_unverified_workspace(self.workspace)
-        if detected is None:
-            return None
-        _outcome, artifact_id = detected
-        return ReconcileResult(
-            job_id=self.registry.job_id,
-            completed_stages=(),
-            repaired_artifact_ids=(),
-            reconstructed_stage_records=(),
-            outcome_repaired=False,
-            pointer_repaired=False,
-            issues=(
-                ReconcileIssue(
-                    "legacy_unverified_workspace",
-                    "legacy_unverified workspace requires explicit migrate-legacy or rerun",
-                    artifact_id=artifact_id,
-                ),
-            ),
-        )
 
     def _registry_for_ref(
         self,
@@ -1833,7 +1675,16 @@ class RuntimeReconciler:
         visited: set[tuple[str, str]] | None = None,
         registry: ArtifactRegistry | None = None,
         refreshed_registries: set[tuple[str, str]] | None = None,
+        owner_record: ArtifactRecord | None = None,
     ) -> ArtifactRecord:
+        if owner_record is not None and owner_record.artifact_type == "lease_publication_manifest":
+            return self._validate_historical_lease_manifest_dependency(
+                owner_record,
+                ref,
+                registry=registry or self.registry,
+                visited=visited,
+                refreshed_registries=refreshed_registries,
+            )
         target_registry = self._registry_for_ref(ref, local_registry=registry)
         active_refreshed = refreshed_registries if refreshed_registries is not None else set()
         registry_key = (
@@ -1863,6 +1714,106 @@ class RuntimeReconciler:
             refreshed_registries=active_refreshed,
         )
         return record
+
+    def _validate_historical_lease_manifest_dependency(
+        self,
+        owner_record: ArtifactRecord,
+        ref: ArtifactDependencyRefV2,
+        *,
+        registry: ArtifactRegistry,
+        visited: set[tuple[str, str]] | None = None,
+        refreshed_registries: set[tuple[str, str]] | None = None,
+    ) -> ArtifactRecord:
+        """Validate an immutable queue publication against its historical target.
+
+        Queue manifests intentionally retain the immutable publication path even
+        when the pointer artifact ID later advances during resume. Resolve the
+        manifest's declared final path and hash directly, while still requiring
+        the dependency identity and bytes to match exactly.
+        """
+
+        if (
+            owner_record.job_id != registry.job_id
+            or ref.dependency_kind != "local_job"
+            or ref.job_id != owner_record.job_id
+        ):
+            raise ReconcileValidationError(
+                f"lease publication dependency identity is invalid: {owner_record.artifact_id}"
+            )
+        registry_key = (
+            os.path.normcase(os.path.abspath(registry.registry_path)),
+            registry.job_id,
+        )
+        active_refreshed = refreshed_registries if refreshed_registries is not None else set()
+        if registry_key not in active_refreshed:
+            registry.reload()
+            active_refreshed.add(registry_key)
+        registered = registry.get(ref.artifact_id)
+        if (
+            registered is None
+            or registered.job_id != owner_record.job_id
+            or registered.status != "ready"
+            or registered.artifact_id != ref.artifact_id
+            or registered.artifact_type != ref.artifact_type
+            or not registered.artifact_version
+        ):
+            raise ReconcileValidationError(
+                f"lease publication target Registry identity is invalid: {owner_record.artifact_id}"
+            )
+        try:
+            ArtifactRegistry._verify_ready_artifact(registered)
+            ArtifactRegistry._verify_ready_artifact(owner_record)
+            payload = json.loads(Path(owner_record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError) as exc:
+            raise ReconcileValidationError(
+                f"lease publication manifest is unreadable: {owner_record.artifact_id}"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ReconcileValidationError(
+                f"lease publication manifest payload is invalid: {owner_record.artifact_id}"
+            )
+        declared_id = str(payload.get("registered_artifact_id") or "")
+        declared_type = str(payload.get("registered_artifact_type") or "")
+        declared_version = str(payload.get("registered_artifact_version") or "")
+        declared_path = str(payload.get("final_path") or "")
+        declared_hash = str(payload.get("registered_artifact_hash") or "")
+        staged_hash = str(payload.get("content_hash") or "")
+        if (
+            str(payload.get("job_id") or "") != owner_record.job_id
+            or declared_id != ref.artifact_id
+            or declared_type != ref.artifact_type
+            or registered.artifact_type != declared_type
+            or registered.artifact_version != declared_version
+            or not declared_hash
+            or declared_hash != ref.content_hash
+            or staged_hash != declared_hash
+        ):
+            raise ReconcileValidationError(
+                f"lease publication target identity mismatch: {owner_record.artifact_id}"
+            )
+        if not declared_path or os.path.normcase(os.path.abspath(declared_path)) != os.path.normcase(
+            os.path.abspath(ref.path)
+        ):
+            raise ReconcileValidationError(
+                f"lease publication target path mismatch: {owner_record.artifact_id}"
+            )
+        target = Path(declared_path)
+        if not target.is_file():
+            raise ReconcileValidationError(
+                f"lease publication target file is missing: {owner_record.artifact_id}"
+            )
+        actual_hash = file_sha256(target)
+        if not declared_hash or actual_hash != declared_hash or ref.content_hash != declared_hash:
+            raise ReconcileValidationError(
+                f"lease publication target hash mismatch: {owner_record.artifact_id}"
+            )
+        self.validate_record(
+            registered,
+            registry=registry,
+            visited=visited,
+            refreshed_registries=active_refreshed,
+        )
+        return registered
 
     def validate_record(
         self,
@@ -1910,6 +1861,7 @@ class RuntimeReconciler:
                     visited=active_visited,
                     registry=active_registry,
                     refreshed_registries=active_refreshed,
+                    owner_record=record,
                 )
         finally:
             active_visited.remove(key)
@@ -2043,321 +1995,54 @@ class RuntimeReconciler:
             metadata=metadata,
         )
 
-    def _repair_outcome_registration(self) -> tuple[bool, str | None, JobOutcomeV1 | None]:
-        path = Path(str(getattr(self.workspace, "artifact_path")("job_outcome_v1.json")))
-        if not path.is_file():
-            return False, None, None
-        synthetic = ArtifactRecord(
-            artifact_id="job_outcome",
-            artifact_role="job_outcome",
-            artifact_type="job_outcome",
-            artifact_version="v1",
-            path=str(path.resolve()),
-            producer="runtime.reconcile.RuntimeReconciler",
-            job_id=self.registry.job_id,
-            status="ready",
-            content_hash=file_sha256(path),
-        )
+    def _repair_outcome_projection(
+        self,
+    ) -> tuple[
+        bool,
+        str | None,
+        JobOutcomeV1,
+        tuple[ReconcileIssue, ...],
+    ]:
         try:
-            _validate_job_outcome(synthetic, path)
-            outcome = JobOutcomeV1.from_dict(_read_json_object(path))
-        except (TypeError, ValueError) as exc:
-            raise ReconcileValidationError(f"job outcome is not repairable: {exc}") from exc
-        if outcome.job_id != self.registry.job_id:
-            raise ReconcileValidationError("job outcome belongs to another job")
-        current = self.registry.get("job_outcome")
-        if current is not None:
-            if current.job_id != self.registry.job_id or current.artifact_type != "job_outcome":
-                raise ReconcileValidationError("job outcome Registry identity conflicts with this workspace")
-            if (
-                current.artifact_role != "job_outcome"
-                or current.artifact_version != "v1"
-                or Path(current.path).resolve() != path.resolve()
-            ):
-                raise ReconcileValidationError("job outcome Registry projection is inconsistent")
-            if current.status != "ready":
-                raise ReconcileValidationError(
-                    f"job outcome Registry record is not ready: {current.status}"
-                )
-            if current.content_hash == synthetic.content_hash:
-                self.validate_record(current)
-                return False, None, outcome
-        self.registry.register_file(
-            artifact_role="job_outcome",
-            artifact_type="job_outcome",
-            artifact_version="v1",
-            path=path,
-            producer="runtime.reconcile.RuntimeReconciler",
-            artifact_id="job_outcome",
-            metadata={
-                "job_status": outcome.job_status,
-                "job_disposition": outcome.job_disposition,
-                "canonical_ready": outcome.canonical_ready,
-                "requires_attention": outcome.requires_attention,
-                "compatibility_status": outcome.compatibility_status,
-                "outcome_revision": outcome.outcome_revision,
-            },
-        )
-        return True, "job_outcome", outcome
+            outcome, canonical_record = load_canonical_job_outcome(self.registry)
+        except (OSError, TypeError, ValueError) as exc:
+            raise ReconcileValidationError(
+                f"canonical Registry job outcome is invalid: {exc}"
+            ) from exc
 
-    def migrate_legacy(self, *, actor: str, reason: str) -> LegacyMigrationResult:
-        from services.audit_record import AuditArtifactRefV1, AuditRecordV1
-
-        normalized_actor = actor.strip()
-        normalized_reason = reason.strip()
-        if not normalized_actor or not normalized_reason:
-            raise ReconcileValidationError("legacy migration requires actor and reason")
-
-        summary_path = _legacy_summary_path(self.workspace)
-        _validate_recognizable_legacy_summary_file(summary_path)
-        outcome_path = Path(
+        projection_path = Path(
             str(getattr(self.workspace, "artifact_path")("job_outcome_v1.json"))
         )
-        audit_id = "audit-legacy-workspace-migration-v1"
-        audit_path = Path(
-            str(getattr(self.workspace, "artifact_path")(f"audits/{audit_id}.json"))
-        )
-        allowed_artifact_ids = {"legacy_summary_file", "job_outcome", audit_id}
-        unexpected = sorted(
-            record.artifact_id
-            for record in self.registry.list_records()
-            if record.artifact_id not in allowed_artifact_ids
-        )
-        if unexpected:
-            raise ReconcileValidationError(
-                "legacy migration requires a summary-only workspace; found registered artifacts: "
-                + ", ".join(unexpected)
+        try:
+            validate_job_outcome_compatibility_projection(
+                projection_path,
+                self.registry,
             )
-
-        summary_hash = file_sha256(summary_path)
-        summary_record = self.registry.get("legacy_summary_file")
-        outcome_record = self.registry.get("job_outcome")
-        audit_record = self.registry.get(audit_id)
-
-        if summary_record is not None:
-            if (
-                summary_record.job_id != self.registry.job_id
-                or summary_record.artifact_role != "legacy_input"
-                or summary_record.artifact_type != "legacy_summary_file"
-                or summary_record.artifact_version != "v1"
-                or Path(summary_record.path).resolve() != summary_path.resolve()
-                or summary_record.content_hash != summary_hash
-            ):
-                raise ReconcileValidationError("legacy summary Registry record is inconsistent")
-            self.validate_record(summary_record)
-
-        if outcome_path.is_file():
-            try:
-                outcome = JobOutcomeV1.from_dict(_read_json_object(outcome_path))
-            except (TypeError, ValueError) as exc:
-                raise ReconcileValidationError(f"legacy migration outcome is invalid: {exc}") from exc
-        else:
-            if self.registry.get("job_outcome") is not None:
-                raise ReconcileValidationError(
-                    "legacy migration outcome Registry record has no durable file"
-                )
-            outcome = project_legacy_workspace_outcome(self.workspace)
-            if outcome is None:
-                raise ReconcileValidationError("workspace is not a recognizable legacy workspace")
-
-        if outcome.job_id != self.registry.job_id:
-            raise ReconcileValidationError("legacy migration outcome belongs to another job")
-        if (
-            outcome.compatibility_status != "legacy_unverified"
-            or outcome.canonical_ready
-            or not outcome.requires_attention
-        ):
-            raise ReconcileValidationError(
-                "legacy migration refuses native or non-fail-closed job outcomes"
+            return False, None, outcome, ()
+        except (OSError, TypeError, ValueError) as projection_error:
+            publication_context = getattr(self.registry, "publication_context", None)
+            result = publish_job_outcome_compatibility_projection(
+                path=projection_path,
+                registry=self.registry,
+                canonical_record=canonical_record,
+                outcome=outcome,
+                producer="runtime.reconcile.RuntimeReconciler",
+                publication_context=publication_context,
             )
-        migration_created_at = outcome.created_at
-
-        if outcome_record is not None:
-            if (
-                outcome_record.job_id != self.registry.job_id
-                or outcome_record.artifact_role != "job_outcome"
-                or outcome_record.artifact_type != "job_outcome"
-                or outcome_record.artifact_version != "v1"
-                or Path(outcome_record.path).resolve() != outcome_path.resolve()
-                or outcome_record.content_hash != file_sha256(outcome_path)
-            ):
-                raise ReconcileValidationError(
-                    "legacy migration outcome Registry content hash mismatch or identity conflict"
-                )
-            self.validate_record(outcome_record)
-
-        def build_audit(outcome_hash: str) -> AuditRecordV1:
-            summary_ref = AuditArtifactRefV1(
-                artifact_id="legacy_summary_file",
-                artifact_type="legacy_summary_file",
-                job_id=self.registry.job_id,
-                content_hash=summary_hash,
-            )
-            outcome_ref = AuditArtifactRefV1(
-                artifact_id="job_outcome",
-                artifact_type="job_outcome",
-                job_id=self.registry.job_id,
-                content_hash=outcome_hash,
-            )
-            return AuditRecordV1.create(
-                audit_id=audit_id,
-                audit_type="legacy_reuse",
-                job_id=self.registry.job_id,
-                attempt_id="legacy-migration-v1",
-                producer="runtime.reconcile.RuntimeReconciler.migrate_legacy",
-                actor=normalized_actor,
-                reason=normalized_reason,
-                scope={
-                    "operation": "legacy_workspace_migration",
-                    "source_contract": "summary_only_legacy_workspace",
-                    "canonical_upgrade": False,
-                },
-                target_artifacts=[summary_ref, outcome_ref],
-                input_artifact_refs=[summary_ref],
-                output_artifact_refs=[outcome_ref],
-                input_hashes={"legacy_summary_file": summary_hash},
-                policy_snapshot={
-                    "provider_calls_allowed": False,
-                    "compatibility_status": "legacy_unverified",
-                    "canonical_ready": False,
-                    "requires_attention": True,
-                },
-                disposition="migrated_fail_closed",
-                created_at=migration_created_at,
-            )
-
-        # Validate operator-controlled audit fields before the first durable mutation.
-        build_audit("0" * 64)
-
-        if audit_path.is_file():
-            if not outcome_path.is_file():
-                raise ReconcileValidationError(
-                    "legacy migration audit exists without a durable job outcome"
-                )
-            expected_audit = build_audit(file_sha256(outcome_path))
-            try:
-                persisted_audit = AuditRecordV1.from_dict(_read_json_object(audit_path))
-            except (TypeError, ValueError) as exc:
-                raise ReconcileValidationError(f"legacy migration audit is invalid: {exc}") from exc
-            if persisted_audit.record_hash != expected_audit.record_hash:
-                raise ReconcileValidationError(
-                    "legacy migration audit differs from the requested actor or reason"
-                )
-            if audit_record is not None:
-                expected_dependencies = (
-                    ArtifactDependencyRefV2(
-                        dependency_kind="local_job",
-                        job_id=self.registry.job_id,
-                        artifact_id="legacy_summary_file",
-                        artifact_type="legacy_summary_file",
-                        path=str(summary_path.resolve()),
-                        content_hash=summary_hash,
-                    ),
-                    ArtifactDependencyRefV2(
-                        dependency_kind="local_job",
-                        job_id=self.registry.job_id,
-                        artifact_id="job_outcome",
-                        artifact_type="job_outcome",
-                        path=str(outcome_path.resolve()),
-                        content_hash=file_sha256(outcome_path),
+            if not result.written:
+                return (
+                    False,
+                    None,
+                    outcome,
+                    (
+                        ReconcileIssue(
+                            "job_outcome_projection_write_failed",
+                            f"{projection_error}; {result.warning}",
+                            artifact_id="job_outcome_compatibility_projection",
+                        ),
                     ),
                 )
-                if (
-                    audit_record.job_id != self.registry.job_id
-                    or audit_record.artifact_role != "audit_record"
-                    or audit_record.artifact_type != "audit_record"
-                    or audit_record.artifact_version != "v1"
-                    or Path(audit_record.path).resolve() != audit_path.resolve()
-                    or audit_record.content_hash != file_sha256(audit_path)
-                    or tuple(audit_record.depends_on) != expected_dependencies
-                ):
-                    raise ReconcileValidationError(
-                        "legacy migration audit Registry record is inconsistent"
-                    )
-                self.validate_record(audit_record)
-        elif audit_record is not None:
-            raise ReconcileValidationError(
-                "legacy migration audit Registry record has no durable file"
-            )
-
-        migrated: list[str] = []
-        if summary_record is None:
-            summary_record = self.registry.register_file(
-                artifact_role="legacy_input",
-                artifact_type="legacy_summary_file",
-                artifact_version="v1",
-                path=summary_path,
-                producer="runtime.reconcile.RuntimeReconciler.migrate_legacy",
-                artifact_id="legacy_summary_file",
-                metadata={
-                    "compatibility_status": "legacy_unverified",
-                    "canonical_ready": False,
-                },
-            )
-            migrated.append(summary_record.artifact_id)
-
-        if not outcome_path.is_file():
-            atomic_write_json(str(outcome_path), outcome.to_dict())
-        outcome_repaired, outcome_artifact_id, persisted_outcome = (
-            self._repair_outcome_registration()
-        )
-        if persisted_outcome is None:
-            raise ReconcileValidationError("legacy migration could not persist job outcome")
-        outcome = persisted_outcome
-        if outcome_repaired and outcome_artifact_id:
-            migrated.append(outcome_artifact_id)
-        outcome_record = self.registry.get("job_outcome")
-        if outcome_record is None:
-            raise ReconcileValidationError("legacy migration outcome is not registered")
-
-        audit = build_audit(outcome_record.content_hash)
-        if audit_path.is_file():
-            persisted_audit = AuditRecordV1.from_dict(_read_json_object(audit_path))
-            if persisted_audit.record_hash != audit.record_hash:
-                raise ReconcileValidationError("legacy migration audit changed after preflight")
-        else:
-            atomic_write_json(str(audit_path), audit.to_dict())
-
-        dependency_refs = tuple(
-            ArtifactDependencyRefV2(
-                dependency_kind="local_job",
-                job_id=record.job_id,
-                artifact_id=record.artifact_id,
-                artifact_type=record.artifact_type,
-                path=record.path,
-                content_hash=record.content_hash,
-            )
-            for record in (summary_record, outcome_record)
-        )
-        audit_record = self.registry.get(audit.audit_id)
-        if audit_record is None:
-            audit_record = self.registry.register_file(
-                artifact_role="audit_record",
-                artifact_type="audit_record",
-                artifact_version="v1",
-                path=audit_path,
-                producer=audit.producer,
-                artifact_id=audit.audit_id,
-                depends_on=dependency_refs,
-                metadata={
-                    "audit_type": audit.audit_type,
-                    "record_hash": audit.record_hash,
-                    "operation": "legacy_workspace_migration",
-                },
-            )
-            migrated.append(audit_record.artifact_id)
-        self.validate_record(audit_record)
-
-        return LegacyMigrationResult(
-            job_id=self.registry.job_id,
-            legacy_summary_path=str(summary_path.resolve()),
-            job_outcome_path=str(outcome_path.resolve()),
-            audit_record_path=str(audit_path.resolve()),
-            migrated_artifact_ids=tuple(migrated),
-            compatibility_status=outcome.compatibility_status,
-            canonical_ready=outcome.canonical_ready,
-            requires_attention=outcome.requires_attention,
-        )
+        return True, "job_outcome_compatibility_projection", outcome, ()
 
     def _repair_terminal_registration(
         self,
@@ -2438,9 +2123,44 @@ class RuntimeReconciler:
         if not isinstance(payload, dict) or str(payload.get("job_id") or "") != self.registry.job_id:
             return False, ()
 
-        resume_report_path = Path(
-            str(getattr(self.workspace, "artifact_path")("resume_state_report.json"))
-        )
+        resume_report_record = self.registry.get("resume_state_report")
+        resume_record_errors: list[str] = []
+        if resume_report_record is None:
+            # Legacy workspaces predate immutable Registry-owned resume reports.
+            resume_report_path = Path(
+                str(getattr(self.workspace, "artifact_path")("resume_state_report.json"))
+            )
+        else:
+            resume_report_path = Path(resume_report_record.path)
+            if resume_report_record.artifact_id != "resume_state_report":
+                resume_record_errors.append("artifact_id")
+            if resume_report_record.job_id != self.registry.job_id:
+                resume_record_errors.append("job_id")
+            if resume_report_record.status != "ready":
+                resume_record_errors.append("status")
+            if resume_report_record.artifact_type != "resume_state_report":
+                resume_record_errors.append("artifact_type")
+            if resume_report_record.artifact_version != "v1":
+                resume_record_errors.append("artifact_version")
+            if not resume_report_record.content_hash:
+                resume_record_errors.append("content_hash")
+            else:
+                try:
+                    actual_resume_hash = file_sha256(resume_report_path)
+                except OSError:
+                    resume_record_errors.append("path")
+                else:
+                    if actual_resume_hash != resume_report_record.content_hash:
+                        resume_record_errors.append("content_hash")
+        if resume_record_errors:
+            return False, (
+                ReconcileIssue(
+                    "invalid_resume_state_report_identity",
+                    "resume state report Registry identity is invalid: "
+                    + ", ".join(resume_record_errors),
+                    artifact_id="resume_state_report",
+                ),
+            )
         try:
             resume_report = _read_json_object(resume_report_path)
         except ReconcileValidationError as exc:
@@ -2454,6 +2174,10 @@ class RuntimeReconciler:
 
         project_name = str(getattr(self.workspace, "project_name", "") or "")
         resume_identity_errors: list[str] = []
+        if str(resume_report.get("artifact_type") or "") != "resume_state_report":
+            resume_identity_errors.append("artifact_type")
+        if str(resume_report.get("artifact_version") or "") != "v1":
+            resume_identity_errors.append("artifact_version")
         if str(resume_report.get("job_id") or "") != self.registry.job_id:
             resume_identity_errors.append("job_id")
         if str(resume_report.get("created_from_job_id") or "") != self.registry.job_id:
@@ -2531,10 +2255,6 @@ class RuntimeReconciler:
         *,
         stage_recoveries: Sequence[ProvenStageRecovery] = (),
     ) -> ReconcileResult:
-        legacy_result = self.legacy_read_only_result()
-        if legacy_result is not None:
-            return legacy_result
-
         repaired: list[str] = []
         reconstructed: list[str] = []
         issues: list[ReconcileIssue] = []
@@ -2542,9 +2262,15 @@ class RuntimeReconciler:
         outcome_repaired = False
         outcome: JobOutcomeV1 | None = None
         try:
-            outcome_repaired, repaired_outcome_id, outcome = self._repair_outcome_registration()
+            (
+                outcome_repaired,
+                repaired_outcome_id,
+                outcome,
+                outcome_issues,
+            ) = self._repair_outcome_projection()
             if repaired_outcome_id:
                 repaired.append(repaired_outcome_id)
+            issues.extend(outcome_issues)
         except ReconcileValidationError as exc:
             issues.append(ReconcileIssue("invalid_job_outcome", str(exc), artifact_id="job_outcome"))
 

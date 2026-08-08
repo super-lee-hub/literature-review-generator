@@ -148,12 +148,19 @@ def build_source_bundle_for_request(request: Any, *, project_name: str | None = 
             resolved_project_name = "auto-generate-ai-runtime"
 
     if source_mode == "zotero":
+        zotero_report = str(getattr(request, "zotero_report", "") or "").strip()
+        library_path = str(getattr(request, "library_path", "") or "").strip()
+        if not zotero_report or not library_path:
+            raise ValueError("zotero source mode requires zotero_report and library_path")
         return build_zotero_source_bundle(
             project_name=resolved_project_name,
-            zotero_report=str(getattr(request, "zotero_report", "") or ""),
-            library_path=str(getattr(request, "library_path", "") or ""),
+            zotero_report=zotero_report,
+            library_path=library_path,
         )
+    pdf_folder = str(getattr(request, "pdf_folder", "") or "").strip()
+    if not pdf_folder:
+        raise ValueError("direct source mode requires pdf_folder")
     return build_direct_source_bundle(
         project_name=resolved_project_name,
-        pdf_folder=str(getattr(request, "pdf_folder", "") or ""),
+        pdf_folder=pdf_folder,
     )

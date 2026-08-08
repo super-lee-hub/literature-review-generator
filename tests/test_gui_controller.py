@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import configparser
 import importlib
@@ -497,6 +498,128 @@ def test_run_workflow_enqueues_while_processor_running_without_block(gui_app_mod
     assert any("排队位置：2" in message for message in notifications)
 
 
+def test_validation_policy_is_derived_once_across_direct_cli_gui_and_queue_entries(
+    gui_app_module,
+    tmp_path: Path,
+) -> None:
+    from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
+    from runtime.runner import AgentRuntimeRunner
+    from services.job_runner import (
+        JobRunner,
+        build_job_request_from_args,
+        build_job_request_from_mapping,
+    )
+    from services.queue_service import PersistentQueueService, QueueRunner, QueueState
+
+    config_path = tmp_path / "config.ini"
+    parser = configparser.ConfigParser()
+    parser.read(REPO_ROOT / "config.ini.example", encoding="utf-8")
+    parser["Paths"]["output_path"] = str(tmp_path / "output")
+    parser["Validation"]["review_enabled"] = "true"
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    direct_spec = RuntimeJobSpec(
+        project_name="policy-parity",
+        source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+        config=str(config_path),
+        action="run_all",
+        queue_file=str(tmp_path / "direct-queue.json"),
+        metadata={},
+    )
+    direct_request = direct_spec.to_job_request()
+
+    mapping = {
+        "config": str(config_path),
+        "project_name": "policy-parity",
+        "pdf_folder": str(pdf_dir),
+        "run_all": True,
+        "queue_file": str(tmp_path / "mapping-queue.json"),
+    }
+    mapping_request = build_job_request_from_mapping(mapping)
+    cli_request = build_job_request_from_args(argparse.Namespace(**mapping))
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    gui_spec = controller._build_queue_job_spec(
+        "policy-parity",
+        str(pdf_dir),
+        "",
+        "run_all",
+        input_mode="pdf",
+        work_mode="normal",
+    )
+    for field_name in (
+        "requested_stages",
+        "validation_required",
+        "require_clean_validation",
+        "allow_unvalidated_when_validation_optional",
+    ):
+        assert field_name not in gui_spec.parameters
+
+    queue_round_trip = QueueJobSpec.from_dict(
+        json.loads(json.dumps(gui_spec.to_dict(), ensure_ascii=False))
+    )
+    gui_request = build_job_request_from_mapping(queue_round_trip.parameters)
+    captured_requests = []
+
+    class _CapturingRunner:
+        def run(self, request, cancel_token=None):
+            del cancel_token
+            captured_requests.append(request)
+            return types.SimpleNamespace(
+                success=True,
+                job_status="completed",
+                exit_code=0,
+                message="captured",
+                workspace_path=str(request.workspace_path),
+                job_id=str(request.job_id),
+                resume_state="new",
+                produced_artifacts=[],
+                log_path="",
+            )
+
+    queue_service = PersistentQueueService(tmp_path / "queue-round-trip.json")
+    queue_service.add_job(queue_round_trip)
+    QueueRunner(queue_service, _CapturingRunner()).run()
+    queue_runtime = queue_service.get_job_runtime(queue_round_trip.job_id)
+    assert queue_runtime is not None
+    assert queue_runtime.state is QueueState.COMPLETED
+    assert len(captured_requests) == 1
+    queue_request = captured_requests[0]
+
+    requests = (direct_request, mapping_request, cli_request, gui_request, queue_request)
+    for request in requests:
+        assert request.requested_stages is None
+        assert request.validation_required is None
+        assert request.require_clean_validation is None
+        assert request.allow_unvalidated_when_validation_optional is None
+
+    def derived_plan(request) -> dict:
+        runtime_spec = JobRunner()._runtime_spec(request)
+        return dict(
+            AgentRuntimeRunner(runtime_spec)
+            ._normalized_spec(resume=False)
+            .metadata["stage_plan"]
+        )
+
+    plans = [derived_plan(request) for request in requests]
+    assert all(plan == plans[0] for plan in plans)
+    assert plans[0] == {
+        "version": "stage-plan-v1",
+        "action": "run_all",
+        "requested_stages": ["analyze", "outline", "review", "validate"],
+        "required_stages": ["source_intake", "analyze", "outline", "review", "validate"],
+        "validation_enabled": True,
+        "validation_required": True,
+        "require_clean_validation": True,
+        "allow_unvalidated_when_validation_optional": False,
+        "current_artifact_set_required": True,
+        "validation_status": "required",
+    }
+
+
 def test_persist_config_keeps_active_queue_service(gui_app_module, monkeypatch, tmp_path) -> None:
     config_path = tmp_path / "config.ini"
     config_path.write_text((REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"), encoding="utf-8")
@@ -522,6 +645,8 @@ def test_clear_completed_jobs_keeps_failed_and_cancelled(gui_app_module, tmp_pat
     }
     for job_id, state in states.items():
         service.add_job(QueueJobSpec(job_id=job_id, job_type="analyze", project_name=job_id))
+        if state is not gui_app_module.QueueState.PENDING:
+            service.update_job_state(job_id, gui_app_module.QueueState.RUNNING)
         service.update_job_state(job_id, state)
 
     controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
@@ -599,6 +724,138 @@ def test_processing_mineru_card_unknown_mode_primary_drift_falls_back_to_local(g
     assert parser_mode_select.value == "local"
     assert primary_select.value == "local"
     assert fallback_select.value == "none"
+
+
+def test_gui_lifecycle_states_are_registry_derived(gui_app_module) -> None:
+    inspection = {
+        "status": {"job_status": "completed"},
+        "artifacts": [
+            {"artifact_type": "final_outline", "status": "ready"},
+            {"artifact_type": "repair_plan", "status": "ready"},
+        ],
+        "provider_receipts": {"complete": False},
+    }
+
+    states = gui_app_module.WorkspaceController._canonical_lifecycle_states(
+        inspection,
+        {"status": "blocked", "validation_artifact": None},
+    )
+
+    assert states == [
+        "receipt_incomplete",
+        "ready_for_adoption",
+        "validation_not_run",
+        "repair_available",
+    ]
+    assert "validation_clean" not in states
+
+
+def test_gui_adoption_requires_actor_reason_and_calls_control_plane(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    calls: list[tuple[str, dict]] = []
+
+    def fake_control_plane_call(operation: str, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "inspect":
+            return {
+                "status": {"job_status": "failed"},
+                "workspace_path": "D:/output/demo__job-1",
+                "artifacts": [
+                    {
+                        "artifact_id": "outline-v3:final_outline",
+                        "artifact_type": "final_outline",
+                        "status": "ready",
+                        "content_hash": "a" * 64,
+                    }
+                ],
+                "provider_receipts": {"complete": True},
+            }
+        return {"status": "succeeded", "mutation_performed": True}
+
+    monkeypatch.setattr(controller, "_control_plane_call", fake_control_plane_call)
+    monkeypatch.setattr(controller, "refresh_lifecycle", lambda **_kwargs: {})
+
+    controller.lifecycle_actor = "researcher"
+    controller.lifecycle_reason = "explicit GUI approval"
+    result = controller.adopt_current_outline()
+
+    assert result["status"] == "succeeded"
+    assert calls[0][0] == "inspect"
+    assert calls[1] == (
+        "adopt",
+        {
+            "artifact_id": "outline-v3:final_outline",
+            "actor": "researcher",
+            "reason": "explicit GUI approval",
+            "expected_hash": "a" * 64,
+        },
+    )
+
+
+def test_gui_validation_button_executes_control_plane_validation(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    calls: list[str] = []
+
+    def fake_control_plane_call(operation: str, **_kwargs):
+        calls.append(operation)
+        if operation == "validate":
+            return {"status": "clean", "mutation_performed": True}
+        return {"status": "blocked", "validation_artifact": None}
+
+    monkeypatch.setattr(controller, "_control_plane_call", fake_control_plane_call)
+    monkeypatch.setattr(controller, "refresh_lifecycle", lambda **_kwargs: {})
+
+    result = asyncio.run(controller.execute_current_validation())
+
+    assert result["status"] == "clean"
+    assert calls[0] == "validate"
+
+
+def test_gui_repair_promotion_uses_quarantined_transaction_and_audit_context(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    calls: list[tuple[str, dict]] = []
+
+    def fake_control_plane_call(operation: str, **kwargs):
+        calls.append((operation, kwargs))
+        if operation == "inspect":
+            return {
+                "status": {"job_status": "failed"},
+                "artifacts": [
+                    {
+                        "artifact_id": "repair-tx:current",
+                        "artifact_type": "repair_transaction",
+                        "status": "quarantined",
+                        "created_at": "2026-08-04T00:00:00Z",
+                    },
+                    {
+                        "artifact_id": "repair-tx:old",
+                        "artifact_type": "repair_transaction",
+                        "status": "ready",
+                        "created_at": "2026-08-03T00:00:00Z",
+                    },
+                ],
+            }
+        return {"status": "promoted", "mutation_performed": True}
+
+    monkeypatch.setattr(controller, "_control_plane_call", fake_control_plane_call)
+    monkeypatch.setattr(controller, "refresh_lifecycle", lambda **_kwargs: {})
+    controller.lifecycle_actor = "researcher"
+    controller.lifecycle_reason = "approve the clean current-service repair revalidation"
+
+    result = controller.promote_repaired_artifacts_from_gui()
+
+    assert result["status"] == "promoted"
+    assert calls == [
+        ("inspect", {}),
+        (
+            "repair_promote",
+            {
+                "transaction_id": "repair-tx:current",
+                "actor": "researcher",
+                "reason": "approve the clean current-service repair revalidation",
+            },
+        ),
+    ]
 
 
 def test_processing_mineru_card_remote_first_primary_drift_falls_back_to_mineru(gui_app_module, monkeypatch) -> None:

@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
-import main
 import pytest
 import services.review_batch as review_batch_module
 
@@ -39,7 +38,6 @@ from services.review_batch import (
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from runtime.reconcile import ReconcileValidationError, RuntimeReconciler
-from tests.test_runtime_bridge_helpers import build_legacy_main
 from runtime.runner import AgentRuntimeRunner, RuntimeRunnerError
 
 
@@ -55,7 +53,20 @@ def _summaries(count: int = 61) -> list[dict]:
                 "source_paper_id": f"source-paper-{index:03d}",
             },
             "ai_summary": normalize_ai_summary(
-                normalize_ai_summary({"summary": f"Contribution {index:03d}"})
+                {
+                    "schema_version": "summary_v2_lite",
+                    "routing": {
+                        "paper_type": "empirical",
+                        "classification_status": "resolved",
+                        "route_confidence": "high",
+                    },
+                    "core_analysis": {
+                        "summary": f"Contribution {index:03d}",
+                        "methodology": "controlled study",
+                        "findings": f"Finding {index:03d}",
+                        "conclusions": f"Conclusion {index:03d}",
+                    },
+                }
             ),
         }
         for index in range(1, count + 1)
@@ -75,6 +86,12 @@ def _write_classification(path: Path) -> None:
                     "AB": "1" if index <= 45 else "0",
                 }
             )
+
+
+def _current_config(tmp_path: Path) -> Path:
+    path = tmp_path / "config.ini"
+    shutil.copyfile(Path(__file__).parents[1] / "config.ini.example", path)
+    return path
 
 
 def _register_parent_paper_artifact(
@@ -370,11 +387,6 @@ def test_abc_a_ab_batches_share_parent_and_never_call_stage1_provider(
     def _forbidden_provider(*_args, **_kwargs):
         pytest.fail("child review batch crossed the Stage 1 provider boundary")
 
-    monkeypatch.setattr(
-        main.LiteratureReviewGenerator,
-        "_call_stage1_reader_with_scheduler",
-        _forbidden_provider,
-    )
     monkeypatch.setattr(AgentRuntimeBridge, "persist_stage1_results", _forbidden_provider)
     workspace = JobWorkspace(
         str(tmp_path / "output"),
@@ -2433,7 +2445,20 @@ def test_batch_derivation_fails_closed_for_divergent_summary_paper_lineage(
     summaries = json.loads(parent.read_text(encoding="utf-8"))
     if divergence == "ai_summary":
         summaries[0]["ai_summary"] = normalize_ai_summary(
-            normalize_ai_summary({"summary": "Divergent but canonical analysis."})
+            {
+                "schema_version": "summary_v2_lite",
+                "routing": {
+                    "paper_type": "empirical",
+                    "classification_status": "resolved",
+                    "route_confidence": "high",
+                },
+                "core_analysis": {
+                    "summary": "Divergent but canonical analysis.",
+                    "methodology": "controlled study",
+                    "findings": "Divergent finding.",
+                    "conclusions": "Divergent conclusion.",
+                },
+            }
         )
     else:
         summaries[0]["paper_info"]["source_paper_id"] = "divergent-source-id"
@@ -2841,19 +2866,15 @@ def test_runtime_bridge_exposes_downstream_only_batch_derivation(
             project_name="derived-child",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="generate_review",
+            config=str(_current_config(tmp_path)),
             queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
         )
     )
-    session = bridge.bootstrap(build_legacy_main())
+    session = bridge.bootstrap()
 
     def _forbidden_stage1(*_args, **_kwargs):
         pytest.fail("runtime child attempted Stage 1")
 
-    monkeypatch.setattr(
-        main.LiteratureReviewGenerator,
-        "_call_stage1_reader_with_scheduler",
-        _forbidden_stage1,
-    )
     monkeypatch.setattr(AgentRuntimeBridge, "persist_stage1_results", _forbidden_stage1)
     stage = bridge.derive_review_batch(
         session,
@@ -2874,7 +2895,7 @@ def test_runtime_bridge_exposes_downstream_only_batch_derivation(
     assert stage.success is True
     assert stage.stage_name == "stage1_derive"
     assert stage.metadata["stage1_model_calls"] == 0
-    assert [item["paper_info"]["canonical_paper_key"] for item in json.loads(Path(session.generator.summary_file).read_text(encoding="utf-8"))] == [
+    assert [item["paper_info"]["canonical_paper_key"] for item in json.loads(Path(session.stage_host.summary_file).read_text(encoding="utf-8"))] == [
         "paper-002",
         "paper-001",
     ]
@@ -2921,24 +2942,22 @@ def test_runtime_runner_coordinates_multi_variant_batch_without_generation_calls
         ),
     )
 
-    def forbidden_handler(*_args, **_kwargs):
-        pytest.fail("derived child crossed a generation-provider boundary")
-
     result = AgentRuntimeRunner(
         RuntimeJobSpec(
             project_name="derived-runner-coordinator",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="derive_review_batch",
-            config=str(tmp_path / "config.ini"),
+            config=str(_current_config(tmp_path)),
             queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
             metadata={"review_batch_spec": batch.to_dict()},
         ),
-        legacy_main=build_legacy_main(),
-        stage_handler=forbidden_handler,
     ).run()
 
     assert result.job_status == "completed"
-    assert result.canonical_ready is True
+    # A derivation-only coordinator has no review/validation CurrentArtifactSet;
+    # fail-closed completion must not promote it as a final review job.
+    assert result.canonical_ready is False
+    assert "current_artifact_set_missing" in result.completion_reasons
     assert "derive_review_batch" in result.completed_stages
     assert "analyze" not in result.completed_stages
     assert "outline" not in result.completed_stages
@@ -2982,11 +3001,10 @@ def test_runtime_runner_rejects_single_selection_coordinator_before_writes(
             project_name="single-coordinator",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="derive_review_batch",
-            config=str(tmp_path / "config.ini"),
+            config=str(_current_config(tmp_path)),
             queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
             metadata={"review_batch_spec": batch.to_dict()},
         ),
-        legacy_main=build_legacy_main(),
     )
 
     with pytest.raises(RuntimeRunnerError, match="requires a multi-variant"):
@@ -3023,11 +3041,10 @@ def test_runtime_runner_rejects_workspace_alias_before_bootstrap_writes(
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             job_id="coordinator-job",
             action="derive_review_batch",
-            config=str(tmp_path / "config.ini"),
+            config=str(_current_config(tmp_path)),
             queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
             metadata={"review_batch_spec": batch.to_dict()},
         ),
-        legacy_main=build_legacy_main(),
     )
 
     with pytest.raises(RuntimeRunnerError, match="aliases the coordinator workspace"):
@@ -3085,11 +3102,10 @@ def test_runtime_runner_resume_reuses_children_after_batch_terminal_gap(
             project_name="resume-coordinator",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="derive_review_batch",
-            config=str(tmp_path / "config.ini"),
+            config=str(_current_config(tmp_path)),
             queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
             metadata={"review_batch_spec": batch.to_dict()},
         ),
-        legacy_main=build_legacy_main(),
         fault_injector=crash,
     )
 
@@ -3097,7 +3113,6 @@ def test_runtime_runner_resume_reuses_children_after_batch_terminal_gap(
     assert first.job_status == "failed"
     resumed = AgentRuntimeRunner(
         replace(runner.job_spec, job_id=first.job_id),
-        legacy_main=build_legacy_main(),
     ).resume()
 
     assert resumed.job_status == "completed"
@@ -3157,11 +3172,10 @@ def test_runtime_runner_rejects_multi_variant_batch_on_single_review_action(
             project_name="batch-coordinator",
             source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
             action="generate_review",
-            config=str(tmp_path / "config.ini"),
+            config=str(_current_config(tmp_path)),
             queue_file=str(tmp_path / "output" / "_queue" / "queue.json"),
             metadata={"review_batch_spec": batch.to_dict()},
         ),
-        legacy_main=build_legacy_main(),
     )
 
     with pytest.raises(RuntimeRunnerError, match="require the derive_review_batch action"):
@@ -3190,9 +3204,7 @@ def test_runtime_runner_resolves_inline_batch_paths_from_job_spec_origin(tmp_pat
     selection["parent_summary_path"] = str(Path(parent).relative_to(tmp_path))
     selection.pop("selection_hash")
 
-    def forbidden_handler(*_args, **_kwargs):
-        pytest.fail("derived child crossed a generation-provider boundary")
-
+    _current_config(tmp_path)
     result = AgentRuntimeRunner(
         RuntimeJobSpec(
             project_name="relative-derived-runner",
@@ -3202,8 +3214,6 @@ def test_runtime_runner_resolves_inline_batch_paths_from_job_spec_origin(tmp_pat
             queue_file="output/_queue/queue.json",
             metadata={"review_batch_spec": batch, "requested_stages": []},
         ),
-        legacy_main=build_legacy_main(),
-        stage_handler=forbidden_handler,
         origin_dir=tmp_path,
     ).run()
 

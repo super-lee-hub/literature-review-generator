@@ -3,24 +3,22 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from runtime.attempt_store import (
     AttemptAlreadyRunningError,
     AttemptExecutionLease,
     AttemptStore,
 )
+from runtime.completion_evaluator import CanonicalCompletionEvaluator, CompletionEvaluationV1
 from runtime.job_spec import RuntimeJobSpec
 from runtime.lifecycle import finalize_job_runtime
 from runtime.lifecycle import publish_running_job_runtime
 from runtime.orchestrator import AgentRuntimeBridge, AgentRuntimeSession
 from runtime.reconcile import (
-    LegacyMigrationResult,
     ReconcileValidationError,
     ReconcileResult,
     RuntimeReconciler,
-    project_legacy_workspace_outcome,
-    validate_canonical_ai_summary,
     validate_review_batch_manifest_for_bootstrap,
 )
 from runtime.stage_contracts import SourceBundle, StageResult
@@ -32,9 +30,11 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
-from services.job_outcome import JobOutcomeV1
-from services.job_workspace import JobWorkspace, atomic_write_json, utc_now_iso
+from services.job_outcome import JobOutcomeV1, load_canonical_job_outcome
+from services.job_workspace import JobWorkspace, publish_json_artifact, utc_now_iso
 from services.queue_service import JobCancelledError
+from services.queue_service import CancelToken
+from runtime.provider_runtime import hash_json
 
 
 class RuntimeRunnerError(RuntimeError):
@@ -45,20 +45,7 @@ class RuntimePathOriginError(RuntimeRunnerError):
     pass
 
 
-class RuntimeStageHandler(Protocol):
-    def __call__(self, stage_name: str, request: "RuntimeStageRequest") -> Any: ...
-
-
 FaultInjector = Callable[[str, Mapping[str, Any]], None]
-
-
-@dataclass(frozen=True)
-class RuntimeStageRequest:
-    stage_name: str
-    job_spec: RuntimeJobSpec
-    source_bundle: SourceBundle
-    workspace_path: str
-    prior_results: Mapping[str, StageResult]
 
 
 @dataclass(frozen=True)
@@ -74,42 +61,204 @@ class RuntimeExecutionResult:
     completed_stages: tuple[str, ...]
     failed_stage: str | None
     job_outcome_path: str
-    compatibility_status: str = "native"
     message: str = ""
+    completion_status: str = ""
+    completion_reasons: tuple[str, ...] = ()
+    completion_evidence_hash: str = ""
 
     @property
     def success(self) -> bool:
-        """Legacy readiness projection; Queue must use job_status."""
+        """Return whether the canonical outcome is ready for downstream use."""
 
         return self.canonical_ready
 
 
-class AgentRuntimeRunner:
-    """Single AI-native state machine layered on the existing bridge.
+def _evaluate_runtime_completion(
+    outcome: JobOutcomeV1,
+    registry: ArtifactRegistry,
+) -> CompletionEvaluationV1:
+    """Read and verify the durable evidence used by status projections."""
 
-    Generation remains a host/subagent responsibility through ``stage_handler``;
-    all lifecycle, persistence, validation, recovery, and reconciliation remain
-    local and deterministic.
-    """
+    registry_verified = True
+    ready_job_outcome = False
+    validation_record = False
+    required_provider_stages = {"analyze", "outline", "review", "validate"}.intersection(
+        outcome.required_stages
+    )
+    provider_receipts_complete = not required_provider_stages
+    provider_receipt_closure: Mapping[str, Any] | None = None
+    current_stage_closure_map: Mapping[str, Any] | None = None
+    try:
+        for record in registry.list_records():
+            if record.status != "ready":
+                continue
+            # The workspace log is intentionally append-only operational
+            # output: its registered hash is the creation hash, not a frozen
+            # canonical artifact hash.  It must not make an otherwise valid
+            # completion fail merely because later lifecycle messages were
+            # appended.
+            if record.artifact_role == "log" or record.artifact_type == "job_log":
+                continue
+            ArtifactRegistry._verify_ready_artifact(record)
+            ready_job_outcome = ready_job_outcome or record.artifact_id == "job_outcome"
+            validation_record = validation_record or record.artifact_type == "validation_run_result"
+        from validation.closure import resolve_current_stage_closure_map
+
+        current_stage_closure_map = resolve_current_stage_closure_map(registry).to_dict()
+        provider_entries = current_stage_closure_map.get("provider_closures_by_stage")
+        if required_provider_stages:
+            if not isinstance(provider_entries, Mapping):
+                provider_receipts_complete = False
+            else:
+                provider_receipts_complete = all(
+                    isinstance(provider_entries.get(stage), Mapping)
+                    and bool(provider_entries[stage].get("complete"))
+                    for stage in required_provider_stages
+                )
+        if isinstance(provider_entries, Mapping):
+            # Keep the stage-indexed aggregate as the completion source.  The
+            # validation closure is one entry in that map, not a replacement
+            # for analyze/outline/review evidence.
+            provider_receipt_closure = {
+                "complete": provider_receipts_complete,
+                "stages": {
+                    str(stage): dict(value)
+                    for stage, value in provider_entries.items()
+                    if isinstance(value, Mapping)
+                },
+            }
+        current_receipt_ref = (current_stage_closure_map.get("stages") or {}).get(
+            "validation_receipt_closure"
+        )
+        current_receipt_id = str(
+            current_receipt_ref.get("artifact_id") if isinstance(current_receipt_ref, Mapping) else ""
+        )
+        current_receipt = registry.get(current_receipt_id) if current_receipt_id else None
+        if current_receipt is not None:
+            closure_envelope = json.loads(Path(current_receipt.path).read_text(encoding="utf-8"))
+            candidate = closure_envelope.get("payload") if isinstance(closure_envelope, Mapping) else None
+            if isinstance(candidate, Mapping):
+                if isinstance(provider_receipt_closure, Mapping):
+                    provider_receipt_closure = {
+                        **dict(provider_receipt_closure),
+                        "validation": dict(candidate),
+                    }
+                else:
+                    provider_receipt_closure = {
+                        "complete": provider_receipts_complete,
+                        "validation": dict(candidate),
+                    }
+            else:
+                if "validate" in required_provider_stages:
+                    provider_receipts_complete = False
+        elif "validate" in required_provider_stages:
+            provider_receipts_complete = False
+    except (OSError, RegistryError, TypeError, ValueError):
+        registry_verified = False
+        provider_receipts_complete = False
+
+    policy = dict(outcome.readiness_policy_snapshot)
+    validation_status = "clean" if outcome.job_disposition == "clean" and validation_record else (
+        "findings" if outcome.job_disposition == "findings" else "missing"
+    )
+    try:
+        current_set = registry.resolve_current_artifact_set()
+    except (OSError, RegistryError, TypeError, ValueError):
+        current_set = None
+    if current_set is not None and current_set.validation_status == "not_requested":
+        validation_status = "not_requested"
+    return CanonicalCompletionEvaluator.evaluate(
+        {
+            "job_id": outcome.job_id,
+            "job_status": outcome.job_status,
+            "required_stages": outcome.required_stages,
+            "completed_stages": outcome.completed_stages,
+            "failed_stage": outcome.failed_stage,
+            "artifact_registry_verified": registry_verified,
+            "canonical_artifacts": {"job_outcome": ready_job_outcome},
+            "validation_required": bool(policy.get("validation_required", False)),
+            "require_clean_validation": bool(policy.get("require_clean_validation", False)),
+            "allow_unvalidated_when_validation_optional": bool(
+                policy.get("allow_unvalidated_when_validation_optional", False)
+            ),
+            "validation_status": validation_status,
+            "provider_receipts_complete": provider_receipts_complete,
+            "provider_receipt_closure": provider_receipt_closure,
+            "current_stage_closure_map": current_stage_closure_map,
+            "declared_canonical_ready": outcome.canonical_ready,
+            "degradation_reasons": outcome.degradation_reasons,
+            "evidence_sources": ("job_outcome_v1", "artifact_registry"),
+        }
+    )
+
+
+class AgentRuntimeRunner:
+    """Single AI-native state machine layered on the internal stage registry."""
+
+    _OUTLINE_V3_ARTIFACT_TYPES = frozenset(
+        {
+            "outline_artifact",
+            "relation_adjudication_result",
+            "confirmed_global_relation_map",
+            "outline_candidate",
+            "structure_critique",
+            "coverage_critique",
+            "evidence_critique",
+            "arbitration_decision",
+            "selected_outline_candidate",
+            "section_evidence_packet_set",
+            "final_outline",
+            "coverage_audit",
+            "stability_audit",
+            "provider_receipt_closure",
+            "outline_stage_health",
+            "adopted_outline",
+            "stage1_canonical_summaries",
+        }
+    )
+
+    @classmethod
+    def _schema_validators(cls) -> dict[str, Callable[[ArtifactRecord, Path], None]]:
+        from runtime.reconcile import DEFAULT_SCHEMA_VALIDATORS
+        from runtime.artifact_validators import make_outline_schema_validators
+
+        validators = dict(DEFAULT_SCHEMA_VALIDATORS)
+        for artifact_type, current_validator in make_outline_schema_validators().items():
+            fallback_validator = validators.get(artifact_type)
+
+            def dispatch(
+                record: ArtifactRecord,
+                path: Path,
+                *,
+                current_validator: Callable[[ArtifactRecord, Path], None] = current_validator,
+                fallback_validator: Callable[[ArtifactRecord, Path], None] | None = fallback_validator,
+            ) -> None:
+                if record.artifact_version == "v3":
+                    current_validator(record, path)
+                elif fallback_validator is not None:
+                    fallback_validator(record, path)
+                else:
+                    raise ValueError(f"no validator is registered for artifact type {record.artifact_type!r}")
+
+            validators[artifact_type] = dispatch
+        return validators
 
     def __init__(
         self,
         job_spec: RuntimeJobSpec,
         *,
-        legacy_main: Any,
-        stage_handler: RuntimeStageHandler | None = None,
-        validator_module: Any | None = None,
         origin_dir: str | Path | None = None,
         fault_injector: FaultInjector | None = None,
+        cancel_token: CancelToken | None = None,
+        publication_context: Any | None = None,
     ) -> None:
         resolved = job_spec.resolved_from(origin_dir) if origin_dir is not None else job_spec
         self._require_explicit_path_origins(resolved)
         resolved.validate()
         self.job_spec = resolved
-        self.legacy_main = legacy_main
-        self.stage_handler = stage_handler
-        self.validator_module = validator_module
         self.fault_injector = fault_injector
+        self.cancel_token = cancel_token
+        self.publication_context = publication_context
 
     @staticmethod
     def _require_explicit_path_origins(spec: RuntimeJobSpec) -> None:
@@ -141,10 +290,31 @@ class AgentRuntimeRunner:
             raise RuntimeRunnerError("resume requires an explicit job_id")
         metadata = dict(self.job_spec.metadata)
         requested_stages = metadata.get("requested_stages")
-        if requested_stages is not None:
-            metadata["requested_stages"] = list(
-                dict.fromkeys(str(item) for item in requested_stages)
+        from config_loader import load_config
+        from services.settings import ApplicationSettings
+        from runtime.stage_planning import StagePlanError, build_stage_plan
+
+        try:
+            settings = ApplicationSettings.from_config(load_config(self.job_spec.config))
+            plan = build_stage_plan(
+                action=self.job_spec.action,
+                requested_stages=requested_stages,
+                validation_enabled=settings.review_validation_enabled(),
+                validation_required=metadata.get("validation_required"),
+                require_clean_validation=metadata.get("require_clean_validation"),
+                allow_unvalidated_when_validation_optional=metadata.get(
+                    "allow_unvalidated_when_validation_optional"
+                ),
             )
+        except (StagePlanError, OSError, ValueError) as exc:
+            raise RuntimeRunnerError(str(exc)) from exc
+        metadata["requested_stages"] = list(plan.requested_stages)
+        metadata["validation_required"] = plan.validation_required
+        metadata["require_clean_validation"] = plan.require_clean_validation
+        metadata["allow_unvalidated_when_validation_optional"] = (
+            plan.allow_unvalidated_when_validation_optional
+        )
+        metadata["stage_plan"] = plan.to_dict()
         return replace(
             self.job_spec,
             job_id=self.job_spec.job_id or JobWorkspace.generate_job_id(),
@@ -169,8 +339,15 @@ class AgentRuntimeRunner:
     def _validate_persisted_spec(
         workspace: JobWorkspace,
         expected_payload: Mapping[str, Any],
+        registry: ArtifactRegistry | None = None,
     ) -> None:
-        path = Path(workspace.artifact_path("runtime_job_spec_v1.json"))
+        active_registry = registry or ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+        record = active_registry.get("runtime_job_spec")
+        path = Path(
+            record.path
+            if record is not None and record.status == "ready"
+            else workspace.artifact_path("runtime_job_spec_v1.json")
+        )
         try:
             persisted_spec = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -316,6 +493,7 @@ class AgentRuntimeRunner:
             reconciler = RuntimeReconciler(
                 session.context.workspace,
                 session.context.registry,
+                schema_validators=self._schema_validators(),
                 external_registry_resolver=(
                     external_registry_resolver
                     or self._external_registry_resolver(session.context.workspace)
@@ -336,87 +514,6 @@ class AgentRuntimeRunner:
         )
         StageTerminalStore(session.context.workspace, session.context.registry).persist(record)
 
-    def _call_handler(
-        self,
-        stage_name: str,
-        *,
-        spec: RuntimeJobSpec,
-        bundle: SourceBundle,
-        session: AgentRuntimeSession,
-        results: Mapping[str, StageResult],
-    ) -> Any:
-        if self.stage_handler is None:
-            raise RuntimeRunnerError(f"required generation stage has no host handler: {stage_name}")
-        return self.stage_handler(
-            stage_name,
-            RuntimeStageRequest(
-                stage_name=stage_name,
-                job_spec=spec,
-                source_bundle=bundle,
-                workspace_path=session.context.workspace.root_dir,
-                prior_results=dict(results),
-            ),
-        )
-
-    @staticmethod
-    def _validate_stage1_summaries(
-        summaries: Any,
-        source_bundle: SourceBundle,
-    ) -> list[Mapping[str, Any]]:
-        if not isinstance(summaries, (list, tuple)):
-            raise RuntimeRunnerError("stage1 handler summaries must be a JSON array")
-        if not source_bundle.paper_work_items:
-            raise RuntimeRunnerError("stage1 requires at least one source work item")
-        if len(summaries) != len(source_bundle.paper_work_items):
-            raise RuntimeRunnerError(
-                "stage1 summary count does not match the source work-item count"
-            )
-
-        expected = {
-            item.canonical_paper_key: item for item in source_bundle.paper_work_items
-        }
-        if len(expected) != len(source_bundle.paper_work_items):
-            raise RuntimeRunnerError("source bundle contains duplicate canonical paper keys")
-
-        seen: set[str] = set()
-        normalized: list[Mapping[str, Any]] = []
-        for index, summary in enumerate(summaries):
-            if not isinstance(summary, Mapping):
-                raise RuntimeRunnerError(f"stage1 summary[{index}] must be a JSON object")
-            if str(summary.get("status") or "").strip().lower() != "success":
-                raise RuntimeRunnerError(
-                    f"stage1 summary[{index}] is not a successful canonical result"
-                )
-            paper_info = summary.get("paper_info")
-            if not isinstance(paper_info, Mapping):
-                raise RuntimeRunnerError(f"stage1 summary[{index}] has no paper_info object")
-            paper_key = str(paper_info.get("canonical_paper_key") or "").strip()
-            source_paper_id = str(paper_info.get("source_paper_id") or "").strip()
-            if not paper_key or paper_key not in expected:
-                raise RuntimeRunnerError(
-                    f"stage1 summary[{index}] canonical paper identity is not in the source bundle"
-                )
-            if paper_key in seen:
-                raise RuntimeRunnerError(f"stage1 summary identity is duplicated: {paper_key}")
-            expected_item = expected[paper_key]
-            if not source_paper_id or source_paper_id != expected_item.source_paper_id:
-                raise RuntimeRunnerError(
-                    f"stage1 summary[{index}] source_paper_id does not match the source bundle"
-                )
-            try:
-                validate_canonical_ai_summary(
-                    summary.get("ai_summary"),
-                    label=f"stage1 summary[{index}] ai_summary",
-                )
-            except ReconcileValidationError as exc:
-                raise RuntimeRunnerError(str(exc)) from exc
-            seen.add(paper_key)
-            normalized.append(summary)
-
-        if seen != set(expected):
-            raise RuntimeRunnerError("stage1 summaries do not cover every source work item")
-        return normalized
-
     def _execute_stage(
         self,
         stage: str,
@@ -429,98 +526,223 @@ class AgentRuntimeRunner:
         attempt_id: str,
         external_registry_resolver: Callable[[str], ArtifactRegistry | None] | None = None,
     ) -> tuple[StageResult, int]:
-        if stage == "analyze":
-            response = self._call_handler("stage1_analyze", spec=spec, bundle=bundle, session=session, results=results)
-            if not isinstance(response, Mapping):
-                raise RuntimeRunnerError("stage1 handler must return a mapping with summaries")
-            summaries = self._validate_stage1_summaries(response.get("summaries"), bundle)
-            return (
-                bridge.persist_stage1_results(
-                    session,
-                    summaries,
-                    source_items=list(response.get("source_items") or []),
-                    rejected_candidates=list(response.get("rejected_candidates") or []),
-                    subagent_run_id=str(response.get("subagent_run_id") or "") or None,
-                ),
-                int(response.get("model_call_count") or len(bundle.paper_work_items)),
-            )
-        if stage == "outline":
-            response = self._call_handler("stage2_outline", spec=spec, bundle=bundle, session=session, results=results)
-            payload = response if isinstance(response, Mapping) else {"outline_text": response}
-            if bool(payload.get("use_generator_outline_v2", False)):
-                if not session.generator.create_literature_review_outline():
-                    raise RuntimeRunnerError("generator Outline v2 pipeline failed")
-                if bool(payload.get("adopt_outline_v2", False)) and not session.generator.adopt_outline_v2(
-                    adopted_by=str(payload.get("adopted_by") or "runtime-handler"),
-                    reason=str(payload.get("adoption_reason") or "explicit runtime Outline v2 adoption"),
-                ):
-                    raise RuntimeRunnerError("generator Outline v2 adoption failed")
-                record = session.context.registry.get("adopted_final_outline")
-                if record is None or record.status != "ready":
-                    raise RuntimeRunnerError("Outline v2 did not produce a ready adopted outline")
-                return (
-                    StageResult(
-                        stage_name="stage2_outline",
-                        success=True,
-                        artifacts=[bridge._artifact_ref_from_record(record)],
-                        metadata={
-                            "outline_mode": "v2",
-                            "stage_health_artifact_id": "outline_stage_health",
-                        },
-                    ),
-                    int(payload.get("model_call_count") or 0),
-                )
-            outline_text = str(payload.get("outline_text") or "")
-            if not outline_text.strip():
-                raise RuntimeRunnerError("stage2 handler returned an empty outline")
-            return (
-                bridge.persist_outline(
-                    session,
-                    outline_text,
-                    subagent_run_id=str(payload.get("subagent_run_id") or "") or None,
-                ),
-                int(payload.get("model_call_count") or 1),
-            )
-        if stage == "review":
-            response = self._call_handler("stage3_review", spec=spec, bundle=bundle, session=session, results=results)
-            if not isinstance(response, Mapping):
-                raise RuntimeRunnerError("stage3 handler must return a mapping")
-            outline_result = results.get("outline")
-            outline_file = str(response.get("outline_file") or "")
-            if not outline_file and outline_result and outline_result.artifacts:
-                outline_file = outline_result.artifacts[0].path
-            if not outline_file:
-                adopted = session.context.registry.get("adopted_final_outline")
-                legacy = session.context.registry.get("literature_review_outline")
-                record = adopted or legacy
-                if record is not None and record.status == "ready":
-                    outline_file = record.path
-            if not outline_file:
-                raise RuntimeRunnerError("review requires an explicit registered outline dependency")
-            self._record_for_ref(session, "", outline_file)
-            sections = response.get("review_sections")
-            if not isinstance(sections, list):
-                raise RuntimeRunnerError("stage3 handler must return review_sections")
-            return (
-                bridge.persist_review_chain(
-                    session,
-                    outline_file=outline_file,
-                    review_sections=sections,
-                    references=list(response.get("references") or []),
-                    rebuild_docx=bool(response.get("rebuild_docx", True)),
-                    subagent_run_id=str(response.get("subagent_run_id") or "") or None,
-                ),
-                int(response.get("model_call_count") or 1),
-            )
-        if stage == "validate":
-            result = bridge.run_validation(
-                session,
+        try:
+            return bridge.execute_stage(
+                stage,
+                session=session,
+                spec=spec,
+                bundle=bundle,
+                results=results,
                 attempt_id=attempt_id,
-                validator_module=self.validator_module,
                 external_registry_resolver=external_registry_resolver,
             )
-            return result, 0
-        raise RuntimeRunnerError(f"unsupported runtime stage: {stage}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeRunnerError(f"built-in stage executor failed for {stage}: {exc}") from exc
+
+    @staticmethod
+    def _publish_optional_current_artifact_set(session: AgentRuntimeSession) -> None:
+        """Publish a review set whose validation disposition is explicit.
+
+        When review validation is disabled, the review artifacts still need a
+        durable current-set boundary.  Validation is represented by a typed
+        ``not_requested`` disposition and an empty, complete receipt closure;
+        the set remains ineligible for validation-stage completion until a
+        later explicit validation run replaces it.
+        """
+
+        from runtime.provider_receipt_closure import ProviderReceiptClosure
+        from validation.disposition import ValidationDispositionV1
+        from validation.repair_transaction import RepairPromotionTransaction
+
+        context = session.context
+        registry = context.registry
+        current_set = registry.resolve_current_artifact_set()
+        if current_set is not None:
+            return
+        job_id = context.workspace.job_id
+        draft = registry.get("review_draft")
+        manifest = registry.get("citation_manifest_v3")
+        review_docx = registry.get("review_docx")
+        if (
+            draft is None
+            or manifest is None
+            or review_docx is None
+            or draft.status != "ready"
+            or manifest.status != "ready"
+            or review_docx.status != "ready"
+        ):
+            raise RuntimeRunnerError(
+                "cannot publish optional current artifact set without ready review, citation, and DOCX artifacts"
+            )
+
+        def ref(record: ArtifactRecord) -> ArtifactDependencyRefV2:
+            return ArtifactDependencyRefV2.from_record(record)
+
+        runtime_spec = registry.get("runtime_job_spec")
+        if runtime_spec is None or runtime_spec.status != "ready":
+            raise RuntimeRunnerError(
+                "cannot publish optional validation disposition without a ready runtime_job_spec"
+            )
+        stage_plan_hash = hash_json(context.readiness_policy_snapshot.get("stage_plan") or {})
+        disposition = ValidationDispositionV1.create(
+            job_id=job_id,
+            stage_plan_hash=stage_plan_hash,
+            spec_hash=runtime_spec.content_hash,
+            review_draft_artifact_id=draft.artifact_id,
+            review_draft_artifact_hash=draft.content_hash,
+            citation_manifest_artifact_id=manifest.artifact_id,
+            citation_manifest_artifact_hash=manifest.content_hash,
+            review_docx_artifact_id=review_docx.artifact_id,
+            review_docx_artifact_hash=review_docx.content_hash,
+            actor="runtime.runner.AgentRuntimeRunner",
+            reason="review completed with validation explicitly not requested by the durable stage plan",
+        )
+        disposition_id = "validation:not_requested"
+        disposition_path = Path(
+            context.workspace.artifact_path("validation/not_requested/validation_disposition.json")
+        )
+        disposition_record = registry.get(disposition_id)
+        if disposition_record is None or disposition_record.status != "ready":
+            disposition_record = publish_json_artifact(
+                context.publication_context,
+                registry,
+                disposition_path,
+                disposition.to_dict(),
+                artifact_role="validation_disposition",
+                artifact_type="validation_disposition",
+                artifact_version="v1",
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id=disposition_id,
+                depends_on=(ref(draft), ref(manifest), ref(review_docx), ref(runtime_spec)),
+                metadata={
+                    "validation_status": "not_requested",
+                    "allow_unvalidated": True,
+                    "stage_plan_hash": stage_plan_hash,
+                    "spec_hash": runtime_spec.content_hash,
+                },
+            )
+        if disposition_record is None:
+            raise RuntimeRunnerError("optional validation disposition registration returned no record")
+
+        empty_closure = ProviderReceiptClosure.evaluate((), ())
+        closure_id = "validation:provider_receipt_closure:not_requested"
+        closure_path = Path(
+            context.workspace.artifact_path("validation/not_requested/provider_receipt_closure.json")
+        )
+        closure_record = registry.get(closure_id)
+        if closure_record is None or closure_record.status != "ready":
+            closure_record = publish_json_artifact(
+                context.publication_context,
+                registry,
+                closure_path,
+                {
+                    "artifact_type": "provider_receipt_closure",
+                    "artifact_version": "v1",
+                    "job_id": job_id,
+                    "payload": empty_closure.to_dict(),
+                },
+                artifact_role="validation_provider_receipt_closure",
+                artifact_type="provider_receipt_closure",
+                artifact_version="v1",
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id=closure_id,
+                depends_on=(ref(disposition_record),),
+                metadata={
+                    "stage_name": "validation",
+                    "validation_status": "not_requested",
+                },
+            )
+        if closure_record is None:
+            raise RuntimeRunnerError("optional validation closure registration returned no record")
+
+        promotion_id = "runtime-validation:not-requested"
+        promotion_path = Path(
+            context.workspace.artifact_path(
+                "validation/not_requested/repair_promotion_transaction.json"
+            )
+        )
+        promotion_record = registry.get(promotion_id)
+        if promotion_record is None or promotion_record.status != "ready":
+            promotion = RepairPromotionTransaction(
+                transaction_id=promotion_id,
+                job_id=job_id,
+                source_transaction_id="",
+                status="prepared",
+                actor="runtime.runner.AgentRuntimeRunner",
+                reason="review completed with validation explicitly not requested",
+                canonical_version="runtime-validation",
+                review_draft_artifact_id=draft.artifact_id,
+                citation_manifest_artifact_id=manifest.artifact_id,
+                review_docx_artifact_id=review_docx.artifact_id,
+                audit_artifact_id="",
+                lineage_artifact_id="",
+                canonical_input_hashes={
+                    draft.artifact_id: draft.content_hash,
+                    manifest.artifact_id: manifest.content_hash,
+                    review_docx.artifact_id: review_docx.content_hash,
+                },
+                output_hashes={
+                    draft.artifact_id: draft.content_hash,
+                    manifest.artifact_id: manifest.content_hash,
+                    review_docx.artifact_id: review_docx.content_hash,
+                    disposition_record.artifact_id: disposition_record.content_hash,
+                    closure_record.artifact_id: closure_record.content_hash,
+                },
+                created_at=utc_now_iso(),
+                validation_run_result_artifact_id="",
+                validation_disposition_artifact_id=disposition_record.artifact_id,
+            )
+            promotion_record = publish_json_artifact(
+                context.publication_context,
+                registry,
+                promotion_path,
+                promotion.to_dict(),
+                artifact_role="repair_promotion_transaction",
+                artifact_type="repair_promotion_transaction",
+                artifact_version="v1",
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id=promotion_id,
+                depends_on=(
+                    ref(draft),
+                    ref(manifest),
+                    ref(review_docx),
+                    ref(disposition_record),
+                    ref(closure_record),
+                ),
+                metadata={
+                    "status": "prepared",
+                    "promotion_state": "prepared",
+                    "validation_status": "not_requested",
+                },
+            )
+        if promotion_record is None:
+            raise RuntimeRunnerError("optional validation promotion registration returned no record")
+
+        current_set = registry.build_current_artifact_set(
+            promotion_transaction_id=promotion_id,
+            promotion_transaction_hash=promotion_record.content_hash,
+            review_draft_artifact_id=draft.artifact_id,
+            review_draft_artifact_hash=draft.content_hash,
+            citation_manifest_artifact_id=manifest.artifact_id,
+            citation_manifest_artifact_hash=manifest.content_hash,
+            review_docx_artifact_id=review_docx.artifact_id,
+            review_docx_artifact_hash=review_docx.content_hash,
+            validation_run_result_artifact_id="",
+            validation_run_result_artifact_hash="",
+            validation_receipt_closure_artifact_id=closure_record.artifact_id,
+            validation_receipt_closure_artifact_hash=closure_record.content_hash,
+            validation_status="not_requested",
+            actor="runtime.runner.AgentRuntimeRunner",
+            reason="review completed with validation explicitly not requested",
+            validation_disposition_artifact_id=disposition_record.artifact_id,
+            validation_disposition_artifact_hash=disposition_record.content_hash,
+        )
+        registry.switch_current_artifact_set(
+            current_set,
+            prepared_promotion_record=promotion_record,
+        )
 
     def run(self) -> RuntimeExecutionResult:
         return self._execute(resume=False)
@@ -562,7 +784,7 @@ class AgentRuntimeRunner:
                 batch_spec.parent_selection()
             )
             validated_batch_parent_registry_path = validated_parent_registry.registry_path
-        bridge = AgentRuntimeBridge(spec)
+        bridge = AgentRuntimeBridge(spec, publication_context=self.publication_context)
         normalized_spec_payload = spec.to_dict()
         resume_preflight = None
         workspace_preflight = None
@@ -580,7 +802,11 @@ class AgentRuntimeRunner:
                 candidate = AttemptExecutionLease(workspace)
                 candidate.acquire()
                 try:
-                    self._validate_persisted_spec(workspace, normalized_spec_payload)
+                    self._validate_persisted_spec(
+                        workspace,
+                        normalized_spec_payload,
+                        ArtifactRegistry(workspace.paths.registry_path, workspace.job_id),
+                    )
                 except BaseException:
                     candidate.release()
                     raise
@@ -589,7 +815,7 @@ class AgentRuntimeRunner:
             resume_preflight = validate_resume
         try:
             session = bridge.bootstrap(
-                self.legacy_main,
+                cancel_token=self.cancel_token,
                 claim_latest_pointer=not resume,
                 resume_requested=resume,
                 resume_preflight=resume_preflight,
@@ -668,22 +894,31 @@ class AgentRuntimeRunner:
             claim_latest_pointer=not resume,
         )
         if not resume:
-            atomic_write_json(normalized_spec_path, normalized_spec_payload)
+            publish_json_artifact(
+                session.context.publication_context,
+                session.context.registry,
+                normalized_spec_path,
+                normalized_spec_payload,
+                artifact_role="runtime_spec",
+                artifact_type="runtime_job_spec",
+                artifact_version="v1",
+                producer="runtime.runner.AgentRuntimeRunner",
+                artifact_id="runtime_job_spec",
+                metadata={
+                    "job_id": session.context.workspace.job_id,
+                    "stage_plan_hash": str(
+                        (normalized_spec_payload.get("metadata") or {}).get("stage_plan_hash") or ""
+                    ),
+                },
+            )
         self._fault("after_artifact_write_before_registry", artifact_type="runtime_job_spec")
-        session.context.registry.register_file(
-            artifact_role="runtime_spec",
-            artifact_type="runtime_job_spec",
-            artifact_version="v1",
-            path=normalized_spec_path,
-            producer="runtime.runner.AgentRuntimeRunner",
-            artifact_id="runtime_job_spec",
-        )
 
         try:
             bundle = bridge.build_source_bundle()
             reconciler = RuntimeReconciler(
                 session.context.workspace,
                 session.context.registry,
+                schema_validators=self._schema_validators(),
                 external_registry_resolver=external_registry_resolver,
             )
             source_result = StageResult(
@@ -736,7 +971,7 @@ class AgentRuntimeRunner:
                             None,
                         )
                         if summary_artifact is not None:
-                            session.generator.summary_file = summary_artifact.path
+                            session.stage_host.summary_file = summary_artifact.path
                 else:
                     derived = bridge.derive_review_batch(
                         session,
@@ -760,6 +995,23 @@ class AgentRuntimeRunner:
 
             for stage in self._requested_stages(spec):
                 active_stage = stage
+                if stage == "review" and spec.action == "run_all":
+                    from outline.adoption_transaction import current_adoption_record
+
+                    adoption = current_adoption_record(session.context.registry)
+                    if adoption is None or adoption.status != "ready":
+                        reason = "outline is ready_for_adoption; explicit adoption is required before review"
+                        attempt_store.finish(running_attempt, "succeeded", reason=reason)
+                        return self._finalize_result(
+                            session,
+                            status="completed",
+                            disposition="needs_review",
+                            canonical_ready=False,
+                            completed=tuple(completed),
+                            failed_stage=None,
+                            requires_attention=True,
+                            message=reason,
+                        )
                 if stage in results:
                     continue
                 if resume:
@@ -798,6 +1050,8 @@ class AgentRuntimeRunner:
                     continue
                 results[stage] = result
                 completed.append(stage)
+                if stage == "review" and "validate" not in self._requested_stages(spec):
+                    self._publish_optional_current_artifact_set(session)
 
             disposition = "unvalidated"
             policy = session.context.readiness_policy_snapshot
@@ -941,22 +1195,29 @@ class AgentRuntimeRunner:
                 status=status,
             ),
         )
-        payload = json.loads(Path(session.context.job_outcome_path).read_text(encoding="utf-8"))
-        outcome = JobOutcomeV1.from_dict(payload)
+        try:
+            outcome, outcome_record = load_canonical_job_outcome(session.context.registry)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeRunnerError(
+                f"canonical job outcome is invalid after finalization: {exc}"
+            ) from exc
+        evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
             workspace_path=session.context.workspace.root_dir,
             job_status=outcome.job_status,
             job_disposition=outcome.job_disposition,
-            canonical_ready=outcome.canonical_ready,
-            requires_attention=outcome.requires_attention,
+            canonical_ready=outcome.canonical_ready and evaluation.canonical_ready,
+            requires_attention=outcome.requires_attention or evaluation.requires_attention,
             attempt_number=outcome.attempt_number,
             resumed_from_attempt=outcome.resumed_from_attempt,
             completed_stages=outcome.completed_stages,
             failed_stage=outcome.failed_stage,
-            job_outcome_path=session.context.job_outcome_path,
-            compatibility_status=outcome.compatibility_status,
+            job_outcome_path=outcome_record.path,
             message=message,
+            completion_status=evaluation.status,
+            completion_reasons=evaluation.reasons,
+            completion_evidence_hash=evaluation.evidence_hash,
         )
 
     @staticmethod
@@ -1025,36 +1286,30 @@ class AgentRuntimeRunner:
         """Read the canonical job head without mutating workspace state."""
 
         workspace, _registry = cls._open_workspace(workspace_path)
-        outcome_path = Path(workspace.artifact_path("job_outcome_v1.json"))
-        if not outcome_path.is_file():
-            outcome = project_legacy_workspace_outcome(workspace)
-            if outcome is None:
-                raise RuntimeRunnerError(f"job outcome is missing: {outcome_path}")
-        else:
-            payload = json.loads(outcome_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, Mapping):
-                raise RuntimeRunnerError("job outcome must be a JSON object")
-            outcome = JobOutcomeV1.from_dict(payload)
+        try:
+            outcome, outcome_record = load_canonical_job_outcome(_registry)
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeRunnerError(f"canonical job outcome is invalid: {exc}") from exc
+        outcome_path = Path(outcome_record.path)
         if outcome.job_id != workspace.job_id:
             raise RuntimeRunnerError("job outcome belongs to another workspace")
+        evaluation = _evaluate_runtime_completion(outcome, _registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
             workspace_path=workspace.root_dir,
             job_status=outcome.job_status,
             job_disposition=outcome.job_disposition,
-            canonical_ready=outcome.canonical_ready,
-            requires_attention=outcome.requires_attention,
+            canonical_ready=outcome.canonical_ready and evaluation.canonical_ready,
+            requires_attention=outcome.requires_attention or evaluation.requires_attention,
             attempt_number=outcome.attempt_number,
             resumed_from_attempt=outcome.resumed_from_attempt,
             completed_stages=outcome.completed_stages,
             failed_stage=outcome.failed_stage,
             job_outcome_path=str(outcome_path),
-            compatibility_status=outcome.compatibility_status,
-            message=(
-                "legacy_unverified workspace projection"
-                if outcome.compatibility_status == "legacy_unverified"
-                else ""
-            ),
+            message="",
+            completion_status=evaluation.status,
+            completion_reasons=evaluation.reasons,
+            completion_evidence_hash=evaluation.evidence_hash,
         )
 
     @classmethod
@@ -1066,43 +1321,11 @@ class AgentRuntimeRunner:
         reconciler = RuntimeReconciler(
             workspace,
             registry,
+            schema_validators=cls._schema_validators(),
             external_registry_resolver=cls._external_registry_resolver(
                 workspace,
                 registry_paths=external_registry_paths,
             ),
         )
-        legacy_result = reconciler.legacy_read_only_result()
-        if legacy_result is not None:
-            return legacy_result
         AttemptStore(workspace, registry).register_orphaned_snapshots()
         return reconciler.reconcile()
-
-    @classmethod
-    def migrate_legacy(
-        cls,
-        workspace_path: str | Path,
-        actor: str,
-        reason: str,
-    ) -> LegacyMigrationResult:
-        """Explicitly materialize a fail-closed, audited legacy workspace head."""
-
-        if not actor.strip() or not reason.strip():
-            raise RuntimeRunnerError("legacy migration requires actor and reason")
-        workspace = cls._workspace_from_path(workspace_path)
-        execution_lease = AttemptExecutionLease(workspace)
-        try:
-            execution_lease.acquire()
-        except AttemptAlreadyRunningError as exc:
-            raise RuntimeRunnerError(f"legacy migration rejected: {exc}") from exc
-        try:
-            try:
-                registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-                return RuntimeReconciler(
-                    workspace,
-                    registry,
-                    external_registry_resolver=cls._external_registry_resolver(workspace),
-                ).migrate_legacy(actor=actor, reason=reason)
-            except (ReconcileValidationError, RegistryError, TypeError, ValueError) as exc:
-                raise RuntimeRunnerError(f"legacy migration rejected: {exc}") from exc
-        finally:
-            execution_lease.release()

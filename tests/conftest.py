@@ -165,8 +165,6 @@ def sample_config():
         "Performance": {
             "max_workers": 2,
             "api_retry_attempts": 3,
-            "primary_tpm_limit": 1000,
-            "primary_rpm_limit": 100
         },
         "Styling": {
             "font_name": "Times New Roman",

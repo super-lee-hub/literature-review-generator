@@ -1,4 +1,6 @@
-from summary_schema import normalize_ai_summary, project_legacy_ai_summary
+import pytest
+
+from summary_schema import normalize_ai_summary
 
 
 def test_normalize_ai_summary_caps_key_points_and_backfills_rationale() -> None:
@@ -38,69 +40,17 @@ def test_normalize_ai_summary_caps_key_points_and_backfills_rationale() -> None:
     assert "routing.classification_rationale" in normalized["quality_audit"]["inferred_fields"]
 
 
-def test_normalize_ai_summary_maps_legacy_type_alias_to_subtype() -> None:
-    normalized = normalize_ai_summary(
-        {
-            "common_core": {
-                "summary": "summary",
-                "key_points": ["point"],
-                "methodology": "method",
-                "findings": "findings",
-                "conclusions": "conclusions",
-                "relevance": "relevance",
-                "limitations": "limitations",
-            },
-            "type_specific_details": {
-                "paper_type": "systematic review",
-                "review_details": {
-                    "review_type": "systematic review",
-                },
-            },
-        }
-    )
-
-    assert normalized["routing"]["paper_type"] == "review"
-    assert normalized["routing"]["paper_subtype_raw"] == "systematic review"
-    assert normalized["routing"]["paper_subtype_normalized"] == "systematic_review"
+def test_normalize_ai_summary_rejects_legacy_type_alias_shape() -> None:
+    with pytest.raises(ValueError, match="legacy summary shape is not accepted"):
+        normalize_ai_summary(
+            {
+                "common_core": {"summary": "summary"},
+                "type_specific_details": {"paper_type": "systematic review"},
+            }
+        )
 
 
-def test_project_legacy_ai_summary_projects_uncertain_type_for_null_primary_type() -> None:
-    canonical = normalize_ai_summary(
-        {
-            "routing": {
-                "paper_type": None,
-                "paper_subtype_raw": None,
-                "paper_subtype_normalized": None,
-                "classification_status": "uncertain",
-                "route_confidence": "low",
-                "classification_rationale": None,
-                "secondary_candidates": [],
-            },
-            "core_analysis": {
-                "summary": "summary",
-                "key_points": ["point"],
-                "methodology": "method",
-                "findings": "findings",
-                "conclusions": "conclusions",
-                "relevance": "relevance",
-                "limitations": "limitations",
-                "theoretical_framework": None,
-                "research_gap": None,
-                "future_research_directions": [],
-            },
-            "specialized_details": {
-                "empirical": None,
-                "review": None,
-                "conceptual": None,
-            },
-        }
-    )
-
-    projected = project_legacy_ai_summary(canonical)
-    assert projected["type_specific_details"]["paper_type"] == "uncertain"
-
-
-def test_normalize_ai_summary_preserves_paper_metadata_and_projects_to_legacy() -> None:
+def test_normalize_ai_summary_preserves_paper_metadata() -> None:
     canonical = normalize_ai_summary(
         {
             "routing": {
@@ -149,11 +99,3 @@ def test_normalize_ai_summary_preserves_paper_metadata_and_projects_to_legacy() 
 
     assert canonical["paper_metadata"]["title"] == "A Better Title"
     assert canonical["paper_metadata"]["authors"] == ["Alice Smith", "Bob Lee"]
-
-    projected = project_legacy_ai_summary(
-        canonical,
-        paper_info={"title": "Fallback Title", "authors": [], "year": "", "journal": "", "doi": ""},
-    )
-    assert projected["common_core"]["title"] == "A Better Title"
-    assert projected["common_core"]["authors"] == ["Alice Smith", "Bob Lee"]
-    assert projected["common_core"]["year"] == "2024"

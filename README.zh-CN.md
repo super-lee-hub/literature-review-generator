@@ -74,7 +74,7 @@ PDF 预处理
         ↓
 
 阶段三：生成综述正文
-├─ review_draft_v2.json
+├─ review_draft.json（artifact_version=v3）
 ├─ citation_manifest_v3.json
 └─ *_literature_review.docx
 
@@ -136,7 +136,15 @@ python launch_gui.py --reload --no-show
    - Run all：一键跑完分析、大纲、正文。
 5. 到 Logs 页面观察日志；输出通常在 `output/<project_name>__<job_id>/`。
 
-GUI 的任务会进入 GUI 内部的持久化串行后台队列。提交一个任务后，表单仍可继续编辑，你可以准备下一项；CLI 和 Codex skill 不进入这个 GUI 队列。
+GUI 的任务会进入 GUI 内部的持久化串行后台队列。提交一个任务后，表单仍可继续编辑，你可以准备下一项；CLI 和 Codex skill 不进入这个 GUI 队列。队列使用跨进程原子 snapshot；source/config fingerprint 变化会重置过期 retry 状态，lease generation 与 fence token 会阻止过期 worker 发布结果。heartbeat、expiry、取消和崩溃恢复都以持久化状态为准，不从 UI 文案推断。
+
+`run_all` 的持久化 StagePlan 在 validation 启用时固定执行
+analyze -> outline -> review -> validate；只有明确把 validation 设为 optional
+并禁用时才执行 analyze -> outline -> review，但这时仍要求 current artifact
+set。派生任务和 outline-only 任务没有 current set 时不能 canonical-ready。
+Outline stability 支持 `off`、默认的 `smoke` 和 `full`；五个 candidate 时，
+核心/smoke/full 预计分别为 10/20/60 次 Provider call，调用和估算成本会在
+transport 前做 preflight。
 
 ## 7. CLI 快速开始
 
@@ -202,11 +210,11 @@ python main.py --project-name "my_review" --generate-review
 | `python launch_gui.py` | 启动本地 GUI |
 | `--pdf-folder "D:\papers"` | 指定 PDF 文件夹 |
 | `--project-name "my_review"` | 指定项目名和输出工作区标识 |
-| `--run-all` / `-a` | 一键运行：分析 -> 大纲 -> 综述 |
+| `--run-all` / `-a` | 一键运行：分析 -> 大纲 -> 综述；validation policy 启用时还会执行验证 |
 | `--analyze-only` / `-A` | 只运行阶段一：论文分析 |
 | `--generate-outline` / `-o` | 只运行阶段二：生成大纲 |
 | `--generate-review` / `-r` | 只运行阶段三：生成综述 |
-| `--validate-review` / `-v` | 验证已生成综述 |
+| `--validate-review` / `-v` | 通过当前 Validation service 验证已生成综述 |
 | `--retry-failed` | 重试阶段一失败论文 |
 | `--generate-section 3` | 只重做第 3 节综述 |
 | `--retry-review-failed` | 重试失败或缺失的综述章节 |
@@ -219,7 +227,7 @@ python main.py --project-name "my_review" --generate-review
 | `--prime-with-folder <path>` + `--concept <name>` | 概念预热 / concept priming |
 | `--free-mode-profile <json>` | 加载 free mode profile |
 | `--free-mode-idea <text>` | 直接传入 free mode idea |
-| `--outline-adopt` | 显式采纳大纲仲裁结果；兼容/手动路径，不是默认主链 |
+| `--outline-adopt` | 旧兼容参数；当前主路径使用 `python -m reviewctl adopt --artifact <final_outline_id> --actor <actor>` 显式采纳 |
 | `--cleanup` | 清理旧工作空间，只保留最新的 |
 
 完整参数可运行：
@@ -330,7 +338,8 @@ MINERU_ALLOWED_URL_HOSTS=
 | `[Outline_API]` | 阶段二大纲生成 |
 | `[Writer_API]` | 阶段三正文写作 |
 | `[Free_Mode_API]` | free mode / idea planning |
-| `[Validator_API]` | 综述验证 |
+| `[Validator_API]` | 当前 Validation service 使用的综述证据审理 Provider |
+| `[OutlineStability]` | stability 模式、Provider call 上限和估算成本上限 |
 
 每个 API 段可设置 `model`、`api_base`、`proxy_mode` 等。`proxy_mode = environment` 表示跟随系统代理环境变量；`proxy_mode = direct` 表示该 provider 绕过本地代理。
 
@@ -366,7 +375,7 @@ output/<project_name>__<job_id>/
 - `reports/*_analyzed_papers.xlsx`
 - `reports/*_literature_review.docx`
 - `reports/*_failed_papers_report.txt`
-- `artifacts/review_drafts/*_review_draft_v2.json`
+- `artifacts/review_drafts/*_review_draft.json`（artifact_version=v3）
 - `artifacts/citation_manifests/*_citation_manifest_v3.json`
 
 兼容目录：
@@ -385,7 +394,17 @@ output/<project_name>/
 python main.py --project-name "my_review" --validate-review
 ```
 
-验证/修复管线会围绕 review draft、citation manifest、preprocess evidence 和 paper metadata 检查引用准确性、证据支撑和潜在漂移。启用时可能产生：
+验证/修复管线会通过当前 `ValidationExecutionService` 围绕 review draft、citation
+manifest、preprocess evidence 和 paper metadata 检查引用准确性、证据支撑和潜在漂移。
+`reviewctl validate` 会真正执行验证并写入新的 validation attempt；
+`reviewctl validation-status` 只读取持久化 closure。零 claim 永远是 `needs_review`，
+不会因为声明 citation-free 就变成 `clean`。Repair 先生成 quarantine 派生产物，
+只有重新验证闭合并显式 `repair-promote` 后才推进 current pointer。完成与导出只消费
+原子 `CurrentArtifactSetV1` 及其 `CurrentStageClosureMapV1`，不会从任意 READY 产物推断完成。启用时可能产生：
+
+完成 map 会聚合 analyze、outline、review、validate 的 stage-indexed closure；
+validation 不是其他 provider 阶段的替代。只要缺少任一必需阶段或 current set，
+就保持 fail-closed。
 
 - `validation_report.json`
 - `repair_plan.json`
@@ -421,6 +440,8 @@ auto-generate-orchestrator
 | 只想修某一节 | 用 `--generate-section <n>` |
 | 只想补失败章节 | 用 `--retry-review-failed` |
 | 想验证生成结果 | 用 `--validate-review` |
+| 想执行当前控制面验证 | 用 `python -m reviewctl validate --job <job_id>` |
+| 想只查看验证闭环 | 用 `python -m reviewctl validation-status --job <job_id>` |
 | 想了解底层产物真相 | 看 [docs/zh-CN/runtime/](./docs/zh-CN/runtime/) |
 | 想接手开发 | 看 [docs/zh-CN/developer/](./docs/zh-CN/developer/) 和 [docs/zh-CN/reference/](./docs/zh-CN/reference/) |
 

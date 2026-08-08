@@ -7,7 +7,7 @@ from free_mode.service import generate_free_mode_profile, plan_free_mode_chat_tu
 def test_plan_free_mode_chat_turn_uses_dedicated_api_and_normalizes_profile(monkeypatch) -> None:
     captured = {}
 
-    def fake_call_ai_api(prompt, api_config, system_prompt, max_tokens=4000, temperature=0.3, response_format="json", logger=None):
+    def fake_call_ai_api(prompt, api_config, system_prompt, max_tokens=4000, temperature=0.3, response_format="json", logger=None, **_kwargs):
         captured["prompt"] = prompt
         captured["api_config"] = api_config
         captured["system_prompt"] = system_prompt
@@ -38,10 +38,8 @@ def test_plan_free_mode_chat_turn_uses_dedicated_api_and_normalizes_profile(monk
                 "api_key": "free-mode-key",
                 "model": "planner-model",
                 "api_base": "https://api.example.com/v1",
-            },
-            "API_Parameters": {
-                "free_mode_max_tokens": "2222",
-                "free_mode_temperature": "0.15",
+                "max_output_tokens": "2222",
+                "temperature": "0.15",
             },
         },
     )
@@ -60,7 +58,7 @@ def test_plan_free_mode_chat_turn_uses_dedicated_api_and_normalizes_profile(monk
 def test_generate_free_mode_profile_falls_back_to_outline_api_and_saves_file(tmp_path: Path, monkeypatch) -> None:
     captured = {}
 
-    def fake_call_ai_api(prompt, api_config, system_prompt, max_tokens=4000, temperature=0.3, response_format="json", logger=None):
+    def fake_call_ai_api(prompt, api_config, system_prompt, max_tokens=4000, temperature=0.3, response_format="json", logger=None, **_kwargs):
         captured["prompt"] = prompt
         captured["api_config"] = api_config
         return {

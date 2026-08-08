@@ -11,6 +11,7 @@ SKIP_DIRS = {
     ".venv",
     "__pycache__",
     "output",
+    "tmp",
     "venv",
 }
 TEXT_EXTENSIONS = {

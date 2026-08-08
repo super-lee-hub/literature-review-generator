@@ -15,10 +15,13 @@ def test_runtime_stage1_bridge_persists_summaries_progress_and_paper_artifacts(t
         source_items=[{"path": str(pdf_dir), "source_type": "direct", "label": "pdf-folder", "priority": 0}],
     )
 
-    summary_path = Path(session.generator.summary_file)
+    summary_path = Path(session.stage_host.summary_file)
     progress_path = Path(session.context.progress_path)
-    manifest_path = Path(session.generator._get_summary_source_manifest_path())
     registry_payload = json.loads(Path(session.context.workspace.paths.registry_path).read_text(encoding="utf-8"))
+    manifest_record = next(
+        item for item in registry_payload["artifacts"] if item["artifact_type"] == "summary_source_manifest"
+    )
+    manifest_path = Path(manifest_record["path"])
 
     assert result.success is True
     assert summary_path.exists() is True

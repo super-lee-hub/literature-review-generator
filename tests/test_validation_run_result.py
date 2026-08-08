@@ -197,7 +197,7 @@ def test_run_disposition_reducer(
     assert reduce_validation_disposition(ValidationExecutionStatus.SUCCEEDED, verdicts) is expected
 
 
-def test_run_disposition_reducer_treats_zero_claim_context_as_unknown() -> None:
+def test_run_disposition_reducer_never_treats_zero_claim_context_as_clean() -> None:
     assert (
         reduce_validation_disposition(ValidationExecutionStatus.SUCCEEDED, ())
         is ValidationRunDisposition.NEEDS_REVIEW
@@ -210,7 +210,7 @@ def test_run_disposition_reducer_treats_zero_claim_context_as_unknown() -> None:
             validated_claim_count=0,
             review_has_citations=False,
         )
-        is ValidationRunDisposition.CLEAN
+        is ValidationRunDisposition.NEEDS_REVIEW
     )
 
 
@@ -292,10 +292,10 @@ def test_empty_report_projection_requires_explicit_citation_free_declaration() -
     )
 
     assert unknown.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
-    assert citation_free.validation_disposition is ValidationRunDisposition.CLEAN
+    assert citation_free.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
 
 
-def test_explicit_citation_free_review_can_be_clean_with_zero_claims() -> None:
+def test_explicit_citation_free_review_is_not_clean_with_zero_claims() -> None:
     result = ValidationRunResultV1.create(
         job_id="job-1",
         execution_status="succeeded",
@@ -310,9 +310,9 @@ def test_explicit_citation_free_review_can_be_clean_with_zero_claims() -> None:
         evidence_complete=True,
     )
 
-    assert result.validation_disposition is ValidationRunDisposition.CLEAN
-    assert result.review_cleanliness is ValidationRunDisposition.CLEAN
-    assert result.contract_satisfied is True
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
+    assert result.review_cleanliness is ValidationRunDisposition.NEEDS_REVIEW
+    assert result.contract_satisfied is False
 
 
 def test_clean_run_without_verified_input_identities_does_not_satisfy_contract() -> None:
@@ -324,7 +324,7 @@ def test_clean_run_without_verified_input_identities_does_not_satisfy_contract()
         evidence_complete=True,
     )
 
-    assert result.validation_disposition is ValidationRunDisposition.CLEAN
+    assert result.validation_disposition is ValidationRunDisposition.NEEDS_REVIEW
     assert result.contract_satisfied is False
 
 
@@ -450,7 +450,7 @@ def test_evidence_manifest_artifact_ids_must_be_unique() -> None:
         ).validate()
 
 
-def test_pre_extension_v1_payload_is_readable_but_unverified() -> None:
+def test_incomplete_current_payload_is_rejected() -> None:
     claim = ClaimValidationResultV1.from_validation_result(_legacy_result("supported"))
     payload = ValidationRunResultV1.create(
         job_id="job-1",
@@ -470,18 +470,12 @@ def test_pre_extension_v1_payload_is_readable_but_unverified() -> None:
     ):
         payload.pop(key)
 
-    restored = ValidationRunResultV1.from_dict(payload)
-
-    assert restored.execution_status is ValidationExecutionStatus.SUCCEEDED
-    assert restored.validation_disposition is ValidationRunDisposition.UNVALIDATED
-    assert restored.review_cleanliness is ValidationRunDisposition.UNVALIDATED
-    assert restored.compatibility_status == "legacy_unverified"
-    assert "legacy_validation_run_result_contract_incomplete" in restored.degradation_reasons
-    assert restored.contract_satisfied is False
+    with pytest.raises(ValidationRunResultError, match="missing current fields"):
+        ValidationRunResultV1.from_dict(payload)
 
 
-def test_legacy_report_reader_is_explicitly_unverified() -> None:
-    legacy = {
+def test_non_current_report_payload_is_rejected() -> None:
+    non_current = {
         "report_id": "legacy-report",
         "created_at": "2026-07-13T00:00:00Z",
         "total_citations": 1,
@@ -498,9 +492,5 @@ def test_legacy_report_reader_is_explicitly_unverified() -> None:
         ],
     }
 
-    restored = ValidationRunResultV1.from_dict(legacy)
-
-    assert restored.compatibility_status == "legacy_unverified"
-    assert restored.execution_status is ValidationExecutionStatus.SKIPPED
-    assert restored.validation_disposition is ValidationRunDisposition.UNVALIDATED
-    assert restored.contract_satisfied is False
+    with pytest.raises(ValidationRunResultError, match="unexpected artifact_type"):
+        ValidationRunResultV1.from_dict(non_current)

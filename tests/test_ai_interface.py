@@ -5,83 +5,24 @@
 """
 
 import pytest
-import threading
 from unittest.mock import Mock, patch
 from requests.exceptions import Timeout, ConnectionError, HTTPError  # type: ignore
 import ai_interface
-from ai_interface import _normalize_type_specific_details
+from runtime.provider_runtime import ProviderRuntime
 
 
 def _runtime_config(retries: str = "3", timeout: str = "600"):
     return {
-        "Performance": {
-            "api_retry_attempts": retries,
+        "Runtime": {
+            "transport_retries": retries,
+            "retry_base_delay_seconds": "0",
+            "retry_max_delay_seconds": "0",
         },
-        "API_Parameters": {
-            "timeout_seconds": timeout,
+        "Primary_Reader_API": {
+            "read_timeout_seconds": timeout,
+            "transport_retries": retries,
         },
     }
-
-
-class TestRateLimiter:
-    """RateLimiter类测试"""
-
-    def test_rate_limiter_initialization(self):
-        """测试RateLimiter初始化"""
-        # 导入RateLimiter
-        ai_interface = __import__('ai_interface', fromlist=['RateLimiter'])
-        RateLimiter = ai_interface.RateLimiter
-
-        # 创建实例
-        limiter = RateLimiter(1000, 100, 2000, 200)
-
-        # 验证属性
-        assert limiter.primary_tpm_capacity == 1000
-        assert limiter.primary_rpm_capacity == 100
-        assert limiter.backup_tpm_capacity == 2000
-        assert limiter.backup_rpm_capacity == 200
-
-    def test_consume_primary_tokens(self):
-        """测试消耗主要令牌"""
-        ai_interface = __import__('ai_interface', fromlist=['RateLimiter'])
-        RateLimiter = ai_interface.RateLimiter
-
-        limiter = RateLimiter(1000, 100, 2000, 200)
-
-        # 消耗令牌 (tokens_needed, requests_needed, engine_type)
-        limiter.consume(100, 1, 'primary')
-
-        # 验证状态
-        status = limiter.get_status('primary')
-        assert 'tpm_tokens' in status
-        assert 'tpm_capacity' in status
-
-    def test_rate_limiter_thread_safety(self):
-        """测试RateLimiter线程安全性"""
-        ai_interface = __import__('ai_interface', fromlist=['RateLimiter'])
-        RateLimiter = ai_interface.RateLimiter
-
-        limiter = RateLimiter(10000, 1000, 20000, 2000)
-        results = []
-
-        def consume_tokens():
-            for _ in range(10):
-                limiter.consume(10, 1, 'primary')
-                results.append(True)
-
-        # 创建多个线程
-        threads = [threading.Thread(target=consume_tokens) for _ in range(5)]
-
-        # 启动所有线程
-        for thread in threads:
-            thread.start()
-
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join()
-
-        # 验证所有操作都成功
-        assert len(results) == 50
 
 
 class TestAIIinterface:
@@ -92,8 +33,18 @@ class TestAIIinterface:
         self.ai_interface = __import__('ai_interface', fromlist=[
             'get_summary_from_ai',
             '_call_ai_api',
-            'RateLimiter'
         ])
+        self._original_detailed_call = self.ai_interface._call_ai_api_detailed
+
+        def bound_test_runtime(*args, **kwargs):
+            if kwargs.get("provider_runtime") is None:
+                kwargs["provider_runtime"] = ProviderRuntime(test_only=True)
+            return self._original_detailed_call(*args, **kwargs)
+
+        self.ai_interface._call_ai_api_detailed = bound_test_runtime
+
+    def teardown_method(self):
+        self.ai_interface._call_ai_api_detailed = self._original_detailed_call
 
     @patch('ai_interface.requests.post')
     def test_call_ai_api_success(self, mock_post):
@@ -267,7 +218,7 @@ class TestAIIinterface:
         with patch('ai_interface.load_config', return_value=_runtime_config(retries="4")), patch('ai_interface.time.sleep', return_value=None):
             result = self.ai_interface._call_ai_api(
                 "test prompt",
-                {"api_key": "test_key", "model": "test_model"},
+                {"api_key": "test_key", "model": "test_model", "transport_retries": "4"},
                 "system prompt"
             )
 
@@ -282,7 +233,7 @@ class TestAIIinterface:
         with patch('ai_interface.load_config', return_value=_runtime_config(retries="invalid")), patch('ai_interface.time.sleep', return_value=None):
             result = self.ai_interface._call_ai_api(
                 "test prompt",
-                {"api_key": "test_key", "model": "test_model"},
+                {"api_key": "test_key", "model": "test_model", "transport_retries": "invalid"},
                 "system prompt"
             )
 
@@ -633,57 +584,6 @@ class TestAIIinterface:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-
-def test_normalize_type_specific_details_projects_review_route_fields() -> None:
-    normalized = _normalize_type_specific_details(
-        {
-            "paper_type": "systematic review",
-            "review_details": {
-                "review_type": "systematic review",
-                "search_databases": ["Scopus", "Web of Science"],
-                "main_themes": ["trust", "adoption"],
-            },
-            "future_research_directions": ["test more longitudinal designs"],
-        }
-    )
-
-    assert normalized["paper_type"] == "review"
-    assert normalized["paper_subtype"] == "systematic review"
-    assert normalized["review_details"]["review_type"] == "systematic review"
-    assert normalized["future_research_directions"] == ["test more longitudinal designs"]
-
-
-def test_normalize_type_specific_details_infers_empirical_route_from_branch_content() -> None:
-    normalized = _normalize_type_specific_details(
-        {
-            "paper_type": "",
-            "route_confidence": "",
-            "classification_rationale": "",
-            "empirical_details": {
-                "data_source_and_size": "survey, n=420",
-                "analysis_technique": "SEM",
-                "core_variables": {
-                    "independent": ["trust"],
-                    "dependent": ["adoption"],
-                },
-            },
-        }
-    )
-
-    assert normalized["paper_type"] == "empirical"
-    assert normalized["paper_subtype"] == ""
-    assert normalized["route_confidence"] == "low"
-    assert normalized["data_source_and_size"] == "survey, n=420"
-    assert normalized["analysis_technique"] == "SEM"
-
-
-def test_normalize_type_specific_details_marks_uncertain_when_no_route_evidence() -> None:
-    normalized = _normalize_type_specific_details({"paper_type": "", "paper_subtype": ""})
-
-    assert normalized["paper_type"] == "uncertain"
-    assert normalized["paper_subtype"] == ""
-    assert normalized["classification_rationale"] == "insufficient evidence to assign a stable primary type"
 
 
 def test_stage1_reader_scheduler_alternates_transient_failures(monkeypatch) -> None:

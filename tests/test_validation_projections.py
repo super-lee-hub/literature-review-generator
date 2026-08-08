@@ -12,7 +12,7 @@ from services.artifact_registry import (
 )
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.repair_policy import ValidationRepairPolicy
-from validation.run_result import ValidationRunResultV1
+from validation.run_result import ClaimValidationResultV1, ValidationRunResultV1
 
 
 def _legacy_claim(*, key: str, status: str) -> SimpleNamespace:
@@ -134,25 +134,42 @@ def test_validator_populates_verified_input_artifact_contract(tmp_path: Path) ->
         job_id="job-input-contract",
     )
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    review_path = workspace.artifact_path("review_draft_v2.json")
+    review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
     evidence_path = workspace.artifact_path("paper_artifacts/paper-a.evidence_manifest_v1.json")
-    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v2"})
+    atomic_write_json(
+        review_path,
+        {
+            "artifact_type": "review_draft",
+            "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "draft_identity": {"draft_id": "review:v3"},
+            "generation_context": {"mode": "test"},
+            "content": {"sections": []},
+            "projections": {},
+        },
+    )
     atomic_write_json(
         citation_path,
         {
             "artifact_type": "citation_manifest",
             "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "manifest_identity": {"manifest_id": "citation:v3"},
+            "review_reference": {"artifact_id": "review:v3"},
             "citation_sets": [{"citation_set_key": "paper-a", "paper_ids": ["paper-a"]}],
             "occurrences": [],
+            "bibliography": [],
         },
     )
     atomic_write_json(evidence_path, {"artifact_type": "evidence_manifest", "artifact_version": "v1"})
     review_record = registry.register_file(
-        artifact_id="review:v2",
+        artifact_id="review:v3",
         artifact_role="review_draft",
         artifact_type="review_draft",
-        artifact_version="v2",
+        artifact_version="v3",
         path=review_path,
         producer="tests",
     )
@@ -175,7 +192,7 @@ def test_validator_populates_verified_input_artifact_contract(tmp_path: Path) ->
     generator = SimpleNamespace(
         job_workspace=workspace,
         artifact_registry=registry,
-        _review_draft_v2_path=lambda: review_path,
+        _review_draft_path=lambda: review_path,
         _citation_manifest_path=lambda: citation_path,
     )
     paper_artifact = {
@@ -260,18 +277,40 @@ def test_validator_registers_external_evidence_only_with_verified_identity(
 
     workspace = JobWorkspace.create(str(tmp_path), "child", job_id="job-child")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    review_path = workspace.artifact_path("review_draft_v2.json")
+    review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
-    atomic_write_json(review_path, {"artifact_type": "review_draft", "artifact_version": "v2"})
+    atomic_write_json(
+        review_path,
+        {
+            "artifact_type": "review_draft",
+            "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "draft_identity": {"draft_id": "review:v3"},
+            "generation_context": {"mode": "test"},
+            "content": {"sections": []},
+            "projections": {},
+        },
+    )
     atomic_write_json(
         citation_path,
-        {"artifact_type": "citation_manifest", "artifact_version": "v3"},
+        {
+            "artifact_type": "citation_manifest",
+            "artifact_version": "v3",
+            "created_from_job_id": workspace.job_id,
+            "created_at": "2026-08-04T00:00:00Z",
+            "manifest_identity": {"manifest_id": "citation:v3"},
+            "review_reference": {"artifact_id": "review:v3"},
+            "occurrences": [],
+            "citation_sets": [],
+            "bibliography": [],
+        },
     )
     review_record = registry.register_file(
-        artifact_id="review:v2",
+        artifact_id="review:v3",
         artifact_role="review_draft",
         artifact_type="review_draft",
-        artifact_version="v2",
+        artifact_version="v3",
         path=review_path,
         producer="tests",
     )
@@ -320,12 +359,17 @@ def test_validator_registers_external_evidence_only_with_verified_identity(
         "evidence_manifest_ids": [evidence_record.artifact_id],
         "evidence_manifest_hashes": [evidence_record.content_hash],
     }
+    claim = ClaimValidationResultV1.from_validation_result(
+        _legacy_claim(key="external", status="supported")
+    )
     canonical = ValidationRunResultV1.create(
         job_id=workspace.job_id,
         report_id="validation-external-evidence",
         execution_status="succeeded",
         input_artifacts=inputs,
-        review_has_citations=False,
+        claim_results=(claim,),
+        expected_claim_count=1,
+        review_has_citations=True,
         evidence_complete=True,
     )
 
@@ -348,7 +392,9 @@ def test_validator_registers_external_evidence_only_with_verified_identity(
         report_id=canonical.validation_run_id,
         execution_status="succeeded",
         input_artifacts=mismatched_inputs,
-        review_has_citations=False,
+        claim_results=(claim,),
+        expected_claim_count=1,
+        review_has_citations=True,
         evidence_complete=True,
     )
     validator._write_validation_reports(
@@ -370,11 +416,15 @@ def test_validator_does_not_treat_cited_draft_with_empty_manifest_as_citation_fr
 ) -> None:
     workspace = JobWorkspace.create(str(tmp_path), "cited-empty-manifest", job_id="job-empty")
     registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
-    review_path = workspace.artifact_path("review_draft_v2.json")
+    review_path = workspace.artifact_path("review_draft_v3.json")
     citation_path = workspace.artifact_path("citation_manifest_v3.json")
     review_draft = {
         "artifact_type": "review_draft",
-        "artifact_version": "v2",
+        "artifact_version": "v3",
+        "created_from_job_id": workspace.job_id,
+        "created_at": "2026-08-04T00:00:00Z",
+        "draft_identity": {"draft_id": "review:v3"},
+        "generation_context": {"mode": "test"},
         "content": {
             "sections": [
                 {
@@ -388,31 +438,37 @@ def test_validator_does_not_treat_cited_draft_with_empty_manifest_as_citation_fr
                 }
             ]
         },
+        "projections": {},
     }
     citation_manifest = {
         "artifact_type": "citation_manifest",
         "artifact_version": "v3",
+        "created_from_job_id": workspace.job_id,
+        "created_at": "2026-08-04T00:00:00Z",
+        "manifest_identity": {"manifest_id": "citation:v3"},
+        "review_reference": {"artifact_id": "review:v3"},
         "citation_sets": [],
         "occurrences": [],
+        "bibliography": [],
     }
     atomic_write_json(review_path, review_draft)
     atomic_write_json(citation_path, citation_manifest)
     for artifact_id, artifact_type, path in (
-        ("review:v2", "review_draft", review_path),
+        ("review:v3", "review_draft", review_path),
         ("citation:v3", "citation_manifest", citation_path),
     ):
         registry.register_file(
             artifact_id=artifact_id,
             artifact_role=artifact_type,
             artifact_type=artifact_type,
-            artifact_version="v2" if artifact_type == "review_draft" else "v3",
+            artifact_version="v3",
             path=path,
             producer="tests",
         )
     generator = SimpleNamespace(
         job_workspace=workspace,
         artifact_registry=registry,
-        _review_draft_v2_path=lambda: review_path,
+        _review_draft_path=lambda: review_path,
         _citation_manifest_path=lambda: citation_path,
     )
 

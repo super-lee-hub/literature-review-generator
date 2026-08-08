@@ -14,7 +14,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional
+
+
+NOT_APPLICABLE = "not_applicable"
 
 
 class PatchGranularity(Enum):
@@ -49,17 +52,31 @@ class DependencyHashBundle:
     paper_artifact_hash: str
     visual_manifest_hash: str
     selected_visual_refs_hash: str
+    # These fields are optional for compatibility with the original Week 4
+    # bundle.  New repair transactions must carry them whenever the
+    # corresponding artifact is in scope; an empty value means that the
+    # artifact was not available to the planner, not that it was verified.
+    review_draft_hash: str = ""
+    citation_manifest_hash: str = ""
+    outline_hash: str = ""
     
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
     
     @classmethod
     def from_dict(cls, data: Dict[str, str]) -> DependencyHashBundle:
+        def value(name: str) -> str:
+            raw = str(data.get(name) or "").strip()
+            return raw or NOT_APPLICABLE
+
         return cls(
-            summary_hash=data.get("summary_hash", ""),
-            paper_artifact_hash=data.get("paper_artifact_hash", ""),
-            visual_manifest_hash=data.get("visual_manifest_hash", ""),
-            selected_visual_refs_hash=data.get("selected_visual_refs_hash", ""),
+            summary_hash=value("summary_hash"),
+            paper_artifact_hash=value("paper_artifact_hash"),
+            visual_manifest_hash=value("visual_manifest_hash"),
+            selected_visual_refs_hash=value("selected_visual_refs_hash"),
+            review_draft_hash=value("review_draft_hash"),
+            citation_manifest_hash=value("citation_manifest_hash"),
+            outline_hash=value("outline_hash"),
         )
 
 
@@ -75,6 +92,43 @@ class PatchTargetSignature:
     span_start: Optional[int] = None  # Character offset for span patches
     span_end: Optional[int] = None
     
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RepairIssue:
+    """A typed validation issue that can drive review or a safe patch."""
+
+    issue_id: str
+    issue_type: str
+    severity: str
+    message: str
+    artifact_id: str = ""
+    citation_id: str = ""
+    block_id: str = ""
+    location: Dict[str, Any] = field(default_factory=dict)
+    evidence: List[Dict[str, Any]] = field(default_factory=list)
+    repairability: str = "manual_review"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ManualReviewAction:
+    """A concrete human action for an issue that is not auto-safe."""
+
+    action_id: str
+    issue_id: str
+    action: str
+    rationale: str
+    required_inputs: List[str] = field(default_factory=list)
+    owner_role: str = "researcher"
+    status: str = "pending"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -114,6 +168,64 @@ class PatchProposal:
 
 
 @dataclass(frozen=True)
+class AutoSafePatch:
+    """A structural-only patch with explicit guard and semantic closure requirements."""
+
+    patch_id: str
+    issue_id: str
+    proposal_id: str
+    target: PatchTargetSignature
+    dependency_bundle: DependencyHashBundle
+    guard_contract: Dict[str, Any] = field(default_factory=dict)
+    semantic_revalidation_required: bool = True
+    status: str = "proposed"
+    operation_type: str = ""
+    replacement_text: str = ""
+    structured_operation: Dict[str, Any] = field(default_factory=dict)
+    anchor_hash_before: str = ""
+    anchor_hash_after: str = ""
+    expected_artifact_hashes: Dict[str, str] = field(default_factory=dict)
+    confidence: float = 0.0
+    root_cause: str = ""
+    preconditions: List[str] = field(default_factory=list)
+    postconditions: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not str(self.patch_id).strip() or not str(self.issue_id).strip() or not str(self.proposal_id).strip():
+            raise ValueError("auto-safe patches require patch, issue, and proposal identities")
+        if self.semantic_revalidation_required is not True:
+            raise ValueError("auto-safe patches require semantic revalidation")
+        operation = str(self.operation_type or "").strip().lower()
+        if operation not in {"replace_text", "structured_operation"}:
+            raise ValueError("auto-safe patches require an executable operation_type")
+        if operation == "replace_text" and not str(self.replacement_text):
+            raise ValueError("replace_text auto-safe patches require replacement_text")
+        if operation == "structured_operation" and not self.structured_operation:
+            raise ValueError("structured_operation auto-safe patches require a structured operation")
+        if not str(self.anchor_hash_before or self.target.anchor_hash).strip():
+            raise ValueError("auto-safe patches require an anchor hash")
+        if not self.expected_artifact_hashes:
+            raise ValueError("auto-safe patches require expected artifact hashes")
+        if any(
+            len(str(value)) != 64 or any(char not in "0123456789abcdef" for char in str(value))
+            for value in self.expected_artifact_hashes.values()
+        ):
+            raise ValueError("expected artifact hashes must be lowercase SHA-256 values")
+        if not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("auto-safe patch confidence must be between 0 and 1")
+        if not str(self.root_cause).strip():
+            raise ValueError("auto-safe patches require a root cause")
+        if not self.preconditions or not self.postconditions:
+            raise ValueError("auto-safe patches require preconditions and postconditions")
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["target"] = self.target.to_dict()
+        payload["dependency_bundle"] = self.dependency_bundle.to_dict()
+        return payload
+
+
+@dataclass(frozen=True)
 class RepairPlan:
     """A plan containing multiple patch proposals.
     
@@ -127,9 +239,13 @@ class RepairPlan:
     policy: RepairPolicy
     artifact_type: str = "repair_plan"
     artifact_version: str = "v1"
+    dependency_hash_bundle: Optional[DependencyHashBundle] = None
+    issues: List[RepairIssue] = field(default_factory=list)
+    manual_review_actions: List[ManualReviewAction] = field(default_factory=list)
+    auto_safe_patches: List[AutoSafePatch] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "artifact_type": self.artifact_type,
             "artifact_version": self.artifact_version,
             "plan_id": self.plan_id,
@@ -139,6 +255,16 @@ class RepairPlan:
             "policy": self.policy.value,
             "proposals": [p.to_dict() for p in self.proposals],
         }
+        if self.dependency_hash_bundle is not None:
+            payload["dependency_hash_bundle"] = self.dependency_hash_bundle.to_dict()
+        payload["issues"] = [issue.to_dict() for issue in self.issues]
+        payload["manual_review_actions"] = [
+            action.to_dict() for action in self.manual_review_actions
+        ]
+        payload["auto_safe_patches"] = [
+            patch.to_dict() for patch in self.auto_safe_patches
+        ]
+        return payload
     
     def get_mapping_first_proposals(self) -> List[PatchProposal]:
         """Get proposals for citation_mapping_error (highest priority)."""
@@ -212,5 +338,65 @@ class RepairReport:
     artifact_type: str = "repair_report"
     artifact_version: str = "v1"
     
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RepairStructuralClosure:
+    """Typed proof that a derived repair preserved structural semantics."""
+
+    passed: bool
+    status: str
+    diagnostics: List[str] = field(default_factory=list)
+    targeted_evidence_hash: str = ""
+    semantic_evidence_hash: str = ""
+    section_count: int = 0
+    block_count: int = 0
+    occurrence_count: int = 0
+    mapped_occurrence_count: int = 0
+    canonical_input_hashes: Dict[str, str] = field(default_factory=dict)
+    derived_output_hashes: Dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_results(
+        cls,
+        targeted: Mapping[str, Any],
+        semantic: Mapping[str, Any],
+        *,
+        canonical_input_hashes: Mapping[str, str] | None = None,
+        derived_output_hashes: Mapping[str, str] | None = None,
+    ) -> "RepairStructuralClosure":
+        diagnostics = sorted(
+            {
+                *(str(item) for item in targeted.get("diagnostics") or []),
+                *(str(item) for item in semantic.get("diagnostics") or []),
+            }
+        )
+        passed = bool(targeted.get("passed")) and bool(semantic.get("passed")) and not diagnostics
+        return cls(
+            passed=passed,
+            status="passed" if passed else "blocked",
+            diagnostics=diagnostics,
+            targeted_evidence_hash=str(targeted.get("evidence_hash") or ""),
+            semantic_evidence_hash=str(semantic.get("evidence_hash") or ""),
+            section_count=int(semantic.get("section_count") or targeted.get("section_count") or 0),
+            block_count=int(semantic.get("block_count") or targeted.get("block_count") or 0),
+            occurrence_count=int(semantic.get("occurrence_count") or targeted.get("occurrence_count") or 0),
+            mapped_occurrence_count=int(
+                semantic.get("mapped_occurrence_count")
+                or targeted.get("mapped_occurrence_count")
+                or 0
+            ),
+            canonical_input_hashes={
+                str(key): str(value)
+                for key, value in (canonical_input_hashes or {}).items()
+            },
+            derived_output_hashes={
+                str(key): str(value)
+                for key, value in (derived_output_hashes or {}).items()
+            },
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

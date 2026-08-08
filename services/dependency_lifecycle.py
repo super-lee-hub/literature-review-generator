@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -13,8 +14,12 @@ from services.artifact_registry import (
     RegistryCorruption,
 )
 from services.audit_record import AuditArtifactRefV1, AuditRecordV1
-from services.job_outcome import JobOutcomeV1
-from services.job_workspace import atomic_write_json, utc_now_iso
+from services.job_outcome import (
+    JobOutcomeV1,
+    load_canonical_job_outcome,
+    publish_job_outcome_compatibility_projection,
+)
+from services.job_workspace import atomic_write_json, publish_json_artifact, utc_now_iso
 
 
 class DependencyLifecycleError(RuntimeError):
@@ -93,11 +98,15 @@ def _audit_path(registry_path: Path, audit_id: str) -> Path:
 
 
 def _invalidate_job_outcome(registry: ArtifactRegistry, registry_path: Path, audit_id: str) -> None:
-    outcome_path = registry_path.parent / "artifacts" / "job_outcome_v1.json"
-    if not outcome_path.is_file():
+    outcome_base_path = registry_path.parent / "artifacts" / "job_outcome_v1.json"
+    if registry.get("job_outcome") is None:
         return
-    payload = json.loads(outcome_path.read_text(encoding="utf-8"))
-    outcome = JobOutcomeV1.from_dict(payload)
+    try:
+        outcome, existing = load_canonical_job_outcome(registry)
+    except (OSError, TypeError, ValueError) as exc:
+        raise DependencyLifecycleError(
+            f"canonical job outcome cannot be invalidated safely: {exc}"
+        ) from exc
     reasons = list(outcome.degradation_reasons)
     if "dependency_force_deleted" not in reasons:
         reasons.append("dependency_force_deleted")
@@ -119,22 +128,42 @@ def _invalidate_job_outcome(registry: ArtifactRegistry, registry_path: Path, aud
         updated_at=utc_now_iso(),
         outcome_revision=outcome.outcome_revision + 1,
     )
-    atomic_write_json(str(outcome_path), updated.to_dict())
-    existing = next(
-        (record for record in registry.list_records() if Path(record.path).resolve() == outcome_path.resolve()),
-        None,
+    publication_context = getattr(registry, "publication_context", None)
+    if publication_context is None:
+        from services.queue_service import LocalPublicationContext
+
+        publication_context = LocalPublicationContext()
+    published = publish_json_artifact(
+        publication_context,
+        registry,
+        outcome_base_path,
+        updated.to_dict(),
+        artifact_role=existing.artifact_role,
+        artifact_type=existing.artifact_type,
+        artifact_version=existing.artifact_version,
+        producer="services.dependency_lifecycle.force_dependency_break",
+        artifact_id=existing.artifact_id,
+        depends_on=existing.depends_on,
+        metadata={
+            **existing.metadata,
+            "job_status": updated.job_status,
+            "job_disposition": updated.job_disposition,
+            "canonical_ready": updated.canonical_ready,
+            "requires_attention": updated.requires_attention,
+            "outcome_revision": updated.outcome_revision,
+            "force_delete_audit_id": audit_id,
+        },
     )
-    if existing is not None:
-        registry.register_file(
-            artifact_role=existing.artifact_role,
-            artifact_type=existing.artifact_type,
-            artifact_version=existing.artifact_version,
-            path=outcome_path,
-            producer="services.dependency_lifecycle.force_dependency_break",
-            artifact_id=existing.artifact_id,
-            depends_on=existing.depends_on,
-            metadata={**existing.metadata, "force_delete_audit_id": audit_id},
-        )
+    projection_result = publish_job_outcome_compatibility_projection(
+        path=outcome_base_path,
+        registry=registry,
+        canonical_record=published,
+        outcome=updated,
+        producer="services.dependency_lifecycle.force_dependency_break",
+        publication_context=publication_context,
+    )
+    if projection_result.warning:
+        warnings.warn(projection_result.warning, RuntimeWarning, stacklevel=2)
 
 
 def guard_artifact_delete(

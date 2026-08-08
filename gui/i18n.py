@@ -44,7 +44,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "首次使用和基础 setup": "First-time setup and basic paths",
         "API 与模型": "APIs & Models",
         "阅读、写作、大纲和验证模型": "Reader, writer, outline, and validator models",
-        "性能与预处理": "Performance & Preprocessing",
+        "运行与预处理": "Runtime & Preprocessing",
         "并发、OCR、缓存与 RAG": "Concurrency, OCR, cache, and RAG",
         "结果": "Outputs",
         "日志与产物": "Logs & Outputs",
@@ -204,7 +204,7 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "4. 配置保存后，API Key 会写入 `.env`，不用手改文本文件。":
             "4. After saving, API Keys will be written into `.env`, so you do not need to edit text files manually.",
         "前往 API 与模型": "Go to APIs & Models",
-        "前往性能与预处理": "Go to Performance & Preprocessing",
+        "前往运行与预处理": "Go to Runtime & Preprocessing",
         "阅读模型、写作模型、独立大纲模型和验证模型都在这里分开配置。每块都支持 URL 预设、自动规范化和连通性测试。":
             "Reader, writer, standalone outline, and validator models are configured separately here. Each card supports URL presets, normalization, and connectivity testing.",
         "阅读模型、写作模型、大纲模型、自由模式对话模型和验证模型都在这里分开配置。每块都支持 URL 预设、自动规范化和连通性测试。":
@@ -734,12 +734,12 @@ TRANSLATIONS["en"].update(
         "输入方式、运行策略、OCR / MinerU、复用和工作区的完整说明都在这一页。":
             "This page contains the full explanation for input modes, run strategies, OCR / MinerU, reuse, and workspaces.",
         "5. MinerU token 在“API 与模型”页填写；真正是否调用，要到“性能与预处理”页选择解析策略。":
-            "5. Fill in the MinerU token on the APIs & Models page; decide whether it is actually used on the Performance & Preprocessing page.",
+            "5. Fill in the MinerU token on the APIs & Models page; decide whether it is actually used on the Runtime & Preprocessing page.",
         "阅读 / 写作 / 大纲 / 自由模式 / 验证模型都在这里配置；MinerU 远程解析的 token 也放在这里统一管理。":
             "Reader / writer / outline / free-mode / validator models are configured here, and the MinerU remote token is managed here as well.",
         "MinerU 远程解析": "MinerU Remote Parsing",
         "这是 PDF 预处理使用的远程解析后端，不属于 LLM 模型卡。是否真的调用，还取决于“性能与预处理”页里的解析策略。":
-            "This is the remote parsing backend used by PDF preprocessing, not an LLM model card. Whether it is actually called still depends on the parser strategy on the Performance & Preprocessing page.",
+            "This is the remote parsing backend used by PDF preprocessing, not an LLM model card. Whether it is actually called still depends on the parser strategy on the Runtime & Preprocessing page.",
         "API Token": "API Token",
         "模型版本": "Model Version",
         "MinerU token 已填写。": "MinerU token is configured.",

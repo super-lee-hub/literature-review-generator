@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from services.citation_manifest import build_citation_manifest_v3_from_review_draft
+from services.citation_manifest import build_citation_manifest_from_review_draft
 from services.citation_ref_catalog import build_document_ref_catalog
-from services.review_draft import _build_block_span_map, build_review_draft_v2
+from services.review_draft import _build_block_span_map, build_review_draft
 from services.sentence_segmenter import SENTENCE_SEGMENTER_VERSION, segment_sentences
 from validation.review_validator import ReviewValidator
 
@@ -83,7 +83,7 @@ def _summaries() -> list[dict]:
 def test_manifest_binds_standalone_citations_to_preceding_sentences() -> None:
     summaries = _summaries()
     catalog = build_document_ref_catalog(summaries, project_name="project", job_id="job")
-    draft = build_review_draft_v2(
+    draft = build_review_draft(
         job_id="job",
         project_name="project",
         draft_id="draft",
@@ -104,13 +104,13 @@ def test_manifest_binds_standalone_citations_to_preceding_sentences() -> None:
         citation_ref_catalog=catalog,
     )
 
-    manifest = build_citation_manifest_v3_from_review_draft(
+    manifest = build_citation_manifest_from_review_draft(
         job_id="job",
         project_name="project",
         manifest_id="manifest",
         review_draft_path="review.json",
         review_word_path="review.docx",
-        review_draft_v2=draft.to_dict(),
+        review_draft=draft.to_dict(),
         paper_summaries=summaries,
         citation_ref_catalog=catalog,
     ).to_dict()

@@ -14,19 +14,19 @@ from services.job_workspace import utc_now_iso
 AUDIT_SCHEMA_VERSION = "v1"
 AuditType = Literal[
     "identity_override",
-    "legacy_reuse",
     "outline_manual_adoption",
     "dependency_force_delete",
     "artifact_quarantine_release",
+    "repair_promotion",
 ]
 
 _AUDIT_TYPES = frozenset(
     {
         "identity_override",
-        "legacy_reuse",
         "outline_manual_adoption",
         "dependency_force_delete",
         "artifact_quarantine_release",
+        "repair_promotion",
     }
 )
 _SHA256_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")

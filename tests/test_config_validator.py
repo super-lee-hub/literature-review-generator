@@ -43,7 +43,7 @@ def test_validate_all_config_warns_for_mismatched_provider_endpoint_combo():
     valid, warnings = validate_all_config(config)
 
     assert valid is True
-    assert any("aihubmix_openai reasoning config requires endpoint_type=responses" in warning for warning in warnings)
+    assert any("selected provider family requires endpoint_type=responses" in warning for warning in warnings)
 
 
 def test_validate_all_config_accepts_custom_openai_responses_provider():

@@ -25,7 +25,7 @@ from services.configuration_service import (
     save_config_and_env,
     test_api_endpoint,
 )
-from services.config_compat import apply_validation_compat_sections, read_validation_settings
+from services.settings import ApplicationSettings
 from services.environment_service import (
     RuntimeEnvironment,
     detect_runtime_environment,
@@ -66,7 +66,7 @@ NAV_GROUPS = [
         "items": [
             ("环境与路径", "/setup", "基础路径与输出目录", "settings_suggest"),
             ("API 与模型", "/setup/api", "阅读、写作、大纲、自由模式与验证模型", "hub"),
-            ("性能与预处理", "/setup/processing", "并发、OCR、缓存、RAG 与可选验证", "tune"),
+            ("运行与预处理", "/setup/processing", "并发、OCR、缓存、RAG 与可选验证", "tune"),
         ],
     },
 ]
@@ -89,7 +89,7 @@ SEARCH_ITEMS = [
     },
     {
         "route": "/setup/processing",
-        "label": "性能与预处理",
+        "label": "运行与预处理",
         "keywords": ["ocr", "preprocess", "rag", "cache", "缓存", "预处理", "并发", "validation"],
     },
     {
@@ -837,8 +837,7 @@ def _candidate_job_logs(
         if workspace_path:
             append(Path(workspace_path) / "logs" / "job.log")
 
-    runtimes = getattr(queue_service, "_runtimes", {}) if queue_service is not None else {}
-    runtime_items = list(runtimes.values()) if isinstance(runtimes, dict) else []
+    runtime_items = queue_service.list_job_runtimes() if queue_service is not None else []
     runtime_items.sort(key=lambda item: str(getattr(item, "completed_at", None) or getattr(item, "started_at", None) or ""), reverse=True)
     for runtime in runtime_items:
         append(getattr(runtime, "log_path", ""))
@@ -866,7 +865,7 @@ def _workspace_primary_artifacts(workspace_path: str, project_name: str) -> list
 
     artifact_candidates: list[tuple[str, Path]] = [
         ("结构化摘要", workspace / "artifacts" / f"{project_name}_summaries.json"),
-        ("综述大纲", workspace / "artifacts" / f"{project_name}_literature_review_outline.md"),
+        ("综述大纲", workspace / "artifacts" / "outline_v3" / "artifacts" / "final_outline.json"),
         ("注册表", workspace / "artifact_registry.json"),
     ]
 
@@ -1144,8 +1143,12 @@ class WorkspaceController:
         self.free_mode_profile_path = ""
         self.free_mode_ready_to_apply = False
         self.free_mode_busy = False
+        self.lifecycle_snapshot: Dict[str, Any] = {}
+        self.lifecycle_actor = ""
+        self.lifecycle_reason = ""
+        self.lifecycle_busy = False
         self.status_message = self.t("工作台已就绪。先完成设置，再按“输入来源 → 运行方式 → 主流程”开始第一轮。")
-        validation_settings = read_validation_settings(self.sections)
+        current_settings = ApplicationSettings.from_config(self.sections)
         mineru_base_url = self.env_values.get("MINERU_BASE_URL", DEFAULT_MINERU_BASE_URL)
         mineru_model_version = self.env_values.get("MINERU_MODEL_VERSION", "vlm") or "vlm"
         allow_local_parse_fallback = str(
@@ -1158,16 +1161,17 @@ class WorkspaceController:
                 "library_path": self.sections["Paths"].get("library_path", ""),
                 "output_path": self.sections["Paths"].get("output_path", "./output"),
             },
-            "performance": {
-                "max_workers": self.sections["Performance"].get("max_workers", "3"),
-                "api_retry_attempts": self.sections["Performance"].get("api_retry_attempts", "5"),
-                "enable_stage2_validation": validation_settings.stage2_enabled,
-            },
-            "stage2_retry": {
-                "enabled": self.sections.get("Stage2_Retry", {}).get("enabled", "true") == "true",
-                "max_retry_rounds": self.sections.get("Stage2_Retry", {}).get("max_retry_rounds", "2"),
-                "base_retry_delay": self.sections.get("Stage2_Retry", {}).get("base_retry_delay", "30"),
-                "max_retry_delay": self.sections.get("Stage2_Retry", {}).get("max_retry_delay", "120"),
+            "runtime": {
+                "max_workers": self.sections["Runtime"].get("max_workers", "3"),
+                "transport_retries": self.sections["Runtime"].get("transport_retries", "2"),
+                "node_retry_limit": self.sections["Runtime"].get("node_retry_limit", "2"),
+                "stage1_retry_limit": self.sections["Runtime"].get("stage1_retry_limit", "2"),
+                "review_section_retry_limit": self.sections["Runtime"].get("review_section_retry_limit", "2"),
+                "validation_retry_limit": self.sections["Runtime"].get("validation_retry_limit", "1"),
+                "retry_base_delay_seconds": self.sections["Runtime"].get("retry_base_delay_seconds", "30"),
+                "retry_max_delay_seconds": self.sections["Runtime"].get("retry_max_delay_seconds", "120"),
+                "total_job_deadline_seconds": self.sections["Runtime"].get("total_job_deadline_seconds", "0"),
+                "review_validation_enabled": current_settings.validation.review_enabled,
             },
             "preprocess": {
                 "enabled": self.sections["Preprocess"].get("enabled", "true") == "true",
@@ -1380,8 +1384,8 @@ class WorkspaceController:
                 else:
                     # 如果queue_runner不存在，只标记状态
                     runtime = self._queue_service.get_job_runtime(job_id)
-                    if runtime and runtime.state == QueueState.RUNNING:
-                        self._queue_service.update_job_state(job_id, QueueState.CANCELLED)
+                    if runtime and runtime.state in (QueueState.PENDING, QueueState.RUNNING):
+                        self._queue_service.request_cancel(job_id, reason="gui_cancel")
                         ui.notify(self.tf("任务已标记为取消: {job_id}", job_id=job_id), type="positive")
                     else:
                         ui.notify(self.t("只能取消运行中的任务"), type="warning")
@@ -1936,26 +1940,24 @@ class WorkspaceController:
                 "output_path": self.state["paths"]["output_path"],
             }
         )
-        updated_sections["Performance"].update(
+        updated_sections["Runtime"].update(
             {
-                "max_workers": str(self.state["performance"]["max_workers"]),
-                "api_retry_attempts": str(self.state["performance"]["api_retry_attempts"]),
+                "max_workers": str(self.state["runtime"]["max_workers"]),
+                "transport_retries": str(self.state["runtime"]["transport_retries"]),
+                "node_retry_limit": str(self.state["runtime"]["node_retry_limit"]),
+                "stage1_retry_limit": str(self.state["runtime"]["stage1_retry_limit"]),
+                "review_section_retry_limit": str(self.state["runtime"]["review_section_retry_limit"]),
+                "validation_retry_limit": str(self.state["runtime"]["validation_retry_limit"]),
+                "retry_base_delay_seconds": str(self.state["runtime"]["retry_base_delay_seconds"]),
+                "retry_max_delay_seconds": str(self.state["runtime"]["retry_max_delay_seconds"]),
+                "total_job_deadline_seconds": str(self.state["runtime"]["total_job_deadline_seconds"]),
             }
         )
         updated_sections.setdefault("Validation", {})
         updated_sections["Validation"].update(
             {
                 "stage1_enabled": "false",
-                "stage2_enabled": "true" if self.state["performance"]["enable_stage2_validation"] else "false",
-            }
-        )
-        updated_sections = apply_validation_compat_sections(updated_sections)
-        updated_sections["Stage2_Retry"].update(
-            {
-                "enabled": "true" if self.state["stage2_retry"]["enabled"] else "false",
-                "max_retry_rounds": str(self.state["stage2_retry"]["max_retry_rounds"]),
-                "base_retry_delay": str(self.state["stage2_retry"]["base_retry_delay"]),
-                "max_retry_delay": str(self.state["stage2_retry"]["max_retry_delay"]),
+                "review_enabled": "true" if self.state["runtime"]["review_validation_enabled"] else "false",
             }
         )
         updated_sections["Preprocess"].update(
@@ -1979,7 +1981,7 @@ class WorkspaceController:
         api_keys: Dict[str, str] = {}
         for section_name, card in self.api_cards.items():
             updated_sections.setdefault(section_name, {})
-            updated_sections[section_name]["provider"] = card["provider"]
+            updated_sections[section_name]["provider_family"] = card["provider"]
             updated_sections[section_name]["model"] = card["model"]
             updated_sections[section_name]["api_base"] = card["api_base"]
             updated_sections[section_name]["proxy_mode"] = card.get("proxy_mode", "environment") or "environment"
@@ -2034,10 +2036,16 @@ class WorkspaceController:
         if self.test_mode:
             response = self._mock_free_mode_response(message)
         else:
+            free_mode_output_dir = str(self.state["paths"].get("output_path") or "./output")
+            free_mode_project_name = str(
+                self.state["workflow"].get("project_name") or "free_mode"
+            ).strip() or "free_mode"
             response = await asyncio.to_thread(
                 plan_free_mode_chat_turn,
                 messages=list(self.free_mode_messages),
                 config=self.build_runtime_config(),
+                output_dir=free_mode_output_dir,
+                project_name=free_mode_project_name,
             )
 
         self.free_mode_busy = False
@@ -2165,12 +2173,10 @@ class WorkspaceController:
     def _latest_queue_progress_snapshot(self) -> Dict[str, Any] | None:
         if not self._queue_service:
             return None
-        runtimes = getattr(self._queue_service, "_runtimes", {})
-        if not isinstance(runtimes, dict):
-            return None
+        runtimes = self._queue_service.list_job_runtimes()
         running = [
             runtime
-            for runtime in runtimes.values()
+            for runtime in runtimes
             if getattr(runtime, "state", None) == QueueState.RUNNING and getattr(runtime, "progress_snapshot", None)
         ]
         running.sort(key=lambda item: str(getattr(item, "started_at", "") or ""), reverse=True)
@@ -2202,6 +2208,300 @@ class WorkspaceController:
             lambda element: element.set_text(self.latest_log_path or self.t("暂无日志文件。")),
         )
         self._safe_update_bound_list(self.bindings.log_views, lambda element: element.set_value(self.latest_log_excerpt))
+
+    def _latest_control_plane_workspace(self) -> str | None:
+        snapshot = _latest_workspace_snapshot(
+            str(self.state["paths"].get("output_path") or "./output"),
+            preferred_project=str(self.state["workflow"].get("project_name") or "").strip(),
+        )
+        workspace_path = str((snapshot or {}).get("workspace_path") or "").strip()
+        return workspace_path or None
+
+    def _control_plane_call(self, operation: str, **kwargs: Any) -> Dict[str, Any]:
+        workspace_path = self._latest_control_plane_workspace()
+        if not workspace_path:
+            return {
+                "status": "blocked",
+                "reason": "no canonical job workspace is available",
+                "mutation_performed": False,
+                "read_only": operation in {"inspect", "validation_status"},
+            }
+        try:
+            from runtime.control_plane import ReviewControlPlane
+
+            control = ReviewControlPlane(
+                repo_root=REPO_ROOT,
+                workspace_roots=[Path(self.state["paths"].get("output_path") or "./output")],
+            )
+            method = getattr(control, operation)
+            result = method(workspace=workspace_path, **kwargs)
+            return dict(result) if isinstance(result, dict) else {
+                "status": "blocked",
+                "reason": "invalid control-plane response",
+                "mutation_performed": False,
+            }
+        except Exception as exc:  # pragma: no cover - defensive GUI boundary.
+            return {
+                "status": "blocked",
+                "workspace_path": workspace_path,
+                "reason": str(exc),
+                "mutation_performed": False,
+                "read_only": operation in {"inspect", "validation_status"},
+            }
+
+    @staticmethod
+    def _canonical_lifecycle_states(
+        inspection: Dict[str, Any],
+        validation_status: Dict[str, Any],
+    ) -> list[str]:
+        records = [item for item in inspection.get("artifacts") or () if isinstance(item, dict)]
+
+        def has_ready_type(*artifact_types: str) -> bool:
+            return any(
+                str(item.get("artifact_type") or "") in artifact_types
+                and str(item.get("status") or "") == "ready"
+                for item in records
+            )
+
+        states: list[str] = []
+        job_status = str((inspection.get("status") or {}).get("job_status") or "").strip().lower()
+        if job_status == "cancel_requested":
+            states.append("cancel_requested")
+        elif job_status == "cancelled" or has_ready_type("cancellation_acknowledgement"):
+            states.append("cancel_acknowledged")
+
+        provider_receipts = inspection.get("provider_receipts") or {}
+        if provider_receipts and not bool(provider_receipts.get("complete")):
+            states.append("receipt_incomplete")
+
+        if has_ready_type("adopted_final_outline"):
+            states.append("adopted")
+        elif has_ready_type("final_outline"):
+            states.append("ready_for_adoption")
+
+        validation_artifact = validation_status.get("validation_artifact")
+        validation_state = str(validation_status.get("status") or "").strip().lower()
+        if isinstance(validation_artifact, dict) and validation_artifact.get("status") == "ready":
+            if validation_state == "clean":
+                states.append("validation_clean")
+            elif validation_state in {"findings", "needs_review"}:
+                states.append("validation_findings")
+            else:
+                states.append("validation_not_run")
+        elif validation_state == "running":
+            states.append("validation_running")
+        else:
+            states.append("validation_not_run")
+
+        if has_ready_type("repair_plan"):
+            states.append("repair_available")
+        if any(
+            str(item.get("artifact_type") or "") in {"repair_transaction", "repair_apply_result"}
+            and str(item.get("status") or "") == "quarantined"
+            for item in records
+        ):
+            states.append("repair_quarantined")
+
+        if any(
+            str(item.get("artifact_type") or "") == "export_bundle"
+            and str(item.get("status") or "") == "ready"
+            and str((item.get("metadata") or {}).get("status") or "") == "canonical_verified"
+            for item in records
+        ):
+            states.append("export_canonical_verified")
+        if any(
+            str(item.get("artifact_type") or "") == "export_bundle"
+            and str(item.get("status") or "") in {"quarantined", "failed"}
+            for item in records
+        ):
+            states.append("export_untrusted")
+        return list(dict.fromkeys(states))
+
+    def refresh_lifecycle(self, *, notify_user: bool = False) -> Dict[str, Any]:
+        inspection = self._control_plane_call("inspect")
+        workspace_path = str(inspection.get("workspace_path") or "")
+        inspection_blocked = str(inspection.get("status") or "").strip().lower() == "blocked"
+        validation_status = (
+            self._control_plane_call("validation_status")
+            if workspace_path and not inspection_blocked
+            else {"status": "blocked", "reason": inspection.get("reason", "")}
+        )
+        snapshot = {
+            "workspace_path": workspace_path,
+            "inspection": inspection,
+            "validation_status": validation_status,
+            "canonical_states": self._canonical_lifecycle_states(inspection, validation_status),
+        }
+        self.lifecycle_snapshot = snapshot
+        if notify_user:
+            if inspection_blocked:
+                self.notify(str(inspection.get("reason") or "canonical status is unavailable"), color="warning")
+            else:
+                self.notify(self.t("canonical lifecycle status refreshed"), color="positive")
+        return snapshot
+
+    def _notify_control_plane_result(self, result: Dict[str, Any]) -> None:
+        status = str(result.get("status") or "blocked").strip().lower()
+        message = str(result.get("reason") or result.get("message") or status)
+        if status in {"succeeded", "clean", "canonical_verified", "requested", "available"}:
+            self.notify(message, color="positive")
+        elif status in {"blocked", "untrusted", "failed", "findings"}:
+            self.notify(message, color="warning", multi_line=True)
+        else:
+            self.notify(message, color="info")
+
+    def adopt_current_outline(self) -> Dict[str, Any]:
+        actor = str(self.lifecycle_actor or "").strip()
+        reason = str(self.lifecycle_reason or "").strip()
+        if not actor or not reason:
+            result = {
+                "status": "blocked",
+                "reason": "adoption actor and reason are required",
+                "mutation_performed": False,
+            }
+            self._notify_control_plane_result(result)
+            return result
+        inspection = self._control_plane_call("inspect")
+        target = next(
+            (
+                item
+                for item in inspection.get("artifacts") or ()
+                if isinstance(item, dict)
+                and item.get("artifact_type") == "final_outline"
+                and item.get("status") == "ready"
+            ),
+            None,
+        )
+        if target is None:
+            result = {
+                "status": "blocked",
+                "reason": "no verified ready final outline is available for adoption",
+                "mutation_performed": False,
+            }
+        else:
+            result = self._control_plane_call(
+                "adopt",
+                artifact_id=str(target.get("artifact_id") or ""),
+                actor=actor,
+                reason=reason,
+                expected_hash=str(target.get("content_hash") or ""),
+            )
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def inspect_validation_status(self) -> Dict[str, Any]:
+        result = self._control_plane_call("validation_status")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    async def execute_current_validation(self) -> Dict[str, Any]:
+        self.lifecycle_busy = True
+        self.set_status(self.t("validation is running through the current validation service"))
+        result: Dict[str, Any] = {
+            "status": "blocked",
+            "reason": "validation execution did not return a control-plane result",
+            "mutation_performed": False,
+        }
+        try:
+            result = await asyncio.to_thread(self._control_plane_call, "validate")
+        finally:
+            self.lifecycle_busy = False
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def resume_current_workspace(self) -> Dict[str, Any]:
+        result = self._control_plane_call("resume")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def cancel_current_workspace(self) -> Dict[str, Any]:
+        result = self._control_plane_call("cancel", requested_by="gui", reason="user_requested_from_gui")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def create_repair_plan_from_gui(self) -> Dict[str, Any]:
+        result = self._control_plane_call("repair_plan")
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def apply_repair_plan_from_gui(self) -> Dict[str, Any]:
+        """Ask the control plane to apply the selected verified repair plan."""
+
+        inspection = self._control_plane_call("inspect")
+        target = next(
+            (
+                item
+                for item in inspection.get("artifacts") or ()
+                if isinstance(item, dict)
+                and item.get("artifact_type") == "repair_plan"
+                and item.get("status") == "ready"
+            ),
+            None,
+        )
+        if target is None:
+            result = {
+                "status": "blocked",
+                "reason": "no verified ready repair plan is available",
+                "mutation_performed": False,
+            }
+        else:
+            result = self._control_plane_call(
+                "repair_apply",
+                plan_id=str(target.get("artifact_id") or ""),
+            )
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
+
+    def promote_repaired_artifacts_from_gui(self) -> Dict[str, Any]:
+        """Promote only a quarantined repair through current revalidation."""
+
+        actor = str(self.lifecycle_actor or "").strip()
+        reason = str(self.lifecycle_reason or "").strip()
+        if not actor or not reason:
+            result = {
+                "status": "blocked",
+                "reason": "promotion actor and reason are required",
+                "mutation_performed": False,
+            }
+            self._notify_control_plane_result(result)
+            return result
+
+        inspection = self._control_plane_call("inspect")
+        transactions = [
+            item
+            for item in inspection.get("artifacts") or ()
+            if isinstance(item, dict)
+            and item.get("artifact_type") == "repair_transaction"
+            and item.get("status") == "quarantined"
+        ]
+        target = max(
+            transactions,
+            key=lambda item: (str(item.get("created_at") or ""), str(item.get("artifact_id") or "")),
+            default=None,
+        )
+        if target is None:
+            result = {
+                "status": "blocked",
+                "reason": "no quarantined repair transaction is available for promotion",
+                "mutation_performed": False,
+            }
+        else:
+            result = self._control_plane_call(
+                "repair_promote",
+                transaction_id=str(target.get("artifact_id") or ""),
+                actor=actor,
+                reason=reason,
+            )
+        self._notify_control_plane_result(result)
+        self.refresh_lifecycle(notify_user=False)
+        return result
 
     def persist_config(self, *, notify_user: bool = True) -> None:
         updated_sections, api_keys, extra_env_values = self._collect_config_payload()
@@ -2433,6 +2733,89 @@ class WorkspaceController:
             self.update_progress_widgets()
             self.refresh_logs()
             self.refresh_queue(notify_user=False)
+
+
+def _render_lifecycle_card(controller: WorkspaceController) -> None:
+    t = controller.t
+    controller.refresh_lifecycle(notify_user=False)
+
+    state_labels = {
+        "ready_for_adoption": "ready_for_adoption",
+        "adopted": "adopted",
+        "validation_not_run": "validation_not_run",
+        "validation_running": "validation_running",
+        "validation_findings": "validation_findings",
+        "validation_clean": "validation_clean",
+        "receipt_incomplete": "receipt_incomplete",
+        "repair_available": "repair_available",
+        "repair_quarantined": "repair_quarantined",
+        "export_canonical_verified": "export_canonical_verified",
+        "export_untrusted": "export_untrusted",
+        "cancel_requested": "cancel_requested",
+        "cancel_acknowledged": "cancel_acknowledged",
+    }
+
+    def refresh_panel() -> None:
+        controller.refresh_lifecycle(notify_user=True)
+        render_panel.refresh()
+
+    async def execute_validation() -> None:
+        await controller.execute_current_validation()
+        render_panel.refresh()
+
+    def view_validation_status() -> None:
+        controller.inspect_validation_status()
+        render_panel.refresh()
+
+    @ui.refreshable
+    def render_panel() -> None:
+        snapshot = controller.lifecycle_snapshot
+        states = [state_labels.get(str(item), str(item)) for item in snapshot.get("canonical_states") or ()]
+        inspection = snapshot.get("inspection") or {}
+        validation = snapshot.get("validation_status") or {}
+        with ui.card().classes("ag-card ag-card-strong p-6 w-full"):
+            ui.label(t("Canonical lifecycle")).classes("ag-section-title")
+            ui.label(
+                t("These states come from ReviewControlPlane and Registry evidence; the GUI does not infer success from files.")
+            ).classes("ag-subtle")
+            workspace_path = str(snapshot.get("workspace_path") or "")
+            ui.label(workspace_path or t("No canonical job workspace found.")).classes("ag-subtle q-mt-sm")
+            if states:
+                with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                    for state in states:
+                        ui.badge(state).props("outline")
+            else:
+                ui.label(t("canonical status unavailable")).classes("ag-subtle q-mt-md")
+            reason = str(inspection.get("reason") or validation.get("reason") or "").strip()
+            if reason:
+                ui.label(reason).classes("ag-subtle q-mt-sm")
+
+            with ui.row().classes("gap-2 q-mt-md flex-wrap"):
+                ui.button(t("Refresh canonical status"), on_click=refresh_panel).props("outline size=sm")
+                ui.button(t("View validation status"), on_click=view_validation_status).props("outline size=sm")
+                ui.button(t("Run validation"), on_click=execute_validation).props("unelevated size=sm")
+                ui.button(t("Resume workspace"), on_click=lambda: (controller.resume_current_workspace(), render_panel.refresh())).props("outline size=sm")
+                ui.button(t("Request cancellation"), on_click=lambda: (controller.cancel_current_workspace(), render_panel.refresh())).props("outline color=negative size=sm")
+                ui.button(t("Create report-only repair plan"), on_click=lambda: (controller.create_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
+                ui.button(t("Apply verified repair plan"), on_click=lambda: (controller.apply_repair_plan_from_gui(), render_panel.refresh())).props("outline size=sm")
+
+            with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
+                actor = ui.input(t("Adoption actor"), value=controller.lifecycle_actor)
+                actor.on("update:model-value", lambda event: setattr(controller, "lifecycle_actor", str(getattr(event, "value", "") or "")))
+                reason_input = ui.input(t("Adoption reason"), value=controller.lifecycle_reason)
+                reason_input.on("update:model-value", lambda event: setattr(controller, "lifecycle_reason", str(getattr(event, "value", "") or "")))
+            ui.button(
+                t("Adopt verified outline"),
+                on_click=lambda: (controller.adopt_current_outline(), render_panel.refresh()),
+            ).props("outline color=primary size=sm")
+            ui.button(
+                t("Promote repaired artifacts"),
+                on_click=lambda: (controller.promote_repaired_artifacts_from_gui(), render_panel.refresh()),
+            ).props("outline color=primary size=sm")
+
+    render_panel()
+    if not controller.test_mode:
+        ui.timer(4.0, refresh_panel)
 
 
 def _render_progress_card(controller: WorkspaceController) -> None:
@@ -3090,7 +3473,7 @@ def _render_mineru_api_card(controller: WorkspaceController) -> None:
     with ui.card().classes("ag-card ag-card-strong p-5 w-full"):
         ui.label(t("MinerU 远程解析")).classes("ag-section-title")
         ui.label(
-            t("这是 PDF 预处理使用的远程解析后端，不属于 LLM 模型卡。是否真的调用，还取决于“性能与预处理”页里的解析策略。"),
+            t("这是 PDF 预处理使用的远程解析后端，不属于 LLM 模型卡。是否真的调用，还取决于“运行与预处理”页里的解析策略。"),
         ).classes("ag-subtle")
         with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
             ui.input("Base URL", value=mineru["base_url"]).bind_value(mineru, "base_url")
@@ -3112,7 +3495,7 @@ def _render_mineru_api_card(controller: WorkspaceController) -> None:
         token_input.on("update:model-value", lambda _: refresh_mineru_notes())
         token_input.on("blur", lambda _: refresh_mineru_notes())
         with ui.row().classes("gap-2 q-mt-sm"):
-            ui.button(t("前往性能与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
+            ui.button(t("前往运行与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
 
 
 def _render_processing_mineru_card(controller: WorkspaceController) -> None:
@@ -3381,10 +3764,10 @@ def launch_gui(
                     ui.label(t("2. 再去“API 与模型”页补模型、API Base 和 API Key。")).classes("ag-subtle")
                     ui.label(t("3. 如果 API Base 填错格式，保存时会自动规范化。")).classes("ag-subtle")
                     ui.label(t("4. 配置保存后，API Key 会写入 `.env`，不用手改文本文件。")).classes("ag-subtle")
-                    ui.label(t("5. MinerU token 在“API 与模型”页填写；真正是否调用，要到“性能与预处理”页选择解析策略。")).classes("ag-subtle")
+                    ui.label(t("5. MinerU token 在“API 与模型”页填写；真正是否调用，要到“运行与预处理”页选择解析策略。")).classes("ag-subtle")
                     with ui.row().classes("gap-2 q-mt-md"):
                         ui.button(t("前往 API 与模型"), on_click=lambda: ui.navigate.to("/setup/api")).props("outline")
-                        ui.button(t("前往性能与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
+                        ui.button(t("前往运行与预处理"), on_click=lambda: ui.navigate.to("/setup/processing")).props("outline")
 
     @ui.page("/setup/api")
     def api_page() -> None:
@@ -3408,7 +3791,7 @@ def launch_gui(
         t = controller.t
         with _page_shell(
             controller,
-            "性能与预处理",
+            "运行与预处理",
             "这一页专门控制并发、解析策略、PDF 预处理、OCR 和本地 RAG。MinerU 是否真正启用，也在这里决定。",
             "/setup/processing",
         ):
@@ -3416,17 +3799,15 @@ def launch_gui(
                 with ui.card().classes("ag-card p-6"):
                     ui.label(t("运行参数")).classes("ag-section-title")
                     with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                        ui.input(t("最大并发"), value=controller.state["performance"]["max_workers"]).bind_value(controller.state["performance"], "max_workers")
-                        ui.input(t("API 重试次数"), value=controller.state["performance"]["api_retry_attempts"]).bind_value(controller.state["performance"], "api_retry_attempts")
-
-                with ui.card().classes("ag-card p-6"):
-                    ui.label(t("阶段二重试")).classes("ag-section-title")
-                    ui.label(t("阶段二自动重试会在全文生成时自动补跑失败章节。")).classes("ag-subtle")
-                    with ui.grid(columns=2).classes("w-full gap-3 q-mt-md"):
-                        ui.switch(t("启用阶段二自动重试"), value=controller.state["stage2_retry"]["enabled"]).bind_value(controller.state["stage2_retry"], "enabled")
-                        ui.input(t("阶段二最大重试轮数"), value=controller.state["stage2_retry"]["max_retry_rounds"]).bind_value(controller.state["stage2_retry"], "max_retry_rounds")
-                        ui.input(t("阶段二基础等待秒数"), value=controller.state["stage2_retry"]["base_retry_delay"]).bind_value(controller.state["stage2_retry"], "base_retry_delay")
-                        ui.input(t("阶段二最大等待秒数"), value=controller.state["stage2_retry"]["max_retry_delay"]).bind_value(controller.state["stage2_retry"], "max_retry_delay")
+                        ui.input(t("最大并发"), value=controller.state["runtime"]["max_workers"]).bind_value(controller.state["runtime"], "max_workers")
+                        ui.input(t("传输层重试次数"), value=controller.state["runtime"]["transport_retries"]).bind_value(controller.state["runtime"], "transport_retries")
+                        ui.input(t("节点重试上限"), value=controller.state["runtime"]["node_retry_limit"]).bind_value(controller.state["runtime"], "node_retry_limit")
+                        ui.input(t("阶段一重试上限"), value=controller.state["runtime"]["stage1_retry_limit"]).bind_value(controller.state["runtime"], "stage1_retry_limit")
+                        ui.input(t("综述章节重试上限"), value=controller.state["runtime"]["review_section_retry_limit"]).bind_value(controller.state["runtime"], "review_section_retry_limit")
+                        ui.input(t("验证批次重试上限"), value=controller.state["runtime"]["validation_retry_limit"]).bind_value(controller.state["runtime"], "validation_retry_limit")
+                        ui.input(t("重试基础等待秒数"), value=controller.state["runtime"]["retry_base_delay_seconds"]).bind_value(controller.state["runtime"], "retry_base_delay_seconds")
+                        ui.input(t("重试最大等待秒数"), value=controller.state["runtime"]["retry_max_delay_seconds"]).bind_value(controller.state["runtime"], "retry_max_delay_seconds")
+                        ui.input(t("任务总时限（秒）"), value=controller.state["runtime"]["total_job_deadline_seconds"]).bind_value(controller.state["runtime"], "total_job_deadline_seconds")
 
                 with ui.card().classes("ag-card ag-card-strong p-6"):
                     ui.label(t("PDF 预处理")).classes("ag-section-title")
@@ -3456,7 +3837,7 @@ def launch_gui(
                     ui.label(t("这里只保留仍然建议用户直接控制的高级项。综述验证是可选增强步骤，默认不改变主流程。")).classes("ag-subtle")
                     with ui.expansion(t("高级 / 可选功能"), icon="science").classes("w-full q-mt-md"):
                         with ui.column().classes("gap-2 q-pa-sm"):
-                            ui.switch(t("启用综述验证"), value=controller.state["performance"]["enable_stage2_validation"]).bind_value(controller.state["performance"], "enable_stage2_validation")
+                            ui.switch(t("启用综述验证"), value=controller.state["runtime"]["review_validation_enabled"]).bind_value(controller.state["runtime"], "review_validation_enabled")
 
     @ui.page("/logs")
     def logs_page() -> None:
@@ -3468,6 +3849,7 @@ def launch_gui(
             "/logs",
         ):
             _render_progress_card(controller)
+            _render_lifecycle_card(controller)
 
             def refresh_results_page() -> None:
                 controller.refresh_logs()

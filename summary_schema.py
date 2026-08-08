@@ -78,69 +78,41 @@ PAPER_TYPE_ALIASES: Dict[str, str] = {
 }
 
 FIELD_OWNER_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "core_analysis.summary": {"legacy_path": "common_core.summary", "critical_for": ("all",)},
-    "core_analysis.key_points": {"legacy_path": "common_core.key_points"},
-    "core_analysis.methodology": {"legacy_path": "common_core.methodology", "critical_for": ("all",)},
-    "core_analysis.findings": {"legacy_path": "common_core.findings", "critical_for": ("all",)},
-    "core_analysis.conclusions": {"legacy_path": "common_core.conclusions", "critical_for": ("all",)},
-    "core_analysis.relevance": {"legacy_path": "common_core.relevance"},
-    "core_analysis.limitations": {"legacy_path": "common_core.limitations"},
+    "core_analysis.summary": {"critical_for": ("all",)},
+    "core_analysis.key_points": {},
+    "core_analysis.methodology": {"critical_for": ("all",)},
+    "core_analysis.findings": {"critical_for": ("all",)},
+    "core_analysis.conclusions": {"critical_for": ("all",)},
+    "core_analysis.relevance": {},
+    "core_analysis.limitations": {},
     "core_analysis.theoretical_framework": {
-        "legacy_path": "type_specific_details.theoretical_framework",
         "critical_for": ("conceptual",),
     },
-    "core_analysis.research_gap": {"legacy_path": "type_specific_details.research_gap"},
-    "core_analysis.future_research_directions": {
-        "legacy_path": "type_specific_details.future_research_directions"
-    },
-    "specialized_details.empirical.research_questions_or_hypotheses": {
-        "legacy_path": "type_specific_details.empirical_details.research_questions_or_hypotheses"
-    },
+    "core_analysis.research_gap": {},
+    "core_analysis.future_research_directions": {},
+    "specialized_details.empirical.research_questions_or_hypotheses": {},
     "specialized_details.empirical.data_source_and_size": {
-        "legacy_path": "type_specific_details.empirical_details.data_source_and_size",
         "critical_for": ("empirical",),
     },
     "specialized_details.empirical.analysis_technique": {
-        "legacy_path": "type_specific_details.empirical_details.analysis_technique",
         "critical_for": ("empirical",),
     },
-    "specialized_details.empirical.core_variables": {
-        "legacy_path": "type_specific_details.empirical_details.core_variables"
-    },
-    "specialized_details.empirical.sample_characteristics_or_context": {
-        "legacy_path": "type_specific_details.empirical_details.sample_characteristics_or_context"
-    },
+    "specialized_details.empirical.core_variables": {},
+    "specialized_details.empirical.sample_characteristics_or_context": {},
     "specialized_details.review.review_type": {
-        "legacy_path": "type_specific_details.review_details.review_type",
         "critical_for": ("review",),
     },
-    "specialized_details.review.search_databases": {
-        "legacy_path": "type_specific_details.review_details.search_databases"
-    },
-    "specialized_details.review.time_span": {
-        "legacy_path": "type_specific_details.review_details.time_span"
-    },
-    "specialized_details.review.included_studies_count": {
-        "legacy_path": "type_specific_details.review_details.included_studies_count"
-    },
-    "specialized_details.review.inclusion_exclusion_criteria": {
-        "legacy_path": "type_specific_details.review_details.inclusion_exclusion_criteria"
-    },
+    "specialized_details.review.search_databases": {},
+    "specialized_details.review.time_span": {},
+    "specialized_details.review.included_studies_count": {},
+    "specialized_details.review.inclusion_exclusion_criteria": {},
     "specialized_details.review.synthesis_approach": {
-        "legacy_path": "type_specific_details.review_details.synthesis_approach",
         "critical_for": ("review",),
     },
-    "specialized_details.review.main_themes": {
-        "legacy_path": "type_specific_details.review_details.main_themes"
-    },
-    "specialized_details.conceptual.core_propositions": {
-        "legacy_path": "type_specific_details.conceptual_details.core_propositions"
-    },
-    "specialized_details.conceptual.conceptual_relationships": {
-        "legacy_path": "type_specific_details.conceptual_details.conceptual_relationships"
-    },
+    "specialized_details.review.main_themes": {},
+    "specialized_details.conceptual.core_propositions": {},
+    "specialized_details.conceptual.conceptual_relationships": {},
     "specialized_details.conceptual.theoretical_contributions": {
-        "legacy_path": "type_specific_details.conceptual_details.theoretical_contributions",
         "critical_for": ("conceptual",),
     },
 }
@@ -491,28 +463,6 @@ def _normalize_core_analysis_from_canonical(value: Any) -> Dict[str, Any]:
     return normalized
 
 
-def _normalize_core_analysis_from_legacy(common_core: Mapping[str, Any], type_specific: Mapping[str, Any]) -> Dict[str, Any]:
-    normalized = default_core_analysis()
-    normalized["summary"] = _normalize_text(common_core.get("summary"))
-    normalized["key_points"] = _normalize_key_points(common_core.get("key_points"))
-    normalized["methodology"] = _normalize_text(common_core.get("methodology"))
-    normalized["findings"] = _normalize_text(common_core.get("findings"))
-    normalized["conclusions"] = _normalize_text(common_core.get("conclusions"))
-    normalized["relevance"] = _normalize_text(common_core.get("relevance"))
-    normalized["limitations"] = _normalize_text(common_core.get("limitations"))
-    normalized["theoretical_framework"] = (
-        _normalize_text(type_specific.get("theoretical_framework"))
-        or _normalize_text((type_specific.get("conceptual_details") or {}).get("theoretical_framework"))
-    )
-    normalized["research_gap"] = _normalize_text(type_specific.get("research_gap"))
-    normalized["future_research_directions"] = (
-        _normalize_string_list(type_specific.get("future_research_directions"))
-        or _normalize_string_list((type_specific.get("review_details") or {}).get("future_research_directions"))
-        or _normalize_string_list((type_specific.get("conceptual_details") or {}).get("future_research_directions"))
-    )
-    return normalized
-
-
 def _normalize_paper_metadata(value: Any) -> Dict[str, Any]:
     normalized = default_paper_metadata()
     if not isinstance(value, Mapping):
@@ -525,18 +475,6 @@ def _normalize_paper_metadata(value: Any) -> Dict[str, Any]:
     return normalized
 
 
-def _normalize_paper_metadata_from_legacy(common_core: Mapping[str, Any]) -> Dict[str, Any]:
-    return _normalize_paper_metadata(
-        {
-            "title": common_core.get("title"),
-            "authors": common_core.get("authors"),
-            "year": common_core.get("year"),
-            "journal": common_core.get("journal"),
-            "doi": common_core.get("doi"),
-        }
-    )
-
-
 def _normalize_specialized_from_canonical(value: Any) -> Dict[str, Any]:
     normalized = default_specialized_details()
     if not isinstance(value, Mapping):
@@ -545,41 +483,6 @@ def _normalize_specialized_from_canonical(value: Any) -> Dict[str, Any]:
     empirical = _normalize_empirical_details(value.get("empirical"))
     review = _normalize_review_details(value.get("review"))
     conceptual = _normalize_conceptual_details(value.get("conceptual"))
-
-    normalized["empirical"] = empirical if _has_content(empirical) else None
-    normalized["review"] = review if _has_content(review) else None
-    normalized["conceptual"] = conceptual if _has_content(conceptual) else None
-    return normalized
-
-
-def _normalize_specialized_from_legacy(type_specific: Mapping[str, Any]) -> Dict[str, Any]:
-    normalized = default_specialized_details()
-
-    empirical_source_raw = type_specific.get("empirical_details")
-    empirical_source: Mapping[str, Any] = empirical_source_raw if isinstance(empirical_source_raw, Mapping) else {}
-    review_source_raw = type_specific.get("review_details")
-    review_source: Mapping[str, Any] = review_source_raw if isinstance(review_source_raw, Mapping) else {}
-    conceptual_source_raw = type_specific.get("conceptual_details")
-    conceptual_source: Mapping[str, Any] = conceptual_source_raw if isinstance(conceptual_source_raw, Mapping) else {}
-
-    empirical = _normalize_empirical_details(
-        {
-            **(empirical_source or {}),
-            "research_questions_or_hypotheses": (empirical_source or {}).get(
-                "research_questions_or_hypotheses",
-                type_specific.get("research_questions_or_hypotheses"),
-            ),
-            "data_source_and_size": (empirical_source or {}).get("data_source_and_size", type_specific.get("data_source_and_size")),
-            "analysis_technique": (empirical_source or {}).get("analysis_technique", type_specific.get("analysis_technique")),
-            "core_variables": (empirical_source or {}).get("core_variables", type_specific.get("core_variables")),
-            "sample_characteristics_or_context": (empirical_source or {}).get(
-                "sample_characteristics_or_context",
-                type_specific.get("sample_characteristics_or_context"),
-            ),
-        }
-    )
-    review = _normalize_review_details(review_source or {})
-    conceptual = _normalize_conceptual_details(conceptual_source or {})
 
     normalized["empirical"] = empirical if _has_content(empirical) else None
     normalized["review"] = review if _has_content(review) else None
@@ -825,97 +728,6 @@ def _normalize_canonical_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     return ai_summary
 
 
-def _normalize_legacy_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
-    inferred_fields: List[str] = []
-    common_core_raw = payload.get("common_core")
-    common_core: Mapping[str, Any] = common_core_raw if isinstance(common_core_raw, Mapping) else payload
-    type_specific_raw = payload.get("type_specific_details")
-    type_specific: Mapping[str, Any] = type_specific_raw if isinstance(type_specific_raw, Mapping) else {}
-
-    specialized_source = _normalize_specialized_from_legacy(type_specific)
-    branch_candidates = _candidate_types_from_branches(specialized_source)
-
-    raw_paper_type_text = _normalize_text(type_specific.get("paper_type"))
-    explicit_paper_type = _normalize_paper_type(type_specific.get("paper_type"))
-    paper_type = explicit_paper_type
-    if not paper_type and len(branch_candidates) == 1:
-        paper_type = branch_candidates[0]
-        inferred_fields.append("routing.paper_type")
-
-    raw_route_confidence = type_specific.get("route_confidence")
-    route_confidence = _normalize_route_confidence(raw_route_confidence)
-    if "route_confidence" not in type_specific and paper_type and not explicit_paper_type:
-        route_confidence = "low"
-
-    subtype_raw = _normalize_text(type_specific.get("paper_subtype"))
-    if not subtype_raw and raw_paper_type_text and raw_paper_type_text.lower() not in PAPER_TYPES:
-        subtype_raw = raw_paper_type_text
-    subtype_normalized = _normalize_subtype_for_type(paper_type, subtype_raw)
-
-    if explicit_paper_type is None and len(branch_candidates) > 1:
-        paper_type = None
-
-    secondary_candidates: List[str] = []
-    if paper_type is None:
-        secondary_candidates = _normalize_secondary_candidates([], None, fallback_candidates=branch_candidates)
-    elif len(branch_candidates) > 1:
-        secondary_candidates = _normalize_secondary_candidates([], paper_type, fallback_candidates=branch_candidates)
-
-    status = "resolved"
-    if explicit_paper_type is None and paper_type is None:
-        status = "uncertain"
-    elif secondary_candidates:
-        status = "uncertain"
-    elif paper_type is None:
-        status = "uncertain"
-
-    routing = default_routing()
-    routing["paper_type"] = paper_type
-    routing["paper_subtype_raw"] = subtype_raw
-    routing["paper_subtype_normalized"] = subtype_normalized if paper_type else None
-    routing["classification_status"] = status if paper_type or status == "uncertain" else "uncertain"
-    routing["route_confidence"] = route_confidence
-    routing["classification_rationale"] = _normalize_text(type_specific.get("classification_rationale"))
-    routing["secondary_candidates"] = secondary_candidates
-
-    core_analysis = _normalize_core_analysis_from_legacy(common_core, type_specific)
-    paper_metadata = _normalize_paper_metadata_from_legacy(common_core)
-    specialized_details = _ensure_specialized_activation(specialized_source, paper_type)
-    _fill_classification_rationale(routing, inferred_fields)
-
-    ai_summary = {
-        "schema_version": SCHEMA_VERSION,
-        "routing": routing,
-        "core_analysis": core_analysis,
-        "paper_metadata": paper_metadata,
-        "specialized_details": specialized_details,
-        "quality_audit": default_quality_audit(),
-    }
-
-    missing_critical_fields = _compute_missing_critical_fields(ai_summary)
-    conflict_flags = _compute_conflict_flags(ai_summary)
-    completeness_score = _compute_completeness_score(ai_summary, missing_critical_fields)
-    extraction_confidence = _compute_extraction_confidence(
-        routing["route_confidence"],
-        completeness_score,
-        conflict_flags,
-    )
-    ai_summary["quality_audit"] = {
-        "extraction_confidence": extraction_confidence,
-        "completeness_score": completeness_score,
-        "needs_manual_review": (
-            routing["classification_status"] != "resolved"
-            or routing["route_confidence"] == "low"
-            or completeness_score < 0.6
-            or bool(conflict_flags)
-        ),
-        "missing_critical_fields": missing_critical_fields,
-        "conflict_flags": conflict_flags,
-        "inferred_fields": _unique_preserve_order(inferred_fields),
-    }
-    return ai_summary
-
-
 def is_canonical_ai_summary(payload: Any) -> bool:
     return isinstance(payload, Mapping) and (
         payload.get("schema_version") == SCHEMA_VERSION
@@ -925,10 +737,18 @@ def is_canonical_ai_summary(payload: Any) -> bool:
 
 def normalize_ai_summary(payload: Any) -> Dict[str, Any]:
     if not isinstance(payload, Mapping):
-        return default_ai_summary()
+        raise ValueError("current summary payload must be a mapping")
+    legacy_keys = {"common_core", "type_specific_details"}.intersection(payload)
+    if legacy_keys:
+        keys = ", ".join(sorted(str(key) for key in legacy_keys))
+        raise ValueError(
+            f"legacy summary shape is not accepted ({keys}); use summary_v2_lite canonical fields"
+        )
     if is_canonical_ai_summary(payload):
         return _normalize_canonical_payload(payload)
-    return _normalize_legacy_payload(payload)
+    raise ValueError(
+        "current summary payload must contain summary_v2_lite canonical fields"
+    )
 
 
 def get_ai_summary(payload: Any) -> Dict[str, Any]:
@@ -960,66 +780,6 @@ def get_quality_audit(payload: Any) -> Dict[str, Any]:
 def get_primary_sheet_target(payload: Any) -> str:
     paper_type = get_routing(payload).get("paper_type")
     return SHEET_TARGETS.get(str(paper_type or ""), "")
-
-
-def project_legacy_ai_summary(ai_summary: Any, paper_info: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    canonical = normalize_ai_summary(ai_summary)
-    routing = canonical["routing"]
-    core = canonical["core_analysis"]
-    metadata = canonical["paper_metadata"]
-    specialized = canonical["specialized_details"]
-    quality = canonical["quality_audit"]
-
-    empirical = specialized.get("empirical") or _empty_empirical_details()
-    review = specialized.get("review") or _empty_review_details()
-    conceptual = specialized.get("conceptual") or _empty_conceptual_details()
-
-    future_research = list(core.get("future_research_directions") or [])
-
-    common_core = {
-        "title": metadata.get("title") or (paper_info or {}).get("title", ""),
-        "authors": list(metadata.get("authors") or (paper_info or {}).get("authors", []) or []),
-        "year": metadata.get("year") or (paper_info or {}).get("year", ""),
-        "journal": metadata.get("journal") or (paper_info or {}).get("journal", ""),
-        "doi": metadata.get("doi") or (paper_info or {}).get("doi", ""),
-        "summary": core.get("summary") or "",
-        "key_points": list(core.get("key_points") or []),
-        "methodology": core.get("methodology") or "",
-        "findings": core.get("findings") or "",
-        "conclusions": core.get("conclusions") or "",
-        "relevance": core.get("relevance") or "",
-        "limitations": core.get("limitations") or "",
-    }
-
-    type_specific_details = {
-        "paper_type": routing.get("paper_type") or "uncertain",
-        "paper_subtype": routing.get("paper_subtype_raw") or routing.get("paper_subtype_normalized") or "",
-        "route_confidence": routing.get("route_confidence") or "low",
-        "classification_rationale": routing.get("classification_rationale") or "",
-        "theoretical_framework": core.get("theoretical_framework") or "",
-        "research_gap": core.get("research_gap") or "",
-        "research_questions_or_hypotheses": list(empirical.get("research_questions_or_hypotheses") or []),
-        "data_source_and_size": empirical.get("data_source_and_size") or "",
-        "analysis_technique": empirical.get("analysis_technique") or "",
-        "core_variables": empirical.get("core_variables") or _normalize_core_variables({}),
-        "sample_characteristics_or_context": empirical.get("sample_characteristics_or_context") or "",
-        "future_research_directions": future_research,
-        "extraction_confidence": quality.get("extraction_confidence") or "low",
-        "empirical_details": empirical,
-        "review_details": {
-            **review,
-            "future_research_directions": future_research,
-        },
-        "conceptual_details": {
-            **conceptual,
-            "theoretical_framework": core.get("theoretical_framework") or "",
-            "future_research_directions": future_research,
-        },
-    }
-    return {
-        "common_core": common_core,
-        "type_specific_details": type_specific_details,
-    }
 
 
 def canonical_ai_summary_json(payload: Any) -> str:

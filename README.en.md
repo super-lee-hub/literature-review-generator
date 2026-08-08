@@ -194,13 +194,44 @@ Meaning:
 - `--generate-section <n>`: regenerate one section only
 - `--retry-failed`: retry only failed stage-1 papers
 - `--retry-review-failed`: retry only failed or missing review sections
-- `--validate-review`: run an extra validation pass; lower-level validation / repair artifacts are written into the active workspace
+- `--validate-review`: run an extra validation pass through the current validation service; lower-level validation / repair artifacts are written into the active workspace
 
 ### 6.5 GUI background queue
 
-Queueing is now a **GUI-first** interaction model. On the Workflow page, buttons such as "Analyze only", "Generate outline", "Generate review", and "Run all" submit jobs into the GUI's internal persistent serial queue. The queue drains in the background, and the form remains editable so you can configure the next job immediately.
+Queueing remains a **GUI-first** interaction model. On the Workflow page,
+buttons such as "Analyze only", "Generate outline", "Generate review", and
+"Run all" submit jobs into the GUI's persistent serial queue. Queue state is
+stored with atomic cross-process snapshots; source/config fingerprints reset
+stale retry state, and lease generations plus fence tokens prevent an expired
+worker from publishing. Heartbeats, expiry, cancellation, and crash recovery
+are explicit rather than inferred from a UI flag.
 
-The CLI no longer exposes public queue commands. Command-line usage is direct-run only, e.g. `--analyze-only`, `--generate-outline`, `--generate-review`, and `--run-all`. The AI-native Codex / OMX skill also runs directly and stays out of the GUI queue.
+The CLI also exposes read/write queue operations through `reviewctl`:
+`queue-list`, `queue-add`, `queue-run`, `queue-retry`, `queue-cancel`,
+`queue-remove`, `queue-export`, and `queue-import`. Direct `main.py` usage is
+still available for `--analyze-only`, `--generate-outline`,
+`--generate-review`, and `--run-all`; the AI-native Codex / OMX skill runs
+directly and stays out of the GUI queue.
+
+Outline v3 outputs are reusable only with an exact execution binding and closed
+provider receipt chain. Explicit adoption creates a versioned adoption identity
+and a current pointer; validation and repair remain separate, registry-backed
+gates. Completion and export consume the atomic `CurrentArtifactSetV1` and its
+`CurrentStageClosureMapV1`, not an arbitrary READY artifact.
+
+The durable `run_all` stage plan requests analyze -> outline -> review ->
+validate when validation is enabled. If validation is explicitly optional and
+disabled, it requests analyze -> outline -> review, but still requires a
+current artifact set; derivation and outline-only jobs cannot become canonical
+without that set. Outline stability is `off`, `smoke` (default), or `full`:
+with five candidates the core/smoke/full call estimates are 10/20/60, and
+preflight records call and estimated-cost ceilings before transport.
+
+For the durable control plane, `python -m reviewctl validate --job <job_id>`
+executes the current `ValidationExecutionService` and persists a new validation
+attempt. Use `python -m reviewctl validation-status --job <job_id>` for a
+read-only closure view. A zero-claim result is `needs_review`, not `clean`, and
+repair outputs remain quarantined until explicit revalidation and promotion.
 
 ## 7. Advanced capabilities
 
@@ -211,7 +242,7 @@ These are part of the current product surface, but not always required for a fir
 - `--free-mode-profile`: load a free-mode profile JSON
 - `--free-mode-idea`: pass a free-mode idea as text
 - `--merge`: merge multiple `summaries.json` files into one
-- `--outline-adopt`: outline-adopt compatibility path (manual / explicit flow, not the default main chain)
+- `--outline-adopt`: legacy compatibility option; use `python -m reviewctl adopt --artifact <final_outline_id> --actor <actor>` for the current explicit adoption transaction
 - preprocess cache artifacts such as `normalized.md`, `page_index.json`, `diagnostics.json`, and `chunks.json`
 - optional local RAG built during preprocessing
 
@@ -279,7 +310,7 @@ It should not be your first assumption for where the real outputs live.
 - `reports/*_literature_review.docx`
 - `reports/*_failed_papers_report.txt`
 - `checkpoints/*_review_checkpoint.json`
-- `artifacts/review_drafts/*_review_draft_v2.json`
+- `artifacts/review_drafts/*_review_draft.json` (`artifact_version=v3`)
 - `artifacts/citation_manifests/*_citation_manifest_v3.json`
 
 ### 8.4 Preprocess cache
@@ -320,15 +351,14 @@ Important config sections include:
 - `Writer_API`
 - `Outline_API`
 - `Free_Mode_API`
-- `Validator_API`
+- `Validator_API` (current validation adjudication provider, called through the validation service)
+- `OutlineStability` (stability mode, provider-call ceiling, and estimated-cost ceiling)
 - `Performance`
 - `Preprocess`
-- `Retry_Settings`
-- `Stage2_Retry`
+- `Runtime` (typed retry limits, backoff, and job deadlines)
 - `Validation`
 - `Styling`
 - `GUI`
-- `API_Parameters`
 
 Important environment variables include:
 
@@ -370,7 +400,7 @@ If you are here to work on the repository rather than just run it, start with:
 8. `.codex/skills/auto-generate-orchestrator/SKILL.md`
 9. `runtime/orchestrator.py`
 10. `preprocess/service.py`
-11. `validation/review_validator.py`
+11. `validation/execution_service.py`
 
 ## 12. One-line summary
 

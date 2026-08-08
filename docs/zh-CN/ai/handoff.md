@@ -56,7 +56,7 @@
 
 当前推荐约定：敏感信息放 `.env`，非敏感运行参数放 `config.ini`。
 
-关键配置段：`Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Retry_Settings`, `Stage2_Retry`, `Validation`, `Styling`, `GUI`, `API_Parameters`
+关键配置段：`Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Runtime`, `Validation`, `Styling`, `GUI`。provider 自有的输出限制、上下文限制、超时和传输重试上限写在对应 provider 段中。
 
 关键环境变量：`LLM_PRIMARY_READER_API`, `LLM_BACKUP_READER_API`, `LLM_WRITER_API`, `LLM_OUTLINE_API`, `LLM_FREE_MODE_API`, `LLM_VALIDATOR_API`, `MINERU_*`
 
@@ -73,7 +73,7 @@
 - partial rerun / failed retry
 - preprocess cache + OCR fallback
 - free mode profile / idea
-- review_draft_v2 + citation_manifest_v3
+- review_draft（artifact_version=v3）+ citation_manifest_v3
 - optional validation / repair
 - optional local RAG
 - AI-native runtime bridge + `source_bundle.json` / `runtime_stage_trace.json`
@@ -84,7 +84,7 @@
 
 - 一个以 job workspace / artifact / GUI 后台队列为底层支撑的本地 AI 文献分析 / 综述写作工作台
 - 入口上既有 `main.py` CLI、`launch_gui.py` + `gui/app.py` GUI，也有 repo-local Codex skill
-- 阶段一主真相是 canonical summaries，阶段三主真相已经前移到 `review_draft_v2 + citation_manifest_v3`
+- 阶段一主真相是 canonical summaries，阶段三主真相是当前 `review_draft（artifact_version=v3）+ citation_manifest_v3`
 - `README.md` 现在只是路由页；用户细节看 `README.zh-CN.md` / `README.en.md`
 - 如果需要更底层的 artifact / compatibility 说明，请继续看 `docs/zh-CN/runtime/`
 

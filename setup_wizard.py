@@ -42,27 +42,6 @@ DEFAULT_MINERU_ENV_VALUES: Dict[str, str] = {
     "ALLOW_LOCAL_PARSE_FALLBACK": "true",
 }
 
-API_PARAMETER_PROMPTS: tuple[tuple[str, str], ...] = (
-    ("timeout_seconds", "API 超时时间（秒）"),
-    ("primary_max_tokens", "主阅读引擎 max_tokens"),
-    ("primary_temperature", "主阅读引擎 temperature"),
-    ("backup_max_tokens", "备用阅读引擎 max_tokens"),
-    ("backup_temperature", "备用阅读引擎 temperature"),
-    ("concept_max_tokens", "概念预热 max_tokens"),
-    ("concept_temperature", "概念预热 temperature"),
-    ("writer_max_tokens", "写作引擎 max_tokens"),
-    ("writer_temperature", "写作引擎 temperature"),
-    ("outline_max_tokens", "大纲引擎 max_tokens"),
-    ("outline_temperature", "大纲引擎 temperature"),
-    ("free_mode_max_tokens", "自由模式 max_tokens"),
-    ("free_mode_temperature", "自由模式 temperature"),
-    ("validator_max_tokens", "验证引擎 max_tokens"),
-    ("validator_temperature", "验证引擎 temperature"),
-    ("claims_max_tokens", "观点验证 max_tokens"),
-    ("claims_temperature", "观点验证 temperature"),
-)
-
-
 def _prompt(label: str, default: str = "", allow_empty: bool = True) -> str:
     hint_parts: list[str] = []
     if default:
@@ -185,40 +164,12 @@ def _collect_api_section(
     )
 
     effective_provider = _guess_provider(api_base, provider) if api_base else provider
-    current_section["provider"] = "custom" if allow_fallback and not api_base else effective_provider
+    current_section["provider_family"] = "custom" if allow_fallback and not api_base else effective_provider
     current_section["model"] = model
     current_section["api_base"] = (
         normalize_api_base(api_base, provider=effective_provider) if api_base else ""
     )
     api_keys[section_name] = api_key
-
-
-def _collect_retry_section(
-    section: Dict[str, str],
-    title: str,
-    include_enabled: bool = False,
-) -> None:
-    print(f"\n[{title}]")
-    if include_enabled:
-        section["enabled"] = "true" if _prompt_yes_no(
-            "启用阶段二失败章节自动补跑",
-            _parse_bool(section.get("enabled", "true")),
-        ) else "false"
-    section["max_retry_rounds"] = _prompt(
-        "最大重试轮数",
-        section["max_retry_rounds"],
-        allow_empty=False,
-    )
-    section["base_retry_delay"] = _prompt(
-        "基础重试等待时间（秒）",
-        section["base_retry_delay"],
-        allow_empty=False,
-    )
-    section["max_retry_delay"] = _prompt(
-        "最大重试等待时间（秒）",
-        section["max_retry_delay"],
-        allow_empty=False,
-    )
 
 
 def _collect_preprocess_section(
@@ -367,24 +318,20 @@ def _collect_validation_section(
     api_keys: Dict[str, str],
     existing_env: Mapping[str, str],
 ) -> None:
-    performance = sections["Performance"]
     validation = sections["Validation"]
     print("\n[验证设置]")
     stage1_validation = _prompt_yes_no(
         "启用阶段一验证",
-        _parse_bool(validation.get("stage1_enabled", performance["enable_stage1_validation"])),
+        _parse_bool(validation.get("stage1_enabled", "false")),
     )
-    stage2_validation = _prompt_yes_no(
-        "启用阶段二验证",
-        _parse_bool(validation.get("stage2_enabled", performance["enable_stage2_validation"])),
+    review_validation = _prompt_yes_no(
+        "启用综述验证",
+        _parse_bool(validation.get("review_enabled", "true")),
     )
-    # 同时更新两个段，保持一致性
-    performance["enable_stage1_validation"] = "true" if stage1_validation else "false"
-    performance["enable_stage2_validation"] = "true" if stage2_validation else "false"
     validation["stage1_enabled"] = "true" if stage1_validation else "false"
-    validation["stage2_enabled"] = "true" if stage2_validation else "false"
+    validation["review_enabled"] = "true" if review_validation else "false"
 
-    if stage1_validation or stage2_validation:
+    if stage1_validation or review_validation:
         _collect_api_section(
             sections,
             api_keys,
@@ -395,12 +342,6 @@ def _collect_validation_section(
         return
 
     api_keys["Validator_API"] = existing_env.get("LLM_VALIDATOR_API", "")
-
-
-def _collect_api_parameters(section: Dict[str, str]) -> None:
-    print("\n[高级 API 参数]")
-    for key, label in API_PARAMETER_PROMPTS:
-        section[key] = _prompt(label, section[key], allow_empty=False)
 
 
 def _collect_simple_fields(section: Dict[str, str], title: str, fields: Sequence[tuple[str, str]]) -> None:
@@ -461,22 +402,19 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
     _collect_api_section(sections, api_keys, "Free_Mode_API", "自由模式对话引擎", "videocaptioner")
 
     _collect_simple_fields(
-        sections["Performance"],
-        "性能与速率限制",
+        sections["Runtime"],
+        "运行设置",
         (
             ("max_workers", "最大并发数"),
-            ("api_retry_attempts", "单次 API 调用重试次数"),
-            ("primary_tpm_limit", "主阅读引擎 TPM 限额"),
-            ("primary_rpm_limit", "主阅读引擎 RPM 限额"),
-            ("backup_tpm_limit", "备用阅读引擎 TPM 限额"),
-            ("backup_rpm_limit", "备用阅读引擎 RPM 限额"),
+            ("transport_retries", "传输层重试次数"),
+            ("node_retry_limit", "节点重试上限"),
+            ("stage1_retry_limit", "阶段一重试上限"),
+            ("review_section_retry_limit", "综述章节重试上限"),
+            ("validation_retry_limit", "验证批次重试上限"),
+            ("retry_base_delay_seconds", "重试基础等待时间（秒）"),
+            ("retry_max_delay_seconds", "重试最大等待时间（秒）"),
+            ("total_job_deadline_seconds", "任务总时限（秒，0 表示不限制）"),
         ),
-    )
-    _collect_retry_section(sections["Retry_Settings"], "阶段一失败论文自动重试")
-    _collect_retry_section(
-        sections["Stage2_Retry"],
-        "阶段二失败章节自动补跑",
-        include_enabled=True,
     )
     _collect_preprocess_section(sections, extra_env_values)
     _collect_validation_section(sections, api_keys, existing_env)
@@ -495,8 +433,6 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
             ("font_size_heading2", "二级标题字号"),
         ),
     )
-    _collect_api_parameters(sections["API_Parameters"])
-
     normalize_for_save(sections)
     save_config_and_env(
         sections,

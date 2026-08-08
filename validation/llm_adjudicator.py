@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from ai_interface import _call_ai_api
 from models import APIConfig
+from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
 
 
 SOURCE_GROUNDED_TIERS = frozenset(
@@ -37,8 +39,8 @@ class AdjudicationPacket:
     per_paper_evidence_packets: Dict[str, Dict[str, List[Dict[str, Any]]]]
     evidence_excerpt_list: List[str]
     trimmed_candidate_counts: Dict[str, int]
-    legacy_evidence_status: str
-    legacy_disposition: str
+    evidence_status: str
+    disposition: str
 
 
 def _candidate_sort_key(candidate: Dict[str, Any]) -> tuple[int, float, str]:
@@ -163,8 +165,8 @@ def build_adjudication_packet(result: Any, *, stage: str = "primary") -> Adjudic
         per_paper_evidence_packets=per_paper_packets,
         evidence_excerpt_list=evidence_excerpt_list,
         trimmed_candidate_counts=trimmed_candidate_counts,
-        legacy_evidence_status=str(getattr(result, "evidence_status", "") or result.details.get("evidence_status") or ""),
-        legacy_disposition=str(getattr(result, "disposition", "") or result.details.get("disposition") or ""),
+        evidence_status=str(getattr(result, "evidence_status", "") or result.details.get("evidence_status") or ""),
+        disposition=str(getattr(result, "disposition", "") or result.details.get("disposition") or ""),
     )
 
 
@@ -204,7 +206,7 @@ def _build_prompts(packet: AdjudicationPacket) -> tuple[str, str]:
 
 
 def run_adjudication_stage(
-    generator_instance: Any,
+    service: Any,
     api_config: Optional[APIConfig],
     packet: AdjudicationPacket,
 ) -> Optional[Dict[str, Any]]:
@@ -212,8 +214,8 @@ def run_adjudication_stage(
         return None
 
     try:
-        base_max_tokens = int((generator_instance.config.get("API_Parameters") or {}).get("claims_max_tokens", 4096))
-        base_temperature = float((generator_instance.config.get("API_Parameters") or {}).get("claims_temperature", 0.2))
+        base_max_tokens = int(api_config.get("max_output_tokens", 4096))
+        base_temperature = float(api_config.get("temperature", 0.2))
     except Exception:
         base_max_tokens = 4096
         base_temperature = 0.2
@@ -226,27 +228,127 @@ def run_adjudication_stage(
         temperature = base_temperature
 
     prompt, system_prompt = _build_prompts(packet)
+    packet_payload: Dict[str, Any]
+    try:
+        packet_payload = asdict(packet)
+    except TypeError:
+        packet_payload = dict(getattr(packet, "__dict__", {}) or {})
+
+    provider_runtime: Optional[ProviderRuntime] = None
+    runtime_factory: Any = getattr(service, "new_provider_runtime", None)
+    if callable(runtime_factory):
+        packet_hash = hashlib.sha256(
+            json.dumps(
+                packet_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        citation_key = str(packet.citation_set_key or "validation").strip()
+        provider_runtime = cast(ProviderRuntime, runtime_factory(
+            stage_name="stage4_validate",
+            route="Validator_API",
+            node_id=f"{packet.stage}:{citation_key}",
+            call_id=f"validation:{packet.stage}:{packet_hash}",
+            api_config=api_config,
+        ))
+    call_kwargs: Dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": "json",
+        "logger": getattr(service, "logger", None),
+    }
+    request_payload: Dict[str, Any] = {
+        "system": system_prompt,
+        "user": prompt,
+        "user_content": None,
+        "response_format": "json",
+        "max_output_tokens": int(max_tokens),
+        "temperature": temperature,
+    }
+    if provider_runtime is not None:
+        call_kwargs["provider_runtime"] = provider_runtime
+        bind_call = getattr(service, "bind_provider_call", None)
+        if callable(bind_call):
+            bind_call(
+                call_id=str(provider_runtime.call_id),
+                prompt=prompt,
+                input_payload=request_payload,
+                api_config=api_config,
+                schema_hash=str(provider_runtime.schema_hash or ""),
+            )
     try:
         report = _call_ai_api(
             prompt,
             api_config,
             system_prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            response_format="json",
-            logger=getattr(generator_instance, "logger", None),
+            **call_kwargs,
         )
     except Exception as exc:
-        logger = getattr(generator_instance, "logger", None)
+        logger = getattr(service, "logger", None)
         if logger:
             logger.warning(f"AI {packet.stage} adjudication failed: {exc}")
         return None
 
+    if provider_runtime is not None and not provider_runtime.receipts:
+        # Injected provider callbacks used by the production E2E surface do
+        # not pass through ai_interface, so close their runtime explicitly.
+        # Real transports already append a receipt inside ai_interface and
+        # therefore take the no-op branch above.
+        try:
+            from runtime.provider_context import ProviderContextProfile
+
+            try:
+                context_limit = max(1, int(api_config.get("max_context_tokens") or 128_000))
+            except (TypeError, ValueError):
+                context_limit = 128_000
+            try:
+                output_limit = max(1, int(api_config.get("max_output_tokens") or max_tokens))
+            except (TypeError, ValueError):
+                output_limit = max_tokens
+            profile = ProviderContextProfile.conservative(
+                provider=str(api_config.get("provider_family") or "configured"),
+                model=str(api_config.get("model") or "validator"),
+                endpoint_type=str(api_config.get("endpoint_type") or "chat_completions"),
+                model_context_limit=context_limit,
+                max_output_tokens=output_limit,
+            )
+            estimate = profile.estimate_request(request_payload)
+            admission = provider_runtime.admit(
+                estimated_tokens=max(1, int(estimate["estimated_input_tokens"]))
+            )
+            provider_runtime.complete(
+                admission=admission,
+                prompt=prompt,
+                input_payload=request_payload,
+                api_config=api_config,
+                result={
+                    "status": "success" if isinstance(report, dict) else "failed",
+                    "content": report if isinstance(report, dict) else None,
+                    "finish_reason": "stop" if isinstance(report, dict) else "",
+                    "usage_status": "reported",
+                    "error_kind": None if isinstance(report, dict) else "invalid_response",
+                },
+                metadata={"execution_mode": "injected_adjudicator"},
+            )
+        except ProviderBudgetExceeded:
+            provider_runtime.blocked_receipt(
+                prompt=prompt,
+                input_payload=request_payload,
+                api_config=api_config,
+                message="validation adjudicator did not produce a provider receipt before its budget closed",
+            )
+
     if not isinstance(report, dict):
         return None
+    bind_output = getattr(service, "bind_provider_output", None)
+    if provider_runtime is not None and callable(bind_output):
+        bind_output(call_id=str(provider_runtime.call_id), content=report)
     report.setdefault("adjudication_stage", packet.stage)
     report.setdefault("claim_type", packet.claim_type)
     report.setdefault("claim_type_confidence", packet.claim_type_confidence)
     report.setdefault("claim_type_rationale", packet.claim_type_rationale)
-    report.setdefault("adjudication_status", str(report.get("status") or packet.legacy_evidence_status or "evidence_gap"))
+    report.setdefault("adjudication_status", str(report.get("status") or packet.evidence_status or "evidence_gap"))
     return report

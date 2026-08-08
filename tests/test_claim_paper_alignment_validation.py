@@ -5,9 +5,10 @@ import types
 
 import pytest
 
-from services.citation_manifest import build_citation_manifest_v3_from_review_draft
+from services.citation_manifest import build_citation_manifest_from_review_draft
 from validation.claim_alignment_audit import build_claim_alignment_audit
 from validation.review_validator import ReviewValidator, ValidationConclusion
+from validation.run_result import ValidationRunResultV1
 import validator
 
 
@@ -220,7 +221,7 @@ def test_ambiguous_alignment_still_flags_missing_paper_identity():
     assert unit["reason"] == "paper_not_found_in_artifacts"
 
 
-def test_legacy_claim_units_without_alignment_fields_fallback_to_paper_ids():
+def test_claim_units_without_alignment_fields_are_ambiguous():
     review_draft = _review_draft("Legacy claim A support [[cite:A]].")
     claim_units = [
         {
@@ -239,27 +240,70 @@ def test_legacy_claim_units_without_alignment_fields_fallback_to_paper_ids():
     result = ReviewValidator(review_draft, _manifest(claim_units, ["A", "B"]), paper_artifacts).validate().citation_results[0]
     unit = result.details["claim_unit_results"][0]
 
-    assert unit["alignment_status"] == "legacy_fallback"
-    assert unit["paper_resolution_source"] == "claim_unit_paper_ids"
-    assert unit["checked_paper_ids"] == ["A"]
+    assert unit["alignment_status"] == "ambiguous"
+    assert unit["paper_resolution_source"] == "bundle_paper_ids"
+    assert unit["checked_paper_ids"] == []
 
 
 def test_manifest_builder_generates_alignment_fields():
-    review_draft = _review_draft("Claim1 A support. Claim2 B support. Claim3 C support [[cite:A]] [[cite:B]] [[cite:C]].")
+    from services.citation_ref_catalog import build_document_ref_catalog
+
     summaries = [
         {"status": "success", "paper_info": {"title": "A", "canonical_paper_key": "A"}, "ai_summary": {"paper_metadata": {"title": "A"}}},
         {"status": "success", "paper_info": {"title": "B", "canonical_paper_key": "B"}, "ai_summary": {"paper_metadata": {"title": "B"}}},
         {"status": "success", "paper_info": {"title": "C", "canonical_paper_key": "C"}, "ai_summary": {"paper_metadata": {"title": "C"}}},
     ]
+    review_draft = {
+        "content": {
+            "sections": [
+                {
+                    "section_number": 1,
+                    "section_title": "Findings",
+                    "blocks": [
+                        {
+                            "block_id": "s1_b1",
+                            "block_order": 1,
+                            "text": "Claim1 A support. Claim2 B support. Claim3 C support [[cite_ref:R001, R002, R003]].",
+                            "citations": [
+                                {
+                                    "citation_token": "[[cite_ref:R001, R002, R003]]",
+                                    "ref_id": "R001",
+                                    "source_type": "structured_ref",
+                                    "span_start": 53,
+                                    "span_end": 82,
+                                },
+                                {
+                                    "citation_token": "[[cite_ref:R001, R002, R003]]",
+                                    "ref_id": "R002",
+                                    "source_type": "structured_ref",
+                                    "span_start": 53,
+                                    "span_end": 82,
+                                },
+                                {
+                                    "citation_token": "[[cite_ref:R001, R002, R003]]",
+                                    "ref_id": "R003",
+                                    "source_type": "structured_ref",
+                                    "span_start": 53,
+                                    "span_end": 82,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    catalog = build_document_ref_catalog(summaries, project_name="project", job_id="job")
 
-    manifest = build_citation_manifest_v3_from_review_draft(
+    manifest = build_citation_manifest_from_review_draft(
         job_id="job",
         project_name="project",
         manifest_id="manifest",
         review_draft_path="review.json",
         review_word_path="review.docx",
-        review_draft_v2=review_draft,
+        review_draft=review_draft,
         paper_summaries=summaries,
+        citation_ref_catalog=catalog,
     ).to_dict()
     claim_unit = manifest["citation_sets"][0]["claim_units"][0]
 
@@ -298,7 +342,9 @@ def test_write_validation_reports_emits_alignment_audit(tmp_path):
         _manifest([_claim_unit("cu_a", "Claim A support.", ["A"], paper_ids=["A"])], ["A"]),
         [_paper("A", "Claim A support.", title="Audit Paper A")],
     ).validate()
+    canonical = ValidationRunResultV1.from_report(report, job_id="job-project")
     workspace = types.SimpleNamespace(
+        job_id="job-project",
         project_name="project",
         paths=types.SimpleNamespace(reports_dir=str(tmp_path)),
     )
@@ -306,7 +352,7 @@ def test_write_validation_reports_emits_alignment_audit(tmp_path):
 
     paths = validator._write_validation_reports(
         generator,
-        report,
+        canonical,
         [],
         validator.ValidationRepairPolicy.REPORT_ONLY,
     )

@@ -66,7 +66,7 @@ class RuntimeJobSpec:
     reuse_summary_files: tuple[str, ...] = ()
     generate_section: int | None = None
     queue_file: str = "output/_queue/queue.json"
-    keep_legacy_projections: bool = True
+    workspace_path: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -130,11 +130,6 @@ class RuntimeJobSpec:
             if requested_stages_raw is not None
             else None
         )
-        validation_default = (
-            "validate" in requested_stages
-            if requested_stages is not None
-            else self.action == "validate_review"
-        )
         return JobRunRequest(
             config=self.config,
             project_name=self.project_name,
@@ -159,21 +154,15 @@ class RuntimeJobSpec:
             zotero_report=self.source.zotero_report or None,
             library_path=self.source.library_path or None,
             queue_file=self.queue_file,
+            workspace_path=self.workspace_path or None,
             requested_stages=requested_stages,
-            validation_required=(
-                self.metadata["validation_required"]
-                if "validation_required" in self.metadata
-                else validation_default
-            ),
-            require_clean_validation=(
-                self.metadata["require_clean_validation"]
-                if "require_clean_validation" in self.metadata
-                else validation_default
-            ),
-            allow_unvalidated_when_validation_optional=(
-                self.metadata["allow_unvalidated_when_validation_optional"]
-                if "allow_unvalidated_when_validation_optional" in self.metadata
-                else not validation_default
+            # Keep omitted policy fields tri-state.  The durable StagePlan
+            # builder is the only layer allowed to derive defaults from the
+            # action, validation setting, and requested stages.
+            validation_required=self.metadata.get("validation_required"),
+            require_clean_validation=self.metadata.get("require_clean_validation"),
+            allow_unvalidated_when_validation_optional=self.metadata.get(
+                "allow_unvalidated_when_validation_optional"
             ),
             derived_summary_source=bool(self.metadata.get("review_batch_spec")),
         )
@@ -221,6 +210,7 @@ class RuntimeJobSpec:
             summary_sources=tuple(resolve_path(item) for item in self.summary_sources),
             reuse_summary_files=tuple(resolve_path(item) for item in self.reuse_summary_files),
             queue_file=resolve_path(self.queue_file),
+            workspace_path=resolve_path(self.workspace_path),
             metadata=metadata,
         )
 
@@ -254,12 +244,7 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            keep_legacy_projections=bool(
-                _optional_bool(
-                    payload.get("keep_legacy_projections", True),
-                    field_name="keep_legacy_projections",
-                )
-            ),
+            workspace_path=str(payload.get("workspace_path") or ""),
             metadata=dict(payload.get("metadata") or {}),
         )
 
@@ -302,12 +287,7 @@ class RuntimeJobSpec:
                 else None
             ),
             queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            keep_legacy_projections=bool(
-                _optional_bool(
-                    payload.get("keep_legacy_projections", True),
-                    field_name="keep_legacy_projections",
-                )
-            ),
+            workspace_path=str(payload.get("workspace_path") or ""),
             metadata=dict(payload.get("metadata") or {}),
         )
 

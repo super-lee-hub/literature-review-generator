@@ -3,19 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Literal, Mapping, Sequence, Tuple, cast
 import uuid
 
+from services.artifact_registry import ArtifactRecord, ArtifactRegistry
 from services.job_workspace import utc_now_iso
 
 
 JOB_OUTCOME_ARTIFACT_TYPE = "job_outcome"
 JOB_OUTCOME_ARTIFACT_VERSION = "v1"
+JOB_OUTCOME_COMPATIBILITY_PROJECTION_ARTIFACT_TYPE = (
+    "job_outcome_compatibility_projection"
+)
+JOB_OUTCOME_COMPATIBILITY_PROJECTION_ARTIFACT_VERSION = "v1"
+JOB_OUTCOME_CANONICAL_ARTIFACT_ID = "job_outcome"
 ATTEMPT_ARTIFACT_TYPE = "job_attempt"
 ATTEMPT_ARTIFACT_VERSION = "v1"
 DEFAULT_READINESS_POLICY_VERSION = "readiness-policy-v1"
-LEGACY_READINESS_POLICY_VERSION = "legacy-unverified-v1"
 
 JobStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
 JobDisposition = Literal["clean", "findings", "needs_review", "unvalidated"]
@@ -28,7 +34,6 @@ AttemptStatus = Literal[
     "blocked",
     "interrupted",
 ]
-CompatibilityStatus = Literal["native", "legacy_unverified"]
 
 _JOB_STATUSES = frozenset({"pending", "running", "completed", "failed", "cancelled"})
 _JOB_DISPOSITIONS = frozenset({"clean", "findings", "needs_review", "unvalidated"})
@@ -57,6 +62,122 @@ class JobOutcomeContractError(ValueError):
 
 class AttemptTransitionError(ValueError):
     """Raised when an attempt history or transition is invalid."""
+
+
+@dataclass(frozen=True)
+class JobOutcomeCompatibilityProjectionV1:
+    """Mutable fixed-path pointer to the Registry-owned canonical outcome."""
+
+    artifact_type: str
+    artifact_version: str
+    job_id: str
+    canonical_job_outcome_artifact_id: str
+    canonical_job_outcome_artifact_hash: str
+    outcome_revision: int
+    projection_generation: int
+    created_at: str
+    producer: str
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if self.artifact_type != JOB_OUTCOME_COMPATIBILITY_PROJECTION_ARTIFACT_TYPE:
+            raise JobOutcomeContractError(
+                f"unsupported compatibility projection artifact_type: {self.artifact_type}"
+            )
+        if self.artifact_version != JOB_OUTCOME_COMPATIBILITY_PROJECTION_ARTIFACT_VERSION:
+            raise JobOutcomeContractError(
+                f"unsupported compatibility projection artifact_version: {self.artifact_version}"
+            )
+        if not self.job_id.strip():
+            raise JobOutcomeContractError("compatibility projection job_id is required")
+        if self.canonical_job_outcome_artifact_id != JOB_OUTCOME_CANONICAL_ARTIFACT_ID:
+            raise JobOutcomeContractError(
+                "compatibility projection canonical artifact id is invalid"
+            )
+        artifact_hash = self.canonical_job_outcome_artifact_hash.lower()
+        if len(artifact_hash) != 64 or any(char not in "0123456789abcdef" for char in artifact_hash):
+            raise JobOutcomeContractError(
+                "compatibility projection canonical artifact hash is invalid"
+            )
+        if self.outcome_revision < 1:
+            raise JobOutcomeContractError(
+                "compatibility projection outcome_revision must be positive"
+            )
+        if self.projection_generation < 1:
+            raise JobOutcomeContractError(
+                "compatibility projection projection_generation must be positive"
+            )
+        if not self.created_at.strip() or not self.producer.strip():
+            raise JobOutcomeContractError(
+                "compatibility projection created_at and producer are required"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_type": self.artifact_type,
+            "artifact_version": self.artifact_version,
+            "job_id": self.job_id,
+            "canonical_job_outcome_artifact_id": self.canonical_job_outcome_artifact_id,
+            "canonical_job_outcome_artifact_hash": self.canonical_job_outcome_artifact_hash,
+            "outcome_revision": self.outcome_revision,
+            "projection_generation": self.projection_generation,
+            "created_at": self.created_at,
+            "producer": self.producer,
+        }
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        job_id: str,
+        canonical_job_outcome_artifact_id: str,
+        canonical_job_outcome_artifact_hash: str,
+        outcome_revision: int,
+        projection_generation: int,
+        producer: str,
+        created_at: str | None = None,
+    ) -> "JobOutcomeCompatibilityProjectionV1":
+        return cls(
+            artifact_type=JOB_OUTCOME_COMPATIBILITY_PROJECTION_ARTIFACT_TYPE,
+            artifact_version=JOB_OUTCOME_COMPATIBILITY_PROJECTION_ARTIFACT_VERSION,
+            job_id=job_id,
+            canonical_job_outcome_artifact_id=canonical_job_outcome_artifact_id,
+            canonical_job_outcome_artifact_hash=canonical_job_outcome_artifact_hash,
+            outcome_revision=outcome_revision,
+            projection_generation=projection_generation,
+            created_at=created_at or utc_now_iso(),
+            producer=producer,
+        )
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "JobOutcomeCompatibilityProjectionV1":
+        return cls(
+            artifact_type=str(payload.get("artifact_type") or ""),
+            artifact_version=str(payload.get("artifact_version") or ""),
+            job_id=str(payload.get("job_id") or ""),
+            canonical_job_outcome_artifact_id=str(
+                payload.get("canonical_job_outcome_artifact_id") or ""
+            ),
+            canonical_job_outcome_artifact_hash=str(
+                payload.get("canonical_job_outcome_artifact_hash") or ""
+            ),
+            outcome_revision=int(payload.get("outcome_revision") or 0),
+            projection_generation=int(payload.get("projection_generation") or 0),
+            created_at=str(payload.get("created_at") or ""),
+            producer=str(payload.get("producer") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class JobOutcomeCompatibilityProjectionPublishResult:
+    written: bool
+    projection: JobOutcomeCompatibilityProjectionV1 | None = None
+    warning: str = ""
 
 
 def _freeze_json(value: Any) -> Any:
@@ -138,7 +259,6 @@ class JobOutcomeV1:
     completed_stages: Tuple[str, ...]
     failed_stage: str | None
     degradation_reasons: Tuple[str, ...]
-    compatibility_status: CompatibilityStatus = "native"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "readiness_policy_snapshot", _freeze_json(self.readiness_policy_snapshot))
@@ -150,7 +270,7 @@ class JobOutcomeV1:
 
     @property
     def success(self) -> bool:
-        """Legacy projection. Queue lifecycle must use ``job_status`` instead."""
+        """Return whether the canonical outcome is ready for downstream use."""
 
         return self.canonical_ready
 
@@ -170,8 +290,6 @@ class JobOutcomeV1:
             raise JobOutcomeContractError(f"unsupported job_status: {self.job_status}")
         if self.job_disposition not in _JOB_DISPOSITIONS:
             raise JobOutcomeContractError(f"unsupported job_disposition: {self.job_disposition}")
-        if self.compatibility_status not in {"native", "legacy_unverified"}:
-            raise JobOutcomeContractError(f"unsupported compatibility_status: {self.compatibility_status}")
         if not self.created_at or not self.updated_at:
             raise JobOutcomeContractError("created_at and updated_at are required")
         if self.outcome_revision < 1:
@@ -197,11 +315,6 @@ class JobOutcomeV1:
             )
         if self.failed_stage and self.failed_stage in self.completed_stages:
             raise JobOutcomeContractError("failed_stage cannot also be completed")
-        if self.compatibility_status == "legacy_unverified":
-            if self.canonical_ready:
-                raise JobOutcomeContractError("legacy-unverified outcomes must fail closed")
-            if self.job_disposition != "unvalidated":
-                raise JobOutcomeContractError("legacy-unverified outcomes must be unvalidated")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,7 +338,6 @@ class JobOutcomeV1:
             "completed_stages": list(self.completed_stages),
             "failed_stage": self.failed_stage,
             "degradation_reasons": list(self.degradation_reasons),
-            "compatibility_status": self.compatibility_status,
         }
 
     @classmethod
@@ -283,7 +395,7 @@ class JobOutcomeV1:
             "readiness_policy_snapshot",
         }
         if not native_keys.issubset(payload.keys()):
-            return cls._from_legacy_dict(payload)
+            raise JobOutcomeContractError("job outcome is missing the current readiness contract")
 
         policy_version = str(payload.get("readiness_policy_version") or DEFAULT_READINESS_POLICY_VERSION)
         policy_snapshot = dict(payload.get("readiness_policy_snapshot") or {})
@@ -310,93 +422,179 @@ class JobOutcomeV1:
             completed_stages=tuple(payload.get("completed_stages") or ()),
             failed_stage=str(payload.get("failed_stage") or "") or None,
             degradation_reasons=tuple(payload.get("degradation_reasons") or ()),
-            compatibility_status=cast(
-                CompatibilityStatus,
-                str(payload.get("compatibility_status") or "native"),
-            ),
         )
 
-    @classmethod
-    def _from_legacy_dict(cls, payload: Mapping[str, Any]) -> "JobOutcomeV1":
-        legacy_status = str(payload.get("job_status") or payload.get("status") or "pending").lower()
-        status_map: Mapping[str, JobStatus] = {
-            "pending": "pending",
-            "queued": "pending",
-            "running": "running",
-            "completed": "completed",
-            "succeeded": "completed",
-            "success": "completed",
-            "failed": "failed",
-            "error": "failed",
-            "cancelled": "cancelled",
-            "canceled": "cancelled",
-        }
-        job_status = status_map.get(legacy_status, "failed")
-        now = str(payload.get("updated_at") or payload.get("created_at") or utc_now_iso())
-        snapshot = MappingProxyType({"compatibility_mode": "legacy_unverified"})
-        policy_hash = build_readiness_policy_hash(LEGACY_READINESS_POLICY_VERSION, snapshot)
-        legacy_reasons = [str(item) for item in (payload.get("degradation_reasons") or []) if str(item)]
-        if "legacy_unverified" not in legacy_reasons:
-            legacy_reasons.append("legacy_unverified")
-        return cls(
-            artifact_type=JOB_OUTCOME_ARTIFACT_TYPE,
-            artifact_version=JOB_OUTCOME_ARTIFACT_VERSION,
-            job_id=str(payload.get("job_id") or "legacy-unknown"),
-            attempt_number=max(int(payload.get("attempt_number") or 1), 1),
-            resumed_from_attempt=_optional_int(payload.get("resumed_from_attempt")),
-            job_status=job_status,
-            job_disposition="unvalidated",
-            canonical_ready=False,
-            requires_attention=True,
-            created_at=str(payload.get("created_at") or now),
-            updated_at=now,
-            outcome_revision=max(int(payload.get("outcome_revision") or 1), 1),
-            readiness_policy_version=LEGACY_READINESS_POLICY_VERSION,
-            readiness_policy_snapshot=snapshot,
-            readiness_policy_hash=policy_hash,
-            required_stages=tuple(payload.get("required_stages") or ()),
-            completed_stages=tuple(payload.get("completed_stages") or ()),
-            failed_stage=str(payload.get("failed_stage") or "") or None,
-            degradation_reasons=tuple(legacy_reasons),
-            compatibility_status="legacy_unverified",
-        )
 
-    @classmethod
-    def legacy_unverified(
-        cls,
-        *,
-        job_id: str,
-        job_status: JobStatus = "completed",
-        required_stages: Sequence[str] = (),
-        completed_stages: Sequence[str] = (),
-        degradation_reasons: Sequence[str] = (),
-    ) -> "JobOutcomeV1":
-        snapshot = MappingProxyType({"compatibility_mode": "legacy_unverified"})
-        policy_hash = build_readiness_policy_hash(LEGACY_READINESS_POLICY_VERSION, snapshot)
-        now = utc_now_iso()
-        return cls(
-            artifact_type=JOB_OUTCOME_ARTIFACT_TYPE,
-            artifact_version=JOB_OUTCOME_ARTIFACT_VERSION,
-            job_id=job_id,
-            attempt_number=1,
-            resumed_from_attempt=None,
-            job_status=job_status,
-            job_disposition="unvalidated",
-            canonical_ready=False,
-            requires_attention=True,
-            created_at=now,
-            updated_at=now,
-            outcome_revision=1,
-            readiness_policy_version=LEGACY_READINESS_POLICY_VERSION,
-            readiness_policy_snapshot=snapshot,
-            readiness_policy_hash=policy_hash,
-            required_stages=tuple(required_stages),
-            completed_stages=tuple(completed_stages),
-            failed_stage=None,
-            degradation_reasons=tuple(
-                dict.fromkeys(("legacy_unverified", *degradation_reasons))
+def load_canonical_job_outcome(
+    registry: ArtifactRegistry,
+) -> tuple[JobOutcomeV1, ArtifactRecord]:
+    """Load the current JobOutcome exclusively through its Registry identity."""
+
+    try:
+        registry.reload()
+        record = registry.get(JOB_OUTCOME_CANONICAL_ARTIFACT_ID)
+    except Exception as exc:
+        raise JobOutcomeContractError(f"cannot read canonical job outcome Registry state: {exc}") from exc
+    if record is None:
+        raise JobOutcomeContractError("canonical job outcome is not registered")
+    if (
+        record.artifact_id != JOB_OUTCOME_CANONICAL_ARTIFACT_ID
+        or record.artifact_role != JOB_OUTCOME_ARTIFACT_TYPE
+        or record.artifact_type != JOB_OUTCOME_ARTIFACT_TYPE
+        or record.artifact_version != JOB_OUTCOME_ARTIFACT_VERSION
+        or record.job_id != registry.job_id
+        or record.status != "ready"
+    ):
+        raise JobOutcomeContractError("canonical job outcome Registry identity is invalid")
+    try:
+        ArtifactRegistry._verify_ready_artifact(record)
+        path = Path(record.path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise JobOutcomeContractError(f"canonical job outcome failed hash verification: {exc}") from exc
+    if not isinstance(payload, Mapping):
+        raise JobOutcomeContractError("canonical job outcome must be a JSON object")
+    outcome = JobOutcomeV1.from_dict(payload)
+    if outcome.job_id != registry.job_id:
+        raise JobOutcomeContractError("canonical job outcome belongs to another job")
+    metadata_checks = {
+        "job_status": outcome.job_status,
+        "job_disposition": outcome.job_disposition,
+        "canonical_ready": outcome.canonical_ready,
+        "requires_attention": outcome.requires_attention,
+        "outcome_revision": outcome.outcome_revision,
+    }
+    mismatches = [
+        field
+        for field, expected in metadata_checks.items()
+        if field in record.metadata and record.metadata[field] != expected
+    ]
+    if mismatches:
+        raise JobOutcomeContractError(
+            "canonical job outcome Registry metadata is inconsistent: "
+            + ", ".join(mismatches)
+        )
+    return outcome, record
+
+
+def _read_job_outcome_compatibility_projection(
+    path: str | Path,
+) -> JobOutcomeCompatibilityProjectionV1:
+    target = Path(path)
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise JobOutcomeContractError(
+            f"job outcome compatibility projection is invalid: {exc}"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise JobOutcomeContractError(
+            "job outcome compatibility projection must be a JSON object"
+        )
+    return JobOutcomeCompatibilityProjectionV1.from_dict(payload)
+
+
+def validate_job_outcome_compatibility_projection(
+    path: str | Path,
+    registry: ArtifactRegistry,
+) -> JobOutcomeCompatibilityProjectionV1:
+    """Verify a fixed-path projection against the current Registry ID and hash."""
+
+    projection = _read_job_outcome_compatibility_projection(path)
+    outcome, canonical_record = load_canonical_job_outcome(registry)
+    mismatches: list[str] = []
+    if projection.job_id != canonical_record.job_id:
+        mismatches.append("job_id")
+    if projection.canonical_job_outcome_artifact_id != canonical_record.artifact_id:
+        mismatches.append("canonical_job_outcome_artifact_id")
+    if projection.canonical_job_outcome_artifact_hash != canonical_record.content_hash:
+        mismatches.append("canonical_job_outcome_artifact_hash")
+    if projection.outcome_revision != outcome.outcome_revision:
+        mismatches.append("outcome_revision")
+    if mismatches:
+        raise JobOutcomeContractError(
+            "job outcome compatibility projection does not match the Registry head: "
+            + ", ".join(mismatches)
+        )
+    return projection
+
+
+def publish_job_outcome_compatibility_projection(
+    *,
+    path: str | Path,
+    registry: ArtifactRegistry,
+    canonical_record: ArtifactRecord,
+    outcome: JobOutcomeV1,
+    producer: str,
+    publication_context: Any | None = None,
+) -> JobOutcomeCompatibilityProjectionPublishResult:
+    """Best-effort fixed-path publication after the canonical Registry commit."""
+
+    target = Path(path).expanduser().resolve()
+    try:
+        current_outcome, current_record = load_canonical_job_outcome(registry)
+        expected_identity = (
+            canonical_record.artifact_id,
+            canonical_record.path,
+            canonical_record.content_hash,
+        )
+        current_identity = (
+            current_record.artifact_id,
+            current_record.path,
+            current_record.content_hash,
+        )
+        if expected_identity != current_identity or current_outcome != outcome:
+            raise JobOutcomeContractError(
+                "canonical job outcome changed before compatibility projection publication"
+            )
+        if Path(current_record.path).resolve() == target:
+            raise JobOutcomeContractError(
+                "compatibility projection path cannot replace the canonical job outcome"
+            )
+
+        previous_generation = 0
+        if target.is_file():
+            try:
+                previous = _read_job_outcome_compatibility_projection(target)
+            except (JobOutcomeContractError, TypeError, ValueError):
+                previous = None
+            if previous is not None and previous.job_id == outcome.job_id:
+                previous_generation = previous.projection_generation
+        projection = JobOutcomeCompatibilityProjectionV1.create(
+            job_id=outcome.job_id,
+            canonical_job_outcome_artifact_id=current_record.artifact_id,
+            canonical_job_outcome_artifact_hash=current_record.content_hash,
+            outcome_revision=outcome.outcome_revision,
+            projection_generation=max(
+                outcome.outcome_revision,
+                previous_generation + 1,
             ),
-            compatibility_status="legacy_unverified",
+            producer=producer,
+        )
+        active_context = publication_context
+        if active_context is None:
+            from services.queue_service import LocalPublicationContext
+
+            active_context = LocalPublicationContext()
+        writer = getattr(active_context, "write_compatibility_json", None)
+        if not callable(writer):
+            raise JobOutcomeContractError(
+                "publication context has no compatibility projection writer"
+            )
+        writer(target, projection.to_dict())
+        persisted = validate_job_outcome_compatibility_projection(target, registry)
+        if persisted != projection:
+            raise JobOutcomeContractError(
+                "job outcome compatibility projection readback changed"
+            )
+        return JobOutcomeCompatibilityProjectionPublishResult(
+            written=True,
+            projection=projection,
+        )
+    except Exception as exc:
+        return JobOutcomeCompatibilityProjectionPublishResult(
+            written=False,
+            warning=f"job outcome compatibility projection was not updated: {exc}",
         )
 
 
@@ -554,7 +752,7 @@ class AttemptV1:
             attempt_number=int(payload.get("attempt_number") or 1),
             resumed_from_attempt=_optional_int(payload.get("resumed_from_attempt")),
             status=status,
-            producer=str(payload.get("producer") or "legacy_reader"),
+            producer=str(payload.get("producer") or "runtime"),
             created_at=created_at,
             updated_at=str(payload.get("updated_at") or created_at),
             started_at=started_at,

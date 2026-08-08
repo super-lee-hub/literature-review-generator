@@ -27,7 +27,7 @@ ERROR_EXPLANATIONS = {
     # HTTP 瞬时错误
     "429": {
         "explanation": "API请求过于频繁",
-        "suggestion": "程序正在自动等待并重试，请耐心等候。如果频繁出现，可以尝试在config.ini中降低'max_workers'的值，或启用API速率限制（设置TPM/RPM）。"
+        "suggestion": "程序正在自动等待并重试，请耐心等候。如果频繁出现，可以降低config.ini中的'max_workers'，或检查Provider配额与网络状态。"
     },
     "500": {
         "explanation": "API服务器内部错误",

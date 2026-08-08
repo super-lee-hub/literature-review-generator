@@ -100,12 +100,9 @@ def _get_config_section(config_obj: Any, section_name: str) -> Dict[str, Any]:
 def _get_validation_max_workers(generator_instance: Any) -> int:
     config_obj = getattr(generator_instance, "config", None)
     validation_config = _get_config_section(config_obj, "Validation")
-    performance_config = _get_config_section(config_obj, "Performance")
     for configured_value in (
         validation_config.get("max_workers"),
         validation_config.get("parallel_workers"),
-        performance_config.get("validation_max_workers"),
-        performance_config.get("max_workers"),
     ):
         if configured_value in (None, ""):
             continue
@@ -116,37 +113,101 @@ def _get_validation_max_workers(generator_instance: Any) -> int:
 
 
 def _get_validation_repair_policy(generator_instance: Any) -> ValidationRepairPolicy:
-    compat_config = getattr(generator_instance, "compat_config", None)
-    repair_policy_getter = getattr(compat_config, "repair_policy", None)
-    if callable(repair_policy_getter):
-        return parse_repair_policy(repair_policy_getter())
     config_obj = getattr(generator_instance, "config", None)
     validation_config = _get_config_section(config_obj, "Validation")
     return parse_repair_policy(validation_config.get("repair_policy"))
 
 
 def _get_validator_context_max_tokens(generator_instance: Any) -> int:
-    api_params = {}
-    try:
-        api_params = generator_instance.config.get("API_Parameters") or {}
-    except Exception:
-        api_params = {}
-    return _coerce_positive_int(api_params.get("validator_context_max_tokens"), 1_000_000)
+    validator_config = _get_config_section(getattr(generator_instance, "config", None), "Validator_API")
+    return _coerce_positive_int(validator_config.get("max_context_tokens"), 0)
 
 
-def _truncate_text_to_token_budget(text: str, max_tokens: int) -> str:
+class ValidationContextBudgetError(ValueError):
+    """Raised when validation input exceeds the configured provider budget."""
+
+
+def _ensure_text_within_token_budget(text: str, max_tokens: int) -> str:
+    """Return the complete text or fail explicitly; never discard evidence."""
+
     if not text or max_tokens <= 0:
         return text
     current_tokens = estimate_tokens(text)
-    if current_tokens <= max_tokens:
-        return text
+    if current_tokens > max_tokens:
+        raise ValidationContextBudgetError(
+            f"validation input requires {current_tokens} tokens but the provider budget is {max_tokens}"
+        )
+    return text
 
-    keep_chars = max(1, int(len(text) * (max_tokens / max(current_tokens, 1))))
-    truncated = text[:keep_chars]
-    while keep_chars > 1 and estimate_tokens(truncated) > max_tokens:
-        keep_chars = max(1, int(keep_chars * 0.95))
-        truncated = text[:keep_chars]
-    return truncated
+
+def _new_validation_provider_runtime(
+    generator_instance: Any,
+    *,
+    stage_name: str,
+    node_id: str,
+    call_id: str,
+    api_config: Mapping[str, Any],
+) -> Any:
+    factory = getattr(generator_instance, "new_provider_runtime", None)
+    if not callable(factory):
+        return None
+    return factory(
+        stage_name=stage_name,
+        route="Validator_API",
+        node_id=str(node_id or "validation-node"),
+        call_id=str(call_id or "validation-call"),
+        api_config=api_config,
+    )
+
+
+def _call_validation_api(
+    generator_instance: Any,
+    prompt: str,
+    api_config: Mapping[str, Any],
+    system_prompt: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    response_format: str,
+    node_id: str,
+    call_id: str,
+) -> Any:
+    provider_runtime = _new_validation_provider_runtime(
+        generator_instance,
+        stage_name="stage4_validate",
+        node_id=node_id,
+        call_id=call_id,
+        api_config=api_config,
+    )
+    call_kwargs: Dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "response_format": response_format,
+        "logger": getattr(generator_instance, "logger", None),
+    }
+    if provider_runtime is not None:
+        call_kwargs["provider_runtime"] = provider_runtime
+    bind_call = getattr(generator_instance, "bind_provider_call", None)
+    if callable(bind_call) and provider_runtime is not None:
+        bind_call(
+            call_id=str(call_id),
+            prompt=prompt,
+            input_payload={
+                "system": system_prompt,
+                "user": prompt,
+                "user_content": None,
+                "response_format": response_format,
+                "max_output_tokens": int(max_tokens),
+                "temperature": temperature,
+            },
+            api_config=api_config,
+            schema_hash=str(getattr(provider_runtime, "schema_hash", "") or ""),
+        )
+    content = _call_ai_api(prompt, api_config, system_prompt, **call_kwargs)  # type: ignore[arg-type]
+    bind_output = getattr(generator_instance, "bind_provider_output", None)
+    if callable(bind_output) and content is not None:
+        bind_output(call_id=str(call_id), content=content)
+    return content
 
 
 def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: Dict[str, Any],
@@ -177,7 +238,6 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
     content_hash: Optional[str] = None
     cache_file_path: Optional[str] = None
     if use_cache:
-        import hashlib
         paper_info: Any = ai_result.get('paper_info') or {}  # type: ignore
         content_str = pdf_text[:1000] + str(paper_info.get('title', '')) + str(paper_info.get('authors', []))  # type: ignore
         content_hash = hashlib.md5(content_str.encode('utf-8')).hexdigest()
@@ -205,11 +265,11 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
 
     # 预检查：如果摘要包含占位符'...'，跳过验证（因为验证AI会错误地填充它）
     try:
-        common_core = get_core_analysis(ai_result)
+        core_analysis = get_core_analysis(ai_result)
         placeholder_fields: List[str] = []
         
         # 检查所有字段是否包含'...'
-        for field, value in common_core.items():
+        for field, value in core_analysis.items():
             if isinstance(value, str) and '...' in value:
                 placeholder_fields.append(field)
             elif isinstance(value, list):
@@ -250,9 +310,9 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
         try:
             summary_str: str = json.dumps(ai_result, ensure_ascii=False, indent=2)
             context_max_tokens = _get_validator_context_max_tokens(generator_instance)
-            truncated_pdf_text = _truncate_text_to_token_budget(pdf_text, context_max_tokens)
+            complete_pdf_text = _ensure_text_within_token_budget(pdf_text, context_max_tokens)
 
-            final_prompt = prompt_template.replace('{{PAPER_FULL_TEXT}}', truncated_pdf_text)
+            final_prompt = prompt_template.replace('{{PAPER_FULL_TEXT}}', complete_pdf_text)
             final_prompt = final_prompt.replace('{{GENERATED_SUMMARY}}', summary_str)
         except Exception as e:
             generator_instance.logger.error(f"生成验证提示词失败: {e}，跳过验证。")
@@ -262,19 +322,25 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
 
         # 调用验证API
         try:
-            # 从配置中读取API参数
-            validator_max_tokens: int = int((generator_instance.config.get('API_Parameters') or {}).get('validator_max_tokens', 4096))  # type: ignore
-            validator_temperature: float = float((generator_instance.config.get('API_Parameters') or {}).get('validator_temperature', 0.3))  # type: ignore
+            validator_max_tokens: int = _coerce_positive_int(validator_api_config.get("max_output_tokens"), 4096)
+            try:
+                validator_temperature = float(validator_api_config.get("temperature", 0.3))
+            except (TypeError, ValueError):
+                validator_temperature = 0.3
 
-            validation_report = _call_ai_api(
+            paper_info = ai_result.get("paper_info") if isinstance(ai_result, Mapping) else {}
+            paper_key = str((paper_info or {}).get("canonical_paper_key") or "summary")
+            validation_report = _call_validation_api(
+                generator_instance,
                 final_prompt,
                 validator_api_config,  # type: ignore
                 system_prompt,
                 max_tokens=validator_max_tokens,
                 temperature=validator_temperature,
                 response_format="json",
-                logger=generator_instance.logger  # type: ignore
-            )  # type: ignore
+                node_id=paper_key,
+                call_id=f"validation:summary:{paper_key}:{hashlib.sha256(final_prompt.encode('utf-8')).hexdigest()[:24]}",
+            )
         except Exception as e:
             generator_instance.logger.error(f"调用验证API失败: {e}，跳过验证。")
             return ai_result
@@ -398,7 +464,7 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
             generator_instance.logger.info(f"共应用了 {applied_corrections}/{len(corrections)} 个修正项")
 
         else:
-            generator_instance.logger.success("验证通过，分析内容与原文一致。")
+            generator_instance.logger.info("验证通过，分析内容与原文一致。")
 
     except (configparser.NoSectionError, configparser.NoOptionError) as e:
         generator_instance.logger.error(f"配置文件错误: {e}，跳过验证。请检查config.ini。")
@@ -417,17 +483,19 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
 
     return ai_result
 
-def _validate_claims_for_single_paper(source_summary: dict, sentences: List[str], api_config: dict, config: dict = None) -> Optional[dict]:  # type: ignore
+def _validate_claims_for_single_paper(
+    source_summary: dict,
+    sentences: List[str],
+    api_config: APIConfig,
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    provider_runtime: Any = None,
+) -> Optional[dict]:  # type: ignore
     """为单篇论文的所有引用句子调用一次AI进行批量验证"""
     try:
-        # 读取API参数配置
         try:
-            if config:
-                max_tokens: int = int(config.get('API_Parameters', {}).get('claims_max_tokens', 8192))  # type: ignore
-                temperature: float = float(config.get('API_Parameters', {}).get('claims_temperature', 0.3))  # type: ignore
-            else:
-                max_tokens = 8192
-                temperature = 0.3
+            max_tokens = _coerce_positive_int(api_config.get("max_output_tokens"), 8192)
+            temperature = float(api_config.get("temperature", 0.3))
         except (ValueError, TypeError) as _:  # type: ignore
             max_tokens = 8192
             temperature = 0.3
@@ -443,7 +511,15 @@ def _validate_claims_for_single_paper(source_summary: dict, sentences: List[str]
 
         system_prompt = "你是一位严谨的学术编辑，负责批量核查文稿中引用的准确性。你的任务是判断一个句子列表中的每句话是否都得到了其引用的文献摘要的支持。"
 
-        return _call_ai_api(final_prompt, api_config, system_prompt, max_tokens=max_tokens, temperature=temperature, response_format="json")  # type: ignore
+        return _call_ai_api(
+            final_prompt,
+            api_config,
+            system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format="json",
+            provider_runtime=provider_runtime,
+        )  # type: ignore
 
     except Exception as _:  # type: ignore
         # 使用generator_instance的logger，如果可用
@@ -504,9 +580,9 @@ def _run_adjudication_stage_checkpointed(
 
 
 def _load_validation_inputs(generator_instance: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-    review_draft_path = generator_instance._review_draft_v2_path()
+    review_draft_path = generator_instance._review_draft_path()
     if not os.path.exists(review_draft_path):
-        generator_instance.logger.error(f"Missing review_draft_v2 file: {review_draft_path}")
+        generator_instance.logger.error(f"Missing review_draft file: {review_draft_path}")
         return None, None, [], {}, {}
 
     citation_manifest_path = generator_instance._citation_manifest_path()
@@ -633,7 +709,7 @@ def _validation_input_contract(
             return "", ""
         return record.artifact_id, actual_hash
 
-    review_path_getter = getattr(generator_instance, "_review_draft_v2_path", None)
+    review_path_getter = getattr(generator_instance, "_review_draft_path", None)
     citation_path_getter = getattr(generator_instance, "_citation_manifest_path", None)
     review_draft_path = review_path_getter() if callable(review_path_getter) else ""
     citation_manifest_path = citation_path_getter() if callable(citation_path_getter) else ""
@@ -1373,14 +1449,21 @@ def _rewrite_block_with_ai(
     )
     system_prompt = "Return JSON only with rewritten_claim_unit. Preserve all citation tokens exactly."
     try:
-        response = _call_ai_api(
+        response = _call_validation_api(
+            generator_instance,
             prompt,
             validator_api_config,
             system_prompt,
             max_tokens=4096,
             temperature=0.2,
             response_format="json",
-            logger=generator_instance.logger,
+            node_id=str((target_claim_unit or {}).get("block_id") or "review-block"),
+            call_id=(
+                "validation:rewrite:"
+                + hashlib.sha256(
+                    (str((target_claim_unit or {}).get("block_id") or "review-block") + prompt).encode("utf-8")
+                ).hexdigest()[:24]
+            ),
         )
     except Exception as exc:
         generator_instance.logger.warning(f"AI review-block rewrite failed: {exc}")
@@ -1482,14 +1565,13 @@ def _rebuild_review_docx(generator_instance: Any, review_draft: Dict[str, Any], 
         review_draft,
         citation_manifest,
         output_path,
-        allow_compat_fallback=False,
     )
 
 
 def _persist_repaired_review_artifacts(generator_instance: Any, review_draft: Dict[str, Any]) -> Dict[str, Any]:
     from services.job_workspace import atomic_write_json
 
-    review_draft_path = generator_instance._review_draft_v2_path()
+    review_draft_path = generator_instance._review_draft_path()
     word_path = generator_instance._get_review_word_file_path()
     atomic_write_json(review_draft_path, review_draft)
     generator_instance._persist_citation_manifest(
@@ -1508,20 +1590,13 @@ def _write_validation_reports(
     manual_review_items: List[Any],
     repair_policy: ValidationRepairPolicy,
 ) -> Dict[str, str]:
-    del manual_review_items  # compatibility input; projections use only the canonical run result
+    del manual_review_items  # projections use only the canonical run result
     workspace = _get_validation_workspace(generator_instance)
     project_name = workspace.project_name
     os.makedirs(workspace.paths.reports_dir, exist_ok=True)
-    validation_run_result = (
-        report
-        if isinstance(report, ValidationRunResultV1)
-        else ValidationRunResultV1.from_report(
-            report,
-            job_id=str(getattr(workspace, "job_id", "") or "legacy-workspace"),
-            attempt_id=str(getattr(generator_instance, "validation_attempt_id", "") or ""),
-            repair_policy=repair_policy.value,
-        )
-    )
+    if not isinstance(report, ValidationRunResultV1):
+        raise TypeError("validation report must be the current ValidationRunResultV1")
+    validation_run_result = report
     validation_run_result_file = os.path.join(
         workspace.paths.reports_dir,
         f"{project_name}_validation_run_result_v1.json",
@@ -1719,19 +1794,21 @@ def _validation_return_payload(
 def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
     generator_instance.logger.info("=" * 60 + "\nStarting review validation\n" + "=" * 60)
     try:
-        stage2_enabled = (
-            generator_instance._stage2_validation_enabled()
-            if hasattr(generator_instance, "_stage2_validation_enabled")
-            else generator_instance.config.getboolean("Performance", "enable_stage2_validation", fallback=False)
-        )
-        if not stage2_enabled:  # type: ignore
-            generator_instance.logger.warning("Stage-2 validation is disabled; skipping review validation.")  # type: ignore
+        validation_config = _get_config_section(getattr(generator_instance, "config", None), "Validation")
+        review_enabled = str(validation_config.get("review_enabled", "true")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not review_enabled:
+            generator_instance.logger.warning("Review validation is disabled; skipping review validation.")  # type: ignore
             repair_policy = ValidationRepairPolicy.REPORT_ONLY
             validation_result, report_paths = _terminal_validation_result(
                 generator_instance,
                 execution_status=ValidationExecutionStatus.SKIPPED,
                 repair_policy=repair_policy,
-                diagnostic="stage2_validation_disabled",
+                diagnostic="review_validation_disabled",
             )
             return {
                 "success": True,
@@ -1806,6 +1883,49 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
         final_report = _build_report_from_results(enriched_results)
         manual_review_items = [result for result in final_report.citation_results if _is_manual_review_item(result)]
         workspace = _get_validation_workspace(generator_instance)
+
+        # The report-first repair planner consumes the current validation
+        # result as a Registry dependency.  Persist a complete validation
+        # snapshot before invoking it so the planner can resolve a ready
+        # current artifact without weakening the dependency boundary.  The
+        # final result is written again below after repair/recheck state is
+        # known; report-only runs retain the same stable status and therefore
+        # keep the plan's validation dependency content-addressed.
+        (
+            pre_repair_input_artifacts,
+            pre_repair_expected_claim_count,
+            pre_repair_review_has_citations,
+            pre_repair_evidence_complete,
+            pre_repair_degradation_reasons,
+        ) = _validation_input_contract(
+            generator_instance,
+            review_draft,
+            citation_manifest,
+            paper_artifacts,
+        )
+        pre_repair_result = ValidationRunResultV1.from_report(
+            final_report,
+            job_id=workspace.job_id,
+            attempt_id=str(getattr(generator_instance, "validation_attempt_id", "") or ""),
+            repair_policy=repair_policy.value,
+            input_artifacts=pre_repair_input_artifacts,
+            expected_claim_count=pre_repair_expected_claim_count,
+            review_has_citations=pre_repair_review_has_citations,
+            evidence_complete=pre_repair_evidence_complete,
+            repair_status=(
+                "report_only"
+                if repair_policy is ValidationRepairPolicy.REPORT_ONLY
+                else "not_needed"
+            ),
+            recheck_status="not_required",
+            degradation_reasons=pre_repair_degradation_reasons,
+        )
+        _write_validation_reports(
+            generator_instance,
+            pre_repair_result,
+            manual_review_items,
+            repair_policy,
+        )
 
         repair_pipeline_result = None
         try:
@@ -1931,7 +2051,7 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             manual_review_items,
             repair_policy,
         )
-        generator_instance.logger.success(f"Validation report written: {report_paths['report_file']}")
+        generator_instance.logger.info(f"Validation report written: {report_paths['report_file']}")
         generator_instance.logger.info(f"Manual review report written: {report_paths['manual_report_file']}")
         if report_paths.get("claim_alignment_audit_json"):
             generator_instance.logger.info(f"Claim alignment audit written: {report_paths['claim_alignment_audit_json']}")
@@ -1993,32 +2113,32 @@ def run_review_validation(generator_instance: Any) -> dict:  # type: ignore
             **_validation_return_payload(validation_result, report_paths),
         }
 
-def run_week3_review_validation(
+def validate_current_review_artifacts(
     review_draft: Dict[str, Any],
     citation_manifest: Dict[str, Any],
     paper_artifacts: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Week 3 compatibility entry point for review validation using Week 2 artifacts."""
+    """Validate current review, citation, and paper-artifact contracts."""
     from validation.review_validator import ReviewValidator
 
     validator = ReviewValidator(review_draft, citation_manifest, paper_artifacts)
     report = validator.validate()
 
     return {
-        "week3_validation": True,
+        "validation": True,
         "report": report,
     }
 
 
-def run_week3_summary_recheck(
+def recheck_current_summary_artifacts(
     paper_artifacts: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Week 3 compatibility entry point for summary recheck using paper artifacts."""
+    """Recheck current Stage 1 paper artifacts."""
     from validation.summary_recheck import run_summary_rechecks
 
     reports = run_summary_rechecks(paper_artifacts)
 
     return {
-        "week3_recheck": True,
+        "recheck": True,
         "reports": reports,
     }
