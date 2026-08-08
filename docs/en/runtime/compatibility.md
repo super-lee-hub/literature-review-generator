@@ -17,6 +17,15 @@ new readiness state and are never silently upgraded.
 - Review, citation, validation, repair, export, and attestation consume the
   current versioned contracts and verify their Registry dependencies and hashes.
 
+## Deprecated preprocess setting
+
+`[Preprocess].strategy_policy` is accepted only while reading legacy config
+files. It is not a production parser-routing control, is removed by config
+normalization, and is excluded from the Stage 1 semantic reuse fingerprint.
+Use `parser_mode`, `primary_parser`, `fallback_parser`, `extractor_profile`,
+`ocr_mode`, `ocr_languages`, and `use_markdown_as_stage1_input` for current
+preprocessing behavior.
+
 ## Rejected stale inputs
 
 - Old configuration sections, old workspace projections, and unregistered

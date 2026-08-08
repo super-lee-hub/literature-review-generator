@@ -15,6 +15,10 @@ from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 CONFIG_SCHEMA_VERSION = 3
 
+# Kept in the accepted schema only so older config files can be read and
+# normalized.  This field is not a current parser-routing control.
+_DEPRECATED_PREPROCESS_KEYS = frozenset({"strategy_policy"})
+
 API_KEYS = frozenset(
     {
         "api_key",
@@ -371,10 +375,21 @@ class ApplicationSettings:
 
     @classmethod
     def from_mutable_config(cls, config: MutableMapping[str, Dict[str, str]]) -> "ApplicationSettings":
-        settings = cls.from_config(config)
+        normalized_sections = {
+            str(section): {
+                str(key): str(value)
+                for key, value in values.items()
+                if not (
+                    str(section) == "Preprocess"
+                    and str(key) in _DEPRECATED_PREPROCESS_KEYS
+                )
+            }
+            for section, values in config.items()
+            if isinstance(values, Mapping)
+        }
         config.clear()
-        config.update({section: dict(values) for section, values in settings.sections.items()})
-        return settings
+        config.update(normalized_sections)
+        return cls.from_config(normalized_sections)
 
     def section(self, name: str) -> Mapping[str, str]:
         value = self.sections.get(name, {})

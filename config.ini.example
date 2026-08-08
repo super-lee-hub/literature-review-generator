@@ -207,7 +207,6 @@ block_empty_research_streams = true
 [Preprocess]
 enabled = true
 cache_dir = ./output/_preprocess_cache
-strategy_policy = auto
 parser_mode = hybrid
 primary_parser = mineru_remote
 fallback_parser = local

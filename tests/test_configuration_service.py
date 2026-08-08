@@ -49,6 +49,15 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert config['OutlineQualityGate']['min_effective_sections'] == '3'
 
 
+def test_legacy_strategy_policy_is_readable_but_removed_from_normalized_config() -> None:
+    legacy = default_config_sections()
+    legacy["Preprocess"]["strategy_policy"] = "local"
+
+    normalized = ensure_config_sections(legacy)
+
+    assert "strategy_policy" not in normalized["Preprocess"]
+
+
 def test_production_outline_defaults_leave_pricing_unknown_but_keep_hard_token_ceiling() -> None:
     config = default_config_sections()
     settings = ApplicationSettings.from_mutable_config(config)
