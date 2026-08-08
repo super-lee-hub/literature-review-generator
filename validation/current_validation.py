@@ -11,6 +11,7 @@ of this execution path.
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ from services.repair_policy import (
     unsafe_auto_rewrite_enabled,
 )
 from validation.edge_checkpoint import ValidationEdgeCheckpointStore
+from validation.adjudication_checkpoint import AdjudicationCheckpointStore, sanitized_route_hash
 from validation.llm_adjudicator import build_adjudication_packet, run_adjudication_stage
 from validation.review_validator import (
     CitationValidationResult,
@@ -520,13 +522,29 @@ def _adjudicate(service: Any, results: Sequence[CitationValidationResult]) -> li
     )
     if not str(config.get("api_key") or "").strip() or not str(config.get("model") or "").strip():
         return list(results)
+    checkpoint_root = getattr(service.workspace.paths, "checkpoints_dir", "")
+    checkpoint_store = AdjudicationCheckpointStore(
+        Path(checkpoint_root) / "validation_adjudication"
+    )
+    route_hash = sanitized_route_hash(config)
     output: list[CitationValidationResult] = []
     for result in results:
         if not result.claim_text.strip() or not result.paper_ids:
             output.append(result)
             continue
         packet = build_adjudication_packet(result, stage="primary")
-        report = run_adjudication_stage(service, config, packet)
+        packet_dict = asdict(packet)
+        key = checkpoint_store.key_for(
+            packet=packet_dict,
+            stage="primary",
+            route_hash=route_hash,
+        )
+        with checkpoint_store.single_flight(key):
+            report = checkpoint_store.load(key)
+            if report is None:
+                report = run_adjudication_stage(service, config, packet)
+                if isinstance(report, Mapping):
+                    checkpoint_store.save(key, report)
         if isinstance(report, Mapping):
             output.append(_apply_adjudication(result, report))
         else:
