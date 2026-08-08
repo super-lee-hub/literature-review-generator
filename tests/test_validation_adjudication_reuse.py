@@ -280,6 +280,104 @@ def test_adjudication_reuse_record_tamper_fails_closed(
     assert error
 
 
+def test_adjudication_reuse_provider_output_tamper_fails_closed(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    service = _service(tmp_path)
+    calls: list[int] = []
+    _patch_ai_call(monkeypatch, calls)
+    current_validation._adjudicate(service, [_result()])
+    reuse_key = build_reuse_key(
+        packet=_packet(),
+        api_config={
+            "api_key": "secret-a",
+            "model": "validator-model",
+            "api_base": "https://example.test",
+        },
+        input_dependency_hashes=service._input_dependency_hashes,
+    )
+    reuse_record = service.artifact_registry.get(reuse_record_artifact_id(reuse_key))
+    assert reuse_record is not None
+    raw = json.loads(Path(reuse_record.path).read_text(encoding="utf-8"))
+    output_record = service.artifact_registry.get(raw["provider_output_artifact_id"])
+    assert output_record is not None
+    Path(output_record.path).write_text('{"payload": {"tampered": true}}', encoding="utf-8")
+
+    report, error = verify_reuse_record(
+        service.artifact_registry,
+        reuse_record,
+        packet=_packet(),
+        api_config={
+            "api_key": "secret-a",
+            "model": "validator-model",
+            "api_base": "https://example.test",
+        },
+        input_dependency_hashes=service._input_dependency_hashes,
+        current_epoch=service.closure_epoch_id,
+        service=service,
+    )
+    assert report is None
+    assert "provider_output" in error or "normalized_result" in error
+
+
+def test_adjudication_reuse_model_change_rejects_old_record(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    service = _service(tmp_path, config={"model": "model-a"})
+    calls: list[int] = []
+
+    def fake_call(*_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        calls.append(1)
+        return {"status": "supported", "confidence": 0.99}
+
+    monkeypatch.setattr("validation.llm_adjudicator._call_ai_api", fake_call)
+    monkeypatch.setattr(
+        current_validation,
+        "get_validator_api_config",
+        lambda _settings: {
+            "api_key": "secret-a",
+            "model": "model-a",
+            "api_base": "https://example.test",
+        },
+    )
+    monkeypatch.setattr(
+        current_validation,
+        "build_adjudication_packet",
+        lambda *_args, **_kwargs: _packet(),
+    )
+    monkeypatch.setattr(current_validation, "_apply_adjudication", lambda item, _report: item)
+    current_validation._adjudicate(service, [_result()])
+    reuse_key = build_reuse_key(
+        packet=_packet(),
+        api_config={
+            "api_key": "secret-a",
+            "model": "model-a",
+            "api_base": "https://example.test",
+        },
+        input_dependency_hashes=service._input_dependency_hashes,
+    )
+    record = service.artifact_registry.get(reuse_record_artifact_id(reuse_key))
+    assert record is not None
+
+    report, error = verify_reuse_record(
+        service.artifact_registry,
+        record,
+        packet=_packet(),
+        api_config={
+            "api_key": "secret-a",
+            "model": "model-b",
+            "api_base": "https://example.test",
+        },
+        input_dependency_hashes=service._input_dependency_hashes,
+        current_epoch=service.closure_epoch_id,
+        service=service,
+    )
+    assert report is None
+    assert "model" in error
+
+
 def test_provider_receipt_closure_allows_verified_reuse_without_receipt() -> None:
     expected = ExpectedProviderCall(
         call_id="validation:primary:abc",
