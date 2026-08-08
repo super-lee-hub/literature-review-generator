@@ -1,11 +1,18 @@
 # PR #14 Final Gap Audit
 
+> Historical pre-merge verification snapshot. The text below describes the
+> state of the PR14 source branch before PR #14 was merged.
+
 Date: 2026-08-08 (Asia/Shanghai)
 Repository: `super-lee-hub/literature-review-generator`
 Branch: `codex/platform-hardening-outline-v3`
-PR: #14 (`Draft` / `Open` / `Unmerged`)
+PR: #14 (`Draft` / `Open` / `Unmerged`) - historical pre-merge state
 Code/test verification: refreshed at the final pre-publication branch tip; the
 final commit SHA is recorded in the PR description and delivery report.
+
+> Post-merge status: PR #14: MERGED
+> squash merge SHA: `2f89c6bce06f282eb91799af329f21425b4eac45`
+> old main: `ecac15976ebb3b6ee754fe5c0dfe44efacd72e9a`
 
 This audit covers the requested current-path remediation. It does not promote
 deterministic provider injection to live-provider verification.
@@ -38,6 +45,10 @@ file itself.
 | Trust-bound export | Versioned `export_bundle` validator, typed current-set targets, stage/receipt/current-set evidence, canonical verified and canonical unvalidated admission, registration-failure cleanup, and forensic read-back | `E2E_VERIFIED` | Future work may add more checksum/read-failure permutations |
 
 ## Fresh local evidence
+
+The aggregate result below is historical pre-merge evidence, not the cleanup
+branch result. Post-merge cleanup evidence is recorded in
+`docs/PR14_POST_MERGE_VERIFICATION.md`.
 
 - `python -m pytest --collect-only -q`: `865` tests collected; the strict marker
   selection is `843 selected / 22 deselected`.
