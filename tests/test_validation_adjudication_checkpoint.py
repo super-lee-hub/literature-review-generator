@@ -2,8 +2,11 @@ import multiprocessing
 import types
 
 from models import APIConfig
+from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
+from services.settings import ApplicationSettings
 from validation.adjudication_checkpoint import AdjudicationCheckpointStore, sanitized_route_hash
+from validation.execution_service import ValidationExecutionService
 from validation.llm_adjudicator import AdjudicationPacket
 import validator
 import validation.current_validation as current_validation
@@ -105,9 +108,28 @@ def test_adjudication_checkpoint_single_flights_across_processes(tmp_path):
 def test_current_adjudication_uses_checkpoint_single_flight(monkeypatch, tmp_path):
     workspace = JobWorkspace.create(str(tmp_path), "project", "job-current")
     config = {"api_key": "secret-a", "model": "validator-model", "api_base": "https://example.test"}
-    service = types.SimpleNamespace(
+    registry = ArtifactRegistry(workspace.paths.registry_path, workspace.job_id)
+    settings = ApplicationSettings.from_config(
+        {
+            "Validator_API": dict(config),
+            "Runtime": {"max_workers": "1", "validation_retry_limit": "0"},
+        }
+    )
+    service = ValidationExecutionService(
+        job_id=workspace.job_id,
+        attempt_id="attempt-1",
         workspace=workspace,
-        settings=types.SimpleNamespace(section=lambda _name: config),
+        artifact_registry=registry,
+        settings=settings,
+        summaries=[],
+        review_draft_record=None,
+        citation_manifest_record=None,
+        paper_artifact_records=[],
+        visual_artifact_records=[],
+        provider_factory=None,
+        cancellation_checker=None,
+        logger=None,
+        runtime_config={"Validator_API": dict(config)},
     )
     result = types.SimpleNamespace(claim_text="claim", paper_ids=["paper-1"], details={})
     packet = AdjudicationPacket(
@@ -122,12 +144,12 @@ def test_current_adjudication_uses_checkpoint_single_flight(monkeypatch, tmp_pat
     monkeypatch.setattr(current_validation, "build_adjudication_packet", lambda *_args, **_kwargs: packet)
     monkeypatch.setattr(current_validation, "_apply_adjudication", lambda item, _report: item)
 
-    def fake_stage(_service, _config, _packet):
+    def fake_call(*_args, **_kwargs):
         nonlocal calls
         calls += 1
-        return {"status": "supported"}
+        return {"status": "supported", "confidence": 0.99}
 
-    monkeypatch.setattr(current_validation, "run_adjudication_stage", fake_stage)
+    monkeypatch.setattr("validation.llm_adjudicator._call_ai_api", fake_call)
     assert current_validation._adjudicate(service, [result]) == [result]
     assert current_validation._adjudicate(service, [result]) == [result]
     assert calls == 1

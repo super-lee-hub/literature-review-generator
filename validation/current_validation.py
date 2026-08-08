@@ -28,6 +28,9 @@ from services.repair_policy import (
 )
 from validation.edge_checkpoint import ValidationEdgeCheckpointStore
 from validation.adjudication_checkpoint import AdjudicationCheckpointStore, sanitized_route_hash
+from validation.adjudication_reuse import (
+    adjudication_call_id,
+)
 from validation.llm_adjudicator import build_adjudication_packet, run_adjudication_stage
 from validation.review_validator import (
     CitationValidationResult,
@@ -533,18 +536,68 @@ def _adjudicate(service: Any, results: Sequence[CitationValidationResult]) -> li
             output.append(result)
             continue
         packet = build_adjudication_packet(result, stage="primary")
-        packet_dict = asdict(packet)
         key = checkpoint_store.key_for(
-            packet=packet_dict,
-            stage="primary",
+            packet=asdict(packet),
+            stage=packet.stage,
             route_hash=route_hash,
         )
         with checkpoint_store.single_flight(key):
-            report = checkpoint_store.load(key)
+            report, reuse_record, reuse_error = service.find_verified_adjudication_reuse(
+                packet=packet,
+                api_config=config,
+            )
+            if report is not None and reuse_record is not None:
+                raw_reuse = json.loads(Path(reuse_record.path).read_text(encoding="utf-8"))
+                output_record = service.artifact_registry.get(
+                    str(raw_reuse.get("provider_output_artifact_id") or "")
+                )
+                if output_record is None or output_record.status != "ready":
+                    report = None
+                else:
+                    service.register_verified_reuse_call(
+                        packet=packet,
+                        api_config=config,
+                        reuse_record=reuse_record,
+                        output_record=output_record,
+                        output_payload=report,
+                    )
             if report is None:
+                if reuse_record is not None and reuse_error:
+                    _log(
+                        service,
+                        "warning",
+                        f"adjudication reuse rejected: {reuse_error}",
+                    )
                 report = run_adjudication_stage(service, config, packet)
                 if isinstance(report, Mapping):
-                    checkpoint_store.save(key, report)
+                    call_id = adjudication_call_id(packet)
+                    expected = getattr(service, "_expected_provider_calls", {}).get(call_id)
+                    if expected is not None and expected.artifact_path:
+                        output_record = next(
+                            (
+                                record
+                                for record in service.artifact_registry.list_records()
+                                if record.status == "ready"
+                                and Path(record.path).resolve()
+                                == Path(expected.artifact_path).resolve()
+                            ),
+                            None,
+                        )
+                        receipt = next(
+                            (
+                                item
+                                for item in service.provider_receipt_ledger.list_receipts()
+                                if item.call_id == call_id and item.status == "success"
+                            ),
+                            None,
+                        )
+                        if output_record is not None and receipt is not None:
+                            service.publish_adjudication_reuse_record(
+                                packet=packet,
+                                api_config=config,
+                                output_record=output_record,
+                                receipt=receipt,
+                            )
         if isinstance(report, Mapping):
             output.append(_apply_adjudication(result, report))
         else:
