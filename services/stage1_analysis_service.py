@@ -616,6 +616,10 @@ class Stage1AnalysisService:
 
         def keep(key: str) -> bool:
             lowered = key.lower()
+            # strategy_policy was accepted by older configs but has no
+            # production parser owner; do not let it invalidate exact reuse.
+            if lowered == "strategy_policy":
+                return False
             return not any(token in lowered for token in ("path", "dir", "timeout", "cache"))
 
         return _redact_mapping({key: value for key, value in raw.items() if keep(str(key))})

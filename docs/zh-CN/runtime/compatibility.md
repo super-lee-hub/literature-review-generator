@@ -15,6 +15,14 @@ fail-closed；不会被投影成新的 readiness，也不会被静默升级。
 - Review、citation、validation、repair、export 和 attestation 只消费当前
   versioned contracts，并校验 Registry 依赖与 hash。
 
+## 已弃用的 Preprocess 设置
+
+`[Preprocess].strategy_policy` 只在读取旧配置时作为兼容字段保留。它不是
+生产解析路由控制项，会在配置规范化时移除，也不会进入 Stage 1 语义复用
+fingerprint。当前解析行为请使用 `parser_mode`、`primary_parser`、
+`fallback_parser`、`extractor_profile`、`ocr_mode`、`ocr_languages` 和
+`use_markdown_as_stage1_input`。
+
 ## 旧输入的处理
 
 - 旧配置 section、旧 workspace 投影和未注册报告文件直接 fail-closed。

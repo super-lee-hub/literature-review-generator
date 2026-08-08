@@ -10,11 +10,13 @@ final commit SHA is recorded in the PR description and delivery report.
 This audit covers the requested current-path remediation. It does not promote
 deterministic provider injection to live-provider verification.
 
-Continuation verification replaced a synthetic preprocess setting with supported
-`strategy_policy`, `parser_mode`, and `primary_parser` cases; added path-independent
-multimodal exact reuse plus visual-content/policy/selection invalidation; and
+Continuation verification covered supported `parser_mode` and `primary_parser`
+invalidation; the post-merge cleanup deprecates the semantically inert
+`strategy_policy` compatibility field. It also added path-independent
+multimodal exact reuse plus visual-content/policy/selection invalidation and
 verified that Registry-detached typed manifests reject missing source-summary,
-provider-closure, and required provider-ledger authority blobs.
+provider-closure, required provider-ledger authority blobs, and the manifest
+file itself.
 
 > The ZIP files are absent from the committed diff and remote branch. The local operator reports that they were not read or staged; remote GitHub evidence cannot independently verify local read access.
 
@@ -97,9 +99,8 @@ provider-closure, and required provider-ledger authority blobs.
 
 ## Non-blocking polish
 
-- There is no isolated page-metadata-only mutation test. Production equality
-  already binds page number, page range, and bounding box, and the multimodal
-  positive/negative matrix exercises the complete visual identity.
-- There is no post-import deletion test for the typed manifest file itself. The
-  current verifier's unreadable-manifest branch fails closed, while the new tests
-  directly cover deletion of every referenced authority blob.
+- Production visual equality binds page number and bounding box, plus page range
+  when present. The cleanup branch now includes an isolated bbox-only mutation
+  regression with unchanged PDF and image bytes.
+- The cleanup branch now includes a direct post-import deletion regression for
+  the typed manifest file itself; the verifier remains fail-closed.

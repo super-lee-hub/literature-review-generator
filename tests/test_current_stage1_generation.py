@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import shutil
 from typing import Any, Mapping
@@ -209,6 +210,15 @@ def _typed_manifest_record(service: Stage1AnalysisService) -> Any:
         for record in service.registry.list_records()
         if record.artifact_type == "stage1_reusable_summary_manifest"
     )
+
+
+def _visual_bundle_payload(service: Stage1AnalysisService) -> dict[str, Any]:
+    bundle_record = next(
+        record
+        for record in service.registry.list_records()
+        if record.artifact_type == "stage1_visual_bundle"
+    )
+    return json.loads(Path(bundle_record.path).read_text(encoding="utf-8"))
 
 
 def _rewrite_registered_closure(
@@ -527,7 +537,6 @@ def test_current_stage1_production_invalidation_matrix_replays_reader_and_closes
     variations = (
         "prompt_template",
         "stage1_input_policy",
-        "preprocess_policy",
         "provider_model",
         "summary_schema",
         "visual_manifest",
@@ -537,8 +546,6 @@ def test_current_stage1_production_invalidation_matrix_replays_reader_and_closes
             overrides: dict[str, Mapping[str, Any]] = {}
             if variation == "stage1_input_policy":
                 overrides["Stage1_Input"] = {"send_extracted_text": "false"}
-            elif variation == "preprocess_policy":
-                overrides["Preprocess"] = {"strategy_policy": "local"}
             elif variation == "provider_model":
                 overrides["Primary_Reader_API"] = {"model": "reader-matrix-v2"}
             elif variation == "prompt_template":
@@ -585,7 +592,6 @@ def test_current_stage1_production_invalidation_matrix_replays_reader_and_closes
 @pytest.mark.parametrize(
     ("setting_name", "changed_value"),
     (
-        ("strategy_policy", "local"),
         ("parser_mode", "hybrid"),
         ("primary_parser", "mineru_remote"),
     ),
@@ -604,7 +610,6 @@ def test_current_stage1_supported_preprocess_setting_change_is_stale_and_regener
         return {"status": "success", "content": _canonical_summary()}
 
     baseline_preprocess = {
-        "strategy_policy": "auto",
         "parser_mode": "local",
         "primary_parser": "local",
     }
@@ -663,6 +668,59 @@ def test_current_stage1_supported_preprocess_setting_change_is_stale_and_regener
     assert changed_result.actual_provider_transport_count == 1
     assert changed_closure_payload["payload"]["complete"] is True
     assert calls == [1, 1]
+
+
+def test_current_stage1_deprecated_strategy_policy_is_ignored_for_reuse(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "deprecated-strategy-policy.pdf"
+    _write_pdf(pdf_path)
+    calls: list[int] = []
+
+    def reader(**kwargs: Any) -> Mapping[str, Any]:
+        calls.append(1)
+        return {"status": "success", "content": _canonical_summary()}
+
+    parent, parent_bundle = _service(
+        tmp_path / "parent",
+        pdf_path,
+        reader,
+        config_overrides={
+            "Preprocess": {
+                "strategy_policy": "auto",
+                "parser_mode": "local",
+                "primary_parser": "local",
+            }
+        },
+    )
+    baseline = parent.run(parent_bundle)
+    imported = InternalStageExecutorRegistry._summary_payloads_from_file(
+        _typed_manifest_record(parent).path
+    )
+
+    child, child_bundle = _service(
+        tmp_path / "child",
+        pdf_path,
+        reader,
+        job_id="deprecated-strategy-policy-child",
+        config_overrides={
+            "Preprocess": {
+                "strategy_policy": "local",
+                "parser_mode": "local",
+                "primary_parser": "local",
+            }
+        },
+    )
+    result = child.run(child_bundle, existing_summaries=imported)
+
+    assert result.reused_count == 1
+    assert result.generated_count == 0
+    assert result.expected_provider_transport_count == 0
+    assert result.actual_provider_transport_count == 0
+    assert result.summaries[0]["stage1_reuse"]["binding"]["preprocess_contract_hash"] == (
+        baseline.summaries[0]["stage1_reuse"]["binding"]["preprocess_contract_hash"]
+    )
+    assert calls == [1]
 
 
 def test_typed_manifest_reuses_equivalent_multimodal_evidence_after_path_move(
@@ -840,6 +898,172 @@ def test_typed_manifest_multimodal_semantic_change_regenerates(
     assert child_result.reused_count == 0
     assert child_result.generated_count == 1
     assert child_calls == [1]
+    assert child_result.expected_provider_transport_count == 1
+    assert child_result.actual_provider_transport_count == 1
+    assert child_closure_payload["payload"]["complete"] is True
+
+
+def test_typed_manifest_visual_bbox_metadata_change_regenerates_without_image_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "visual-paper.pdf"
+    _write_visual_pdf(pdf_path)
+
+    def parent_reader(**kwargs: Any) -> Mapping[str, Any]:
+        return {"status": "success", "content": _canonical_summary()}
+
+    parent_service, parent_bundle = _service(
+        tmp_path / "parent-run",
+        pdf_path,
+        parent_reader,
+        job_id="visual-bbox-parent",
+        config_overrides=_visual_config_overrides(),
+    )
+    parent_result = parent_service.run(parent_bundle)
+    parent_binding = parent_result.summaries[0]["stage1_reuse"]["binding"]
+    imported = InternalStageExecutorRegistry._summary_payloads_from_file(
+        _typed_manifest_record(parent_service).path
+    )
+    parent_bundle_payload = _visual_bundle_payload(parent_service)
+
+    original_materialize = Stage1VisualArtifactBuilder._materialize_visuals
+
+    def materialize_with_bbox_only(self: Any, **kwargs: Any) -> list[Any]:
+        visuals = original_materialize(self, **kwargs)
+        target_index = next(
+            index
+            for index, visual in enumerate(visuals)
+            if visual.artifact_type == "figure_crop"
+        )
+        target = visuals[target_index]
+        changed_bbox = [round(float(value) + 1.0, 2) for value in target.bbox]
+        return [
+            replace(visual, bbox=changed_bbox) if index == target_index else visual
+            for index, visual in enumerate(visuals)
+        ]
+
+    monkeypatch.setattr(
+        Stage1VisualArtifactBuilder,
+        "_materialize_visuals",
+        materialize_with_bbox_only,
+    )
+
+    child_calls: list[int] = []
+
+    def child_reader(**kwargs: Any) -> Mapping[str, Any]:
+        child_calls.append(1)
+        return {"status": "success", "content": _canonical_summary()}
+
+    child_service, child_bundle = _service(
+        tmp_path / "child-run",
+        pdf_path,
+        child_reader,
+        job_id="visual-bbox-child",
+        config_overrides=_visual_config_overrides(),
+    )
+    child_result = child_service.run(child_bundle, existing_summaries=imported)
+    child_closure = child_service.finalize_provider_receipt_closure()
+    child_closure_payload = json.loads(
+        Path(child_closure.path).read_text(encoding="utf-8")
+    )
+    child_binding = child_result.summaries[0]["stage1_reuse"]["binding"]
+    child_bundle_payload = _visual_bundle_payload(child_service)
+
+    parent_refs = parent_bundle_payload["selected_visual_refs"]
+    child_refs = child_bundle_payload["selected_visual_refs"]
+    assert len(parent_refs) == len(child_refs)
+    parent_identity = Stage1AnalysisService._build_visual_semantic_identity(
+        visual_bundle=parent_bundle_payload,
+        selected_visual_refs=parent_refs,
+        selection_policy_snapshot=parent_bundle_payload["selection_policy_snapshot"],
+    )
+    child_identity = Stage1AnalysisService._build_visual_semantic_identity(
+        visual_bundle=child_bundle_payload,
+        selected_visual_refs=child_refs,
+        selection_policy_snapshot=child_bundle_payload["selection_policy_snapshot"],
+    )
+    parent_visuals = parent_identity["selected_visuals"]
+    child_visuals = child_identity["selected_visuals"]
+    assert len(parent_visuals) == len(child_visuals)
+    changed_bbox_count = 0
+    for parent_visual, child_visual in zip(parent_visuals, child_visuals):
+        assert {
+            key: value for key, value in parent_visual.items() if key != "bbox"
+        } == {
+            key: value for key, value in child_visual.items() if key != "bbox"
+        }
+        if parent_visual["bbox"] != child_visual["bbox"]:
+            changed_bbox_count += 1
+    assert changed_bbox_count == 1
+    assert parent_identity["selection_policy"] == child_identity["selection_policy"]
+    assert parent_identity["bundle_metadata"] == child_identity["bundle_metadata"]
+    assert parent_binding["visual_input_manifest_hash"] != child_binding[
+        "visual_input_manifest_hash"
+    ]
+    assert child_result.summaries[0]["stage1_reuse"]["decision"] != "exact_summary_reuse"
+    assert child_result.reused_count == 0
+    assert child_result.generated_count == 1
+    assert child_calls == [1]
+    assert child_result.expected_provider_transport_count == 1
+    assert child_result.actual_provider_transport_count == 1
+    assert child_closure_payload["payload"]["complete"] is True
+
+
+def test_typed_manifest_file_deletion_regenerates_with_unreadable_authority_reason(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "paper.pdf"
+    _write_pdf(pdf_path)
+    parent_calls: list[int] = []
+
+    def parent_reader(**kwargs: Any) -> Mapping[str, Any]:
+        parent_calls.append(1)
+        return {"status": "success", "content": _canonical_summary()}
+
+    parent_service, parent_bundle = _service(
+        tmp_path / "parent-run",
+        pdf_path,
+        parent_reader,
+        job_id="missing-parent-manifest-file",
+    )
+    parent_service.run(parent_bundle)
+    manifest_record = _typed_manifest_record(parent_service)
+    manifest_path = Path(manifest_record.path)
+    manifest_bytes = manifest_path.read_bytes()
+    imported = InternalStageExecutorRegistry._summary_payloads_from_file(
+        manifest_record.path
+    )
+    manifest_path.unlink()
+
+    child_calls: list[int] = []
+
+    def child_reader(**kwargs: Any) -> Mapping[str, Any]:
+        child_calls.append(1)
+        return {"status": "success", "content": _canonical_summary()}
+
+    try:
+        child_service, child_bundle = _service(
+            tmp_path / "child-run",
+            pdf_path,
+            child_reader,
+            job_id="missing-child-manifest-file",
+        )
+        child_result = child_service.run(child_bundle, existing_summaries=imported)
+        child_closure = child_service.finalize_provider_receipt_closure()
+        child_closure_payload = json.loads(
+            Path(child_closure.path).read_text(encoding="utf-8")
+        )
+    finally:
+        manifest_path.write_bytes(manifest_bytes)
+
+    reuse = child_result.summaries[0]["stage1_reuse"]
+    assert parent_calls == [1]
+    assert child_calls == [1]
+    assert reuse["decision"] == "identity_match_unverified"
+    assert reuse["reason"].startswith("typed_manifest_unreadable:")
+    assert child_result.reused_count == 0
+    assert child_result.generated_count == 1
     assert child_result.expected_provider_transport_count == 1
     assert child_result.actual_provider_transport_count == 1
     assert child_closure_payload["payload"]["complete"] is True
