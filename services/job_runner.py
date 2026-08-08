@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Any, Mapping, Optional, cast
 
 from runtime.source_intake import build_source_bundle_for_request
 from runtime.stage_contracts import SourceBundle
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.job_workspace import JobWorkspace, atomic_write_json
 from services.source_inventory import (
     SourceInventoryDiagnosticV1,
@@ -182,6 +183,18 @@ def build_job_request_from_args(args: argparse.Namespace) -> JobRunRequest:
     return build_job_request_from_mapping(vars(args))
 
 
+def validate_free_mode_options(profile: Any, idea: Any) -> Optional[str]:
+    profile_path = str(profile or "").strip()
+    idea_text = str(idea or "").strip()
+    if profile_path and idea_text:
+        return "--free-mode-profile and --free-mode-idea are mutually exclusive"
+    if profile_path:
+        resolved = Path(profile_path).expanduser().resolve()
+        if not resolved.is_file():
+            return f"--free-mode-profile does not exist or is not a file: {resolved}"
+    return None
+
+
 def validate_job_request_options(request: Any) -> Optional[str]:
     summary_file = getattr(request, "summary_file", None)
     summary_sources = getattr(request, "summary_sources", ()) or ()
@@ -199,7 +212,10 @@ def validate_job_request_options(request: Any) -> Optional[str]:
         return "--reuse-stage1 can only be used with stage1 analysis or --run-all"
     if reuse_summary_files and not reuse_stage1:
         return "--reuse-summary-file requires --reuse-stage1"
-    return None
+    return validate_free_mode_options(
+        getattr(request, "free_mode_profile", None),
+        getattr(request, "free_mode_idea", None),
+    )
 
 
 class JobRunner:
@@ -353,6 +369,16 @@ class JobRunner:
         payload = asdict(request)
         payload.pop("progress_tracker", None)
         payload.pop("publication_context", None)
+        profile_path = str(request.free_mode_profile or "").strip()
+        resolved_profile = str(Path(profile_path).expanduser().resolve()) if profile_path else ""
+        payload["free_mode_profile"] = resolved_profile
+        payload["free_mode_profile_sha256"] = (
+            file_sha256(resolved_profile) if resolved_profile and Path(resolved_profile).is_file() else ""
+        )
+        idea_text = str(request.free_mode_idea or "")
+        payload["free_mode_idea_sha256"] = (
+            hashlib.sha256(idea_text.encode("utf-8")).hexdigest() if idea_text else ""
+        )
         return payload
 
     def _build_workspace(
@@ -443,6 +469,12 @@ class JobRunner:
             job_id=request.job_id or "",
             config=str(Path(request.config).expanduser().resolve()),
             action=request.action,
+            free_mode_profile=(
+                str(Path(request.free_mode_profile).expanduser().resolve())
+                if request.free_mode_profile
+                else ""
+            ),
+            free_mode_idea=request.free_mode_idea or "",
             summary_file=str(Path(request.summary_file).expanduser().resolve()) if request.summary_file else "",
             summary_sources=tuple(str(Path(item).expanduser().resolve()) for item in request.summary_sources),
             reuse_stage1=request.reuse_stage1,

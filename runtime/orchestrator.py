@@ -7,6 +7,20 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, cast
 
 from config_loader import load_config
+from free_mode.intent_input import (
+    FREE_MODE_INTENT_INPUT_ARTIFACT_ID,
+    FREE_MODE_INTENT_INPUT_ARTIFACT_TYPE,
+    FREE_MODE_INTENT_INPUT_ARTIFACT_VERSION,
+    FREE_MODE_REVIEW_INTENT_PROJECTION_ARTIFACT_ID,
+    FREE_MODE_REVIEW_INTENT_PROJECTION_ARTIFACT_TYPE,
+    FREE_MODE_REVIEW_INTENT_PROJECTION_ARTIFACT_VERSION,
+    build_free_mode_intent_envelope,
+    build_free_mode_writer_context,
+    build_review_intent_projection_payload,
+    canonical_payload_bytes,
+    verify_free_mode_intent_input,
+    verify_free_mode_review_intent_projection,
+)
 from runtime.architecture_gates import ArchitectureGateScope, collect_scannable_paths, scan_paths_for_forbidden_patterns
 from runtime.lifecycle import BootstrappedRuntimeContext, bootstrap_job_runtime, finalize_job_runtime
 from runtime.job_spec import RuntimeJobSpec
@@ -816,6 +830,10 @@ class InternalStageExecutorRegistry:
         )
         provider = self._outline_provider(session, profile, api_config)
         stability = settings.outline_stability_settings()
+        free_mode_review_intent: Mapping[str, Any] | None = None
+        if self.bridge.free_mode_envelope is not None:
+            self.bridge.persist_free_mode_review_intent_projection(session)
+            free_mode_review_intent = dict(self.bridge.free_mode_envelope["review_intent"])
         executor = OutlineV3Executor(
             job_id=session.context.workspace.job_id,
             summaries=summaries,
@@ -825,11 +843,7 @@ class InternalStageExecutorRegistry:
             provider_profile=profile,
             candidate_count=settings.outline_candidate_count(),
             quality_gate=settings.outline_quality_gate(),
-            review_intent=(
-                self.bridge.job_spec.metadata.get("review_intent")
-                if isinstance(self.bridge.job_spec.metadata.get("review_intent"), Mapping)
-                else None
-            ),
+            review_intent=free_mode_review_intent,
             cancellation_checker=session.stage_host.check_cancelled,
             publication_context=self.bridge.publication_context,
             stability_mode=stability.mode,
@@ -959,6 +973,13 @@ class InternalStageExecutorRegistry:
         from services.review_generation_service import ReviewGenerationService
 
         session.stage_host.summaries = list(summaries)
+        free_mode_context: Mapping[str, Any] | None = None
+        if self.bridge.free_mode_envelope is not None:
+            verify_free_mode_intent_input(
+                session.context.registry,
+                self.bridge.free_mode_envelope,
+            )
+            free_mode_context = build_free_mode_writer_context(self.bridge.free_mode_envelope)
         generation = ReviewGenerationService(
             job_id=session.context.workspace.job_id,
             attempt_id=attempt_id,
@@ -972,6 +993,7 @@ class InternalStageExecutorRegistry:
         ).run(
             outline_payload=payload,
             evidence_packets=[dict(item) for item in packets if isinstance(item, Mapping)],
+            free_mode_context=free_mode_context,
         )
         review_stage = self.bridge.persist_review_chain(
                 session,
@@ -1038,6 +1060,18 @@ class AgentRuntimeBridge:
         job_spec.validate()
         self.job_spec = job_spec
         self.publication_context = publication_context
+        metadata = dict(job_spec.metadata or {})
+        frozen_envelope = metadata.get("free_mode_input")
+        if isinstance(frozen_envelope, Mapping) and frozen_envelope.get("artifact_id"):
+            self.free_mode_envelope = dict(frozen_envelope)
+        elif job_spec.free_mode_profile or job_spec.free_mode_idea:
+            self.free_mode_envelope = build_free_mode_intent_envelope(
+                profile_path=job_spec.free_mode_profile,
+                idea=job_spec.free_mode_idea,
+                job_id=job_spec.job_id or "",
+            )
+        else:
+            self.free_mode_envelope = None
 
     def build_job_request(self) -> JobRunRequest:
         request = self.job_spec.to_job_request()
@@ -1057,6 +1091,90 @@ class AgentRuntimeBridge:
         if error:
             raise ValueError(error)
         return request
+
+    def _freeze_free_mode_snapshot(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        if self.free_mode_envelope is None:
+            return snapshot
+        payload = dict(self.free_mode_envelope["payload"])
+        snapshot["free_mode_profile_sha256"] = str(payload.get("profile_content_sha256") or "")
+        snapshot["free_mode_idea_sha256"] = str(payload.get("idea_text_sha256") or "")
+        snapshot["free_mode_input_artifact_id"] = str(self.free_mode_envelope["artifact_id"])
+        snapshot["free_mode_input_artifact_hash"] = str(self.free_mode_envelope["artifact_hash"])
+        snapshot["free_mode_context_hash"] = str(self.free_mode_envelope["context_hash"])
+        return snapshot
+
+    def register_free_mode_input(self, session: AgentRuntimeSession) -> Any | None:
+        """Publish or verify the frozen Free Mode input Registry artifact."""
+
+        if self.free_mode_envelope is None:
+            return None
+        registry = session.context.registry
+        existing = registry.get(FREE_MODE_INTENT_INPUT_ARTIFACT_ID)
+        if existing is not None:
+            verify_free_mode_intent_input(registry, self.free_mode_envelope)
+            return existing
+        payload_bytes = canonical_payload_bytes(self.free_mode_envelope)
+        path = session.context.workspace.artifact_path("free_mode_intent_input_v1.json")
+        record = publish_bytes_artifact(
+            session.context.publication_context,
+            registry,
+            path,
+            payload_bytes,
+            artifact_role="free_mode_intent_input",
+            artifact_type=FREE_MODE_INTENT_INPUT_ARTIFACT_TYPE,
+            artifact_version=FREE_MODE_INTENT_INPUT_ARTIFACT_VERSION,
+            producer="runtime.orchestrator.AgentRuntimeBridge.register_free_mode_input",
+            artifact_id=FREE_MODE_INTENT_INPUT_ARTIFACT_ID,
+            metadata={
+                "job_id": session.context.workspace.job_id,
+                "source_kind": str(self.free_mode_envelope["payload"].get("source_kind") or ""),
+                "context_hash": str(self.free_mode_envelope["context_hash"]),
+            },
+        )
+        if record.content_hash != str(self.free_mode_envelope["artifact_hash"]):
+            raise RuntimeError("free mode input Registry hash does not match the typed envelope")
+        verify_free_mode_intent_input(registry, self.free_mode_envelope)
+        return record
+
+    def persist_free_mode_review_intent_projection(
+        self,
+        session: AgentRuntimeSession,
+    ) -> Any | None:
+        """Bind the Free Mode input artifact as review-intent provenance."""
+
+        if self.free_mode_envelope is None:
+            return None
+        input_record = self.register_free_mode_input(session)
+        if input_record is None:
+            raise RuntimeError("free mode review intent projection requires the input artifact")
+        registry = session.context.registry
+        existing = registry.get(FREE_MODE_REVIEW_INTENT_PROJECTION_ARTIFACT_ID)
+        if existing is not None:
+            verify_free_mode_review_intent_projection(registry, self.free_mode_envelope)
+            return existing
+        payload = build_review_intent_projection_payload(self.free_mode_envelope)
+        path = session.context.workspace.artifact_path(
+            "free_mode_review_intent_projection_v1.json"
+        )
+        record = publish_json_artifact(
+            session.context.publication_context,
+            registry,
+            path,
+            payload,
+            artifact_role="free_mode_review_intent_projection",
+            artifact_type=FREE_MODE_REVIEW_INTENT_PROJECTION_ARTIFACT_TYPE,
+            artifact_version=FREE_MODE_REVIEW_INTENT_PROJECTION_ARTIFACT_VERSION,
+            producer="runtime.orchestrator.AgentRuntimeBridge.persist_free_mode_review_intent_projection",
+            artifact_id=FREE_MODE_REVIEW_INTENT_PROJECTION_ARTIFACT_ID,
+            depends_on=[ArtifactDependencyRefV2.from_record(input_record)],
+            metadata={
+                "job_id": session.context.workspace.job_id,
+                "free_mode_input_artifact_hash": str(self.free_mode_envelope["artifact_hash"]),
+                "context_hash": str(self.free_mode_envelope["context_hash"]),
+            },
+        )
+        verify_free_mode_review_intent_projection(registry, self.free_mode_envelope)
+        return record
 
     def build_source_bundle(self) -> SourceBundle:
         request = self.build_job_request()
@@ -1209,12 +1327,15 @@ class AgentRuntimeBridge:
             request=request,
             project_name=project_name,
         )
+        request_snapshot = self._freeze_free_mode_snapshot(
+            runner._request_snapshot(request)
+        )
         context = bootstrap_job_runtime(
             request=request,
             generator=stage_host,
             project_name=project_name,
             source_snapshot=runner._source_snapshot(stage_host, request),
-            request_snapshot=runner._request_snapshot(request),
+            request_snapshot=request_snapshot,
             build_workspace=runner._build_workspace,
             write_resume_report=runner._write_resume_report,
             source_inventory=prepared_sources.inventory,
@@ -1226,12 +1347,14 @@ class AgentRuntimeBridge:
             publish_running_state=publish_running_state,
             publication_context=self.publication_context,
         )
-        return AgentRuntimeSession(
+        session = AgentRuntimeSession(
             runner=runner,
             request=request,
             stage_host=stage_host,
             context=context,
         )
+        self.persist_free_mode_review_intent_projection(session)
+        return session
 
     def persist_source_bundle(self, session: AgentRuntimeSession, source_bundle: SourceBundle) -> StageArtifactRef:
         source_dependencies: list[ArtifactDependencyRefV2] = []

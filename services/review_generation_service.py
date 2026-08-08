@@ -100,7 +100,9 @@ class ReviewGenerationService:
         *,
         outline_payload: Mapping[str, Any],
         evidence_packets: Sequence[Mapping[str, Any]],
+        free_mode_context: Mapping[str, Any] | None = None,
     ) -> ReviewGenerationResult:
+        self.free_mode_context = dict(free_mode_context or {})
         catalog, catalog_path = self._build_and_persist_catalog()
         packet_by_section = {
             str(packet.get("section_id") or "").strip(): dict(packet)
@@ -137,6 +139,7 @@ class ReviewGenerationService:
                 "catalog": hash_json(catalog),
                 "evidence_packets": hash_json(evidence_packets),
                 "summaries": hash_json(self.summaries),
+                "free_mode_context": hash_json(self.free_mode_context),
             },
             provider_config_hash=hash_json(_redact_mapping(writer_config_for_epoch)),
             schema_version="review-v3",
@@ -390,10 +393,14 @@ class ReviewGenerationService:
     ) -> dict[str, Any]:
         profile = self._provider_context_profile()
         adoption = self._current_adoption_binding()
+        free_mode = self.free_mode_context
         return {
             "binding_version": "review-section-binding-v1",
             "stage_name": runtime.stage_name,
             "section_id": section_id,
+            "free_mode_input_artifact_id": str(free_mode.get("free_mode_input_artifact_id") or ""),
+            "free_mode_input_artifact_hash": str(free_mode.get("free_mode_input_artifact_hash") or ""),
+            "free_mode_context_hash": str(free_mode.get("free_mode_context_hash") or ""),
             "adoption_artifact_id": adoption["adoption_artifact_id"],
             "adoption_artifact_hash": adoption["adoption_artifact_hash"],
             "final_outline_hash": adoption["final_outline_hash"],
@@ -997,6 +1004,7 @@ class ReviewGenerationService:
                 "must_use_only_allowed_refs": True,
                 "must_ground_each_block_in_packet": True,
             },
+            "free_mode_context": dict(self.free_mode_context) if self.free_mode_context else None,
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 

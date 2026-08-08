@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Literal, Mapping, cast
 
-from services.job_runner import JobRunRequest, resolve_stage1_reuse
+from services.job_runner import JobRunRequest, resolve_stage1_reuse, validate_free_mode_options
 
 
 SourceMode = Literal["direct", "zotero"]
@@ -60,6 +60,8 @@ class RuntimeJobSpec:
     job_id: str = ""
     config: str = "config.ini"
     action: str = "run_all"
+    free_mode_profile: str = ""
+    free_mode_idea: str = ""
     summary_file: str = ""
     summary_sources: tuple[str, ...] = ()
     reuse_stage1: bool | None = None
@@ -93,6 +95,13 @@ class RuntimeJobSpec:
                 raise ValueError("generate_section must be greater than 0")
         if self.action == "derive_review_batch" and not self.metadata.get("review_batch_spec"):
             raise ValueError("derive_review_batch action requires review_batch_spec metadata")
+        if not isinstance(self.metadata.get("free_mode_input"), Mapping):
+            free_mode_error = validate_free_mode_options(
+                self.free_mode_profile,
+                self.free_mode_idea,
+            )
+            if free_mode_error:
+                raise ValueError(free_mode_error)
         requested_stages = self.metadata.get("requested_stages")
         if requested_stages is not None:
             if not isinstance(requested_stages, (list, tuple)):
@@ -136,6 +145,8 @@ class RuntimeJobSpec:
             job_id=self.job_id or None,
             pdf_folder=self.source.pdf_folder or None,
             action=self.action,
+            free_mode_profile=self.free_mode_profile or None,
+            free_mode_idea=self.free_mode_idea or None,
             summary_file=self.summary_file or None,
             summary_sources=tuple(item for item in self.summary_sources if str(item).strip()),
             reuse_stage1=resolve_stage1_reuse(self.action, self.reuse_stage1),
@@ -206,6 +217,7 @@ class RuntimeJobSpec:
                 library_path=resolve_path(self.source.library_path),
             ),
             config=resolve_path(self.config),
+            free_mode_profile=resolve_path(self.free_mode_profile),
             summary_file=resolve_path(self.summary_file),
             summary_sources=tuple(resolve_path(item) for item in self.summary_sources),
             reuse_summary_files=tuple(resolve_path(item) for item in self.reuse_summary_files),
@@ -222,6 +234,8 @@ class RuntimeJobSpec:
             job_id=str(payload.get("job_id") or ""),
             config=str(payload.get("config") or "config.ini"),
             action=str(payload.get("action") or "run_all"),
+            free_mode_profile=str(payload.get("free_mode_profile") or ""),
+            free_mode_idea=str(payload.get("free_mode_idea") or ""),
             summary_file=str(payload.get("summary_file") or ""),
             summary_sources=tuple(
                 str(item).strip()
@@ -265,6 +279,8 @@ class RuntimeJobSpec:
             job_id=str(payload.get("job_id") or ""),
             config=str(payload.get("config") or "config.ini"),
             action=str(payload.get("action") or "run_all"),
+            free_mode_profile=str(payload.get("free_mode_profile") or ""),
+            free_mode_idea=str(payload.get("free_mode_idea") or ""),
             summary_file=str(payload.get("summary_file") or ""),
             summary_sources=tuple(
                 str(item).strip()

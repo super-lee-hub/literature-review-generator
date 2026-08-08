@@ -90,6 +90,9 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "stage1_portable_summary_manifest",
         "stage1_portable_provider_closure",
         "stage1_portable_provider_ledger",
+        "free_mode_intent_input",
+        "free_mode_review_intent_projection",
+        "validation_adjudication_reuse_record",
     }
 )
 
@@ -1317,6 +1320,134 @@ def _validate_forensic_attestation(record: Any, _path: str | Path, root: Mapping
     _require_fields(root, ("checked_at", "evidence_hash", "status", "graph", "verified", "manual", "issues", "completion", "closure", "receipt_closure", "adoption"), "forensic_attestation")
 
 
+def _validate_free_mode_intent_input(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("free_mode_intent_input",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "artifact_type",
+            "artifact_version",
+            "schema_version",
+            "job_id",
+            "source_kind",
+            "created_from",
+            "review_intent",
+            "context_hash",
+        ),
+        "free_mode_intent_input",
+    )
+    source_kind = str(root.get("source_kind") or "")
+    if source_kind not in {"profile", "idea"}:
+        raise ArtifactSchemaError("free_mode_intent_input.source_kind must be profile or idea")
+    if not isinstance(root.get("review_intent"), Mapping):
+        raise ArtifactSchemaError("free_mode_intent_input.review_intent must be an object")
+    if len(str(root.get("context_hash") or "")) != 64:
+        raise ArtifactSchemaError("free_mode_intent_input.context_hash must be a SHA-256 hex digest")
+    if source_kind == "profile":
+        if not isinstance(root.get("profile"), Mapping):
+            raise ArtifactSchemaError("free_mode_intent_input.profile must be an object")
+        if len(str(root.get("profile_content_sha256") or "")) != 64:
+            raise ArtifactSchemaError("free_mode_intent_input.profile_content_sha256 must be a SHA-256 hex digest")
+        if "raw_idea" in root or "idea_text_sha256" in root:
+            raise ArtifactSchemaError("free_mode_intent_input profile cannot also carry an idea")
+    else:
+        if "profile" in root or "profile_content_sha256" in root:
+            raise ArtifactSchemaError("free_mode_intent_input idea cannot also carry a profile")
+        if "raw_idea" not in root or "idea_text_sha256" not in root or "normalized_idea" not in root:
+            raise ArtifactSchemaError("free_mode_intent_input idea payload is incomplete")
+        if len(str(root.get("idea_text_sha256") or "")) != 64:
+            raise ArtifactSchemaError("free_mode_intent_input.idea_text_sha256 must be a SHA-256 hex digest")
+
+
+def _validate_free_mode_review_intent_projection(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("free_mode_review_intent_projection",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "artifact_type",
+            "artifact_version",
+            "schema_version",
+            "projection_version",
+            "job_id",
+            "review_intent",
+            "free_mode_input_artifact_id",
+            "free_mode_input_artifact_hash",
+            "free_mode_context_hash",
+        ),
+        "free_mode_review_intent_projection",
+    )
+    if not isinstance(root.get("review_intent"), Mapping):
+        raise ArtifactSchemaError("free_mode_review_intent_projection.review_intent must be an object")
+    if len(str(root.get("free_mode_input_artifact_hash") or "")) != 64:
+        raise ArtifactSchemaError("free_mode_review_intent_projection input hash must be a SHA-256 hex digest")
+    if len(str(root.get("free_mode_context_hash") or "")) != 64:
+        raise ArtifactSchemaError("free_mode_review_intent_projection context hash must be a SHA-256 hex digest")
+
+
+def _validate_validation_adjudication_reuse_record(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("validation_adjudication_reuse_record",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "artifact_type",
+            "artifact_version",
+            "reuse_version",
+            "job_id",
+            "attempt_id",
+            "citation_set_key",
+            "stage",
+            "canonical_adjudication_packet_hash",
+            "prompt_version",
+            "validation_schema_version",
+            "provider",
+            "model",
+            "endpoint_type",
+            "redacted_provider_config_hash",
+            "call_id",
+            "prompt_hash",
+            "input_hash",
+            "schema_hash",
+            "provider_output_artifact_id",
+            "provider_output_artifact_hash",
+            "normalized_result_hash",
+            "source_receipt_id",
+            "source_receipt_hash",
+            "source_provider_closure_epoch_id",
+            "current_input_dependency_hashes",
+        ),
+        "validation_adjudication_reuse_record",
+    )
+    if str(root.get("reuse_version") or "") != "validation_adjudication_reuse_record/v1":
+        raise ArtifactSchemaError("validation_adjudication_reuse_record.reuse_version is invalid")
+    if str(root.get("stage") or "") not in {"primary", "stronger"}:
+        raise ArtifactSchemaError("validation_adjudication_reuse_record.stage is invalid")
+    if not isinstance(root.get("current_input_dependency_hashes"), Mapping):
+        raise ArtifactSchemaError("validation_adjudication_reuse_record input dependency hashes must be an object")
+
+
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     version = str(getattr(record, "artifact_version", "") or "")
@@ -1357,6 +1488,9 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("export_bundle", "v1"): _validate_export_bundle,
         ("forensic_attestation", "v1"): _validate_forensic_attestation,
         ("review_section", "v3"): _validate_review_section,
+        ("free_mode_intent_input", "v1"): _validate_free_mode_intent_input,
+        ("free_mode_review_intent_projection", "v1"): _validate_free_mode_review_intent_projection,
+        ("validation_adjudication_reuse_record", "v1"): _validate_validation_adjudication_reuse_record,
     }
     validator = validators.get((artifact_type, version))
     if validator is None:

@@ -335,6 +335,24 @@ def test_validate_workflow_request_only_blocks_pending_free_mode_when_free_mode_
     assert notifications[-1] == "自由模式对话还没有应用到本次任务。请先应用当前规划，或清空对话后再运行。"
 
 
+def test_concept_mode_is_disabled_honestly_in_gui_and_queue(gui_app_module) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.state["workflow"]["project_name"] = "demo"
+    controller.state["workflow"]["input_mode"] = "pdf"
+    controller.state["workflow"]["pdf_folder"] = "D:/papers"
+    controller.state["workflow"]["work_mode"] = "concept"
+
+    assert controller.validate_workflow_request("analyze") is False
+    with pytest.raises(ValueError, match="not yet available"):
+        controller._build_queue_job_spec(
+            "demo",
+            "D:/papers",
+            "",
+            "analyze",
+            work_mode="concept",
+        )
+
+
 def test_build_queue_job_spec_can_use_explicit_input_mode(gui_app_module) -> None:
     controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
     controller.state["workflow"]["input_mode"] = "pdf"
