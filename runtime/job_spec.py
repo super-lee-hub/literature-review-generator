@@ -95,9 +95,13 @@ class RuntimeJobSpec:
                 raise ValueError("generate_section must be greater than 0")
         if self.action == "derive_review_batch" and not self.metadata.get("review_batch_spec"):
             raise ValueError("derive_review_batch action requires review_batch_spec metadata")
-        free_mode_error = validate_free_mode_options(self.free_mode_profile, self.free_mode_idea)
-        if free_mode_error:
-            raise ValueError(free_mode_error)
+        if not isinstance(self.metadata.get("free_mode_input"), Mapping):
+            free_mode_error = validate_free_mode_options(
+                self.free_mode_profile,
+                self.free_mode_idea,
+            )
+            if free_mode_error:
+                raise ValueError(free_mode_error)
         requested_stages = self.metadata.get("requested_stages")
         if requested_stages is not None:
             if not isinstance(requested_stages, (list, tuple)):

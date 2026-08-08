@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from free_mode.intent_input import (
+    build_free_mode_intent_envelope,
+    build_free_mode_writer_context,
+)
 from runtime.attempt_store import (
     AttemptAlreadyRunningError,
     AttemptExecutionLease,
@@ -265,6 +269,7 @@ class AgentRuntimeRunner:
         values = [
             spec.config,
             spec.queue_file,
+            spec.free_mode_profile,
             spec.source.pdf_folder,
             spec.source.zotero_report,
             spec.source.library_path,
@@ -315,6 +320,25 @@ class AgentRuntimeRunner:
             plan.allow_unvalidated_when_validation_optional
         )
         metadata["stage_plan"] = plan.to_dict()
+        if self.job_spec.free_mode_profile or self.job_spec.free_mode_idea:
+            if resume:
+                frozen_envelope = metadata.get("free_mode_input")
+                if not isinstance(frozen_envelope, Mapping) or not frozen_envelope.get("artifact_id"):
+                    raise RuntimeRunnerError(
+                        "free mode resume requires frozen free_mode_input metadata"
+                    )
+                envelope = dict(frozen_envelope)
+            else:
+                envelope = build_free_mode_intent_envelope(
+                    profile_path=self.job_spec.free_mode_profile,
+                    idea=self.job_spec.free_mode_idea,
+                    job_id=self.job_spec.job_id or "",
+                )
+                if envelope is None:
+                    raise RuntimeRunnerError("free mode input envelope could not be built")
+                metadata["free_mode_input"] = envelope
+            metadata["review_intent"] = dict(envelope["review_intent"])
+            metadata["free_mode_context"] = build_free_mode_writer_context(envelope)
         return replace(
             self.job_spec,
             job_id=self.job_spec.job_id or JobWorkspace.generate_job_id(),

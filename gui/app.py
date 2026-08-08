@@ -1409,6 +1409,8 @@ class WorkspaceController:
         workflow_state = self.state["workflow"]
         resolved_input_mode = str(input_mode or workflow_state.get("input_mode") or "pdf")
         resolved_work_mode = str(work_mode or workflow_state.get("work_mode") or "normal")
+        if resolved_work_mode == "concept":
+            raise ValueError("Concept Mode is not yet available in the current PR14 runtime")
         library_path = str(self.state["paths"].get("library_path") or "").strip() or None if resolved_input_mode == "zotero" else None
         effective_pdf_folder = str(pdf_folder or "").strip() or None if resolved_input_mode == "pdf" else None
         effective_zotero_report = str(zotero_report or "").strip() or None if resolved_input_mode == "zotero" else None
@@ -2638,6 +2640,13 @@ class WorkspaceController:
         zotero_report = str(self.state["paths"]["zotero_report"]).strip()
         library_path = str(self.state["paths"]["library_path"]).strip()
 
+        if work_mode == "concept":
+            self.notify(
+                self.t("Concept Mode is not yet available in the current PR14 runtime."),
+                color="warning",
+            )
+            return False
+
         if not project_name:
             self.notify(self.t("请先填写项目名。"), color="warning")
             return False
@@ -3094,22 +3103,18 @@ def _render_workflow_mode_card(controller: WorkspaceController) -> None:
     t = controller.t
     with ui.card().classes("ag-card p-6 w-full"):
         ui.label(t("运行方式")).classes("ag-section-title")
-        ui.label(t("先用普通模式跑通第一轮；只有在确实需要额外概念抽取或先聊清写作意图时，再切换模式。")).classes("ag-subtle")
+        ui.label(t("先用普通模式跑通第一轮；自由模式可在写综述前先和规划助手聊清目标。")).classes("ag-subtle")
         ui.toggle(
             {
                 "normal": t("普通模式"),
-                "concept": t("概念增强模式"),
                 "free": t("自由模式"),
             },
             value=controller.state["workflow"]["work_mode"],
-        ).bind_value(controller.state["workflow"], "work_mode").classes("ag-mode-toggle ag-mode-toggle-3 w-full q-mt-md")
-        with ui.element("div").classes("ag-toggle-ledger ag-toggle-ledger-3"):
+        ).bind_value(controller.state["workflow"], "work_mode").classes("ag-mode-toggle ag-mode-toggle-2 w-full q-mt-md")
+        with ui.element("div").classes("ag-toggle-ledger ag-toggle-ledger-2"):
             with ui.element("div").classes("ag-toggle-note"):
                 ui.label(t("普通模式")).classes("text-body1")
                 ui.label(t("普通模式：适合第一次运行和大多数常规任务。")).classes("ag-subtle ag-wrap-note")
-            with ui.element("div").classes("ag-toggle-note"):
-                ui.label(t("概念增强模式")).classes("text-body1")
-                ui.label(t("概念增强：只在你要围绕某个核心概念补抓变量、定义和比较时使用。")).classes("ag-subtle ag-wrap-note")
             with ui.element("div").classes("ag-toggle-note"):
                 ui.label(t("自由模式")).classes("text-body1")
                 ui.label(t("自由模式：先和规划助手聊清目标，再把规划应用到本次任务。")).classes("ag-subtle ag-wrap-note")
@@ -3118,12 +3123,8 @@ def _render_workflow_mode_card(controller: WorkspaceController) -> None:
 def _render_workflow_concept_card(controller: WorkspaceController) -> None:
     t = controller.t
     with ui.card().classes("ag-card p-6 w-full").bind_visibility_from(controller.state["workflow"], "work_mode", value="concept"):
-        ui.label(t("概念增强（仅在概念模式下填写）")).classes("ag-section-title")
-        ui.label(t("如果这次要围绕某个核心概念补抓变量、定义和比较关系，就填写概念词。普通模式可以留空。")).classes("ag-subtle")
-        ui.input(
-            t("概念增强模式概念词"),
-            value=controller.state["workflow"]["concept"],
-        ).bind_value(controller.state["workflow"], "concept").classes("w-full q-mt-md")
+        ui.label(t("Concept Mode is not yet available in the current PR14 runtime.")).classes("ag-section-title")
+        ui.label(t("概念增强模式已暂时关闭，请使用普通模式或自由模式。")).classes("ag-subtle ag-wrap-note")
 
 
 def _render_free_mode_planner_card(controller: WorkspaceController) -> None:
@@ -3960,7 +3961,7 @@ def launch_gui(
                     for step_index, title_key, note_key in [
                         ("01", "准备输入材料", "PDF 模式只需要文件夹；Zotero 模式需要 report 和 library。"),
                         ("02", "完成设置与模型连接", "先去设置页填路径，再检查 Reader / Writer / Outline 等模型是否可用。"),
-                        ("03", "进入工作台选择运行方式", "普通模式最适合第一次跑；概念增强和自由模式只在有明确需要时再用。"),
+                        ("03", "进入工作台选择运行方式", "普通模式最适合第一次跑；自由模式可在写综述前先和规划助手聊清目标。"),
                         ("04", "先跑仅分析文献", "先确认结构化摘要、预处理和抽取质量，再决定是否继续大纲和全文。"),
                         ("05", "去结果与日志页看工作区", "最新 job workspace 和主要产物比原始日志更值得先看。"),
                     ]:
@@ -3994,11 +3995,6 @@ def launch_gui(
                                 ui.label(t("最稳妥，最适合第一轮。")).classes("ag-step-note")
                         with ui.element("div").classes("ag-editorial-step"):
                             ui.label("02").classes("ag-step-index")
-                            with ui.column().classes("gap-1"):
-                                ui.label(t("概念增强模式")).classes("ag-step-title")
-                                ui.label(t("适合围绕某个概念做更聚焦的抽取、定义和比较。")).classes("ag-step-note")
-                        with ui.element("div").classes("ag-editorial-step"):
-                            ui.label("03").classes("ag-step-index")
                             with ui.column().classes("gap-1"):
                                 ui.label(t("自由模式")).classes("ag-step-title")
                                 ui.label(t("适合先和规划助手聊清楚目标，再把当前规划应用到本次任务。")).classes("ag-step-note")
