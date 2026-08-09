@@ -174,7 +174,7 @@ def build_free_mode_intent_envelope(
     else:
         raw_idea = str(idea or "")
         normalized_idea = raw_idea.strip()
-        review_intent = project_review_intent(None)
+        review_intent = build_review_intent({"review_question": normalized_idea}).to_dict()
         payload = {
             "artifact_type": FREE_MODE_INTENT_INPUT_ARTIFACT_TYPE,
             "artifact_version": FREE_MODE_INTENT_INPUT_ARTIFACT_VERSION,

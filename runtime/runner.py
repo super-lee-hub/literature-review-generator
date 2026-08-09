@@ -293,6 +293,7 @@ class AgentRuntimeRunner:
     def _normalized_spec(self, *, resume: bool) -> RuntimeJobSpec:
         if resume and not self.job_spec.job_id:
             raise RuntimeRunnerError("resume requires an explicit job_id")
+        resolved_job_id = self.job_spec.job_id or JobWorkspace.generate_job_id()
         metadata = dict(self.job_spec.metadata)
         requested_stages = metadata.get("requested_stages")
         from config_loader import load_config
@@ -332,7 +333,7 @@ class AgentRuntimeRunner:
                 envelope = build_free_mode_intent_envelope(
                     profile_path=self.job_spec.free_mode_profile,
                     idea=self.job_spec.free_mode_idea,
-                    job_id=self.job_spec.job_id or "",
+                    job_id=resolved_job_id,
                 )
                 if envelope is None:
                     raise RuntimeRunnerError("free mode input envelope could not be built")
@@ -341,7 +342,7 @@ class AgentRuntimeRunner:
             metadata["free_mode_context"] = build_free_mode_writer_context(envelope)
         return replace(
             self.job_spec,
-            job_id=self.job_spec.job_id or JobWorkspace.generate_job_id(),
+            job_id=resolved_job_id,
             metadata=metadata,
         )
 

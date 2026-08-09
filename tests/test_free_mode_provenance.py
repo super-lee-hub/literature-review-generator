@@ -4,6 +4,7 @@ import pytest
 
 from runtime.job_spec import RuntimeJobSpec, RuntimeSourceSpec
 from services.job_runner import (
+    CONCEPT_MODE_DISABLED_MESSAGE,
     JobRunRequest,
     JobRunner,
     build_job_request_from_mapping,
@@ -128,3 +129,26 @@ def test_mapping_preserves_free_mode_options() -> None:
     )
     assert request.free_mode_idea == "draft idea"
     assert request.free_mode_profile is None
+
+
+def test_concept_mode_is_rejected_at_the_central_job_runner_boundary() -> None:
+    request = JobRunRequest(
+        config="config.ini",
+        project_name="demo",
+        pdf_folder="papers",
+        action="analyze",
+        concept="A causes B",
+    )
+    mapped = build_job_request_from_mapping(
+        {
+            "project_name": "demo",
+            "pdf_folder": "papers",
+            "action": "analyze",
+            "concept": "A causes B",
+        }
+    )
+
+    assert validate_job_request_options(request) == CONCEPT_MODE_DISABLED_MESSAGE
+    assert validate_job_request_options(mapped) == CONCEPT_MODE_DISABLED_MESSAGE
+    with pytest.raises(ValueError, match="Concept Mode is not yet available"):
+        JobRunner().run(request)
