@@ -1,0 +1,11 @@
+{
+  "project_name": "my_zotero_review",
+  "config": "../../config.ini",
+  "action": "run_all",
+  "source": {
+    "mode": "zotero",
+    "pdf_folder": "",
+    "zotero_report": "../../data/zotero/report.txt",
+    "library_path": "../../data/zotero/storage"
+  }
+}

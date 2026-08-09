@@ -17,7 +17,10 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urljoin, urlparse
 
-import fitz  # type: ignore
+try:
+    import pymupdf as fitz  # type: ignore
+except ImportError:  # pragma: no cover - compatibility with older PyMuPDF releases.
+    import fitz  # type: ignore
 import requests  # type: ignore
 
 from services.stage1_input_selector import Stage1InputSelection, select_stage1_input

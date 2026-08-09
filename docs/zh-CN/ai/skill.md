@@ -1,46 +1,35 @@
-# Codex/OMX Skill 文档
+# Codex/OMX Skill 契约
 
-> 受众：AI Agent、Codex/OMX 用户。
-> 来源：`.codex/skills/auto-generate-orchestrator/SKILL.md`
+> 真源：`.codex/skills/auto-generate-orchestrator/SKILL.md`。
 
-## 意图
+repo-local Skill 是与 GUI、CLI 共用 durable runtime 的 AI-native 适配层，不是
+另一个 peer control plane。
 
-- 在 CLI 和 GUI 之外增加第三条 AI-native 入口
-- 复用当前持久基座（`services/job_runner.py`、`services/job_workspace.py`、`services/artifact_registry.py`、`services/progress_state.py`、`validator.py`）
-- 保持确定性生命周期 / 持久化 / 渲染 / 验证转换在本地执行
-- 通过子 agent 路由生成阶段，而不是依赖 legacy CLI 或外部 API 包装
+## 当前 runtime
 
-## 规范约束
+```text
+AI request
+  -> RuntimeJobSpec
+  -> AgentRuntimeRunner
+  -> AgentRuntimeBridge
+  -> Registry-backed stages and workspace
+```
 
-1. `services.job_runner.JobRunRequest` 保持为规范请求模型
-2. CLI 和 GUI 保持为一等人类接口；不要替代它们
-3. AI 模式是加法面，MVP 阶段不进入队列，但必须保持 workspace 兼容
-4. 规范下游产物为 summaries、已注册 Outline v3 产物、当前 `review_draft`（artifact_version=v3）、`citation_manifest_v3`、docx、validation/repair 产物
+人类使用的机器控制面是 `python -m reviewctl`，后端是 `ReviewControlPlane`。
+`JobRunRequest` 只在当前代码需要时作为内部 adapter；公开的 durable run
+specification 是 `RuntimeJobSpec`。
 
-## 主要运行时辅助模块
+## 当前契约
 
-- `runtime.job_spec.RuntimeJobSpec`
-- `runtime.orchestrator.AgentRuntimeBridge`
-- `runtime.source_intake.*`
-- `runtime.subagent_policy.*`
-- `runtime.stage_contracts.*`
-- `runtime.lifecycle.*`
+- Outline Intelligence v3 是唯一生产 Outline 路径。
+- Stage 3 输出 `review_draft` artifact version v3、`citation_manifest` v3 和 DOCX。
+- Validation 使用 `ValidationExecutionService`、`current_validation`、
+  `adjudication_reuse` 和 Registry-backed `closure` 证据。
+- Free Mode 使用 `free_mode_intent_input/v1`、`ReviewIntent` projection 和
+  Writer context binding。
+- Concept Mode is currently disabled（概念模式当前不可用）。过时请求会被拒绝，
+  不会静默降级。
 
-## 预期操作模式
-
-1. 将 AI 输入归一化为 `RuntimeJobSpec`
-2. 编译为规范 `JobRunRequest`
-3. 本地构建 source intake bundle
-4. 本地引导 workspace / registry / resume 状态
-5. 将生成阶段委托给子 agent：阶段一分析、阶段二提纲、阶段三综述
-6. 通过现有规范产物辅助模块持久化输出
-7. 通过现有验证接缝本地运行验证
-8. 注册 runtime stage trace 产物，使执行模式可观测
-
-## 硬禁止
-
-- 不要把 `python main.py ...` 作为规范 AI 运行时
-- 不要引入第二个平行的请求模型
-- 不要绕过 latest-pointer / artifact-registry / resume-state 行为
-- 不要用替代 schema 替换当前 `review_draft` / `citation_manifest_v3` 契约
-- 当更丰富的产物证据存在时，不要把仅摘要级别的证据当作验证真相
+source intake、workspace、Registry publication、stage closure、resume、validation
+和 runtime trace 必须保持本地且 durable，不要用 shell 命令或 report projection
+替代它们。

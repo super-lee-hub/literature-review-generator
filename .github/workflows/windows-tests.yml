@@ -22,6 +22,8 @@ jobs:
       PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
@@ -30,9 +32,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install --prefer-binary -r requirements-dev.txt
+      - name: Compile check
+        run: python -m compileall -q .
+      - name: Collect tests
+        run: python -m pytest --collect-only -q
+      - name: Public CLI smoke
+        run: |
+          python -m reviewctl --help
+          python -m reviewctl plan --help
+          python -m reviewctl run --help
+          python -m reviewctl doctor --help
+          python -m reviewctl status --help
+          python -m reviewctl inspect --help
+          python -m reviewctl next-action --help
+          python -m reviewctl resume --help
+          python -m reviewctl validate --help
+          python -m reviewctl validation-status --help
+          python -m reviewctl queue-list --help
+          python -m reviewctl queue-add --help
+          python -m reviewctl queue-run --help
       - name: Strict-offline test suite
         run: >-
           python -m pytest -q --strict-markers
           -m "not live_api and not playwright and not heavy_ocr"
       - name: Type check
         run: python -m pyright
+      - name: Doctor
+        run: python -m reviewctl doctor --config config.ini.example
+      - name: Committed-range whitespace check
+        run: git diff --check HEAD~1 HEAD

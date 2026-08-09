@@ -1,90 +1,50 @@
-# AI Handoff Document
+# AI handoff
 
-> Audience: AI agents, new maintainers.
-> Source: AGENTS.md §1-3, §9, §10, §14.
+This document is for AI agents and new maintainers. Read current sources before
+editing; historical migration and baseline documents retain their original
+claims and evidence.
 
-## Documentation Split
+## Current reading order
 
-Current documentation division:
+1. `AGENTS.md`
+2. `docs/en/runtime/truth-sources.md`
+3. `docs/en/reference/feature-matrix.md`
+4. `runtime/job_spec.py`
+5. `reviewctl.py`
+6. `runtime/control_plane.py`
+7. `runtime/runner.py`
+8. `runtime/orchestrator.py`
+9. `services/job_runner.py`
+10. `services/artifact_registry.py`
+11. `services/job_workspace.py`
+12. `outline/v3_executor.py`
+13. `services/review_generation_service.py`
+14. `validation/execution_service.py`
+15. `validation/current_validation.py`
+16. `validation/closure.py`
+17. `runtime/provider_receipt_closure.py`
 
-- `README.md` — Project landing page / router; no longer carries all detail
-- `README.zh-CN.md` — Complete Chinese user guide
-- `README.en.md` — Complete English user guide
-- `AGENTS.md` — AI / new maintainer handoff entry point (fat stub with reading order and links)
-- `TRUTH_SOURCES.md` — Runtime truth, durable artifacts, compatibility paths (thin stub → docs/)
-- `FEATURE_MATRIX.md` — Feature status matrix (thin stub → docs/)
-- `ARCHITECTURE_BASELINE.md` — Migration-era baseline (thin stub → docs/)
+Stage 1-specific work should then use `summary_schema.py`,
+`preprocess/service.py`, and `services/summary_reuse.py`.
 
-## Project Summary
+## Current truth
 
-`auto-generate` is a local AI literature analysis and review-writing workbench supporting:
+- The public CLI is `python -m reviewctl`.
+- `RuntimeJobSpec` is the current durable run specification.
+- `AgentRuntimeRunner` and `AgentRuntimeBridge` own the AI-native execution
+  path.
+- Outline Intelligence v3 is the only current Outline path.
+- Stage 3 truth is `review_draft` v3 plus `citation_manifest` v3 and DOCX.
+- Validation truth is owned by `ValidationExecutionService` and its
+  Registry-backed closure/adjudication authority.
+- `main.py` is a small compatibility-free shim into `reviewctl`, not the old
+  orchestration CLI.
+- Concept Mode is currently disabled and stale requests are rejected.
 
-- PDF folder input
-- Zotero report + Zotero library input
-- CLI, GUI, and repo-local Codex skill — three entry points
-- Stage 1 summaries / Outline Intelligence v3 / Stage 3 review draft
-- GUI background queue, checkpoint resume, summary reuse, preprocess cache, validation/repair, optional local RAG
+## Safety boundaries
 
-It should no longer be understood as a "single-script literature review generator" but as a local workbench with workspace / artifact / GUI background queue infrastructure.
-
-## Recommended Reading Order
-
-If you are a new AI conversation, build context in this order:
-
-1. `AGENTS.md` (fat stub at root)
-2. `TRUTH_SOURCES.md` → [../runtime/truth-sources.md](../runtime/truth-sources.md)
-3. `FEATURE_MATRIX.md` → [../reference/feature-matrix.md](../reference/feature-matrix.md)
-4. `summary_schema.py`
-5. `services/job_runner.py`
-6. `main.py`
-7. `gui/app.py`
-8. `.codex/skills/auto-generate-orchestrator/SKILL.md`
-9. `runtime/orchestrator.py`
-10. `preprocess/service.py`
-11. `services/summary_reuse.py`
-12. `validation/review_validator.py`
-13. `services/repair_integration.py`
-14. `tests/test_summary_reuse.py`
-15. `tests/test_gui_playwright.py`
-16. `tests/test_runtime_orchestrator.py` / `tests/test_runtime_subagent_contract.py`
-17. `tests/test_job_runner.py`
-18. `tests/test_week3_validation.py` / `tests/test_week4_repair_integration.py`
-
-Key notes: `summary_schema.py` is the canonical summary fact source; `services/job_runner.py` is the primary job workspace / resume / artifact coordination entry; `tests/*` are often more trustworthy than old comments and help text.
-
-## Configuration System
-
-Recommended convention: secrets in `.env`, non-sensitive parameters in `config.ini`.
-
-Key config sections: `Paths`, `Primary_Reader_API`, `Backup_Reader_API`, `Writer_API`, `Outline_API`, `Free_Mode_API`, `Validator_API`, `Performance`, `Preprocess`, `Runtime`, `Validation`, `Styling`, `GUI`. Provider-owned output limits, context limits, timeouts, and transport retry ceilings live in the relevant provider section.
-
-Key environment variables: `LLM_PRIMARY_READER_API`, `LLM_BACKUP_READER_API`, `LLM_WRITER_API`, `LLM_OUTLINE_API`, `LLM_FREE_MODE_API`, `LLM_VALIDATOR_API`, `MINERU_*`
-
-## Current Capabilities
-
-When updating README or introducing the project, at minimum cover:
-- PDF folder / Zotero dual input
-- GUI + CLI + repo-local Codex skill three entry points
-- job workspace + artifact registry + latest pointer
-- stage-1 summary reuse
-- downstream `--summary-file` + `--summary-source`
-- GUI workflow-page queue system
-- partial rerun / failed retry
-- preprocess cache + OCR fallback
-- free mode profile / idea
-- review_draft (artifact_version=v3) + citation_manifest_v3
-- optional validation / repair
-- optional local RAG
-- AI-native runtime bridge + `source_bundle.json` / `runtime_stage_trace.json`
-
-## Conclusion for Future AI Conversations
-
-Default understanding of this project:
-
-- A local AI literature analysis / review-writing workbench built on job workspace / artifact / GUI background queue infrastructure
-- Entry points: `main.py` CLI, `launch_gui.py` + `gui/app.py` GUI, and repo-local Codex skill
-- Stage 1 truth is canonical summaries; Stage 3 truth is `review_draft (artifact_version=v3) + citation_manifest_v3`
-- `README.md` is now only a router page; user details in `README.zh-CN.md` / `README.en.md`
-- For deeper artifact / compatibility details, see `docs/en/runtime/`
-
-Read this file first, then switch to the relevant module for the task. Do not treat old migration docs or scattered comments as the sole fact source.
+Do not bypass the Registry, fake provider receipts, turn report projections into
+canonical truth, silently promote intermediate Outline candidates, restore
+Outline v2, or change frozen Stage 1, Free Mode, validation authority, queue,
+repair, promotion, export, or publication contracts without a deterministic
+regression proving a real defect.

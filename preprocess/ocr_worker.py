@@ -6,7 +6,10 @@ import json
 from pathlib import Path
 import sys
 
-import fitz  # type: ignore
+try:
+    import pymupdf as fitz  # type: ignore
+except ImportError:  # pragma: no cover - compatibility with older PyMuPDF releases.
+    import fitz  # type: ignore
 
 
 def main(argv: list[str] | None = None) -> int:
