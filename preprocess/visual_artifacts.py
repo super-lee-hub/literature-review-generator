@@ -11,7 +11,10 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-import fitz  # type: ignore
+try:
+    import pymupdf as fitz  # type: ignore
+except ImportError:  # pragma: no cover - compatibility with older PyMuPDF releases.
+    import fitz  # type: ignore
 
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact, utc_now_iso

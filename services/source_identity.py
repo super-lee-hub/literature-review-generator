@@ -274,7 +274,10 @@ def inspect_pdf_identity(
     metadata: dict[str, Any] = {}
     first_page_text = ""
     try:
-        import fitz  # type: ignore
+        try:
+            import pymupdf as fitz  # type: ignore
+        except ImportError:  # pragma: no cover - compatibility with older PyMuPDF releases.
+            import fitz  # type: ignore
 
         with fitz.open(str(path)) as document:
             metadata = dict(document.metadata or {})

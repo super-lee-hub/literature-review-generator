@@ -20,7 +20,10 @@ except ImportError:  # pragma: no cover - optional dependency.
 
 # 为PyMuPDF(fitz)类型创建类型别名
 try:
-    import fitz  # PyMuPDF  # type: ignore
+    try:
+        import pymupdf as fitz  # PyMuPDF  # type: ignore
+    except ImportError:  # pragma: no cover - compatibility with older PyMuPDF releases.
+        import fitz  # type: ignore
     # 类型别名，用于提高类型检查的清晰度
     FitxDocument = fitz.Document  # type: ignore
     FitxPage = fitz.Page  # type: ignore
@@ -81,8 +84,6 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
     
     # 尝试使用PyMuPDF提取文本
     try:
-        import fitz  # PyMuPDF  # type: ignore
-        
         doc: FitxDocument = fitz.open(pdf_path)  # type: ignore
         logging.info(f"PyMuPDF: PDF文件包含 {doc.page_count} 页")  # type: ignore
         
@@ -123,8 +124,6 @@ def get_pdf_info(pdf_path: str) -> Optional[Dict[str, _Any]]:
         return None
     
     try:
-        import fitz  # PyMuPDF  # type: ignore
-        
         doc: _Any = fitz.open(pdf_path)  # type: ignore - 使用_Any避免类型冲突
         metadata: Dict[str, _Any] = doc.metadata or {}  # type: ignore
         info: Dict[str, _Any] = {
@@ -154,8 +153,6 @@ def is_scanned_pdf(pdf_path: str) -> bool:
         如果是扫描版PDF返回True，否则返回False
     """
     try:
-        import fitz  # PyMuPDF  # type: ignore
-        
         doc: _Any = fitz.open(pdf_path)  # type: ignore - 使用_Any避免类型冲突
         
         for page_num in range(doc.page_count):  # type: ignore
