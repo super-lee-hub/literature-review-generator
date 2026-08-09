@@ -72,6 +72,11 @@ class ValidationExecutionService:
         init=False,
         repr=False,
     )
+    _preexisting_provider_receipt_ids: set[str] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
     _expected_provider_calls: dict[str, ExpectedProviderCall] = field(
         default_factory=dict,
         init=False,
@@ -83,6 +88,16 @@ class ValidationExecutionService:
         repr=False,
     )
     _adjudication_reuse_records: dict[str, Any] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _provisional_adjudication_reuse_records: dict[str, Any] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
+    _verified_reuse_evidence_records: dict[str, Any] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -181,11 +196,17 @@ class ValidationExecutionService:
                 char if char.isalnum() or char in {"-", "_", "."} else "_"
                 for char in self.closure_epoch_id
             )
-            self._provider_receipt_ledger = ProviderRuntimeLedger(
+            ledger = ProviderRuntimeLedger(
                 self.workspace.artifact_path(
                     f".publication-staging/provider-receipts/stage4_validate/{safe_epoch}.jsonl"
                 )
             )
+            self._preexisting_provider_receipt_ids = {
+                str(receipt.receipt_id)
+                for receipt in ledger.list_receipts()
+                if str(receipt.receipt_id)
+            }
+            self._provider_receipt_ledger = ledger
         return self._provider_receipt_ledger
 
     def new_provider_runtime(
@@ -397,6 +418,7 @@ class ValidationExecutionService:
             metadata={"reuse_key": reuse_key, "closure_bound": False},
         )
         self._adjudication_reuse_records[reuse_key] = record
+        self._provisional_adjudication_reuse_records[reuse_key] = record
         return record
 
     def register_verified_reuse_call(
@@ -417,6 +439,19 @@ class ValidationExecutionService:
         raw = self._load_json(reuse_record.path)
         call_id = adjudication_call_id(packet)
         normalized_hash = hash_json(output_payload)
+        existing = self._expected_provider_calls.get(call_id)
+        self._verified_reuse_evidence_records[call_id] = reuse_record
+        if existing is not None:
+            if existing.verified_reuse:
+                if existing.reuse_evidence_artifact_id != reuse_record.artifact_id:
+                    raise RuntimeError(
+                        f"verified reuse evidence changed for provider call: {call_id}"
+                    )
+            # A same-service reuse is evidence of a normal call which has
+            # already been admitted and observed.  Preserve that normal call
+            # in the expected graph so closure accounting still requires its
+            # receipt instead of silently converting it into a zero-call reuse.
+            return call_id
         expected = ExpectedProviderCall(
             call_id=call_id,
             job_id=self.job_id,
@@ -455,9 +490,14 @@ class ValidationExecutionService:
         ledger_record: Any | None,
     ) -> list[Any]:
         records: list[Any] = []
-        for reuse_key, original in list(self._adjudication_reuse_records.items()):
-            if str(original.metadata.get("closure_bound") or "") == "true":
-                continue
+        if closure_record is None or closure_record.status != "ready":
+            return records
+        closure_payload = self._load_json(closure_record.path).get("payload")
+        if not isinstance(closure_payload, Mapping) or closure_payload.get("complete") is not True:
+            return records
+        if ledger_record is None or ledger_record.status != "ready":
+            return records
+        for reuse_key, original in list(self._provisional_adjudication_reuse_records.items()):
             payload = self._load_json(original.path)
             payload["source_receipt_ledger_artifact_id"] = (
                 str(ledger_record.artifact_id) if ledger_record is not None else ""
@@ -467,13 +507,13 @@ class ValidationExecutionService:
             )
             payload["source_provider_closure_artifact_id"] = closure_record.artifact_id
             payload["source_provider_closure_artifact_hash"] = closure_record.content_hash
+            payload["authority_state"] = "durable"
             artifact_id = reuse_record_artifact_id(reuse_key, closure_bound=True)
             path = self.workspace.artifact_path(
                 f"validation_reuse/{reuse_key}.closure-bound.json"
             )
             dependencies = [ArtifactDependencyRefV2.from_record(original)]
-            if ledger_record is not None:
-                dependencies.append(ArtifactDependencyRefV2.from_record(ledger_record))
+            dependencies.append(ArtifactDependencyRefV2.from_record(ledger_record))
             dependencies.append(ArtifactDependencyRefV2.from_record(closure_record))
             record = publish_json_artifact(
                 self.publication_context,
@@ -486,7 +526,11 @@ class ValidationExecutionService:
                 producer="validation.execution_service.ValidationExecutionService.publish_closure_bound_reuse_records",
                 artifact_id=artifact_id,
                 depends_on=dependencies,
-                metadata={"reuse_key": reuse_key, "closure_bound": "true"},
+                metadata={
+                    "reuse_key": reuse_key,
+                    "closure_bound": "true",
+                    "authority_state": "durable",
+                },
             )
             self._adjudication_reuse_records[f"{reuse_key}:closure-bound"] = record
             records.append(record)
@@ -510,9 +554,19 @@ class ValidationExecutionService:
         )
         closure_bound_id = reuse_record_artifact_id(reuse_key, closure_bound=True)
         candidate = self.artifact_registry.get(closure_bound_id)
-        if candidate is None or candidate.status != "ready":
+        authority = "durable"
+        if candidate is None:
             candidate = self.artifact_registry.get(reuse_record_artifact_id(reuse_key))
-        if candidate is None or candidate.status != "ready":
+            authority = "provisional"
+            owned = self._provisional_adjudication_reuse_records.get(reuse_key)
+            if (
+                owned is None
+                or candidate is None
+                or owned.artifact_id != candidate.artifact_id
+                or owned.content_hash != candidate.content_hash
+            ):
+                return None, candidate, "adjudication_reuse_provisional_authority_unowned"
+        if candidate.status != "ready":
             return None, None, ""
         report, error = verify_reuse_record(
             self.artifact_registry,
@@ -522,6 +576,7 @@ class ValidationExecutionService:
             input_dependency_hashes=self._input_dependency_hashes,
             current_epoch=self.closure_epoch_id,
             service=self,
+            authority=authority,
         )
         if error:
             return None, candidate, error
@@ -745,7 +800,11 @@ class ValidationExecutionService:
     ) -> dict[str, Any]:
         """Persist receipt ledger and evaluate against pre-transport expectations."""
 
-        receipts = list(self.provider_receipt_ledger.list_receipts())
+        receipts = [
+            receipt
+            for receipt in self.provider_receipt_ledger.list_receipts()
+            if str(receipt.receipt_id) not in self._preexisting_provider_receipt_ids
+        ]
         expected_calls = list(self._expected_provider_calls.values())
         closure: ReceiptClosureResult = ProviderReceiptClosure.evaluate(
             expected_calls,
@@ -816,6 +875,8 @@ class ValidationExecutionService:
                 )
             )
         for reuse_record in list(self._adjudication_reuse_records.values()):
+            add_dependency(reuse_record)
+        for reuse_record in list(self._verified_reuse_evidence_records.values()):
             add_dependency(reuse_record)
         closure_record = publish_json_artifact(
             self.publication_context,

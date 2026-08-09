@@ -1112,35 +1112,25 @@ def _adjudication_reuse_receipt_verified(
     payload: Mapping[str, Any],
     dependency_records: Sequence[ArtifactRecord],
 ) -> bool:
-    receipt_id = str(payload.get("source_receipt_id") or "")
-    receipt_hash = str(payload.get("source_receipt_hash") or "")
-    if not receipt_id or not receipt_hash:
+    from validation.adjudication_reuse import durable_reuse_authority_issues, reuse_record_artifact_id
+
+    reuse_key = str(payload.get("reuse_key") or "")
+    candidate = next(
+        (
+            record
+            for record in dependency_records
+            if reuse_key
+            and record.artifact_id == reuse_record_artifact_id(reuse_key, closure_bound=True)
+        ),
+        None,
+    )
+    if candidate is None:
         return False
-    ledger_records = [
-        record
-        for record in dependency_records
-        if record.artifact_type == "provider_receipt_ledger"
-    ]
-    source_closure_id = str(payload.get("source_provider_closure_artifact_id") or "")
-    if source_closure_id:
-        source_closure = registry.get(source_closure_id)
-        if source_closure is not None and source_closure.status == "ready":
-            for dependency in source_closure.depends_on:
-                candidate = registry.get(dependency.artifact_id)
-                if (
-                    candidate is not None
-                    and candidate.status == "ready"
-                    and candidate.artifact_type == "provider_receipt_ledger"
-                ):
-                    ledger_records.append(candidate)
-    for ledger_record in ledger_records:
-        for row in _read_jsonl_objects(ledger_record.path):
-            if (
-                str(row.get("receipt_id") or "") == receipt_id
-                and hash_json(row) == receipt_hash
-            ):
-                return True
-    return False
+    issues = durable_reuse_authority_issues(registry, candidate)
+    return not any(
+        "receipt" in issue or "ledger" in issue or "closure" in issue
+        for issue in issues
+    )
 
 
 def _adjudication_reuse_closure_verified(
@@ -1149,24 +1139,16 @@ def _adjudication_reuse_closure_verified(
     *,
     closure_epoch_id: str,
 ) -> bool:
-    source_epoch = str(payload.get("source_provider_closure_epoch_id") or "")
-    closure_id = str(payload.get("source_provider_closure_artifact_id") or "")
-    closure_hash = str(payload.get("source_provider_closure_artifact_hash") or "")
-    if not source_epoch:
+    del closure_epoch_id
+    from validation.adjudication_reuse import durable_reuse_authority_issues, reuse_record_artifact_id
+
+    reuse_key = str(payload.get("reuse_key") or "")
+    candidate = registry.get(reuse_record_artifact_id(reuse_key, closure_bound=True)) if reuse_key else None
+    if candidate is None:
         return False
-    if not closure_id or not closure_hash:
-        return source_epoch == closure_epoch_id
-    record = registry.get(closure_id)
-    if record is None or record.status != "ready" or record.content_hash != closure_hash:
-        return False
-    raw = _json_object(record.path)
-    if raw is None:
-        return False
-    payload_value = raw.get("payload")
-    closure_payload = payload_value if isinstance(payload_value, Mapping) else raw
-    return (
-        str(closure_payload.get("closure_epoch_id") or "") == source_epoch
-        and bool(closure_payload.get("complete"))
+    return not any(
+        "closure" in issue
+        for issue in durable_reuse_authority_issues(registry, candidate)
     )
 
 
@@ -1220,6 +1202,16 @@ def _adjudication_reuse_call_issues(
             f"provider_closure_adjudication_reuse_record_unreadable:{stage}:{call_id}"
         )
         return issues
+    from validation.adjudication_reuse import durable_reuse_authority_issues
+
+    for authority_issue in durable_reuse_authority_issues(
+        registry,
+        reuse_record,
+        expected_call=expected_call,
+    ):
+        issues.append(
+            f"provider_closure_adjudication_reuse_authority_invalid:{stage}:{call_id}:{authority_issue}"
+        )
     for field in (
         "call_id",
         "node_id",
