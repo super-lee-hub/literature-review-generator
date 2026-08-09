@@ -1,39 +1,36 @@
-# 功能实现状态矩阵
+# 当前功能矩阵
 
-状态对应当前 `codex/platform-hardening-outline-v3` 分支和最新离线验证。
-`IMPLEMENTED` 表示组件存在，`INTEGRATED` 表示已接入生产调用方，
-`CONTROLLER_VERIFIED` 只表示 controller/label 边界已验证，不宣称浏览器自动化，
-`E2E_VERIFIED` 表示当前生产形状链路实际跑过，`LIVE_VERIFIED` 只保留给真实
-外部 Provider 运行，`NOT_VERIFIED` 表示所需 live 或 UI 证据尚未运行。
+本矩阵描述当前 main 的公共能力，不写入会随时间漂移的 pytest 精确数量；精确数量
+应记录在 PR 或 release verification evidence 中。Windows GitHub Actions 当前负责
+strict-offline tests、Pyright、compile、collection、public CLI smoke、doctor 和
+committed-range whitespace gates。
 
-当前离线 collection 为 855；严格 marker 选择为 selected 833、deselected 22，
-严格 aggregate 已通过（`833 passed, 22 deselected`，`2644.77s`，约 44:04）。
-这是本地 pytest 时长；最终 SHA 的 GitHub Actions 时长在 PR 描述中单独报告。
-Live API、Playwright、heavy OCR 和多主机验证本轮仍为 `NOT_RUN`。
+| 能力 | 当前状态 | 边界 |
+| --- | --- | --- |
+| Outline Intelligence v3 | `E2E_VERIFIED` | 唯一当前生产 Outline 路径 |
+| Free Mode typed intent | `E2E_VERIFIED` | `free_mode_intent_input/v1` |
+| Free Mode -> ReviewIntent | `E2E_VERIFIED` | literal idea projection 与 writer binding |
+| Free Mode Writer replay binding | `E2E_VERIFIED` | replay 时保持 context 与 identity 绑定 |
+| Stage 1 independence from Free Mode | `E2E_VERIFIED` | Stage 1 使用独立的当前契约 |
+| Concept Mode | `DISABLED` | 过时请求会被拒绝 |
+| Validation adjudication single-flight | `E2E_VERIFIED` | 仅声明 single-host 范围 |
+| Registry-backed durable adjudication reuse | `E2E_VERIFIED` | provisional 与 durable closure-bound authority |
+| `reviewctl` control plane | `E2E_VERIFIED` | `RuntimeJobSpec` -> `AgentRuntimeRunner` |
+| Stage 3 review contract | `E2E_VERIFIED` | `review_draft` v3、`citation_manifest` v3、DOCX |
+| Queue fencing/publication | `E2E_VERIFIED` | 当前 lease 与 Registry boundary |
+| JobOutcome / CurrentArtifactSet | `E2E_VERIFIED` | Registry-backed canonical authority |
+| Repair/promotion 与 export admission | `E2E_VERIFIED` | 当前 transaction 与 dependency gates |
 
-| 功能 | 状态 | 规范实现 |
-|---|---|---|
-| 来源 inventory 与 identity gate | E2E_VERIFIED | 内容 hash；DOI 或标题加真实作者/年份证据；match/ambiguous/mismatch；Stage 1 前 quarantine |
-| Zotero 与 FileIndex | IMPLEMENTED | 带诊断解析、按 root 隔离、只读、多候选 |
-| Artifact Registry v2 | E2E_VERIFIED | revision 锁事务、typed multi-record 原子保存、READY 本地/跨 job 依赖递归 fail-closed 校验、lease manifest 的 target type/version/path/hash 绑定，以及对既有相同 hash immutable publication target 的保护 |
-| Job outcome 与 attempts | E2E_VERIFIED | Registry 权威 canonical outcome、append-only attempts、带 fencing 的兼容投影写入、陈旧/篡改投影修复和 pointer 所有权 |
-| Stage 1 与证据 | E2E_VERIFIED | 不可变 content-addressed summaries、paper artifact、evidence manifest、typed `stage1_reusable_summary_manifest/v1` source manifest、edge checkpoint；同 epoch 稳定 provider authority、zero-call closure、all-reuse/mixed-reuse provenance、真实 Registry source-artifact binding，且不伪造 receipt ledger；summary -> source_bundle -> 来源 PDF 依赖链 |
-| ReviewBatch 派生 | INTEGRATED | 固定父 hash、child Stage 1 调用为零、derivation/coordinator lease、单调 generation、immutable max-head projection receipt |
-| Outline Intelligence v3 | E2E_VERIFIED | 已注册 artifact validation surface、确定性 node DAG、精确 execution/replay 闭包、typed quality gate、`off`/`smoke`/`full` stability、调用/成本 preflight、checkpointed subruns、health、critic retry scope 和显式 versioned adoption |
-| Review/Citation/DOCX | E2E_VERIFIED | 当前 review draft v3、完整 section binding、manifest v3、token spans、实际引用 bibliography、DOCX |
-| Validation 真相源 | E2E_VERIFIED | 显式 `ValidationExecutionService` constructor，以及 direct/CLI/GUI/queue 共享入口 policy；transport 前 request binding；response/normalized/artifact/node receipt 闭包；持久化回读并绑定 job/attempt/hash 的 `ValidationRunResultV1`；optional disabled 时使用 typed `ValidationDispositionV1(status=not_requested, allow_unvalidated=true)` 和 typed zero-call receipt closure；review/citation/evidence `depends_on` 精确闭包；其他报告仅为投影 |
-| Stage plan 与 `run_all` policy | E2E_VERIFIED | validation 启用时持久化 plan 固定为 analyze/outline/review/validate；禁用时只省略 optional validation 并发布 typed not-requested disposition 与 zero-call validation closure，但仍要求 `CurrentArtifactSet`；派生或 outline-only 不能在没有 current set 时 canonical-ready |
-| Outline quality 与 stability gates | E2E_VERIFIED | typed `OutlineQualityGate`、effective-section/duplicate/placeholder/empty-stream audit、一个额外的完整 reversed-summary smoke chain、full-decision stability variants、逐节点 call/token/cost plan、provider/model 绑定 pricing、硬 call/context/prompt/total-token admission、zero-transport exact replay 和 gate-hash invalidation |
-| Repair promotion boundary | E2E_VERIFIED | typed issue/action/auto-safe patch、current service revalidation、quarantined 派生版本、原子 `CurrentArtifactSet` 切换以及不覆盖 canonical 的 versioned draft/manifest/DOCX/audit/lineage promotion |
-| AgentRuntimeRunner | E2E_VERIFIED | 在 `AgentRuntimeBridge` 上提供 run/resume/status/reconcile；持久化 `BaseException` 终态并从规范 artifact 恢复 Validation disposition |
-| Queue 状态映射 | E2E_VERIFIED | Queue 读取 `job_status`；旧 success 仅为 readiness 投影；lease-generation staging 按 queue-lock -> Registry 顺序发布 immutable bytes；target 与 lease publication manifest 原子提交并校验 live target/schema/递归依赖；失败只留下未引用 immutable bytes；重复/direct alias 保护既有相同文件，并覆盖 Windows `spawn` stale-worker current-set race |
-| Trust-bound canonical export | E2E_VERIFIED | `canonical_verified` 与真实 `canonical_unvalidated` 都通过 completion、typed disposition、CurrentArtifactSet、stage closure、Registry dependency、ZIP provenance 和 forensic read-back；unvalidated 明确警告且不声称 clean validation |
-| Publication architecture gate | E2E_VERIFIED | 当前 writer 使用 publication boundary；architecture scan 拒绝 canonical path 写/替换后再单独 Registry 注册，仅允许狭窄的 private staging/cache/rendering/read-only legacy 例外 |
-| MinerU/Docling/OCR 稳定性 | IMPLEMENTED | preflight、共享认证熔断、受控子进程 timeout |
-| Windows 输出 | IMPLEMENTED | UTF-8 控制台与 ASCII-safe JSON progress |
-| GUI workflow 与 queue | CONTROLLER_VERIFIED | 本地 workflow controller/status label、跨进程原子 queue snapshot、CAS worker lease、heartbeat、expiry/crash recovery 和 serial persistent queue；Playwright 尚未运行 |
-| 过期 workspace | IMPLEMENTED | 缺少当前 identity/readiness 字段时拒绝进入运行，保持非 ready |
-| 真实 provider smoke | NOT_VERIFIED | 必须具备 marker、显式开关和凭据；本轮未调用 live provider |
+## 证据限制
 
-未来工作必须写成带责任边界和自动化验收的具体 limitation；不能把 deterministic
-offline 证据描述为 live verification。
+以下范围不由 strict-offline evidence 声明：
+
+- live API/provider verification — `NOT VERIFIED`
+- Playwright — `NOT VERIFIED`
+- heavy OCR — `NOT VERIFIED`
+- multi-host single-flight — `NOT VERIFIED`
+- multi-host publication/fencing — `NOT VERIFIED`
+- cryptographic provenance verification — `NOT CLAIMED`
+
+`reviewctl doctor` 可能报告的 stale-lock warning 是 non-blocking diagnostic。本矩阵
+不授权自动删除 lock。

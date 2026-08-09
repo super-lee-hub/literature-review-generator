@@ -1,0 +1,12 @@
+{
+  "project_name": "mechanism_comparison",
+  "config": "../../config.ini",
+  "action": "run_all",
+  "source": {
+    "mode": "direct",
+    "pdf_folder": "../../data/papers",
+    "zotero_report": "",
+    "library_path": ""
+  },
+  "free_mode_idea": "Compare mechanism A and mechanism B"
+}

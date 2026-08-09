@@ -1,412 +1,103 @@
-# auto-generate English Guide
+# auto-generate — English user guide
 
-> The root README (`README.md`) is now a landing page / router. This file owns the full English user guide.
+`auto-generate` is a local, corpus-controlled, full-text-first literature
+analysis and review-writing workbench. The pipeline is:
 
-## 1. Document split
+```text
+PDF folder or Zotero report + library
+  -> preprocessing and Stage 1 structured summaries
+  -> Outline Intelligence v3
+  -> review_draft v3 + citation_manifest v3 + DOCX
+  -> optional validation and repair
+```
 
-- `README.md`: landing page / router
-- `README.zh-CN.md`: full Chinese user guide
-- `README.en.md`: full English user guide (this file)
-- `AGENTS.md`: AI + maintainer handoff entry (fat stub → docs/)
-- [docs/en/](./docs/en/): full English technical docs site (developer, AI, runtime, reference)
-- [docs/zh-CN/](./docs/zh-CN/): full Chinese technical docs site
+The source corpus, workspace, artifact registry, stage closures, and validation
+evidence remain inspectable and resumable.
 
-## 2. What this project is
+## Choose an entry point
 
-`auto-generate` is now a local AI literature-analysis and review-writing workbench, not just the original single-script generator.
+| Need | Command or file |
+| --- | --- |
+| Initial configuration | `python setup_wizard.py` |
+| Guided GUI workflow | `python launch_gui.py` |
+| Machine-readable CLI | `python -m reviewctl` |
+| AI-native execution | `RuntimeJobSpec` -> `AgentRuntimeRunner` -> `AgentRuntimeBridge` |
 
-It supports two main input modes:
+`main.py` is a small compatibility-free shim into `reviewctl`. It is not the
+current orchestration engine and is not the public direct-run CLI.
 
-- **PDF folder mode**: scan a folder of PDF papers directly
-- **Zotero mode**: use `Zotero report + Zotero library`
-
-It now has three main entry surfaces:
-
-- **CLI**: `python main.py ...`
-- **GUI**: `python launch_gui.py`
-- **Codex / OMX skill**: the repo-local `auto-generate-orchestrator`, for AI-native execution inside Codex
-
-The main pipeline still follows three classic stages:
-
-1. **Stage 1: paper analysis** -> structured `summaries.json`
-2. **Stage 2: outline generation** -> `outline.md`
-3. **Stage 3: review generation** -> `docx`
-
-Around that core pipeline, the project now also includes:
-
-- a local GUI workbench
-- job workspaces / artifact registry / resume state
-- GUI-managed serial background queueing and recovery
-- PDF preprocessing cache, OCR fallback, and `normalized.md` intermediates
-- stage-1 summary reuse across runs
-- free-mode profile / idea flows
-- persisted review-draft + citation-manifest artifacts
-- optional validation / repair pipeline
-- optional local RAG
-
-## 3. Current capabilities
-
-### 3.1 What you can do
-
-- Batch-analyze papers from a PDF folder
-- Work from a Zotero report plus library path
-- Generate stage-1 summaries, stage-2 outlines, and stage-3 review documents
-- Regenerate one section only
-- Retry failed papers or failed review sections only
-- Reuse historical `summaries.json`
-- Merge multiple historical `summaries.json` files into one downstream run
-- Use either the GUI or the direct-run CLI
-- Use the repo-local Codex / OMX skill entry surface for AI-native execution
-- Submit GUI workflow jobs into the built-in serial background queue
-- Run optional review validation
-
-### 3.2 How the project currently works
-
-- **GUI and CLI share the same execution chain** instead of owning two separate engines.
-- **Codex skill mode is a third additive surface**: it does not replace GUI / CLI, and it still reuses the same workspace / artifact / validation substrate.
-- The real durable outputs now primarily live inside **job workspaces**, not the old mixed `output/<project>/` layout.
-- Word and Excel files are important exports, but many runtime truths now live in structured JSON artifacts.
-
-## 4. Install and initialize
-
-### 4.1 Install dependencies
+## Quick start
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 4.2 Run setup
-
-```bash
-python main.py --setup
-```
-
-### 4.3 Launch the GUI
-
-```bash
+python setup_wizard.py
 python launch_gui.py
 ```
 
-For development:
+For CLI use, edit a version-controlled `RuntimeJobSpec` example. The examples
+use placeholders only:
 
 ```bash
-python launch_gui.py --reload --no-show
+python -m reviewctl plan --spec examples/runtime_specs/direct-run-all.json
+python -m reviewctl plan --spec examples/runtime_specs/zotero-run-all.json
+python -m reviewctl plan --spec examples/runtime_specs/free-mode-idea.json
+python -m reviewctl run --spec my-run.json
 ```
 
-## 5. Quick start
+The `plan` command validates the source, action, paths, Free Mode input, and
+stage policy without performing a provider run. `run` executes the durable
+runtime described by the spec.
 
-### 5.1 Shortest CLI path (PDF folder)
+## Runtime spec shape
+
+A direct run uses `source.mode = "direct"` and a `pdf_folder`; a Zotero run
+uses `source.mode = "zotero"`, `zotero_report`, and `library_path`. The current
+action for a complete pipeline is `run_all`. Other typed actions are validated
+by `RuntimeJobSpec`, including `analyze`, `generate_outline`,
+`generate_review`, `generate_section`, and `validate_review`.
+
+Free Mode input is typed at the spec boundary. Use either `free_mode_idea` or
+`free_mode_profile`, never both. An idea is projected to the current
+`ReviewIntent` contract and remains bound to the writer context.
+
+Concept Mode is currently disabled. Stale Concept Mode requests are rejected;
+the runtime does not silently downgrade them or make a provider call.
+
+## Existing jobs and validation
 
 ```bash
-python main.py --pdf-folder "D:\papers" --analyze-only
-python main.py --pdf-folder "D:\papers" --generate-outline
-python main.py --pdf-folder "D:\papers" --generate-review
+python -m reviewctl status --job <job_id>
+python -m reviewctl inspect --job <job_id>
+python -m reviewctl next-action --job <job_id>
+python -m reviewctl resume --job <job_id>
+python -m reviewctl validate --job <job_id>
+python -m reviewctl validation-status --job <job_id>
 ```
 
-Or run the full pipeline:
+The current validation service is `ValidationExecutionService`. Its
+adjudication reuse authority is bound to the appropriate provider ledger,
+receipt, source closure, attempt identity, and Registry dependency closure.
+
+## Queue and maintenance commands
+
+The current parser also exposes `doctor`, `queue-list`, `queue-add`,
+`queue-run`, `queue-retry`, `queue-cancel`, `queue-remove`, `queue-export`,
+and `queue-import`. Run any command with `--help` for its exact options.
 
 ```bash
-python main.py --pdf-folder "D:\papers" --run-all
+python -m reviewctl doctor --config config.ini.example
+python -m reviewctl queue-list --queue-file output/_queue/queue.json
 ```
 
-It is usually better to give the run a stable project name:
-
-```bash
-python main.py --pdf-folder "D:\papers" --project-name "my_review" --run-all
-```
-
-### 5.2 Shortest GUI path
-
-1. Run `python launch_gui.py`
-2. Fill in paths, APIs, and models on the Setup pages
-3. Go to Workflow, choose PDF or Zotero mode
-4. Submit from Workflow; the GUI automatically queues jobs serially in the background while the form stays editable
-
-## 6. Common workflows
-
-### 6.1 PDF folder mode
-
-```bash
-python main.py --pdf-folder "D:\papers" --analyze-only
-python main.py --pdf-folder "D:\papers" --generate-outline
-python main.py --pdf-folder "D:\papers" --generate-review
-python main.py --pdf-folder "D:\papers" --run-all
-```
-
-### 6.2 Zotero mode
-
-Set these in `config.ini` or the GUI first:
-
-- `Paths.zotero_report`
-- `Paths.library_path`
-
-You can also pass them directly:
-
-```bash
-python main.py --project-name "my_review" --zotero-report "D:\zotero_report.txt" --library-path "D:\ZoteroLibrary" --analyze-only
-python main.py --project-name "my_review" --generate-outline
-python main.py --project-name "my_review" --generate-review
-```
-
-### 6.3 Reuse existing stage-1 summaries
-
-There are now two reuse patterns:
-
-1. **Explicit downstream loading of historical summary files**
-   - `--summary-file`
-   - repeatable `--summary-source <path>`
-2. **Automatic incremental stage-1 reuse across historical runs**
-   - enabled by default for `--analyze-only` and `--run-all`
-   - `--no-reuse-stage1` disables automatic reuse for a forced fresh stage-1 run
-   - repeatable `--reuse-summary-file <path>`
-
-Automatic reuse currently tries matches in this order:
-
-1. exact DOI
-2. exact canonical paper key
-3. unique high-confidence `title + first author + year`
-
-Examples:
-
-```bash
-python main.py --project-name "subset_outline" --summary-file "D:\subset\subset_summaries.json" --generate-outline
-
-python main.py --project-name "subset_review" --summary-file "D:\subset\subset_a_summaries.json" --summary-source "D:\subset\subset_b_summaries.json" --generate-review
-
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only
-
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --reuse-summary-file "D:\cache\curated_summaries.json"
-
-python main.py --pdf-folder "D:\new_papers" --project-name "pdf_overlap" --analyze-only --no-reuse-stage1
-```
-
-### 6.4 Partial reruns and failure recovery
-
-```bash
-python main.py --pdf-folder "D:\papers" --generate-section 3
-python main.py --pdf-folder "D:\papers" --retry-failed
-python main.py --pdf-folder "D:\papers" --retry-review-failed
-python main.py --project-name "my_review" --validate-review
-```
-
-Meaning:
-
-- `--generate-section <n>`: regenerate one section only
-- `--retry-failed`: retry only failed stage-1 papers
-- `--retry-review-failed`: retry only failed or missing review sections
-- `--validate-review`: run an extra validation pass through the current validation service; lower-level validation / repair artifacts are written into the active workspace
-
-### 6.5 GUI background queue
-
-Queueing remains a **GUI-first** interaction model. On the Workflow page,
-buttons such as "Analyze only", "Generate outline", "Generate review", and
-"Run all" submit jobs into the GUI's persistent serial queue. Queue state is
-stored with atomic cross-process snapshots; source/config fingerprints reset
-stale retry state, and lease generations plus fence tokens prevent an expired
-worker from publishing. Heartbeats, expiry, cancellation, and crash recovery
-are explicit rather than inferred from a UI flag.
-
-The CLI also exposes read/write queue operations through `reviewctl`:
-`queue-list`, `queue-add`, `queue-run`, `queue-retry`, `queue-cancel`,
-`queue-remove`, `queue-export`, and `queue-import`. Direct `main.py` usage is
-still available for `--analyze-only`, `--generate-outline`,
-`--generate-review`, and `--run-all`; the AI-native Codex / OMX skill runs
-directly and stays out of the GUI queue.
-
-Outline v3 outputs are reusable only with an exact execution binding and closed
-provider receipt chain. Explicit adoption creates a versioned adoption identity
-and a current pointer; validation and repair remain separate, registry-backed
-gates. Completion and export consume the atomic `CurrentArtifactSetV1` and its
-`CurrentStageClosureMapV1`, not an arbitrary READY artifact.
-
-The durable `run_all` stage plan requests analyze -> outline -> review ->
-validate when validation is enabled. If validation is explicitly optional and
-disabled, it requests analyze -> outline -> review, but still requires a
-current artifact set; derivation and outline-only jobs cannot become canonical
-without that set. Outline stability is `off`, `smoke` (default), or `full`:
-with five candidates the core/smoke/full call estimates are 10/20/60, and
-preflight records call and estimated-cost ceilings before transport.
-
-For the durable control plane, `python -m reviewctl validate --job <job_id>`
-executes the current `ValidationExecutionService` and persists a new validation
-attempt. Use `python -m reviewctl validation-status --job <job_id>` for a
-read-only closure view. A zero-claim result is `needs_review`, not `clean`, and
-repair outputs remain quarantined until explicit revalidation and promotion.
-
-## 7. Advanced capabilities
-
-These are part of the current product surface, but not always required for a first run:
-
-- `auto-generate-orchestrator`: repo-local skill for AI-native execution inside Codex / OMX
-- `--prime-with-folder` + `--concept`: concept priming
-- `--free-mode-profile`: load a free-mode profile JSON
-- `--free-mode-idea`: pass a free-mode idea as text
-- `--merge`: merge multiple `summaries.json` files into one
-- `--outline-adopt`: legacy compatibility option; use `python -m reviewctl adopt --artifact <final_outline_id> --actor <actor>` for the current explicit adoption transaction
-- preprocess cache artifacts such as `normalized.md`, `page_index.json`, `diagnostics.json`, and `chunks.json`
-- optional local RAG built during preprocessing
-
-### 7.1 Codex / skill AI-native entry surface
-
-If you are operating this repository from Codex / OMX instead of manually using the GUI or CLI, you can use the repo-local `auto-generate-orchestrator` skill.
-
-That surface is:
-
-- a **third entry surface**, not a replacement for GUI / CLI
-- still workspace-compatible with the existing `job workspace`, `artifact registry`, `resume`, and `validation / repair` substrate
-- better suited for AI-native orchestration where Codex normalizes inputs, runs stages, persists artifacts, and validates results directly inside the repo
-
-When you use that surface, the workspace may also contain:
-
-- `artifacts/source_bundle.json`
-- `artifacts/runtime_stage_trace.json`
-
-If you are a regular end user, start with the GUI / CLI mental model first. Reach for the skill surface when you are already working inside Codex.
-
-## 8. Output layout and key artifacts
-
-### 8.1 Primary output layout
-
-Most real outputs now live under:
-
-```text
-output/<project_name>__<job_id>/
-```
-
-Typical structure:
-
-```text
-output/<project_name>__<job_id>/
-?? artifacts/
-?  ?? <project>_summaries.json
-?  ?? <project>_summary_source_manifest.json
-?  ?? <project>_summary_reuse_report.json
-?  ?? <project>_literature_review_outline.md
-?  ?? paper_artifacts/
-?  ?? review_drafts/
-?  ?? citation_manifests/
-?  ?? validation / repair JSON artifacts (when enabled)
-?? checkpoints/
-?? logs/
-?? reports/
-?? artifact_registry.json
-```
-
-### 8.2 Compatibility directory
-
-```text
-output/<project_name>/
-```
-
-This directory is now mainly used for pointers such as:
-
-- `_latest_job.json`
-
-It should not be your first assumption for where the real outputs live.
-
-### 8.3 Common exports
-
-- `reports/*_analyzed_papers.xlsx`
-- `reports/*_literature_review.docx`
-- `reports/*_failed_papers_report.txt`
-- `checkpoints/*_review_checkpoint.json`
-- `artifacts/review_drafts/*_review_draft.json` (`artifact_version=v3`)
-- `artifacts/citation_manifests/*_citation_manifest_v3.json`
-
-### 8.4 Preprocess cache
-
-```text
-output/_preprocess_cache/
-```
-
-Common cached files:
-
-- `normalized.md`
-- `plain_text.txt`
-- `page_index.json`
-- `chunks.json`
-- `diagnostics.json`
-- `structured.json`
-- `prepare_manifest.json`
-
-### 8.5 AI-native runtime extras
-
-When the repo-local Codex skill surface is used, the active workspace may also include:
-
-- `artifacts/source_bundle.json`: normalized source intake snapshot for the AI-native run
-- `artifacts/runtime_stage_trace.json`: stage trace that distinguishes local runtime steps from subagent generation steps
-
-## 9. Configuration guidance
-
-Recommended split:
-
-- put **sensitive values** in `.env`
-- put **non-sensitive runtime settings** in `config.ini`
-
-Important config sections include:
-
-- `Paths`
-- `Primary_Reader_API`
-- `Backup_Reader_API`
-- `Writer_API`
-- `Outline_API`
-- `Free_Mode_API`
-- `Validator_API` (current validation adjudication provider, called through the validation service)
-- `OutlineStability` (stability mode, provider-call ceiling, and estimated-cost ceiling)
-- `Performance`
-- `Preprocess`
-- `Runtime` (typed retry limits, backoff, and job deadlines)
-- `Validation`
-- `Styling`
-- `GUI`
-
-Important environment variables include:
-
-- `LLM_PRIMARY_READER_API`
-- `LLM_BACKUP_READER_API`
-- `LLM_WRITER_API`
-- `LLM_OUTLINE_API`
-- `LLM_FREE_MODE_API`
-- `LLM_VALIDATOR_API`
-- `MINERU_*`
-
-`MINERU_ALLOWED_URL_HOSTS` accepts comma-separated exact hostnames for trusted
-HTTPS upload, download, or storage URLs outside the configured MinerU origin.
-Do not include a scheme, path, or wildcard. Leave it empty unless the provider
-returns links on a trusted external storage host.
-
-## 10. Troubleshooting shortcuts
-
-- **First run**: start with `--analyze-only`
-- **Want the GUI**: run `python launch_gui.py`
-- **Want the repo to run itself from Codex**: use the repo-local `auto-generate-orchestrator` skill
-- **Cannot find outputs**: check `output/<project_name>__<job_id>/` first
-- **Need partial repair**: use `--generate-section` or `--retry-review-failed`
-- **Want incremental stage-1 reuse**: it is automatic for stage-1 runs; add `--reuse-summary-file` for extra pools or `--no-reuse-stage1` for a forced fresh run
-- **Need deeper runtime truth**: see [docs/en/runtime/](./docs/en/runtime/)
-- **Need AI / maintainer handoff context**: read `AGENTS.md` or [docs/en/ai/handoff.md](./docs/en/ai/handoff.md)
-
-## 11. For developers and maintainers
-
-If you are here to work on the repository rather than just run it, start with:
-
-1. `AGENTS.md`
-2. `TRUTH_SOURCES.md`
-3. `FEATURE_MATRIX.md`
-4. `summary_schema.py`
-5. `services/job_runner.py`
-6. `main.py`
-7. `gui/app.py`
-8. `.codex/skills/auto-generate-orchestrator/SKILL.md`
-9. `runtime/orchestrator.py`
-10. `preprocess/service.py`
-11. `validation/execution_service.py`
-
-## 12. One-line summary
-
-Think of this repository as:
-
-- a local AI literature-analysis / review-writing workbench with GUI, CLI, and a repo-local Codex skill entrypoint
-- a project that already has product-style capabilities such as workspaces, artifacts, GUI background queueing, reuse, and validation
-- a user surface documented mainly in this file and the Chinese README
-- a deeper runtime reality documented in `AGENTS.md` and `TRUTH_SOURCES.md`
+## Evidence boundaries
+
+The normal Windows CI gate covers compile, test collection, public CLI smoke,
+strict-offline tests, Pyright, doctor, and committed-range whitespace checks.
+Live API/provider calls, Playwright, heavy OCR, multi-host publication/fencing,
+multi-host single-flight, and cryptographic provenance verification are
+separate opt-in scopes and are not implied by offline evidence.
+
+See [AGENTS.md](./AGENTS.md), the [runtime truth sources](./docs/en/runtime/truth-sources.md),
+the [architecture map](./docs/en/developer/architecture.md), and the
+[feature matrix](./docs/en/reference/feature-matrix.md) for maintainer and AI
+contracts.

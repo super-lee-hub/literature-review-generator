@@ -1,69 +1,54 @@
----
-name: auto-generate-orchestrator
-description: AI-native additive entrypoint for auto-generate that reuses the current workspace/artifact/resume/validation substrate while delegating generation stages to subagents.
----
-
 # auto-generate orchestrator
 
-Use this skill when Codex should operate the repository in **AI-native mode** instead of the human CLI/GUI entrypoints.
+This repo-local Skill is an AI-native adapter to the current runtime. It does
+not define a second execution engine or a second public control plane.
 
-## Intent
+## Current contract
 
-- Add a third entry surface alongside CLI and GUI
-- Reuse the current durable substrate (`services/job_runner.py`, `services/job_workspace.py`, `services/artifact_registry.py`, `services/progress_state.py`, `validator.py`)
-- Keep deterministic lifecycle / persistence / render / validation transitions local
-- Route generation stages through subagents, not legacy CLI shelling or external-API wrappers
+- Public execution input: `RuntimeJobSpec` from `runtime/job_spec.py`.
+- Public runtime: `AgentRuntimeRunner` from `runtime/runner.py`.
+- Bridge: `AgentRuntimeBridge` from `runtime/orchestrator.py`.
+- Human control plane: `python -m reviewctl`, backed by
+  `ReviewControlPlane`.
+- GUI: `launch_gui.py` -> `gui/app.py` -> workflow facade/JobRunner -> the
+  same `RuntimeJobSpec` and `AgentRuntimeRunner` contracts.
 
-## Canonical constraints
+`JobRunRequest` may remain an internal adapter/data boundary where the current
+code uses it. It is not an alternate public peer to `RuntimeJobSpec`.
 
-1. `services.job_runner.JobRunRequest` remains the canonical request model.
-2. CLI and GUI remain first-class human surfaces; do not replace them.
-3. AI mode is additive and out-of-queue for MVP, but must remain workspace-compatible.
-4. Canonical downstream artifacts remain:
-   - summaries
-   - markdown outline
-   - `review_draft_v2`
-   - `citation_manifest_v3`
-   - docx
-   - validation / repair artifacts
+## Operating pattern
 
-## Primary runtime helpers
+1. Normalize the request into a validated `RuntimeJobSpec`.
+2. Resolve spec-owned paths relative to the spec file.
+3. Let `AgentRuntimeRunner` and `AgentRuntimeBridge` create or resume the
+   durable workspace, Registry state, source bundle, and stage trace.
+4. Keep stage execution, artifact publication, validation, and resume decisions
+   inside the current Registry-backed runtime.
+5. Report the durable job status and current next action through `reviewctl`
+   semantics rather than inventing a parallel result format.
 
-- `runtime.job_spec.RuntimeJobSpec`
-- `runtime.orchestrator.AgentRuntimeBridge`
-- `runtime.source_intake.*`
-- `runtime.subagent_policy.*`
-- `runtime.stage_contracts.*`
-- `runtime.lifecycle.*`
+## Current stage contracts
 
-## Expected operating pattern
-
-1. Normalize AI input into `RuntimeJobSpec`
-2. Compile it into canonical `JobRunRequest`
-3. Build source intake bundles locally
-4. Bootstrap workspace / registry / resume state locally
-5. Delegate generation stages to subagents:
-   - Stage 1 analyze
-   - Stage 2 outline
-   - Stage 3 review
-6. Persist outputs through existing canonical artifact helpers
-7. Run validation locally through existing validation seams
-8. Register runtime stage trace artifacts so execution mode is observable
+- Stage 1 uses the current source identity, preprocessing, summary, and reuse
+  contracts.
+- Stage 2 is Outline Intelligence v3 only. Do not use or describe Outline v2.
+- Stage 3 produces `review_draft` with `artifact_version=v3`,
+  `citation_manifest` v3, and DOCX through the current review service.
+- Validation uses `ValidationExecutionService`, `current_validation`,
+  `adjudication_reuse`, and Registry-backed `closure` evidence.
+- Free Mode uses `free_mode_intent_input/v1`, projects to `ReviewIntent`, and
+  binds the Writer context before generation/replay.
+- Concept Mode is currently disabled. Stale Concept Mode requests must be
+  rejected; do not silently downgrade or implement provider calls for them.
 
 ## Hard prohibitions
 
-- Do not shell out to `python main.py ...` as the canonical AI runtime
-- Do not introduce a second peer request model
-- Do not bypass latest-pointer / artifact-registry / resume-state behavior
-- Do not replace `review_draft_v2` / `citation_manifest_v3` with alternate canonical schemas
-- Do not treat summary-only evidence as validation truth when richer artifact evidence exists
-
-## Minimal execution checklist
-
-- build canonical request
-- build source bundle
-- bootstrap workspace + latest pointer
-- emit runtime stage trace entries
-- persist canonical artifacts
-- validate through existing validator contract
-- finalize latest pointer / resume state
+- Do not bypass the Registry, current stage closure, or durable resume state.
+- Do not fake provider receipts or treat a raw checkpoint as reuse authority.
+- Do not silently promote intermediate Outline candidates.
+- Do not treat report projections as canonical truth.
+- Do not shell into removed legacy direct-flag flows.
+- Do not redesign Stage 1, Free Mode semantics, validation adjudication
+  authority, queue fencing/publication, `JobOutcome`, `CurrentArtifactSet`,
+  repair/promotion, export admission, candidate DAG, critics, arbitration,
+  adoption, pricing, or trading contracts in a documentation task.

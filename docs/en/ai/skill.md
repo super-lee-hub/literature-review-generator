@@ -1,46 +1,35 @@
-# Codex/OMX Skill Documentation
+# Codex/OMX Skill contract
 
-> Audience: AI agents, Codex/OMX users.
-> Source: `.codex/skills/auto-generate-orchestrator/SKILL.md`
+> Source of truth: `.codex/skills/auto-generate-orchestrator/SKILL.md`.
 
-## Intent
+The repo-local Skill is an AI-native adapter to the same durable runtime used
+by the GUI and CLI. It is not a peer control plane.
 
-- Provide the Codex/OMX entry surface alongside the single `reviewctl` control plane and GUI
-- Reuse the current durable substrate (`services/job_runner.py`, `services/job_workspace.py`, `services/artifact_registry.py`, `services/progress_state.py`, `validator.py`)
-- Keep deterministic lifecycle / persistence / render / validation transitions local
-- Route generation stages through the internal runtime executor, not shelling or external stage wrappers
+## Public runtime
 
-## Canonical Constraints
+```text
+AI request
+  -> RuntimeJobSpec
+  -> AgentRuntimeRunner
+  -> AgentRuntimeBridge
+  -> Registry-backed stages and workspace
+```
 
-1. `services.job_runner.JobRunRequest` remains the canonical request model
-2. CLI and GUI remain first-class human surfaces; do not replace them
-3. AI mode is bound to the current durable job workspace and internal executor registry
-4. Canonical downstream artifacts are summaries, registered Outline v3 artifacts, `review_draft` (artifact_version=v3), `citation_manifest_v3`, docx, and validation/repair artifacts
+The human machine control plane is `python -m reviewctl`, backed by
+`ReviewControlPlane`. `JobRunRequest` is an internal adapter where current code
+uses it; `RuntimeJobSpec` is the public durable run specification.
 
-## Primary Runtime Helpers
+## Current contracts
 
-- `runtime.job_spec.RuntimeJobSpec`
-- `runtime.orchestrator.AgentRuntimeBridge`
-- `runtime.source_intake.*`
-- `runtime.subagent_policy.*`
-- `runtime.stage_contracts.*`
-- `runtime.lifecycle.*`
+- Outline Intelligence v3 is the only production Outline path.
+- Stage 3 emits `review_draft` artifact version v3 and `citation_manifest` v3.
+- Validation uses `ValidationExecutionService`, `current_validation`,
+  `adjudication_reuse`, and Registry-backed `closure` evidence.
+- Free Mode uses `free_mode_intent_input/v1`, the `ReviewIntent` projection,
+  and Writer context binding.
+- Concept Mode is currently disabled. Requests using that stale mode are
+  rejected rather than silently downgraded.
 
-## Expected Operating Pattern
-
-1. Normalize AI input into `RuntimeJobSpec`
-2. Compile it into canonical `JobRunRequest`
-3. Build source intake bundles locally
-4. Bootstrap workspace / registry / resume state locally
-5. Delegate generation stages through the internal Stage 1, Outline v3, and Stage 3 executors
-6. Persist outputs through existing canonical artifact helpers
-7. Run validation locally through existing validation seams
-8. Register runtime stage trace artifacts so execution mode is observable
-
-## Hard Prohibitions
-
-- Do not shell out to `python main.py ...` as the canonical AI runtime
-- Do not introduce a second peer request model
-- Do not bypass latest-pointer / artifact-registry / resume-state behavior
-- Do not replace the current `review_draft` / `citation_manifest_v3` contracts with alternate schemas
-- Do not treat summary-only evidence as validation truth when richer artifact evidence exists
+Keep source intake, workspace creation, Registry publication, stage closure,
+resume, validation, and runtime trace local and durable. Do not replace them
+with shell commands or report-only projections.
