@@ -1058,6 +1058,9 @@ class AgentRuntimeBridge:
 
     def __init__(self, job_spec: RuntimeJobSpec, publication_context: Any | None = None) -> None:
         job_spec.validate()
+        self._job_id_was_omitted = not bool(str(job_spec.job_id or "").strip())
+        resolved_job_id = job_spec.job_id or JobWorkspace.generate_job_id()
+        job_spec = replace(job_spec, job_id=resolved_job_id)
         self.job_spec = job_spec
         self.publication_context = publication_context
         metadata = dict(job_spec.metadata or {})
@@ -1068,7 +1071,7 @@ class AgentRuntimeBridge:
             self.free_mode_envelope = build_free_mode_intent_envelope(
                 profile_path=job_spec.free_mode_profile,
                 idea=job_spec.free_mode_idea,
-                job_id=job_spec.job_id or "",
+                job_id=resolved_job_id,
             )
         else:
             self.free_mode_envelope = None
@@ -1289,6 +1292,8 @@ class AgentRuntimeBridge:
         workspace_preflight: Callable[[JobWorkspace], None] | None = None,
         publish_running_state: bool = True,
     ) -> AgentRuntimeSession:
+        if resume_requested and self._job_id_was_omitted:
+            raise RuntimeError("resume requires an explicit job_id")
         request = self.build_job_request()
         runner = JobRunner()
         project_name = runner._resolve_project_name(request)

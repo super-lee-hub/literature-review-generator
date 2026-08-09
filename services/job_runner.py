@@ -21,6 +21,7 @@ from utils import sanitize_path_component
 
 
 STAGE1_REUSE_ACTIONS = {"analyze", "run_all"}
+CONCEPT_MODE_DISABLED_MESSAGE = "Concept Mode is not yet available in the current PR14 runtime."
 
 
 def _coerce_optional_bool(value: Any) -> Optional[bool]:
@@ -196,6 +197,8 @@ def validate_free_mode_options(profile: Any, idea: Any) -> Optional[str]:
 
 
 def validate_job_request_options(request: Any) -> Optional[str]:
+    if str(getattr(request, "concept", "") or "").strip():
+        return CONCEPT_MODE_DISABLED_MESSAGE
     summary_file = getattr(request, "summary_file", None)
     summary_sources = getattr(request, "summary_sources", ()) or ()
     reuse_stage1 = bool(getattr(request, "reuse_stage1", False))

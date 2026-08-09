@@ -105,6 +105,43 @@ def test_free_mode_profile_registers_typed_input_and_projection(tmp_path: Path) 
     )
 
 
+@pytest.mark.parametrize("mode", ["profile", "idea"])
+def test_free_mode_generated_job_id_is_bound_before_intake_and_registry(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    profile = _profile_file(tmp_path) if mode == "profile" else None
+    spec = _runtime_spec(
+        tmp_path,
+        profile=str(profile) if profile is not None else "",
+        idea="Compare mechanism A and B" if mode == "idea" else "",
+        job_id="",
+    )
+
+    normalized = AgentRuntimeRunner(spec)._normalized_spec(resume=False)
+    assert normalized.job_id
+    envelope = normalized.metadata["free_mode_input"]
+    assert envelope["payload"]["job_id"] == normalized.job_id
+
+    bridge = AgentRuntimeBridge(normalized)
+    session = bridge.bootstrap()
+    assert session.context.workspace.job_id == normalized.job_id
+    input_record = session.context.registry.get(FREE_MODE_INTENT_INPUT_ARTIFACT_ID)
+    assert input_record is not None
+    assert input_record.job_id == normalized.job_id
+    verify_free_mode_intent_input(session.context.registry, envelope)
+    verify_free_mode_review_intent_projection(session.context.registry, envelope)
+
+
+def test_free_mode_direct_bridge_resolves_omitted_job_id_before_envelope(tmp_path: Path) -> None:
+    profile = _profile_file(tmp_path)
+    bridge = AgentRuntimeBridge(_runtime_spec(tmp_path, profile=str(profile), job_id=""))
+
+    assert bridge.job_spec.job_id
+    assert bridge.free_mode_envelope is not None
+    assert bridge.free_mode_envelope["payload"]["job_id"] == bridge.job_spec.job_id
+
+
 def test_free_mode_same_path_content_change_changes_authority_hash(tmp_path: Path) -> None:
     profile = _profile_file(tmp_path)
     first = build_free_mode_intent_envelope(profile_path=str(profile), job_id="job-a")
@@ -209,6 +246,38 @@ def test_free_mode_outline_identity_changes_with_review_intent(tmp_path: Path) -
     )
     executor_b = OutlineV3Executor(
         job_id="outline-job",
+        summaries=[summary],
+        workspace=workspace,
+        candidate_count=1,
+        stability_mode="off",
+        review_intent=envelope_b["review_intent"],
+    )
+    assert executor_a._review_intent_hash != executor_b._review_intent_hash
+    assert executor_a.logical_attempt_identity != executor_b.logical_attempt_identity
+    assert executor_a.closure_epoch_id != executor_b.closure_epoch_id
+
+
+def test_free_mode_idea_changes_outline_identity(tmp_path: Path) -> None:
+    summary, _pdf = _stage1_summary(tmp_path)
+    envelope_a = build_free_mode_intent_envelope(idea="Compare mechanism A", job_id="idea-outline-job")
+    envelope_b = build_free_mode_intent_envelope(idea="Compare mechanism B", job_id="idea-outline-job")
+    assert envelope_a is not None and envelope_b is not None
+
+    workspace = JobWorkspace.create(
+        str(tmp_path / "idea-outline-output"),
+        "outline",
+        job_id="idea-outline-job",
+    )
+    executor_a = OutlineV3Executor(
+        job_id="idea-outline-job",
+        summaries=[summary],
+        workspace=workspace,
+        candidate_count=1,
+        stability_mode="off",
+        review_intent=envelope_a["review_intent"],
+    )
+    executor_b = OutlineV3Executor(
+        job_id="idea-outline-job",
         summaries=[summary],
         workspace=workspace,
         candidate_count=1,
@@ -395,7 +464,7 @@ def test_free_mode_idea_maps_literally(tmp_path: Path) -> None:
     assert payload["raw_idea"] == "Compare mechanism A and B"
     assert payload["normalized_idea"] == "Compare mechanism A and B"
     assert len(payload["idea_text_sha256"]) == 64
-    assert payload["review_intent"]["review_question"] == ""
+    assert payload["review_intent"]["review_question"] == "Compare mechanism A and B"
     assert envelope["context_hash"]
     writer_context = build_free_mode_writer_context(envelope)
     assert writer_context["raw_idea"] == "Compare mechanism A and B"

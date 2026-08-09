@@ -31,6 +31,8 @@ The projection is deterministic and literal:
 
 `concept_relationship`, `generated_prompt`, and `writing_constraints` are
 preserved in the typed Free Mode context rather than silently reinterpreted.
+For idea mode, the normalized idea is mapped literally to
+`ReviewIntent.review_question`; no hidden LLM conversion or inference is used.
 The projection is published as `free_mode_review_intent_projection/v1` with a
 Registry dependency on the typed input artifact. Changing profile semantics
 changes `review_intent_hash`, Outline replay identity, and affected Outline v3
@@ -53,6 +55,7 @@ not invalidate the reusable Stage 1 summary.
 
 ## Concept Mode
 
-`CURRENTLY DISABLED HONESTLY`. The GUI no longer offers Concept Mode as an
-active mode and rejects stale `concept` requests with a clear message:
+`CURRENTLY DISABLED HONESTLY`. Concept Mode is disabled at all public/runtime
+boundaries. The GUI and central JobRunner validator reject stale `concept`
+requests with a clear message:
 Concept Mode is not yet available in the current PR14 runtime.
