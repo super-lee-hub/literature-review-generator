@@ -1,3 +1,8 @@
+---
+name: auto-generate-orchestrator
+description: Use this skill when Codex or OMX should operate the auto-generate repository through the current RuntimeJobSpec, AgentRuntimeRunner, and AgentRuntimeBridge workflow for running, resuming, inspecting, generating Outline v3/review artifacts, using Free Mode, and performing Registry-backed validation and safe recovery. Do not use it to restore legacy main.py direct-flag flows or Concept Mode.
+---
+
 # auto-generate orchestrator
 
 This repo-local Skill is an AI-native adapter to the current runtime. It does

@@ -44,6 +44,130 @@ def _read_current_docs() -> str:
     return "\n".join(path.read_text(encoding="utf-8") for path in CURRENT_DOCS)
 
 
+def _skill_frontmatter(path: Path) -> tuple[dict[str, str], str]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError(f"missing opening YAML frontmatter delimiter: {path}")
+
+    try:
+        closing = next(
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        )
+    except StopIteration as exc:
+        raise ValueError(f"missing closing YAML frontmatter delimiter: {path}") from exc
+
+    metadata: dict[str, str] = {}
+    for line in lines[1:closing]:
+        key, separator, value = line.partition(":")
+        if separator and key.strip() in {"name", "description"}:
+            metadata[key.strip()] = value.strip()
+
+    for field in ("name", "description"):
+        if not metadata.get(field):
+            raise ValueError(f"missing non-empty frontmatter field {field!r}: {path}")
+
+    if metadata["name"] != path.parent.name:
+        raise ValueError(
+            f"Skill name {metadata['name']!r} does not match directory "
+            f"{path.parent.name!r}: {path}"
+        )
+
+    body = "\n".join(lines[closing + 1:]).strip()
+    if not body:
+        raise ValueError(f"Skill body is empty: {path}")
+    return metadata, body
+
+
+def test_repo_local_skills_have_structural_frontmatter() -> None:
+    skill_files = sorted((ROOT / ".codex" / "skills").glob("*/SKILL.md"))
+    assert skill_files
+
+    for path in skill_files:
+        metadata, body = _skill_frontmatter(path)
+        assert metadata["name"] == path.parent.name
+        assert body
+
+    current_skill = ROOT / ".codex" / "skills" / "auto-generate-orchestrator" / "SKILL.md"
+    assert current_skill in skill_files
+    metadata, body = _skill_frontmatter(current_skill)
+    assert metadata["name"] == "auto-generate-orchestrator"
+    frontmatter_text = "\n".join(f"{key}: {value}" for key, value in metadata.items())
+    for marker in (
+        "review_draft_v2",
+        "services/progress_state.py",
+        "python main.py --run-all",
+        "python main.py --analyze-only",
+        "Outline v2",
+    ):
+        assert marker not in frontmatter_text, marker
+    for marker in (
+        "Outline Intelligence v3 only",
+        "review_draft",
+        "ValidationExecutionService",
+        "Free Mode",
+        "Concept Mode is currently disabled",
+    ):
+        assert marker in body, marker
+
+
+@pytest.mark.parametrize(
+    ("directory", "contents"),
+    (
+        ("auto-generate-orchestrator", "# auto-generate orchestrator\n"),
+        (
+            "auto-generate-orchestrator",
+            "---\nname: auto-generate-orchestrator\ndescription: test\n# body\n",
+        ),
+        (
+            "auto-generate-orchestrator",
+            "---\ndescription: test\n---\n# body\n",
+        ),
+        (
+            "auto-generate-orchestrator",
+            "---\nname:\ndescription: test\n---\n# body\n",
+        ),
+        (
+            "auto-generate-orchestrator",
+            "---\nname: auto-generate-orchestrator\n---\n# body\n",
+        ),
+        (
+            "auto-generate-orchestrator",
+            "---\nname: auto-generate-orchestrator\ndescription:\n---\n# body\n",
+        ),
+        (
+            "other-skill",
+            "---\nname: auto-generate-orchestrator\ndescription: test\n---\n# body\n",
+        ),
+        (
+            "auto-generate-orchestrator",
+            "---\nname: auto-generate-orchestrator\ndescription: test\n---\n",
+        ),
+    ),
+    ids=(
+        "missing-opening",
+        "missing-closing",
+        "missing-name",
+        "empty-name",
+        "missing-description",
+        "empty-description",
+        "name-directory-mismatch",
+        "empty-body",
+    ),
+)
+def test_skill_frontmatter_rejects_malformed_shapes(
+    tmp_path: Path, directory: str, contents: str
+) -> None:
+    path = tmp_path / directory / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        _skill_frontmatter(path)
+
+
 def _parser_commands() -> set[str]:
     parser = build_parser()
     subparsers = next(
