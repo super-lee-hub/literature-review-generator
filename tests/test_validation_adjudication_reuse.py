@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import json
 from pathlib import Path
 import types
@@ -15,7 +16,9 @@ from services.settings import ApplicationSettings
 from validation.adjudication_checkpoint import AdjudicationCheckpointStore
 from validation.adjudication_reuse import (
     ADJUDICATION_REUSE_ARTIFACT_TYPE,
+    adjudication_call_id,
     build_reuse_key,
+    durable_reuse_authority_issues,
     reuse_record_artifact_id,
     verify_reuse_record,
 )
@@ -146,6 +149,12 @@ def test_adjudication_reuse_thread_single_flight_exactly_one_transport(
     assert reuse_record.artifact_id in {
         dependency.artifact_id for dependency in closure["closure_record"].depends_on
     }
+    call_id = adjudication_call_id(_packet())
+    assert closure["expected_call_ids"] == (call_id,)
+    assert closure["closure"].observed_call_ids == (call_id,)
+    assert closure["closure"].verified_reuse_call_ids == ()
+    assert closure["closure"].missing_call_ids == ()
+    assert closure["closure"].unexpected_receipts == ()
 
 
 def test_adjudication_reuse_different_packets_make_independent_calls(
@@ -275,6 +284,7 @@ def test_adjudication_reuse_record_tamper_fails_closed(
         input_dependency_hashes=service._input_dependency_hashes,
         current_epoch=service.closure_epoch_id,
         service=service,
+        authority="provisional",
     )
     assert report is None
     assert error
@@ -316,6 +326,7 @@ def test_adjudication_reuse_provider_output_tamper_fails_closed(
         input_dependency_hashes=service._input_dependency_hashes,
         current_epoch=service.closure_epoch_id,
         service=service,
+        authority="provisional",
     )
     assert report is None
     assert "provider_output" in error or "normalized_result" in error
@@ -373,9 +384,10 @@ def test_adjudication_reuse_model_change_rejects_old_record(
         input_dependency_hashes=service._input_dependency_hashes,
         current_epoch=service.closure_epoch_id,
         service=service,
+        authority="provisional",
     )
     assert report is None
-    assert "model" in error
+    assert "model" in error or "reuse_key" in error
 
 
 def test_provider_receipt_closure_allows_verified_reuse_without_receipt() -> None:
@@ -435,12 +447,137 @@ def test_adjudication_reuse_after_authoritative_publication_reuses(
     _patch_ai_call(monkeypatch, calls)
     current_validation._adjudicate(first_service, [_result()])
     assert len(calls) == 1
+    first_closure = first_service.finalize_provider_receipts()
+    assert first_closure["closure"].complete is True
 
     second_service = _service(tmp_path)
     current_validation._adjudicate(second_service, [_result()])
     assert len(calls) == 1
     closure = second_service.finalize_provider_receipts()
     assert closure["closure"].complete is True
+    call_id = adjudication_call_id(_packet())
+    assert closure["closure"].observed_call_ids == ()
+    assert closure["closure"].verified_reuse_call_ids == (call_id,)
+
+
+def test_durable_reuse_requires_exact_registry_authority_graph(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    service = _service(tmp_path)
+    calls: list[int] = []
+    _patch_ai_call(monkeypatch, calls)
+    current_validation._adjudicate(service, [_result()])
+    finalization = service.finalize_provider_receipts()
+    assert finalization["closure"].complete is True
+
+    reuse_key = build_reuse_key(
+        packet=_packet(),
+        api_config={
+            "api_key": "secret-a",
+            "model": "validator-model",
+            "api_base": "https://example.test",
+        },
+        input_dependency_hashes=service._input_dependency_hashes,
+    )
+    bound = service.artifact_registry.get(reuse_record_artifact_id(reuse_key, closure_bound=True))
+    assert bound is not None
+    assert durable_reuse_authority_issues(service.artifact_registry, bound) == []
+
+    dependency_ids = {
+        reuse_record_artifact_id(reuse_key),
+        str(finalization["ledger"].artifact_id),
+        str(finalization["closure_record"].artifact_id),
+    }
+    for dependency_id in dependency_ids:
+        tampered = replace(
+            bound,
+            depends_on=[
+                dependency
+                for dependency in bound.depends_on
+                if dependency.artifact_id != dependency_id
+            ],
+        )
+        assert durable_reuse_authority_issues(service.artifact_registry, tampered)
+
+    ledger_dependency = next(
+        dependency
+        for dependency in bound.depends_on
+        if dependency.artifact_id == finalization["ledger"].artifact_id
+    )
+    wrong_hash = replace(
+        ledger_dependency,
+        content_hash="0" * 64,
+    )
+    tampered = replace(
+        bound,
+        depends_on=[
+            wrong_hash if dependency is ledger_dependency else dependency
+            for dependency in bound.depends_on
+        ],
+    )
+    assert durable_reuse_authority_issues(service.artifact_registry, tampered)
+
+
+@pytest.mark.parametrize("authority_artifact", ["ledger", "closure"])
+def test_durable_reuse_rejects_tampered_bound_authority(
+    tmp_path: Path,
+    monkeypatch: Any,
+    authority_artifact: str,
+) -> None:
+    service = _service(tmp_path)
+    calls: list[int] = []
+    _patch_ai_call(monkeypatch, calls)
+    current_validation._adjudicate(service, [_result()])
+    finalization = service.finalize_provider_receipts()
+    assert finalization["closure"].complete is True
+    authority_record = (
+        finalization["ledger"]
+        if authority_artifact == "ledger"
+        else finalization["closure_record"]
+    )
+    assert authority_record is not None
+    authority_path = Path(authority_record.path)
+    authority_path.write_bytes(authority_path.read_bytes() + b"\n")
+
+    reconstructed = _service(tmp_path)
+    current_validation._adjudicate(reconstructed, [_result()])
+    assert len(calls) == 2
+
+
+def test_adjudication_reuse_before_publication_reconstructed_service_makes_fresh_call(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    first_service = _service(tmp_path)
+    calls: list[int] = []
+    _patch_ai_call(monkeypatch, calls)
+    current_validation._adjudicate(first_service, [_result()])
+    assert len(calls) == 1
+
+    second_service = _service(tmp_path)
+    current_validation._adjudicate(second_service, [_result()])
+    assert len(calls) == 2
+
+
+def test_same_service_reuse_preserves_normal_expected_call_accounting(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    service = _service(tmp_path)
+    calls: list[int] = []
+    _patch_ai_call(monkeypatch, calls)
+    current_validation._adjudicate(service, [_result()])
+    current_validation._adjudicate(service, [_result()])
+
+    assert len(calls) == 1
+    call_id = adjudication_call_id(_packet())
+    expected = service._expected_provider_calls[call_id]
+    assert expected.verified_reuse is False
+    closure = service.finalize_provider_receipts()
+    assert closure["closure"].complete is True
+    assert call_id in closure["closure"].observed_call_ids
+    assert call_id not in closure["closure"].verified_reuse_call_ids
 
 
 def test_adjudication_reuse_before_publication_makes_fresh_call(
