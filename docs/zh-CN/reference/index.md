@@ -1,6 +1,6 @@
 # 参考文档
 
-> 受众：所有人。本目录包含功能矩阵和迁移历史。
+> 受众：所有人。本目录包含配置、Prompt authority、功能矩阵和迁移历史。
 
 ## 文档列表
 
@@ -8,6 +8,8 @@
 |------|------|
 | [feature-matrix.md](./feature-matrix.md) | 功能实现状态矩阵：已实现 / 部分实现 / 遗留 / 计划中 |
 | [migration-history.md](./migration-history.md) | 迁移历史：架构变更、破坏性改动、版本间适配记录 |
+| [configuration.md](./configuration.md) | 当前配置 schema、模型路由、Stage 1 视觉设置和迁移规则 |
+| [prompt-inventory.md](./prompt-inventory.md) | 生产/legacy Prompt 调用者、契约、版本和 hash authority |
 
 ## 内容范围
 

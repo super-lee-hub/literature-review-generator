@@ -48,7 +48,7 @@ file itself.
 
 The aggregate result below is historical pre-merge evidence, not the cleanup
 branch result. Post-merge cleanup evidence is recorded in
-`docs/PR14_POST_MERGE_VERIFICATION.md`.
+`PR14_POST_MERGE_VERIFICATION.md`.
 
 - `python -m pytest --collect-only -q`: `865` tests collected; the strict marker
   selection is `843 selected / 22 deselected`.

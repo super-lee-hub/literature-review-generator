@@ -1,7 +1,7 @@
 # 工作区布局与产物注册
 
 > 受众：维护者、AI Agent。
-> 来源：AGENTS.md §7；TRUTH_SOURCES.md。
+> 来源：AGENTS.md 和[运行时真源](./truth-sources.md)。
 
 ## 当前真实输出目录
 

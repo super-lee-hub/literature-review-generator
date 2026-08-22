@@ -74,6 +74,15 @@ python -m reviewctl validation-status --job <job_id>
 绑定 provider ledger、receipt、source closure、attempt identity 和 Registry
 dependency closure。
 
+## Stage 1 与 Prompt authority
+
+Stage 1 默认采用实验性的 `deepseek-v4-flash-vision-exp`：MinerU 文本仍是主
+证据，所有非空 PDF 页面都会渲染并写入 visual coverage，长论文会先按批次做
+可恢复的视觉扫描，再进行最终综合。视觉模型失败时回退到
+`deepseek-v4-flash`；validation 仍固定使用纯文本的 `deepseek-v4-flash`。
+生产 Prompt 统一通过带 hash 校验的 [Prompt 清单](./docs/zh-CN/reference/prompt-inventory.md)
+加载。
+
 ## Queue 与维护命令
 
 当前 parser 还提供 `doctor`、`queue-list`、`queue-add`、`queue-run`、`queue-retry`、
@@ -93,5 +102,7 @@ Playwright、heavy OCR、多主机 publication/fencing、多主机 single-flight
 cryptographic provenance verification 属于独立 opt-in 范围，不由离线证据推断。
 
 详见 [AGENTS.md](./AGENTS.md)、[运行时真源](./docs/zh-CN/runtime/truth-sources.md)、
-[架构图](./docs/zh-CN/developer/architecture.md)、[功能矩阵](./docs/zh-CN/reference/feature-matrix.md)
+[架构图](./docs/zh-CN/developer/architecture.md)、[功能矩阵](./docs/zh-CN/reference/feature-matrix.md)、
+[Stage 1 Vision 流程](./docs/zh-CN/runtime/stage1-vision.md)、[配置参考](./docs/zh-CN/reference/configuration.md)、
+[Prompt 清单](./docs/zh-CN/reference/prompt-inventory.md)
 和 repo-local [Codex/OMX Skill](./.codex/skills/auto-generate-orchestrator/SKILL.md)。

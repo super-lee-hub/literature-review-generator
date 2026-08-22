@@ -23,7 +23,7 @@ verification.
   strict offline result `843 passed, 22 deselected in 744.99s`,
   Pyright `0 errors, 0 warnings, 0 informations`
 - Historical local pre-merge evidence is preserved in
-  `docs/PR14_FINAL_GAP_AUDIT.md`, labeled as a historical pre-merge
+  `PR14_FINAL_GAP_AUDIT.md`, labeled as a historical pre-merge
   verification snapshot.
 
 > The ZIP files are absent from the committed diff and remote branch. The local

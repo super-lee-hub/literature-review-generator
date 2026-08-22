@@ -1,6 +1,7 @@
 # Reference Documentation
 
-> Audience: Everyone. This section covers feature matrix and migration history.
+> Audience: Everyone. This section covers configuration, prompt authority,
+> feature status, and migration history.
 
 ## Documents
 
@@ -8,6 +9,8 @@
 |----------|---------|
 | [feature-matrix.md](./feature-matrix.md) | Feature implementation status: implemented / partial / legacy / planned |
 | [migration-history.md](./migration-history.md) | Migration history: architecture changes, breaking changes, version adaptation notes |
+| [configuration.md](./configuration.md) | Current config schema, model routes, Stage 1 vision settings, and migration rules |
+| [prompt-inventory.md](./prompt-inventory.md) | Production/legacy prompt callers, contracts, versions, and hash authority |
 
 ## Content Scope
 

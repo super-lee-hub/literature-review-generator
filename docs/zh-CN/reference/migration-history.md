@@ -2,7 +2,7 @@
 
 > 受众：维护者 / AI Agent。
 > 本文档记录 job-workspace 执行模型引入的迁移期行为和兼容性决策。
-> 来源：MIGRATION_NOTES.md（完整迁移）。
+> 来源：[`../../archive/migrations/`](../../archive/migrations/) 中的迁移期记录。
 
 ## Week 1 迁移说明
 

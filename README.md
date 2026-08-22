@@ -46,6 +46,15 @@ python -m reviewctl validation-status --job <job_id>
 Concept Mode is currently disabled. Stale Concept Mode requests are rejected
 instead of being silently downgraded.
 
+## Stage 1 and Prompt authority
+
+Stage 1 is vision-first with the experimental `deepseek-v4-flash-vision-exp`:
+MinerU text remains primary evidence, every non-blank PDF page is rendered and
+tracked in visual coverage, and long papers use recoverable visual-scan batches
+before final synthesis. Vision failures fall back to `deepseek-v4-flash`.
+Validation remains text-only `deepseek-v4-flash`. Production prompts are loaded
+through the hash-verified [Prompt inventory](./docs/en/reference/prompt-inventory.md).
+
 ## Documentation
 
 - [English user guide](./README.en.md)
@@ -54,6 +63,9 @@ instead of being silently downgraded.
 - [Runtime truth sources](./docs/en/runtime/truth-sources.md)
 - [Architecture](./docs/en/developer/architecture.md)
 - [Feature matrix](./docs/en/reference/feature-matrix.md)
+- [Stage 1 Vision pipeline](./docs/en/runtime/stage1-vision.md)
+- [Configuration reference](./docs/en/reference/configuration.md)
+- [Prompt inventory](./docs/en/reference/prompt-inventory.md)
 - [Codex/OMX Skill](./.codex/skills/auto-generate-orchestrator/SKILL.md)
 
 Historical migration and baseline documents are retained as historical

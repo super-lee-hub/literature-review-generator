@@ -144,6 +144,12 @@ logs/
 *_backup.*
 temp/
 tmp/
+test_temp/
+tmp_debug_stage2/
+visual_render/
+.visual-render-*/
+*.visual.json
+*.visual.jsonl
 .pyright/
 .ruff_cache/
 playwright-report/

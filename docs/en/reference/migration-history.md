@@ -2,7 +2,7 @@
 
 > Audience: maintainers / AI agents.
 > This document tracks migration-era behavior and compatibility decisions.
-> Source: MIGRATION_NOTES.md (full migration).
+> Source: the archived migration-era record in [`../../archive/migrations/`](../../archive/migrations/).
 
 ## Week 1 Migration Notes
 
