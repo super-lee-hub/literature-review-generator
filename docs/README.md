@@ -19,7 +19,7 @@ and migration evidence lives under `archive/` and is not an execution source.
 
 - [PR14 archive](./archive/pr14/)
 - [Audit archive](./archive/audits/)
-- [Migration archive](./archive/migrations/)
+- [Migration archive](./migrations/)
 
 Archived files preserve historical evidence and may describe superseded
 behavior. The current runtime authority remains the code and contracts listed

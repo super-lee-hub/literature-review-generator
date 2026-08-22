@@ -14,6 +14,8 @@
 8. 无法清楚辨认的内容使用 null 或空数组，并设置 needs_manual_review=true。
 9. 不得根据论文题目、领域常识或前后页面猜测。
 10. 不得形成跨页面的整篇论文结论。
+11. 对每一个本次请求实际发送的 visual_id 必须返回且只能返回一项 observation；不能返回空数组、重复项或未发送的 visual_id。
+12. 如果图像内容不清楚，仍返回对应 observation，但使用 low confidence、null/空数组，并设置 needs_manual_review=true。
 
 只返回以下结构的合法 JSON，不得输出 Markdown：
 

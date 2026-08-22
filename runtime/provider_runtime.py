@@ -106,6 +106,115 @@ def hash_json(value: Any) -> str:
         return stable_provider_hash("repr", repr(value))
 
 
+def _canonical_file_identity(path: str) -> dict[str, Any]:
+    """Return path-independent, non-secret identity for a local input file."""
+
+    normalized = str(path or "").strip()
+    if not normalized:
+        return {"exists": False, "bytes": 0, "sha256": ""}
+    try:
+        size = int(os.path.getsize(normalized))
+    except OSError:
+        return {"exists": False, "bytes": 0, "sha256": ""}
+    digest = hashlib.sha256()
+    try:
+        with open(normalized, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return {"exists": False, "bytes": 0, "sha256": ""}
+    return {"exists": True, "bytes": size, "sha256": digest.hexdigest()}
+
+
+def _canonical_request_content(prompt: str, user_content: Any) -> Any:
+    """Normalize logical content without persisting raw prompts or base64."""
+
+    if not isinstance(user_content, (list, tuple)):
+        return [{"type": "text", "text": str(prompt or "")}] if str(prompt or "") else []
+    normalized: list[dict[str, Any]] = []
+    has_text = False
+    for raw in user_content:
+        if not isinstance(raw, Mapping):
+            continue
+        item_type = str(raw.get("type") or "").strip().lower()
+        if item_type in {"text", "input_text"}:
+            value = str(raw.get("text") or "")
+            if value:
+                normalized.append({"type": "text", "text": value})
+                has_text = True
+            continue
+        if item_type == "local_image_path":
+            path = str(raw.get("path") or "").strip()
+            identity = _canonical_file_identity(path)
+            if not identity["exists"] or identity["bytes"] <= 0:
+                continue
+            normalized.append({
+                "type": "image",
+                "visual_id": str(raw.get("visual_id") or ""),
+                "page_no": int(raw.get("page_no") or 0),
+                "bbox": list(raw.get("bbox") or []),
+                "artifact_type": str(raw.get("artifact_type") or ""),
+                "detail": str(raw.get("detail") or "original"),
+                **identity,
+            })
+            continue
+        if item_type == "image_url":
+            image_url = raw.get("image_url")
+            if isinstance(image_url, Mapping):
+                url = str(image_url.get("url") or "").strip()
+                detail = str(image_url.get("detail") or raw.get("detail") or "original")
+            else:
+                url = str(image_url or "").strip()
+                detail = str(raw.get("detail") or "original")
+            if url:
+                normalized.append({"type": "image_url", "url_sha256": hash_text(url), "detail": detail})
+            continue
+        if item_type == "local_pdf_path":
+            identity = _canonical_file_identity(str(raw.get("path") or "").strip())
+            if identity["exists"]:
+                normalized.append({"type": "file", "filename": "document.pdf", **identity})
+            continue
+        if item_type in {"input_file", "file"}:
+            file_identity = {
+                str(key): str(raw.get(key) or "")
+                for key in ("file_id", "file_url", "filename")
+                if raw.get(key)
+            }
+            if raw.get("file_data"):
+                file_identity["file_data_sha256"] = hash_text(str(raw.get("file_data")))
+            if file_identity:
+                normalized.append({"type": "file", **file_identity})
+    if not has_text and prompt:
+        normalized.insert(0, {"type": "text", "text": str(prompt)})
+    return normalized
+
+
+def canonical_provider_request_payload(
+    *,
+    prompt: str,
+    system_prompt: str,
+    user_content: Any,
+    response_format: str,
+    max_output_tokens: int,
+    temperature: float,
+) -> dict[str, Any]:
+    """Build the one request identity shared by expected and actual calls."""
+
+    return {
+        "identity_version": "provider_request_identity/v1",
+        "system": str(system_prompt or ""),
+        "user": str(prompt or ""),
+        "user_content": _canonical_request_content(prompt, user_content),
+        "response_format": str(response_format or ""),
+        "max_output_tokens": int(max_output_tokens),
+        "temperature": float(temperature),
+    }
+
+
+def provider_request_input_hash(**kwargs: Any) -> str:
+    return hash_json(canonical_provider_request_payload(**kwargs))
+
+
 def compute_closure_epoch_id(
     *,
     job_id: str,
@@ -738,6 +847,7 @@ class ProviderRuntime:
         result: Mapping[str, Any],
         schema_hash: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        route: str | None = None,
     ) -> ProviderCallReceiptV1:
         provider = str(api_config.get("provider_family") or api_config.get("provider") or "generic")
         model = str(api_config.get("model") or "")
@@ -748,7 +858,7 @@ class ProviderRuntime:
             job_id=self.job_id,
             attempt_id=self.attempt_id,
             stage_name=self.stage_name,
-            route=self.route or provider,
+            route=str(route or self.route or provider),
             provider=provider,
             model=model,
             endpoint=endpoint,
@@ -785,6 +895,7 @@ class ProviderRuntime:
         error_kind: ProviderErrorKind = "budget_exhausted",
         message: str = "provider runtime admission rejected",
         schema_hash: str | None = None,
+        route: str | None = None,
     ) -> ProviderCallReceiptV1:
         with self._lock:
             self._calls += 1
@@ -804,6 +915,7 @@ class ProviderRuntime:
             api_config=api_config,
             result={"status": "failed", "error_kind": error_kind, "message": _redact_text(message)},
             schema_hash=schema_hash,
+            route=route,
         )
         return receipt
 
@@ -818,8 +930,10 @@ __all__ = [
     "ProviderRuntime",
     "ProviderRuntimeContractError",
     "ProviderRuntimeLedger",
+    "canonical_provider_request_payload",
     "compute_closure_epoch_id",
     "hash_json",
     "hash_text",
+    "provider_request_input_hash",
     "stable_provider_hash",
 ]

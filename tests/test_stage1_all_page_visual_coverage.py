@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import fitz  # type: ignore
@@ -74,4 +75,10 @@ def test_long_paper_scans_every_nonblank_page_and_publishes_observations(tmp_pat
     assert coverage["visually_scanned_pages"] == 15
     assert coverage["coverage_status"] == "complete"
     assert result.summaries[0]["ai_summary"]["quality_audit"]["needs_manual_review"] is not True
+    assert '"visible"' in result.summaries[0]["stage1_input"]["prompt_text"]
+    assert result.summaries[0]["stage1_input"]["selected_visual_refs"]
+    closure_record = service.registry.get("stage1:provider_receipt_closure")
+    assert closure_record is not None
+    closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))
+    assert closure_payload["payload"]["complete"] is True
     assert len([record for record in service.registry.list_records() if record.artifact_type == "stage1_visual_observations"]) == 4

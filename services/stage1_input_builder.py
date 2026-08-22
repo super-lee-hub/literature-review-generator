@@ -3,13 +3,18 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 import os
-from typing import Any, Dict, List, Mapping, Optional, cast
+from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 
 from models import APIConfig
 
 from services.model_capabilities import resolve_model_capability
 from services.multimodal_capability import detect_multimodal_capability
-from services.stage1_visual_scan import plan_visual_scan_batches
+from services.stage1_visual_scan import (
+    DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+    DEFAULT_MAX_SINGLE_IMAGE_BYTES,
+    estimate_encoded_image_bytes,
+    plan_visual_scan_batches,
+)
 from services.visual_artifact_resolver import normalize_visual_artifact
 
 
@@ -41,12 +46,14 @@ class Stage1BuiltInput:
     prompt_id: str = ""
     prompt_version: str = ""
     prompt_sha256: str = ""
+    all_visual_refs: List[Dict[str, Any]] = None  # type: ignore[assignment]
     visual_coverage: Dict[str, Any] = None  # type: ignore[assignment]
     visual_scan_batches: List[List[Dict[str, Any]]] = None  # type: ignore[assignment]
 
     def to_metadata_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["selected_visual_refs"] = [dict(item) for item in self.selected_visual_refs]
+        payload["all_visual_refs"] = [dict(item) for item in (self.all_visual_refs or [])]
         payload["visual_selection_policy_snapshot"] = dict(self.visual_selection_policy_snapshot)
         payload["multimodal_capability"] = dict(self.multimodal_capability)
         payload["visual_coverage"] = dict(self.visual_coverage or {})
@@ -75,6 +82,9 @@ class Stage1InputBuilder:
         preprocess_metadata: Mapping[str, Any] | None = None,
         prompt_identity: Mapping[str, Any] | None = None,
         prompt_values: Mapping[str, Any] | None = None,
+        post_scan_visual_refs: Sequence[Mapping[str, Any]] | None = None,
+        visual_observations: Sequence[Mapping[str, Any]] | None = None,
+        visual_coverage: Mapping[str, Any] | None = None,
     ) -> Stage1BuiltInput:
         visual_bundle_dict = dict(visual_bundle or {})
         stage1_settings = dict(stage1_input_settings or {})
@@ -93,16 +103,30 @@ class Stage1InputBuilder:
         visual_bundle_path = str(visual_bundle_dict.get("bundle_path") or "")
         selection_policy_snapshot = dict(visual_bundle_dict.get("selection_policy_snapshot") or {})
         visual_coverage = dict(
-            visual_bundle_dict.get("coverage_report")
+            visual_coverage
+            or visual_bundle_dict.get("coverage_report")
             or visual_bundle_dict.get("visual_coverage")
             or {}
         )
+        post_scan_refs = [
+            normalize_visual_artifact(dict(item))
+            for item in (post_scan_visual_refs or [])
+            if isinstance(item, Mapping)
+        ]
         prompt_identity_dict = dict(prompt_identity or {})
         prompt_values_dict = dict(prompt_values or {})
         prompt_values_dict.setdefault(
             "VISUAL_COVERAGE_JSON",
             json.dumps(
-                visual_bundle_dict.get("coverage_report") or visual_bundle_dict.get("visual_coverage") or {},
+                visual_coverage,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        prompt_values_dict.setdefault(
+            "VISUAL_OBSERVATIONS_JSON",
+            json.dumps(
+                [dict(item) for item in (visual_observations or []) if isinstance(item, Mapping)],
                 ensure_ascii=False,
                 sort_keys=True,
             ),
@@ -128,11 +152,11 @@ class Stage1InputBuilder:
         final_image_refs_max = max(0, int(stage1_settings.get("final_image_refs_max", 8) or 8))
         max_request_image_bytes = max(
             1,
-            int(stage1_settings.get("max_request_image_bytes", 36000000) or 36000000),
+            int(stage1_settings.get("max_request_image_bytes", DEFAULT_MAX_REQUEST_IMAGE_BYTES) or DEFAULT_MAX_REQUEST_IMAGE_BYTES),
         )
         max_single_image_bytes = max(
             1,
-            int(stage1_settings.get("max_single_image_bytes", 24000000) or 24000000),
+            int(stage1_settings.get("max_single_image_bytes", DEFAULT_MAX_SINGLE_IMAGE_BYTES) or DEFAULT_MAX_SINGLE_IMAGE_BYTES),
         )
         page_refs = sorted(
             [item for item in all_visual_refs if str(item.get("artifact_type") or "") == "page_snapshot"],
@@ -144,7 +168,7 @@ class Stage1InputBuilder:
         )
         nonblank_page_count = int(visual_coverage.get("nonblank_pages") or len(page_refs))
         page_total_bytes = sum(
-            int(item.get("image_bytes") or 0)
+            estimate_encoded_image_bytes(int(item.get("image_bytes") or 0))
             for item in page_refs
         )
         page_sizes_safe = all(
@@ -165,14 +189,19 @@ class Stage1InputBuilder:
             )
         else:
             selected_visual_refs = self._fit_visual_budget(
-                crop_refs[:final_image_refs_max] or page_refs[:final_image_refs_max],
+                post_scan_refs or [],
                 max_bytes=max_request_image_bytes,
                 max_single_bytes=max_single_image_bytes,
                 required=[],
             )
-        planned_batches = plan_visual_scan_batches(page_refs, batch_size=visual_scan_batch_size) if not short_path else ()
+        planned_batches = plan_visual_scan_batches(
+            page_refs,
+            batch_size=visual_scan_batch_size,
+            max_request_image_bytes=max_request_image_bytes,
+            max_single_image_bytes=max_single_image_bytes,
+        ) if not short_path else ()
         visual_scan_batches = [list(batch.visual_refs) for batch in planned_batches]
-        visual_coverage["scan_batches"] = [
+        planned_scan_batches = [
             {
                 "batch_index": index,
                 "visual_ids": [str(item.get("visual_id") or "") for item in batch],
@@ -180,6 +209,13 @@ class Stage1InputBuilder:
             }
             for index, batch in enumerate(visual_scan_batches)
         ]
+        # Keep the immutable plan separate from execution results.  A long
+        # paper is built once before scanning and once after scanning; the
+        # second build must not overwrite the durable batch outcomes.
+        visual_coverage["planned_scan_batches"] = planned_scan_batches
+        visual_coverage.setdefault("scan_batches", [])
+        visual_coverage.setdefault("planned_visual_ids", [str(item.get("visual_id") or "") for item in page_refs])
+        visual_coverage.setdefault("coverage_status", "planned" if page_refs else "complete")
 
         if not send_selected_visuals:
             selected_visual_refs = []
@@ -222,24 +258,6 @@ class Stage1InputBuilder:
             prompt_text = prompt_text.replace("{{" + str(key) + "}}", str(value))
         prompt_text = prompt_text.replace("{{PAPER_FULL_TEXT}}", paper_body)
         capability = detect_multimodal_capability(reader_api_config)
-        if short_path and capability.supports_image_input and page_refs and len(
-            [item for item in selected_visual_refs if str(item.get("artifact_type") or "") == "page_snapshot"]
-        ) >= len(page_refs):
-            visual_coverage = dict(visual_coverage)
-            visual_coverage["visually_scanned_pages"] = nonblank_page_count
-            visual_coverage["coverage_status"] = "complete"
-            visual_coverage["page_status"] = [
-                {
-                    **dict(item),
-                    "status": "scanned" if str(item.get("status") or "") == "rendered" else item.get("status"),
-                }
-                for item in visual_coverage.get("page_status") or []
-                if isinstance(item, Mapping)
-            ]
-            prompt_text = prompt_text.replace(
-                json.dumps(visual_bundle_dict.get("coverage_report") or visual_bundle_dict.get("visual_coverage") or {}, ensure_ascii=False, sort_keys=True),
-                json.dumps(visual_coverage, ensure_ascii=False, sort_keys=True),
-            )
         model_capability = resolve_model_capability(
             cast(APIConfig, dict(reader_api_config or {}))
         )
@@ -283,6 +301,7 @@ class Stage1InputBuilder:
                 prompt_text=prompt_text,
                 user_message_content=user_message_content,
                 selected_visual_refs=[],
+                all_visual_refs=all_visual_refs,
                 visual_manifest_path=visual_manifest_path,
                 visual_bundle_path=visual_bundle_path,
                 visual_selection_policy_snapshot=selection_policy_snapshot,
@@ -311,6 +330,7 @@ class Stage1InputBuilder:
                 prompt_text=prompt_text,
                 user_message_content=user_message_content,
                 selected_visual_refs=selected_visual_refs,
+                all_visual_refs=all_visual_refs,
                 visual_manifest_path=visual_manifest_path,
                 visual_bundle_path=visual_bundle_path,
                 visual_selection_policy_snapshot=selection_policy_snapshot,
@@ -354,6 +374,7 @@ class Stage1InputBuilder:
             prompt_text=prompt_text,
             user_message_content=user_message_content,
             selected_visual_refs=selected_visual_refs,
+            all_visual_refs=all_visual_refs,
             visual_manifest_path=visual_manifest_path,
             visual_bundle_path=visual_bundle_path,
             visual_selection_policy_snapshot=selection_policy_snapshot,
@@ -393,9 +414,10 @@ class Stage1InputBuilder:
                 size = 0
             if size > max_single_bytes and visual_id not in required_ids:
                 continue
-            if visual_id in required_ids or total + size <= max_bytes:
+            encoded_size = estimate_encoded_image_bytes(size)
+            if visual_id in required_ids or total + encoded_size <= max_bytes:
                 selected.append(item)
-                total += size
+                total += encoded_size
         return selected
 
     @staticmethod

@@ -28,9 +28,10 @@ def test_required_placeholders_are_strictly_rendered() -> None:
     rendered = registry.render(
         "stage1.analysis.user.v3",
         {
-            "PAPER_FULL_TEXT": "paper",
-            "VISUAL_COVERAGE_JSON": "{}",
-            "SUMMARY_SCHEMA_CONTRACT": "{}",
+                "PAPER_FULL_TEXT": "paper",
+                "VISUAL_COVERAGE_JSON": "{}",
+                "VISUAL_OBSERVATIONS_JSON": "[]",
+                "SUMMARY_SCHEMA_CONTRACT": "{}",
         },
     )
     assert "{{PAPER_FULL_TEXT}}" not in rendered

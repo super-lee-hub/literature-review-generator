@@ -70,6 +70,7 @@ _DEFAULT_SELECTION_POLICY: Dict[str, Any] = {
         "crop_format": "png",
         "crop_padding_ratio": 0.04,
         "max_request_image_bytes": 36000000,
+        "max_single_image_bytes": 24000000,
     },
     "rendering_safety": {
         "max_rendered_pixels": 16000000,
@@ -141,6 +142,15 @@ def _load_json(path: str) -> Any:
 
 def _paper_hash(paper_key: str) -> str:
     return hashlib.sha256(paper_key.encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_image_format(value: Any, default: str) -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized in {"jpg", "jpeg"}:
+        return "jpeg"
+    if normalized == "png":
+        return "png"
+    return default
 
 
 @dataclass(frozen=True)
@@ -223,20 +233,25 @@ class Stage1VisualArtifactBuilder:
             ("crop_long_edge_px", "crop_long_edge_px"),
             ("page_max_pixels", "page_max_pixels"),
             ("crop_max_pixels", "crop_max_pixels"),
+            ("page_format", "page_format"),
             ("page_jpeg_quality", "page_jpeg_quality"),
+            ("crop_format", "crop_format"),
             ("crop_padding_ratio", "crop_padding_ratio"),
             ("max_request_image_bytes", "max_request_image_bytes"),
+            ("max_single_image_bytes", "max_single_image_bytes"),
         ):
             if key in configured_visual and str(configured_visual[key]).strip() != "":
                 try:
                     rendering[target] = float(configured_visual[key]) if "." in str(configured_visual[key]) else int(configured_visual[key])
                 except (TypeError, ValueError):
                     pass
+        rendering["page_format"] = _normalize_image_format(rendering.get("page_format"), "jpeg")
+        rendering["crop_format"] = _normalize_image_format(rendering.get("crop_format"), "png")
         policy["rendering_safety"]["max_rendered_pixels"] = int(
             rendering.get("page_max_pixels") or policy["rendering_safety"]["max_rendered_pixels"]
         )
         policy["rendering_safety"]["max_visual_artifact_bytes"] = int(
-            rendering.get("max_request_image_bytes") or policy["rendering_safety"]["max_visual_artifact_bytes"]
+            rendering.get("max_single_image_bytes") or policy["rendering_safety"]["max_visual_artifact_bytes"]
         )
         preprocess_metadata = dict(preprocess_metadata or {})
         artifact_hash = _paper_hash(paper_key)
@@ -857,6 +872,8 @@ class Stage1VisualArtifactBuilder:
         image_path: str,
         policy: Mapping[str, Any],
         clip: Optional[Any] = None,
+        image_format: str = "png",
+        jpeg_quality: int = 92,
     ) -> bool:
         safety = policy.get("rendering_safety", {}) if isinstance(policy, Mapping) else {}
         max_pixels = int(safety.get("max_rendered_pixels", 16_000_000) or 16_000_000)
@@ -890,7 +907,19 @@ class Stage1VisualArtifactBuilder:
             return False
 
         pixmap = page.get_pixmap(matrix=matrix, clip=rect if clip is not None else None, alpha=False)
-        pixmap.save(image_path)
+        normalized_format = _normalize_image_format(image_format, "png")
+        if normalized_format == "jpeg":
+            try:
+                encoded = pixmap.tobytes(output="jpeg", jpg_quality=max(1, min(int(jpeg_quality), 100)))
+                with open(image_path, "wb") as handle:
+                    handle.write(encoded)
+            except (AttributeError, TypeError, ValueError, OSError):
+                # Older PyMuPDF releases do not expose jpg_quality on tobytes;
+                # retain the configured format and let the safety check below
+                # decide whether the fallback output is acceptable.
+                pixmap.save(image_path)
+        else:
+            pixmap.save(image_path)
         try:
             if os.path.getsize(image_path) > max_bytes:
                 os.remove(image_path)
@@ -981,6 +1010,14 @@ class Stage1VisualArtifactBuilder:
             page_target = max(1, int(rendering.get("page_long_edge_px", 2200) or 2200))
             crop_target = max(1, int(rendering.get("crop_long_edge_px", 2400) or 2400))
             padding_ratio = max(0.0, min(float(rendering.get("crop_padding_ratio", 0.04) or 0.04), 0.25))
+            page_format = _normalize_image_format(rendering.get("page_format"), "jpeg")
+            crop_format = _normalize_image_format(rendering.get("crop_format"), "png")
+            page_extension = "jpg" if page_format == "jpeg" else "png"
+            crop_extension = "jpg" if crop_format == "jpeg" else "png"
+            try:
+                page_jpeg_quality = max(1, min(int(rendering.get("page_jpeg_quality", 92) or 92), 100))
+            except (TypeError, ValueError):
+                page_jpeg_quality = 92
 
             for page_candidate in selected_pages:
                 page_no = int(page_candidate["page_no"])
@@ -992,12 +1029,14 @@ class Stage1VisualArtifactBuilder:
                 bbox = [0.0, 0.0, round(float(page.rect.width), 2), round(float(page.rect.height), 2)]
                 page_long_edge = max(float(page.rect.width), float(page.rect.height), 1.0)
                 render_scale = min(max(page_target / page_long_edge, 0.5), 6.0)
-                image_path = os.path.join(bundle_dir, f"page_snapshot_p{page_no:03d}.jpg")
+                image_path = os.path.join(bundle_dir, f"page_snapshot_p{page_no:03d}.{page_extension}")
                 if not self._render_pixmap_if_safe(
                     page=page,
                     matrix=fitz.Matrix(render_scale, render_scale),
                     image_path=image_path,
                     policy=policy,
+                    image_format=page_format,
+                    jpeg_quality=page_jpeg_quality,
                 ):
                     continue
                 artifact_id = f"page_snapshot:{artifact_hash}:p{page_no:03d}"
@@ -1040,13 +1079,15 @@ class Stage1VisualArtifactBuilder:
                 clip_long_edge = max(float(clip.width), float(clip.height), 1.0)
                 render_scale = min(max(crop_target / clip_long_edge, 0.75), 8.0)
                 artifact_type = str(crop_candidate.get("artifact_type") or "figure_crop")
-                image_path = os.path.join(bundle_dir, f"{artifact_type}_p{page_no:03d}_{index:02d}.png")
+                image_path = os.path.join(bundle_dir, f"{artifact_type}_p{page_no:03d}_{index:02d}.{crop_extension}")
                 if not self._render_pixmap_if_safe(
                     page=page,
                     matrix=fitz.Matrix(render_scale, render_scale),
                     clip=clip,
                     image_path=image_path,
                     policy=policy,
+                    image_format=crop_format,
+                    jpeg_quality=page_jpeg_quality,
                 ):
                     continue
                 artifact_id = f"{artifact_type}:{artifact_hash}:p{page_no:03d}:c{index:02d}"

@@ -27,6 +27,7 @@ from runtime.provider_runtime import (
     ProviderRuntimeLedger,
     _redact_mapping,
     compute_closure_epoch_id,
+    canonical_provider_request_payload,
     hash_json,
     hash_text,
 )
@@ -50,12 +51,13 @@ from services.job_workspace import (
 from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
-from services.prompt_registry import PromptRegistry, PromptRegistryError
+from services.prompt_registry import PromptRegistry
 from services.stage1_visual_scan import (
     VisualScanBatch,
     build_visual_scan_prompt,
     build_visual_scan_user_content,
     validate_visual_observations,
+    select_final_visual_refs_after_scan,
 )
 from services.multimodal_capability import detect_multimodal_capability
 from services.stage1_reuse import (
@@ -103,6 +105,8 @@ class _PreparedStage1Item:
     built_input: Any
     primary_config: dict[str, Any]
     backup_config: dict[str, Any]
+    stage1_input_settings: dict[str, Any]
+    visual_bundle: dict[str, Any]
     reuse_eligibility: Stage1ReuseEligibilityV1 | None = None
     current_binding: Stage1ReusableSummaryBindingV1 = Stage1ReusableSummaryBindingV1()
 
@@ -162,6 +166,8 @@ class Stage1AnalysisService:
         self.expected_call_graph_hash = ""
         self.closure_epoch_id = ""
         self.expected_call_graph_path = ""
+        self._expected_source_bundle_hash = ""
+        self._expected_runtime_spec_hash = ""
         self.receipt_closure_path = ""
         self.receipt_closure_hash = ""
         self.reuse_evidence_ids: list[str] = []
@@ -392,6 +398,8 @@ class Stage1AnalysisService:
             built_input=built_input,
             primary_config=primary_config,
             backup_config=dict(self.settings.section("Backup_Reader_API")),
+            stage1_input_settings=stage1_settings,
+            visual_bundle=dict(visual_bundle),
             reuse_eligibility=reuse_eligibility,
             current_binding=current_binding,
         )
@@ -458,10 +466,10 @@ class Stage1AnalysisService:
         prompt_template_hash = hash_json(prompt_authority)
         visual_identity = self._build_visual_semantic_identity(
             visual_bundle=visual_bundle,
-            selected_visual_refs=built_input.selected_visual_refs,
+            selected_visual_refs=(built_input.all_visual_refs or built_input.selected_visual_refs),
             selection_policy_snapshot=built_input.visual_selection_policy_snapshot,
         )
-        semantic_visual_refs = list(visual_identity.get("selected_visuals") or [])
+        semantic_visual_refs = list(visual_identity.get("all_visuals") or visual_identity.get("selected_visuals") or [])
         semantic_visual_policy = dict(visual_identity.get("selection_policy") or {})
         visual_input_manifest_hash = hash_json(visual_identity)
         input_builder_policy_hash = hash_json(
@@ -497,7 +505,7 @@ class Stage1AnalysisService:
             input_builder_policy_hash=input_builder_policy_hash,
             summary_schema_hash=self._schema_hash(),
             visual_input_manifest_hash=visual_input_manifest_hash,
-            visual_coverage_hash=hash_json(visual_identity.get("coverage_report") or {}),
+            visual_coverage_hash=hash_json(visual_identity.get("coverage_plan") or {}),
             original_source_location=str(item.source_pdf or ""),
             current_source_location=str(item.source_pdf or ""),
             preprocess_hash=preprocess_hash,
@@ -552,7 +560,7 @@ class Stage1AnalysisService:
                 "source_kind": "stage1_provider_generated",
                 "provider_transport_count": 1,
                 "prompt_authority": prompt_authority,
-                "visual_coverage_hash": hash_json(visual_identity.get("coverage_report") or {}),
+                "visual_coverage_hash": hash_json(visual_identity.get("coverage_plan") or {}),
             },
         )
 
@@ -576,6 +584,15 @@ class Stage1AnalysisService:
         coverage.pop("selected_crops", None)
         coverage.pop("coverage_artifact_path", None)
         coverage.pop("coverage_artifact_hash", None)
+        # These are achieved execution facts, not immutable input semantics.
+        # Keeping them in a reuse hash makes a long-paper first run (planned)
+        # differ from its own post-scan synthesis (achieved).
+        for key in (
+            "scan_batches", "visually_scanned_pages", "failed_pages",
+            "coverage_status", "omissions", "observed_visual_ids",
+            "sent_visual_ids", "observation_artifact_hashes",
+        ):
+            coverage.pop(key, None)
         coverage["page_status"] = [
             {
                 "page_no": int(item.get("page_no") or 0),
@@ -639,7 +656,9 @@ class Stage1AnalysisService:
             "artifact_version": str(visual_bundle.get("artifact_version") or ""),
             "selection_policy": policy,
             "bundle_metadata": dict(visual_bundle.get("bundle_metadata") or {}),
-            "coverage_report": coverage,
+            "coverage_plan": coverage,
+            "all_visuals": selected_visuals,
+            # Retain the old key for readers that only understand v1.
             "selected_visuals": selected_visuals,
         }
 
@@ -1047,21 +1066,47 @@ class Stage1AnalysisService:
         prepared: Sequence[_PreparedStage1Item],
     ) -> None:
         source_bundle_hash, runtime_spec_hash = self._ensure_durable_input_records(bundle)
-        # Exact summary reuse is evidence, not provider work.  The expected
-        # graph contains only items that can genuinely produce a transport
-        # receipt in this epoch.
+        # Exact summary reuse is evidence, not provider work. The expected
+        # graph contains only items that can genuinely produce a receipt.
         graph_seed: list[dict[str, Any]] = []
         for item in prepared:
             if item.previous is not None:
                 continue
             paper_key = self._paper_key(item.item)
             vision_enabled = detect_multimodal_capability(item.primary_config).supports_image_input
+            scan_call_planned = False
             for batch_index, batch_refs in enumerate(item.built_input.visual_scan_batches or []):
                 if not vision_enabled:
                     break
                 batch = VisualScanBatch(batch_index=batch_index, visual_refs=tuple(dict(ref) for ref in batch_refs))
-                prompt, _system_prompt = self._visual_scan_request(item, batch)
-                input_payload = self._visual_scan_input_payload(item, batch)
+                _scan_content, transport_report = build_visual_scan_user_content(
+                    batch,
+                    return_report=True,
+                    max_single_image_bytes=int(item.stage1_input_settings.get("max_single_image_bytes", 24_000_000) or 24_000_000),
+                    max_request_image_bytes=int(item.stage1_input_settings.get("max_request_image_bytes", 36_000_000) or 36_000_000),
+                )
+                sent_refs = tuple(
+                    dict(ref)
+                    for ref in transport_report.get("sent_visual_refs", [])
+                    if isinstance(ref, Mapping)
+                )
+                # A batch with no sendable image is an explicit omission, not
+                # a provider call that can later be mistaken for coverage.
+                if not sent_refs:
+                    continue
+                scan_call_planned = True
+                effective_batch = VisualScanBatch(
+                    batch_index=batch_index,
+                    visual_refs=sent_refs,
+                )
+                prompt, system_prompt = self._visual_scan_request(item, effective_batch)
+                effective_scan_content, _effective_report = build_visual_scan_user_content(
+                    effective_batch,
+                    return_report=True,
+                    max_single_image_bytes=int(item.stage1_input_settings.get("max_single_image_bytes", 24_000_000) or 24_000_000),
+                    max_request_image_bytes=int(item.stage1_input_settings.get("max_request_image_bytes", 36_000_000) or 36_000_000),
+                )
+                effective_config = self._effective_provider_config(item.primary_config)
                 scan_identity = self.prompt_registry.identity("stage1.visual_scan.system.v1")
                 graph_seed.append(
                     {
@@ -1075,14 +1120,47 @@ class Stage1AnalysisService:
                         "prompt_id": scan_identity.prompt_id,
                         "prompt_version": scan_identity.version,
                         "prompt_sha256": scan_identity.sha256,
-                        "input_hash": hash_json(input_payload),
-                        "config_hash": hash_json(_redact_mapping(item.primary_config)),
+                        "input_hash": self._request_hash(prompt, system_prompt, effective_scan_content, effective_config, response_format="json"),
+                        "config_hash": hash_json(_redact_mapping(effective_config)),
                         "schema_hash": self._visual_scan_schema_hash(),
                         "artifact_path": self._visual_observation_path(paper_key, batch_index),
                         "max_attempts": max(1, self.settings.runtime.node_retry_limit + 1),
                         "usage_required": False,
                     }
                 )
+            synthesis_content = item.built_input.user_message_content
+            primary_config = self._effective_provider_config(item.primary_config)
+            backup_config = self._effective_provider_config(item.backup_config)
+            primary_hash = (
+                ""
+                if scan_call_planned
+                else self._request_hash(
+                    item.built_input.prompt_text,
+                    self.prompt_registry.read("stage1.analysis.system.v3"),
+                    synthesis_content,
+                    primary_config,
+                    response_format="json",
+                )
+            )
+            backup_content = self._text_only_content(synthesis_content)
+            backup_hash = self._request_hash(
+                item.built_input.prompt_text,
+                self.prompt_registry.read("stage1.analysis.system.v3"),
+                backup_content,
+                backup_config,
+                response_format="json",
+                default_max_tokens=8192,
+            )
+            variants = []
+            if primary_hash:
+                variants.append({
+                    "input_hash": primary_hash,
+                    "config_hash": hash_json(_redact_mapping(primary_config)),
+                })
+            variants.append({
+                "input_hash": backup_hash,
+                "config_hash": hash_json(_redact_mapping(backup_config)),
+            })
             graph_seed.append(
                 {
                     "call_id": self._synthesis_call_id(paper_key),
@@ -1095,25 +1173,36 @@ class Stage1AnalysisService:
                     "prompt_id": item.built_input.prompt_id,
                     "prompt_version": item.built_input.prompt_version,
                     "prompt_sha256": item.built_input.prompt_sha256,
-                    "input_hash": (
-                        ""
-                        if item.built_input.visual_scan_batches
-                        else hash_json(item.built_input.to_metadata_dict())
-                    ),
-                    "config_hash": hash_json(_redact_mapping(item.primary_config)),
+                    "input_hash": primary_hash,
+                    "config_hash": hash_json(_redact_mapping(primary_config)),
                     "schema_hash": self._schema_hash(),
                     "artifact_path": self._paper_artifact_path(item.item),
                     "max_attempts": max(1, self.settings.runtime.node_retry_limit + 1),
                     "usage_required": False,
+                "request_variants": variants if primary_hash else ({
+                    "input_hash": backup_hash,
+                    "config_hash": hash_json(_redact_mapping(backup_config)),
+                },),
                 }
             )
         graph_hash = hash_json({
+            "identity_version": "stage1_expected_call_graph/v2",
             "job_id": self.job_id,
             "stage_name": "stage1_analyze",
             "attempt_id": self.attempt_id,
             "source_bundle_hash": source_bundle_hash,
             "runtime_spec_hash": runtime_spec_hash,
-            "expected_calls": graph_seed,
+            "call_shapes": [
+                {
+                    "call_id": item["call_id"],
+                    "node_id": item["node_id"],
+                    "prompt_id": item["prompt_id"],
+                    "schema_hash": item["schema_hash"],
+                    "artifact_path": item["artifact_path"],
+                    "max_attempts": item["max_attempts"],
+                }
+                for item in graph_seed
+            ],
         })
         config_hash = hash_json({
             "primary_reader": [item.primary_config for item in prepared],
@@ -1133,6 +1222,8 @@ class Stage1AnalysisService:
         )
         self.expected_call_graph_hash = graph_hash
         self.closure_epoch_id = epoch
+        self._expected_source_bundle_hash = source_bundle_hash
+        self._expected_runtime_spec_hash = runtime_spec_hash
         self.expected_calls = tuple(
             ExpectedProviderCall(
                 **item,
@@ -1141,9 +1232,156 @@ class Stage1AnalysisService:
             )
             for item in graph_seed
         )
-        self.expected_call_graph_path = self.workspace.artifact_path(
-            "stage1/provider_expected_calls.json"
+        self.expected_call_graph_path = self.workspace.artifact_path("stage1/provider_expected_calls.json")
+        self._publish_expected_call_graph()
+
+    @staticmethod
+    def _text_only_content(content: Any) -> Any:
+        if not isinstance(content, list):
+            return content
+        text_items = [
+            dict(item)
+            for item in content
+            if isinstance(item, Mapping)
+            and str(item.get("type") or "").strip().lower() in {"text", "input_text"}
+            and str(item.get("text") or "").strip()
+        ]
+        return text_items or None
+
+    @staticmethod
+    def _effective_provider_config(config: Mapping[str, Any]) -> dict[str, Any]:
+        """Mirror the effective config fields added by ai_interface."""
+
+        effective = dict(config)
+        effective["api_key"] = str(config.get("api_key") or "")
+        effective["model"] = str(config.get("model") or "")
+        effective["api_base"] = str(
+            config.get("api_base") or "https://api.openai.com/v1"
         )
+        return effective
+
+    @staticmethod
+    def _request_parameters(
+        api_config: Mapping[str, Any],
+        *,
+        default_max_tokens: int,
+    ) -> tuple[int, float]:
+        raw_max_tokens = api_config.get("max_output_tokens", default_max_tokens)
+        raw_temperature = api_config.get("temperature", 0.3)
+        try:
+            max_tokens = int(raw_max_tokens)
+            temperature = float(raw_temperature)
+        except (TypeError, ValueError):
+            # This mirrors get_summary_from_ai_detailed's defensive fallback.
+            max_tokens = 3000
+            temperature = 0.3
+        return max_tokens, temperature
+
+    @staticmethod
+    def _request_hash(
+        prompt: str,
+        system_prompt: str,
+        user_content: Any,
+        api_config: Mapping[str, Any],
+        *,
+        response_format: str,
+        default_max_tokens: int = 3000,
+    ) -> str:
+        max_tokens, temperature = Stage1AnalysisService._request_parameters(
+            api_config,
+            default_max_tokens=default_max_tokens if response_format == "json" else 4000,
+        )
+        return hash_json(canonical_provider_request_payload(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            response_format=response_format,
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        ))
+
+    @staticmethod
+    def _transport_metadata_for_content(
+        content: Any,
+        *,
+        stage1_input_settings: Mapping[str, Any],
+        engine_type: str,
+    ) -> dict[str, Any]:
+        """Calculate the local-input transport facts for injected readers."""
+
+        max_single = max(
+            1,
+            int(
+                stage1_input_settings.get("max_single_image_bytes", 24_000_000)
+                or 24_000_000
+            ),
+        )
+        max_request = max(
+            1,
+            int(
+                stage1_input_settings.get("max_request_image_bytes", 36_000_000)
+                or 36_000_000
+            ),
+        )
+        planned_ids: list[str] = []
+        sent_ids: list[str] = []
+        omissions: list[dict[str, Any]] = []
+        encoded_bytes = 0
+        has_file = False
+        if engine_type != "backup" and isinstance(content, list):
+            for raw in content:
+                if not isinstance(raw, Mapping):
+                    continue
+                item_type = str(raw.get("type") or "").strip().lower()
+                if item_type == "local_image_path":
+                    visual_id = str(raw.get("visual_id") or "")
+                    if visual_id:
+                        planned_ids.append(visual_id)
+                    path = str(raw.get("path") or "").strip()
+                    try:
+                        image_bytes = int(raw.get("image_bytes") or Path(path).stat().st_size)
+                    except (OSError, TypeError, ValueError):
+                        image_bytes = 0
+                    reason = ""
+                    if not path or not Path(path).is_file():
+                        reason = "image_missing"
+                    elif image_bytes <= 0:
+                        reason = "image_empty"
+                    elif image_bytes > max_single:
+                        reason = "image_exceeds_single_byte_budget"
+                    else:
+                        encoded = int((image_bytes * 4 + 2) // 3) + 240
+                        if encoded_bytes + encoded > max_request:
+                            reason = "image_exceeds_request_byte_budget"
+                        else:
+                            encoded_bytes += encoded
+                    if reason:
+                        omissions.append(
+                            {
+                                "visual_id": visual_id,
+                                "page_no": int(raw.get("page_no") or 0),
+                                "reason": reason,
+                            }
+                        )
+                    elif visual_id:
+                        sent_ids.append(visual_id)
+                    continue
+                if item_type in {"local_pdf_path", "input_file", "file"}:
+                    has_file = True
+        successful_mode = "multimodal" if sent_ids else "pdf_plus_text" if has_file else "text_only"
+        return {
+            "planned_visual_ids": planned_ids,
+            "sent_visual_ids": sent_ids,
+            "omissions": omissions,
+            "images_planned_count": len(planned_ids),
+            "images_actually_sent_count": len(sent_ids),
+            "estimated_encoded_image_bytes": encoded_bytes,
+            "max_single_image_bytes": max_single,
+            "max_request_image_bytes": max_request,
+            "successful_input_mode": successful_mode,
+        }
+
+    def _publish_expected_call_graph(self) -> None:
         graph_record = publish_json_artifact(
             self.publication_context,
             self.registry,
@@ -1154,10 +1392,10 @@ class Stage1AnalysisService:
                 "job_id": self.job_id,
                 "stage_name": "stage1_analyze",
                 "attempt_id": self.attempt_id,
-                "closure_epoch_id": epoch,
-                "expected_call_graph_hash": graph_hash,
-                "source_bundle_hash": source_bundle_hash,
-                "runtime_spec_hash": runtime_spec_hash,
+                "closure_epoch_id": self.closure_epoch_id,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "source_bundle_hash": self._expected_source_bundle_hash,
+                "runtime_spec_hash": self._expected_runtime_spec_hash,
                 "expected_calls": [asdict(item) for item in self.expected_calls],
             },
             artifact_role="provider_expected_call_graph",
@@ -1166,15 +1404,55 @@ class Stage1AnalysisService:
             producer="services.stage1_analysis_service.Stage1AnalysisService",
             artifact_id="stage1:provider_expected_call_graph",
             metadata={
-                "closure_epoch_id": epoch,
-                "expected_call_graph_hash": graph_hash,
-                "source_bundle_hash": source_bundle_hash,
-                "runtime_spec_hash": runtime_spec_hash,
+                "closure_epoch_id": self.closure_epoch_id,
+                "expected_call_graph_hash": self.expected_call_graph_hash,
+                "source_bundle_hash": self._expected_source_bundle_hash,
+                "runtime_spec_hash": self._expected_runtime_spec_hash,
                 "expected_call_count": len(self.expected_calls),
                 "reuse_excluded_from_expected_calls": True,
             },
         )
         self.expected_call_graph_path = graph_record.path
+
+    def _refresh_synthesis_expected_call(self, prepared: _PreparedStage1Item) -> None:
+        """Bind long-paper synthesis to the post-scan request identity."""
+
+        paper_key = self._paper_key(prepared.item)
+        prompt = prepared.built_input.prompt_text
+        system_prompt = self.prompt_registry.read("stage1.analysis.system.v3")
+        primary_config = self._effective_provider_config(prepared.primary_config)
+        backup_config = self._effective_provider_config(prepared.backup_config)
+        primary_hash = self._request_hash(
+            prompt,
+            system_prompt,
+            prepared.built_input.user_message_content,
+            primary_config,
+            response_format="json",
+        )
+        backup_hash = self._request_hash(
+            prompt,
+            system_prompt,
+            self._text_only_content(prepared.built_input.user_message_content),
+            backup_config,
+            response_format="json",
+            default_max_tokens=8192,
+        )
+        primary_config_hash = hash_json(_redact_mapping(primary_config))
+        backup_config_hash = hash_json(_redact_mapping(backup_config))
+        self.expected_calls = tuple(
+            replace(
+                expected,
+                input_hash=primary_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.input_hash,
+                config_hash=primary_config_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.config_hash,
+                prompt_hash=hash_text(prompt) if expected.call_id == self._synthesis_call_id(paper_key) else expected.prompt_hash,
+                request_variants=(
+                    {"input_hash": primary_hash, "config_hash": primary_config_hash},
+                    {"input_hash": backup_hash, "config_hash": backup_config_hash},
+                ) if expected.call_id == self._synthesis_call_id(paper_key) else expected.request_variants,
+            )
+            for expected in self.expected_calls
+        )
+        self._publish_expected_call_graph()
 
     def _execute_prepared(
         self,
@@ -1347,7 +1625,7 @@ class Stage1AnalysisService:
             }
             return summary, ()
 
-        prepared, visual_coverage, visual_observation_text = self._run_visual_scans(prepared)
+        prepared, visual_coverage, visual_observations = self._run_visual_scans(prepared)
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
                 max_calls=max(2, self.settings.runtime.node_retry_limit + 2),
@@ -1368,29 +1646,38 @@ class Stage1AnalysisService:
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.attempt_id,
         )
-        if visual_observation_text:
-            built_input = replace(
-                prepared.built_input,
-                user_message_content=[
-                    *list(prepared.built_input.user_message_content or []),
-                    {"type": "text", "text": visual_observation_text},
-                ],
+        if prepared.built_input.visual_scan_batches:
+            final_visual_refs = select_final_visual_refs_after_scan(
+                prepared.built_input.all_visual_refs
+                or prepared.built_input.selected_visual_refs
+                or [],
+                visual_observations,
+                max_refs=max(
+                    0,
+                    int(prepared.stage1_input_settings.get("final_image_refs_max", 8) or 8),
+                ),
+            )
+            rebuilt_input = Stage1InputBuilder(logger=self.logger).build(
+                prompt_template=self._prompt_template(),
+                paper_text=str(prepared.preprocess_metadata.get("stage1_input_text") or ""),
+                reader_api_config=prepared.primary_config,
+                visual_bundle=prepared.visual_bundle,
+                pdf_path=str(item.source_pdf or ""),
+                stage1_input_settings=prepared.stage1_input_settings,
+                preprocess_metadata=prepared.preprocess_metadata,
+                prompt_identity=self._stage1_user_prompt_identity.to_dict(),
+                prompt_values={"SUMMARY_SCHEMA_CONTRACT": build_summary_schema_contract()},
+                post_scan_visual_refs=final_visual_refs,
+                visual_observations=visual_observations,
                 visual_coverage=visual_coverage,
             )
+            prepared = replace(prepared, built_input=rebuilt_input)
+            self._refresh_synthesis_expected_call(prepared)
+            # Refresh only the current graph artifact provenance.  The
+            # reusable input binding remains the immutable pre-scan identity.
             prepared = replace(
                 prepared,
-                built_input=built_input,
-                current_binding=replace(
-                    prepared.current_binding,
-                    visual_coverage_hash=self._coverage_identity_hash(visual_coverage),
-                    extra={
-                        **dict(prepared.current_binding.extra),
-                        "visual_observation_artifact_hashes": [
-                            record.content_hash
-                            for record in self._visual_observation_records.get(self._paper_key(item), [])
-                        ],
-                    },
-                ),
+                current_binding=self._bind_execution_provenance(prepared.current_binding),
             )
 
         provider_result = self._call_reader(
@@ -1400,15 +1687,119 @@ class Stage1AnalysisService:
             backup_config=prepared.backup_config,
             runtime=runtime,
         )
+        engine_type = str(provider_result.get("engine_type") or "primary").strip().lower()
+        provider_route = "Backup_Reader_API" if engine_type == "backup" else "Primary_Reader_API"
+        provider_config = (
+            prepared.backup_config if engine_type == "backup" else prepared.primary_config
+        )
+        effective_provider_config = self._effective_provider_config(provider_config)
+        request_content = (
+            self._text_only_content(prepared.built_input.user_message_content)
+            if engine_type == "backup"
+            else prepared.built_input.user_message_content
+        )
+        transport_metadata = self._transport_metadata_for_content(
+            request_content,
+            stage1_input_settings=prepared.stage1_input_settings,
+            engine_type=engine_type,
+        )
+        reported_transport = provider_result.get("transport_metadata")
+        if isinstance(reported_transport, Mapping):
+            transport_metadata.update(
+                {
+                    str(key): value
+                    for key, value in reported_transport.items()
+                    if value is not None
+                }
+            )
+        transport_metadata["successful_input_mode"] = (
+            "multimodal"
+            if int(transport_metadata.get("images_actually_sent_count") or 0) > 0
+            else str(transport_metadata.get("successful_input_mode") or "text_only")
+        )
+        provider_result = {
+            **dict(provider_result),
+            "transport_metadata": transport_metadata,
+        }
+        max_tokens, temperature = self._request_parameters(
+            effective_provider_config,
+            default_max_tokens=8192 if engine_type == "backup" else 3000,
+        )
+        request_payload = canonical_provider_request_payload(
+            prompt=prepared.built_input.prompt_text,
+            system_prompt=self.prompt_registry.read("stage1.analysis.system.v3"),
+            user_content=request_content,
+            response_format="json",
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        )
         self._ensure_receipt(
             runtime,
             prompt=prepared.built_input.prompt_text,
-            input_payload=prepared.built_input.to_metadata_dict(),
-            api_config=prepared.primary_config,
+            input_payload=request_payload,
+            api_config=effective_provider_config,
+            route=provider_route,
             result=provider_result,
         )
         ai_summary = self._canonical_substantive_summary(provider_result)
         coverage = dict(visual_coverage or prepared.built_input.visual_coverage or {})
+        actual_visual_ids = [
+            str(value)
+            for value in (transport_metadata.get("sent_visual_ids") or [])
+            if str(value)
+        ]
+        planned_visual_ids = [
+            str(value)
+            for value in (coverage.get("planned_visual_ids") or [])
+            if str(value)
+        ]
+        coverage["final_engine_type"] = engine_type
+        coverage["final_provider_route"] = provider_route
+        coverage["final_successful_input_mode"] = str(
+            transport_metadata.get("successful_input_mode") or "text_only"
+        )
+        coverage["direct_visual_ids"] = actual_visual_ids
+        coverage["direct_visual_pages"] = sorted(
+            {
+                int(ref.get("page_no") or 0)
+                for ref in (prepared.built_input.selected_visual_refs or [])
+                if str(ref.get("visual_id") or "") in set(actual_visual_ids)
+            }
+        )
+        coverage["images_planned_count"] = int(
+            transport_metadata.get("images_planned_count")
+            or len(prepared.built_input.selected_visual_refs or [])
+        )
+        coverage["images_actually_sent_count"] = int(
+            transport_metadata.get("images_actually_sent_count") or 0
+        )
+        coverage["transport_omissions"] = list(transport_metadata.get("omissions") or [])
+        if not prepared.built_input.visual_scan_batches:
+            direct_complete = bool(planned_visual_ids) and (
+                set(actual_visual_ids) >= set(planned_visual_ids)
+                and not transport_metadata.get("omissions")
+                and engine_type == "primary"
+            )
+            if planned_visual_ids:
+                coverage["observed_visual_ids"] = sorted(set(actual_visual_ids))
+                coverage["visually_scanned_pages"] = len(
+                    {
+                        int(ref.get("page_no") or 0)
+                        for ref in (prepared.built_input.selected_visual_refs or [])
+                        if str(ref.get("visual_id") or "") in set(actual_visual_ids)
+                    }
+                )
+                coverage["coverage_status"] = "complete" if direct_complete else "partial"
+            elif coverage.get("coverage_status") == "planned":
+                coverage["coverage_status"] = "complete"
+        elif engine_type == "backup" and planned_visual_ids:
+            # The backup route is intentionally text-only.  Even when prior
+            # scan artifacts are complete, the final provider transport cannot
+            # be labeled multimodal or final-transport complete.
+            coverage["scan_coverage_status"] = str(
+                coverage.get("coverage_status") or "partial"
+            )
+            coverage["coverage_status"] = "partial"
         if coverage.get("coverage_status") != "complete":
             quality_audit = dict(ai_summary.get("quality_audit") or {})
             quality_audit["needs_manual_review"] = True
@@ -1417,9 +1808,6 @@ class Stage1AnalysisService:
                 flags.append("visual_coverage_incomplete")
             quality_audit["conflict_flags"] = flags
             ai_summary["quality_audit"] = quality_audit
-        engine_type = str(provider_result.get("engine_type") or "primary").strip().lower()
-        provider_route = "Backup_Reader_API" if engine_type == "backup" else runtime.route
-        provider_config = prepared.backup_config if engine_type == "backup" else prepared.primary_config
         fallback_reason = str(provider_result.get("fallback_reason") or "").strip()
         source_record, generated_binding = self._publish_generated_source_artifact(
             prepared,
@@ -1448,8 +1836,15 @@ class Stage1AnalysisService:
                 "receipt_ids": list(self._paper_receipt_ids(self._paper_key(item))),
                 "receipt_ledger_path": self.receipt_ledger_path,
                 "fallback_reason": fallback_reason,
-                "input_mode": prepared.built_input.input_mode,
+                "planned_input_mode": prepared.built_input.input_mode,
+                "input_mode": str(transport_metadata.get("successful_input_mode") or "text_only"),
+                "successful_input_mode": str(transport_metadata.get("successful_input_mode") or "text_only"),
+                "images_planned_count": int(transport_metadata.get("images_planned_count") or 0),
+                "images_actually_sent_count": int(transport_metadata.get("images_actually_sent_count") or 0),
+                "successful_engine": engine_type,
+                "transport_omissions": list(transport_metadata.get("omissions") or []),
                 "visual_coverage_status": str(coverage.get("coverage_status") or ""),
+                "visual_scan_coverage_status": str(coverage.get("scan_coverage_status") or coverage.get("coverage_status") or ""),
             },
             "stage1_reuse": {
                 "decision": (
@@ -1486,27 +1881,129 @@ class Stage1AnalysisService:
     def _run_visual_scans(
         self,
         prepared: _PreparedStage1Item,
-    ) -> tuple[_PreparedStage1Item, dict[str, Any], str]:
-        """Run long-paper page scans and return durable observations for synthesis."""
+    ) -> tuple[_PreparedStage1Item, dict[str, Any], list[dict[str, Any]]]:
+        """Scan every sendable page and return substantive observations."""
 
         paper_key = self._paper_key(prepared.item)
         coverage = dict(prepared.built_input.visual_coverage or {})
         batches = tuple(prepared.built_input.visual_scan_batches or ())
         capability = detect_multimodal_capability(prepared.primary_config)
-        if not batches or not capability.supports_image_input:
-            return prepared, coverage, ""
+        if not batches:
+            self._visual_observation_records[paper_key] = []
+            return prepared, coverage, []
+
+        try:
+            max_single = max(
+                1,
+                int(prepared.stage1_input_settings.get("max_single_image_bytes", 24_000_000) or 24_000_000),
+            )
+            max_request = max(
+                1,
+                int(prepared.stage1_input_settings.get("max_request_image_bytes", 36_000_000) or 36_000_000),
+            )
+        except (TypeError, ValueError):
+            max_single, max_request = 24_000_000, 36_000_000
 
         observation_records: list[ArtifactRecord] = []
+        observations: list[dict[str, Any]] = []
         scan_results: list[dict[str, Any]] = []
-        successful_pages: set[int] = set()
+        sent_visual_ids: set[str] = set()
+        observed_visual_ids: set[str] = set()
         failed_pages: set[int] = set()
+        omissions: list[dict[str, Any]] = []
+        planned_visual_ids = [
+            str(value)
+            for value in (coverage.get("planned_visual_ids") or [])
+            if str(value)
+        ]
+
         for batch_index, raw_refs in enumerate(batches):
-            batch = VisualScanBatch(
+            planned_batch = VisualScanBatch(
                 batch_index=batch_index,
                 visual_refs=tuple(dict(ref) for ref in raw_refs if isinstance(ref, Mapping)),
             )
+            scan_content, report = build_visual_scan_user_content(
+                planned_batch,
+                return_report=True,
+                max_single_image_bytes=max_single,
+                max_request_image_bytes=max_request,
+            )
+            batch_omissions = [
+                dict(item)
+                for item in (report.get("omissions") or [])
+                if isinstance(item, Mapping)
+            ]
+            omissions.extend(batch_omissions)
+            sent_refs = tuple(
+                dict(ref)
+                for ref in (report.get("sent_visual_refs") or [])
+                if isinstance(ref, Mapping)
+            )
+            sent_ids = [str(ref.get("visual_id") or "") for ref in sent_refs if str(ref.get("visual_id") or "")]
+            sent_visual_ids.update(sent_ids)
+            page_nos = sorted({int(ref.get("page_no") or 0) for ref in planned_batch.visual_refs})
+            if not capability.supports_image_input:
+                omissions.extend(
+                    {
+                        "visual_id": str(ref.get("visual_id") or ""),
+                        "page_no": int(ref.get("page_no") or 0),
+                        "reason": "provider_does_not_support_image_input",
+                    }
+                    for ref in planned_batch.visual_refs
+                )
+                failed_pages.update(page_nos)
+                scan_results.append(
+                    {
+                        "batch_index": batch_index,
+                        "call_id": "",
+                        "status": "skipped_no_multimodal_capability",
+                        "planned_visual_ids": list(planned_batch.visual_ids),
+                        "sent_visual_ids": [],
+                        "page_nos": page_nos,
+                        "omissions": batch_omissions,
+                        "observation_artifact_id": "",
+                        "observation_artifact_hash": "",
+                    }
+                )
+                continue
+            if not sent_refs:
+                failed_pages.update(page_nos)
+                scan_results.append(
+                    {
+                        "batch_index": batch_index,
+                        "call_id": "",
+                        "status": "skipped_no_sendable_images",
+                        "planned_visual_ids": list(planned_batch.visual_ids),
+                        "sent_visual_ids": [],
+                        "page_nos": page_nos,
+                        "omissions": batch_omissions,
+                        "observation_artifact_id": "",
+                        "observation_artifact_hash": "",
+                    }
+                )
+                continue
+
+            batch = VisualScanBatch(batch_index=batch_index, visual_refs=sent_refs)
+            scan_content, effective_report = build_visual_scan_user_content(
+                batch,
+                return_report=True,
+                max_single_image_bytes=max_single,
+                max_request_image_bytes=max_request,
+            )
             prompt, system_prompt = self._visual_scan_request(prepared, batch)
-            input_payload = self._visual_scan_input_payload(prepared, batch)
+            effective_config = self._effective_provider_config(prepared.primary_config)
+            max_tokens, temperature = self._request_parameters(
+                effective_config,
+                default_max_tokens=3000,
+            )
+            input_payload = canonical_provider_request_payload(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                user_content=scan_content,
+                response_format="json",
+                max_output_tokens=max_tokens,
+                temperature=temperature,
+            )
             runtime = ProviderRuntime(
                 budget=ProviderBudgetV1(
                     max_calls=max(1, self.settings.runtime.node_retry_limit + 1),
@@ -1532,13 +2029,15 @@ class Stage1AnalysisService:
                 batch=batch,
                 prompt=prompt,
                 system_prompt=system_prompt,
+                user_content=scan_content,
                 runtime=runtime,
             )
             self._ensure_receipt(
                 runtime,
                 prompt=prompt,
                 input_payload=input_payload,
-                api_config=prepared.primary_config,
+                api_config=effective_config,
+                route="Primary_Reader_API",
                 result=result,
             )
             payload, record, valid = self._publish_visual_observation(
@@ -1548,57 +2047,97 @@ class Stage1AnalysisService:
             )
             if record is not None:
                 observation_records.append(record)
-            page_nos = {int(ref.get("page_no") or 0) for ref in batch.visual_refs}
-            if valid:
-                successful_pages.update(page_nos)
-            else:
+            batch_observations = [
+                dict(item)
+                for item in (payload.get("observations") or [])
+                if isinstance(item, Mapping)
+            ] if valid else []
+            observations.extend(batch_observations)
+            observed_ids = {
+                str(item.get("visual_id") or "")
+                for item in batch_observations
+                if str(item.get("visual_id") or "")
+            }
+            observed_visual_ids.update(observed_ids)
+            observed_pages = {
+                int(item.get("page_no") or 0)
+                for item in batch_observations
+                if int(item.get("page_no") or 0) > 0
+            }
+            if not valid:
                 failed_pages.update(page_nos)
+            else:
+                failed_pages.update(set(page_nos) - observed_pages)
             scan_results.append(
                 {
                     "batch_index": batch_index,
                     "call_id": runtime.call_id,
                     "status": "success" if valid else "scan_failed",
-                    "visual_ids": list(batch.visual_ids),
-                    "page_nos": sorted(page_nos),
+                    "planned_visual_ids": list(planned_batch.visual_ids),
+                    "sent_visual_ids": list(batch.visual_ids),
+                    "page_nos": page_nos,
+                    "omissions": batch_omissions,
                     "observation_artifact_id": record.artifact_id if record is not None else "",
                     "observation_artifact_hash": record.content_hash if record is not None else "",
                     "error": str(payload.get("error") or "") if not valid else "",
+                    "effective_transport": dict(effective_report),
                 }
             )
 
         self._visual_observation_records[paper_key] = observation_records
+        observed_pages = {
+            int(ref.get("page_no") or 0)
+            for ref in (prepared.built_input.all_visual_refs or prepared.built_input.selected_visual_refs or [])
+            if str(ref.get("visual_id") or "") in observed_visual_ids
+        }
         page_status = []
         for item in coverage.get("page_status") or []:
             if not isinstance(item, Mapping):
                 continue
             page = int(item.get("page_no") or 0)
             status = str(item.get("status") or "")
-            if status in {"rendered", "scanned"} and page in successful_pages:
+            if status in {"rendered", "scanned"} and page in observed_pages:
                 status = "scanned"
             elif status in {"rendered", "scanned"} and page in failed_pages:
                 status = "scan_failed"
-            page_status.append({
-                "page_no": page,
-                "status": status,
-                "skipped_reason": str(item.get("skipped_reason") or ""),
-            })
+            page_status.append(
+                {
+                    "page_no": page,
+                    "status": status,
+                    "skipped_reason": str(item.get("skipped_reason") or ""),
+                }
+            )
         nonblank_pages = int(coverage.get("nonblank_pages") or 0)
-        scanned_pages = len(successful_pages)
         failed_count = sum(1 for item in page_status if item.get("status") == "scan_failed")
+        scan_status = (
+            "complete"
+            if nonblank_pages == 0 or (
+                len(observed_pages) >= nonblank_pages and failed_count == 0
+            )
+            else "failed"
+            if failed_count and not observed_pages
+            else "partial"
+        )
         coverage.update(
             {
-                "visually_scanned_pages": scanned_pages,
-                "failed_pages": int(coverage.get("failed_pages") or 0) + failed_count,
+                "planned_visual_ids": planned_visual_ids,
+                "sent_visual_ids": sorted(sent_visual_ids),
+                "observed_visual_ids": sorted(observed_visual_ids),
+                "visually_scanned_pages": len(observed_pages),
+                "failed_pages": failed_count,
                 "page_status": page_status,
                 "scan_batches": scan_results,
-                "coverage_status": (
-                    "complete"
-                    if nonblank_pages > 0 and scanned_pages >= nonblank_pages and failed_count == 0
-                    else "failed"
-                    if failed_count and scanned_pages == 0
-                    else "partial"
-                ),
-                "omissions": [item for item in page_status if item.get("status") in {"render_failed", "scan_failed"}],
+                "observation_artifact_hashes": [record.content_hash for record in observation_records],
+                "scan_coverage_status": scan_status,
+                "coverage_status": scan_status,
+                "omissions": [
+                    *omissions,
+                    *[
+                        item
+                        for item in page_status
+                        if item.get("status") in {"render_failed", "scan_failed"}
+                    ],
+                ],
             }
         )
         coverage_record = self._publish_visual_coverage(
@@ -1610,21 +2149,7 @@ class Stage1AnalysisService:
             coverage["coverage_artifact_path"] = coverage_record.path
             coverage["coverage_artifact_hash"] = coverage_record.content_hash
             self._visual_coverage_records[paper_key] = coverage_record
-        observation_text = "[STAGE1 VISUAL OBSERVATIONS]\n" + "\n".join(
-            json.dumps(
-                {
-                    "batch_index": result["batch_index"],
-                    "status": result["status"],
-                    "visual_ids": result["visual_ids"],
-                    "observation_artifact_id": result["observation_artifact_id"],
-                    "observation_artifact_hash": result["observation_artifact_hash"],
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-            for result in scan_results
-        )
-        return prepared, coverage, observation_text
+        return prepared, coverage, observations
 
     def _call_visual_scan(
         self,
@@ -1633,9 +2158,9 @@ class Stage1AnalysisService:
         batch: VisualScanBatch,
         prompt: str,
         system_prompt: str,
+        user_content: Any,
         runtime: ProviderRuntime,
     ) -> Mapping[str, Any]:
-        user_content = build_visual_scan_user_content(batch)
         if self.reader is not None:
             value = self.reader(
                 purpose="visual_scan",
@@ -1687,6 +2212,8 @@ class Stage1AnalysisService:
                 content = validate_visual_observations(
                     content,
                     allowed_visual_ids=batch.visual_ids,
+                    expected_visual_refs=batch.visual_refs,
+                    sent_visual_ids=batch.visual_ids,
                 )
                 valid = True
             except ValueError as exc:
@@ -2460,7 +2987,12 @@ class Stage1AnalysisService:
                 ),
                 None,
             )
-            output_record = source_record or paper_record
+            visual_record = (
+                self.registry.get(expected.call_id)
+                if str(expected.call_id).startswith("stage1_visual_scan:")
+                else None
+            )
+            output_record = source_record or visual_record or paper_record
             if source_record is not None:
                 stable_source_ids.append(source_record.artifact_id)
             if paper_record is not None and source_record is None:
@@ -2473,11 +3005,20 @@ class Stage1AnalysisService:
                     if isinstance(envelope, list) and len(envelope) == 1 and isinstance(envelope[0], Mapping):
                         payload_hash = hash_json(envelope[0].get("ai_summary"))
                     elif isinstance(envelope, Mapping):
-                        payload_hash = hash_json(
-                            envelope.get("analysis")
-                            if envelope.get("analysis") is not None
-                            else envelope.get("ai_summary")
-                        )
+                        if envelope.get("artifact_type") == "stage1_visual_observations":
+                            payload_hash = hash_json(
+                                {
+                                    "artifact_type": envelope.get("artifact_type"),
+                                    "artifact_version": envelope.get("artifact_version"),
+                                    "observations": envelope.get("observations") or [],
+                                }
+                            )
+                        else:
+                            payload_hash = hash_json(
+                                envelope.get("analysis")
+                                if envelope.get("analysis") is not None
+                                else envelope.get("ai_summary")
+                            )
                 except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
                     payload_hash = ""
             response_hash = str(receipt.response_hash or "")
@@ -2809,11 +3350,34 @@ class Stage1AnalysisService:
             backup_config=dict(self.settings.section("Backup_Reader_API")),
             runtime=runtime,
         )
+        legacy_engine = str(provider_result.get("engine_type") or "primary").strip().lower()
+        legacy_config = self._effective_provider_config(
+            dict(self.settings.section("Backup_Reader_API"))
+            if legacy_engine == "backup"
+            else primary_config
+        )
+        legacy_content = (
+            self._text_only_content(built_input.user_message_content)
+            if legacy_engine == "backup"
+            else built_input.user_message_content
+        )
+        legacy_max_tokens, legacy_temperature = self._request_parameters(
+            legacy_config,
+            default_max_tokens=8192 if legacy_engine == "backup" else 3000,
+        )
         self._ensure_receipt(
             runtime,
             prompt=built_input.prompt_text,
-            input_payload=built_input.to_metadata_dict(),
-            api_config=primary_config,
+            input_payload=canonical_provider_request_payload(
+                prompt=built_input.prompt_text,
+                system_prompt=self.prompt_registry.read("stage1.analysis.system.v3"),
+                user_content=legacy_content,
+                response_format="json",
+                max_output_tokens=legacy_max_tokens,
+                temperature=legacy_temperature,
+            ),
+            api_config=legacy_config,
+            route="Backup_Reader_API" if legacy_engine == "backup" else "Primary_Reader_API",
             result=provider_result,
         )
         ai_summary = self._canonical_substantive_summary(provider_result)
@@ -2998,19 +3562,29 @@ class Stage1AnalysisService:
         prompt: str,
         input_payload: Mapping[str, Any],
         api_config: Mapping[str, Any],
+        route: str,
         result: Mapping[str, Any],
     ) -> None:
         if runtime.receipts:
             return
         try:
             admission = runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+            receipt_metadata: dict[str, Any] = {
+                "execution_mode": "injected_reader",
+            }
+            transport_metadata = result.get("transport_metadata")
+            if isinstance(transport_metadata, Mapping):
+                receipt_metadata.update(
+                    {str(key): value for key, value in transport_metadata.items()}
+                )
             runtime.complete(
                 admission=admission,
                 prompt=prompt,
                 input_payload=input_payload,
                 api_config=api_config,
                 result=result,
-                metadata={"execution_mode": "injected_reader"},
+                route=route,
+                metadata=receipt_metadata,
             )
         except ProviderBudgetExceeded:
             runtime.blocked_receipt(
@@ -3018,6 +3592,7 @@ class Stage1AnalysisService:
                 input_payload=input_payload,
                 api_config=api_config,
                 message="Stage 1 reader did not produce a provider receipt before its budget closed",
+                route=route,
             )
 
     def _register_receipt_ledger(self) -> None:
@@ -3098,10 +3673,7 @@ class Stage1AnalysisService:
 
     @staticmethod
     def _prompt_template() -> str:
-        try:
-            return PromptRegistry().read("stage1.analysis.user.v3")
-        except PromptRegistryError:
-            return "Analyze the following paper and return canonical JSON:\n\n{{PAPER_FULL_TEXT}}"
+        return PromptRegistry().read("stage1.analysis.user.v3")
 
     @staticmethod
     def _schema_hash() -> str:

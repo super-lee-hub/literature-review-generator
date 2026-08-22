@@ -56,6 +56,9 @@ class ExpectedProviderCall:
     reuse_evidence_artifact_id: str = ""
     reuse_evidence_artifact_hash: str = ""
     reuse_evidence_record_hash: str = ""
+    # A transport node may have a declared primary and backup request identity.
+    # Each variant is still exact; this is not a wildcard for mismatched calls.
+    request_variants: tuple[Mapping[str, Any], ...] = ()
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ExpectedProviderCall":
@@ -91,6 +94,11 @@ class ExpectedProviderCall:
             reuse_evidence_artifact_id=str(payload.get("reuse_evidence_artifact_id") or ""),
             reuse_evidence_artifact_hash=str(payload.get("reuse_evidence_artifact_hash") or ""),
             reuse_evidence_record_hash=str(payload.get("reuse_evidence_record_hash") or ""),
+            request_variants=tuple(
+                dict(item)
+                for item in (payload.get("request_variants") or ())
+                if isinstance(item, Mapping)
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -98,6 +106,7 @@ class ExpectedProviderCall:
             raise ValueError("expected provider calls require call, job, attempt, stage, and node identities")
         if self.max_attempts < 0:
             raise ValueError("max_attempts cannot be negative")
+        object.__setattr__(self, "request_variants", tuple(dict(item) for item in self.request_variants))
 
 
 @dataclass(frozen=True)
@@ -265,6 +274,15 @@ class ProviderReceiptClosure:
                 missing.append(call_id)
                 continue
             current = max(candidates, key=lambda item: (item.attempts, item.sequence, item.finished_at))
+            variant_matches = [
+                variant
+                for variant in contract.request_variants
+                if all(
+                    not str(field).strip()
+                    or str(getattr(current, str(field), "") or "") == str(value or "")
+                    for field, value in variant.items()
+                )
+            ]
             identity_mismatches = {
                 field: (str(getattr(current, field) or ""), str(getattr(contract, field) or ""))
                 for field in (
@@ -281,8 +299,27 @@ class ProviderReceiptClosure:
                     "schema_hash",
                     "logical_attempt_identity",
                 )
-                if getattr(contract, field) and str(getattr(current, field) or "") != str(getattr(contract, field) or "")
+                if getattr(contract, field)
+                and str(getattr(current, field) or "") != str(getattr(contract, field) or "")
+                and not (variant_matches and field in {"input_hash", "config_hash"})
             }
+            # A variant must explicitly bind both input and config identity;
+            # partial variants are never allowed to excuse a mismatch.
+            if variant_matches and not any(
+                str(variant.get("input_hash") or "")
+                and str(variant.get("config_hash") or "")
+                for variant in variant_matches
+            ):
+                variant_matches = []
+                identity_mismatches = {
+                    field: (str(getattr(current, field) or ""), str(getattr(contract, field) or ""))
+                    for field in (
+                        "job_id", "attempt_id", "stage_name", "node_id", "prompt_hash", "prompt_id",
+                        "prompt_version", "prompt_sha256", "input_hash", "config_hash", "schema_hash",
+                        "logical_attempt_identity",
+                    )
+                    if getattr(contract, field) and str(getattr(current, field) or "") != str(getattr(contract, field) or "")
+                }
             if identity_mismatches:
                 stale.append(call_id)
                 mismatches[call_id] = tuple(sorted(identity_mismatches))
@@ -344,6 +381,15 @@ class ProviderReceiptClosure:
                                 payload = envelope.get("section")
                             if payload is None:
                                 payload = envelope.get("analysis")
+                            if (
+                                payload is None
+                                and envelope.get("artifact_type") == "stage1_visual_observations"
+                            ):
+                                payload = {
+                                    "artifact_type": envelope.get("artifact_type"),
+                                    "artifact_version": envelope.get("artifact_version"),
+                                    "observations": envelope.get("observations") or [],
+                                }
                             if payload_hash and hash_json(payload) != payload_hash:
                                 mismatch_fields.add("artifact_payload_hash")
                     except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):

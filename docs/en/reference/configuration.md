@@ -36,6 +36,13 @@ validated by `services.settings`.
 - `max_single_image_bytes = 24000000` raw-byte budget, leaving headroom below
   the official 32 MiB single base64/URL image limit.
 
+The runtime estimates base64-expanded bytes for both per-image and per-request
+budgets. A visual scan records planned, sent, omitted, and observed visual IDs;
+an observation batch is valid only when it contains exactly one strict-schema
+observation for every image actually sent. Long papers scan all sendable
+nonblank pages first, then select the final raw image references from those
+observations. Backup reader transport is text-only and is recorded as such.
+
 ## Stage 1 Visual Rendering
 
 `[Stage1_Visual]` defaults render every nonblank page at a target long edge
@@ -51,3 +58,5 @@ evidence, visual manifest, or visual coverage invalidates Stage 1 reuse. Missing
 or failed page rendering is recorded in `stage1_visual_coverage/v1`; with
 `require_complete_visual_coverage=true`, the summary remains eligible only with
 `quality_audit.needs_manual_review=true` or a fresh successful complete run.
+Prompt files are Registry-authorized by SHA-256; malformed JSON node policies,
+hash drift, and missing prompt placeholders fail closed.

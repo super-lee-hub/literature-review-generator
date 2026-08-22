@@ -37,9 +37,9 @@
       "version": "v3",
       "status": "ACTIVE",
       "owner": "services.stage1_analysis_service.Stage1AnalysisService",
-      "required_placeholders": ["PAPER_FULL_TEXT", "VISUAL_COVERAGE_JSON", "SUMMARY_SCHEMA_CONTRACT"],
+      "required_placeholders": ["PAPER_FULL_TEXT", "VISUAL_COVERAGE_JSON", "VISUAL_OBSERVATIONS_JSON", "SUMMARY_SCHEMA_CONTRACT"],
       "output_contract": "summary_v2_lite canonical JSON",
-      "sha256": "5cefe4fda69592d5cdfdc6d17655d7c77acb5ef4a3d753a1228066f53cf8ae0a"
+      "sha256": "3d60446608ef78acf37662731d53117a7a932760f12149214c995a1330622408"
     },
     {
       "prompt_id": "stage1.visual_scan.system.v1",
@@ -49,7 +49,7 @@
       "owner": "services.stage1_analysis_service.Stage1AnalysisService",
       "required_placeholders": [],
       "output_contract": "stage1_visual_observations/v1 JSON",
-      "sha256": "900736de01edc49ebdcda6a94d84004edab5415cfac8a2e0d4cbf483fb6a2eff"
+      "sha256": "d5a29e63c4ddb97123bfdfc31afeffcbd48647ae531f0775f7a9709003589fb1"
     },
     {
       "prompt_id": "outline.node.system.v3",
@@ -69,7 +69,8 @@
       "owner": "outline.v3_executor.OutlineV3Executor",
       "required_placeholders": [],
       "output_contract": "node role policy map JSON",
-      "sha256": "6a352fe334d83292e8179145fbb707a9337e2f447718c9adf328f08622aa3a22"
+      "required_roles": ["relation_adjudicator", "candidate_generator", "structure_critic", "coverage_critic", "evidence_critic", "arbitrator"],
+      "sha256": "54e966b7ff70a16ddda0ae37298c30ccc1fa6e1277974ce38c862cf1cd293ca0"
     },
     {
       "prompt_id": "review.section_writer.system.v3",
@@ -89,7 +90,7 @@
       "owner": "validator._rewrite_block_with_ai",
       "required_placeholders": [],
       "output_contract": "rewritten_claim_unit JSON",
-      "sha256": "3d55eed9a97c99f80559678d069129fa6b5db976b83b230daf2e865dec6bea6b"
+      "sha256": "5dc0ab75daabce636659a06ad54a9d52b34b239aa4bfc8ce2bf856145c61794f"
     },
     {
       "prompt_id": "validation.adjudicator.system.v2",

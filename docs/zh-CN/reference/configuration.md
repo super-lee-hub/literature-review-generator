@@ -35,6 +35,11 @@
 - `max_single_image_bytes = 24000000` 原始单图字节预算，为 base64 膨胀预留空间，
   低于官方 base64/URL 单图 32 MiB 限制。
 
+运行时会按 base64 膨胀后的估算值同时执行单图和单请求预算。视觉扫描会分别记录
+planned、sent、omitted、observed visual ID；只有对每个实际发送图片恰好返回一个严格
+schema observation 的批次才算有效。长文先扫描全部可发送的非空页，再依据 observations
+选择最终 raw image；备用 reader 强制纯文本，并在 provider 证据中如实记录。
+
 ## Stage 1 视觉渲染
 
 `[Stage1_Visual]` 默认把每个非空页面渲染到约 2200 px 长边。全页图使用 JPEG
@@ -47,4 +52,6 @@
 model、capability、Prompt identity/hash、schema、预处理证据、visual manifest 或
 visual coverage 任一变化都会使 Stage 1 reuse 失效。页面渲染缺失或失败会写入
 `stage1_visual_coverage/v1`；当 `require_complete_visual_coverage=true` 时，摘要
-必须带 `quality_audit.needs_manual_review=true`，不能静默声称视觉完整。
+必须带 `quality_audit.needs_manual_review=true`，不能静默声称视觉完整。Prompt 文件由
+Registry 的 SHA-256 authority 绑定；JSON policy 损坏、hash 漂移或缺少 placeholder 都会
+fail closed。

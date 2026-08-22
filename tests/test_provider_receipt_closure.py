@@ -143,6 +143,23 @@ def test_hash_mismatch_blocks_with_explicit_reason(tmp_path: Path) -> None:
     assert "provider_response_hash" in closure.hash_mismatches[receipt.call_id]
 
 
+def test_request_variant_accepts_exact_backup_identity_without_wildcarding(tmp_path: Path) -> None:
+    receipt, expected = _bound_receipt(tmp_path, call_id="call-request-variant")
+    variant = replace(
+        expected,
+        input_hash="a" * 64,
+        config_hash="b" * 64,
+        request_variants=(
+            {"input_hash": receipt.input_hash, "config_hash": receipt.config_hash},
+        ),
+    )
+
+    closure = ProviderReceiptClosure.evaluate([variant], [receipt])
+
+    assert closure.complete is True
+    assert closure.hash_mismatches == {}
+
+
 @pytest.mark.parametrize(
     "field_name",
     ("job_id", "attempt_id", "stage_name", "node_id", "prompt_hash", "input_hash", "config_hash", "schema_hash"),

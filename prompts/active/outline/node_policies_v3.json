@@ -6,5 +6,3 @@
   "evidence_critic": "检查每个 planned claim 是否有对应证据、paper_keys 和 relation_ids；识别过度概括、错误因果化和弱支持。",
   "arbitrator": "综合候选与 critiques，保留证据最充分且结构最清楚的方案，并仅使用允许的 ID 做最小修订。不得在仲裁阶段发明新论文、新关系或无证据主题。"
 }
-
-Outline 的动态 evidence、allowed IDs 和 output_contract 继续由代码生成；不要把动态 schema 硬编码进静态 Prompt。

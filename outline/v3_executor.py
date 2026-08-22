@@ -1689,12 +1689,10 @@ class OutlineV3Executor:
         """Make the Registry-owned system prompt part of every provider input."""
 
         enriched = dict(request)
-        try:
-            policies = json.loads(
-                self.prompt_registry.read("outline.node.policies.v3")
-            )
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            policies = {}
+        # The node policy map is an authority input.  A malformed or edited
+        # file must stop the outline run instead of silently becoming an empty
+        # policy map.
+        policies = self.prompt_registry.read_json("outline.node.policies.v3")
         enriched["_prompt_authority"] = {
             "prompt_id": self._outline_prompt_identity.prompt_id,
             "prompt_version": self._outline_prompt_identity.version,

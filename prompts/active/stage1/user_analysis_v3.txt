@@ -18,6 +18,10 @@
 
 {{VISUAL_COVERAGE_JSON}}
 
+【已验证的视觉观察】
+
+{{VISUAL_OBSERVATIONS_JSON}}
+
 【唯一输出契约】
 
 {{SUMMARY_SCHEMA_CONTRACT}}
@@ -30,6 +34,8 @@
 - 不得生成示例数据。
 - 不得把参考文献列表内容当作本文结果。
 - 不得把图中看不清的数字写入 findings。
+- 视觉观察是逐个 visual_id 验证过的结构化证据；只能使用其中实际出现的内容，不得把扫描元数据、artifact hash 或未发送页面当作观察结果。
+- 如果视觉覆盖为 partial、failed 或存在 omissions，必须在 quality_audit 中标记 needs_manual_review=true，并缩小任何依赖视觉的结论。
 - 不得把统计相关、预测关系或组间差异改写成因果关系。
 - 不得忽略 quality_audit。
 - 只返回 JSON。

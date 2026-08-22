@@ -131,7 +131,31 @@ class PromptRegistry:
         )
 
     def read(self, prompt_id: str, *, allow_non_active: bool = False) -> str:
+        # Every production read re-checks the declared content hash.  A caller
+        # must never be able to use an edited prompt merely because the
+        # registry object was instantiated before the edit.
+        self.identity(prompt_id, allow_non_active=allow_non_active)
         return self.path(prompt_id, allow_non_active=allow_non_active).read_text(encoding="utf-8")
+
+    def read_json(self, prompt_id: str, *, allow_non_active: bool = False) -> dict[str, Any]:
+        """Read a Registry-authorized JSON prompt and fail closed on shape."""
+
+        entry = self.entry(prompt_id, allow_non_active=allow_non_active)
+        text = self.read(prompt_id, allow_non_active=allow_non_active)
+        try:
+            payload = json.loads(text)
+        except (TypeError, UnicodeError, json.JSONDecodeError) as exc:
+            raise PromptRegistryError(f"prompt {prompt_id} is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise PromptRegistryError(f"prompt {prompt_id} JSON root must be an object")
+        required_roles = entry.get("required_roles") or []
+        if isinstance(required_roles, list):
+            missing = [str(role) for role in required_roles if str(role) not in payload]
+            if missing:
+                raise PromptRegistryError(f"prompt {prompt_id} is missing required roles: {missing}")
+            if any(not isinstance(payload.get(str(role)), str) or not str(payload.get(str(role))).strip() for role in required_roles):
+                raise PromptRegistryError(f"prompt {prompt_id} has empty or non-string role policies")
+        return {str(key): value for key, value in payload.items()}
 
     def render(
         self,
@@ -186,6 +210,8 @@ class PromptRegistry:
             version = str(entry.get("version") or "").strip()
             if not owner or not version:
                 raise PromptRegistryError(f"prompt {identity.prompt_id} requires owner and version")
+            if str(entry.get("path") or "").lower().endswith(".json"):
+                self.read_json(identity.prompt_id, allow_non_active=True)
         return identities
 
 

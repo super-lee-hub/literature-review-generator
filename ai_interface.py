@@ -17,19 +17,24 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
-from services.prompt_registry import PromptRegistryError, default_prompt_registry
+from services.prompt_registry import default_prompt_registry
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
+from runtime.provider_runtime import (
+    ProviderBudgetExceeded,
+    ProviderRuntime,
+    canonical_provider_request_payload,
+)
 from summary_schema import (
     default_ai_summary,
     get_ai_summary,
     normalize_ai_summary,
 )
 from services.multimodal_capability import detect_multimodal_capability
+from services.stage1_visual_scan import DEFAULT_MAX_SINGLE_IMAGE_BYTES
 
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
-_MAX_LOCAL_IMAGE_INPUT_BYTES = 20 * 1024 * 1024
+_MAX_LOCAL_IMAGE_INPUT_BYTES = DEFAULT_MAX_SINGLE_IMAGE_BYTES
 _NON_RETRIABLE_HTTP_STATUSES = {400, 401, 402, 403, 404, 422}
 _QUOTA_ERROR_MARKERS = (
     "insufficient_user_quota",
@@ -72,15 +77,9 @@ _PAYLOAD_PARAMETER_ERROR_MARKERS = (
 def _load_stage1_system_prompt(logger: Any = None) -> str:
     """Load the canonical Stage 1 system prompt through prompt authority."""
 
-    try:
-        return default_prompt_registry().read("stage1.analysis.system.v3")
-    except PromptRegistryError as exc:
-        if logger:
-            logger.warning(f"Unable to load canonical Stage 1 system prompt: {exc}")
-        return (
-            "Return one summary_v2_lite JSON object using only the supplied evidence. "
-            "Missing facts must remain null or empty; do not invent facts."
-        )
+    # Prompt authority failures are production blockers. A generic fallback
+    # would make the receipt look valid while changing the actual prompt.
+    return default_prompt_registry().read("stage1.analysis.system.v3")
 
 
 def _api_result(
@@ -573,11 +572,17 @@ def _encode_local_pdf_as_data_url(path: str) -> Optional[str]:
     return f"data:application/pdf;base64,{encoded}"
 
 
-def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any = None) -> Any:
+def _normalize_user_message_content_with_report(
+    prompt: str,
+    user_content: Any,
+    logger: Any = None,
+) -> Tuple[Any, Dict[str, Any]]:
     if not isinstance(user_content, list):
-        return prompt
+        return prompt, {"sent_visual_ids": [], "omissions": [], "images_actually_sent_count": 0}
 
     normalized: List[Dict[str, Any]] = []
+    sent_visual_ids: List[str] = []
+    omissions: List[Dict[str, Any]] = []
     for item in user_content:
         if not isinstance(item, dict):
             continue
@@ -591,6 +596,11 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
             path = str(item.get("path") or "").strip()
             data_url = _encode_local_image_as_data_url(path)
             if not data_url:
+                omissions.append({
+                    "visual_id": str(item.get("visual_id") or ""),
+                    "page_no": int(item.get("page_no") or 0),
+                    "reason": "missing_or_oversized_local_image",
+                })
                 if logger:
                     logger.warning(f"Skipping missing or unreadable local image input: {path}")
                 continue
@@ -600,6 +610,7 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
                     "image_url": {"url": data_url, "detail": str(item.get("detail") or "original")},
                 }
             )
+            sent_visual_ids.append(str(item.get("visual_id") or ""))
             continue
         if item_type == "image_url":
             image_url = item.get("image_url")
@@ -628,6 +639,7 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
             path = str(item.get("path") or "").strip()
             data_url = _encode_local_pdf_as_data_url(path)
             if not data_url:
+                omissions.append({"visual_id": "", "reason": "missing_or_unreadable_local_pdf"})
                 if logger:
                     logger.warning(f"Skipping missing or unreadable local PDF input: {path}")
                 continue
@@ -649,11 +661,24 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
             continue
 
     if not normalized:
-        return prompt
+        return prompt, {
+            "sent_visual_ids": sent_visual_ids,
+            "omissions": omissions,
+            "images_actually_sent_count": len(sent_visual_ids),
+        }
 
     has_text = any(item.get("type") == "text" for item in normalized)
     if not has_text and prompt:
         normalized.insert(0, {"type": "text", "text": prompt})
+    return normalized, {
+        "sent_visual_ids": sent_visual_ids,
+        "omissions": omissions,
+        "images_actually_sent_count": len(sent_visual_ids),
+    }
+
+
+def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any = None) -> Any:
+    normalized, _report = _normalize_user_message_content_with_report(prompt, user_content, logger=logger)
     return normalized
 
 
@@ -951,6 +976,7 @@ def _call_ai_api_detailed(
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
     provider_runtime: Optional[ProviderRuntime] = None,
+    provider_route: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Call the transport only after bound-runtime and complete-budget admission."""
 
@@ -968,14 +994,14 @@ def _call_ai_api_detailed(
             return default
         return parsed if parsed > 0 else default
 
-    request_payload: dict[str, Any] = {
-        "system": system_prompt,
-        "user": prompt,
-        "user_content": user_content,
-        "response_format": response_format,
-        "max_output_tokens": int(max_tokens),
-        "temperature": temperature,
-    }
+    request_payload = canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        response_format=response_format,
+        max_output_tokens=int(max_tokens),
+        temperature=temperature,
+    )
     capability = resolve_model_capability(api_config)
     profile = ProviderContextProfile.conservative(
         provider=str(api_config.get("provider_family") or capability.provider_family),
@@ -996,6 +1022,7 @@ def _call_ai_api_detailed(
                 "provider input exceeds verified context budget: "
                 f"{budget['estimated_input_tokens']} > {budget['input_budget']}"
             ),
+            route=provider_route,
         )
         blocked = _api_result(
             status="failed",
@@ -1003,6 +1030,10 @@ def _call_ai_api_detailed(
             message="provider input exceeds verified context budget",
         )
         blocked["provider_receipt"] = receipt.to_dict()
+        blocked["transport_metadata"] = {
+            "successful_input_mode": "text_only",
+            "images_actually_sent_count": 0,
+        }
         return blocked
 
     estimated_tokens = int(budget["estimated_input_tokens"])
@@ -1014,6 +1045,7 @@ def _call_ai_api_detailed(
             input_payload=request_payload,
             api_config=api_config,
             message=str(exc),
+            route=provider_route,
         )
         blocked = _api_result(
             status="failed",
@@ -1021,6 +1053,10 @@ def _call_ai_api_detailed(
             message=str(exc),
         )
         blocked["provider_receipt"] = receipt.to_dict()
+        blocked["transport_metadata"] = {
+            "successful_input_mode": "text_only",
+            "images_actually_sent_count": 0,
+        }
         return blocked
 
     result = _call_ai_api_detailed_uninstrumented(
@@ -1036,13 +1072,26 @@ def _call_ai_api_detailed(
         timeout_seconds=timeout_seconds,
         max_retries_per_call=provider_runtime.budget.max_retries_per_call,
     )
+    _normalized_content, transport_report = _normalize_user_message_content_with_report(
+        prompt,
+        user_content,
+        logger=logger,
+    )
+    result = {
+        **dict(result),
+        "transport_metadata": {
+            **transport_report,
+            "successful_input_mode": "multimodal" if transport_report.get("images_actually_sent_count", 0) else "text_only",
+        },
+    }
     receipt = provider_runtime.complete(
         admission=admission,
         prompt=prompt,
         input_payload=request_payload,
         api_config=api_config,
         result=result,
-        metadata={"request_budget": budget},
+        metadata={"request_budget": budget, **dict(result.get("transport_metadata") or {})},
+        route=provider_route,
     )
     enriched = dict(result)
     enriched["provider_receipt"] = receipt.to_dict()
@@ -1587,7 +1636,7 @@ def get_summary_from_ai_detailed(
         'api_base': api_base,
     }
     effective_user_content = user_content
-    if not detect_multimodal_capability(request_api_config).supports_image_input:
+    if engine_type != "primary" or not detect_multimodal_capability(request_api_config).supports_image_input:
         effective_user_content = _text_only_user_content(user_content)
 
     detailed = _call_ai_api_detailed(
@@ -1601,6 +1650,7 @@ def get_summary_from_ai_detailed(
         user_content=effective_user_content,
         retry_attempts=retry_attempts,
         provider_runtime=provider_runtime,
+        provider_route="Backup_Reader_API" if engine_type == "backup" else "Primary_Reader_API",
     )
     detailed["engine_type"] = engine_type
 
