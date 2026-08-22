@@ -17,6 +17,7 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
+from services.prompt_registry import PromptRegistryError, default_prompt_registry
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
 from summary_schema import (
@@ -24,6 +25,7 @@ from summary_schema import (
     get_ai_summary,
     normalize_ai_summary,
 )
+from services.multimodal_capability import detect_multimodal_capability
 
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
@@ -65,6 +67,20 @@ _PAYLOAD_PARAMETER_ERROR_MARKERS = (
     "unrecognized parameter",
     "not allowed",
 )
+
+
+def _load_stage1_system_prompt(logger: Any = None) -> str:
+    """Load the canonical Stage 1 system prompt through prompt authority."""
+
+    try:
+        return default_prompt_registry().read("stage1.analysis.system.v3")
+    except PromptRegistryError as exc:
+        if logger:
+            logger.warning(f"Unable to load canonical Stage 1 system prompt: {exc}")
+        return (
+            "Return one summary_v2_lite JSON object using only the supplied evidence. "
+            "Missing facts must remain null or empty; do not invent facts."
+        )
 
 
 def _api_result(
@@ -290,10 +306,15 @@ def _convert_chat_content_to_responses_content(content: Any) -> Any:
             image_url = item.get("image_url")
             if isinstance(image_url, dict):
                 url = str(image_url.get("url") or "").strip()
+                detail = str(image_url.get("detail") or item.get("detail") or "original").strip()
             else:
                 url = str(image_url or "").strip()
+                detail = str(item.get("detail") or "original").strip()
             if url:
-                converted.append({"type": "input_image", "image_url": url})
+                converted_item: Dict[str, Any] = {"type": "input_image", "image_url": url}
+                if detail:
+                    converted_item["detail"] = detail
+                converted.append(converted_item)
             continue
         if item_type == "input_text":
             converted.append({"type": "input_text", "text": str(item.get("text") or "")})
@@ -301,7 +322,10 @@ def _convert_chat_content_to_responses_content(content: Any) -> Any:
         if item_type == "input_image":
             image_url = str(item.get("image_url") or item.get("url") or "").strip()
             if image_url:
-                converted.append({"type": "input_image", "image_url": image_url})
+                converted_item = {"type": "input_image", "image_url": image_url}
+                if item.get("detail"):
+                    converted_item["detail"] = str(item.get("detail"))
+                converted.append(converted_item)
             continue
         if item_type == "input_file":
             file_item: Dict[str, Any] = {"type": "input_file"}
@@ -570,14 +594,35 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
                 if logger:
                     logger.warning(f"Skipping missing or unreadable local image input: {path}")
                 continue
-            normalized.append({"type": "image_url", "image_url": {"url": data_url}})
+            normalized.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url, "detail": str(item.get("detail") or "original")},
+                }
+            )
             continue
         if item_type == "image_url":
             image_url = item.get("image_url")
             if isinstance(image_url, dict) and image_url.get("url"):
-                normalized.append({"type": "image_url", "image_url": {"url": str(image_url.get("url"))}})
+                normalized.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": str(image_url.get("url")),
+                            "detail": str(image_url.get("detail") or item.get("detail") or "original"),
+                        },
+                    }
+                )
             elif isinstance(image_url, str) and image_url.strip():
-                normalized.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+                normalized.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url.strip(),
+                            "detail": str(item.get("detail") or "original"),
+                        },
+                    }
+                )
             continue
         if item_type == "local_pdf_path":
             path = str(item.get("path") or "").strip()
@@ -610,6 +655,21 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
     if not has_text and prompt:
         normalized.insert(0, {"type": "text", "text": prompt})
     return normalized
+
+
+def _text_only_user_content(user_content: Any) -> Any:
+    """Remove image/file parts when a fallback route is text-only."""
+
+    if not isinstance(user_content, list):
+        return user_content
+    text_items = [
+        dict(item)
+        for item in user_content
+        if isinstance(item, dict)
+        and str(item.get("type") or "").strip().lower() in {"text", "input_text"}
+        and str(item.get("text") or "").strip()
+    ]
+    return text_items or None
 
 
 def _call_ai_api_detailed_uninstrumented(
@@ -1372,19 +1432,7 @@ def get_concept_profile(prompt: str, api_config: APIConfig, logger: Optional[Any
     Returns:
         概念配置字典，失败返回None
     """
-    # 读取API参数配置
-    try:
-        max_tokens = int(api_config.get('max_output_tokens', 4000))
-        temperature = float(api_config.get('temperature', 0.3))
-    except (ValueError, TypeError) as e:
-        if logger:
-            logger.warning(f"读取概念分析API参数配置失败，使用默认值: {e}")
-        max_tokens = 4000
-        temperature = 0.3
-
-    # 使用统一的API调用函数
-    system_prompt = "你是一位学术研究专家，专门研究概念的历史发展和理论演化。请基于提供的种子论文，深入分析并创建一个关于指定概念的全面学习笔记。"
-    return _call_ai_api(prompt, api_config, system_prompt, max_tokens=max_tokens, temperature=temperature, response_format="json", logger=logger)
+    raise RuntimeError("Concept Mode is not yet available in the current PR14 runtime")
 
 
 def get_concept_analysis(prompt: str, api_config: APIConfig, logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -1400,19 +1448,7 @@ def get_concept_analysis(prompt: str, api_config: APIConfig, logger: Optional[An
     Returns:
         概念分析字典，失败返回None
     """
-    # 读取API参数配置
-    try:
-        max_tokens = int(api_config.get('max_output_tokens', 4000))
-        temperature = float(api_config.get('temperature', 0.3))
-    except (ValueError, TypeError) as e:
-        if logger:
-            logger.warning(f"读取概念分析API参数配置失败，使用默认值: {e}")
-        max_tokens = 4000
-        temperature = 0.3
-
-    # 使用统一的API调用函数
-    system_prompt = "你是一位专门研究概念的学术分析专家。请基于提供的概念学习笔记，对当前论文进行深度分析，评估其在该概念发展历程中的地位和贡献。"
-    return _call_ai_api(prompt, api_config, system_prompt, max_tokens=max_tokens, temperature=temperature, response_format="json", logger=logger)
+    raise RuntimeError("Concept Mode is not yet available in the current PR14 runtime")
 
 
 class ContextLengthExceededError(Exception):
@@ -1442,6 +1478,8 @@ def get_summary_from_ai_detailed(
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
     provider_runtime: Optional[ProviderRuntime] = None,
+    system_prompt: Optional[str] = None,
+    normalize_summary: bool = True,
 ) -> Dict[str, Any]:
     """Stage-1 reader call that preserves API failure classification."""
     if ('dummy' in (primary_api_config.get('api_key') or '') or
@@ -1540,16 +1578,7 @@ def get_summary_from_ai_detailed(
         max_tokens = 3000
         temperature = 0.3
 
-    try:
-        with open('prompts/prompt_system_analyze.txt', 'r', encoding='utf-8') as handle:
-            system_prompt = handle.read()
-    except Exception as exc:
-        if logger:
-            logger.warning(f"Unable to load system prompt, using default: {exc}")
-        system_prompt = (
-            "You are an academic literature analysis expert. Analyze the paper text "
-            "and return a structured JSON summary."
-        )
+    system_prompt = system_prompt or _load_stage1_system_prompt(logger)
 
     request_api_config: APIConfig = {
         **api_config,
@@ -1557,6 +1586,9 @@ def get_summary_from_ai_detailed(
         'model': model_name,
         'api_base': api_base,
     }
+    effective_user_content = user_content
+    if not detect_multimodal_capability(request_api_config).supports_image_input:
+        effective_user_content = _text_only_user_content(user_content)
 
     detailed = _call_ai_api_detailed(
         prompt_text,
@@ -1566,7 +1598,7 @@ def get_summary_from_ai_detailed(
         temperature=temperature,
         response_format="json",
         logger=logger,
-        user_content=user_content,
+        user_content=effective_user_content,
         retry_attempts=retry_attempts,
         provider_runtime=provider_runtime,
     )
@@ -1577,7 +1609,7 @@ def get_summary_from_ai_detailed(
 
     ai_response = detailed.get("content")
     if isinstance(ai_response, dict):
-        detailed["content"] = normalize_ai_summary(ai_response)
+        detailed["content"] = normalize_ai_summary(ai_response) if normalize_summary else dict(ai_response)
         return detailed
     if ai_response:
         if logger:
@@ -1602,7 +1634,9 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                                       disable_engine_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
                                       is_engine_disabled_callback: Optional[Callable[[str], bool]] = None,
                                       skip_engines: Optional[Set[str]] = None,
-                                      provider_runtime: Optional[ProviderRuntime] = None) -> Optional[Dict[str, Any]]:
+                                      provider_runtime: Optional[ProviderRuntime] = None,
+                                      system_prompt: Optional[str] = None,
+                                      normalize_summary: bool = True) -> Optional[Dict[str, Any]]:
     """
     Stage-1 reader scheduler. Transient failures alternate engines:
     primary#1 -> backup#1 -> primary#2 -> backup#2. Quota/balance failures
@@ -1614,6 +1648,7 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
     engine_order = ["primary", "backup"]
     remaining = {engine: attempt_budget for engine in engine_order}
     last_result: Optional[Dict[str, Any]] = None
+    primary_failure_reason = ""
 
     def configured(engine: str) -> bool:
         cfg = primary_api_config if engine == "primary" else backup_api_config
@@ -1648,12 +1683,23 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                 user_content=user_content,
                 retry_attempts=1,
                 provider_runtime=provider_runtime,
+                system_prompt=system_prompt,
+                normalize_summary=normalize_summary,
             )
             last_result = result
             if result.get("status") == "success":
+                if engine != "primary":
+                    result = {
+                        **dict(result),
+                        "fallback_reason": primary_failure_reason or "primary_reader_failed_before_backup",
+                    }
                 return result if return_detailed else result.get("content")
 
             error_kind = str(result.get("error_kind") or "")
+            if engine == "primary":
+                primary_failure_reason = str(
+                    result.get("message") or result.get("error_kind") or "primary_reader_failed"
+                )[:240]
             if error_kind == "quota_exhausted":
                 remaining[engine] = 0
                 if disable_engine_callback:
@@ -1680,7 +1726,8 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
 
 def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,
                        engine_type: str = 'primary', logger: Optional[Any] = None,
-                       config: Optional[Dict[str, Any]] = None, user_content: Any = None) -> Optional[Dict[str, Any]]:
+                       config: Optional[Dict[str, Any]] = None, user_content: Any = None,
+                       system_prompt: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     调用AI API并返回结构化摘要（带重试机制和429错误处理）
 
@@ -1791,16 +1838,12 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         temperature = 0.3
 
     # 从外部文件读取系统提示词
-    try:
-        with open('prompts/prompt_system_analyze.txt', 'r', encoding='utf-8') as f:
-            system_prompt = f.read()
-    except Exception as e:
-        # 如果读取失败，使用默认提示词
-        if logger:
-            logger.warning(f"无法加载系统提示词文件，使用默认提示词: {e}")
-        system_prompt = """你是一个学术文献分析专家。请对提供的学术文本进行深度分析，并返回一个结构化摘要。请严格按照JSON格式返回结果，包含title、authors、year、journal、summary、key_points、methodology、findings、conclusions、relevance、limitations等字段。"""
+    system_prompt = system_prompt or _load_stage1_system_prompt(logger)
 
     # 使用统一的API调用函数
+    effective_user_content = user_content
+    if not detect_multimodal_capability(api_config).supports_image_input:
+        effective_user_content = _text_only_user_content(user_content)
     ai_response = _call_ai_api(
         prompt_text,
         api_config,
@@ -1809,7 +1852,7 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         temperature=temperature,
         response_format="json",
         logger=logger,
-        user_content=user_content,
+        user_content=effective_user_content,
     )
 
     if not ai_response:

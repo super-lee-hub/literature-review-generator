@@ -41,6 +41,9 @@ _STRUCTURED_COMPARISON_FIELDS = (
     "stage1_extracted_text_hash",
     "stage1_semantic_input_hash",
     "preprocess_contract_hash",
+    "prompt_id",
+    "prompt_version",
+    "prompt_sha256",
     "prompt_template_hash",
     "input_builder_policy_hash",
     "provider",
@@ -49,6 +52,7 @@ _STRUCTURED_COMPARISON_FIELDS = (
     "provider_config_hash",
     "summary_schema_hash",
     "visual_input_manifest_hash",
+    "visual_coverage_hash",
     # Provenance facts are projected here as well.  They are checked against
     # the prior authority below; an empty current-run value is expected before
     # reuse succeeds and is therefore not treated as a current-input miss.
@@ -124,10 +128,14 @@ class Stage1ReusableSummaryBindingV1:
     stage1_extracted_text_hash: str = ""
     stage1_semantic_input_hash: str = ""
     preprocess_contract_hash: str = ""
+    prompt_id: str = ""
+    prompt_version: str = ""
+    prompt_sha256: str = ""
     prompt_template_hash: str = ""
     input_builder_policy_hash: str = ""
     summary_schema_hash: str = ""
     visual_input_manifest_hash: str = ""
+    visual_coverage_hash: str = ""
     original_source_location: str = ""
     current_source_location: str = ""
     location_changed: bool = False
@@ -259,10 +267,14 @@ class Stage1ReusableSummaryBindingV1:
                 "stage1_extracted_text_hash",
                 "stage1_semantic_input_hash",
                 "preprocess_contract_hash",
+                "prompt_id",
+                "prompt_version",
+                "prompt_sha256",
                 "prompt_template_hash",
                 "input_builder_policy_hash",
                 "summary_schema_hash",
                 "visual_input_manifest_hash",
+                "visual_coverage_hash",
                 "normalized_summary_payload_hash",
             )
         )
@@ -286,10 +298,13 @@ class Stage1ReusableSummaryBindingV1:
         for field_name in comparison_fields:
             original = _text(getattr(self, field_name))
             actual = _text(getattr(current, field_name))
-            if not original and not actual and (
-                field_name in _OPTIONAL_COMPARISON_FIELDS
-                or field_name in _PROVENANCE_COMPARISON_FIELDS
-            ):
+            # A structured binding may be only partially populated when it
+            # comes from an older producer.  Two empty values mean that both
+            # sides omit this optional/forward-compatible contract field; it
+            # is not a mismatch.  A value present on only one side remains a
+            # missing-field mismatch, which preserves fail-closed invalidation
+            # when a newer producer adds a binding fact.
+            if not original and not actual:
                 continue
             if field_name in _PROVENANCE_COMPARISON_FIELDS and not actual:
                 # The current binding is built before it can own a prior
@@ -332,10 +347,14 @@ class Stage1ReusableSummaryManifestV1:
     stage1_extracted_text_hash: str = ""
     stage1_semantic_input_hash: str = ""
     preprocess_contract_hash: str = ""
+    prompt_id: str = ""
+    prompt_version: str = ""
+    prompt_sha256: str = ""
     prompt_template_hash: str = ""
     input_builder_policy_hash: str = ""
     summary_schema_hash: str = ""
     visual_input_manifest_hash: str = ""
+    visual_coverage_hash: str = ""
     provider: str = ""
     model: str = ""
     endpoint_type: str = ""
@@ -472,6 +491,9 @@ def _validate_manifest_self_binding(
         "stage1_extracted_text_hash",
         "stage1_semantic_input_hash",
         "preprocess_contract_hash",
+        "prompt_id",
+        "prompt_version",
+        "prompt_sha256",
         "prompt_template_hash",
         "input_builder_policy_hash",
         "summary_schema_hash",
@@ -924,10 +946,14 @@ def _registered_source_is_verifiable(
         "stage1_extracted_text_hash",
         "stage1_semantic_input_hash",
         "preprocess_contract_hash",
+        "prompt_id",
+        "prompt_version",
+        "prompt_sha256",
         "prompt_template_hash",
         "input_builder_policy_hash",
         "summary_schema_hash",
         "visual_input_manifest_hash",
+        "visual_coverage_hash",
     ):
         if str(manifest_payload.get(field_name) or "") != _text(getattr(binding, field_name)):
             return False, f"source_summary_manifest_{field_name}_mismatch"

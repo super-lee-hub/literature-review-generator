@@ -80,16 +80,16 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Primary_Reader_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "deepseek-v4-pro",
+            "model": "deepseek-v4-flash-vision-exp",
             "api_base": PROVIDER_PRESETS["deepseek"].default_api_base,
             "proxy_mode": "environment",
             "endpoint_type": "chat_completions",
             "provider_family": "deepseek",
             "thinking": "enabled",
-            "reasoning_effort": "max",
+            "reasoning_effort": "high",
             "max_context_tokens": "1000000",
-            "max_output_tokens": "3000",
-            "temperature": "0.3",
+            "max_output_tokens": "6000",
+            "temperature": "0.0",
             "connect_timeout_seconds": "30",
             "read_timeout_seconds": "600",
             "total_timeout_seconds": "600",
@@ -102,14 +102,16 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Backup_Reader_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "",
-            "api_base": PROVIDER_PRESETS["videocaptioner"].default_api_base,
+            "model": "deepseek-v4-flash",
+            "api_base": PROVIDER_PRESETS["deepseek"].default_api_base,
             "proxy_mode": "environment",
             "endpoint_type": "chat_completions",
-            "provider_family": "generic",
-            "max_context_tokens": "128000",
-            "max_output_tokens": "8192",
-            "temperature": "0.3",
+            "provider_family": "deepseek",
+            "thinking": "enabled",
+            "reasoning_effort": "high",
+            "max_context_tokens": "1000000",
+            "max_output_tokens": "6000",
+            "temperature": "0.0",
             "connect_timeout_seconds": "30",
             "read_timeout_seconds": "600",
             "total_timeout_seconds": "600",
@@ -219,7 +221,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Validator_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "deepseek-v4-pro",
+            "model": "deepseek-v4-flash",
             "api_base": PROVIDER_PRESETS["deepseek"].default_api_base,
             "proxy_mode": "environment",
             "endpoint_type": "chat_completions",
@@ -247,6 +249,42 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "visual_refs_enabled": "true",
             "review_drift_threshold": "0.3",
             "summary_drift_threshold": "0.2",
+        },
+        "Stage1_Input": {
+            "mode": "vision_first",
+            "send_extracted_text": "true",
+            "send_selected_visuals": "true",
+            "send_original_pdf": "never",
+            "pdf_required_for_formal_precision": "false",
+            "max_pdf_file_mb": "50",
+            "formal_precision_text_only_policy": "rich_mineru_evidence",
+            "force_pdf_file_input_for_provider": "false",
+            "pdf_verifier_api": "disabled",
+            "image_transport": "base64",
+            "single_call_max_pages": "12",
+            "visual_scan_batch_size": "10",
+            "final_image_refs_max": "8",
+            "require_complete_visual_coverage": "true",
+            "max_request_image_bytes": "36000000",
+            "max_single_image_bytes": "24000000",
+        },
+        "Stage1_Visual": {
+            "enabled": "true",
+            "max_visual_refs_per_paper": "8",
+            "visual_artifact_dir": "./output/_visual_artifacts",
+            "render_all_nonblank_pages": "true",
+            "page_long_edge_px": "2200",
+            "crop_long_edge_px": "2400",
+            "page_max_pixels": "16000000",
+            "crop_max_pixels": "16000000",
+            "page_format": "jpeg",
+            "page_jpeg_quality": "92",
+            "crop_format": "png",
+            "crop_padding_ratio": "0.04",
+            "table_crop_enabled": "true",
+            "formula_crop_enabled": "true",
+            "max_request_image_bytes": "36000000",
+            "max_single_image_bytes": "24000000",
         },
         "Outline": {
             "candidate_count": "5",
@@ -338,6 +376,34 @@ def ensure_config_sections(
         merged.setdefault(section, {})
         merged[section].update({key: str(value) for key, value in values.items()})
 
+    # Migrate only the former shipped defaults.  A user-selected model is
+    # preserved; vision-first is an explicit Stage 1 mode, not permission to
+    # overwrite arbitrary provider configuration.
+    stage1_input = merged.setdefault("Stage1_Input", {})
+    stage1_input.setdefault("mode", "vision_first")
+    legacy_primary_defaults = {"deepseek-v4-pro"}
+    if (
+        str(stage1_input.get("mode") or "").strip().lower() == "vision_first"
+        and str(merged["Primary_Reader_API"].get("model") or "").strip().lower() in legacy_primary_defaults
+    ):
+        merged["Primary_Reader_API"]["model"] = "deepseek-v4-flash-vision-exp"
+        merged["Primary_Reader_API"]["provider_family"] = "deepseek"
+        merged["Primary_Reader_API"]["api_base"] = PROVIDER_PRESETS["deepseek"].default_api_base
+    if str(merged["Backup_Reader_API"].get("model") or "").strip() == "":
+        merged["Backup_Reader_API"].update(
+            {
+                "model": "deepseek-v4-flash",
+                "api_base": PROVIDER_PRESETS["deepseek"].default_api_base,
+                "provider_family": "deepseek",
+                "thinking": "enabled",
+                "reasoning_effort": "high",
+            }
+        )
+    if str(merged["Validator_API"].get("model") or "").strip().lower() == "deepseek-v4-pro":
+        merged["Validator_API"]["model"] = "deepseek-v4-flash"
+        merged["Validator_API"]["provider_family"] = "deepseek"
+    merged["Application"]["config_schema"] = str(CONFIG_SCHEMA_VERSION)
+
     # Outline API should inherit writer defaults if still blank.
     if not merged["Outline_API"].get("model"):
         merged["Outline_API"]["model"] = merged["Writer_API"].get("model", "")
@@ -419,6 +485,9 @@ def save_config_and_env(
     """Persist both config.ini and .env in one call."""
 
     normalized = ensure_config_sections(config_sections)
+    # [Multimodal] remains readable for one migration cycle but is no longer
+    # written.  Primary_Reader_API capability is the sole visual authority.
+    normalized.pop("Multimodal", None)
 
     for section_name, env_key in API_ENV_MAPPING.items():
         normalized.setdefault(section_name, {})

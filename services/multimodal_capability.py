@@ -22,6 +22,11 @@ class MultimodalCapability:
     api_base: str
     transport_format: str
     reason: str
+    experimental: bool = False
+    image_token_upper_bound: int = 0
+    supports_base64: bool = False
+    supports_external_url: bool = False
+    supports_files_api: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -66,6 +71,24 @@ def detect_multimodal_capability(api_config: Mapping[str, Any] | None) -> Multim
     parsed = urlparse(api_base)
     host = (parsed.netloc or parsed.path or "").lower()
     normalized_model = model.lower()
+
+    if (
+        normalized_model == "deepseek-v4-flash-vision-exp"
+        and (provider == "deepseek" or "deepseek" in host or str(config.get("provider_family") or "").lower() == "deepseek")
+    ):
+        return MultimodalCapability(
+            supports_image_input=True,
+            provider="deepseek",
+            model=model,
+            api_base=api_base,
+            transport_format="chat_completions_image_url",
+            reason="deepseek_vision_experimental_model",
+            experimental=True,
+            image_token_upper_bound=384,
+            supports_base64=True,
+            supports_external_url=True,
+            supports_files_api=True,
+        )
 
     if "api.openai.com" in host and normalized_model.startswith(_OPENAI_MULTIMODAL_MODEL_PREFIXES):
         return MultimodalCapability(

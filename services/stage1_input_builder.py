@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import os
 from typing import Any, Dict, List, Mapping, Optional, cast
 
@@ -8,6 +9,7 @@ from models import APIConfig
 
 from services.model_capabilities import resolve_model_capability
 from services.multimodal_capability import detect_multimodal_capability
+from services.stage1_visual_scan import plan_visual_scan_batches
 from services.visual_artifact_resolver import normalize_visual_artifact
 
 
@@ -36,12 +38,22 @@ class Stage1BuiltInput:
     pdf_attachment_size_mb: float
     formal_input_path: str
     text_only_evidence_used: str
+    prompt_id: str = ""
+    prompt_version: str = ""
+    prompt_sha256: str = ""
+    visual_coverage: Dict[str, Any] = None  # type: ignore[assignment]
+    visual_scan_batches: List[List[Dict[str, Any]]] = None  # type: ignore[assignment]
 
     def to_metadata_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["selected_visual_refs"] = [dict(item) for item in self.selected_visual_refs]
         payload["visual_selection_policy_snapshot"] = dict(self.visual_selection_policy_snapshot)
         payload["multimodal_capability"] = dict(self.multimodal_capability)
+        payload["visual_coverage"] = dict(self.visual_coverage or {})
+        payload["visual_scan_batches"] = [
+            [dict(item) for item in batch]
+            for batch in (self.visual_scan_batches or [])
+        ]
         return payload
 
 
@@ -61,18 +73,44 @@ class Stage1InputBuilder:
         pdf_path: str = "",
         stage1_input_settings: Mapping[str, Any] | None = None,
         preprocess_metadata: Mapping[str, Any] | None = None,
+        prompt_identity: Mapping[str, Any] | None = None,
+        prompt_values: Mapping[str, Any] | None = None,
     ) -> Stage1BuiltInput:
         visual_bundle_dict = dict(visual_bundle or {})
         stage1_settings = dict(stage1_input_settings or {})
         preprocess_metadata_dict = dict(preprocess_metadata or {})
-        selected_visual_refs = [
+        all_visual_refs = [
             normalize_visual_artifact(dict(item))
-            for item in (visual_bundle_dict.get("selected_visual_refs") or [])
+            for item in (
+                visual_bundle_dict.get("all_visual_refs")
+                or visual_bundle_dict.get("selected_visual_refs")
+                or []
+            )
             if isinstance(item, Mapping)
         ]
+        selected_visual_refs = list(all_visual_refs)
         visual_manifest_path = str(visual_bundle_dict.get("visual_manifest_path") or "")
         visual_bundle_path = str(visual_bundle_dict.get("bundle_path") or "")
         selection_policy_snapshot = dict(visual_bundle_dict.get("selection_policy_snapshot") or {})
+        visual_coverage = dict(
+            visual_bundle_dict.get("coverage_report")
+            or visual_bundle_dict.get("visual_coverage")
+            or {}
+        )
+        prompt_identity_dict = dict(prompt_identity or {})
+        prompt_values_dict = dict(prompt_values or {})
+        prompt_values_dict.setdefault(
+            "VISUAL_COVERAGE_JSON",
+            json.dumps(
+                visual_bundle_dict.get("coverage_report") or visual_bundle_dict.get("visual_coverage") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        if "SUMMARY_SCHEMA_CONTRACT" in prompt_template and "SUMMARY_SCHEMA_CONTRACT" not in prompt_values_dict:
+            from summary_schema import build_summary_schema_contract
+
+            prompt_values_dict["SUMMARY_SCHEMA_CONTRACT"] = build_summary_schema_contract()
 
         send_extracted_text = _as_bool(stage1_settings.get("send_extracted_text"), default=True)
         send_selected_visuals = _as_bool(stage1_settings.get("send_selected_visuals"), default=True)
@@ -85,8 +123,75 @@ class Stage1InputBuilder:
             default=False,
         )
 
+        single_call_max_pages = max(1, int(stage1_settings.get("single_call_max_pages", 12) or 12))
+        visual_scan_batch_size = max(1, int(stage1_settings.get("visual_scan_batch_size", 10) or 10))
+        final_image_refs_max = max(0, int(stage1_settings.get("final_image_refs_max", 8) or 8))
+        max_request_image_bytes = max(
+            1,
+            int(stage1_settings.get("max_request_image_bytes", 36000000) or 36000000),
+        )
+        max_single_image_bytes = max(
+            1,
+            int(stage1_settings.get("max_single_image_bytes", 24000000) or 24000000),
+        )
+        page_refs = sorted(
+            [item for item in all_visual_refs if str(item.get("artifact_type") or "") == "page_snapshot"],
+            key=lambda item: int(item.get("page_no") or 0),
+        )
+        crop_refs = sorted(
+            [item for item in all_visual_refs if str(item.get("artifact_type") or "") != "page_snapshot"],
+            key=lambda item: (-float(item.get("selection_score") or 0.0), int(item.get("page_no") or 0)),
+        )
+        nonblank_page_count = int(visual_coverage.get("nonblank_pages") or len(page_refs))
+        page_total_bytes = sum(
+            int(item.get("image_bytes") or 0)
+            for item in page_refs
+        )
+        page_sizes_safe = all(
+            int(item.get("image_bytes") or 0) <= max_single_image_bytes
+            for item in page_refs
+        )
+        short_path = (
+            nonblank_page_count <= single_call_max_pages
+            and page_total_bytes <= max_request_image_bytes
+            and page_sizes_safe
+        )
+        if short_path:
+            selected_visual_refs = self._fit_visual_budget(
+                [*page_refs, *crop_refs[:final_image_refs_max]],
+                max_bytes=max_request_image_bytes,
+                max_single_bytes=max_single_image_bytes,
+                required=page_refs,
+            )
+        else:
+            selected_visual_refs = self._fit_visual_budget(
+                crop_refs[:final_image_refs_max] or page_refs[:final_image_refs_max],
+                max_bytes=max_request_image_bytes,
+                max_single_bytes=max_single_image_bytes,
+                required=[],
+            )
+        planned_batches = plan_visual_scan_batches(page_refs, batch_size=visual_scan_batch_size) if not short_path else ()
+        visual_scan_batches = [list(batch.visual_refs) for batch in planned_batches]
+        visual_coverage["scan_batches"] = [
+            {
+                "batch_index": index,
+                "visual_ids": [str(item.get("visual_id") or "") for item in batch],
+                "page_nos": [int(item.get("page_no") or 0) for item in batch],
+            }
+            for index, batch in enumerate(visual_scan_batches)
+        ]
+
         if not send_selected_visuals:
             selected_visual_refs = []
+            visual_scan_batches = []
+            visual_coverage["scan_batches"] = []
+
+        transport_visual_refs = [
+            item
+            for item in selected_visual_refs
+            if str(item.get("image_path") or "").strip()
+            and os.path.isfile(str(item.get("image_path") or "").strip())
+        ]
 
         visual_appendix = self._build_visual_appendix(selected_visual_refs)
         rich_evidence_appendix = self._build_rich_mineru_evidence_appendix(
@@ -112,8 +217,29 @@ class Stage1InputBuilder:
                 f"{visual_appendix}"
             ).strip()
 
-        prompt_text = prompt_template.replace("{{PAPER_FULL_TEXT}}", paper_body)
+        prompt_text = prompt_template
+        for key, value in prompt_values_dict.items():
+            prompt_text = prompt_text.replace("{{" + str(key) + "}}", str(value))
+        prompt_text = prompt_text.replace("{{PAPER_FULL_TEXT}}", paper_body)
         capability = detect_multimodal_capability(reader_api_config)
+        if short_path and capability.supports_image_input and page_refs and len(
+            [item for item in selected_visual_refs if str(item.get("artifact_type") or "") == "page_snapshot"]
+        ) >= len(page_refs):
+            visual_coverage = dict(visual_coverage)
+            visual_coverage["visually_scanned_pages"] = nonblank_page_count
+            visual_coverage["coverage_status"] = "complete"
+            visual_coverage["page_status"] = [
+                {
+                    **dict(item),
+                    "status": "scanned" if str(item.get("status") or "") == "rendered" else item.get("status"),
+                }
+                for item in visual_coverage.get("page_status") or []
+                if isinstance(item, Mapping)
+            ]
+            prompt_text = prompt_text.replace(
+                json.dumps(visual_bundle_dict.get("coverage_report") or visual_bundle_dict.get("visual_coverage") or {}, ensure_ascii=False, sort_keys=True),
+                json.dumps(visual_coverage, ensure_ascii=False, sort_keys=True),
+            )
         model_capability = resolve_model_capability(
             cast(APIConfig, dict(reader_api_config or {}))
         )
@@ -148,7 +274,7 @@ class Stage1InputBuilder:
         text_only_evidence_used = "rich_mineru_evidence_v1" if rich_evidence_appendix else "stage1_input_text"
 
         user_message_content: Optional[List[Dict[str, Any]]]
-        if not selected_visual_refs:
+        if not selected_visual_refs or not transport_visual_refs:
             user_message_content = None
             if pdf_item:
                 user_message_content = [{"type": "text", "text": prompt_text}, pdf_item]
@@ -161,7 +287,7 @@ class Stage1InputBuilder:
                 visual_bundle_path=visual_bundle_path,
                 visual_selection_policy_snapshot=selection_policy_snapshot,
                 multimodal_capability=capability.to_dict(),
-                fallback_reason="no_selected_visuals",
+                fallback_reason=("no_selected_visuals" if not selected_visual_refs else "visual_image_unavailable"),
                 pdf_file_input_supported=pdf_file_input_supported,
                 pdf_attachment_status=pdf_attachment_status,
                 original_pdf_attached=original_pdf_attached,
@@ -169,6 +295,11 @@ class Stage1InputBuilder:
                 pdf_attachment_size_mb=pdf_attachment_size_mb,
                 formal_input_path=formal_input_path,
                 text_only_evidence_used=text_only_evidence_used,
+                prompt_id=str(prompt_identity_dict.get("prompt_id") or ""),
+                prompt_version=str(prompt_identity_dict.get("prompt_version") or prompt_identity_dict.get("version") or ""),
+                prompt_sha256=str(prompt_identity_dict.get("prompt_sha256") or prompt_identity_dict.get("sha256") or ""),
+                visual_coverage=visual_coverage,
+                visual_scan_batches=visual_scan_batches,
             )
 
         if not capability.supports_image_input:
@@ -192,15 +323,22 @@ class Stage1InputBuilder:
                 pdf_attachment_size_mb=pdf_attachment_size_mb,
                 formal_input_path=formal_input_path,
                 text_only_evidence_used=text_only_evidence_used,
+                prompt_id=str(prompt_identity_dict.get("prompt_id") or ""),
+                prompt_version=str(prompt_identity_dict.get("prompt_version") or prompt_identity_dict.get("version") or ""),
+                prompt_sha256=str(prompt_identity_dict.get("prompt_sha256") or prompt_identity_dict.get("sha256") or ""),
+                visual_coverage=visual_coverage,
+                visual_scan_batches=visual_scan_batches,
             )
 
         user_message_content = [{"type": "text", "text": prompt_text}]
         if pdf_item:
             user_message_content.append(pdf_item)
-        for visual in selected_visual_refs:
+        for visual in transport_visual_refs:
             image_path = str(visual.get("image_path") or "").strip()
             if not image_path:
                 continue
+            label = self._visual_label(visual)
+            user_message_content.append({"type": "text", "text": label})
             user_message_content.append(
                 {
                     "type": "local_image_path",
@@ -228,6 +366,52 @@ class Stage1InputBuilder:
             pdf_attachment_size_mb=pdf_attachment_size_mb,
             formal_input_path=formal_input_path,
             text_only_evidence_used=text_only_evidence_used,
+            prompt_id=str(prompt_identity_dict.get("prompt_id") or ""),
+            prompt_version=str(prompt_identity_dict.get("prompt_version") or prompt_identity_dict.get("version") or ""),
+            prompt_sha256=str(prompt_identity_dict.get("prompt_sha256") or prompt_identity_dict.get("sha256") or ""),
+            visual_coverage=visual_coverage,
+            visual_scan_batches=visual_scan_batches,
+        )
+
+    @staticmethod
+    def _fit_visual_budget(
+        refs: List[Dict[str, Any]],
+        *,
+        max_bytes: int,
+        max_single_bytes: int,
+        required: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        required_ids = {str(item.get("visual_id") or "") for item in required}
+        selected: List[Dict[str, Any]] = []
+        total = 0
+        for item in refs:
+            visual_id = str(item.get("visual_id") or "")
+            image_path = str(item.get("image_path") or "")
+            try:
+                size = int(item.get("image_bytes") or os.path.getsize(image_path))
+            except OSError:
+                size = 0
+            if size > max_single_bytes and visual_id not in required_ids:
+                continue
+            if visual_id in required_ids or total + size <= max_bytes:
+                selected.append(item)
+                total += size
+        return selected
+
+    @staticmethod
+    def _visual_label(visual: Mapping[str, Any]) -> str:
+        page_no = int(visual.get("page_no") or 0)
+        bbox = visual.get("bbox") or []
+        artifact_type = str(visual.get("artifact_type") or "visual")
+        visual_id = str(visual.get("visual_id") or "")
+        caption = _truncate(visual.get("caption_excerpt") or "", 360)
+        nearby = _truncate(visual.get("nearby_text_excerpt") or "", 500)
+        return (
+            f"[VISUAL OBJECT] visual_id={visual_id}; page_no={page_no}; bbox={bbox}; "
+            f"artifact_type={artifact_type}\n"
+            f"caption_excerpt={caption or '<none>'}\n"
+            f"nearby_text_excerpt={nearby or '<none>'}\n"
+            "The following image is evidence for this label only."
         )
 
     def _build_visual_appendix(self, selected_visual_refs: List[Dict[str, Any]]) -> str:

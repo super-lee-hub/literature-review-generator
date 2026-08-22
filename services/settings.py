@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping, MutableMapping
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 
 # Kept in the accepted schema only so older config files can be read and
 # normalized.  This field is not a current parser-routing control.
@@ -45,6 +45,7 @@ API_KEYS = frozenset(
         "pdf_file_input",
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
+        "experimental",
     }
 )
 
@@ -167,6 +168,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
     "GUI": frozenset({"language"}),
     "Stage1_Input": frozenset(
         {
+            "mode",
             "send_extracted_text",
             "send_selected_visuals",
             "send_original_pdf",
@@ -175,9 +177,35 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "formal_precision_text_only_policy",
             "force_pdf_file_input_for_provider",
             "pdf_verifier_api",
+            "image_transport",
+            "single_call_max_pages",
+            "visual_scan_batch_size",
+            "final_image_refs_max",
+            "require_complete_visual_coverage",
+            "max_request_image_bytes",
+            "max_single_image_bytes",
         }
     ),
-    "Stage1_Visual": frozenset({"enabled", "max_visual_refs_per_paper", "visual_artifact_dir"}),
+    "Stage1_Visual": frozenset(
+        {
+            "enabled",
+            "max_visual_refs_per_paper",
+            "visual_artifact_dir",
+            "render_all_nonblank_pages",
+            "page_long_edge_px",
+            "crop_long_edge_px",
+            "page_max_pixels",
+            "crop_max_pixels",
+            "page_format",
+            "page_jpeg_quality",
+            "crop_format",
+            "crop_padding_ratio",
+            "table_crop_enabled",
+            "formula_crop_enabled",
+            "max_request_image_bytes",
+            "max_single_image_bytes",
+        }
+    ),
     "Multimodal": frozenset({"enabled", "multimodal_api_key", "multimodal_model", "multimodal_api_base"}),
 }
 
