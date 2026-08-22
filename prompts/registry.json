@@ -140,7 +140,7 @@
       "owner": "validator.validate_summary_with_ai",
       "required_placeholders": ["PAPER_FULL_TEXT", "GENERATED_SUMMARY"],
       "output_contract": "legacy summary fact-check JSON",
-      "sha256": "a880243cade0e9be09c8619373712ba8870636d783f3115ab345c70049c4ea50"
+      "sha256": "70fc33bd89cfbecf7b3606361e3278235b19451f2ee5081c65db436cabaac1f6"
     },
     {
       "prompt_id": "validation.legacy.claims_batch.v1",
@@ -150,7 +150,7 @@
       "owner": "validator._validate_claims_for_single_paper",
       "required_placeholders": ["SOURCE_SUMMARY", "SENTENCES_TO_VALIDATE"],
       "output_contract": "legacy batch validation JSON",
-      "sha256": "67346a45efe4fbd98a4beb6cfe7d36a1559dabd1d65eae788702d5f077be82b1"
+      "sha256": "d7ac08ba13d086466c5d8f643cc2b3d4ae966fd37a2a196ff186997ac29ebe9c"
     }
   ]
 }

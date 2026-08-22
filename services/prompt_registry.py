@@ -25,6 +25,22 @@ class PromptRegistryError(ValueError):
     """Raised when prompt authority or placeholder contracts are invalid."""
 
 
+def _canonical_prompt_bytes(target: Path) -> bytes:
+    """Return prompt bytes with platform line endings normalized to LF.
+
+    Prompt hashes are authority data, so they must be stable across Windows
+    checkouts (which may materialize CRLF) and POSIX checkouts (which usually
+    materialize LF).  Decode first so malformed prompt files still fail
+    closed instead of receiving a hash that the runtime cannot read.
+    """
+
+    try:
+        text = target.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PromptRegistryError(f"unable to read prompt as UTF-8: {target}") from exc
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
 @dataclass(frozen=True)
 class PromptIdentity:
     prompt_id: str
@@ -113,7 +129,7 @@ class PromptRegistry:
     def identity(self, prompt_id: str, *, allow_non_active: bool = False) -> PromptIdentity:
         entry = self.entry(prompt_id, allow_non_active=allow_non_active)
         target = self.path(prompt_id, allow_non_active=allow_non_active)
-        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        digest = hashlib.sha256(_canonical_prompt_bytes(target)).hexdigest()
         declared = str(entry.get("sha256") or "").strip().lower()
         if not _SHA256_RE.fullmatch(declared):
             raise PromptRegistryError(f"prompt {prompt_id} has no valid declared sha256")

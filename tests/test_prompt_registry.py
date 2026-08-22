@@ -1,10 +1,43 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from services.prompt_registry import PromptRegistry, PromptRegistryError
+
+
+def test_prompt_hash_is_stable_when_windows_materializes_crlf(tmp_path: Path) -> None:
+    prompt_text = "system line\nuser line\n"
+    prompt_path = tmp_path / "prompts" / "active" / "test.txt"
+    prompt_path.parent.mkdir(parents=True)
+    prompt_path.write_bytes(prompt_text.replace("\n", "\r\n").encode("utf-8"))
+    registry_path = prompt_path.parents[1] / "registry.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "prompts": [
+                    {
+                        "prompt_id": "test.prompt",
+                        "version": "v1",
+                        "status": "ACTIVE",
+                        "owner": "test",
+                        "path": "prompts/active/test.txt",
+                        "sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = PromptRegistry(tmp_path)
+    identity = registry.identity("test.prompt")
+
+    assert identity.sha256 == hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    assert registry.read("test.prompt") == prompt_text
 
 
 def test_active_prompt_registry_is_hash_valid_and_has_no_orphans() -> None:
