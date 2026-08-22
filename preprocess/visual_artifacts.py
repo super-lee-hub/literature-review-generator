@@ -874,9 +874,14 @@ class Stage1VisualArtifactBuilder:
         clip: Optional[Any] = None,
         image_format: str = "png",
         jpeg_quality: int = 92,
+        max_rendered_pixels: Optional[int] = None,
     ) -> bool:
         safety = policy.get("rendering_safety", {}) if isinstance(policy, Mapping) else {}
-        max_pixels = int(safety.get("max_rendered_pixels", 16_000_000) or 16_000_000)
+        max_pixels = int(
+            max_rendered_pixels
+            or safety.get("max_rendered_pixels", 16_000_000)
+            or 16_000_000
+        )
         max_dimension = int(safety.get("max_rendered_dimension_px", 8_000) or 8_000)
         max_bytes = int(safety.get("max_visual_artifact_bytes", 20 * 1024 * 1024) or (20 * 1024 * 1024))
 
@@ -1012,6 +1017,14 @@ class Stage1VisualArtifactBuilder:
             padding_ratio = max(0.0, min(float(rendering.get("crop_padding_ratio", 0.04) or 0.04), 0.25))
             page_format = _normalize_image_format(rendering.get("page_format"), "jpeg")
             crop_format = _normalize_image_format(rendering.get("crop_format"), "png")
+            page_max_pixels = max(
+                1,
+                int(rendering.get("page_max_pixels") or 16_000_000),
+            )
+            crop_max_pixels = max(
+                1,
+                int(rendering.get("crop_max_pixels") or 16_000_000),
+            )
             page_extension = "jpg" if page_format == "jpeg" else "png"
             crop_extension = "jpg" if crop_format == "jpeg" else "png"
             try:
@@ -1037,6 +1050,7 @@ class Stage1VisualArtifactBuilder:
                     policy=policy,
                     image_format=page_format,
                     jpeg_quality=page_jpeg_quality,
+                    max_rendered_pixels=page_max_pixels,
                 ):
                     continue
                 artifact_id = f"page_snapshot:{artifact_hash}:p{page_no:03d}"
@@ -1088,6 +1102,7 @@ class Stage1VisualArtifactBuilder:
                     policy=policy,
                     image_format=crop_format,
                     jpeg_quality=page_jpeg_quality,
+                    max_rendered_pixels=crop_max_pixels,
                 ):
                     continue
                 artifact_id = f"{artifact_type}:{artifact_hash}:p{page_no:03d}:c{index:02d}"

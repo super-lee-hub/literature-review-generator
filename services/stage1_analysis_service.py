@@ -56,6 +56,8 @@ from services.stage1_visual_scan import (
     VisualScanBatch,
     build_visual_scan_prompt,
     build_visual_scan_user_content,
+    estimate_encoded_image_bytes,
+    normalize_visual_byte_budgets,
     validate_visual_observations,
     select_final_visual_refs_after_scan,
 )
@@ -1079,11 +1081,15 @@ class Stage1AnalysisService:
                 if not vision_enabled:
                     break
                 batch = VisualScanBatch(batch_index=batch_index, visual_refs=tuple(dict(ref) for ref in batch_refs))
+                max_request, max_single = normalize_visual_byte_budgets(
+                    max_request_image_bytes=item.stage1_input_settings.get("max_request_image_bytes"),
+                    max_single_image_bytes=item.stage1_input_settings.get("max_single_image_bytes"),
+                )
                 _scan_content, transport_report = build_visual_scan_user_content(
                     batch,
                     return_report=True,
-                    max_single_image_bytes=int(item.stage1_input_settings.get("max_single_image_bytes", 24_000_000) or 24_000_000),
-                    max_request_image_bytes=int(item.stage1_input_settings.get("max_request_image_bytes", 36_000_000) or 36_000_000),
+                    max_single_image_bytes=max_single,
+                    max_request_image_bytes=max_request,
                 )
                 sent_refs = tuple(
                     dict(ref)
@@ -1103,8 +1109,8 @@ class Stage1AnalysisService:
                 effective_scan_content, _effective_report = build_visual_scan_user_content(
                     effective_batch,
                     return_report=True,
-                    max_single_image_bytes=int(item.stage1_input_settings.get("max_single_image_bytes", 24_000_000) or 24_000_000),
-                    max_request_image_bytes=int(item.stage1_input_settings.get("max_request_image_bytes", 36_000_000) or 36_000_000),
+                    max_single_image_bytes=max_single,
+                    max_request_image_bytes=max_request,
                 )
                 effective_config = self._effective_provider_config(item.primary_config)
                 scan_identity = self.prompt_registry.identity("stage1.visual_scan.system.v1")
@@ -1309,19 +1315,9 @@ class Stage1AnalysisService:
     ) -> dict[str, Any]:
         """Calculate the local-input transport facts for injected readers."""
 
-        max_single = max(
-            1,
-            int(
-                stage1_input_settings.get("max_single_image_bytes", 24_000_000)
-                or 24_000_000
-            ),
-        )
-        max_request = max(
-            1,
-            int(
-                stage1_input_settings.get("max_request_image_bytes", 36_000_000)
-                or 36_000_000
-            ),
+        max_request, max_single = normalize_visual_byte_budgets(
+            max_request_image_bytes=stage1_input_settings.get("max_request_image_bytes"),
+            max_single_image_bytes=stage1_input_settings.get("max_single_image_bytes"),
         )
         planned_ids: list[str] = []
         sent_ids: list[str] = []
@@ -1350,7 +1346,7 @@ class Stage1AnalysisService:
                     elif image_bytes > max_single:
                         reason = "image_exceeds_single_byte_budget"
                     else:
-                        encoded = int((image_bytes * 4 + 2) // 3) + 240
+                        encoded = estimate_encoded_image_bytes(image_bytes)
                         if encoded_bytes + encoded > max_request:
                             reason = "image_exceeds_request_byte_budget"
                         else:
@@ -1892,17 +1888,10 @@ class Stage1AnalysisService:
             self._visual_observation_records[paper_key] = []
             return prepared, coverage, []
 
-        try:
-            max_single = max(
-                1,
-                int(prepared.stage1_input_settings.get("max_single_image_bytes", 24_000_000) or 24_000_000),
-            )
-            max_request = max(
-                1,
-                int(prepared.stage1_input_settings.get("max_request_image_bytes", 36_000_000) or 36_000_000),
-            )
-        except (TypeError, ValueError):
-            max_single, max_request = 24_000_000, 36_000_000
+        max_request, max_single = normalize_visual_byte_budgets(
+            max_request_image_bytes=prepared.stage1_input_settings.get("max_request_image_bytes"),
+            max_single_image_bytes=prepared.stage1_input_settings.get("max_single_image_bytes"),
+        )
 
         observation_records: list[ArtifactRecord] = []
         observations: list[dict[str, Any]] = []
@@ -2188,6 +2177,8 @@ class Stage1AnalysisService:
                 provider_runtime=runtime,
                 system_prompt=system_prompt,
                 normalize_summary=False,
+                max_single_image_bytes=prepared.stage1_input_settings.get("max_single_image_bytes"),
+                max_request_image_bytes=prepared.stage1_input_settings.get("max_request_image_bytes"),
             )
         if not isinstance(value, Mapping):
             return {
@@ -3508,6 +3499,7 @@ class Stage1AnalysisService:
         else:
             from ai_interface import get_summary_from_ai_with_fallback
 
+            visual_coverage = built_input.visual_coverage or {}
             value = get_summary_from_ai_with_fallback(
                 built_input.prompt_text,
                 cast(APIConfig, dict(primary_config)),
@@ -3518,6 +3510,8 @@ class Stage1AnalysisService:
                 return_detailed=True,
                 provider_runtime=runtime,
                 system_prompt=self.prompt_registry.read("stage1.analysis.system.v3"),
+                max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
+                max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
             )
         if not isinstance(value, Mapping):
             raise RuntimeError(f"Stage 1 reader returned a non-object for {self._paper_key(item)}")

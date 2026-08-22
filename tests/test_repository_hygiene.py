@@ -60,6 +60,17 @@ def test_root_readme_and_agents_links_resolve() -> None:
             assert (path.parent / target).resolve().is_file(), (name, target)
 
 
+def test_docs_markdown_relative_links_resolve() -> None:
+    docs_root = ROOT / "docs"
+    for path in docs_root.rglob("*.md"):
+        text = path.read_text(encoding="utf-8")
+        for raw_target in re.findall(r"\]\(([^)#]+)", text):
+            target = raw_target.strip().strip("<>")
+            if "://" in target or target.startswith("mailto:"):
+                continue
+            assert (path.parent / target).resolve().exists(), (path, target)
+
+
 def test_deleted_pointer_documents_have_no_inbound_references() -> None:
     text = _tracked_text()
     for name in (

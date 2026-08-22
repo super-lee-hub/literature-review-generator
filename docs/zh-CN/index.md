@@ -1,6 +1,6 @@
 # auto-generate 文档站
 
-> 面向开发者、AI Agent 和维护者的权威技术文档。用户使用指南请返回根目录查阅 [README.md](../README.md) 和 [README.zh-CN.md](../README.zh-CN.md)。
+> 面向开发者、AI Agent 和维护者的权威技术文档。用户使用指南请返回根目录查阅 [README.md](../../README.md) 和 [README.zh-CN.md](../../README.zh-CN.md)。
 
 ## 文档分区
 
@@ -15,7 +15,7 @@
 
 `auto-generate` 是一个本地运行、语料可控、全文优先的 AI 文献分析与综述写作工作台。支持 PDF 文件夹模式和 Zotero 模式，提供 GUI（新手友好）、CLI（可重复批量运行）和 Codex/OMX Skill（AI 原生执行）三种入口。
 
-- 项目首页：[README.md](../README.md)
-- 中文用户指南：[README.zh-CN.md](../README.zh-CN.md)
-- English User Guide: [README.en.md](../README.en.md)
-- AI/开发者入口：[AGENTS.md](../AGENTS.md)
+- 项目首页：[README.md](../../README.md)
+- 中文用户指南：[README.zh-CN.md](../../README.zh-CN.md)
+- English User Guide: [README.en.md](../../README.en.md)
+- AI/开发者入口：[AGENTS.md](../../AGENTS.md)

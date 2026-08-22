@@ -18,7 +18,7 @@
 - 技术约束和兼容性规则
 
 **不属于本目录的内容：**
-- 用户使用指南 → 见根目录 [README.zh-CN.md](../../README.zh-CN.md)
+- 用户使用指南 → 见根目录 [README.zh-CN.md](../../../README.zh-CN.md)
 - AI Agent 交接文档 → 见 [../ai/index.md](../ai/index.md)
 - 运行时真源和产物说明 → 见 [../runtime/index.md](../runtime/index.md)
 - CLI 参数和配置字段参考 → 见 [../reference/index.md](../reference/index.md)

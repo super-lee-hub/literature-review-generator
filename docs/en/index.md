@@ -1,6 +1,6 @@
 # auto-generate Documentation Site
 
-> Authoritative technical documentation for developers, AI agents, and maintainers. For user guides, return to the root [README.md](../README.md) and [README.en.md](../README.en.md).
+> Authoritative technical documentation for developers, AI agents, and maintainers. For user guides, return to the root [README.md](../../README.md) and [README.en.md](../../README.en.md).
 
 ## Document Sections
 
@@ -15,7 +15,7 @@
 
 `auto-generate` is a local, corpus-controlled, full-text-first AI literature analysis and review-writing workbench. It supports PDF folder mode and Zotero mode, with three entry points: GUI (beginner-friendly), CLI (repeatable batch runs), and Codex/OMX skill (AI-native execution).
 
-- Product Homepage: [README.md](../README.md)
-- English User Guide: [README.en.md](../README.en.md)
-- 中文用户指南: [README.zh-CN.md](../README.zh-CN.md)
-- AI/Developer Entry: [AGENTS.md](../AGENTS.md)
+- Product Homepage: [README.md](../../README.md)
+- English User Guide: [README.en.md](../../README.en.md)
+- 中文用户指南: [README.zh-CN.md](../../README.zh-CN.md)
+- AI/Developer Entry: [AGENTS.md](../../AGENTS.md)

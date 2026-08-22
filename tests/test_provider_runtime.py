@@ -220,6 +220,95 @@ def test_low_level_http_mock_receipt_hash_matches_actual_multimodal_request(monk
     assert receipt.metadata["successful_input_mode"] == "multimodal"
 
 
+def test_low_level_http_mock_budget_omission_matches_receipt_and_payload(monkeypatch, tmp_path) -> None:
+    first_image = tmp_path / "first.jpg"
+    second_image = tmp_path / "second.jpg"
+    first_image.write_bytes(b"first-image")
+    second_image.write_bytes(b"second-image")
+    captured: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {"content": '{"answer":"ok"}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+    def post(url: str, **kwargs: object) -> Response:
+        captured["payload"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    runtime = ProviderRuntime(
+        ledger=ledger,
+        job_id="job-1",
+        attempt_id="attempt-1",
+        stage_name="stage1_analyze",
+        route="Primary_Reader_API",
+        node_id="paper-1",
+        call_id="stage1_synthesis:paper-1",
+        endpoint_type="chat_completions",
+    )
+    config = {
+        "api_key": "secret",
+        "model": "deepseek-v4-flash-vision-exp",
+        "api_base": "https://api.deepseek.com/v1",
+        "provider_family": "deepseek",
+    }
+    first_ref = {
+        "type": "local_image_path",
+        "path": str(first_image),
+        "visual_id": "page-001",
+        "page_no": 1,
+    }
+    second_ref = {
+        "type": "local_image_path",
+        "path": str(second_image),
+        "visual_id": "page-002",
+        "page_no": 2,
+    }
+    user_content = [{"type": "text", "text": "text evidence"}, first_ref, second_ref]
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        config,
+        "system",
+        user_content=user_content,
+        provider_runtime=runtime,
+        max_single_image_bytes=1000,
+        max_request_image_bytes=300,
+    )
+
+    assert result["status"] == "success"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    content = payload["messages"][1]["content"]
+    assert sum(item.get("type") == "image_url" for item in content) == 1
+    receipt = ledger.list_receipts()[0]
+    assert receipt.input_hash == hash_json(
+        canonical_provider_request_payload(
+            prompt="prompt",
+            system_prompt="system",
+            user_content=[{"type": "text", "text": "text evidence"}, first_ref],
+            response_format="json",
+            max_output_tokens=4000,
+            temperature=0.3,
+        )
+    )
+    assert receipt.metadata["sent_visual_ids"] == ["page-001"]
+    assert receipt.metadata["omissions"][0]["visual_id"] == "page-002"
+    assert receipt.metadata["omissions"][0]["reason"] == "image_exceeds_request_byte_budget"
+
+
 def test_backup_http_mock_is_text_only_and_receipt_route_is_backup(monkeypatch, tmp_path) -> None:
     image_path = tmp_path / "page.jpg"
     image_path.write_bytes(b"fake-image-bytes")

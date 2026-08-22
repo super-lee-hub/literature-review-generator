@@ -32,6 +32,24 @@ def estimate_encoded_image_bytes(raw_bytes: int, *, metadata_bytes: int = 240) -
     return int(math.ceil(raw * _BASE64_NUMERATOR / _BASE64_DENOMINATOR)) + max(0, int(metadata_bytes))
 
 
+def normalize_visual_byte_budgets(
+    *,
+    max_request_image_bytes: Any = None,
+    max_single_image_bytes: Any = None,
+) -> tuple[int, int]:
+    """Resolve the one raw/encoded image budget used by planning and transport."""
+
+    try:
+        request_limit = int(max_request_image_bytes)
+    except (TypeError, ValueError):
+        request_limit = DEFAULT_MAX_REQUEST_IMAGE_BYTES
+    try:
+        single_limit = int(max_single_image_bytes)
+    except (TypeError, ValueError):
+        single_limit = DEFAULT_MAX_SINGLE_IMAGE_BYTES
+    return max(1, request_limit), max(1, single_limit)
+
+
 def _image_bytes(visual: Mapping[str, Any]) -> int:
     try:
         declared = int(visual.get("image_bytes") or 0)
@@ -87,8 +105,10 @@ def plan_visual_scan_batches(
     """Partition every page snapshot by order, count, and encoded byte budget."""
 
     size = max(1, int(batch_size))
-    request_limit = max(1, int(max_request_image_bytes))
-    single_limit = max(1, int(max_single_image_bytes))
+    request_limit, single_limit = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
     normalized = [dict(item) for item in visual_refs if isinstance(item, Mapping)]
     normalized.sort(key=lambda item: (int(item.get("page_no") or 0), str(item.get("visual_id") or "")))
     batches: list[VisualScanBatch] = []
@@ -143,8 +163,10 @@ def build_visual_scan_user_content(
     sent_refs: list[dict[str, Any]] = []
     omissions: list[dict[str, Any]] = []
     encoded_bytes = 0
-    single_limit = max(1, int(max_single_image_bytes))
-    request_limit = max(1, int(max_request_image_bytes))
+    request_limit, single_limit = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
     for visual in batch.visual_refs:
         visual_id = str(visual.get("visual_id") or "")
         path = str(visual.get("image_path") or "").strip()
@@ -364,6 +386,6 @@ def build_visual_scan_prompt(batch: VisualScanBatch, *, ocr_by_visual_id: Mappin
 __all__ = [
     "DEFAULT_MAX_REQUEST_IMAGE_BYTES", "DEFAULT_MAX_SINGLE_IMAGE_BYTES", "VISUAL_INPUT_IDENTITY_VERSION",
     "VisualScanBatch", "build_visual_scan_prompt", "build_visual_scan_user_content",
-    "estimate_encoded_image_bytes", "plan_visual_scan_batches", "select_final_visual_refs_after_scan",
+    "estimate_encoded_image_bytes", "normalize_visual_byte_budgets", "plan_visual_scan_batches", "select_final_visual_refs_after_scan",
     "validate_visual_observations", "visual_label",
 ]

@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 
 import fitz  # type: ignore
+import pytest
 
+import preprocess.visual_artifacts as visual_artifacts
+from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
 from tests.test_current_stage1_generation import _canonical_summary, _service
 
 
@@ -45,3 +48,59 @@ def test_page_snapshots_are_clear_bounded_and_hashed(tmp_path: Path) -> None:
         assert item["width"] * item["height"] <= 16_000_000
         assert item["image_bytes"] > 0
         assert len(item["image_sha256"]) == 64
+
+
+def test_page_and_crop_pixel_budgets_are_applied_independently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "pixel-budgets.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "Figure 1. Pixel budget test")
+    document.save(pdf_path)
+    document.close()
+
+    policy = json.loads(json.dumps(visual_artifacts._DEFAULT_SELECTION_POLICY))
+    policy["rendering"]["page_max_pixels"] = 111
+    policy["rendering"]["crop_max_pixels"] = 222
+    captured: list[tuple[bool, int]] = []
+
+    def capture_render(self: Stage1VisualArtifactBuilder, **kwargs: object) -> bool:
+        captured.append((kwargs.get("clip") is None, int(kwargs["max_rendered_pixels"])))
+        return False
+
+    monkeypatch.setattr(Stage1VisualArtifactBuilder, "_render_pixmap_if_safe", capture_render)
+    builder = Stage1VisualArtifactBuilder()
+    builder._materialize_visuals(
+        source_pdf=str(pdf_path),
+        page_candidates=[
+            {
+                "page_no": 1,
+                "score": 1,
+                "caption_excerpt": "",
+                "nearby_text_excerpt": "",
+                "selection_reason": "test",
+                "dedupe_group_id": "page-1",
+            }
+        ],
+        figure_candidates=[
+            {
+                "page_no": 1,
+                "bbox": [72, 72, 200, 160],
+                "score": 1,
+                "caption_excerpt": "Figure 1",
+                "nearby_text_excerpt": "",
+                "selection_reason": "test",
+                "dedupe_group_id": "figure-1",
+                "artifact_type": "figure_crop",
+            }
+        ],
+        layout_candidates=[],
+        policy=policy,
+        bundle_dir=str(tmp_path / "renders"),
+        paper_key="pixel-budget-paper",
+        artifact_hash="pixel-budget-hash",
+    )
+
+    assert captured == [(True, 111), (False, 222)]

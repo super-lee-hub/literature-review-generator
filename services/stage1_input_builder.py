@@ -13,6 +13,7 @@ from services.stage1_visual_scan import (
     DEFAULT_MAX_REQUEST_IMAGE_BYTES,
     DEFAULT_MAX_SINGLE_IMAGE_BYTES,
     estimate_encoded_image_bytes,
+    normalize_visual_byte_budgets,
     plan_visual_scan_batches,
 )
 from services.visual_artifact_resolver import normalize_visual_artifact
@@ -150,14 +151,16 @@ class Stage1InputBuilder:
         single_call_max_pages = max(1, int(stage1_settings.get("single_call_max_pages", 12) or 12))
         visual_scan_batch_size = max(1, int(stage1_settings.get("visual_scan_batch_size", 10) or 10))
         final_image_refs_max = max(0, int(stage1_settings.get("final_image_refs_max", 8) or 8))
-        max_request_image_bytes = max(
-            1,
-            int(stage1_settings.get("max_request_image_bytes", DEFAULT_MAX_REQUEST_IMAGE_BYTES) or DEFAULT_MAX_REQUEST_IMAGE_BYTES),
+        max_request_image_bytes, max_single_image_bytes = normalize_visual_byte_budgets(
+            max_request_image_bytes=stage1_settings.get(
+                "max_request_image_bytes", DEFAULT_MAX_REQUEST_IMAGE_BYTES
+            ),
+            max_single_image_bytes=stage1_settings.get(
+                "max_single_image_bytes", DEFAULT_MAX_SINGLE_IMAGE_BYTES
+            ),
         )
-        max_single_image_bytes = max(
-            1,
-            int(stage1_settings.get("max_single_image_bytes", DEFAULT_MAX_SINGLE_IMAGE_BYTES) or DEFAULT_MAX_SINGLE_IMAGE_BYTES),
-        )
+        visual_coverage["max_request_image_bytes"] = max_request_image_bytes
+        visual_coverage["max_single_image_bytes"] = max_single_image_bytes
         page_refs = sorted(
             [item for item in all_visual_refs if str(item.get("artifact_type") or "") == "page_snapshot"],
             key=lambda item: int(item.get("page_no") or 0),

@@ -30,7 +30,11 @@ from summary_schema import (
     normalize_ai_summary,
 )
 from services.multimodal_capability import detect_multimodal_capability
-from services.stage1_visual_scan import DEFAULT_MAX_SINGLE_IMAGE_BYTES
+from services.stage1_visual_scan import (
+    DEFAULT_MAX_SINGLE_IMAGE_BYTES,
+    estimate_encoded_image_bytes,
+    normalize_visual_byte_budgets,
+)
 
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
@@ -347,9 +351,17 @@ def build_chat_completions_payload(
     user_content: Any = None,
     logger: Any = None,
     capability: Optional[ModelCapability] = None,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     capability = capability or resolve_model_capability(api_config)
-    normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
+    normalized_user_content = _normalize_user_message_content(
+        prompt,
+        user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
     token_limit = _configured_positive_int(api_config.get("max_completion_tokens"), max_tokens)
     token_limit = _configured_positive_int(api_config.get("max_tokens"), token_limit)
     payload: Dict[str, Any] = {
@@ -378,9 +390,17 @@ def build_responses_payload(
     user_content: Any = None,
     logger: Any = None,
     capability: Optional[ModelCapability] = None,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     capability = capability or resolve_model_capability(api_config)
-    normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
+    normalized_user_content = _normalize_user_message_content(
+        prompt,
+        user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
     max_output_tokens = _configured_positive_int(api_config.get("max_output_tokens"), max_tokens)
     payload: Dict[str, Any] = {
         "model": api_config.get("model") or "",
@@ -536,23 +556,28 @@ def _load_api_runtime_settings(api_config: Optional[Mapping[str, Any]] = None) -
     return timeout_seconds, retry_attempts
 
 
-def _encode_local_image_as_data_url(path: str) -> Optional[str]:
+def _encode_local_image_as_data_url(
+    path: str,
+    *,
+    max_image_bytes: int = _MAX_LOCAL_IMAGE_INPUT_BYTES,
+) -> Optional[str]:
     if not path:
         return None
     try:
         image_size = os.path.getsize(path)
     except OSError:
         return None
-    if image_size <= 0 or image_size > _MAX_LOCAL_IMAGE_INPUT_BYTES:
+    max_bytes = max(1, int(max_image_bytes or _MAX_LOCAL_IMAGE_INPUT_BYTES))
+    if image_size <= 0 or image_size > max_bytes:
         return None
 
     try:
         with open(path, "rb") as handle:
-            image_bytes = handle.read(_MAX_LOCAL_IMAGE_INPUT_BYTES + 1)
+            image_bytes = handle.read(max_bytes + 1)
     except OSError:
         return None
 
-    if not image_bytes or len(image_bytes) > _MAX_LOCAL_IMAGE_INPUT_BYTES:
+    if not image_bytes or len(image_bytes) > max_bytes:
         return None
 
     mime_type = mimetypes.guess_type(path)[0] or "image/png"
@@ -576,13 +601,21 @@ def _normalize_user_message_content_with_report(
     prompt: str,
     user_content: Any,
     logger: Any = None,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
+    max_request, max_single = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
     if not isinstance(user_content, list):
         return prompt, {"sent_visual_ids": [], "omissions": [], "images_actually_sent_count": 0}
 
     normalized: List[Dict[str, Any]] = []
     sent_visual_ids: List[str] = []
     omissions: List[Dict[str, Any]] = []
+    encoded_bytes = 0
     for item in user_content:
         if not isinstance(item, dict):
             continue
@@ -594,11 +627,41 @@ def _normalize_user_message_content_with_report(
             continue
         if item_type == "local_image_path":
             path = str(item.get("path") or "").strip()
-            data_url = _encode_local_image_as_data_url(path)
+            try:
+                image_size = int(os.path.getsize(path))
+            except OSError:
+                image_size = 0
+            visual_id = str(item.get("visual_id") or "")
+            page_no = int(item.get("page_no") or 0)
+            if not path or not os.path.isfile(path) or image_size <= 0:
+                omissions.append({
+                    "visual_id": visual_id,
+                    "page_no": page_no,
+                    "reason": "missing_or_unreadable_local_image",
+                })
+                if logger:
+                    logger.warning(f"Skipping missing or unreadable local image input: {path}")
+                continue
+            if image_size > max_single:
+                omissions.append({
+                    "visual_id": visual_id,
+                    "page_no": page_no,
+                    "reason": "image_exceeds_single_byte_budget",
+                })
+                continue
+            estimated = estimate_encoded_image_bytes(image_size)
+            if encoded_bytes + estimated > max_request:
+                omissions.append({
+                    "visual_id": visual_id,
+                    "page_no": page_no,
+                    "reason": "image_exceeds_request_byte_budget",
+                })
+                continue
+            data_url = _encode_local_image_as_data_url(path, max_image_bytes=max_single)
             if not data_url:
                 omissions.append({
-                    "visual_id": str(item.get("visual_id") or ""),
-                    "page_no": int(item.get("page_no") or 0),
+                    "visual_id": visual_id,
+                    "page_no": page_no,
                     "reason": "missing_or_oversized_local_image",
                 })
                 if logger:
@@ -610,7 +673,8 @@ def _normalize_user_message_content_with_report(
                     "image_url": {"url": data_url, "detail": str(item.get("detail") or "original")},
                 }
             )
-            sent_visual_ids.append(str(item.get("visual_id") or ""))
+            encoded_bytes += estimated
+            sent_visual_ids.append(visual_id)
             continue
         if item_type == "image_url":
             image_url = item.get("image_url")
@@ -677,8 +741,21 @@ def _normalize_user_message_content_with_report(
     }
 
 
-def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any = None) -> Any:
-    normalized, _report = _normalize_user_message_content_with_report(prompt, user_content, logger=logger)
+def _normalize_user_message_content(
+    prompt: str,
+    user_content: Any,
+    logger: Any = None,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Any:
+    normalized, _report = _normalize_user_message_content_with_report(
+        prompt,
+        user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
     return normalized
 
 
@@ -697,6 +774,55 @@ def _text_only_user_content(user_content: Any) -> Any:
     return text_items or None
 
 
+def _admit_local_images_to_budget(
+    user_content: Any,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Tuple[Any, List[Dict[str, Any]]]:
+    """Keep the logical request identity aligned with images eligible for transport."""
+
+    max_request, max_single = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
+    if not isinstance(user_content, list):
+        return user_content, []
+
+    admitted: List[Dict[str, Any]] = []
+    omissions: List[Dict[str, Any]] = []
+    encoded_bytes = 0
+    for raw in user_content:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("type") or "").strip().lower() != "local_image_path":
+            admitted.append(dict(raw))
+            continue
+        visual_id = str(raw.get("visual_id") or "")
+        page_no = int(raw.get("page_no") or 0)
+        path = str(raw.get("path") or "").strip()
+        try:
+            image_size = int(os.path.getsize(path))
+        except OSError:
+            image_size = 0
+        reason = ""
+        if not path or not os.path.isfile(path) or image_size <= 0:
+            reason = "missing_or_unreadable_local_image"
+        elif image_size > max_single:
+            reason = "image_exceeds_single_byte_budget"
+        else:
+            estimated = estimate_encoded_image_bytes(image_size)
+            if encoded_bytes + estimated > max_request:
+                reason = "image_exceeds_request_byte_budget"
+            else:
+                encoded_bytes += estimated
+        if reason:
+            omissions.append({"visual_id": visual_id, "page_no": page_no, "reason": reason})
+            continue
+        admitted.append(dict(raw))
+    return admitted, omissions
+
+
 def _call_ai_api_detailed_uninstrumented(
     prompt: str,
     api_config: APIConfig,
@@ -709,6 +835,8 @@ def _call_ai_api_detailed_uninstrumented(
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
     max_retries_per_call: int = 0,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
@@ -760,6 +888,8 @@ def _call_ai_api_detailed_uninstrumented(
                 user_content=user_content,
                 logger=logger,
                 capability=capability,
+                max_single_image_bytes=max_single_image_bytes,
+                max_request_image_bytes=max_request_image_bytes,
             )
             response_parser = parse_responses_response
         else:
@@ -773,6 +903,8 @@ def _call_ai_api_detailed_uninstrumented(
                 user_content=user_content,
                 logger=logger,
                 capability=capability,
+                max_single_image_bytes=max_single_image_bytes,
+                max_request_image_bytes=max_request_image_bytes,
             )
             response_parser = parse_chat_completions_response
 
@@ -977,6 +1109,8 @@ def _call_ai_api_detailed(
     timeout_seconds: Optional[int] = None,
     provider_runtime: Optional[ProviderRuntime] = None,
     provider_route: Optional[str] = None,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call the transport only after bound-runtime and complete-budget admission."""
 
@@ -994,10 +1128,15 @@ def _call_ai_api_detailed(
             return default
         return parsed if parsed > 0 else default
 
+    admitted_user_content, admission_omissions = _admit_local_images_to_budget(
+        user_content,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
     request_payload = canonical_provider_request_payload(
         prompt=prompt,
         system_prompt=system_prompt,
-        user_content=user_content,
+        user_content=admitted_user_content,
         response_format=response_format,
         max_output_tokens=int(max_tokens),
         temperature=temperature,
@@ -1067,16 +1206,24 @@ def _call_ai_api_detailed(
         temperature=temperature,
         response_format=response_format,
         logger=logger,
-        user_content=user_content,
+        user_content=admitted_user_content,
         retry_attempts=retry_attempts,
         timeout_seconds=timeout_seconds,
         max_retries_per_call=provider_runtime.budget.max_retries_per_call,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
     )
     _normalized_content, transport_report = _normalize_user_message_content_with_report(
         prompt,
-        user_content,
+        admitted_user_content,
         logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
     )
+    transport_report["omissions"] = [
+        *admission_omissions,
+        *list(transport_report.get("omissions") or []),
+    ]
     result = {
         **dict(result),
         "transport_metadata": {
@@ -1529,6 +1676,8 @@ def get_summary_from_ai_detailed(
     provider_runtime: Optional[ProviderRuntime] = None,
     system_prompt: Optional[str] = None,
     normalize_summary: bool = True,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Stage-1 reader call that preserves API failure classification."""
     if ('dummy' in (primary_api_config.get('api_key') or '') or
@@ -1651,6 +1800,8 @@ def get_summary_from_ai_detailed(
         retry_attempts=retry_attempts,
         provider_runtime=provider_runtime,
         provider_route="Backup_Reader_API" if engine_type == "backup" else "Primary_Reader_API",
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
     )
     detailed["engine_type"] = engine_type
 
@@ -1686,7 +1837,9 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                                       skip_engines: Optional[Set[str]] = None,
                                       provider_runtime: Optional[ProviderRuntime] = None,
                                       system_prompt: Optional[str] = None,
-                                      normalize_summary: bool = True) -> Optional[Dict[str, Any]]:
+                                      normalize_summary: bool = True,
+                                      max_single_image_bytes: Optional[int] = None,
+                                      max_request_image_bytes: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Stage-1 reader scheduler. Transient failures alternate engines:
     primary#1 -> backup#1 -> primary#2 -> backup#2. Quota/balance failures
@@ -1735,6 +1888,8 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                 provider_runtime=provider_runtime,
                 system_prompt=system_prompt,
                 normalize_summary=normalize_summary,
+                max_single_image_bytes=max_single_image_bytes,
+                max_request_image_bytes=max_request_image_bytes,
             )
             last_result = result
             if result.get("status") == "success":

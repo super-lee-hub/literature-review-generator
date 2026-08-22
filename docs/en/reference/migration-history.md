@@ -2,7 +2,7 @@
 
 > Audience: maintainers / AI agents.
 > This document tracks migration-era behavior and compatibility decisions.
-> Source: the archived migration-era record in [`../../../migrations/`](../../../migrations/).
+> Source: the archived migration-era evidence in [`../../archive/`](../../archive/); the complete migration record is preserved in Git history.
 
 ## Week 1 Migration Notes
 
