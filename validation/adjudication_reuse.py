@@ -25,6 +25,7 @@ from validation.llm_adjudicator import (
     _build_prompts,
 )
 from validation.run_result import VALIDATION_RUN_SCHEMA_VERSION
+from services.prompt_registry import PromptRegistry
 
 
 ADJUDICATION_REUSE_ARTIFACT_TYPE = "validation_adjudication_reuse_record"
@@ -36,6 +37,10 @@ PROVIDER_RECEIPT_LEDGER_ARTIFACT_TYPE = "provider_receipt_ledger"
 PROVIDER_RECEIPT_LEDGER_ARTIFACT_VERSION = "v1"
 PROVIDER_RECEIPT_CLOSURE_ARTIFACT_TYPE = "provider_receipt_closure"
 PROVIDER_RECEIPT_CLOSURE_ARTIFACT_VERSION = "v1"
+
+
+def _adjudication_prompt_identity() -> Any:
+    return PromptRegistry().identity("validation.adjudicator.user.v2")
 
 
 def canonical_json(value: Any) -> str:
@@ -106,10 +111,13 @@ def build_reuse_key(
     api_config: Mapping[str, Any],
     input_dependency_hashes: Mapping[str, str],
 ) -> str:
+    prompt_identity = _adjudication_prompt_identity()
     identity = {
         "packet_hash": adjudication_packet_hash(packet),
         "stage": packet.stage,
         "prompt_version": ADJUDICATION_PROMPT_VERSION,
+        "prompt_id": prompt_identity.prompt_id,
+        "prompt_sha256": prompt_identity.sha256,
         "validation_schema_version": VALIDATION_RUN_SCHEMA_VERSION,
         "redacted_provider_config_hash": hash_json(_redact_mapping(dict(api_config))),
         "current_input_dependency_hashes": {
@@ -131,6 +139,7 @@ def build_reuse_record_payload(
     input_dependency_hashes: Mapping[str, str],
 ) -> dict[str, Any]:
     prompt, _system_prompt = _build_prompts(packet)
+    prompt_identity = _adjudication_prompt_identity()
     request_payload = _request_payload(packet, api_config)
     return {
         "artifact_type": ADJUDICATION_REUSE_ARTIFACT_TYPE,
@@ -146,6 +155,8 @@ def build_reuse_record_payload(
         "call_id": adjudication_call_id(packet),
         "canonical_adjudication_packet_hash": adjudication_packet_hash(packet),
         "prompt_version": ADJUDICATION_PROMPT_VERSION,
+        "prompt_id": prompt_identity.prompt_id,
+        "prompt_sha256": prompt_identity.sha256,
         "validation_schema_version": VALIDATION_RUN_SCHEMA_VERSION,
         "provider": str(api_config.get("provider_family") or "configured"),
         "model": str(api_config.get("model") or ""),
@@ -597,6 +608,7 @@ def verify_reuse_record(
         api_config=api_config,
         input_dependency_hashes=input_dependency_hashes,
     )
+    prompt_identity = _adjudication_prompt_identity()
     expected_fields = {
         "artifact_type": ADJUDICATION_REUSE_ARTIFACT_TYPE,
         "artifact_version": ADJUDICATION_REUSE_ARTIFACT_VERSION,
@@ -610,6 +622,8 @@ def verify_reuse_record(
         "call_id": adjudication_call_id(packet),
         "canonical_adjudication_packet_hash": adjudication_packet_hash(packet),
         "prompt_version": ADJUDICATION_PROMPT_VERSION,
+        "prompt_id": prompt_identity.prompt_id,
+        "prompt_sha256": prompt_identity.sha256,
         "validation_schema_version": VALIDATION_RUN_SCHEMA_VERSION,
         "provider": str(api_config.get("provider_family") or "configured"),
         "model": str(api_config.get("model") or ""),

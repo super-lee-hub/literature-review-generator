@@ -1,0 +1,1 @@
+Return JSON only with rewritten_claim_unit. Preserve every citation token exactly. Rewrite only the targeted claim unit using the supplied source-grounded evidence; do not add facts, citations, or causal strength that the evidence does not support.

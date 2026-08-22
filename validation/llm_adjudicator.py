@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, cast
 from ai_interface import _call_ai_api
 from models import APIConfig
 from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
+from services.prompt_registry import PromptRegistry, PromptRegistryError
 
 
 SOURCE_GROUNDED_TIERS = frozenset(
@@ -172,36 +173,18 @@ def build_adjudication_packet(result: Any, *, stage: str = "primary") -> Adjudic
 
 def _build_prompts(packet: AdjudicationPacket) -> tuple[str, str]:
     packet_json = json.dumps(asdict(packet), ensure_ascii=False, indent=2)
-    stage_label = "stronger" if packet.stage == "stronger" else "primary"
-    prompt = (
-        f"You are the {stage_label} adjudication stage for a literature-review citation bundle.\n"
-        "Your job is to judge whether the cited claim bundle is supportable by the exact cited paper set.\n"
-        "Important rules:\n"
-        "- The validator judges cited claims only, not uncited bridge prose.\n"
-        "- Multiple cited papers may jointly support different sub-claims inside the same sentence.\n"
-        "- Do not require every paper to support the full sentence if the set jointly supports it.\n"
-        "- Respect checked_paper_ids and expected_supporting_paper_ids on each claim_unit_result; do not infer claim-paper mappings from pooled citations.\n"
-        "- If a claim_unit_result reason is ambiguous_claim_paper_alignment, keep it as evidence_gap or low_confidence/manual_review unless source identity is truly missing or wrong.\n"
-        "- Distinguish result, synthesis, future-direction, and limitation/method critique claims.\n"
-        "- If the evidence is still not strong enough, use an uncertainty/manual-review outcome instead of forcing unsupported.\n"
-        "- Prefer source-grounded evidence packets over summary-only hints when both are available.\n"
-        "- ai_summary packets are hints/context only and cannot by themselves justify clean source-grounded support.\n\n"
-        f"Bundle packet:\n{packet_json}"
-    )
-    if packet.stage == "stronger":
-        prompt += (
-            "\n\nThis is the stronger escalation pass. Re-evaluate carefully before leaving the item in manual review. "
-            "Only keep manual review when the packet remains genuinely uncertain after deeper reasoning."
+    registry = PromptRegistry()
+    try:
+        prompt = registry.render(
+            "validation.adjudicator.user.v2",
+            {
+                "ADJUDICATION_STAGE": packet.stage,
+                "ADJUDICATION_PACKET_JSON": packet_json,
+            },
         )
-
-    system_prompt = (
-        "Return JSON only with keys: status, confidence, repair_scope, disposition, low_confidence, reasoning, "
-        "repair_hint, summary_paper_ids, manual_review_reason, claim_type, claim_type_confidence, claim_type_rationale, adjudication_status. "
-        "status must be one of supported, partial_support, evidence_gap, unsupported, contradicted, wrong_source, low_confidence. "
-        "repair_scope must be one of none, summary, review, both, manual_review. "
-        "disposition must be one of keep_as_is, narrowed_and_kept, manual_review, fail, summary_repair, review_repair, both_repair. "
-        "adjudication_status should summarize the semantic outcome (for example supported, evidence_gap, uncertain, wrong_source, unsupported, contradicted)."
-    )
+        system_prompt = registry.read("validation.adjudicator.system.v2")
+    except PromptRegistryError as exc:
+        raise RuntimeError(f"validation prompt authority unavailable: {exc}") from exc
     return prompt, system_prompt
 
 

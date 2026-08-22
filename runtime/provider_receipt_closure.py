@@ -34,6 +34,9 @@ class ExpectedProviderCall:
     logical_attempt_identity: str = ""
     expected_call_graph_hash: str = ""
     prompt_hash: str = ""
+    prompt_id: str = ""
+    prompt_version: str = ""
+    prompt_sha256: str = ""
     input_hash: str = ""
     config_hash: str = ""
     schema_hash: str = ""
@@ -66,6 +69,9 @@ class ExpectedProviderCall:
             logical_attempt_identity=str(payload.get("logical_attempt_identity") or ""),
             expected_call_graph_hash=str(payload.get("expected_call_graph_hash") or ""),
             prompt_hash=str(payload.get("prompt_hash") or ""),
+            prompt_id=str(payload.get("prompt_id") or ""),
+            prompt_version=str(payload.get("prompt_version") or ""),
+            prompt_sha256=str(payload.get("prompt_sha256") or ""),
             input_hash=str(payload.get("input_hash") or ""),
             config_hash=str(payload.get("config_hash") or ""),
             schema_hash=str(payload.get("schema_hash") or ""),
@@ -267,6 +273,9 @@ class ProviderReceiptClosure:
                     "stage_name",
                     "node_id",
                     "prompt_hash",
+                    "prompt_id",
+                    "prompt_version",
+                    "prompt_sha256",
                     "input_hash",
                     "config_hash",
                     "schema_hash",

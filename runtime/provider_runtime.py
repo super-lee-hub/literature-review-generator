@@ -277,6 +277,9 @@ class ProviderCallReceiptV1:
     timeout_kind: str = ""
     usage_status: str = "unreported"
     test_only: bool = False
+    prompt_id: str = ""
+    prompt_version: str = ""
+    prompt_sha256: str = ""
 
     def __post_init__(self) -> None:
         if self.artifact_type != PROVIDER_RECEIPT_ARTIFACT_TYPE:
@@ -312,6 +315,11 @@ class ProviderCallReceiptV1:
             value = str(getattr(self, name) or "")
             if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
                 raise ProviderRuntimeContractError(f"{name} must be a lowercase SHA-256 hash")
+        if self.prompt_sha256 and (
+            len(self.prompt_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.prompt_sha256)
+        ):
+            raise ProviderRuntimeContractError("prompt_sha256 must be a lowercase SHA-256 hash when present")
         if self.response_hash is not None and len(self.response_hash) != 64:
             raise ProviderRuntimeContractError("response_hash must be a SHA-256 hash when present")
         if self.http_status is not None and self.http_status < 100:
@@ -363,6 +371,9 @@ class ProviderCallReceiptV1:
         logical_attempt_identity: str = "",
         endpoint_type: str = "",
         test_only: bool = False,
+        prompt_id: str = "",
+        prompt_version: str = "",
+        prompt_sha256: str = "",
     ) -> "ProviderCallReceiptV1":
         status = "success" if result.get("status") == "success" else "failed"
         candidate_error_kind = str(result.get("error_kind") or "invalid_response")
@@ -423,6 +434,9 @@ class ProviderCallReceiptV1:
             timeout_kind=str(result.get("timeout_kind") or ""),
             usage_status=str(result.get("usage_status") or ("reported" if result.get("input_tokens") is not None or result.get("output_tokens") is not None else "unreported")),
             test_only=test_only,
+            prompt_id=str(prompt_id or ""),
+            prompt_version=str(prompt_version or ""),
+            prompt_sha256=str(prompt_sha256 or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -488,6 +502,9 @@ class ProviderCallReceiptV1:
             timeout_kind=str(payload.get("timeout_kind") or ""),
             usage_status=str(payload.get("usage_status") or "unreported"),
             test_only=bool(payload.get("test_only", False)),
+            prompt_id=str(payload.get("prompt_id") or ""),
+            prompt_version=str(payload.get("prompt_version") or ""),
+            prompt_sha256=str(payload.get("prompt_sha256") or ""),
         )
 
 
@@ -608,6 +625,9 @@ class ProviderRuntime:
         logical_attempt_identity: str = "",
         endpoint_type: str = "",
         test_only: bool = False,
+        prompt_id: str = "",
+        prompt_version: str = "",
+        prompt_sha256: str = "",
     ) -> None:
         if not test_only:
             missing = [
@@ -637,6 +657,9 @@ class ProviderRuntime:
         self.call_id = call_id
         self.logical_attempt_identity = str(logical_attempt_identity or attempt_id)
         self.endpoint_type = endpoint_type
+        self.prompt_id = str(prompt_id or "")
+        self.prompt_version = str(prompt_version or "")
+        self.prompt_sha256 = str(prompt_sha256 or "")
         self.test_only = bool(test_only)
         self.schema_hash = schema_hash or hash_text("provider-runtime-default-schema-v1")
         self.closure_epoch_id = str(closure_epoch_id or "")
@@ -743,6 +766,9 @@ class ProviderRuntime:
             logical_attempt_identity=self.logical_attempt_identity,
             endpoint_type=str(result.get("endpoint_type") or self.endpoint_type),
             test_only=self.test_only,
+            prompt_id=self.prompt_id,
+            prompt_version=self.prompt_version,
+            prompt_sha256=self.prompt_sha256,
         )
         with self._lock:
             if self.ledger is not None:

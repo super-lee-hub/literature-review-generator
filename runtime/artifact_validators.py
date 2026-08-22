@@ -93,6 +93,8 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "free_mode_intent_input",
         "free_mode_review_intent_projection",
         "validation_adjudication_reuse_record",
+        "stage1_visual_observations",
+        "stage1_visual_coverage",
     }
 )
 
@@ -507,6 +509,9 @@ def _validate_provider_expected_call_graph(record: Any, _path: str | Path, root:
                 "stage_name",
                 "node_id",
                 "prompt_hash",
+                "prompt_id",
+                "prompt_version",
+                "prompt_sha256",
                 "input_hash",
                 "config_hash",
                 "schema_hash",
@@ -1420,7 +1425,6 @@ def _validate_validation_adjudication_reuse_record(
             "citation_set_key",
             "stage",
             "canonical_adjudication_packet_hash",
-            "prompt_version",
             "validation_schema_version",
             "provider",
             "model",
@@ -1428,6 +1432,9 @@ def _validate_validation_adjudication_reuse_record(
             "redacted_provider_config_hash",
             "call_id",
             "prompt_hash",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
             "input_hash",
             "schema_hash",
             "provider_output_artifact_id",
@@ -1446,6 +1453,64 @@ def _validate_validation_adjudication_reuse_record(
         raise ArtifactSchemaError("validation_adjudication_reuse_record.stage is invalid")
     if not isinstance(root.get("current_input_dependency_hashes"), Mapping):
         raise ArtifactSchemaError("validation_adjudication_reuse_record input dependency hashes must be an object")
+
+
+def _validate_stage1_visual_observations(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_observations",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "batch_index",
+            "call_id",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "visual_ids",
+            "status",
+            "observations",
+        ),
+        "stage1_visual_observations",
+    )
+    if not isinstance(root.get("visual_ids"), list) or not isinstance(root.get("observations"), list):
+        raise ArtifactSchemaError("stage1_visual_observations visual_ids and observations must be arrays")
+    if str(root.get("status") or "") not in {"success", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_observations.status is invalid")
+
+
+def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_coverage",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "total_pdf_pages",
+            "nonblank_pages",
+            "rendered_pages",
+            "visually_scanned_pages",
+            "page_status",
+            "scan_batches",
+            "coverage_status",
+            "omissions",
+        ),
+        "stage1_visual_coverage",
+    )
+    if str(root.get("coverage_status") or "") not in {"complete", "partial", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_coverage.coverage_status is invalid")
+    if not isinstance(root.get("page_status"), list) or not isinstance(root.get("scan_batches"), list):
+        raise ArtifactSchemaError("stage1_visual_coverage page_status and scan_batches must be arrays")
 
 
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
@@ -1491,6 +1556,8 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("free_mode_intent_input", "v1"): _validate_free_mode_intent_input,
         ("free_mode_review_intent_projection", "v1"): _validate_free_mode_review_intent_projection,
         ("validation_adjudication_reuse_record", "v1"): _validate_validation_adjudication_reuse_record,
+        ("stage1_visual_observations", "v1"): _validate_stage1_visual_observations,
+        ("stage1_visual_coverage", "v1"): _validate_stage1_visual_coverage,
     }
     validator = validators.get((artifact_type, version))
     if validator is None:

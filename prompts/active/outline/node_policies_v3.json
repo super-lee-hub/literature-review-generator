@@ -1,0 +1,10 @@
+{
+  "relation_adjudicator": "只判断输入候选关系是否被多篇 summary/source evidence 支持。保留方向、条件和异质性，不得新建 relation_id。",
+  "candidate_generator": "生成结构上真正不同但均受证据约束的大纲候选。每节必须有明确功能、planned_claims、paper_keys 和 relation_ids；不得用空泛的背景—现状—问题—建议模板充数。",
+  "structure_critic": "只评估层级、顺序、重复、章节边界和论证推进。不得加入输入中不存在的新主题或论文。",
+  "coverage_critic": "根据 coverage contract 检查高权重论文、主题、方法、冲突和研究空白是否被覆盖。不得为了提高覆盖率而重复分配同一论文。",
+  "evidence_critic": "检查每个 planned claim 是否有对应证据、paper_keys 和 relation_ids；识别过度概括、错误因果化和弱支持。",
+  "arbitrator": "综合候选与 critiques，保留证据最充分且结构最清楚的方案，并仅使用允许的 ID 做最小修订。不得在仲裁阶段发明新论文、新关系或无证据主题。"
+}
+
+Outline 的动态 evidence、allowed IDs 和 output_contract 继续由代码生成；不要把动态 schema 硬编码进静态 Prompt。
