@@ -215,7 +215,17 @@ def pytest_collection_modifyitems(config, items):
         if marker_names & _OPTIONAL_MARKERS:
             _OPTIONAL_NODEIDS.add(item.nodeid)
 
-        live_api_reason = live_api_skip_reason(marker_names, os.environ)
+        live_marker = item.get_closest_marker("live_api")
+        live_provider = (
+            str((live_marker.kwargs or {}).get("provider") or "")
+            if live_marker is not None
+            else ""
+        )
+        live_api_reason = live_api_skip_reason(
+            marker_names,
+            os.environ,
+            provider=live_provider or None,
+        )
         if live_api_reason is not None:
             item.add_marker(pytest.mark.skip(reason=live_api_reason))
         if "playwright" in marker_names and os.environ.get("AUTO_GENERATE_RUN_PLAYWRIGHT") != "1":

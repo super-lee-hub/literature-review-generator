@@ -9,6 +9,7 @@ from services.stage1_visual_scan import (
     build_visual_scan_prompt,
     plan_visual_scan_batches,
     select_final_visual_refs_after_scan,
+    validate_current_visual_observations_v2,
     validate_visual_observations,
 )
 
@@ -516,3 +517,222 @@ def test_visual_scan_prompt_carries_child_metadata_without_sending_child_images(
     assert "table-025-a" in user_prompt
     assert "stage1_visual_scan.system.v2" not in system_prompt
     assert '"candidate_attribution_status"' in system_prompt
+
+
+@pytest.mark.parametrize(
+    ("evidence_kinds", "observation_updates"),
+    [
+        (["visible_text"], {"visible_text": ["tiny label"]}),
+        (["manual_review"], {"needs_manual_review": True}),
+        (["visible_text"], {"confidence": "low", "visible_text": ["unreadable detail"]}),
+    ],
+)
+def test_v2_explicit_attribution_is_admitted_without_legacy_evidence_strength(
+    evidence_kinds: list[str],
+    observation_updates: dict[str, object],
+) -> None:
+    page = {**_refs(1)[0], "visual_id": "page-026", "page_no": 26}
+    child = _child_ref(
+        "figure-026-a",
+        26,
+        "figure_crop",
+        selection_score=0.1,
+        bbox=[0, 0, 40, 40],
+    )
+    observation = _v2_observation(
+        "page-026",
+        26,
+        status="resolved",
+        candidates=[_candidate_attribution("figure-026-a", evidence_kinds=evidence_kinds)],
+    )
+    for key in (
+        "axes_or_headers",
+        "quantitative_values",
+        "relationships",
+        "layout_observations",
+        "ocr_conflicts",
+    ):
+        observation[key] = []
+    observation.update(observation_updates)
+    batch = plan_visual_scan_batches([page], candidate_refs=[child], batch_size=1)[0]
+    normalized = validate_current_visual_observations_v2(
+        {
+            "artifact_type": "stage1_visual_observations",
+            "artifact_version": "v2",
+            "observations": [observation],
+        },
+        allowed_visual_ids=batch.visual_ids,
+        expected_visual_refs=batch.visual_refs,
+        sent_visual_ids=batch.visual_ids,
+        candidate_refs=batch.child_candidates,
+    )
+    selected = select_final_visual_refs_after_scan(
+        [page, child], normalized["observations"], max_refs=1
+    )
+    assert [item["visual_id"] for item in selected] == ["figure-026-a"]
+
+
+def test_current_v2_validator_rejects_legacy_v1_payload() -> None:
+    page = _refs(1)[0]
+    with pytest.raises(ValueError, match="artifact_version"):
+        validate_current_visual_observations_v2(
+            {
+                "artifact_type": "stage1_visual_observations",
+                "artifact_version": "v1",
+                "observations": [_observation("page-001", 1)],
+            },
+            allowed_visual_ids=["page-001"],
+            expected_visual_refs=[page],
+            sent_visual_ids=["page-001"],
+        )
+
+
+def test_ambiguous_overlapping_same_dedupe_group_is_atomic() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-027", "page_no": 27}
+    child_a = _child_ref(
+        "figure-027-a", 27, "figure_crop", selection_score=1.0, bbox=[0, 0, 100, 100]
+    )
+    child_b = _child_ref(
+        "figure-027-b", 27, "figure_crop", selection_score=0.9, bbox=[5, 5, 95, 95]
+    )
+    child_a["dedupe_group_id"] = child_b["dedupe_group_id"] = "same-group"
+    batch = plan_visual_scan_batches([page], candidate_refs=[child_a, child_b], batch_size=1)[0]
+    normalized = validate_current_visual_observations_v2(
+        {
+            "artifact_type": "stage1_visual_observations",
+            "artifact_version": "v2",
+            "observations": [
+                _v2_observation(
+                    "page-027",
+                    27,
+                    status="ambiguous",
+                    candidates=[
+                        _candidate_attribution("figure-027-a"),
+                        _candidate_attribution("figure-027-b"),
+                    ],
+                )
+            ],
+        },
+        allowed_visual_ids=batch.visual_ids,
+        expected_visual_refs=batch.visual_refs,
+        sent_visual_ids=batch.visual_ids,
+        candidate_refs=batch.child_candidates,
+    )
+    selected = select_final_visual_refs_after_scan(
+        [page, child_a, child_b], normalized["observations"], max_refs=2
+    )
+    assert [item["visual_id"] for item in selected] == [
+        "figure-027-a",
+        "figure-027-b",
+    ]
+    assert {item["raw_reinspection_resolution"] for item in selected} == {"all_children"}
+    assert all(
+        item["ambiguous_candidate_ids"] == ["figure-027-a", "figure-027-b"]
+        for item in selected
+    )
+
+
+def test_ambiguous_group_falls_back_atomically_when_encoded_bytes_do_not_fit() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-028", "page_no": 28, "image_bytes": 1}
+    child_a = _child_ref(
+        "table-028-a", 28, "table_crop", selection_score=1.0, bbox=[0, 0, 40, 40]
+    )
+    child_b = _child_ref(
+        "table-028-b", 28, "table_crop", selection_score=0.9, bbox=[50, 50, 90, 90]
+    )
+    child_a["image_bytes"] = child_b["image_bytes"] = 20_000_000
+    batch = plan_visual_scan_batches([page], candidate_refs=[child_a, child_b], batch_size=1)[0]
+    normalized = validate_current_visual_observations_v2(
+        {
+            "artifact_type": "stage1_visual_observations",
+            "artifact_version": "v2",
+            "observations": [
+                _v2_observation(
+                    "page-028",
+                    28,
+                    status="ambiguous",
+                    candidates=[
+                        _candidate_attribution("table-028-a"),
+                        _candidate_attribution("table-028-b"),
+                    ],
+                )
+            ],
+        },
+        allowed_visual_ids=batch.visual_ids,
+        expected_visual_refs=batch.visual_refs,
+        sent_visual_ids=batch.visual_ids,
+        candidate_refs=batch.child_candidates,
+    )
+    selected = select_final_visual_refs_after_scan(
+        [page, child_a, child_b],
+        normalized["observations"],
+        max_refs=2,
+        max_request_image_bytes=30_000_000,
+        max_single_image_bytes=25_000_000,
+    )
+    assert [item["visual_id"] for item in selected] == ["page-028"]
+    assert selected[0]["raw_reinspection_resolution"] == "page_snapshot_fallback"
+    assert selected[0]["raw_reinspection_fallback_reason"] == (
+        "ambiguous_group_exceeds_request_byte_budget"
+    )
+    assert selected[0]["raw_reinspection_selected_ids"] == ["page-028"]
+
+
+@pytest.mark.parametrize(
+    ("mutator", "reason"),
+    [
+        (
+            lambda child: child.update({"image_bytes": 26_000_000}),
+            "ambiguous_child_exceeds_single_image_byte_budget",
+        ),
+        (
+            lambda child: child.update({"image_path": "missing-child.png", "image_bytes": 0}),
+            "ambiguous_child_unavailable",
+        ),
+    ],
+)
+def test_ambiguous_group_falls_back_atomically_for_unsafe_child(
+    mutator: object,
+    reason: str,
+) -> None:
+    page = {**_refs(1)[0], "visual_id": "page-029", "page_no": 29, "image_bytes": 1}
+    child_a = _child_ref(
+        "figure-029-a", 29, "figure_crop", selection_score=1.0, bbox=[0, 0, 40, 40]
+    )
+    child_b = _child_ref(
+        "figure-029-b", 29, "figure_crop", selection_score=0.9, bbox=[50, 50, 90, 90]
+    )
+    child_a["image_bytes"] = child_b["image_bytes"] = 100
+    mutator(child_b)  # type: ignore[operator]
+    batch = plan_visual_scan_batches([page], candidate_refs=[child_a, child_b], batch_size=1)[0]
+    normalized = validate_current_visual_observations_v2(
+        {
+            "artifact_type": "stage1_visual_observations",
+            "artifact_version": "v2",
+            "observations": [
+                _v2_observation(
+                    "page-029",
+                    29,
+                    status="ambiguous",
+                    candidates=[
+                        _candidate_attribution("figure-029-a"),
+                        _candidate_attribution("figure-029-b"),
+                    ],
+                )
+            ],
+        },
+        allowed_visual_ids=batch.visual_ids,
+        expected_visual_refs=batch.visual_refs,
+        sent_visual_ids=batch.visual_ids,
+        candidate_refs=batch.child_candidates,
+    )
+    selected = select_final_visual_refs_after_scan(
+        [page, child_a, child_b],
+        normalized["observations"],
+        max_refs=2,
+        max_request_image_bytes=30_000_000,
+        max_single_image_bytes=25_000_000,
+    )
+    assert [item["visual_id"] for item in selected] == ["page-029"]
+    assert selected[0]["raw_reinspection_resolution"] == "page_snapshot_fallback"
+    assert selected[0]["raw_reinspection_fallback_reason"] == reason

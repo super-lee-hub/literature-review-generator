@@ -59,6 +59,24 @@ def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
     normalized["source_page_visual_id"] = visual.get("source_page_visual_id") or ""
     normalized["source_observation_visual_id"] = visual.get("source_observation_visual_id") or ""
     normalized["dedupe_group_id"] = visual.get("dedupe_group_id") or ""
+    normalized["raw_reinspection_group_id"] = visual.get("raw_reinspection_group_id") or ""
+    normalized["ambiguous_candidate_ids"] = [
+        str(item)
+        for item in (visual.get("ambiguous_candidate_ids") or [])
+        if str(item)
+    ]
+    normalized["raw_reinspection_resolution"] = visual.get("raw_reinspection_resolution") or ""
+    normalized["raw_reinspection_selected_ids"] = [
+        str(item)
+        for item in (visual.get("raw_reinspection_selected_ids") or [])
+        if str(item)
+    ]
+    normalized["raw_reinspection_fallback_reason"] = (
+        visual.get("raw_reinspection_fallback_reason") or ""
+    )
+    normalized["raw_reinspection_atomic"] = bool(
+        visual.get("raw_reinspection_atomic")
+    )
     for field_name in (
         "width", "height", "render_scale", "estimated_dpi", "image_format",
         "image_bytes", "image_sha256",

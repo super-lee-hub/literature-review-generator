@@ -16,6 +16,7 @@ from services.stage1_visual_scan import (
     estimate_encoded_image_bytes,
     normalize_visual_byte_budgets,
     plan_visual_scan_batches,
+    summarize_raw_reinspection_groups,
 )
 from services.visual_artifact_resolver import normalize_visual_artifact
 
@@ -239,6 +240,9 @@ class Stage1InputBuilder:
                 max_single_bytes=max_single_image_bytes,
                 required=[],
             )
+        visual_coverage.update(
+            summarize_raw_reinspection_groups(selected_visual_refs)
+        )
         planned_batches = plan_visual_scan_batches(
             page_refs,
             candidate_refs=all_visual_refs,
@@ -468,13 +472,56 @@ class Stage1InputBuilder:
         required_ids = {str(item.get("visual_id") or "") for item in required}
         selected: List[Dict[str, Any]] = []
         total = 0
-        for item in refs:
-            visual_id = str(item.get("visual_id") or "")
+        processed_group_keys: set[tuple[str, str]] = set()
+
+        def _size(item: Mapping[str, Any]) -> int:
             image_path = str(item.get("image_path") or "")
             try:
-                size = int(item.get("image_bytes") or os.path.getsize(image_path))
+                return int(item.get("image_bytes") or os.path.getsize(image_path))
             except OSError:
-                size = 0
+                return 0
+
+        def _encoded(item: Mapping[str, Any]) -> int:
+            return estimate_encoded_image_bytes(_size(item))
+
+        for item in refs:
+            group_id = str(item.get("raw_reinspection_group_id") or "").strip()
+            resolution = str(item.get("raw_reinspection_resolution") or "").strip()
+            group_key = (group_id, resolution) if group_id and resolution else None
+            if group_key is not None:
+                if group_key in processed_group_keys:
+                    continue
+                processed_group_keys.add(group_key)
+                group_items = [
+                    candidate
+                    for candidate in refs
+                    if (
+                        str(candidate.get("raw_reinspection_group_id") or "").strip(),
+                        str(candidate.get("raw_reinspection_resolution") or "").strip(),
+                    ) == group_key
+                ]
+                if resolution == "all_children":
+                    group_unsafe = any(
+                        not str(candidate.get("image_path") or "").strip()
+                        or not os.path.isfile(str(candidate.get("image_path") or "").strip())
+                        or _size(candidate) <= 0
+                        or _size(candidate) > max_single_bytes
+                        for candidate in group_items
+                    )
+                    group_cost = sum(_encoded(candidate) for candidate in group_items)
+                    if group_unsafe or total + group_cost > max_bytes:
+                        continue
+                    selected.extend(dict(candidate) for candidate in group_items)
+                    total += group_cost
+                    continue
+
+                # A page-snapshot fallback is itself one atomic resolution;
+                # never reintroduce any of the child members here.
+                if len(group_items) != 1:
+                    continue
+                item = group_items[0]
+            visual_id = str(item.get("visual_id") or "")
+            size = _size(item)
             if size > max_single_bytes and visual_id not in required_ids:
                 continue
             encoded_size = estimate_encoded_image_bytes(size)

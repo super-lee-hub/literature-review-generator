@@ -17,20 +17,33 @@ class OfflineNetworkError(OSError):
 
 _LIVE_API_CREDENTIAL_ENV_NAMES = (
     "AUTO_GENERATE_LIVE_API_KEY",
-    "OPENAI_API_KEY",
     "DEEPSEEK_API_KEY",
+    "AUTO_GENERATE_DEEPSEEK_API_KEY",
 )
+
+_PROVIDER_CREDENTIAL_ENV_NAMES = {
+    "deepseek": ("DEEPSEEK_API_KEY", "AUTO_GENERATE_DEEPSEEK_API_KEY"),
+}
 
 
 def live_api_skip_reason(
     marker_names: Collection[str],
     environment: Mapping[str, str],
+    *,
+    provider: str | None = None,
 ) -> str | None:
     if "live_api" not in marker_names:
         return None
     if environment.get("AUTO_GENERATE_RUN_LIVE_API") != "1":
         return "live API test not explicitly enabled"
-    if not any(environment.get(name) for name in _LIVE_API_CREDENTIAL_ENV_NAMES):
+    provider_name = str(provider or "").strip().casefold()
+    credential_names = _PROVIDER_CREDENTIAL_ENV_NAMES.get(
+        provider_name,
+        _LIVE_API_CREDENTIAL_ENV_NAMES,
+    )
+    if not any(environment.get(name) for name in credential_names):
+        if provider_name:
+            return f"{provider_name} live API credential is not configured"
         return "live API credential is not configured"
     return None
 

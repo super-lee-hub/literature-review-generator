@@ -563,6 +563,54 @@ def _validate_visual_observations_v2(
     }
 
 
+def validate_legacy_visual_observations_v1(
+    payload: Mapping[str, Any],
+    *,
+    allowed_visual_ids: Sequence[str],
+    expected_visual_refs: Sequence[Mapping[str, Any]] | None = None,
+    sent_visual_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Validate the historical v1 observation contract only."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("visual observation payload must be an object")
+    if payload.get("artifact_type") != VISUAL_OBSERVATIONS_ARTIFACT_TYPE:
+        raise ValueError("visual observation artifact_type is invalid")
+    if payload.get("artifact_version") != "v1":
+        raise ValueError("visual observation artifact_version is invalid")
+    return _validate_visual_observations_v1(
+        payload,
+        allowed_visual_ids=allowed_visual_ids,
+        expected_visual_refs=expected_visual_refs,
+        sent_visual_ids=sent_visual_ids,
+    )
+
+
+def validate_current_visual_observations_v2(
+    payload: Mapping[str, Any],
+    *,
+    allowed_visual_ids: Sequence[str],
+    expected_visual_refs: Sequence[Mapping[str, Any]] | None = None,
+    sent_visual_ids: Sequence[str] | None = None,
+    candidate_refs: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Validate the current v2 observation contract only."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("visual observation payload must be an object")
+    if payload.get("artifact_type") != VISUAL_OBSERVATIONS_ARTIFACT_TYPE:
+        raise ValueError("visual observation artifact_type is invalid")
+    if payload.get("artifact_version") != VISUAL_OBSERVATIONS_VERSION:
+        raise ValueError("visual observation artifact_version is invalid")
+    return _validate_visual_observations_v2(
+        payload,
+        allowed_visual_ids=allowed_visual_ids,
+        expected_visual_refs=expected_visual_refs,
+        sent_visual_ids=sent_visual_ids,
+        candidate_refs=candidate_refs,
+    )
+
+
 def validate_visual_observations(
     payload: Mapping[str, Any],
     *,
@@ -571,7 +619,7 @@ def validate_visual_observations(
     sent_visual_ids: Sequence[str] | None = None,
     candidate_refs: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Validate current v2 observations while retaining an explicit v1 reader."""
+    """Compatibility dispatcher; production callers must use a versioned API."""
 
     if not isinstance(payload, Mapping):
         raise ValueError("visual observation payload must be an object")
@@ -579,14 +627,14 @@ def validate_visual_observations(
         raise ValueError("visual observation artifact_type is invalid")
     version = str(payload.get("artifact_version") or "")
     if version == "v1":
-        return _validate_visual_observations_v1(
+        return validate_legacy_visual_observations_v1(
             payload,
             allowed_visual_ids=allowed_visual_ids,
             expected_visual_refs=expected_visual_refs,
             sent_visual_ids=sent_visual_ids,
         )
     if version == VISUAL_OBSERVATIONS_VERSION:
-        return _validate_visual_observations_v2(
+        return validate_current_visual_observations_v2(
             payload,
             allowed_visual_ids=allowed_visual_ids,
             expected_visual_refs=expected_visual_refs,
@@ -601,6 +649,8 @@ def select_final_visual_refs_after_scan(
     observations: Sequence[Mapping[str, Any]],
     *,
     max_refs: int = 8,
+    max_request_image_bytes: Any = DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+    max_single_image_bytes: Any = DEFAULT_MAX_SINGLE_IMAGE_BYTES,
 ) -> list[dict[str, Any]]:
     """Select raw crops/pages after scan evidence exists, deterministically.
 
@@ -615,6 +665,10 @@ def select_final_visual_refs_after_scan(
     limit = max(0, int(max_refs))
     if limit == 0:
         return []
+    request_limit, single_limit = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
     by_id = {
         str(item.get("visual_id") or ""): dict(item)
         for item in observations
@@ -664,6 +718,17 @@ def select_final_visual_refs_after_scan(
         if str(observation.get("candidate_attribution_status") or "").strip().casefold() == "ambiguous"
         and len(page_attributions_by_page.get(page_no, {})) >= 2
     }
+
+    def _encoded_cost(ref: Mapping[str, Any]) -> int:
+        return estimate_encoded_image_bytes(_image_bytes(ref))
+
+    def _ambiguous_child_failure_reason(ref: Mapping[str, Any]) -> str:
+        path = str(ref.get("image_path") or "").strip()
+        if not path or not os.path.isfile(path) or _image_bytes(ref) <= 0:
+            return "ambiguous_child_unavailable"
+        if _image_bytes(ref) > single_limit:
+            return "ambiguous_child_exceeds_single_image_byte_budget"
+        return ""
 
     def _items(observation: Mapping[str, Any], field: str) -> list[str]:
         value = observation.get(field)
@@ -878,7 +943,10 @@ def select_final_visual_refs_after_scan(
                     "layout_observations", "ocr_conflicts", "artifact_type_match",
                 )
             )
-            if evidence_strength <= 0.0:
+            explicit_v2_attribution = bool(
+                attribution is not None and is_v2_page_observation
+            )
+            if not explicit_v2_attribution and evidence_strength <= 0.0:
                 continue
         selected_ref = dict(ref)
         source_page_visual_id = str(
@@ -930,32 +998,142 @@ def select_final_visual_refs_after_scan(
         )
         candidates.append((-score, page_no, visual_id, selected_ref))
     candidates.sort(key=lambda item: item[:3])
+    candidates_by_id = {
+        str(item.get("visual_id") or ""): item
+        for _score_value, _page_no, _visual_id, item in candidates
+        if str(item.get("visual_id") or "")
+    }
     selected: list[dict[str, Any]] = []
     seen_groups: set[str] = set()
     ambiguous_fallback_pages: set[int] = set()
     ambiguous_reserved_pages: set[int] = set()
+    ambiguous_group_plans: dict[int, dict[str, Any]] = {}
+    selected_encoded_bytes = 0
+
+    def _plan_ambiguous_page(page_no: int) -> dict[str, Any]:
+        existing = ambiguous_group_plans.get(page_no)
+        if existing is not None:
+            return existing
+        candidate_ids = list(page_attributions_by_page.get(page_no, {}))
+        child_refs = [
+            candidates_by_id[candidate_id]
+            for candidate_id in candidate_ids
+            if candidate_id in candidates_by_id
+            and str(candidates_by_id[candidate_id].get("artifact_type") or "")
+            != "page_snapshot"
+        ]
+        reason = ""
+        if len(child_refs) != len(candidate_ids):
+            reason = "ambiguous_child_unavailable"
+        else:
+            for child_ref in child_refs:
+                reason = _ambiguous_child_failure_reason(child_ref)
+                if reason:
+                    break
+        group_cost = sum(_encoded_cost(child_ref) for child_ref in child_refs)
+        if not reason and len(candidate_ids) > (limit - len(selected)):
+            reason = "ambiguous_group_exceeds_ref_count_budget"
+        if not reason and group_cost > (request_limit - selected_encoded_bytes):
+            reason = "ambiguous_group_exceeds_request_byte_budget"
+        plan = {
+            "page_no": page_no,
+            "ambiguous_candidate_ids": candidate_ids,
+            "resolution": "all_children" if not reason else "page_snapshot_fallback",
+            "fallback_reason": reason,
+            "child_refs": child_refs,
+            "group_cost": group_cost,
+            "group_id": f"ambiguous-page-{page_no}",
+        }
+        ambiguous_group_plans[page_no] = plan
+        return plan
+
+    def _apply_ambiguous_metadata(
+        ref: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        *,
+        selected_ids: Sequence[str],
+    ) -> dict[str, Any]:
+        result = dict(ref)
+        result.update(
+            {
+                "raw_reinspection_group_id": str(plan.get("group_id") or ""),
+                "ambiguous_candidate_ids": list(plan.get("ambiguous_candidate_ids") or []),
+                "raw_reinspection_resolution": str(plan.get("resolution") or ""),
+                "raw_reinspection_selected_ids": [str(item) for item in selected_ids if str(item)],
+                "raw_reinspection_fallback_reason": str(plan.get("fallback_reason") or ""),
+                "raw_reinspection_atomic": True,
+            }
+        )
+        return result
+
     for _neg_score, _page_no, _visual_id, ref in candidates:
         page_no = int(ref.get("page_no") or 0)
         artifact_type = str(ref.get("artifact_type") or "page_snapshot")
+        ambiguous_plan = (
+            _plan_ambiguous_page(page_no)
+            if page_no in ambiguous_pages
+            else None
+        )
         if page_no in ambiguous_pages:
-            candidate_ids = set(page_attributions_by_page.get(page_no, {}))
+            if ambiguous_plan is None:
+                # The branch is guarded by ``ambiguous_pages`` above, but keep
+                # the production reducer safe if that invariant changes.
+                continue
+            candidate_ids = [
+                str(item)
+                for item in (ambiguous_plan.get("ambiguous_candidate_ids") or [])
+                if str(item)
+            ]
             if artifact_type != "page_snapshot":
-                if page_no not in ambiguous_reserved_pages and page_no not in ambiguous_fallback_pages:
-                    remaining = limit - len(selected)
-                    if len(candidate_ids) > remaining:
-                        ambiguous_fallback_pages.add(page_no)
-                    else:
-                        ambiguous_reserved_pages.add(page_no)
-                if page_no in ambiguous_fallback_pages:
+                if str(ambiguous_plan.get("resolution") or "") != "all_children":
+                    ambiguous_fallback_pages.add(page_no)
                     continue
+                if page_no in ambiguous_reserved_pages:
+                    continue
+                ambiguous_reserved_pages.add(page_no)
+                group_items = [
+                    _apply_ambiguous_metadata(
+                        candidates_by_id[candidate_id],
+                        ambiguous_plan,
+                        selected_ids=candidate_ids,
+                    )
+                    for candidate_id in ambiguous_plan.get("ambiguous_candidate_ids") or []
+                    if candidate_id in candidates_by_id
+                ]
+                if len(group_items) != len(candidate_ids):
+                    # The plan was conservative, but retain the fail-closed
+                    # invariant if the candidate map changes during reduction.
+                    ambiguous_reserved_pages.discard(page_no)
+                    ambiguous_fallback_pages.add(page_no)
+                    ambiguous_plan = {
+                        **ambiguous_plan,
+                        "resolution": "page_snapshot_fallback",
+                        "fallback_reason": "ambiguous_child_unavailable",
+                    }
+                    continue
+                selected.extend(group_items)
+                selected_encoded_bytes += int(ambiguous_plan.get("group_cost") or 0)
+                for group_item in group_items:
+                    group = str(group_item.get("dedupe_group_id") or "")
+                    if group:
+                        seen_groups.add(group)
+                if len(selected) >= limit:
+                    break
+                continue
             elif page_no in ambiguous_reserved_pages:
                 # The explicitly attributed child set is the higher-detail
                 # representation when the full ambiguous set fits the budget.
                 continue
             elif page_no in ambiguous_fallback_pages:
+                ref = dict(ref)
                 ref["selection_reason"] = (
                     str(ref.get("selection_reason") or "").rstrip("; ")
                     + "; ambiguous attribution; page snapshot safe fallback"
+                )
+                ref = _apply_ambiguous_metadata(
+                    ref,
+                    ambiguous_plan,
+                    selected_ids=[str(ref.get("visual_id") or "")],
                 )
                 ref["object_attribution_reason"] = (
                     "ambiguous child attribution did not fit the raw-image budget; "
@@ -964,7 +1142,7 @@ def select_final_visual_refs_after_scan(
         group = str(ref.get("dedupe_group_id") or "")
         if group and group in seen_groups and page_no not in ambiguous_reserved_pages:
             continue
-        if artifact_type != "page_snapshot":
+        if artifact_type != "page_snapshot" and page_no not in ambiguous_reserved_pages:
             if any(
                 str(item.get("artifact_type") or "") != "page_snapshot"
                 and int(item.get("page_no") or 0) == page_no
@@ -981,12 +1159,131 @@ def select_final_visual_refs_after_scan(
             # A substantive crop is a better representation of the same page
             # than a low-resolution full-page duplicate.
             continue
+        encoded_cost = _encoded_cost(ref)
+        raw_bytes = _image_bytes(ref)
+        if artifact_type != "page_snapshot" and raw_bytes > single_limit:
+            continue
+        if selected_encoded_bytes + encoded_cost > request_limit:
+            continue
         selected.append(ref)
+        selected_encoded_bytes += encoded_cost
         if group:
             seen_groups.add(group)
         if len(selected) >= limit:
             break
     return selected
+
+
+def summarize_raw_reinspection_groups(
+    visual_refs: Sequence[Mapping[str, Any]],
+    *,
+    sent_visual_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Summarize planned/selected/sent state for atomic ambiguous groups."""
+
+    sent_ids = (
+        {str(item) for item in sent_visual_ids if str(item)}
+        if sent_visual_ids is not None
+        else None
+    )
+    groups: dict[str, dict[str, Any]] = {}
+    for ref in visual_refs:
+        if not isinstance(ref, Mapping):
+            continue
+        group_id = str(ref.get("raw_reinspection_group_id") or "").strip()
+        candidate_ids = [
+            str(item)
+            for item in (ref.get("ambiguous_candidate_ids") or [])
+            if str(item)
+        ]
+        if not group_id or not candidate_ids:
+            continue
+        selected_ids = [
+            str(item)
+            for item in (ref.get("raw_reinspection_selected_ids") or [])
+            if str(item)
+        ]
+        entry = groups.setdefault(
+            group_id,
+            {
+                "group_id": group_id,
+                "page_no": int(ref.get("page_no") or 0),
+                "ambiguous_candidate_ids": candidate_ids,
+                "raw_reinspection_resolution": str(
+                    ref.get("raw_reinspection_resolution") or ""
+                ),
+                "raw_reinspection_fallback_reason": str(
+                    ref.get("raw_reinspection_fallback_reason") or ""
+                ),
+                "planned_selected_ids": [],
+            },
+        )
+        for item in selected_ids:
+            if item not in entry["planned_selected_ids"]:
+                entry["planned_selected_ids"].append(item)
+    normalized_groups: list[dict[str, Any]] = []
+    for entry in sorted(groups.values(), key=lambda item: (int(item["page_no"]), str(item["group_id"]))):
+        candidate_order = list(entry["ambiguous_candidate_ids"])
+        planned_ids = [
+            item
+            for item in candidate_order
+            if item in entry["planned_selected_ids"]
+        ] + [
+            item
+            for item in entry["planned_selected_ids"]
+            if item not in candidate_order
+        ]
+        actual_ids = (
+            [item for item in planned_ids if item in sent_ids]
+            if sent_ids is not None
+            else planned_ids
+        )
+        resolution = str(entry["raw_reinspection_resolution"] or "")
+        child_ids = list(entry["ambiguous_candidate_ids"])
+        child_complete = resolution == "all_children" and all(
+            item in actual_ids for item in child_ids
+        )
+        entry = {
+            **entry,
+            "raw_reinspection_selected_ids": actual_ids,
+            "raw_reinspection_transport_status": (
+                "complete" if child_complete or (
+                    resolution == "page_snapshot_fallback" and actual_ids
+                ) else "partial" if actual_ids else "not_sent"
+            ),
+            "child_reinspection_complete": child_complete,
+        }
+        normalized_groups.append(entry)
+    candidate_ids: list[str] = []
+    selected_ids: list[str] = []
+    resolutions: list[str] = []
+    fallback_reasons: list[str] = []
+    for group in normalized_groups:
+        for item in group["ambiguous_candidate_ids"]:
+            if item not in candidate_ids:
+                candidate_ids.append(item)
+        for item in group["raw_reinspection_selected_ids"]:
+            if item not in selected_ids:
+                selected_ids.append(item)
+        resolution = str(group.get("raw_reinspection_resolution") or "")
+        if resolution and resolution not in resolutions:
+            resolutions.append(resolution)
+        reason = str(group.get("raw_reinspection_fallback_reason") or "")
+        if reason and reason not in fallback_reasons:
+            fallback_reasons.append(reason)
+    return {
+        "raw_reinspection_groups": normalized_groups,
+        "ambiguous_candidate_ids": candidate_ids,
+        "raw_reinspection_resolution": (
+            resolutions[0] if len(resolutions) == 1 else "mixed" if resolutions else ""
+        ),
+        "raw_reinspection_selected_ids": selected_ids,
+        "raw_reinspection_fallback_reason": (
+            fallback_reasons[0]
+            if len(fallback_reasons) == 1
+            else ";".join(fallback_reasons)
+        ),
+    }
 
 
 def build_visual_scan_prompt(batch: VisualScanBatch, *, ocr_by_visual_id: Mapping[str, str] | None = None) -> tuple[str, str]:
@@ -1033,5 +1330,7 @@ __all__ = [
     "VISUAL_OBSERVATIONS_ARTIFACT_TYPE", "VISUAL_OBSERVATIONS_VERSION", "VISUAL_SCAN_PROMPT_ID",
     "VisualScanBatch", "build_visual_scan_prompt", "build_visual_scan_user_content",
     "estimate_encoded_image_bytes", "normalize_visual_byte_budgets", "plan_visual_scan_batches", "select_final_visual_refs_after_scan",
+    "validate_current_visual_observations_v2", "validate_legacy_visual_observations_v1",
     "validate_visual_observations", "visual_label",
+    "summarize_raw_reinspection_groups",
 ]

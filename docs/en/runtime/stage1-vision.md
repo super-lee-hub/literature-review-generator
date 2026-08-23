@@ -40,6 +40,12 @@ merely because it shares a page. The selected child carries
 `source_page_visual_id`, `source_observation_visual_id`, `object_attribution_*`,
 `post_scan_score`, and score components. If an ambiguous set does not fit the
 raw-image budget, the reducer retains the page snapshot as the safe fallback.
+Ambiguous attribution is atomic: the reducer admits the complete candidate set
+or one page snapshot, never a partial child set. This atomic decision covers
+reference count, encoded request bytes, per-image bytes, missing/unreadable
+children, overlap, dedupe groups, and transport constraints. The final coverage
+and provider transport metadata retain the group id, candidate ids, resolution,
+selected ids, fallback reason, transport status, and child-completion flag.
 
 The achieved reducer is recorded in the typed
 `visual_evidence_qualification` binding and distinguishes four independent
@@ -61,7 +67,10 @@ complete page scan keeps `scan_coverage_status=complete`, but records
 With `require_complete_visual_coverage=true`, exact reuse verifies the Registry
 records, content hashes, JSON type/version, the v2 observation prompt/schema
 identity, and observation/coverage bytes. A prior v1 observation contract is
-therefore invalidated rather than silently reinterpreted.
+therefore invalidated rather than silently reinterpreted. The
+`validate_legacy_visual_observations_v1` API is a legacy reader only; current
+Stage 1 and Registry paths call `validate_current_visual_observations_v2` and
+reject v1 provider responses.
 Partial or failed scans, omitted required pages, and missing, deleted, or
 tampered coverage/observation artifacts block reuse and require new provider
 work. Setting the option to `false` is an explicit degraded-reuse policy: it
@@ -73,7 +82,11 @@ must still verify.
 DeepSeek Vision uses the official OpenAI-compatible Chat Completions format:
 `text` blocks and `image_url` blocks containing base64 data URLs. Responses
 uses `input_text` and `input_image`. The experimental model is explicitly
-capability-gated; ordinary `deepseek-v4-flash` is text-only.
+capability-gated; ordinary `deepseek-v4-flash` is text-only. The configured
+`deepseek-v4-flash-vision-exp` model is publicly documented/reported as live;
+generic model-list endpoints may lag that availability. Therefore a missing
+key means that live availability was not independently verified, not that the
+model was declared unavailable.
 
 If the vision call fails, the reader falls back to ordinary Flash with MinerU
 full text and any successful visual observations rendered as text. A fallback
@@ -109,7 +122,11 @@ $env:AUTO_GENERATE_RUN_LIVE_API = "1"
 python -m pytest -q tests/live/test_deepseek_vision_smoke.py -m live_api
 ```
 
-Without an API key, the result is intentionally
-`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_KEY`; offline and mocked tests do not
-substitute for that live evidence. The smoke test never writes the key,
+The smoke test accepts only `DEEPSEEK_API_KEY` or
+`AUTO_GENERATE_DEEPSEEK_API_KEY`; a generic live key or `OPENAI_API_KEY` is
+never sent to the DeepSeek endpoint. Without explicit opt-in, the result is
+`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_LIVE_API_NOT_ENABLED`; without a
+DeepSeek-specific key, it is
+`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_DEEPSEEK_KEY`. Offline and mocked tests
+do not substitute for live evidence. The smoke test never writes the key,
 response body, or synthetic PDF into the repository.

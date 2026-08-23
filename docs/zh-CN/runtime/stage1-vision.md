@@ -31,7 +31,11 @@ Stage 1 始终把 MinerU 或其他预处理器生成的 normalized full text 作
 定量或关系证据。被选择的 child 带有 `source_page_visual_id`、
 `source_observation_visual_id`、`object_attribution_*`、`post_scan_score` 和评分
 分量。如果 ambiguous 集合超出 raw-image 预算，reducer 会保留整页 snapshot
-作为安全回退。
+作为安全回退。ambiguous 归因是原子的：要么保留完整候选 child 集合，要么保留
+一张整页 snapshot，绝不保留部分 child。原子决策同时覆盖引用数量、编码后的请求
+字节数、单图字节数、child 缺失/不可读、重叠、dedupe group 以及 transport 约束；
+最终 coverage 和 provider transport metadata 会保存 group id、候选 id、resolution、
+selected id、回退原因、transport status 和 child 完成标志。
 
 最终 reducer 会在 typed `visual_evidence_qualification` binding 中记录四个
 相互独立的事实：
@@ -51,7 +55,9 @@ Stage 1 始终把 MinerU 或其他预处理器生成的 normalized full text 作
 当 `require_complete_visual_coverage=true` 时，exact reuse 必须重新验证
 Registry record、内容 hash、JSON type/version、v2 observation 的 Prompt/schema
 identity 以及 coverage/observation 文件本身。旧 v1 observation contract 会被判为
-失效，不会被静默重新解释。
+失效，不会被静默重新解释。`validate_legacy_visual_observations_v1` 只允许作为旧
+reader；当前 Stage 1 和 Registry 路径使用 `validate_current_visual_observations_v2`，
+会拒绝 provider 返回的 v1。
 部分/失败扫描、必需页遗漏，以及 coverage 或 observation 被删除、篡改、失效，
 都会阻断 reuse 并要求新的 provider 工作。设为 `false` 是显式的降级复用策略：
 不会抹掉状态或人工复核标记，引用的产物仍必须通过完整性验证。
@@ -61,6 +67,9 @@ identity 以及 coverage/observation 文件本身。旧 v1 observation contract 
 DeepSeek Vision 遵循官方 OpenAI-compatible Chat Completions 格式：`text` block 和
 含 base64 data URL 的 `image_url` block。Responses 使用 `input_text` 和
 `input_image`。实验模型通过 capability 显式识别；普通 `deepseek-v4-flash` 是纯文本。
+配置中的 `deepseek-v4-flash-vision-exp` 已有公开文档/公开运行报告；普通 model-list
+接口可能滞后。因此没有 key 只表示本环境没有独立验证 live availability，不表示把该
+模型判定为不可用。
 
 视觉调用失败时回退普通 Flash，并携带 MinerU 全文和已经成功的视觉 observation 文本。
 fallback 会写入证据，不能标记为 multimodal success。
@@ -93,6 +102,9 @@ $env:AUTO_GENERATE_RUN_LIVE_API = "1"
 python -m pytest -q tests/live/test_deepseek_vision_smoke.py -m live_api
 ```
 
-没有 API key 时，结果必须是
-`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_KEY`；离线和 mocked 测试不能替代
-live 证据。测试不会把 key、响应正文或合成 PDF 写入仓库。
+未显式 opt-in 时，结果必须是
+`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_LIVE_API_NOT_ENABLED`；没有 DeepSeek 专用 key
+时是 `LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_DEEPSEEK_KEY`。smoke 只接受
+`DEEPSEEK_API_KEY` 或 `AUTO_GENERATE_DEEPSEEK_API_KEY`，不会把通用 live key 或
+`OPENAI_API_KEY` 发往 DeepSeek endpoint。离线和 mocked 测试不能替代 live 证据。
+测试不会把 key、响应正文或合成 PDF 写入仓库。

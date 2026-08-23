@@ -14,13 +14,22 @@ from runtime.provider_runtime import ProviderBudgetV1, ProviderRuntime, Provider
 
 _MODEL = "deepseek-v4-flash-vision-exp"
 _API_BASE = "https://api.deepseek.com"
+
+
 def _live_key() -> str:
     return str(
         os.environ.get("DEEPSEEK_API_KEY")
-        or os.environ.get("AUTO_GENERATE_LIVE_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("AUTO_GENERATE_DEEPSEEK_API_KEY")
         or ""
     ).strip()
+
+
+def _live_gate_reason() -> str | None:
+    if os.environ.get("AUTO_GENERATE_RUN_LIVE_API") != "1":
+        return "LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_LIVE_API_NOT_ENABLED"
+    if not _live_key():
+        return "LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_DEEPSEEK_KEY"
+    return None
 
 
 def _build_smoke_pdf_and_page_image(tmp_path: Path) -> Path:
@@ -63,12 +72,13 @@ def _build_smoke_pdf_and_page_image(tmp_path: Path) -> Path:
     return image_path
 
 
-@pytest.mark.live_api
+@pytest.mark.live_api(provider="deepseek")
 def test_deepseek_vision_live_smoke(tmp_path: Path) -> None:
+    gate_reason = _live_gate_reason()
+    if gate_reason is not None:
+        print(gate_reason)
+        pytest.skip(gate_reason)
     api_key = _live_key()
-    if not api_key:
-        print("LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_KEY")
-        pytest.skip("LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_KEY")
 
     image_path = _build_smoke_pdf_and_page_image(tmp_path)
     ledger = ProviderRuntimeLedger(tmp_path / "provider_receipts.jsonl")

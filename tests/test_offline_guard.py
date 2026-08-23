@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from offline_guard import OfflineNetworkError, live_api_skip_reason
+from offline_guard import OfflineNetworkError, live_api_skip_reason, offline_enabled
 
 
 def test_external_dns_is_blocked() -> None:
@@ -82,3 +82,57 @@ def test_live_api_gate_requires_marker_opt_in_and_credential(
     expected_reason: str | None,
 ) -> None:
     assert live_api_skip_reason(marker_names, environment) == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected_reason"),
+    [
+        (
+            {
+                "AUTO_GENERATE_RUN_LIVE_API": "1",
+                "OPENAI_API_KEY": "openai-secret",
+            },
+            "deepseek live API credential is not configured",
+        ),
+        (
+            {
+                "AUTO_GENERATE_RUN_LIVE_API": "1",
+                "AUTO_GENERATE_LIVE_API_KEY": "generic-secret",
+            },
+            "deepseek live API credential is not configured",
+        ),
+        (
+            {
+                "AUTO_GENERATE_RUN_LIVE_API": "1",
+                "DEEPSEEK_API_KEY": "deepseek-secret",
+            },
+            None,
+        ),
+        (
+            {"DEEPSEEK_API_KEY": "deepseek-secret"},
+            "live API test not explicitly enabled",
+        ),
+    ],
+)
+def test_provider_aware_deepseek_live_gate_never_uses_other_provider_keys(
+    environment: dict[str, str],
+    expected_reason: str | None,
+) -> None:
+    assert (
+        live_api_skip_reason({"live_api"}, environment, provider="deepseek")
+        == expected_reason
+    )
+
+
+def test_openai_key_does_not_disable_offline_guard_for_deepseek_smoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "AUTO_GENERATE_LIVE_API_KEY",
+        "AUTO_GENERATE_DEEPSEEK_API_KEY",
+        "DEEPSEEK_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_API", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    assert offline_enabled() is True

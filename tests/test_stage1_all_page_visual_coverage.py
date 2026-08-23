@@ -388,6 +388,159 @@ def test_long_paper_final_synthesis_receives_attributed_child_crop(tmp_path: Pat
     assert child["path"] == selected_child["image_path"]
 
 
+def test_long_paper_final_request_keeps_ambiguous_children_atomic(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "ambiguous-atomic-long.pdf"
+    document = fitz.open()
+    for page_no in range(13):
+        page = document.new_page()
+        page.insert_text(
+            (72, 72),
+            f"Page {page_no + 1} framework evidence\n"
+            "Results: treatment improved the outcome by 17.3 percent.",
+        )
+    document.save(pdf_path)
+    document.close()
+    synthesis_contents: list[object] = []
+
+    def reader(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("purpose") == "visual_scan":
+            batch = kwargs["visual_scan_batch"]
+            observations = _long_scan_content(batch)["observations"]
+            for observation in observations:
+                if int(observation.get("page_no") or 0) != 7:
+                    continue
+                candidates = [
+                    dict(item)
+                    for item in (batch.get("child_candidates") or [])
+                    if isinstance(item, dict)
+                    and int(item.get("page_no") or 0) == 7
+                ]
+                observation["candidate_attribution_status"] = "ambiguous"
+                observation["raw_reinspection_candidates"] = [
+                    {
+                        "candidate_visual_id": str(item["candidate_visual_id"]),
+                        "evidence_kinds": ["visible_text"],
+                        "reason": "page resolution cannot distinguish the two overlapping objects",
+                        "confidence": "low",
+                        "requires_raw_reinspection": True,
+                    }
+                    for item in candidates
+                ]
+            return {
+                "status": "success",
+                "content": {
+                    "artifact_type": "stage1_visual_observations",
+                    "artifact_version": "v2",
+                    "observations": observations,
+                },
+            }
+        synthesis_contents.append(kwargs.get("user_content"))
+        return {"status": "success", "content": _canonical_summary()}
+
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader,
+        config_overrides=_long_visual_config(),
+    )
+    original_build_visual_bundle = service._build_visual_bundle
+
+    def build_bundle_with_ambiguous_pair(item: Any, preprocess_metadata: dict[str, Any]) -> dict[str, Any]:
+        visual_bundle = original_build_visual_bundle(item, preprocess_metadata)
+        refs = [
+            dict(ref)
+            for ref in (visual_bundle.get("all_visual_refs") or [])
+            if isinstance(ref, dict)
+        ]
+        source = next(
+            ref
+            for ref in refs
+            if int(ref.get("page_no") or 0) == 7
+            and str(ref.get("artifact_type") or "") == "page_snapshot"
+        )
+        child_a = {
+            **source,
+            "visual_id": "figure-007-ambiguous-a",
+            "artifact_type": "figure_crop",
+            "bbox": [0, 0, 100, 100],
+            "selection_score": 1.0,
+            "dedupe_group_id": "ambiguous-pair",
+        }
+        child_b = {
+            **child_a,
+            "visual_id": "figure-007-ambiguous-b",
+            "bbox": [5, 5, 95, 95],
+            "selection_score": 0.9,
+        }
+        refs.extend([child_a, child_b])
+        visual_bundle["all_visual_refs"] = refs
+        visual_bundle["selected_visual_refs"] = refs
+        return visual_bundle
+
+    service._build_visual_bundle = build_bundle_with_ambiguous_pair  # type: ignore[method-assign]
+    result = service.run(bundle)
+
+    assert len(synthesis_contents) == 1
+    final_content = synthesis_contents[0]
+    assert isinstance(final_content, list)
+    final_image_ids = {
+        str(item.get("visual_id") or "")
+        for item in final_content
+        if isinstance(item, dict) and item.get("type") == "local_image_path"
+    }
+    assert {"figure-007-ambiguous-a", "figure-007-ambiguous-b"}.issubset(final_image_ids)
+    assert "page-007" not in final_image_ids
+    coverage = result.summaries[0]["stage1_input"]["visual_coverage"]
+    group = next(
+        item
+        for item in coverage["raw_reinspection_groups"]
+        if item["page_no"] == 7
+    )
+    assert group["raw_reinspection_resolution"] == "all_children"
+    assert group["ambiguous_candidate_ids"] == [
+        "figure-007-ambiguous-a",
+        "figure-007-ambiguous-b",
+    ]
+    assert group["raw_reinspection_selected_ids"] == [
+        "figure-007-ambiguous-a",
+        "figure-007-ambiguous-b",
+    ]
+    assert group["child_reinspection_complete"] is True
+
+
+def test_current_stage1_rejects_v1_visual_provider_output(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "legacy-visual-output-long.pdf"
+    _write_long_text_pdf(pdf_path)
+
+    def reader(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("purpose") == "visual_scan":
+            legacy = _long_scan_content(kwargs["visual_scan_batch"])
+            legacy["artifact_version"] = "v1"
+            for observation in legacy["observations"]:
+                observation.pop("candidate_attribution_status", None)
+                observation.pop("raw_reinspection_candidates", None)
+            return {"status": "success", "content": legacy}
+        return {"status": "success", "content": _canonical_summary()}
+
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader,
+        config_overrides=_long_visual_config(),
+    )
+    result = service.run(bundle)
+    summary = result.summaries[0]
+    coverage = summary["stage1_input"]["visual_coverage"]
+
+    assert coverage["scan_coverage_status"] in {"failed", "partial"}
+    assert coverage["evidence_coverage_status"] == "incomplete"
+    assert coverage["observed_visual_ids"] == []
+    assert all(
+        str(item.get("status") or "") == "scan_failed"
+        for item in coverage["scan_batches"]
+    )
+
+
 def test_partial_long_scan_blocks_exact_reuse_and_requires_new_provider_work(tmp_path: Path) -> None:
     pdf_path = tmp_path / "partial-long.pdf"
     _write_long_text_pdf(pdf_path)

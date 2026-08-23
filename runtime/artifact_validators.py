@@ -1607,9 +1607,9 @@ def _validate_stage1_visual_observations_v2(record: Any, path: str | Path, root:
         return
 
     try:
-        from services.stage1_visual_scan import validate_visual_observations
+        from services.stage1_visual_scan import validate_current_visual_observations_v2
 
-        validate_visual_observations(
+        validate_current_visual_observations_v2(
             root,
             allowed_visual_ids=[str(item) for item in root.get("visual_ids") or []],
             sent_visual_ids=[str(item) for item in root.get("visual_ids") or []],

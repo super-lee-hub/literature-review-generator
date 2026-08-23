@@ -60,7 +60,8 @@ from services.stage1_visual_scan import (
     build_visual_scan_user_content,
     estimate_encoded_image_bytes,
     normalize_visual_byte_budgets,
-    validate_visual_observations,
+    summarize_raw_reinspection_groups,
+    validate_current_visual_observations_v2,
     select_final_visual_refs_after_scan,
 )
 from services.config_values import parse_strict_bool
@@ -1675,6 +1676,14 @@ class Stage1AnalysisService:
             logical_attempt_identity=self.attempt_id,
         )
         if prepared.built_input.visual_scan_batches:
+            max_request, max_single = normalize_visual_byte_budgets(
+                max_request_image_bytes=prepared.stage1_input_settings.get(
+                    "max_request_image_bytes"
+                ),
+                max_single_image_bytes=prepared.stage1_input_settings.get(
+                    "max_single_image_bytes"
+                ),
+            )
             final_visual_refs = select_final_visual_refs_after_scan(
                 prepared.built_input.all_visual_refs
                 or prepared.built_input.selected_visual_refs
@@ -1684,6 +1693,11 @@ class Stage1AnalysisService:
                     0,
                     int(prepared.stage1_input_settings.get("final_image_refs_max", 8) or 8),
                 ),
+                max_request_image_bytes=max_request,
+                max_single_image_bytes=max_single,
+            )
+            visual_coverage.update(
+                summarize_raw_reinspection_groups(final_visual_refs)
             )
             rebuilt_input = Stage1InputBuilder(logger=self.logger).build(
                 prompt_template=self._prompt_template(),
@@ -1745,6 +1759,12 @@ class Stage1AnalysisService:
             if int(transport_metadata.get("images_actually_sent_count") or 0) > 0
             else str(transport_metadata.get("successful_input_mode") or "text_only")
         )
+        transport_metadata.update(
+            summarize_raw_reinspection_groups(
+                prepared.built_input.selected_visual_refs or [],
+                sent_visual_ids=transport_metadata.get("sent_visual_ids") or [],
+            )
+        )
         provider_result = {
             **dict(provider_result),
             "transport_metadata": transport_metadata,
@@ -1802,6 +1822,12 @@ class Stage1AnalysisService:
             transport_metadata.get("images_actually_sent_count") or 0
         )
         coverage["transport_omissions"] = list(transport_metadata.get("omissions") or [])
+        coverage.update(
+            summarize_raw_reinspection_groups(
+                prepared.built_input.selected_visual_refs or [],
+                sent_visual_ids=actual_visual_ids,
+            )
+        )
         required_page_ids = {
             str(value) for value in (coverage.get("required_page_ids") or []) if str(value)
         }
@@ -1927,6 +1953,21 @@ class Stage1AnalysisService:
                 ),
                 "evidence_coverage_status": str(
                     coverage.get("evidence_coverage_status") or ""
+                ),
+                "raw_reinspection_groups": list(
+                    transport_metadata.get("raw_reinspection_groups") or []
+                ),
+                "ambiguous_candidate_ids": list(
+                    transport_metadata.get("ambiguous_candidate_ids") or []
+                ),
+                "raw_reinspection_resolution": str(
+                    transport_metadata.get("raw_reinspection_resolution") or ""
+                ),
+                "raw_reinspection_selected_ids": list(
+                    transport_metadata.get("raw_reinspection_selected_ids") or []
+                ),
+                "raw_reinspection_fallback_reason": str(
+                    transport_metadata.get("raw_reinspection_fallback_reason") or ""
                 ),
             },
             "stage1_reuse": {
@@ -2436,7 +2477,7 @@ class Stage1AnalysisService:
         error = ""
         if str(result.get("status") or "").strip().lower() == "success" and isinstance(content, Mapping):
             try:
-                content = validate_visual_observations(
+                content = validate_current_visual_observations_v2(
                     content,
                     allowed_visual_ids=batch.visual_ids,
                     expected_visual_refs=batch.visual_refs,
