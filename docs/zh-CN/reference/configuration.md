@@ -40,6 +40,24 @@ planned、sent、omitted、observed visual ID；只有对每个实际发送图�
 schema observation 的批次才算有效。长文先扫描全部可发送的非空页，再依据 observations
 选择最终 raw image；备用 reader 强制纯文本，并在 provider 证据中如实记录。
 
+## Stage 1 配置 ownership 与迁移键
+
+`Stage1_Input` 负责 provider-facing 的文本/PDF/图片传输、页面扫描 batch 与最终
+引用预算，以及 `require_complete_visual_coverage` reuse 策略。
+`mode=vision_first`、`image_transport=base64` 和
+`Stage1_Visual.render_all_nonblank_pages=true` 是 invariant。历史键
+`pdf_required_for_formal_precision`、`formal_precision_text_only_policy`、
+`pdf_verifier_api` 仅用于迁移归一化，进入 typed current settings 前会被移除。
+
+`Stage1_Visual` 负责渲染和 crop 形状：页面/crop 尺寸、像素和产物字节上限、格式、
+JPEG 质量、padding，以及 table/formula crop 开关。当前传输预算统一留在
+`Stage1_Input`。旧的 `max_visual_refs_per_paper`、`visual_artifact_dir` 和重复的
+`Stage1_Visual.max_request_image_bytes` / `max_single_image_bytes` 已移除并拒绝，
+不会被静默当作当前控制项。
+
+`config.ini.example` 的默认值会与 `default_config_sections()` 做一致性检查（秘密
+占位符除外），避免 GUI 默认值、示例文件和 runtime owner map 各自漂移。
+
 ## Stage 1 视觉渲染
 
 `[Stage1_Visual]` 默认把每个非空页面渲染到约 2200 px 长边。全页图使用 JPEG
@@ -52,6 +70,8 @@ schema observation 的批次才算有效。长文先扫描全部可发送的非�
 model、capability、Prompt identity/hash、schema、预处理证据、visual manifest 或
 visual coverage 任一变化都会使 Stage 1 reuse 失效。页面渲染缺失或失败会写入
 `stage1_visual_coverage/v1`；当 `require_complete_visual_coverage=true` 时，摘要
-必须带 `quality_audit.needs_manual_review=true`，不能静默声称视觉完整。Prompt 文件由
-Registry 的 SHA-256 authority 绑定；JSON policy 损坏、hash 漂移或缺少 placeholder 都会
-fail closed。
+必须由 typed `visual_evidence_qualification` 验证为完整证据后才能 exact reuse。
+`quality_audit.needs_manual_review=true` 只记录降级或不完整证据，不能授权 reuse。
+显式设置 `require_complete_visual_coverage=false` 时，可以在验证 binding 完整性后复用
+降级结果，但必须保留该状态。Prompt 文件由 Registry 的 SHA-256 authority 绑定；JSON
+policy 损坏、hash 漂移或缺少 placeholder 都会 fail closed。

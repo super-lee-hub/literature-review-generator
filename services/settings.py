@@ -18,6 +18,56 @@ CONFIG_SCHEMA_VERSION = 4
 # Kept in the accepted schema only so older config files can be read and
 # normalized.  This field is not a current parser-routing control.
 _DEPRECATED_PREPROCESS_KEYS = frozenset({"strategy_policy"})
+_MIGRATION_ONLY_STAGE1_KEYS = frozenset(
+    {
+        "pdf_required_for_formal_precision",
+        "formal_precision_text_only_policy",
+        "pdf_verifier_api",
+    }
+)
+
+# Every accepted Stage 1 key has an explicit owner disposition.  Migration
+# keys remain readable so an older config can be normalized, while REMOVE
+# keys are rejected instead of being silently ignored.
+STAGE1_CONFIG_OWNERSHIP: Dict[str, Dict[str, str]] = {
+    "Stage1_Input": {
+        "mode": "INVARIANT",
+        "send_extracted_text": "ACTIVE",
+        "send_selected_visuals": "ACTIVE",
+        "send_original_pdf": "ACTIVE",
+        "pdf_required_for_formal_precision": "MIGRATION_ONLY",
+        "max_pdf_file_mb": "ACTIVE",
+        "formal_precision_text_only_policy": "MIGRATION_ONLY",
+        "force_pdf_file_input_for_provider": "ACTIVE",
+        "pdf_verifier_api": "MIGRATION_ONLY",
+        "image_transport": "INVARIANT",
+        "single_call_max_pages": "ACTIVE",
+        "visual_scan_batch_size": "ACTIVE",
+        "final_image_refs_max": "ACTIVE",
+        "require_complete_visual_coverage": "ACTIVE",
+        "max_request_image_bytes": "ACTIVE",
+        "max_single_image_bytes": "ACTIVE",
+    },
+    "Stage1_Visual": {
+        "enabled": "ACTIVE",
+        "max_visual_refs_per_paper": "REMOVE",
+        "visual_artifact_dir": "REMOVE",
+        "render_all_nonblank_pages": "INVARIANT",
+        "page_long_edge_px": "ACTIVE",
+        "crop_long_edge_px": "ACTIVE",
+        "page_max_pixels": "ACTIVE",
+        "crop_max_pixels": "ACTIVE",
+        "page_format": "ACTIVE",
+        "page_jpeg_quality": "ACTIVE",
+        "crop_format": "ACTIVE",
+        "crop_padding_ratio": "ACTIVE",
+        "table_crop_enabled": "ACTIVE",
+        "formula_crop_enabled": "ACTIVE",
+        "max_request_image_bytes": "REMOVE",
+        "max_single_image_bytes": "REMOVE",
+        "max_visual_artifact_bytes": "ACTIVE",
+    },
+}
 
 API_KEYS = frozenset(
     {
@@ -189,8 +239,6 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
     "Stage1_Visual": frozenset(
         {
             "enabled",
-            "max_visual_refs_per_paper",
-            "visual_artifact_dir",
             "render_all_nonblank_pages",
             "page_long_edge_px",
             "crop_long_edge_px",
@@ -202,8 +250,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "crop_padding_ratio",
             "table_crop_enabled",
             "formula_crop_enabled",
-            "max_request_image_bytes",
-            "max_single_image_bytes",
+            "max_visual_artifact_bytes",
         }
     ),
     "Multimodal": frozenset({"enabled", "multimodal_api_key", "multimodal_model", "multimodal_api_base"}),
@@ -410,6 +457,9 @@ class ApplicationSettings:
                 if not (
                     str(section) == "Preprocess"
                     and str(key) in _DEPRECATED_PREPROCESS_KEYS
+                ) and not (
+                    str(section) == "Stage1_Input"
+                    and str(key) in _MIGRATION_ONLY_STAGE1_KEYS
                 )
             }
             for section, values in config.items()
@@ -581,6 +631,7 @@ __all__ = [
     "CONFIG_KEYS",
     "CONFIG_SCHEMA_VERSION",
     "ApplicationSettings",
+    "STAGE1_CONFIG_OWNERSHIP",
     "ValidationSettings",
     "RuntimeSettings",
     "OutlineSettings",

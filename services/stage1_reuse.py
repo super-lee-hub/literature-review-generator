@@ -113,6 +113,147 @@ def _hash_file(path: str) -> str:
         return ""
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float, str)):
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
+@dataclass(frozen=True)
+class Stage1VisualEvidenceQualificationV1:
+    """Achieved visual evidence facts used to gate exact summary reuse.
+
+    Input identity remains in :class:`Stage1ReusableSummaryBindingV1`; this
+    section records what the run actually proved.  Keeping the two separate
+    prevents a partial scan from becoming a new input identity while still
+    making the partial result impossible to use as an exact-reuse authority.
+    """
+
+    artifact_type: str = "stage1_visual_evidence_qualification"
+    artifact_version: str = "v1"
+    coverage_artifact_id: str = ""
+    coverage_artifact_hash: str = ""
+    coverage_artifact_path: str = ""
+    observation_artifact_ids: tuple[str, ...] = ()
+    observation_artifact_hashes: tuple[str, ...] = ()
+    observation_artifact_paths: tuple[str, ...] = ()
+    required_nonblank_page_count: int = 0
+    required_page_ids: tuple[str, ...] = ()
+    sent_page_ids: tuple[str, ...] = ()
+    observed_page_ids: tuple[str, ...] = ()
+    render_failed_page_ids: tuple[str, ...] = ()
+    scan_failed_page_ids: tuple[str, ...] = ()
+    transport_omissions: tuple[Mapping[str, Any], ...] = ()
+    scan_coverage_status: str = "not_required"
+    final_synthesis_modality: str = "text_only"
+    final_raw_visual_recheck_status: str = "not_required"
+    evidence_coverage_status: str = "complete"
+    require_complete_visual_coverage: bool = True
+
+    @staticmethod
+    def _strings(value: Any) -> tuple[str, ...]:
+        if not isinstance(value, (list, tuple)):
+            return ()
+        return tuple(str(item).strip() for item in value if str(item).strip())
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "Stage1VisualEvidenceQualificationV1":
+        raw = dict(value or {})
+        omissions = raw.get("transport_omissions")
+        normalized_omissions: tuple[Mapping[str, Any], ...] = tuple(
+            dict(item) for item in omissions if isinstance(item, Mapping)
+        ) if isinstance(omissions, (list, tuple)) else ()
+        try:
+            required_count = max(0, int(raw.get("required_nonblank_page_count") or 0))
+        except (TypeError, ValueError):
+            required_count = 0
+        return cls(
+            artifact_type=_text(raw.get("artifact_type")) or cls.artifact_type,
+            artifact_version=_text(raw.get("artifact_version")) or cls.artifact_version,
+            coverage_artifact_id=_text(raw.get("coverage_artifact_id")),
+            coverage_artifact_hash=_text(raw.get("coverage_artifact_hash")),
+            coverage_artifact_path=_text(raw.get("coverage_artifact_path")),
+            observation_artifact_ids=cls._strings(raw.get("observation_artifact_ids")),
+            observation_artifact_hashes=cls._strings(raw.get("observation_artifact_hashes")),
+            observation_artifact_paths=cls._strings(raw.get("observation_artifact_paths")),
+            required_nonblank_page_count=required_count,
+            required_page_ids=cls._strings(raw.get("required_page_ids")),
+            sent_page_ids=cls._strings(raw.get("sent_page_ids")),
+            observed_page_ids=cls._strings(raw.get("observed_page_ids")),
+            render_failed_page_ids=cls._strings(raw.get("render_failed_page_ids")),
+            scan_failed_page_ids=cls._strings(raw.get("scan_failed_page_ids")),
+            transport_omissions=normalized_omissions,
+            scan_coverage_status=_text(raw.get("scan_coverage_status")) or "not_required",
+            final_synthesis_modality=_text(raw.get("final_synthesis_modality")) or "text_only",
+            final_raw_visual_recheck_status=(
+                _text(raw.get("final_raw_visual_recheck_status")) or "not_required"
+            ),
+            evidence_coverage_status=_text(raw.get("evidence_coverage_status")) or "complete",
+            require_complete_visual_coverage=_as_bool(
+                raw.get("require_complete_visual_coverage"), True
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        for field_name in (
+            "observation_artifact_ids", "observation_artifact_hashes",
+            "observation_artifact_paths", "required_page_ids", "sent_page_ids",
+            "observed_page_ids", "render_failed_page_ids", "scan_failed_page_ids",
+        ):
+            payload[field_name] = list(payload[field_name])
+        payload["transport_omissions"] = [dict(item) for item in self.transport_omissions]
+        return payload
+
+    def qualification_issues(self) -> tuple[str, ...]:
+        issues: list[str] = []
+        if self.artifact_type != "stage1_visual_evidence_qualification" or self.artifact_version != "v1":
+            issues.append("qualification_type_invalid")
+        if self.required_nonblank_page_count != len(self.required_page_ids):
+            issues.append("required_page_ids_incomplete")
+        required = set(self.required_page_ids)
+        if self.scan_coverage_status in {"complete", "partial", "failed"}:
+            if required - set(self.sent_page_ids):
+                issues.append("required_page_inputs_not_sent")
+            if required - set(self.observed_page_ids):
+                issues.append("required_page_observations_missing")
+        if self.render_failed_page_ids:
+            issues.append("required_page_render_failed")
+        if self.scan_failed_page_ids:
+            issues.append("required_page_scan_failed")
+        if self.transport_omissions:
+            issues.append("required_visual_transport_omitted")
+        if self.scan_coverage_status not in {"complete", "partial", "failed", "not_required"}:
+            issues.append("scan_coverage_status_invalid")
+        if self.final_synthesis_modality not in {"multimodal", "text_only", "pdf_plus_text"}:
+            issues.append("final_synthesis_modality_invalid")
+        if self.final_raw_visual_recheck_status not in {
+            "complete", "partial", "not_run_fallback", "not_required",
+        }:
+            issues.append("final_raw_visual_recheck_status_invalid")
+        if self.evidence_coverage_status not in {"complete", "degraded", "incomplete"}:
+            issues.append("evidence_coverage_status_invalid")
+        if self.require_complete_visual_coverage and self.evidence_coverage_status != "complete":
+            issues.append("evidence_not_complete_for_reuse")
+        return tuple(dict.fromkeys(issues))
+
+    def complete_for_reuse(self) -> bool:
+        return not self.qualification_issues()
+
+
 @dataclass(frozen=True)
 class Stage1ReusableSummaryBindingV1:
     """The source and execution facts that must match before reuse."""
@@ -136,6 +277,7 @@ class Stage1ReusableSummaryBindingV1:
     summary_schema_hash: str = ""
     visual_input_manifest_hash: str = ""
     visual_coverage_hash: str = ""
+    visual_evidence_qualification: Mapping[str, Any] = field(default_factory=dict)
     original_source_location: str = ""
     current_source_location: str = ""
     location_changed: bool = False
@@ -199,15 +341,19 @@ class Stage1ReusableSummaryBindingV1:
         nested = raw.get("binding")
         if isinstance(nested, Mapping):
             raw = dict(nested)
-        known: dict[str, Any] = {
-            name: (
-                bool(raw[name])
-                if name == "location_changed"
-                else _text(raw[name])
+        known: dict[str, Any] = {}
+        for name in cls.__dataclass_fields__:
+            if name in {"extra", "visual_evidence_qualification"} or name not in raw or raw[name] is None:
+                continue
+            known[name] = bool(raw[name]) if name == "location_changed" else _text(raw[name])
+        if "visual_evidence_qualification" in raw and isinstance(
+            raw.get("visual_evidence_qualification"), Mapping
+        ):
+            known["visual_evidence_qualification"] = (
+                Stage1VisualEvidenceQualificationV1.from_mapping(
+                    raw.get("visual_evidence_qualification")
+                ).to_dict()
             )
-            for name in cls.__dataclass_fields__
-            if name != "extra" and name in raw and raw[name] is not None
-        }
         raw_extra_value = raw.get("extra")
         raw_extra: Mapping[str, Any] = (
             raw_extra_value if isinstance(raw_extra_value, Mapping) else {}
@@ -355,6 +501,7 @@ class Stage1ReusableSummaryManifestV1:
     summary_schema_hash: str = ""
     visual_input_manifest_hash: str = ""
     visual_coverage_hash: str = ""
+    visual_evidence_qualification: Mapping[str, Any] = field(default_factory=dict)
     provider: str = ""
     model: str = ""
     endpoint_type: str = ""
@@ -392,7 +539,7 @@ class Stage1ReusableSummaryManifestV1:
         for name in cls.__dataclass_fields__:
             if name not in raw:
                 continue
-            if name in {"binding", "paper_info", "summary_payload"}:
+            if name in {"binding", "paper_info", "summary_payload", "visual_evidence_qualification"}:
                 known[name] = dict(raw[name]) if isinstance(raw[name], Mapping) else {}
             else:
                 known[name] = _text(raw[name])
@@ -508,6 +655,14 @@ def _validate_manifest_self_binding(
         binding_value = _text(getattr(manifest_binding, field_name))
         if not manifest_value or manifest_value != binding_value:
             return None, f"typed_manifest_{field_name}_mismatch"
+    manifest_qualification = Stage1VisualEvidenceQualificationV1.from_mapping(
+        manifest.visual_evidence_qualification
+    ).to_dict()
+    binding_qualification = Stage1VisualEvidenceQualificationV1.from_mapping(
+        manifest_binding.visual_evidence_qualification
+    ).to_dict()
+    if manifest_qualification != binding_qualification:
+        return None, "typed_manifest_visual_evidence_qualification_mismatch"
     if manifest.source_registry_identity != manifest_binding.source_authority_registry_id:
         return None, "typed_manifest_registry_identity_mismatch"
     if manifest.source_registry_revision != manifest_binding.source_authority_registry_revision:
@@ -547,6 +702,158 @@ def _validate_manifest_self_binding(
     return manifest, "typed_manifest_self_binding_verified"
 
 
+def _verify_visual_evidence_qualification(
+    raw_qualification: Mapping[str, Any] | None,
+    *,
+    manifest_path: Path | None = None,
+    registry: ArtifactRegistry | None = None,
+) -> tuple[bool, str]:
+    """Verify visual coverage/observation bytes and the achieved reducer."""
+
+    if not raw_qualification:
+        # Bindings written before the typed qualification was introduced are
+        # accepted only when they never opted into the complete-coverage gate.
+        # Current Stage 1 bindings always carry the policy explicitly.
+        return True, "visual_qualification_not_declared_legacy"
+    qualification = Stage1VisualEvidenceQualificationV1.from_mapping(raw_qualification)
+    issues = qualification.qualification_issues()
+    if issues:
+        if any(issue in issues for issue in ("required_page_observations_missing", "required_page_inputs_not_sent")):
+            return False, "prior_visual_observation_incomplete"
+        if any(issue in issues for issue in ("required_page_render_failed", "required_page_scan_failed", "required_visual_transport_omitted")):
+            return False, "prior_visual_coverage_incomplete"
+        if "evidence_not_complete_for_reuse" in issues:
+            return False, "prior_visual_coverage_incomplete"
+        return False, "prior_visual_coverage_artifact_invalid"
+
+    def resolve_path(declared: str) -> Path | None:
+        if not declared:
+            return None
+        target = Path(declared).expanduser()
+        if not target.is_absolute() and manifest_path is not None:
+            target = manifest_path.parent / target
+        try:
+            return target.resolve()
+        except OSError:
+            return None
+
+    def verify_artifact(
+        *,
+        artifact_id: str,
+        expected_hash: str,
+        declared_path: str,
+        artifact_type: str,
+        invalid_reason: str,
+    ) -> tuple[bool, Path | None, str]:
+        record = registry.get(artifact_id) if registry is not None and artifact_id else None
+        if record is not None:
+            if record.status != "ready" or record.artifact_type != artifact_type or record.artifact_version != "v1":
+                return False, None, invalid_reason
+            if expected_hash and record.content_hash != expected_hash:
+                return False, None, invalid_reason
+            target = Path(record.path).expanduser()
+        else:
+            target = resolve_path(declared_path)
+            if target is None:
+                return False, None, invalid_reason
+        if not target.is_file() or not expected_hash or not _is_sha256(expected_hash):
+            return False, None, invalid_reason
+        actual_hash = _hash_file(str(target))
+        if actual_hash != expected_hash:
+            return False, None, invalid_reason
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False, None, invalid_reason
+        if not isinstance(payload, Mapping) or payload.get("artifact_type") != artifact_type or payload.get("artifact_version") != "v1":
+            return False, None, invalid_reason
+        if registry is not None and record is not None:
+            try:
+                ArtifactRegistry._verify_ready_artifact(record)
+            except (OSError, TypeError, ValueError, RuntimeError):
+                return False, None, invalid_reason
+        return True, target, ""
+
+    required_visual_evidence = bool(
+        qualification.required_page_ids
+        or qualification.required_nonblank_page_count
+        or qualification.scan_coverage_status != "not_required"
+    )
+    if required_visual_evidence:
+        coverage_ok, coverage_path, coverage_reason = verify_artifact(
+            artifact_id=qualification.coverage_artifact_id,
+            expected_hash=qualification.coverage_artifact_hash,
+            declared_path=qualification.coverage_artifact_path,
+            artifact_type="stage1_visual_coverage",
+            invalid_reason="prior_visual_coverage_artifact_invalid",
+        )
+        if not coverage_ok:
+            return False, coverage_reason
+        try:
+            coverage_payload = json.loads(coverage_path.read_text(encoding="utf-8")) if coverage_path else {}
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False, "prior_visual_coverage_artifact_invalid"
+        if not isinstance(coverage_payload, Mapping):
+            return False, "prior_visual_coverage_artifact_invalid"
+        for field_name in (
+            "scan_coverage_status", "required_nonblank_page_count",
+            "required_page_ids", "sent_visual_ids", "observed_visual_ids",
+        ):
+            declared = getattr(qualification, field_name, None)
+            if field_name == "sent_visual_ids":
+                declared = list(qualification.sent_page_ids)
+            elif field_name == "observed_visual_ids":
+                declared = list(qualification.observed_page_ids)
+            elif field_name == "required_page_ids":
+                declared = list(qualification.required_page_ids)
+            if declared is not None and field_name in coverage_payload:
+                actual = coverage_payload.get(field_name)
+                if field_name == "required_nonblank_page_count":
+                    actual_count = _as_int_or_none(actual)
+                    declared_count = _as_int_or_none(declared)
+                    if actual_count is None or declared_count is None or actual_count != declared_count:
+                        return False, "prior_visual_coverage_artifact_invalid"
+                elif field_name == "scan_coverage_status":
+                    if str(actual or "") != str(declared or ""):
+                        return False, "prior_visual_coverage_artifact_invalid"
+                elif field_name in {"sent_visual_ids", "observed_visual_ids"}:
+                    # The qualification records page IDs, while the durable
+                    # coverage artifact may also contain child crops.  The
+                    # page proof must be present; extra crop IDs are valid
+                    # and must not make an equivalent artifact unverifiable.
+                    actual_ids = {str(item) for item in (actual or [])}
+                    declared_ids = {str(item) for item in (declared or [])}
+                    if not declared_ids.issubset(actual_ids):
+                        return False, "prior_visual_coverage_artifact_invalid"
+                elif sorted(str(item) for item in (actual or [])) != sorted(str(item) for item in (declared or [])):
+                    return False, "prior_visual_coverage_artifact_invalid"
+
+    if len(qualification.observation_artifact_ids) != len(qualification.observation_artifact_hashes):
+        return False, "prior_visual_observation_artifact_invalid"
+    if qualification.observation_artifact_paths and len(qualification.observation_artifact_paths) != len(qualification.observation_artifact_ids):
+        return False, "prior_visual_observation_artifact_invalid"
+    for index, (artifact_id, artifact_hash) in enumerate(
+        zip(qualification.observation_artifact_ids, qualification.observation_artifact_hashes)
+    ):
+        declared_path = qualification.observation_artifact_paths[index] if index < len(qualification.observation_artifact_paths) else ""
+        ok, _path, reason = verify_artifact(
+            artifact_id=artifact_id,
+            expected_hash=artifact_hash,
+            declared_path=declared_path,
+            artifact_type="stage1_visual_observations",
+            invalid_reason="prior_visual_observation_artifact_invalid",
+        )
+        if not ok:
+            return False, reason
+    if qualification.require_complete_visual_coverage and not qualification.complete_for_reuse():
+        return False, "prior_visual_coverage_incomplete"
+    return True, (
+        "visual_qualification_verified"
+        if qualification.evidence_coverage_status == "complete"
+        else "degraded_visual_reuse_allowed_by_policy"
+    )
+
+
 def verify_stage1_typed_manifest_authority(
     previous_summary: Mapping[str, Any],
     binding: Stage1ReusableSummaryBindingV1,
@@ -580,6 +887,13 @@ def verify_stage1_typed_manifest_authority(
     )
     if manifest is None:
         return None, reason
+
+    qualification_ok, qualification_reason = _verify_visual_evidence_qualification(
+        manifest.visual_evidence_qualification,
+        manifest_path=manifest_path,
+    )
+    if not qualification_ok:
+        return None, qualification_reason
 
     source_summary_path = _resolve_manifest_reference(
         manifest_path, manifest.source_summary_artifact_path
@@ -807,6 +1121,12 @@ def _registered_source_is_verifiable(
         if target_registry is None:
             return False, "source_authority_registry_unavailable"
         target_registry.reload()
+    qualification_ok, qualification_reason = _verify_visual_evidence_qualification(
+        binding.visual_evidence_qualification,
+        registry=target_registry,
+    )
+    if not qualification_ok:
+        return False, qualification_reason
     record = target_registry.get(authority_id)
     if record is None:
         return False, "source_authority_artifact_not_registered"
@@ -1145,6 +1465,7 @@ def build_binding_hash(payload: Mapping[str, Any]) -> str:
 __all__ = [
     "STAGE1_REUSE_BINDING_VERSION",
     "STAGE1_REUSE_POLICY",
+    "Stage1VisualEvidenceQualificationV1",
     "Stage1ReusableSummaryBindingV1",
     "Stage1ReusableSummaryManifestV1",
     "Stage1TypedManifestAuthorityV1",

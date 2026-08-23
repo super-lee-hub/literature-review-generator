@@ -228,11 +228,8 @@ mode = vision_first
 send_extracted_text = true
 send_selected_visuals = true
 send_original_pdf = never
-pdf_required_for_formal_precision = false
 max_pdf_file_mb = 50
-formal_precision_text_only_policy = rich_mineru_evidence
 force_pdf_file_input_for_provider = false
-pdf_verifier_api = disabled
 image_transport = base64
 single_call_max_pages = 12
 visual_scan_batch_size = 10
@@ -243,8 +240,6 @@ max_single_image_bytes = 24000000
 
 [Stage1_Visual]
 enabled = true
-max_visual_refs_per_paper = 8
-visual_artifact_dir = ./output/_visual_artifacts
 render_all_nonblank_pages = true
 page_long_edge_px = 2200
 crop_long_edge_px = 2400
@@ -256,8 +251,7 @@ crop_format = png
 crop_padding_ratio = 0.04
 table_crop_enabled = true
 formula_crop_enabled = true
-max_request_image_bytes = 36000000
-max_single_image_bytes = 24000000
+max_visual_artifact_bytes = 24000000
 
 [Queue]
 enabled = false

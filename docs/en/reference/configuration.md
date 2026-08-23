@@ -43,6 +43,27 @@ observation for every image actually sent. Long papers scan all sendable
 nonblank pages first, then select the final raw image references from those
 observations. Backup reader transport is text-only and is recorded as such.
 
+## Stage 1 ownership and migration keys
+
+`Stage1_Input` owns provider-facing text/PDF/image transport, page-scan batch
+and final-reference budgets, and the `require_complete_visual_coverage` reuse
+policy. `mode=vision_first`, `image_transport=base64`, and
+`Stage1_Visual.render_all_nonblank_pages=true` are invariants. The historical
+`pdf_required_for_formal_precision`, `formal_precision_text_only_policy`, and
+`pdf_verifier_api` keys are accepted only for migration normalization and are
+removed from the typed current settings.
+
+`Stage1_Visual` owns rendering and crop shape: page/crop dimensions, pixel and
+artifact-byte limits, formats, JPEG quality, padding, and table/formula crop
+switches. The current transport budgets remain in `Stage1_Input`. The old
+`max_visual_refs_per_paper`, `visual_artifact_dir`, and the duplicate
+`Stage1_Visual.max_request_image_bytes` / `max_single_image_bytes` keys are
+removed and rejected; they are not silently accepted as current controls.
+
+Default values in `config.ini.example` are checked against
+`default_config_sections()` (apart from secret placeholders) so GUI defaults,
+the example file, and the runtime owner map cannot drift independently.
+
 ## Stage 1 Visual Rendering
 
 `[Stage1_Visual]` defaults render every nonblank page at a target long edge
@@ -56,7 +77,11 @@ format, byte count, and SHA-256.
 Changing the model, capability, prompt identity/hash, schema, preprocess
 evidence, visual manifest, or visual coverage invalidates Stage 1 reuse. Missing
 or failed page rendering is recorded in `stage1_visual_coverage/v1`; with
-`require_complete_visual_coverage=true`, the summary remains eligible only with
-`quality_audit.needs_manual_review=true` or a fresh successful complete run.
+`require_complete_visual_coverage=true`, the typed
+`visual_evidence_qualification` must verify complete evidence before exact
+reuse. `quality_audit.needs_manual_review=true` records degraded or incomplete
+evidence; it does not authorize reuse. An explicit
+`require_complete_visual_coverage=false` policy may reuse a verified degraded
+binding with that status preserved.
 Prompt files are Registry-authorized by SHA-256; malformed JSON node policies,
 hash drift, and missing prompt placeholders fail closed.

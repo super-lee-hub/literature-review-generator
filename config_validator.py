@@ -197,6 +197,50 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
             if not valid:
                 return False, [f"[Runtime] {key} {error}"]
 
+    stage1_input = config_dict.get("Stage1_Input", {})
+    if isinstance(stage1_input, dict):
+        mode = _normalize_config_text(stage1_input.get("mode"))
+        if mode and mode.casefold() != "vision_first":
+            return False, ["[Stage1_Input] mode must be vision_first"]
+        image_transport = _normalize_config_text(stage1_input.get("image_transport"))
+        if image_transport and image_transport.casefold() != "base64":
+            return False, ["[Stage1_Input] image_transport must be base64"]
+        for key, minimum, maximum in (
+            ("max_pdf_file_mb", 1, 1000000),
+            ("single_call_max_pages", 1, 1000000),
+            ("visual_scan_batch_size", 1, 1000000),
+            ("final_image_refs_max", 0, 1000000),
+            ("max_request_image_bytes", 1, 2000000000),
+            ("max_single_image_bytes", 1, 2000000000),
+        ):
+            if key in stage1_input:
+                valid, error = validate_numeric_range(str(stage1_input[key]), minimum, maximum)
+                if not valid:
+                    return False, [f"[Stage1_Input] {key} {error}"]
+
+    stage1_visual = config_dict.get("Stage1_Visual", {})
+    if isinstance(stage1_visual, dict):
+        render_all = _normalize_config_text(stage1_visual.get("render_all_nonblank_pages"))
+        if render_all and render_all.casefold() not in {"true", "1", "yes", "on"}:
+            return False, ["[Stage1_Visual] render_all_nonblank_pages is an invariant and must be true"]
+        for key in ("page_format", "crop_format"):
+            if key in stage1_visual:
+                image_format = _normalize_config_text(stage1_visual[key]).casefold()
+                if image_format not in {"jpg", "jpeg", "png"}:
+                    return False, [f"[Stage1_Visual] {key} must be jpeg/jpg/png"]
+        if "page_jpeg_quality" in stage1_visual:
+            valid, error = validate_numeric_range(str(stage1_visual["page_jpeg_quality"]), 1, 100)
+            if not valid:
+                return False, [f"[Stage1_Visual] page_jpeg_quality {error}"]
+        for key in (
+            "page_long_edge_px", "crop_long_edge_px", "page_max_pixels",
+            "crop_max_pixels", "max_visual_artifact_bytes",
+        ):
+            if key in stage1_visual:
+                valid, error = validate_numeric_range(str(stage1_visual[key]), 1, 2000000000)
+                if not valid:
+                    return False, [f"[Stage1_Visual] {key} {error}"]
+
     try:
         settings = ApplicationSettings.from_config(config_dict)
         parse_repair_policy(config_dict.get("Validation", {}).get("repair_policy"))

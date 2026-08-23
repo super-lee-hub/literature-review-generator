@@ -97,5 +97,10 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
     assert summary["provider"]["successful_engine"] == "backup"
     assert summary["provider"]["successful_input_mode"] == "text_only"
     assert summary["provider"]["images_actually_sent_count"] == 0
-    assert summary["provider"]["visual_coverage_status"] == "partial"
+    assert summary["provider"]["scan_coverage_status"] == "not_required"
+    assert summary["provider"]["final_synthesis_modality"] == "text_only"
+    assert summary["provider"]["final_raw_visual_recheck_status"] == "not_run_fallback"
+    assert summary["provider"]["evidence_coverage_status"] == "degraded"
+    assert summary["provider"]["visual_coverage_status"] == "degraded"
+    assert "final_raw_visual_recheck_missing" in summary["ai_summary"]["quality_audit"]["conflict_flags"]
     assert summary["ai_summary"]["quality_audit"]["needs_manual_review"] is True

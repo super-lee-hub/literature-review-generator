@@ -69,8 +69,7 @@ _DEFAULT_SELECTION_POLICY: Dict[str, Any] = {
         "page_jpeg_quality": 92,
         "crop_format": "png",
         "crop_padding_ratio": 0.04,
-        "max_request_image_bytes": 36000000,
-        "max_single_image_bytes": 24000000,
+        "max_visual_artifact_bytes": 24000000,
     },
     "rendering_safety": {
         "max_rendered_pixels": 16000000,
@@ -144,12 +143,14 @@ def _paper_hash(paper_key: str) -> str:
     return hashlib.sha256(paper_key.encode("utf-8")).hexdigest()[:16]
 
 
-def _normalize_image_format(value: Any, default: str) -> str:
+def _normalize_image_format(value: Any, default: str, *, strict: bool = False) -> str:
     normalized = str(value or default).strip().lower()
     if normalized in {"jpg", "jpeg"}:
         return "jpeg"
     if normalized == "png":
         return "png"
+    if strict:
+        raise ValueError(f"unsupported visual image format: {value}")
     return default
 
 
@@ -228,6 +229,9 @@ class Stage1VisualArtifactBuilder:
         policy = json.loads(json.dumps(_DEFAULT_SELECTION_POLICY))
         configured_visual = dict(visual_settings or {})
         rendering = policy["rendering"]
+        render_all = str(configured_visual.get("render_all_nonblank_pages") or "true").strip().casefold()
+        if render_all not in {"true", "1", "yes", "on"}:
+            raise ValueError("render_all_nonblank_pages=false is unsupported")
         for key, target in (
             ("page_long_edge_px", "page_long_edge_px"),
             ("crop_long_edge_px", "crop_long_edge_px"),
@@ -237,21 +241,27 @@ class Stage1VisualArtifactBuilder:
             ("page_jpeg_quality", "page_jpeg_quality"),
             ("crop_format", "crop_format"),
             ("crop_padding_ratio", "crop_padding_ratio"),
-            ("max_request_image_bytes", "max_request_image_bytes"),
-            ("max_single_image_bytes", "max_single_image_bytes"),
+            ("max_visual_artifact_bytes", "max_visual_artifact_bytes"),
         ):
             if key in configured_visual and str(configured_visual[key]).strip() != "":
-                try:
-                    rendering[target] = float(configured_visual[key]) if "." in str(configured_visual[key]) else int(configured_visual[key])
-                except (TypeError, ValueError):
-                    pass
-        rendering["page_format"] = _normalize_image_format(rendering.get("page_format"), "jpeg")
-        rendering["crop_format"] = _normalize_image_format(rendering.get("crop_format"), "png")
+                raw_value = configured_visual[key]
+                if key in {"page_format", "crop_format"}:
+                    rendering[target] = _normalize_image_format(raw_value, rendering[target], strict=True)
+                else:
+                    try:
+                        rendering[target] = (
+                            float(raw_value) if "." in str(raw_value) else int(raw_value)
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"invalid Stage1_Visual.{key}: {raw_value}") from exc
+        rendering["page_format"] = _normalize_image_format(rendering.get("page_format"), "jpeg", strict=True)
+        rendering["crop_format"] = _normalize_image_format(rendering.get("crop_format"), "png", strict=True)
         policy["rendering_safety"]["max_rendered_pixels"] = int(
             rendering.get("page_max_pixels") or policy["rendering_safety"]["max_rendered_pixels"]
         )
         policy["rendering_safety"]["max_visual_artifact_bytes"] = int(
-            rendering.get("max_single_image_bytes") or policy["rendering_safety"]["max_visual_artifact_bytes"]
+            rendering.get("max_visual_artifact_bytes")
+            or policy["rendering_safety"]["max_visual_artifact_bytes"]
         )
         preprocess_metadata = dict(preprocess_metadata or {})
         artifact_hash = _paper_hash(paper_key)

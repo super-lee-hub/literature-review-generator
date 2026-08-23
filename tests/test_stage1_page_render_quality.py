@@ -8,7 +8,8 @@ import pytest
 
 import preprocess.visual_artifacts as visual_artifacts
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
-from tests.test_current_stage1_generation import _canonical_summary, _service
+from services.artifact_registry import file_sha256
+from tests.test_current_stage1_generation import _canonical_summary, _service, _write_visual_pdf
 
 
 def test_page_snapshots_are_clear_bounded_and_hashed(tmp_path: Path) -> None:
@@ -104,3 +105,47 @@ def test_page_and_crop_pixel_budgets_are_applied_independently(
     )
 
     assert captured == [(True, 111), (False, 222)]
+
+
+def test_configured_png_pages_and_jpeg_crops_report_render_truth(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "format-truth.pdf"
+    _write_visual_pdf(pdf_path)
+
+    def reader(**kwargs):
+        return {"status": "success", "content": _canonical_summary()}
+
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader,
+        config_overrides={
+            "Stage1_Visual": {
+                "enabled": "true",
+                "page_format": "png",
+                "crop_format": "jpeg",
+                "page_jpeg_quality": "80",
+            },
+            "Stage1_Input": {"send_selected_visuals": "true"},
+            "Primary_Reader_API": {
+                "model": "deepseek-v4-flash-vision-exp",
+                "api_base": "https://api.deepseek.com",
+                "provider_family": "deepseek",
+            },
+        },
+    )
+    service.run(bundle)
+    manifest_record = next(
+        record for record in service.registry.list_records() if record.artifact_type == "visual_manifest"
+    )
+    payload = json.loads(Path(manifest_record.path).read_text(encoding="utf-8"))
+    pages = [item for item in payload["visuals"] if item["artifact_type"] == "page_snapshot"]
+    crops = [item for item in payload["visuals"] if item["artifact_type"] != "page_snapshot"]
+
+    assert pages and crops
+    assert all(item["image_format"] == "png" and Path(item["image_path"]).suffix == ".png" for item in pages)
+    assert all(item["image_format"] == "jpg" and Path(item["image_path"]).suffix == ".jpg" for item in crops)
+    for item in [*pages, *crops]:
+        path = Path(item["image_path"])
+        assert path.is_file()
+        assert item["image_bytes"] == path.stat().st_size
+        assert item["image_sha256"] == file_sha256(str(path))

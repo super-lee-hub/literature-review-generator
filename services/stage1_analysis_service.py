@@ -66,6 +66,7 @@ from services.stage1_reuse import (
     STAGE1_REUSE_POLICY,
     Stage1ReusableSummaryBindingV1,
     Stage1ReusableSummaryManifestV1,
+    Stage1VisualEvidenceQualificationV1,
     Stage1ReuseEligibilityV1,
     build_binding_hash,
     evaluate_stage1_reuse,
@@ -563,6 +564,9 @@ class Stage1AnalysisService:
                 "provider_transport_count": 1,
                 "prompt_authority": prompt_authority,
                 "visual_coverage_hash": hash_json(visual_identity.get("coverage_plan") or {}),
+                "require_complete_visual_coverage": str(
+                    stage1_input_settings.get("require_complete_visual_coverage", "true")
+                ).strip().casefold() not in {"false", "0", "no", "off"},
             },
         )
 
@@ -850,6 +854,7 @@ class Stage1AnalysisService:
                 summary_schema_hash=closure_payload.summary_schema_hash,
                 visual_input_manifest_hash=closure_payload.visual_input_manifest_hash,
                 visual_coverage_hash=closure_payload.visual_coverage_hash,
+                visual_evidence_qualification=closure_payload.visual_evidence_qualification,
                 provider=closure_payload.provider,
                 model=closure_payload.model,
                 endpoint_type=closure_payload.endpoint_type,
@@ -899,6 +904,8 @@ class Stage1AnalysisService:
                 self.registry.get(closure_record.artifact_id),
                 ledger_record,
                 self.registry.get(closure_payload.evidence_manifest_id),
+                self._visual_coverage_records.get(paper_key),
+                *self._visual_observation_records.get(paper_key, []),
             ):
                 if dependency_record is None or dependency_record.status != "ready":
                     continue
@@ -1593,6 +1600,7 @@ class Stage1AnalysisService:
                 source_authority_registry_path=str(
                     reuse_payload.get("source_authority_registry_path") or ""
                 ),
+                visual_evidence_qualification=prior_binding.visual_evidence_qualification,
                 extra={
                     **dict(prepared.current_binding.extra),
                 },
@@ -1770,40 +1778,83 @@ class Stage1AnalysisService:
             transport_metadata.get("images_actually_sent_count") or 0
         )
         coverage["transport_omissions"] = list(transport_metadata.get("omissions") or [])
+        required_page_ids = {
+            str(value) for value in (coverage.get("required_page_ids") or []) if str(value)
+        }
         if not prepared.built_input.visual_scan_batches:
-            direct_complete = bool(planned_visual_ids) and (
-                set(actual_visual_ids) >= set(planned_visual_ids)
-                and not transport_metadata.get("omissions")
-                and engine_type == "primary"
-            )
-            if planned_visual_ids:
-                coverage["observed_visual_ids"] = sorted(set(actual_visual_ids))
-                coverage["visually_scanned_pages"] = len(
-                    {
-                        int(ref.get("page_no") or 0)
-                        for ref in (prepared.built_input.selected_visual_refs or [])
-                        if str(ref.get("visual_id") or "") in set(actual_visual_ids)
-                    }
-                )
-                coverage["coverage_status"] = "complete" if direct_complete else "partial"
-            elif coverage.get("coverage_status") == "planned":
-                coverage["coverage_status"] = "complete"
-        elif engine_type == "backup" and planned_visual_ids:
-            # The backup route is intentionally text-only.  Even when prior
-            # scan artifacts are complete, the final provider transport cannot
-            # be labeled multimodal or final-transport complete.
-            coverage["scan_coverage_status"] = str(
-                coverage.get("coverage_status") or "partial"
-            )
-            coverage["coverage_status"] = "partial"
-        if coverage.get("coverage_status") != "complete":
+            # Short papers use the final synthesis request as the only visual
+            # transport.  That is a raw recheck, not a page scan.
+            coverage["sent_visual_ids"] = sorted(set(actual_visual_ids))
+            coverage.setdefault("observed_visual_ids", [])
+            coverage["scan_coverage_status"] = "not_required"
+        scan_status = str(coverage.get("scan_coverage_status") or "not_required")
+        successful_mode = str(
+            transport_metadata.get("successful_input_mode") or "text_only"
+        )
+        final_modality = successful_mode if successful_mode in {
+            "multimodal", "text_only", "pdf_plus_text"
+        } else "text_only"
+        coverage["final_synthesis_modality"] = final_modality
+        final_omissions = list(transport_metadata.get("omissions") or [])
+        if not required_page_ids:
+            raw_recheck_status = "not_required"
+        elif final_modality == "multimodal" and not final_omissions and actual_visual_ids:
+            raw_recheck_status = "complete"
+        elif engine_type == "backup":
+            raw_recheck_status = "not_run_fallback"
+        else:
+            raw_recheck_status = "partial" if actual_visual_ids else "not_run_fallback"
+        coverage["final_raw_visual_recheck_status"] = raw_recheck_status
+        scan_incomplete = bool(
+            scan_status in {"partial", "failed"}
+            or (prepared.built_input.visual_scan_batches and required_page_ids - {
+                str(value) for value in (coverage.get("observed_visual_ids") or [])
+            })
+            or coverage.get("failed_pages")
+            or coverage.get("omissions")
+        )
+        direct_incomplete = bool(
+            not prepared.built_input.visual_scan_batches
+            and required_page_ids
+            and final_modality != "multimodal"
+            and engine_type != "backup"
+            and final_omissions
+        )
+        if scan_incomplete or direct_incomplete:
+            evidence_status = "incomplete"
+        elif not required_page_ids:
+            evidence_status = "complete"
+        elif final_modality == "multimodal" and raw_recheck_status == "complete":
+            evidence_status = "complete"
+        else:
+            # A successful text-only backup after a complete page scan is a
+            # degraded final synthesis, not a failed page scan.
+            evidence_status = "degraded"
+        coverage["evidence_coverage_status"] = evidence_status
+        coverage["coverage_status"] = evidence_status
+        if evidence_status != "complete":
             quality_audit = dict(ai_summary.get("quality_audit") or {})
             quality_audit["needs_manual_review"] = True
             flags = list(quality_audit.get("conflict_flags") or [])
-            if "visual_coverage_incomplete" not in flags:
-                flags.append("visual_coverage_incomplete")
+            flag = (
+                "visual_coverage_incomplete"
+                if evidence_status == "incomplete"
+                else "final_raw_visual_recheck_missing"
+            )
+            if flag not in flags:
+                flags.append(flag)
             quality_audit["conflict_flags"] = flags
             ai_summary["quality_audit"] = quality_audit
+        coverage = self._publish_final_visual_coverage(prepared, coverage)
+        qualification = self._build_visual_evidence_qualification(prepared, coverage)
+        prepared = replace(
+            prepared,
+            built_input=replace(prepared.built_input, visual_coverage=coverage),
+            current_binding=replace(
+                prepared.current_binding,
+                visual_evidence_qualification=qualification,
+            ),
+        )
         fallback_reason = str(provider_result.get("fallback_reason") or "").strip()
         source_record, generated_binding = self._publish_generated_source_artifact(
             prepared,
@@ -1840,7 +1891,19 @@ class Stage1AnalysisService:
                 "successful_engine": engine_type,
                 "transport_omissions": list(transport_metadata.get("omissions") or []),
                 "visual_coverage_status": str(coverage.get("coverage_status") or ""),
-                "visual_scan_coverage_status": str(coverage.get("scan_coverage_status") or coverage.get("coverage_status") or ""),
+                "visual_scan_coverage_status": str(
+                    coverage.get("scan_coverage_status") or ""
+                ),
+                "scan_coverage_status": str(coverage.get("scan_coverage_status") or ""),
+                "final_synthesis_modality": str(
+                    coverage.get("final_synthesis_modality") or ""
+                ),
+                "final_raw_visual_recheck_status": str(
+                    coverage.get("final_raw_visual_recheck_status") or ""
+                ),
+                "evidence_coverage_status": str(
+                    coverage.get("evidence_coverage_status") or ""
+                ),
             },
             "stage1_reuse": {
                 "decision": (
@@ -1886,6 +1949,15 @@ class Stage1AnalysisService:
         capability = detect_multimodal_capability(prepared.primary_config)
         if not batches:
             self._visual_observation_records[paper_key] = []
+            coverage.update(
+                {
+                    "scan_coverage_status": "not_required",
+                    "coverage_status": "not_required",
+                    "observation_artifact_ids": [],
+                    "observation_artifact_hashes": [],
+                    "observation_artifact_paths": [],
+                }
+            )
             return prepared, coverage, []
 
         max_request, max_single = normalize_visual_byte_budgets(
@@ -2116,7 +2188,9 @@ class Stage1AnalysisService:
                 "failed_pages": failed_count,
                 "page_status": page_status,
                 "scan_batches": scan_results,
+                "observation_artifact_ids": [record.artifact_id for record in observation_records],
                 "observation_artifact_hashes": [record.content_hash for record in observation_records],
+                "observation_artifact_paths": [record.path for record in observation_records],
                 "scan_coverage_status": scan_status,
                 "coverage_status": scan_status,
                 "omissions": [
@@ -2134,11 +2208,106 @@ class Stage1AnalysisService:
             coverage=coverage,
             observation_records=observation_records,
         )
-        if coverage_record is not None:
-            coverage["coverage_artifact_path"] = coverage_record.path
-            coverage["coverage_artifact_hash"] = coverage_record.content_hash
-            self._visual_coverage_records[paper_key] = coverage_record
         return prepared, coverage, observations
+
+    def _build_visual_evidence_qualification(
+        self,
+        prepared: _PreparedStage1Item,
+        coverage: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Reduce scan, transport, and final-modality facts into one typed gate."""
+
+        page_status = [item for item in coverage.get("page_status") or [] if isinstance(item, Mapping)]
+        required_page_ids = tuple(
+            str(item) for item in (coverage.get("required_page_ids") or []) if str(item)
+        )
+        required_page_set = set(required_page_ids)
+        sent_page_ids = tuple(
+            str(item)
+            for item in (coverage.get("sent_visual_ids") or [])
+            if str(item) in required_page_set
+        )
+        observed_page_ids = tuple(
+            str(item)
+            for item in (coverage.get("observed_visual_ids") or [])
+            if str(item) in required_page_set
+        )
+        render_failed_page_ids = tuple(
+            str(int(item.get("page_no") or 0))
+            for item in page_status
+            if str(item.get("status") or "") == "render_failed"
+        )
+        scan_failed_page_ids = tuple(
+            str(int(item.get("page_no") or 0))
+            for item in page_status
+            if str(item.get("status") or "") == "scan_failed"
+        )
+        return Stage1VisualEvidenceQualificationV1(
+            coverage_artifact_id=str(coverage.get("coverage_artifact_id") or ""),
+            coverage_artifact_hash=str(coverage.get("coverage_artifact_hash") or ""),
+            coverage_artifact_path=str(coverage.get("coverage_artifact_path") or ""),
+            observation_artifact_ids=tuple(
+                str(item) for item in (coverage.get("observation_artifact_ids") or []) if str(item)
+            ),
+            observation_artifact_hashes=tuple(
+                str(item) for item in (coverage.get("observation_artifact_hashes") or []) if str(item)
+            ),
+            observation_artifact_paths=tuple(
+                str(item) for item in (coverage.get("observation_artifact_paths") or []) if str(item)
+            ),
+            required_nonblank_page_count=int(
+                coverage.get("required_nonblank_page_count")
+                or coverage.get("nonblank_pages")
+                or len(required_page_ids)
+                or 0
+            ),
+            required_page_ids=required_page_ids,
+            sent_page_ids=sent_page_ids,
+            observed_page_ids=observed_page_ids,
+            render_failed_page_ids=render_failed_page_ids,
+            scan_failed_page_ids=scan_failed_page_ids,
+            transport_omissions=tuple(
+                dict(item)
+                for item in (
+                    list(coverage.get("omissions") or [])
+                    + list(coverage.get("transport_omissions") or [])
+                )
+                if isinstance(item, Mapping)
+            ),
+            scan_coverage_status=str(coverage.get("scan_coverage_status") or "not_required"),
+            final_synthesis_modality=str(
+                coverage.get("final_synthesis_modality") or "text_only"
+            ),
+            final_raw_visual_recheck_status=str(
+                coverage.get("final_raw_visual_recheck_status") or "not_required"
+            ),
+            evidence_coverage_status=str(
+                coverage.get("evidence_coverage_status") or "incomplete"
+            ),
+            require_complete_visual_coverage=str(
+                prepared.stage1_input_settings.get("require_complete_visual_coverage", "true")
+            ).strip().casefold() not in {"false", "0", "no", "off"},
+        ).to_dict()
+
+    def _publish_final_visual_coverage(
+        self,
+        prepared: _PreparedStage1Item,
+        coverage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Publish the final reducer state after synthesis transport is known."""
+
+        paper_key = self._paper_key(prepared.item)
+        record = self._publish_visual_coverage(
+            prepared=prepared,
+            coverage=coverage,
+            observation_records=self._visual_observation_records.get(paper_key, []),
+        )
+        if record is not None:
+            coverage["coverage_artifact_id"] = record.artifact_id
+            coverage["coverage_artifact_path"] = record.path
+            coverage["coverage_artifact_hash"] = record.content_hash
+            self._visual_coverage_records[paper_key] = record
+        return coverage
 
     def _call_visual_scan(
         self,
@@ -2261,21 +2430,56 @@ class Stage1AnalysisService:
             "paper_key": self._paper_key(prepared.item),
             **dict(coverage),
         }
+        # The artifact identity belongs to the Registry record being created.
+        # Never embed a previous publication's identity in the new payload:
+        # doing so makes the final reducer self-reference stale bytes and
+        # weakens the typed reuse qualification.
+        for key in (
+            "coverage_artifact_id",
+            "coverage_artifact_path",
+            "coverage_artifact_hash",
+        ):
+            payload.pop(key, None)
         digest = hash_json(payload)
         manifest_record = self._record_for_path(prepared.built_input.visual_manifest_path)
         dependencies = [ArtifactDependencyRefV2.from_record(manifest_record)] if manifest_record is not None else []
         dependencies.extend(ArtifactDependencyRefV2.from_record(record) for record in observation_records)
+        artifact_id = f"stage1_visual_coverage:final:{digest[:24]}"
+        artifact_path = self.workspace.artifact_path(f"stage1_visuals/coverage_{digest[:24]}.json")
+        # A previous run may have left this deterministic identity pointing at
+        # bytes that were later tampered with or deleted.  Do not silently
+        # reuse that Registry record; publish a fresh, traceable repair
+        # identity so the new provider run can close its dependency graph.
+        existing = self.registry.get(artifact_id)
+        if existing is not None:
+            try:
+                existing_is_intact = (
+                    existing.status == "ready"
+                    and Path(existing.path).is_file()
+                    and file_sha256(existing.path) == existing.content_hash
+                )
+            except (OSError, TypeError, ValueError):
+                existing_is_intact = False
+            if not existing_is_intact:
+                repair_suffix = hashlib.sha256(
+                    f"{artifact_id}|{existing.content_hash}|{file_sha256(existing.path)}|"
+                    f"{len(self.registry.list_records())}".encode("utf-8")
+                ).hexdigest()[:12]
+                artifact_id = f"{artifact_id}:repair:{repair_suffix}"
+                artifact_path = self.workspace.artifact_path(
+                    f"stage1_visuals/coverage_{digest[:24]}_repair_{repair_suffix}.json"
+                )
         try:
             return publish_json_artifact(
                 self.publication_context,
                 self.registry,
-                self.workspace.artifact_path(f"stage1_visuals/coverage_{digest[:24]}.json"),
+                artifact_path,
                 payload,
                 artifact_role="stage1_visual_coverage",
                 artifact_type="stage1_visual_coverage",
                 artifact_version="v1",
                 producer="services.stage1_analysis_service.Stage1AnalysisService",
-                artifact_id=f"stage1_visual_coverage:final:{digest[:24]}",
+                artifact_id=artifact_id,
                 depends_on=dependencies,
             )
         except (OSError, RegistryError, TypeError, ValueError):
@@ -2296,6 +2500,7 @@ class Stage1AnalysisService:
     @staticmethod
     def _coverage_identity_hash(coverage: Mapping[str, Any]) -> str:
         normalized = dict(coverage)
+        normalized.pop("coverage_artifact_id", None)
         normalized.pop("coverage_artifact_path", None)
         normalized.pop("coverage_artifact_hash", None)
         return hash_json(normalized)

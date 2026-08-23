@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -318,7 +319,15 @@ def select_final_visual_refs_after_scan(
     *,
     max_refs: int = 8,
 ) -> list[dict[str, Any]]:
-    """Select raw crops/pages after scan evidence exists, deterministically."""
+    """Select raw crops/pages after scan evidence exists, deterministically.
+
+    The first scan pass is intentionally page-only.  Crops therefore do not
+    have a direct observation of their own; a crop is eligible when it belongs
+    to a page with a validated observation and that observation contains
+    evidence appropriate for the crop type.  This keeps the scan budget page
+    based while allowing the final synthesis to receive a higher-resolution
+    table, figure, or formula crop.
+    """
 
     limit = max(0, int(max_refs))
     if limit == 0:
@@ -328,29 +337,236 @@ def select_final_visual_refs_after_scan(
         for item in observations
         if isinstance(item, Mapping) and str(item.get("visual_id") or "")
     }
+    page_refs_by_page = {
+        int(ref.get("page_no") or 0): dict(ref)
+        for ref in visual_refs
+        if isinstance(ref, Mapping)
+        and str(ref.get("artifact_type") or "") == "page_snapshot"
+        and int(ref.get("page_no") or 0) > 0
+    }
+    page_observations_by_page: dict[int, dict[str, Any]] = {}
+    for observation in by_id.values():
+        page_no = int(observation.get("page_no") or 0)
+        if page_no <= 0:
+            continue
+        current = page_observations_by_page.get(page_no)
+        # Prefer the observation whose id is also the page visual id.  This
+        # makes the page -> crop provenance deterministic when a producer
+        # returns an additional observation for the same page.
+        page_ref = page_refs_by_page.get(page_no)
+        if current is None or (
+            page_ref is not None
+            and str(observation.get("visual_id") or "")
+            == str(page_ref.get("visual_id") or "")
+        ):
+            page_observations_by_page[page_no] = observation
+
+    def _items(observation: Mapping[str, Any], field: str) -> list[str]:
+        value = observation.get(field)
+        if not isinstance(value, (list, tuple)):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _joined_observation_text(observation: Mapping[str, Any]) -> str:
+        fields = (
+            "visible_text", "axes_or_headers", "legend_or_notes",
+            "quantitative_values", "relationships", "layout_observations",
+            "ocr_conflicts", "title_or_caption",
+        )
+        return " ".join(
+            [str(observation.get("title_or_caption") or "")] + [
+                text
+                for field in fields
+                if field != "title_or_caption"
+                for text in _items(observation, field)
+            ]
+        ).casefold()
+
+    def _bbox(value: Any) -> tuple[float, float, float, float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            return None
+        try:
+            x0, y0, x1, y1 = (float(item) for item in value)
+        except (TypeError, ValueError):
+            return None
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return x0, y0, x1, y1
+
+    def _overlap_ratio(left: Mapping[str, Any], right: Mapping[str, Any]) -> float:
+        first = _bbox(left.get("bbox"))
+        second = _bbox(right.get("bbox"))
+        if first is None or second is None:
+            return 0.0
+        ix0, iy0 = max(first[0], second[0]), max(first[1], second[1])
+        ix1, iy1 = min(first[2], second[2]), min(first[3], second[3])
+        intersection = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+        if intersection <= 0:
+            return 0.0
+        first_area = (first[2] - first[0]) * (first[3] - first[1])
+        second_area = (second[2] - second[0]) * (second[3] - second[1])
+        return intersection / max(min(first_area, second_area), 1e-9)
+
+    def _score(ref: Mapping[str, Any], observation: Mapping[str, Any] | None) -> tuple[float, dict[str, float], str]:
+        artifact_type = str(ref.get("artifact_type") or "page_snapshot")
+        components: dict[str, float] = {
+            # The pre-scan heuristic is only a tie-breaker.  A crop with
+            # substantive page evidence must beat a decorative crop whose
+            # heuristic happened to be large.
+            "selection_prior": min(max(float(ref.get("selection_score") or 0.0), 0.0), 4.0) * 0.25,
+            "quantitative_values": 0.0,
+            "relationships": 0.0,
+            "axes_or_headers": 0.0,
+            "visible_text": 0.0,
+            "layout_observations": 0.0,
+            "ocr_conflicts": 0.0,
+            "manual_review": 0.0,
+            "confidence": 0.0,
+            "artifact_type_match": 0.0,
+            "crop_detail": 0.0,
+            "caption_linkage": 0.0,
+        }
+        reasons: list[str] = []
+        if observation is None:
+            reasons.append("page snapshot fallback: no validated page observation")
+            return components["selection_prior"], components, "; ".join(reasons)
+
+        quantitative = _items(observation, "quantitative_values")
+        relationships = _items(observation, "relationships")
+        axes = _items(observation, "axes_or_headers")
+        visible = _items(observation, "visible_text")
+        layout = _items(observation, "layout_observations")
+        conflicts = _items(observation, "ocr_conflicts")
+        text = _joined_observation_text(observation)
+        components["quantitative_values"] = 3.0 * len(quantitative)
+        components["relationships"] = 3.0 * len(relationships)
+        components["axes_or_headers"] = 1.5 * len(axes)
+        components["visible_text"] = 0.25 * len(visible)
+        components["layout_observations"] = 1.5 * len(layout)
+        components["ocr_conflicts"] = 1.25 * len(conflicts)
+        if observation.get("needs_manual_review"):
+            components["manual_review"] = 2.5
+            reasons.append("manual review requested")
+        components["confidence"] = {
+            "high": 1.5,
+            "medium": 0.75,
+            "low": 0.25,
+        }.get(str(observation.get("confidence") or ""), 0.0)
+
+        if artifact_type == "table_crop":
+            if quantitative or axes or "table" in text or "表" in text:
+                components["artifact_type_match"] = 4.0
+                reasons.append("table crop matches quantitative/header evidence")
+        elif artifact_type == "figure_crop":
+            mechanism_terms = (
+                "relationship", "mechanism", "framework", "process", "workflow",
+                "diagram", "node", "arrow", "causal", "pathway", "关系", "机制",
+                "框架", "流程", "箭头",
+            )
+            if relationships or any(term in text for term in mechanism_terms):
+                components["artifact_type_match"] = 4.5
+                reasons.append("figure crop matches relationship/mechanism evidence")
+            elif quantitative or axes:
+                components["artifact_type_match"] = 1.0
+        elif artifact_type == "formula_crop":
+            formula_terms = (
+                "equation", "formula", "regression", "coefficient", "beta", "β",
+                "∑", "∫", "公式", "方程", "回归",
+            )
+            if layout or any(term in text for term in formula_terms):
+                components["artifact_type_match"] = 5.0
+                reasons.append("formula crop matches equation/layout evidence")
+        else:
+            components["artifact_type_match"] = 0.5
+
+        if artifact_type != "page_snapshot":
+            components["crop_detail"] = 2.0
+            reasons.append("higher-resolution child crop available")
+        caption = " ".join(
+            str(ref.get(key) or "") for key in ("caption_excerpt", "nearby_text_excerpt")
+        ).casefold()
+        if caption and any(token in text for token in re.findall(r"[a-z0-9_\u4e00-\u9fff]+", caption)):
+            components["caption_linkage"] = 1.0
+            reasons.append("crop caption/nearby text linked to page observation")
+        if quantitative:
+            reasons.append(f"{len(quantitative)} quantitative value(s) observed")
+        if relationships:
+            reasons.append(f"{len(relationships)} relationship(s) observed")
+        if conflicts:
+            reasons.append(f"{len(conflicts)} OCR conflict(s) retained")
+        if not reasons:
+            reasons.append("page observation retained as bounded visual evidence")
+        return sum(components.values()), components, "; ".join(reasons)
+
     candidates: list[tuple[float, int, str, dict[str, Any]]] = []
     for ref in visual_refs:
         if not isinstance(ref, Mapping):
             continue
         visual_id = str(ref.get("visual_id") or "")
-        observation = by_id.get(visual_id)
-        if observation is None:
+        page_no = int(ref.get("page_no") or 0)
+        artifact_type = str(ref.get("artifact_type") or "page_snapshot")
+        direct_observation = by_id.get(visual_id)
+        page_ref = page_refs_by_page.get(page_no)
+        page_observation = page_observations_by_page.get(page_no)
+        observation = direct_observation or page_observation
+        # A child crop is scored from its source page observation.  A crop
+        # without that source is not silently promoted; the page snapshot is
+        # the only safe fallback for that page.
+        if artifact_type != "page_snapshot" and direct_observation is None and page_observation is None:
             continue
-        score = float(ref.get("selection_score") or 0.0)
-        score += 2.0 * len(observation.get("quantitative_values") or [])
-        score += 1.5 * len(observation.get("relationships") or [])
-        score += 1.0 * len(observation.get("axes_or_headers") or [])
-        score += 0.5 * len(observation.get("visible_text") or [])
-        score += 2.0 if observation.get("needs_manual_review") else 0.0
-        score += {"high": 1.5, "medium": 1.0, "low": 0.25}.get(str(observation.get("confidence") or ""), 0.0)
-        score += 0.5 if str(ref.get("artifact_type") or "") != "page_snapshot" else 0.0
-        candidates.append((-score, int(ref.get("page_no") or 0), visual_id, dict(ref)))
+        score, components, reason = _score(ref, observation)
+        if artifact_type != "page_snapshot":
+            evidence_strength = sum(
+                components[name]
+                for name in (
+                    "quantitative_values", "relationships", "axes_or_headers",
+                    "layout_observations", "ocr_conflicts", "artifact_type_match",
+                )
+            )
+            if evidence_strength <= 0.0:
+                continue
+        selected_ref = dict(ref)
+        source_page_visual_id = str(
+            (page_ref or {}).get("visual_id") or ref.get("visual_id") or ""
+        )
+        source_observation_visual_id = str(
+            (observation or {}).get("visual_id") or ""
+        )
+        selected_ref.update(
+            {
+                "post_scan_score": round(score, 4),
+                "score_components": {key: round(value, 4) for key, value in components.items()},
+                "selection_reason": reason,
+                "source_page_visual_id": source_page_visual_id,
+                "source_observation_visual_id": source_observation_visual_id,
+            }
+        )
+        candidates.append((-score, page_no, visual_id, selected_ref))
     candidates.sort(key=lambda item: item[:3])
     selected: list[dict[str, Any]] = []
     seen_groups: set[str] = set()
     for _neg_score, _page_no, _visual_id, ref in candidates:
         group = str(ref.get("dedupe_group_id") or "")
         if group and group in seen_groups:
+            continue
+        artifact_type = str(ref.get("artifact_type") or "page_snapshot")
+        page_no = int(ref.get("page_no") or 0)
+        if artifact_type != "page_snapshot":
+            if any(
+                str(item.get("artifact_type") or "") != "page_snapshot"
+                and int(item.get("page_no") or 0) == page_no
+                and _overlap_ratio(item, ref) >= 0.72
+                for item in selected
+            ):
+                continue
+        elif any(
+            str(item.get("artifact_type") or "") != "page_snapshot"
+            and int(item.get("page_no") or 0) == page_no
+            and float(item.get("post_scan_score") or 0.0) >= float(ref.get("post_scan_score") or 0.0) + 2.0
+            for item in selected
+        ):
+            # A substantive crop is a better representation of the same page
+            # than a low-resolution full-page duplicate.
             continue
         selected.append(ref)
         if group:

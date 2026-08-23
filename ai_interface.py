@@ -840,10 +840,26 @@ def _call_ai_api_detailed_uninstrumented(
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
+    removed_compat_params: Set[Any] = set()
+
+    def mutation_label(value: Any) -> str:
+        if isinstance(value, tuple) and tuple(str(item) for item in value) == ("reasoning", "display"):
+            return "removed_reasoning_display"
+        text = str(value or "").strip()
+        if text == "reasoning_effort:max_to_high":
+            return "reasoning_effort:max->high"
+        if text.startswith("removed_"):
+            return text
+        return f"removed_{text}" if text else ""
 
     def finish(result: Dict[str, Any]) -> Dict[str, Any]:
         enriched = dict(result)
         enriched["attempts"] = max(1, attempts_used)
+        enriched["fallback_or_payload_mutations"] = sorted(
+            label
+            for label in (mutation_label(item) for item in removed_compat_params)
+            if label
+        )
         return enriched
 
     try:
@@ -918,7 +934,6 @@ def _call_ai_api_detailed_uninstrumented(
                 return attempts_used < max_retries
             return attempt < max_retries
 
-        removed_compat_params: Set[Any] = set()
         while can_start_attempt():
             attempt += 1
             attempts_used += 1

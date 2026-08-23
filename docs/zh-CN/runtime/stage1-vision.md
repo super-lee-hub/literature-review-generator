@@ -21,6 +21,36 @@ Stage 1 始终把 MinerU 或其他预处理器生成的 normalized full text 作
   以及不超过 `final_image_refs_max` 张高价值 crop。二阶段选 crop 只决定最终复核，
   不决定哪些页面曾经被视觉模型看见。
 
+## 页到 crop 的归因与 reuse 资格
+
+第一遍扫描严格以页面为单位：长文覆盖只发送并观察 `page_snapshot`。观察结果
+通过严格校验后，才允许从同页选择 `table_crop`、`figure_crop` 或
+`formula_crop`。子 crop 必须携带 `source_page_visual_id`、
+`source_observation_visual_id`、`post_scan_score` 和评分分量；没有已验证的
+来源页 observation 的 crop 不得晋级到最终 synthesis。因此最终多模态请求中
+会出现带页面标签的确切本地 crop 路径，但扫描预算仍按页面计算。
+
+最终 reducer 会在 typed `visual_evidence_qualification` binding 中记录四个
+相互独立的事实：
+
+- `scan_coverage_status`：`complete`、`partial`、`failed`、`not_required`；
+- `final_synthesis_modality`：`multimodal`、`text_only`、`pdf_plus_text`；
+- `final_raw_visual_recheck_status`：`complete`、`partial`、
+  `not_run_fallback`、`not_required`；
+- `evidence_coverage_status`：`complete`、`degraded`、`incomplete`。
+
+旧的多义 `coverage_status` 只保留为兼容别名。完整页扫描后如果最终走 backup，
+仍保持 `scan_coverage_status=complete`，但记录
+`final_synthesis_modality=text_only`、
+`final_raw_visual_recheck_status=not_run_fallback`、
+`evidence_coverage_status=degraded`，并要求人工复核。
+
+当 `require_complete_visual_coverage=true` 时，exact reuse 必须重新验证
+Registry record、内容 hash、JSON type/version 以及 coverage/observation 文件本身。
+部分/失败扫描、必需页遗漏，以及 coverage 或 observation 被删除、篡改、失效，
+都会阻断 reuse 并要求新的 provider 工作。设为 `false` 是显式的降级复用策略：
+不会抹掉状态或人工复核标记，引用的产物仍必须通过完整性验证。
+
 ## Provider 与 fallback
 
 DeepSeek Vision 遵循官方 OpenAI-compatible Chat Completions 格式：`text` block 和

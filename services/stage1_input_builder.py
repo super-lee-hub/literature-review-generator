@@ -139,6 +139,12 @@ class Stage1InputBuilder:
 
         send_extracted_text = _as_bool(stage1_settings.get("send_extracted_text"), default=True)
         send_selected_visuals = _as_bool(stage1_settings.get("send_selected_visuals"), default=True)
+        mode = str(stage1_settings.get("mode") or "vision_first").strip().casefold()
+        if mode and mode != "vision_first":
+            raise ValueError("Stage1_Input.mode must be vision_first")
+        image_transport = str(stage1_settings.get("image_transport") or "base64").strip().casefold()
+        if image_transport and image_transport != "base64":
+            raise ValueError("Stage1_Input.image_transport must be base64")
         send_original_pdf = str(stage1_settings.get("send_original_pdf") or "never").strip().lower()
         if send_original_pdf not in {"never", "auto", "always"}:
             send_original_pdf = "never"
@@ -170,6 +176,12 @@ class Stage1InputBuilder:
             key=lambda item: (-float(item.get("selection_score") or 0.0), int(item.get("page_no") or 0)),
         )
         nonblank_page_count = int(visual_coverage.get("nonblank_pages") or len(page_refs))
+        visual_coverage["required_nonblank_page_count"] = nonblank_page_count
+        visual_coverage["required_page_ids"] = [
+            str(item.get("visual_id") or "")
+            for item in page_refs
+            if str(item.get("visual_id") or "")
+        ]
         page_total_bytes = sum(
             estimate_encoded_image_bytes(int(item.get("image_bytes") or 0))
             for item in page_refs
@@ -219,6 +231,10 @@ class Stage1InputBuilder:
         visual_coverage.setdefault("scan_batches", [])
         visual_coverage.setdefault("planned_visual_ids", [str(item.get("visual_id") or "") for item in page_refs])
         visual_coverage.setdefault("coverage_status", "planned" if page_refs else "complete")
+        visual_coverage.setdefault(
+            "scan_coverage_status",
+            "planned" if page_refs and not short_path else "not_required",
+        )
 
         if not send_selected_visuals:
             selected_visual_refs = []

@@ -54,7 +54,16 @@ def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
     # 选择信息
     normalized["selection_reason"] = visual.get("selection_reason") or ""
     normalized["selection_score"] = float(visual.get("selection_score") or 0.0)
+    normalized["post_scan_score"] = float(visual.get("post_scan_score") or 0.0)
+    normalized["score_components"] = dict(visual.get("score_components") or {}) if isinstance(visual.get("score_components"), dict) else {}
+    normalized["source_page_visual_id"] = visual.get("source_page_visual_id") or ""
+    normalized["source_observation_visual_id"] = visual.get("source_observation_visual_id") or ""
     normalized["dedupe_group_id"] = visual.get("dedupe_group_id") or ""
+    for field_name in (
+        "width", "height", "render_scale", "estimated_dpi", "image_format",
+        "image_bytes", "image_sha256",
+    ):
+        normalized[field_name] = visual.get(field_name) or (0 if field_name not in {"image_format", "image_sha256"} else "")
     
     return normalized
 

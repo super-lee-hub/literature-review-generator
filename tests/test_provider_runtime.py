@@ -309,6 +309,97 @@ def test_low_level_http_mock_budget_omission_matches_receipt_and_payload(monkeyp
     assert receipt.metadata["omissions"][0]["reason"] == "image_exceeds_request_byte_budget"
 
 
+def test_http_parameter_mutation_is_recorded_without_changing_logical_request_hash(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured_payloads: list[dict[str, object]] = []
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict[str, object]) -> None:
+            self.status_code = status_code
+            self._payload = payload
+            self.text = json.dumps(payload)
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise ai_interface.requests.exceptions.HTTPError(response=self)
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    def post(url: str, **kwargs: object) -> Response:
+        payload = kwargs["json"]
+        assert isinstance(payload, dict)
+        captured_payloads.append(payload)
+        if len(captured_payloads) == 1:
+            return Response(
+                400,
+                {
+                    "error": {
+                        "code": "unsupported_parameter",
+                        "message": "unsupported parameter: temperature",
+                    }
+                },
+            )
+        return Response(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {"content": '{"answer":"ok"}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    runtime = ProviderRuntime(
+        budget=ProviderBudgetV1(max_retries_per_call=1),
+        ledger=ledger,
+        job_id="job-1",
+        attempt_id="attempt-1",
+        stage_name="stage1_analyze",
+        route="Primary_Reader_API",
+        node_id="paper-1",
+        call_id="stage1_synthesis:paper-1",
+        endpoint_type="chat_completions",
+    )
+    config = {
+        "api_key": "secret",
+        "model": "test-model",
+        "api_base": "https://api.deepseek.com/v1",
+        "provider_family": "generic",
+        "transport_retries": "3",
+    }
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        config,
+        "system",
+        provider_runtime=runtime,
+    )
+
+    assert result["status"] == "success"
+    assert len(captured_payloads) == 2
+    assert "temperature" in captured_payloads[0]
+    assert "temperature" not in captured_payloads[1]
+    receipt = ledger.list_receipts()[0]
+    assert receipt.attempts == 2
+    assert receipt.fallback_or_payload_mutations == ("removed_temperature",)
+    assert receipt.input_hash == hash_json(
+        canonical_provider_request_payload(
+            prompt="prompt",
+            system_prompt="system",
+            user_content=None,
+            response_format="json",
+            max_output_tokens=4000,
+            temperature=0.3,
+        )
+    )
+
+
 def test_backup_http_mock_is_text_only_and_receipt_route_is_backup(monkeypatch, tmp_path) -> None:
     image_path = tmp_path / "page.jpg"
     image_path.write_bytes(b"fake-image-bytes")
