@@ -13,6 +13,10 @@ import requests  # type: ignore
 from services.model_capabilities import resolve_model_capability
 from services.proxy_policy import should_bypass_environment_proxy
 from services.repair_policy import parse_repair_policy
+from services.config_values import (
+    StrictConfigValueError,
+    normalize_stage1_config_sections,
+)
 from services.settings import ApplicationSettings, validate_config_keys
 
 
@@ -158,6 +162,10 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
     schema_errors = validate_config_keys(config_dict)
     if schema_errors:
         return False, schema_errors
+    try:
+        normalized_stage1 = normalize_stage1_config_sections(config_dict)
+    except StrictConfigValueError as exc:
+        return False, [str(exc)]
     if "Paths" not in config_dict:
         return False, ["缺少配置段: [Paths]"]
     if not str(config_dict["Paths"].get("output_path", "")).strip():
@@ -197,7 +205,7 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
             if not valid:
                 return False, [f"[Runtime] {key} {error}"]
 
-    stage1_input = config_dict.get("Stage1_Input", {})
+    stage1_input = normalized_stage1.get("Stage1_Input", {})
     if isinstance(stage1_input, dict):
         mode = _normalize_config_text(stage1_input.get("mode"))
         if mode and mode.casefold() != "vision_first":
@@ -218,10 +226,10 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 if not valid:
                     return False, [f"[Stage1_Input] {key} {error}"]
 
-    stage1_visual = config_dict.get("Stage1_Visual", {})
+    stage1_visual = normalized_stage1.get("Stage1_Visual", {})
     if isinstance(stage1_visual, dict):
         render_all = _normalize_config_text(stage1_visual.get("render_all_nonblank_pages"))
-        if render_all and render_all.casefold() not in {"true", "1", "yes", "on"}:
+        if render_all and render_all.casefold() != "true":
             return False, ["[Stage1_Visual] render_all_nonblank_pages is an invariant and must be true"]
         for key in ("page_format", "crop_format"):
             if key in stage1_visual:

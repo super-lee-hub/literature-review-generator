@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from services.stage1_visual_scan import (
     build_visual_scan_user_content,
+    build_visual_scan_prompt,
     plan_visual_scan_batches,
     select_final_visual_refs_after_scan,
     validate_visual_observations,
@@ -56,6 +59,39 @@ def _observation(visual_id: str, page_no: int, *, value: bool = False) -> dict[s
         "ocr_conflicts": [],
         "confidence": "high",
         "needs_manual_review": False,
+    }
+
+
+def _v2_observation(
+    visual_id: str,
+    page_no: int,
+    *,
+    status: str,
+    candidates: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    observation = _observation(visual_id, page_no, value=True)
+    observation.update(
+        {
+            "candidate_attribution_status": status,
+            "raw_reinspection_candidates": list(candidates or []),
+        }
+    )
+    return observation
+
+
+def _candidate_attribution(
+    visual_id: str,
+    *,
+    evidence_kinds: list[str] | None = None,
+    confidence: str = "high",
+    requires_raw_reinspection: bool = True,
+) -> dict[str, object]:
+    return {
+        "candidate_visual_id": visual_id,
+        "evidence_kinds": evidence_kinds or ["quantitative_values"],
+        "reason": f"page evidence identifies {visual_id}",
+        "confidence": confidence,
+        "requires_raw_reinspection": requires_raw_reinspection,
     }
 
 
@@ -276,3 +312,207 @@ def test_substantive_low_heuristic_crop_beats_weak_high_heuristic_crop() -> None
     selected = select_final_visual_refs_after_scan(refs, observations, max_refs=1)
 
     assert [item["visual_id"] for item in selected] == ["table-011-substantive"]
+
+
+@pytest.mark.parametrize("artifact_type", ["table_crop", "figure_crop"])
+def test_v2_explicit_attribution_selects_the_named_child_crop(artifact_type: str) -> None:
+    page = {**_refs(1)[0], "visual_id": "page-020", "page_no": 20}
+    first = _child_ref(
+        f"{artifact_type}-020-a",
+        20,
+        artifact_type,
+        selection_score=100.0,
+        bbox=[0, 0, 40, 40],
+        caption="first object",
+    )
+    second = _child_ref(
+        f"{artifact_type}-020-b",
+        20,
+        artifact_type,
+        selection_score=0.1,
+        bbox=[50, 50, 90, 90],
+        caption="second object",
+    )
+    refs = [page, first, second]
+    batch = plan_visual_scan_batches(
+        [page],
+        candidate_refs=[first, second],
+        batch_size=1,
+    )[0]
+    payload = {
+        "artifact_type": "stage1_visual_observations",
+        "artifact_version": "v2",
+        "observations": [
+            _v2_observation(
+                "page-020",
+                20,
+                status="resolved",
+                candidates=[_candidate_attribution(second["visual_id"])],
+            )
+        ],
+    }
+
+    normalized = validate_visual_observations(
+        payload,
+        allowed_visual_ids=batch.visual_ids,
+        expected_visual_refs=batch.visual_refs,
+        sent_visual_ids=batch.visual_ids,
+        candidate_refs=batch.child_candidates,
+    )
+    selected = select_final_visual_refs_after_scan(refs, normalized["observations"], max_refs=1)
+
+    assert [item["visual_id"] for item in selected] == [second["visual_id"]]
+    assert selected[0]["object_attribution_status"] == "resolved"
+    assert selected[0]["score_components"]["explicit_attribution"] == 100.0
+
+
+def test_v2_attribution_rejects_unknown_and_cross_page_candidates() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-021", "page_no": 21}
+    child = _child_ref(
+        "table-021-a",
+        21,
+        "table_crop",
+        selection_score=1.0,
+        bbox=[0, 0, 40, 40],
+    )
+    batch = plan_visual_scan_batches([page], candidate_refs=[child], batch_size=1)[0]
+    base = {
+        "artifact_type": "stage1_visual_observations",
+        "artifact_version": "v2",
+        "observations": [
+            _v2_observation(
+                "page-021",
+                21,
+                status="resolved",
+                candidates=[_candidate_attribution("not-a-candidate")],
+            )
+        ],
+    }
+    with pytest.raises(ValueError, match="unknown raw reinspection candidate"):
+        validate_visual_observations(
+            base,
+            allowed_visual_ids=batch.visual_ids,
+            expected_visual_refs=batch.visual_refs,
+            sent_visual_ids=batch.visual_ids,
+            candidate_refs=batch.child_candidates,
+        )
+
+    cross_page = _child_ref(
+        "table-022-a",
+        22,
+        "table_crop",
+        selection_score=1.0,
+        bbox=[0, 0, 40, 40],
+    )
+    payload = {
+        **base,
+        "observations": [
+            _v2_observation(
+                "page-021",
+                21,
+                status="resolved",
+                candidates=[_candidate_attribution("table-022-a")],
+            )
+        ],
+    }
+    with pytest.raises(ValueError, match="page mismatch"):
+        validate_visual_observations(
+            payload,
+            allowed_visual_ids=batch.visual_ids,
+            expected_visual_refs=batch.visual_refs,
+            sent_visual_ids=batch.visual_ids,
+            candidate_refs=[child, cross_page],
+        )
+
+
+def test_v2_ambiguous_attribution_reserves_children_or_falls_back_to_page() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-023", "page_no": 23}
+    child_a = _child_ref(
+        "table-023-a", 23, "table_crop", selection_score=1.0, bbox=[0, 0, 40, 40]
+    )
+    child_b = _child_ref(
+        "table-023-b", 23, "table_crop", selection_score=0.9, bbox=[50, 50, 90, 90]
+    )
+    batch = plan_visual_scan_batches(
+        [page], candidate_refs=[child_a, child_b], batch_size=1
+    )[0]
+    payload = {
+        "artifact_type": "stage1_visual_observations",
+        "artifact_version": "v2",
+        "observations": [
+            _v2_observation(
+                "page-023",
+                23,
+                status="ambiguous",
+                candidates=[
+                    _candidate_attribution("table-023-a"),
+                    _candidate_attribution("table-023-b"),
+                ],
+            )
+        ],
+    }
+    normalized = validate_visual_observations(
+        payload,
+        allowed_visual_ids=batch.visual_ids,
+        expected_visual_refs=batch.visual_refs,
+        sent_visual_ids=batch.visual_ids,
+        candidate_refs=batch.child_candidates,
+    )
+    refs = [page, child_a, child_b]
+
+    selected_children = select_final_visual_refs_after_scan(
+        refs, normalized["observations"], max_refs=2
+    )
+    assert {item["visual_id"] for item in selected_children} == {
+        "table-023-a",
+        "table-023-b",
+    }
+
+    selected_fallback = select_final_visual_refs_after_scan(
+        refs, normalized["observations"], max_refs=1
+    )
+    assert [item["visual_id"] for item in selected_fallback] == ["page-023"]
+    assert "retained page snapshot" in selected_fallback[0]["object_attribution_reason"]
+
+
+def test_v2_no_matching_candidate_does_not_inherit_page_evidence() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-024", "page_no": 24}
+    child = _child_ref(
+        "figure-024-a", 24, "figure_crop", selection_score=100.0, bbox=[0, 0, 40, 40]
+    )
+    batch = plan_visual_scan_batches([page], candidate_refs=[child], batch_size=1)[0]
+    payload = {
+        "artifact_type": "stage1_visual_observations",
+        "artifact_version": "v2",
+        "observations": [_v2_observation("page-024", 24, status="no_matching_candidate")],
+    }
+    normalized = validate_visual_observations(
+        payload,
+        allowed_visual_ids=batch.visual_ids,
+        expected_visual_refs=batch.visual_refs,
+        sent_visual_ids=batch.visual_ids,
+        candidate_refs=batch.child_candidates,
+    )
+
+    selected = select_final_visual_refs_after_scan(
+        [page, child], normalized["observations"], max_refs=2
+    )
+
+    assert [item["visual_id"] for item in selected] == ["page-024"]
+
+
+def test_visual_scan_prompt_carries_child_metadata_without_sending_child_images() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-025", "page_no": 25}
+    child = _child_ref(
+        "table-025-a", 25, "table_crop", selection_score=1.0, bbox=[0, 0, 40, 40]
+    )
+    batch = plan_visual_scan_batches([page], candidate_refs=[child], batch_size=1)[0]
+    content, report = build_visual_scan_user_content(batch, return_report=True)
+    user_prompt, system_prompt = build_visual_scan_prompt(batch)
+
+    assert report["child_candidate_ids"] == ["table-025-a"]
+    assert len([item for item in content if item["type"] == "local_image_path"]) == 1
+    assert "candidate_visual_id" in user_prompt
+    assert "table-025-a" in user_prompt
+    assert "stage1_visual_scan.system.v2" not in system_prompt
+    assert '"candidate_attribution_status"' in system_prompt

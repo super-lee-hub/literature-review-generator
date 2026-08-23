@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 
 from models import APIConfig
 
+from services.config_values import parse_bounded_float, parse_enum, parse_strict_bool
 from services.model_capabilities import resolve_model_capability
 from services.multimodal_capability import detect_multimodal_capability
 from services.stage1_visual_scan import (
@@ -50,6 +51,7 @@ class Stage1BuiltInput:
     all_visual_refs: List[Dict[str, Any]] = None  # type: ignore[assignment]
     visual_coverage: Dict[str, Any] = None  # type: ignore[assignment]
     visual_scan_batches: List[List[Dict[str, Any]]] = None  # type: ignore[assignment]
+    visual_scan_candidate_refs: List[List[Dict[str, Any]]] = None  # type: ignore[assignment]
 
     def to_metadata_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -61,6 +63,10 @@ class Stage1BuiltInput:
         payload["visual_scan_batches"] = [
             [dict(item) for item in batch]
             for batch in (self.visual_scan_batches or [])
+        ]
+        payload["visual_scan_candidate_refs"] = [
+            [dict(item) for item in batch]
+            for batch in (self.visual_scan_candidate_refs or [])
         ]
         return payload
 
@@ -137,20 +143,44 @@ class Stage1InputBuilder:
 
             prompt_values_dict["SUMMARY_SCHEMA_CONTRACT"] = build_summary_schema_contract()
 
-        send_extracted_text = _as_bool(stage1_settings.get("send_extracted_text"), default=True)
-        send_selected_visuals = _as_bool(stage1_settings.get("send_selected_visuals"), default=True)
-        mode = str(stage1_settings.get("mode") or "vision_first").strip().casefold()
-        if mode and mode != "vision_first":
-            raise ValueError("Stage1_Input.mode must be vision_first")
-        image_transport = str(stage1_settings.get("image_transport") or "base64").strip().casefold()
-        if image_transport and image_transport != "base64":
-            raise ValueError("Stage1_Input.image_transport must be base64")
-        send_original_pdf = str(stage1_settings.get("send_original_pdf") or "never").strip().lower()
-        if send_original_pdf not in {"never", "auto", "always"}:
-            send_original_pdf = "never"
-        max_pdf_file_mb = _as_float(stage1_settings.get("max_pdf_file_mb"), default=50.0)
-        force_pdf_file_input_for_provider = _as_bool(
+        send_extracted_text = parse_strict_bool(
+            stage1_settings.get("send_extracted_text"),
+            field="Stage1_Input.send_extracted_text",
+            default=True,
+        )
+        send_selected_visuals = parse_strict_bool(
+            stage1_settings.get("send_selected_visuals"),
+            field="Stage1_Input.send_selected_visuals",
+            default=True,
+        )
+        mode = parse_enum(
+            stage1_settings.get("mode"),
+            field="Stage1_Input.mode",
+            allowed=("vision_first",),
+            default="vision_first",
+        )
+        image_transport = parse_enum(
+            stage1_settings.get("image_transport"),
+            field="Stage1_Input.image_transport",
+            allowed=("base64",),
+            default="base64",
+        )
+        send_original_pdf = parse_enum(
+            stage1_settings.get("send_original_pdf"),
+            field="Stage1_Input.send_original_pdf",
+            allowed=("never", "auto", "always"),
+            default="never",
+        )
+        max_pdf_file_mb = parse_bounded_float(
+            stage1_settings.get("max_pdf_file_mb"),
+            field="Stage1_Input.max_pdf_file_mb",
+            minimum=1.0,
+            maximum=1_000_000.0,
+            default=50.0,
+        )
+        force_pdf_file_input_for_provider = parse_strict_bool(
             stage1_settings.get("force_pdf_file_input_for_provider"),
+            field="Stage1_Input.force_pdf_file_input_for_provider",
             default=False,
         )
 
@@ -211,16 +241,26 @@ class Stage1InputBuilder:
             )
         planned_batches = plan_visual_scan_batches(
             page_refs,
+            candidate_refs=all_visual_refs,
             batch_size=visual_scan_batch_size,
             max_request_image_bytes=max_request_image_bytes,
             max_single_image_bytes=max_single_image_bytes,
         ) if not short_path else ()
         visual_scan_batches = [list(batch.visual_refs) for batch in planned_batches]
+        visual_scan_candidate_refs = [
+            [dict(item) for item in batch.child_candidates]
+            for batch in planned_batches
+        ]
         planned_scan_batches = [
             {
                 "batch_index": index,
                 "visual_ids": [str(item.get("visual_id") or "") for item in batch],
                 "page_nos": [int(item.get("page_no") or 0) for item in batch],
+                "child_candidate_ids": [
+                    str(item.get("visual_id") or "")
+                    for item in visual_scan_candidate_refs[index]
+                    if str(item.get("visual_id") or "")
+                ],
             }
             for index, batch in enumerate(visual_scan_batches)
         ]
@@ -239,6 +279,7 @@ class Stage1InputBuilder:
         if not send_selected_visuals:
             selected_visual_refs = []
             visual_scan_batches = []
+            visual_scan_candidate_refs = []
             visual_coverage["scan_batches"] = []
 
         transport_visual_refs = [
@@ -338,6 +379,7 @@ class Stage1InputBuilder:
                 prompt_sha256=str(prompt_identity_dict.get("prompt_sha256") or prompt_identity_dict.get("sha256") or ""),
                 visual_coverage=visual_coverage,
                 visual_scan_batches=visual_scan_batches,
+                visual_scan_candidate_refs=visual_scan_candidate_refs,
             )
 
         if not capability.supports_image_input:
@@ -367,6 +409,7 @@ class Stage1InputBuilder:
                 prompt_sha256=str(prompt_identity_dict.get("prompt_sha256") or prompt_identity_dict.get("sha256") or ""),
                 visual_coverage=visual_coverage,
                 visual_scan_batches=visual_scan_batches,
+                visual_scan_candidate_refs=visual_scan_candidate_refs,
             )
 
         user_message_content = [{"type": "text", "text": prompt_text}]
@@ -411,6 +454,7 @@ class Stage1InputBuilder:
             prompt_sha256=str(prompt_identity_dict.get("prompt_sha256") or prompt_identity_dict.get("sha256") or ""),
             visual_coverage=visual_coverage,
             visual_scan_batches=visual_scan_batches,
+            visual_scan_candidate_refs=visual_scan_candidate_refs,
         )
 
     @staticmethod
@@ -563,19 +607,3 @@ class Stage1InputBuilder:
         if len(pages) > 12:
             lines.append(f"- additional_pages={len(pages) - 12}")
         return lines
-
-
-def _as_bool(value: Any, *, default: bool = False) -> bool:
-    if value in (None, ""):
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().casefold() in {"1", "true", "yes", "y", "on", "enabled", "enable"}
-
-
-def _as_float(value: Any, *, default: float) -> float:
-    try:
-        parsed = float(str(value).strip())
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= 0 else default

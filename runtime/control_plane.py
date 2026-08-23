@@ -1130,7 +1130,7 @@ class ReviewControlPlane:
                 valid, warnings = validate_all_config(dict(normalized_config))
                 add(
                     "configuration",
-                    "pass" if valid else "warn",
+                    "pass" if valid else "fail",
                     {"path": str(target_config), "valid": bool(valid), "warnings": list(warnings)},
                 )
             except Exception as exc:

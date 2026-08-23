@@ -1,6 +1,8 @@
 import pytest
 
 from config_validator import validate_all_config
+from services.config_values import StrictConfigValueError
+from services.settings import ApplicationSettings
 
 
 def _base_config():
@@ -125,3 +127,57 @@ def test_validate_all_config_rejects_invalid_stage1_visual_transport_values(
 
     assert valid is False
     assert messages
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        ("Stage1_Input", "send_selected_visuals", "truue"),
+        ("Stage1_Input", "send_original_pdf", "sometimes"),
+        ("Stage1_Input", "mode", "vision"),
+        ("Stage1_Visual", "enabled", "maybe"),
+        ("Stage1_Visual", "crop_padding_ratio", "0.26"),
+        ("Stage1_Visual", "crop_padding_ratio", "not-a-number"),
+    ],
+)
+def test_validate_all_config_rejects_unknown_or_out_of_range_stage1_values(
+    section: str,
+    key: str,
+    value: str,
+) -> None:
+    config = _base_config()
+    config[section] = {key: value}
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert messages
+    assert key in messages[0]
+
+
+def test_application_settings_does_not_coerce_unknown_stage1_boolean() -> None:
+    config = _base_config()
+    config["Stage1_Input"] = {"send_selected_visuals": "truue"}
+
+    with pytest.raises(StrictConfigValueError, match="send_selected_visuals"):
+        ApplicationSettings.from_config(config)
+
+
+def test_application_settings_normalizes_explicit_stage1_values() -> None:
+    config = _base_config()
+    config["Stage1_Input"] = {
+        "send_selected_visuals": "YES",
+        "send_original_pdf": "AUTO",
+        "mode": "VISION_FIRST",
+        "image_transport": "BASE64",
+    }
+    config["Stage1_Visual"] = {"enabled": "0", "crop_padding_ratio": "0.125"}
+
+    settings = ApplicationSettings.from_config(config)
+
+    assert settings.section("Stage1_Input")["send_selected_visuals"] == "true"
+    assert settings.section("Stage1_Input")["send_original_pdf"] == "auto"
+    assert settings.section("Stage1_Input")["mode"] == "vision_first"
+    assert settings.section("Stage1_Input")["image_transport"] == "base64"
+    assert settings.section("Stage1_Visual")["enabled"] == "false"
+    assert settings.section("Stage1_Visual")["crop_padding_ratio"] == "0.125"

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from services.stage1_reuse import Stage1ReusableSummaryBindingV1
+from services.stage1_reuse import (
+    Stage1ReusableSummaryBindingV1,
+    Stage1VisualEvidenceQualificationV1,
+    _verify_visual_evidence_qualification,
+)
 
 
 def test_prompt_and_visual_hash_changes_block_exact_reuse() -> None:
@@ -35,3 +39,24 @@ def test_prompt_and_visual_hash_changes_block_exact_reuse() -> None:
     assert result["equal"] is False
     assert result["mismatches"]["prompt_version"]
     assert result["mismatches"]["visual_coverage_hash"]
+
+
+def test_v1_visual_observation_qualification_is_invalid_under_current_v2_contract() -> None:
+    qualification = Stage1VisualEvidenceQualificationV1(
+        required_nonblank_page_count=1,
+        required_page_ids=("page-001",),
+        sent_page_ids=("page-001",),
+        observed_page_ids=("page-001",),
+        scan_coverage_status="complete",
+        evidence_coverage_status="complete",
+        visual_observation_artifact_version="v1",
+        visual_scan_prompt_id="stage1.visual_scan.system.v1",
+        visual_scan_prompt_version="v1",
+        visual_scan_prompt_sha256="a" * 64,
+        visual_scan_schema_hash="b" * 64,
+    )
+
+    verified, reason = _verify_visual_evidence_qualification(qualification.to_dict())
+
+    assert verified is False
+    assert reason == "prior_visual_observation_contract_invalid"

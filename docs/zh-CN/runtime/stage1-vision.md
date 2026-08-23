@@ -16,19 +16,22 @@ Stage 1 始终把 MinerU 或其他预处理器生成的 normalized full text 作
   全文、页面元数据、每页标签/OCR、页面图片以及受限的 figure/table/formula crop。
 - 长论文先按不超过 `visual_scan_batch_size` 个 page object 做视觉扫描。每张图片
   前紧邻一个文本标签，标签包含 `visual_id`、页码、bbox、artifact type、图注和
-  附近 OCR/文本。扫描结果持久化为 `stage1_visual_observations/v1`。
+  附近 OCR/文本。扫描结果持久化为 `stage1_visual_observations/v2`。
 - 最终 synthesis 接收完整 normalized text、全部扫描 observations、coverage report
   以及不超过 `final_image_refs_max` 张高价值 crop。二阶段选 crop 只决定最终复核，
   不决定哪些页面曾经被视觉模型看见。
 
 ## 页到 crop 的归因与 reuse 资格
 
-第一遍扫描严格以页面为单位：长文覆盖只发送并观察 `page_snapshot`。观察结果
-通过严格校验后，才允许从同页选择 `table_crop`、`figure_crop` 或
-`formula_crop`。子 crop 必须携带 `source_page_visual_id`、
-`source_observation_visual_id`、`post_scan_score` 和评分分量；没有已验证的
-来源页 observation 的 crop 不得晋级到最终 synthesis。因此最终多模态请求中
-会出现带页面标签的确切本地 crop 路径，但扫描预算仍按页面计算。
+第一遍扫描严格以页面为单位：长文覆盖只发送并观察 `page_snapshot`。v2 Prompt
+会接收同页 `figure_crop`、`table_crop`、`formula_crop` 的有界候选元数据，但
+元数据只是候选，不是已经确认的观察。每个页面 observation 必须声明
+`resolved`、`ambiguous` 或 `no_matching_candidate`。只有通过严格校验的
+`raw_reinspection_candidates` 显式归因才能选择 child；child 不会仅因同页就继承
+定量或关系证据。被选择的 child 带有 `source_page_visual_id`、
+`source_observation_visual_id`、`object_attribution_*`、`post_scan_score` 和评分
+分量。如果 ambiguous 集合超出 raw-image 预算，reducer 会保留整页 snapshot
+作为安全回退。
 
 最终 reducer 会在 typed `visual_evidence_qualification` binding 中记录四个
 相互独立的事实：
@@ -46,7 +49,9 @@ Stage 1 始终把 MinerU 或其他预处理器生成的 normalized full text 作
 `evidence_coverage_status=degraded`，并要求人工复核。
 
 当 `require_complete_visual_coverage=true` 时，exact reuse 必须重新验证
-Registry record、内容 hash、JSON type/version 以及 coverage/observation 文件本身。
+Registry record、内容 hash、JSON type/version、v2 observation 的 Prompt/schema
+identity 以及 coverage/observation 文件本身。旧 v1 observation contract 会被判为
+失效，不会被静默重新解释。
 部分/失败扫描、必需页遗漏，以及 coverage 或 observation 被删除、篡改、失效，
 都会阻断 reuse 并要求新的 provider 工作。设为 `false` 是显式的降级复用策略：
 不会抹掉状态或人工复核标记，引用的产物仍必须通过完整性验证。
@@ -63,8 +68,31 @@ fallback 会写入证据，不能标记为 multimodal success。
 Validation 仍使用普通 `deepseek-v4-flash`，只接收 source chunk、OCR、图注和 observation
 文本，不接收图片或 PDF 文件。原始 PDF 默认不作为文件附件发送。
 
+## 严格配置值
+
+当前 Stage 1 的布尔值、枚举值和 `crop_padding_ratio` 在配置校验、settings 归一化和
+运行时 input 构建中共用同一个严格 parser。未知的布尔拼写、不支持的枚举值、非有限或
+超出范围的 padding 都会 fail closed，不会静默变成默认值。布尔值允许
+`true/false`、`1/0`、`yes/no`、`on/off`；当前枚举为 `mode=vision_first`、
+`image_transport=base64` 以及 `send_original_pdf=never|auto|always`。
+
 ## 官方限制
 
 实现遵循[DeepSeek Vision 官方文档](https://api-docs.deepseek.com/zh-cn/guides/vision)：
 inline 请求体 48 MiB、base64/URL 单图 32 MiB、图片 token 上限 384；请求包含 15 张及以上
 图片时单边最长限制为 4096 px。
+
+## 显式 live smoke
+
+可选 live smoke 会在临时目录生成一页包含小表格和框架图的合成 PDF，
+然后检查精确实验模型 ID、图片 payload、JSON 输出、usage 和 provider receipt。
+只有在明确允许外部网络调用且配置凭据时才运行：
+
+```powershell
+$env:AUTO_GENERATE_RUN_LIVE_API = "1"
+python -m pytest -q tests/live/test_deepseek_vision_smoke.py -m live_api
+```
+
+没有 API key 时，结果必须是
+`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_KEY`；离线和 mocked 测试不能替代
+live 证据。测试不会把 key、响应正文或合成 PDF 写入仓库。

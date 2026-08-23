@@ -1484,6 +1484,145 @@ def _validate_stage1_visual_observations(record: Any, _path: str | Path, root: M
         raise ArtifactSchemaError("stage1_visual_observations.status is invalid")
 
 
+def _validate_stage1_visual_observations_v2(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
+    """Validate the current page-observation/child-attribution artifact.
+
+    The owning Stage 1 service performs the context-bound validation before
+    publication.  The Registry validator repeats the schema check from the
+    persisted payload so a ready record cannot later drift into an untyped v2
+    artifact.  Failed provider calls retain their diagnostic envelope without
+    being treated as successful observations.
+    """
+
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_observations",),
+        expected_version="v2",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "batch_index",
+            "call_id",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "visual_ids",
+            "child_candidate_ids",
+            "child_candidate_refs",
+            "schema_hash",
+            "status",
+            "observations",
+            "error",
+        ),
+        "stage1_visual_observations",
+    )
+    if not isinstance(root.get("visual_ids"), list):
+        raise ArtifactSchemaError("stage1_visual_observations visual_ids must be an array")
+    if not isinstance(root.get("child_candidate_ids"), list):
+        raise ArtifactSchemaError("stage1_visual_observations child_candidate_ids must be an array")
+    if not isinstance(root.get("child_candidate_refs"), list):
+        raise ArtifactSchemaError("stage1_visual_observations child_candidate_refs must be an array")
+    if not isinstance(root.get("observations"), list):
+        raise ArtifactSchemaError("stage1_visual_observations observations must be an array")
+    visual_ids = [str(item).strip() for item in root.get("visual_ids") or []]
+    if not visual_ids or any(not item for item in visual_ids) or len(set(visual_ids)) != len(visual_ids):
+        raise ArtifactSchemaError("stage1_visual_observations visual_ids must be unique non-empty strings")
+    child_ids = [str(item).strip() for item in root.get("child_candidate_ids") or []]
+    if any(not item for item in child_ids) or len(set(child_ids)) != len(child_ids):
+        raise ArtifactSchemaError(
+            "stage1_visual_observations child_candidate_ids must be unique non-empty strings"
+        )
+    reference_ids: list[str] = []
+    for index, candidate in enumerate(root.get("child_candidate_refs") or []):
+        if not isinstance(candidate, Mapping):
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] must be an object"
+            )
+        if set(candidate) - {"visual_id", "page_no", "artifact_type", "bbox"}:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] has unexpected fields"
+            )
+        candidate_id = str(candidate.get("visual_id") or "").strip()
+        if not candidate_id:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] visual_id is missing"
+            )
+        reference_ids.append(candidate_id)
+        try:
+            page_no = int(candidate.get("page_no") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] page_no is invalid"
+            ) from exc
+        if page_no <= 0:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] page_no is invalid"
+            )
+        if str(candidate.get("artifact_type") or "") not in {
+            "figure_crop",
+            "table_crop",
+            "formula_crop",
+        }:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] artifact_type is invalid"
+            )
+        bbox = candidate.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] bbox is invalid"
+            )
+        try:
+            bbox_values = [float(value) for value in bbox]
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] bbox is not numeric"
+            ) from exc
+        if any(value < 0 for value in bbox_values):
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] bbox is negative"
+            )
+    if len(set(reference_ids)) != len(reference_ids) or reference_ids != child_ids:
+        raise ArtifactSchemaError(
+            "stage1_visual_observations child_candidate_ids do not match child_candidate_refs"
+        )
+    for field in ("prompt_id", "prompt_version", "call_id", "schema_hash"):
+        if not str(root.get(field) or "").strip():
+            raise ArtifactSchemaError(f"stage1_visual_observations.{field} is missing")
+    for field in ("prompt_sha256", "schema_hash"):
+        digest = str(root.get(field) or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
+            raise ArtifactSchemaError(f"stage1_visual_observations.{field} is not a SHA-256 hex digest")
+    status = str(root.get("status") or "")
+    if status not in {"success", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_observations.status is invalid")
+    if status == "failed":
+        if not str(root.get("error") or ""):
+            raise ArtifactSchemaError("failed stage1_visual_observations must include an error")
+        if root.get("observations"):
+            raise ArtifactSchemaError("failed stage1_visual_observations must not include observations")
+        return
+
+    try:
+        from services.stage1_visual_scan import validate_visual_observations
+
+        validate_visual_observations(
+            root,
+            allowed_visual_ids=[str(item) for item in root.get("visual_ids") or []],
+            sent_visual_ids=[str(item) for item in root.get("visual_ids") or []],
+            candidate_refs=[
+                dict(item)
+                for item in root.get("child_candidate_refs") or []
+                if isinstance(item, Mapping)
+            ],
+        )
+    except (ValueError, TypeError, ImportError) as exc:
+        raise ArtifactSchemaError(f"stage1_visual_observations v2 schema is invalid: {exc}") from exc
+
+
 def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
     _validate_production_identity(
         record,
@@ -1557,6 +1696,7 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("free_mode_review_intent_projection", "v1"): _validate_free_mode_review_intent_projection,
         ("validation_adjudication_reuse_record", "v1"): _validate_validation_adjudication_reuse_record,
         ("stage1_visual_observations", "v1"): _validate_stage1_visual_observations,
+        ("stage1_visual_observations", "v2"): _validate_stage1_visual_observations_v2,
         ("stage1_visual_coverage", "v1"): _validate_stage1_visual_coverage,
     }
     validator = validators.get((artifact_type, version))

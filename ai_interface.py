@@ -966,6 +966,32 @@ def _call_ai_api_detailed_uninstrumented(
                     ))
 
                 formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
+                if isinstance(response_data, dict):
+                    provider_model = str(response_data.get("model") or "").strip()
+                    usage = response_data.get("usage")
+                    formatted["provider_response_model"] = provider_model
+                    formatted["provider_usage_present"] = isinstance(usage, dict)
+                    if isinstance(usage, dict):
+                        usage_keys = {
+                            "input_tokens": ("prompt_tokens", "input_tokens"),
+                            "output_tokens": ("completion_tokens", "output_tokens"),
+                            "total_tokens": ("total_tokens",),
+                        }
+                        for result_key, candidates in usage_keys.items():
+                            for usage_key in candidates:
+                                raw_value = usage.get(usage_key)
+                                if isinstance(raw_value, bool) or not isinstance(
+                                    raw_value, (int, float, str)
+                                ):
+                                    continue
+                                try:
+                                    parsed_value = int(raw_value)
+                                except (TypeError, ValueError, OverflowError):
+                                    continue
+                                if parsed_value >= 0:
+                                    formatted[result_key] = parsed_value
+                                    break
+                        formatted["usage_status"] = "reported"
                 if (
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"

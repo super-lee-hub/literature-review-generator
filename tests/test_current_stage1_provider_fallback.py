@@ -54,7 +54,7 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
                 "status": "success",
                 "content": {
                     "artifact_type": "stage1_visual_observations",
-                    "artifact_version": "v1",
+                    "artifact_version": "v2",
                     "observations": [
                         {
                             "visual_id": visual_id,
@@ -71,6 +71,8 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
                             "ocr_conflicts": [],
                             "confidence": "high",
                             "needs_manual_review": False,
+                            "candidate_attribution_status": "no_matching_candidate",
+                            "raw_reinspection_candidates": [],
                         }
                         for visual_id, page_no in zip(batch["visual_ids"], batch["page_nos"])
                     ],

@@ -54,6 +54,11 @@ _BLOCKED_COMMAND = re.compile(
 
 
 def offline_enabled() -> bool:
+    if (
+        os.environ.get("AUTO_GENERATE_RUN_LIVE_API") == "1"
+        and any(os.environ.get(name) for name in _LIVE_API_CREDENTIAL_ENV_NAMES)
+    ):
+        return False
     value = os.environ.get("AUTO_GENERATE_OFFLINE_TESTS", "1").strip().lower()
     return value not in {"0", "false", "no", "off"}
 

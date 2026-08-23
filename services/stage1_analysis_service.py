@@ -54,6 +54,8 @@ from services.stage1_input_completeness import build_completeness_metrics, has_b
 from services.prompt_registry import PromptRegistry
 from services.stage1_visual_scan import (
     VisualScanBatch,
+    VISUAL_OBSERVATIONS_VERSION,
+    VISUAL_SCAN_PROMPT_ID,
     build_visual_scan_prompt,
     build_visual_scan_user_content,
     estimate_encoded_image_bytes,
@@ -61,6 +63,7 @@ from services.stage1_visual_scan import (
     validate_visual_observations,
     select_final_visual_refs_after_scan,
 )
+from services.config_values import parse_strict_bool
 from services.multimodal_capability import detect_multimodal_capability
 from services.stage1_reuse import (
     STAGE1_REUSE_POLICY,
@@ -509,6 +512,7 @@ class Stage1AnalysisService:
             summary_schema_hash=self._schema_hash(),
             visual_input_manifest_hash=visual_input_manifest_hash,
             visual_coverage_hash=hash_json(visual_identity.get("coverage_plan") or {}),
+            visual_scan_schema_hash=self._visual_scan_schema_hash(),
             original_source_location=str(item.source_pdf or ""),
             current_source_location=str(item.source_pdf or ""),
             preprocess_hash=preprocess_hash,
@@ -564,9 +568,12 @@ class Stage1AnalysisService:
                 "provider_transport_count": 1,
                 "prompt_authority": prompt_authority,
                 "visual_coverage_hash": hash_json(visual_identity.get("coverage_plan") or {}),
-                "require_complete_visual_coverage": str(
-                    stage1_input_settings.get("require_complete_visual_coverage", "true")
-                ).strip().casefold() not in {"false", "0", "no", "off"},
+                "visual_scan_schema_hash": self._visual_scan_schema_hash(),
+                "require_complete_visual_coverage": parse_strict_bool(
+                    stage1_input_settings.get("require_complete_visual_coverage"),
+                    field="Stage1_Input.require_complete_visual_coverage",
+                    default=True,
+                ),
             },
         )
 
@@ -854,6 +861,7 @@ class Stage1AnalysisService:
                 summary_schema_hash=closure_payload.summary_schema_hash,
                 visual_input_manifest_hash=closure_payload.visual_input_manifest_hash,
                 visual_coverage_hash=closure_payload.visual_coverage_hash,
+                visual_scan_schema_hash=closure_payload.visual_scan_schema_hash,
                 visual_evidence_qualification=closure_payload.visual_evidence_qualification,
                 provider=closure_payload.provider,
                 model=closure_payload.model,
@@ -999,11 +1007,11 @@ class Stage1AnalysisService:
         )
 
     def _visual_scan_schema_hash(self) -> str:
-        identity = self.prompt_registry.identity("stage1.visual_scan.system.v1")
+        identity = self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID)
         return hash_json(
             {
                 "artifact_type": "stage1_visual_observations",
-                "artifact_version": "v1",
+                "artifact_version": VISUAL_OBSERVATIONS_VERSION,
                 "prompt_id": identity.prompt_id,
                 "prompt_version": identity.version,
                 "prompt_sha256": identity.sha256,
@@ -1042,9 +1050,10 @@ class Stage1AnalysisService:
         batch: VisualScanBatch,
     ) -> dict[str, Any]:
         ocr_by_id = self._visual_scan_ocr_by_id(prepared)
+        identity = self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID)
         return {
             "artifact_type": "stage1_visual_scan_input",
-            "artifact_version": "v1",
+            "artifact_version": VISUAL_OBSERVATIONS_VERSION,
             "batch_index": int(batch.batch_index),
             "visual_refs": [
                 {
@@ -1064,9 +1073,10 @@ class Stage1AnalysisService:
                 }
                 for item in batch.visual_refs
             ],
-            "prompt_id": self.prompt_registry.identity("stage1.visual_scan.system.v1").prompt_id,
-            "prompt_version": self.prompt_registry.identity("stage1.visual_scan.system.v1").version,
-            "prompt_sha256": self.prompt_registry.identity("stage1.visual_scan.system.v1").sha256,
+            "child_candidates": list(batch.to_dict().get("child_candidates") or []),
+            "prompt_id": identity.prompt_id,
+            "prompt_version": identity.version,
+            "prompt_sha256": identity.sha256,
         }
 
     def _predeclare_expected_calls(
@@ -1084,10 +1094,23 @@ class Stage1AnalysisService:
             paper_key = self._paper_key(item.item)
             vision_enabled = detect_multimodal_capability(item.primary_config).supports_image_input
             scan_call_planned = False
+            candidate_batches = item.built_input.visual_scan_candidate_refs or []
             for batch_index, batch_refs in enumerate(item.built_input.visual_scan_batches or []):
                 if not vision_enabled:
                     break
-                batch = VisualScanBatch(batch_index=batch_index, visual_refs=tuple(dict(ref) for ref in batch_refs))
+                batch = VisualScanBatch(
+                    batch_index=batch_index,
+                    visual_refs=tuple(dict(ref) for ref in batch_refs),
+                    child_candidates=tuple(
+                        dict(ref)
+                        for ref in (
+                            candidate_batches[batch_index]
+                            if batch_index < len(candidate_batches)
+                            else []
+                        )
+                        if isinstance(ref, Mapping)
+                    ),
+                )
                 max_request, max_single = normalize_visual_byte_budgets(
                     max_request_image_bytes=item.stage1_input_settings.get("max_request_image_bytes"),
                     max_single_image_bytes=item.stage1_input_settings.get("max_single_image_bytes"),
@@ -1111,6 +1134,7 @@ class Stage1AnalysisService:
                 effective_batch = VisualScanBatch(
                     batch_index=batch_index,
                     visual_refs=sent_refs,
+                    child_candidates=batch.child_candidates,
                 )
                 prompt, system_prompt = self._visual_scan_request(item, effective_batch)
                 effective_scan_content, _effective_report = build_visual_scan_user_content(
@@ -1120,7 +1144,7 @@ class Stage1AnalysisService:
                     max_request_image_bytes=max_request,
                 )
                 effective_config = self._effective_provider_config(item.primary_config)
-                scan_identity = self.prompt_registry.identity("stage1.visual_scan.system.v1")
+                scan_identity = self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID)
                 graph_seed.append(
                     {
                         "call_id": self._visual_scan_call_id(paper_key, batch_index),
@@ -1946,6 +1970,17 @@ class Stage1AnalysisService:
         paper_key = self._paper_key(prepared.item)
         coverage = dict(prepared.built_input.visual_coverage or {})
         batches = tuple(prepared.built_input.visual_scan_batches or ())
+        candidate_batches = tuple(prepared.built_input.visual_scan_candidate_refs or ())
+        scan_identity = self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID)
+        coverage.update(
+            {
+                "visual_observation_artifact_version": VISUAL_OBSERVATIONS_VERSION,
+                "visual_scan_prompt_id": scan_identity.prompt_id,
+                "visual_scan_prompt_version": scan_identity.version,
+                "visual_scan_prompt_sha256": scan_identity.sha256,
+                "visual_scan_schema_hash": self._visual_scan_schema_hash(),
+            }
+        )
         capability = detect_multimodal_capability(prepared.primary_config)
         if not batches:
             self._visual_observation_records[paper_key] = []
@@ -1982,6 +2017,15 @@ class Stage1AnalysisService:
             planned_batch = VisualScanBatch(
                 batch_index=batch_index,
                 visual_refs=tuple(dict(ref) for ref in raw_refs if isinstance(ref, Mapping)),
+                child_candidates=tuple(
+                    dict(ref)
+                    for ref in (
+                        candidate_batches[batch_index]
+                        if batch_index < len(candidate_batches)
+                        else []
+                    )
+                    if isinstance(ref, Mapping)
+                ),
             )
             scan_content, report = build_visual_scan_user_content(
                 planned_batch,
@@ -2044,7 +2088,11 @@ class Stage1AnalysisService:
                 )
                 continue
 
-            batch = VisualScanBatch(batch_index=batch_index, visual_refs=sent_refs)
+            batch = VisualScanBatch(
+                batch_index=batch_index,
+                visual_refs=sent_refs,
+                child_candidates=planned_batch.child_candidates,
+            )
             scan_content, effective_report = build_visual_scan_user_content(
                 batch,
                 return_report=True,
@@ -2079,9 +2127,9 @@ class Stage1AnalysisService:
                 call_id=self._visual_scan_call_id(paper_key, batch_index),
                 endpoint_type=str(prepared.primary_config.get("endpoint_type") or "chat_completions"),
                 schema_hash=self._visual_scan_schema_hash(),
-                prompt_id=self.prompt_registry.identity("stage1.visual_scan.system.v1").prompt_id,
-                prompt_version=self.prompt_registry.identity("stage1.visual_scan.system.v1").version,
-                prompt_sha256=self.prompt_registry.identity("stage1.visual_scan.system.v1").sha256,
+                prompt_id=self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID).prompt_id,
+                prompt_version=self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID).version,
+                prompt_sha256=self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID).sha256,
                 closure_epoch_id=self.closure_epoch_id,
                 logical_attempt_identity=self.attempt_id,
             )
@@ -2242,6 +2290,7 @@ class Stage1AnalysisService:
             for item in page_status
             if str(item.get("status") or "") == "scan_failed"
         )
+        scan_identity = self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID)
         return Stage1VisualEvidenceQualificationV1(
             coverage_artifact_id=str(coverage.get("coverage_artifact_id") or ""),
             coverage_artifact_hash=str(coverage.get("coverage_artifact_hash") or ""),
@@ -2284,9 +2333,27 @@ class Stage1AnalysisService:
             evidence_coverage_status=str(
                 coverage.get("evidence_coverage_status") or "incomplete"
             ),
-            require_complete_visual_coverage=str(
-                prepared.stage1_input_settings.get("require_complete_visual_coverage", "true")
-            ).strip().casefold() not in {"false", "0", "no", "off"},
+            require_complete_visual_coverage=parse_strict_bool(
+                prepared.stage1_input_settings.get("require_complete_visual_coverage"),
+                field="Stage1_Input.require_complete_visual_coverage",
+                default=True,
+            ),
+            visual_observation_artifact_version=str(
+                coverage.get("visual_observation_artifact_version")
+                or VISUAL_OBSERVATIONS_VERSION
+            ),
+            visual_scan_prompt_id=str(
+                coverage.get("visual_scan_prompt_id") or scan_identity.prompt_id
+            ),
+            visual_scan_prompt_version=str(
+                coverage.get("visual_scan_prompt_version") or scan_identity.version
+            ),
+            visual_scan_prompt_sha256=str(
+                coverage.get("visual_scan_prompt_sha256") or scan_identity.sha256
+            ),
+            visual_scan_schema_hash=str(
+                coverage.get("visual_scan_schema_hash") or self._visual_scan_schema_hash()
+            ),
         ).to_dict()
 
     def _publish_final_visual_coverage(
@@ -2374,6 +2441,7 @@ class Stage1AnalysisService:
                     allowed_visual_ids=batch.visual_ids,
                     expected_visual_refs=batch.visual_refs,
                     sent_visual_ids=batch.visual_ids,
+                    candidate_refs=batch.child_candidates,
                 )
                 valid = True
             except ValueError as exc:
@@ -2382,17 +2450,38 @@ class Stage1AnalysisService:
             error = str(result.get("message") or result.get("error_kind") or "visual_scan_failed")
         payload = {
             "artifact_type": "stage1_visual_observations",
-            "artifact_version": "v1",
+            "artifact_version": VISUAL_OBSERVATIONS_VERSION,
             "job_id": self.job_id,
             "paper_key": self._paper_key(prepared.item),
             "batch_index": int(batch.batch_index),
             "call_id": self._visual_scan_call_id(self._paper_key(prepared.item), batch.batch_index),
-            "prompt_id": self.prompt_registry.identity("stage1.visual_scan.system.v1").prompt_id,
-            "prompt_version": self.prompt_registry.identity("stage1.visual_scan.system.v1").version,
-            "prompt_sha256": self.prompt_registry.identity("stage1.visual_scan.system.v1").sha256,
+            "prompt_id": self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID).prompt_id,
+            "prompt_version": self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID).version,
+            "prompt_sha256": self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID).sha256,
             "visual_ids": list(batch.visual_ids),
+            "child_candidate_ids": list(batch.child_candidate_ids),
+            # Persist only the metadata needed to revalidate attribution at
+            # the Registry boundary; never persist local image paths here.
+            "child_candidate_refs": [
+                {
+                    "visual_id": str(ref.get("visual_id") or ""),
+                    "page_no": int(ref.get("page_no") or 0),
+                    "artifact_type": str(ref.get("artifact_type") or ""),
+                    "bbox": list(ref.get("bbox") or []),
+                }
+                for ref in batch.child_candidates
+                if isinstance(ref, Mapping) and str(ref.get("visual_id") or "")
+            ],
+            "schema_hash": self._visual_scan_schema_hash(),
             "status": "success" if valid else "failed",
-            "observations": list(content.get("observations") or []) if isinstance(content, Mapping) else [],
+            # Only persist observations after the complete v2 contract has
+            # passed.  A failed provider response is diagnostic evidence, not
+            # a partially trusted observation artifact.
+            "observations": (
+                list(content.get("observations") or [])
+                if valid and isinstance(content, Mapping)
+                else []
+            ),
             "error": error,
         }
         manifest_record = self._record_for_path(prepared.built_input.visual_manifest_path)
@@ -2405,7 +2494,7 @@ class Stage1AnalysisService:
                 payload,
                 artifact_role="stage1_visual_observations",
                 artifact_type="stage1_visual_observations",
-                artifact_version="v1",
+                artifact_version=VISUAL_OBSERVATIONS_VERSION,
                 producer="services.stage1_analysis_service.Stage1AnalysisService",
                 artifact_id=self._visual_scan_call_id(self._paper_key(prepared.item), batch.batch_index),
                 depends_on=dependencies,

@@ -36,6 +36,14 @@ validated by `services.settings`.
 - `max_single_image_bytes = 24000000` raw-byte budget, leaving headroom below
   the official 32 MiB single base64/URL image limit.
 
+Current Stage 1 boolean and enum values are strict. Accepted boolean spellings
+are `true/false`, `1/0`, `yes/no`, and `on/off`; current enum values are
+`mode=vision_first`, `image_transport=base64`, and
+`send_original_pdf=never|auto|always`. `crop_padding_ratio` is a finite value
+from `0` through `0.25` inclusive. Unknown spellings, unsupported enum values,
+non-finite floats, and out-of-range padding fail configuration validation and
+are not silently replaced with defaults.
+
 The runtime estimates base64-expanded bytes for both per-image and per-request
 budgets. A visual scan records planned, sent, omitted, and observed visual IDs;
 an observation batch is valid only when it contains exactly one strict-schema

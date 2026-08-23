@@ -131,3 +131,38 @@ def test_citation_ref_catalog_uses_its_canonical_v1_contract(tmp_path: Path) -> 
     path.write_text(json.dumps(malformed), encoding="utf-8")
     with pytest.raises(ArtifactSchemaError):
         validate_registered_artifact(record, path)
+
+
+def test_stage1_visual_observations_v2_binds_child_ids_to_persisted_refs(tmp_path: Path) -> None:
+    payload = {
+        "artifact_type": "stage1_visual_observations",
+        "artifact_version": "v2",
+        "job_id": "job-1",
+        "paper_key": "paper-a",
+        "batch_index": 0,
+        "call_id": "stage1_visual_scan:paper-a:0",
+        "prompt_id": "stage1.visual_scan.system.v2",
+        "prompt_version": "v2",
+        "prompt_sha256": "a" * 64,
+        "visual_ids": ["page-001"],
+        "child_candidate_ids": ["table-001-01"],
+        "child_candidate_refs": [],
+        "schema_hash": "b" * 64,
+        "status": "failed",
+        "observations": [],
+        "error": "provider failure",
+    }
+    path = tmp_path / "visual-observations.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    record = SimpleNamespace(
+        artifact_type="stage1_visual_observations",
+        artifact_version="v2",
+        job_id="job-1",
+    )
+
+    with pytest.raises(ArtifactSchemaError, match="child_candidate_ids do not match"):
+        validate_registered_artifact(record, path)
+
+    payload["child_candidate_ids"] = []
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    validate_registered_artifact(record, path)

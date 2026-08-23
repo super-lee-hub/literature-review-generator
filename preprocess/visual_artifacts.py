@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - compatibility with older PyMuPDF relea
     import fitz  # type: ignore
 
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from services.config_values import parse_bounded_float, parse_strict_bool
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact, utc_now_iso
 from services.queue_service import LocalPublicationContext
 
@@ -229,8 +230,12 @@ class Stage1VisualArtifactBuilder:
         policy = json.loads(json.dumps(_DEFAULT_SELECTION_POLICY))
         configured_visual = dict(visual_settings or {})
         rendering = policy["rendering"]
-        render_all = str(configured_visual.get("render_all_nonblank_pages") or "true").strip().casefold()
-        if render_all not in {"true", "1", "yes", "on"}:
+        render_all = parse_strict_bool(
+            configured_visual.get("render_all_nonblank_pages"),
+            field="Stage1_Visual.render_all_nonblank_pages",
+            default=True,
+        )
+        if not render_all:
             raise ValueError("render_all_nonblank_pages=false is unsupported")
         for key, target in (
             ("page_long_edge_px", "page_long_edge_px"),
@@ -248,12 +253,20 @@ class Stage1VisualArtifactBuilder:
                 if key in {"page_format", "crop_format"}:
                     rendering[target] = _normalize_image_format(raw_value, rendering[target], strict=True)
                 else:
-                    try:
-                        rendering[target] = (
-                            float(raw_value) if "." in str(raw_value) else int(raw_value)
+                    if key == "crop_padding_ratio":
+                        rendering[target] = parse_bounded_float(
+                            raw_value,
+                            field="Stage1_Visual.crop_padding_ratio",
+                            minimum=0.0,
+                            maximum=0.25,
                         )
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(f"invalid Stage1_Visual.{key}: {raw_value}") from exc
+                    else:
+                        try:
+                            rendering[target] = (
+                                float(raw_value) if "." in str(raw_value) else int(raw_value)
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(f"invalid Stage1_Visual.{key}: {raw_value}") from exc
         rendering["page_format"] = _normalize_image_format(rendering.get("page_format"), "jpeg", strict=True)
         rendering["crop_format"] = _normalize_image_format(rendering.get("crop_format"), "png", strict=True)
         policy["rendering_safety"]["max_rendered_pixels"] = int(
@@ -293,9 +306,17 @@ class Stage1VisualArtifactBuilder:
         page_candidates = self._select_page_candidates(page_index, policy)
         figure_candidates = self._select_figure_candidates(page_blocks, page_index, policy)
         layout_candidates = self._select_layout_candidates(page_blocks, page_index, policy)
-        if str(configured_visual.get("table_crop_enabled") or "true").strip().lower() in {"false", "0", "no"}:
+        if not parse_strict_bool(
+            configured_visual.get("table_crop_enabled"),
+            field="Stage1_Visual.table_crop_enabled",
+            default=True,
+        ):
             layout_candidates = [item for item in layout_candidates if item.get("artifact_type") != "table_crop"]
-        if str(configured_visual.get("formula_crop_enabled") or "true").strip().lower() in {"false", "0", "no"}:
+        if not parse_strict_bool(
+            configured_visual.get("formula_crop_enabled"),
+            field="Stage1_Visual.formula_crop_enabled",
+            default=True,
+        ):
             layout_candidates = [item for item in layout_candidates if item.get("artifact_type") != "formula_crop"]
 
         render_dir = tempfile.mkdtemp(prefix=".visual-render-", dir=bundle_dir)
@@ -1024,7 +1045,13 @@ class Stage1VisualArtifactBuilder:
             rendering = policy.get("rendering", {}) if isinstance(policy, Mapping) else {}
             page_target = max(1, int(rendering.get("page_long_edge_px", 2200) or 2200))
             crop_target = max(1, int(rendering.get("crop_long_edge_px", 2400) or 2400))
-            padding_ratio = max(0.0, min(float(rendering.get("crop_padding_ratio", 0.04) or 0.04), 0.25))
+            padding_ratio = parse_bounded_float(
+                rendering.get("crop_padding_ratio"),
+                field="Stage1_Visual.crop_padding_ratio",
+                minimum=0.0,
+                maximum=0.25,
+                default=0.04,
+            )
             page_format = _normalize_image_format(rendering.get("page_format"), "jpeg")
             crop_format = _normalize_image_format(rendering.get("crop_format"), "png")
             page_max_pixels = max(

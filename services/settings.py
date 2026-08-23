@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, MutableMapping
 
+from services.config_values import normalize_stage1_config_sections
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 
@@ -435,17 +436,19 @@ class ApplicationSettings:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ApplicationSettings":
         application = _section(config, "Application")
+        raw_sections = {
+            str(section): {str(key): value for key, value in values.items()}
+            for section, values in config.items()
+            if isinstance(values, Mapping)
+        }
+        normalized_sections = normalize_stage1_config_sections(raw_sections)
         return cls(
             config_schema=_int(application.get("config_schema"), CONFIG_SCHEMA_VERSION),
             validation=ValidationSettings.from_config(config),
             runtime=RuntimeSettings.from_config(config),
             outline=OutlineSettings.from_config(config),
             outline_stability=OutlineStabilitySettings.from_config(config),
-            sections={
-                str(section): {str(key): str(value) for key, value in values.items()}
-                for section, values in config.items()
-                if isinstance(values, Mapping)
-            },
+            sections=normalized_sections,
         )
 
     @classmethod
@@ -465,6 +468,7 @@ class ApplicationSettings:
             for section, values in config.items()
             if isinstance(values, Mapping)
         }
+        normalized_sections = normalize_stage1_config_sections(normalized_sections)
         config.clear()
         config.update(normalized_sections)
         return cls.from_config(normalized_sections)

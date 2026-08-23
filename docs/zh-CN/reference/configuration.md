@@ -35,6 +35,12 @@
 - `max_single_image_bytes = 24000000` 原始单图字节预算，为 base64 膨胀预留空间，
   低于官方 base64/URL 单图 32 MiB 限制。
 
+当前 Stage 1 的布尔值和枚举值采用严格解析。布尔值允许
+`true/false`、`1/0`、`yes/no`、`on/off`；枚举值为 `mode=vision_first`、
+`image_transport=base64` 以及 `send_original_pdf=never|auto|always`。
+`crop_padding_ratio` 必须是 `0` 到 `0.25`（含边界）的有限数值。未知拼写、
+不支持的枚举、非有限浮点数和越界 padding 都会使配置校验失败，不会静默回退到默认值。
+
 运行时会按 base64 膨胀后的估算值同时执行单图和单请求预算。视觉扫描会分别记录
 planned、sent、omitted、observed visual ID；只有对每个实际发送图片恰好返回一个严格
 schema observation 的批次才算有效。长文先扫描全部可发送的非空页，再依据 observations

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from services.artifact_registry import ArtifactRegistry, file_sha256
+from services.prompt_registry import PromptRegistry
+from services.stage1_visual_scan import VISUAL_OBSERVATIONS_VERSION, VISUAL_SCAN_PROMPT_ID
 from runtime.provider_runtime import hash_json
 
 
@@ -53,6 +55,7 @@ _STRUCTURED_COMPARISON_FIELDS = (
     "summary_schema_hash",
     "visual_input_manifest_hash",
     "visual_coverage_hash",
+    "visual_scan_schema_hash",
     # Provenance facts are projected here as well.  They are checked against
     # the prior authority below; an empty current-run value is expected before
     # reuse succeeds and is therefore not treated as a current-input miss.
@@ -162,6 +165,11 @@ class Stage1VisualEvidenceQualificationV1:
     final_raw_visual_recheck_status: str = "not_required"
     evidence_coverage_status: str = "complete"
     require_complete_visual_coverage: bool = True
+    visual_observation_artifact_version: str = ""
+    visual_scan_prompt_id: str = ""
+    visual_scan_prompt_version: str = ""
+    visual_scan_prompt_sha256: str = ""
+    visual_scan_schema_hash: str = ""
 
     @staticmethod
     def _strings(value: Any) -> tuple[str, ...]:
@@ -205,6 +213,13 @@ class Stage1VisualEvidenceQualificationV1:
             require_complete_visual_coverage=_as_bool(
                 raw.get("require_complete_visual_coverage"), True
             ),
+            visual_observation_artifact_version=_text(
+                raw.get("visual_observation_artifact_version")
+            ),
+            visual_scan_prompt_id=_text(raw.get("visual_scan_prompt_id")),
+            visual_scan_prompt_version=_text(raw.get("visual_scan_prompt_version")),
+            visual_scan_prompt_sha256=_text(raw.get("visual_scan_prompt_sha256")),
+            visual_scan_schema_hash=_text(raw.get("visual_scan_schema_hash")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -226,6 +241,14 @@ class Stage1VisualEvidenceQualificationV1:
             issues.append("required_page_ids_incomplete")
         required = set(self.required_page_ids)
         if self.scan_coverage_status in {"complete", "partial", "failed"}:
+            if self.visual_observation_artifact_version != VISUAL_OBSERVATIONS_VERSION:
+                issues.append("visual_observation_schema_invalid")
+            if self.visual_scan_prompt_id != VISUAL_SCAN_PROMPT_ID:
+                issues.append("visual_scan_prompt_invalid")
+            if not self.visual_scan_prompt_version or not self.visual_scan_prompt_sha256:
+                issues.append("visual_scan_prompt_identity_missing")
+            if not self.visual_scan_schema_hash:
+                issues.append("visual_scan_schema_hash_missing")
             if required - set(self.sent_page_ids):
                 issues.append("required_page_inputs_not_sent")
             if required - set(self.observed_page_ids):
@@ -277,6 +300,7 @@ class Stage1ReusableSummaryBindingV1:
     summary_schema_hash: str = ""
     visual_input_manifest_hash: str = ""
     visual_coverage_hash: str = ""
+    visual_scan_schema_hash: str = ""
     visual_evidence_qualification: Mapping[str, Any] = field(default_factory=dict)
     original_source_location: str = ""
     current_source_location: str = ""
@@ -421,6 +445,7 @@ class Stage1ReusableSummaryBindingV1:
                 "summary_schema_hash",
                 "visual_input_manifest_hash",
                 "visual_coverage_hash",
+                "visual_scan_schema_hash",
                 "normalized_summary_payload_hash",
             )
         )
@@ -501,6 +526,7 @@ class Stage1ReusableSummaryManifestV1:
     summary_schema_hash: str = ""
     visual_input_manifest_hash: str = ""
     visual_coverage_hash: str = ""
+    visual_scan_schema_hash: str = ""
     visual_evidence_qualification: Mapping[str, Any] = field(default_factory=dict)
     provider: str = ""
     model: str = ""
@@ -645,6 +671,7 @@ def _validate_manifest_self_binding(
         "input_builder_policy_hash",
         "summary_schema_hash",
         "visual_input_manifest_hash",
+        "visual_scan_schema_hash",
         "provider",
         "model",
         "endpoint_type",
@@ -653,7 +680,9 @@ def _validate_manifest_self_binding(
     for field_name in top_level_binding_fields:
         manifest_value = _text(getattr(manifest, field_name))
         binding_value = _text(getattr(manifest_binding, field_name))
-        if not manifest_value or manifest_value != binding_value:
+        if (manifest_value or binding_value) and (
+            not manifest_value or manifest_value != binding_value
+        ):
             return None, f"typed_manifest_{field_name}_mismatch"
     manifest_qualification = Stage1VisualEvidenceQualificationV1.from_mapping(
         manifest.visual_evidence_qualification
@@ -724,7 +753,48 @@ def _verify_visual_evidence_qualification(
             return False, "prior_visual_coverage_incomplete"
         if "evidence_not_complete_for_reuse" in issues:
             return False, "prior_visual_coverage_incomplete"
+        if any(
+            issue in issues
+            for issue in (
+                "visual_observation_schema_invalid",
+                "visual_scan_prompt_invalid",
+                "visual_scan_prompt_identity_missing",
+                "visual_scan_schema_hash_missing",
+            )
+        ):
+            return False, "prior_visual_observation_contract_invalid"
         return False, "prior_visual_coverage_artifact_invalid"
+
+    required_visual_evidence = bool(
+        qualification.required_page_ids
+        or qualification.required_nonblank_page_count
+        or qualification.scan_coverage_status != "not_required"
+        or qualification.observation_artifact_ids
+    )
+    expected_scan_identity = None
+    expected_scan_schema_hash = ""
+    if required_visual_evidence:
+        try:
+            expected_scan_identity = PromptRegistry().identity(VISUAL_SCAN_PROMPT_ID)
+            expected_scan_schema_hash = hash_json(
+                {
+                    "artifact_type": "stage1_visual_observations",
+                    "artifact_version": VISUAL_OBSERVATIONS_VERSION,
+                    "prompt_id": expected_scan_identity.prompt_id,
+                    "prompt_version": expected_scan_identity.version,
+                    "prompt_sha256": expected_scan_identity.sha256,
+                }
+            )
+        except (OSError, TypeError, ValueError, RuntimeError):
+            return False, "prior_visual_observation_contract_invalid"
+        if (
+            qualification.visual_observation_artifact_version != VISUAL_OBSERVATIONS_VERSION
+            or qualification.visual_scan_prompt_id != expected_scan_identity.prompt_id
+            or qualification.visual_scan_prompt_version != expected_scan_identity.version
+            or qualification.visual_scan_prompt_sha256 != expected_scan_identity.sha256
+            or qualification.visual_scan_schema_hash != expected_scan_schema_hash
+        ):
+            return False, "prior_visual_observation_contract_invalid"
 
     def resolve_path(declared: str) -> Path | None:
         if not declared:
@@ -743,11 +813,16 @@ def _verify_visual_evidence_qualification(
         expected_hash: str,
         declared_path: str,
         artifact_type: str,
+        expected_artifact_version: str,
         invalid_reason: str,
     ) -> tuple[bool, Path | None, str]:
         record = registry.get(artifact_id) if registry is not None and artifact_id else None
         if record is not None:
-            if record.status != "ready" or record.artifact_type != artifact_type or record.artifact_version != "v1":
+            if (
+                record.status != "ready"
+                or record.artifact_type != artifact_type
+                or record.artifact_version != expected_artifact_version
+            ):
                 return False, None, invalid_reason
             if expected_hash and record.content_hash != expected_hash:
                 return False, None, invalid_reason
@@ -765,7 +840,11 @@ def _verify_visual_evidence_qualification(
             payload = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return False, None, invalid_reason
-        if not isinstance(payload, Mapping) or payload.get("artifact_type") != artifact_type or payload.get("artifact_version") != "v1":
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("artifact_type") != artifact_type
+            or payload.get("artifact_version") != expected_artifact_version
+        ):
             return False, None, invalid_reason
         if registry is not None and record is not None:
             try:
@@ -774,17 +853,13 @@ def _verify_visual_evidence_qualification(
                 return False, None, invalid_reason
         return True, target, ""
 
-    required_visual_evidence = bool(
-        qualification.required_page_ids
-        or qualification.required_nonblank_page_count
-        or qualification.scan_coverage_status != "not_required"
-    )
     if required_visual_evidence:
         coverage_ok, coverage_path, coverage_reason = verify_artifact(
             artifact_id=qualification.coverage_artifact_id,
             expected_hash=qualification.coverage_artifact_hash,
             declared_path=qualification.coverage_artifact_path,
             artifact_type="stage1_visual_coverage",
+            expected_artifact_version="v1",
             invalid_reason="prior_visual_coverage_artifact_invalid",
         )
         if not coverage_ok:
@@ -835,16 +910,37 @@ def _verify_visual_evidence_qualification(
     for index, (artifact_id, artifact_hash) in enumerate(
         zip(qualification.observation_artifact_ids, qualification.observation_artifact_hashes)
     ):
-        declared_path = qualification.observation_artifact_paths[index] if index < len(qualification.observation_artifact_paths) else ""
-        ok, _path, reason = verify_artifact(
+        declared_path = (
+            qualification.observation_artifact_paths[index]
+            if index < len(qualification.observation_artifact_paths)
+            else ""
+        )
+        ok, observation_path, reason = verify_artifact(
             artifact_id=artifact_id,
             expected_hash=artifact_hash,
             declared_path=declared_path,
             artifact_type="stage1_visual_observations",
+            expected_artifact_version=VISUAL_OBSERVATIONS_VERSION,
             invalid_reason="prior_visual_observation_artifact_invalid",
         )
         if not ok:
             return False, reason
+        try:
+            observation_payload = (
+                json.loads(observation_path.read_text(encoding="utf-8"))
+                if observation_path is not None
+                else {}
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False, "prior_visual_observation_artifact_invalid"
+        if not isinstance(observation_payload, Mapping):
+            return False, "prior_visual_observation_artifact_invalid"
+        if (
+            observation_payload.get("prompt_id") != qualification.visual_scan_prompt_id
+            or observation_payload.get("prompt_version") != qualification.visual_scan_prompt_version
+            or observation_payload.get("prompt_sha256") != qualification.visual_scan_prompt_sha256
+        ):
+            return False, "prior_visual_observation_contract_invalid"
     if qualification.require_complete_visual_coverage and not qualification.complete_for_reuse():
         return False, "prior_visual_coverage_incomplete"
     return True, (

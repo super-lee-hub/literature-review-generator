@@ -46,7 +46,7 @@ def _long_scan_content(batch: dict[str, Any], *, omit_last: bool = False) -> dic
         pairs = pairs[:-1]
     return {
         "artifact_type": "stage1_visual_observations",
-        "artifact_version": "v1",
+        "artifact_version": "v2",
         "observations": [
             {
                 "visual_id": visual_id,
@@ -63,6 +63,8 @@ def _long_scan_content(batch: dict[str, Any], *, omit_last: bool = False) -> dic
                 "ocr_conflicts": ["OCR says 13.7%"],
                 "confidence": "high",
                 "needs_manual_review": False,
+                "candidate_attribution_status": "no_matching_candidate",
+                "raw_reinspection_candidates": [],
             }
             for visual_id, page_no in pairs
         ],
@@ -124,7 +126,7 @@ def test_long_paper_scans_every_nonblank_page_and_publishes_observations(tmp_pat
                 "status": "success",
                 "content": {
                     "artifact_type": "stage1_visual_observations",
-                    "artifact_version": "v1",
+                    "artifact_version": "v2",
                     "observations": [
                         {
                             "visual_id": visual_id,
@@ -141,6 +143,8 @@ def test_long_paper_scans_every_nonblank_page_and_publishes_observations(tmp_pat
                             "ocr_conflicts": ["OCR says 13.7%, visual says 17.3%"],
                             "confidence": "high",
                             "needs_manual_review": False,
+                            "candidate_attribution_status": "no_matching_candidate",
+                            "raw_reinspection_candidates": [],
                         }
                         for visual_id, page_no in zip(batch["visual_ids"], batch["page_nos"])
                     ],
@@ -207,7 +211,7 @@ def test_long_paper_visual_run_reuses_without_rescan_or_provider_transport(tmp_p
                 "status": "success",
                 "content": {
                     "artifact_type": "stage1_visual_observations",
-                    "artifact_version": "v1",
+                    "artifact_version": "v2",
                     "observations": [
                         {
                             "visual_id": visual_id,
@@ -224,6 +228,8 @@ def test_long_paper_visual_run_reuses_without_rescan_or_provider_transport(tmp_p
                             "ocr_conflicts": ["OCR says 13.7%, visual says 17.3%"],
                             "confidence": "high",
                             "needs_manual_review": False,
+                            "candidate_attribution_status": "no_matching_candidate",
+                            "raw_reinspection_candidates": [],
                         }
                         for visual_id, page_no in zip(batch["visual_ids"], batch["page_nos"])
                     ],
@@ -287,11 +293,16 @@ def test_long_paper_final_synthesis_receives_attributed_child_crop(tmp_path: Pat
     def reader(**kwargs):
         if kwargs.get("purpose") == "visual_scan":
             batch = kwargs["visual_scan_batch"]
+            child_candidates = [
+                dict(item)
+                for item in (batch.get("child_candidates") or [])
+                if isinstance(item, dict)
+            ]
             return {
                 "status": "success",
                 "content": {
                     "artifact_type": "stage1_visual_observations",
-                    "artifact_version": "v1",
+                    "artifact_version": "v2",
                     "observations": [
                         {
                             "visual_id": visual_id,
@@ -308,6 +319,27 @@ def test_long_paper_final_synthesis_receives_attributed_child_crop(tmp_path: Pat
                             "ocr_conflicts": ["OCR says 13.7%, visual says 17.3%"],
                             "confidence": "high",
                             "needs_manual_review": False,
+                            "candidate_attribution_status": (
+                                "resolved"
+                                if page_no == 7 and any(
+                                    int(item.get("page_no") or 0) == page_no
+                                    for item in child_candidates
+                                )
+                                else "no_matching_candidate"
+                            ),
+                            "raw_reinspection_candidates": [
+                                {
+                                    "candidate_visual_id": str(candidate["candidate_visual_id"]),
+                                    "evidence_kinds": ["relationships", "quantitative_values"],
+                                    "reason": "the page observation identifies the visible framework crop",
+                                    "confidence": "high",
+                                    "requires_raw_reinspection": True,
+                                }
+                                for candidate in child_candidates
+                                if page_no == 7
+                                and int(candidate.get("page_no") or 0) == page_no
+                                and str(candidate.get("artifact_type") or "") == "figure_crop"
+                            ][:1],
                         }
                         for visual_id, page_no in zip(batch["visual_ids"], batch["page_nos"])
                     ],
