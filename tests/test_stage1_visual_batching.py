@@ -736,3 +736,69 @@ def test_ambiguous_group_falls_back_atomically_for_unsafe_child(
     assert [item["visual_id"] for item in selected] == ["page-029"]
     assert selected[0]["raw_reinspection_resolution"] == "page_snapshot_fallback"
     assert selected[0]["raw_reinspection_fallback_reason"] == reason
+
+
+def test_ambiguous_raw_unit_is_not_starved_or_dropped_by_global_budget() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-030", "page_no": 30}
+    page["image_path"] = "missing-page-030.png"
+    child_a = _child_ref(
+        "figure-030-a", 30, "figure_crop", selection_score=1.0, bbox=[0, 0, 40, 40]
+    )
+    child_b = _child_ref(
+        "figure-030-b", 30, "figure_crop", selection_score=0.9, bbox=[50, 50, 90, 90]
+    )
+    child_a["image_bytes"] = child_b["image_bytes"] = 30_000_000
+    ordinary = {**_refs(1)[0], "visual_id": "page-031", "page_no": 31}
+    observations = [
+        _v2_observation(
+            "page-030",
+            30,
+            status="ambiguous",
+            candidates=[
+                _candidate_attribution("figure-030-a"),
+                _candidate_attribution("figure-030-b"),
+            ],
+        ),
+        _observation("page-031", 31, value=True),
+    ]
+    selected, units = select_final_visual_refs_after_scan(
+        [page, child_a, child_b, ordinary],
+        observations,
+        max_refs=2,
+        max_request_image_bytes=80_000_000,
+        max_single_image_bytes=25_000_000,
+        return_plan=True,
+    )
+
+    # The ordinary page may use the remaining slot, but the mandatory
+    # ambiguous unit remains explicit and unresolved; it is never reduced to
+    # a silently omitted child or an accidental single-child request.
+    assert [item["visual_id"] for item in selected] == ["page-031"]
+    unit = next(item for item in units if item["unit_id"] == "ambiguous-page-30")
+    assert unit["resolution"] == "not_represented"
+    assert unit["selected_ids"] == []
+
+
+def test_v2_explicit_attribution_false_does_not_force_raw_child_reinspection() -> None:
+    page = {**_refs(1)[0], "visual_id": "page-032", "page_no": 32}
+    child = _child_ref(
+        "figure-032-a", 32, "figure_crop", selection_score=100.0, bbox=[0, 0, 40, 40]
+    )
+    observation = _v2_observation(
+        "page-032",
+        32,
+        status="resolved",
+        candidates=[
+            _candidate_attribution(
+                "figure-032-a",
+                evidence_kinds=["visible_text"],
+                requires_raw_reinspection=False,
+            )
+        ],
+    )
+    selected, units = select_final_visual_refs_after_scan(
+        [page, child], [observation], max_refs=2, return_plan=True
+    )
+
+    assert [item["visual_id"] for item in selected] == ["page-032"]
+    assert units == []

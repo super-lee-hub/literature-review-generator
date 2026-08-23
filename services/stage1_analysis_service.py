@@ -1286,6 +1286,83 @@ class Stage1AnalysisService:
         ]
         return text_items or None
 
+    def _freeze_synthesis_visual_transport(
+        self,
+        prepared: _PreparedStage1Item,
+    ) -> _PreparedStage1Item:
+        """Freeze the final visual wire membership before expected-call binding.
+
+        Selection and the HTTP transport are separate trust boundaries.  This
+        preflight makes the final request identity depend on the bytes that
+        will actually be sent and records any atomic-group fallback or
+        non-representation before the provider call is admitted.
+        """
+
+        content = prepared.built_input.user_message_content
+        if not isinstance(content, list):
+            return prepared
+        from ai_interface import freeze_local_visual_transport_content
+
+        max_request, max_single = normalize_visual_byte_budgets(
+            max_request_image_bytes=prepared.stage1_input_settings.get(
+                "max_request_image_bytes"
+            ),
+            max_single_image_bytes=prepared.stage1_input_settings.get(
+                "max_single_image_bytes"
+            ),
+        )
+        frozen_content, report = freeze_local_visual_transport_content(
+            content,
+            max_single_image_bytes=max_single,
+            max_request_image_bytes=max_request,
+        )
+        coverage = dict(prepared.built_input.visual_coverage or {})
+        planned_units = [
+            dict(item)
+            for item in (coverage.get("raw_reinspection_units") or [])
+            if isinstance(item, Mapping)
+        ]
+        group_reports = {
+            str(item.get("group_id") or ""): item
+            for item in (report.get("raw_reinspection_groups") or [])
+            if isinstance(item, Mapping) and str(item.get("group_id") or "")
+        }
+        updated_units: list[dict[str, Any]] = []
+        for unit in planned_units:
+            unit_id = str(unit.get("unit_id") or "")
+            group_report = group_reports.get(unit_id)
+            if group_report is not None:
+                resolution = str(group_report.get("resolution") or "")
+                if resolution in {"page_snapshot_fallback", "not_represented"}:
+                    unit["resolution"] = resolution
+                    unit["selected_ids"] = [
+                        str(value)
+                        for value in (group_report.get("selected_ids") or [])
+                        if str(value)
+                    ]
+                    if resolution == "page_snapshot_fallback":
+                        unit["fallback_refs"] = list(unit["selected_ids"])
+                    unit["fallback_reason"] = str(
+                        group_report.get("fallback_reason") or ""
+                    )
+            updated_units.append(unit)
+        if planned_units:
+            coverage.update(
+                summarize_raw_reinspection_groups(
+                    prepared.built_input.selected_visual_refs or [],
+                    sent_visual_ids=report.get("sent_visual_ids") or [],
+                    planned_units=updated_units,
+                )
+            )
+        coverage["transport_preflight"] = dict(report)
+        coverage["transport_preflight_omissions"] = list(report.get("omissions") or [])
+        rebuilt_input = replace(
+            prepared.built_input,
+            user_message_content=frozen_content,
+            visual_coverage=coverage,
+        )
+        return replace(prepared, built_input=rebuilt_input)
+
     @staticmethod
     def _effective_provider_config(config: Mapping[str, Any]) -> dict[str, Any]:
         """Mirror the effective config fields added by ai_interface."""
@@ -1354,6 +1431,7 @@ class Stage1AnalysisService:
         planned_ids: list[str] = []
         sent_ids: list[str] = []
         omissions: list[dict[str, Any]] = []
+        raw_group_reports: dict[str, dict[str, Any]] = {}
         encoded_bytes = 0
         has_file = False
         if engine_type != "backup" and isinstance(content, list):
@@ -1363,15 +1441,55 @@ class Stage1AnalysisService:
                 item_type = str(raw.get("type") or "").strip().lower()
                 if item_type == "local_image_path":
                     visual_id = str(raw.get("visual_id") or "")
-                    if visual_id:
-                        planned_ids.append(visual_id)
+                    planned_for_item = [
+                        str(value)
+                        for value in (
+                            raw.get("transport_planned_visual_ids")
+                            or raw.get("ambiguous_candidate_ids")
+                            or ([visual_id] if visual_id else [])
+                        )
+                        if str(value)
+                    ]
+                    for value in planned_for_item:
+                        if value not in planned_ids:
+                            planned_ids.append(value)
+                    group_id = str(raw.get("raw_reinspection_group_id") or "").strip()
+                    group: dict[str, Any] | None = None
+                    if group_id:
+                        group = raw_group_reports.setdefault(
+                            group_id,
+                            {
+                                "group_id": group_id,
+                                "page_no": int(raw.get("page_no") or 0),
+                                "ambiguous_candidate_ids": list(planned_for_item),
+                                "resolution": str(
+                                    raw.get("raw_reinspection_resolution") or ""
+                                ),
+                                "selected_ids": [
+                                    str(value)
+                                    for value in (raw.get("raw_reinspection_selected_ids") or [])
+                                    if str(value)
+                                ],
+                                "actual_sent_ids": [],
+                                "fallback_reason": str(
+                                    raw.get("raw_reinspection_fallback_reason") or ""
+                                ),
+                            },
+                        )
                     path = str(raw.get("path") or "").strip()
                     try:
-                        image_bytes = int(raw.get("image_bytes") or Path(path).stat().st_size)
+                        image_bytes = int(
+                            raw.get("frozen_image_bytes")
+                            or raw.get("image_bytes")
+                            or Path(path).stat().st_size
+                        )
                     except (OSError, TypeError, ValueError):
                         image_bytes = 0
                     reason = ""
-                    if not path or not Path(path).is_file():
+                    frozen = bool(raw.get("transport_frozen")) and bool(
+                        raw.get("frozen_image_data_url")
+                    )
+                    if not frozen and (not path or not Path(path).is_file()):
                         reason = "image_missing"
                     elif image_bytes <= 0:
                         reason = "image_empty"
@@ -1389,10 +1507,23 @@ class Stage1AnalysisService:
                                 "visual_id": visual_id,
                                 "page_no": int(raw.get("page_no") or 0),
                                 "reason": reason,
+                                **(
+                                    {
+                                        "raw_reinspection_group_id": group_id,
+                                        "raw_reinspection_resolution": "not_represented",
+                                        "raw_reinspection_fallback_reason": reason,
+                                    }
+                                    if group_id
+                                    else {}
+                                ),
                             }
                         )
                     elif visual_id:
                         sent_ids.append(visual_id)
+                        if group is not None:
+                            actual = group["actual_sent_ids"]
+                            if visual_id not in actual:
+                                actual.append(visual_id)
                     continue
                 if item_type in {"local_pdf_path", "input_file", "file"}:
                     has_file = True
@@ -1401,6 +1532,7 @@ class Stage1AnalysisService:
             "planned_visual_ids": planned_ids,
             "sent_visual_ids": sent_ids,
             "omissions": omissions,
+            "raw_reinspection_groups": list(raw_group_reports.values()),
             "images_planned_count": len(planned_ids),
             "images_actually_sent_count": len(sent_ids),
             "estimated_encoded_image_bytes": encoded_bytes,
@@ -1684,7 +1816,7 @@ class Stage1AnalysisService:
                     "max_single_image_bytes"
                 ),
             )
-            final_visual_refs = select_final_visual_refs_after_scan(
+            selection_result = select_final_visual_refs_after_scan(
                 prepared.built_input.all_visual_refs
                 or prepared.built_input.selected_visual_refs
                 or [],
@@ -1695,9 +1827,16 @@ class Stage1AnalysisService:
                 ),
                 max_request_image_bytes=max_request,
                 max_single_image_bytes=max_single,
+                return_plan=True,
             )
+            if not isinstance(selection_result, tuple):
+                raise RuntimeError("visual selector did not return its raw-reinspection plan")
+            final_visual_refs, raw_reinspection_units = selection_result
             visual_coverage.update(
-                summarize_raw_reinspection_groups(final_visual_refs)
+                summarize_raw_reinspection_groups(
+                    final_visual_refs,
+                    planned_units=raw_reinspection_units,
+                )
             )
             rebuilt_input = Stage1InputBuilder(logger=self.logger).build(
                 prompt_template=self._prompt_template(),
@@ -1714,13 +1853,19 @@ class Stage1AnalysisService:
                 visual_coverage=visual_coverage,
             )
             prepared = replace(prepared, built_input=rebuilt_input)
-            self._refresh_synthesis_expected_call(prepared)
-            # Refresh only the current graph artifact provenance.  The
-            # reusable input binding remains the immutable pre-scan identity.
-            prepared = replace(
-                prepared,
-                current_binding=self._bind_execution_provenance(prepared.current_binding),
-            )
+
+        prepared = self._freeze_synthesis_visual_transport(prepared)
+        visual_coverage = {
+            **dict(visual_coverage or {}),
+            **dict(prepared.built_input.visual_coverage or {}),
+        }
+        self._refresh_synthesis_expected_call(prepared)
+        # Refresh only the current graph artifact provenance.  The reusable
+        # input binding remains the immutable pre-scan identity.
+        prepared = replace(
+            prepared,
+            current_binding=self._bind_execution_provenance(prepared.current_binding),
+        )
 
         provider_result = self._call_reader(
             item=item,
@@ -1745,6 +1890,40 @@ class Stage1AnalysisService:
             stage1_input_settings=prepared.stage1_input_settings,
             engine_type=engine_type,
         )
+        local_transport_metadata = dict(transport_metadata)
+        preflight_report = visual_coverage.get("transport_preflight")
+        if isinstance(preflight_report, Mapping):
+            preflight_planned_ids = [
+                str(value)
+                for value in (preflight_report.get("planned_visual_ids") or [])
+                if str(value)
+            ]
+            merged_planned_ids = list(
+                dict.fromkeys(
+                    [
+                        *preflight_planned_ids,
+                        *[
+                            str(value)
+                            for value in (transport_metadata.get("planned_visual_ids") or [])
+                            if str(value)
+                        ],
+                    ]
+                )
+            )
+            transport_metadata["planned_visual_ids"] = merged_planned_ids
+            transport_metadata["images_planned_count"] = len(merged_planned_ids)
+            transport_metadata["omissions"] = [
+                *[
+                    dict(item)
+                    for item in (preflight_report.get("omissions") or [])
+                    if isinstance(item, Mapping)
+                ],
+                *[
+                    dict(item)
+                    for item in (transport_metadata.get("omissions") or [])
+                    if isinstance(item, Mapping)
+                ],
+            ]
         reported_transport = provider_result.get("transport_metadata")
         if isinstance(reported_transport, Mapping):
             transport_metadata.update(
@@ -1754,6 +1933,55 @@ class Stage1AnalysisService:
                     if value is not None
                 }
             )
+        # Wire membership is determined by the frozen request content, not by
+        # an injected reader's optional report.  Keep the provider report as
+        # supplemental metadata, but restore the locally verifiable planned,
+        # sent, and omitted visual facts so expected calls, receipts, and the
+        # final coverage reducer cannot disagree.
+        local_planned_ids = [
+            str(value)
+            for value in (local_transport_metadata.get("planned_visual_ids") or [])
+            if str(value)
+        ]
+        if isinstance(preflight_report, Mapping):
+            local_planned_ids = list(
+                dict.fromkeys(
+                    [
+                        *[
+                            str(value)
+                            for value in (preflight_report.get("planned_visual_ids") or [])
+                            if str(value)
+                        ],
+                        *local_planned_ids,
+                    ]
+                )
+            )
+        transport_metadata["planned_visual_ids"] = local_planned_ids
+        transport_metadata["sent_visual_ids"] = [
+            str(value)
+            for value in (local_transport_metadata.get("sent_visual_ids") or [])
+            if str(value)
+        ]
+        transport_metadata["images_planned_count"] = len(local_planned_ids)
+        transport_metadata["images_actually_sent_count"] = len(
+            transport_metadata["sent_visual_ids"]
+        )
+        transport_metadata["omissions"] = [
+            *[
+                dict(item)
+                for item in (
+                    (preflight_report.get("omissions") or [])
+                    if isinstance(preflight_report, Mapping)
+                    else []
+                )
+                if isinstance(item, Mapping)
+            ],
+            *[
+                dict(item)
+                for item in (local_transport_metadata.get("omissions") or [])
+                if isinstance(item, Mapping)
+            ],
+        ]
         transport_metadata["successful_input_mode"] = (
             "multimodal"
             if int(transport_metadata.get("images_actually_sent_count") or 0) > 0
@@ -1763,6 +1991,7 @@ class Stage1AnalysisService:
             summarize_raw_reinspection_groups(
                 prepared.built_input.selected_visual_refs or [],
                 sent_visual_ids=transport_metadata.get("sent_visual_ids") or [],
+                planned_units=visual_coverage.get("raw_reinspection_units"),
             )
         )
         provider_result = {
@@ -1826,6 +2055,7 @@ class Stage1AnalysisService:
             summarize_raw_reinspection_groups(
                 prepared.built_input.selected_visual_refs or [],
                 sent_visual_ids=actual_visual_ids,
+                planned_units=coverage.get("raw_reinspection_units"),
             )
         )
         required_page_ids = {
@@ -1846,15 +2076,43 @@ class Stage1AnalysisService:
         } else "text_only"
         coverage["final_synthesis_modality"] = final_modality
         final_omissions = list(transport_metadata.get("omissions") or [])
-        if not required_page_ids:
-            raw_recheck_status = "not_required"
-        elif final_modality == "multimodal" and not final_omissions and actual_visual_ids:
+        raw_units = [
+            item
+            for item in (coverage.get("raw_reinspection_units") or [])
+            if isinstance(item, Mapping)
+        ]
+        required_raw_unit_count = len(raw_units)
+        unresolved_raw_unit_ids = [
+            str(item.get("unit_id") or "")
+            for item in raw_units
+            if item.get("closed") is not True and str(item.get("unit_id") or "")
+        ]
+        coverage["required_raw_reinspection_unit_count"] = required_raw_unit_count
+        coverage["unresolved_raw_reinspection_unit_ids"] = unresolved_raw_unit_ids
+        has_planned_visuals = bool(
+            coverage.get("planned_visual_ids")
+            or prepared.built_input.selected_visual_refs
+        )
+        if required_raw_unit_count == 0:
+            # A backup/text-only route can still have had visual evidence
+            # planned.  Preserve that it was not rechecked instead of
+            # collapsing it into the genuinely no-visual ``not_required``
+            # state.
+            raw_recheck_status = (
+                "not_run_fallback"
+                if has_planned_visuals and final_modality != "multimodal"
+                else "not_required"
+            )
+        elif not unresolved_raw_unit_ids and final_modality == "multimodal" and actual_visual_ids:
             raw_recheck_status = "complete"
         elif engine_type == "backup":
             raw_recheck_status = "not_run_fallback"
         else:
             raw_recheck_status = "partial" if actual_visual_ids else "not_run_fallback"
         coverage["final_raw_visual_recheck_status"] = raw_recheck_status
+        raw_recheck_incomplete = bool(
+            required_raw_unit_count and unresolved_raw_unit_ids
+        )
         scan_incomplete = bool(
             scan_status in {"partial", "failed"}
             or (prepared.built_input.visual_scan_batches and required_page_ids - {
@@ -1870,18 +2128,24 @@ class Stage1AnalysisService:
             and engine_type != "backup"
             and final_omissions
         )
-        if scan_incomplete or direct_incomplete:
+        if scan_incomplete or direct_incomplete or raw_recheck_incomplete:
             evidence_status = "incomplete"
         elif not required_page_ids:
             evidence_status = "complete"
-        elif final_modality == "multimodal" and raw_recheck_status == "complete":
+        elif final_modality == "multimodal" and not raw_recheck_incomplete and actual_visual_ids:
             evidence_status = "complete"
         else:
             # A successful text-only backup after a complete page scan is a
             # degraded final synthesis, not a failed page scan.
             evidence_status = "degraded"
         coverage["evidence_coverage_status"] = evidence_status
-        coverage["coverage_status"] = evidence_status
+        # ``coverage_status`` is the Registry v1 scan-domain status.  Final
+        # synthesis quality is a separate reducer fact and may legitimately be
+        # ``degraded`` or ``incomplete`` without invalidating the Registry
+        # artifact schema.
+        coverage["coverage_status"] = (
+            "complete" if scan_status == "not_required" else scan_status
+        )
         if evidence_status != "complete":
             quality_audit = dict(ai_summary.get("quality_audit") or {})
             quality_audit["needs_manual_review"] = True
@@ -2025,14 +2289,82 @@ class Stage1AnalysisService:
         capability = detect_multimodal_capability(prepared.primary_config)
         if not batches:
             self._visual_observation_records[paper_key] = []
+            page_status = list(coverage.get("page_status") or [])
+            total_pdf_pages = int(coverage.get("total_pdf_pages") or 0)
+            nonblank_pages = int(coverage.get("nonblank_pages") or 0)
+            rendered_pages = int(coverage.get("rendered_pages") or 0)
+            skipped_pages = int(
+                coverage.get("skipped_pages")
+                or sum(
+                    1
+                    for item in page_status
+                    if isinstance(item, Mapping)
+                    and str(item.get("status") or "") == "skipped_blank"
+                )
+            )
+            failed_page_count = int(
+                coverage.get("failed_pages")
+                or sum(
+                    1
+                    for item in page_status
+                    if isinstance(item, Mapping)
+                    and str(item.get("status") or "") in {
+                        "render_failed", "scan_failed"
+                    }
+                )
+            )
+            raw_units = [
+                dict(item)
+                for item in (coverage.get("raw_reinspection_units") or [])
+                if isinstance(item, Mapping)
+            ]
             coverage.update(
                 {
+                    "total_pdf_pages": total_pdf_pages,
+                    "nonblank_pages": nonblank_pages,
+                    "rendered_pages": rendered_pages,
+                    "visually_scanned_pages": int(
+                        coverage.get("visually_scanned_pages") or 0
+                    ),
+                    "skipped_pages": skipped_pages,
+                    "failed_pages": failed_page_count,
+                    "page_status": page_status,
+                    "scan_batches": list(coverage.get("scan_batches") or []),
                     "scan_coverage_status": "not_required",
                     "coverage_status": "not_required",
+                    "final_synthesis_modality": str(
+                        coverage.get("final_synthesis_modality") or "text_only"
+                    ),
+                    "final_raw_visual_recheck_status": str(
+                        coverage.get("final_raw_visual_recheck_status")
+                        or ("not_required" if not coverage.get("planned_visual_ids") else "not_run_fallback")
+                    ),
+                    "evidence_coverage_status": str(
+                        coverage.get("evidence_coverage_status") or "incomplete"
+                    ),
+                    "raw_reinspection_units": raw_units,
+                    "required_raw_reinspection_unit_count": len(raw_units),
+                    "closed_raw_reinspection_unit_count": sum(
+                        1 for item in raw_units if item.get("closed") is True
+                    ),
+                    "unresolved_raw_reinspection_unit_ids": [
+                        str(item.get("unit_id") or "")
+                        for item in raw_units
+                        if item.get("closed") is not True
+                        and str(item.get("unit_id") or "")
+                    ],
+                    "omissions": list(coverage.get("omissions") or []),
                     "observation_artifact_ids": [],
                     "observation_artifact_hashes": [],
                     "observation_artifact_paths": [],
                 }
+            )
+            prepared = replace(
+                prepared,
+                built_input=replace(
+                    prepared.built_input,
+                    visual_coverage=coverage,
+                ),
             )
             return prepared, coverage, []
 
@@ -2282,6 +2614,27 @@ class Stage1AnalysisService:
                 "observation_artifact_paths": [record.path for record in observation_records],
                 "scan_coverage_status": scan_status,
                 "coverage_status": scan_status,
+                "final_synthesis_modality": str(
+                    coverage.get("final_synthesis_modality") or "text_only"
+                ),
+                "final_raw_visual_recheck_status": str(
+                    coverage.get("final_raw_visual_recheck_status") or "not_required"
+                ),
+                "evidence_coverage_status": str(
+                    coverage.get("evidence_coverage_status") or "incomplete"
+                ),
+                "raw_reinspection_units": list(
+                    coverage.get("raw_reinspection_units") or []
+                ),
+                "required_raw_reinspection_unit_count": int(
+                    coverage.get("required_raw_reinspection_unit_count") or 0
+                ),
+                "closed_raw_reinspection_unit_count": int(
+                    coverage.get("closed_raw_reinspection_unit_count") or 0
+                ),
+                "unresolved_raw_reinspection_unit_ids": list(
+                    coverage.get("unresolved_raw_reinspection_unit_ids") or []
+                ),
                 "omissions": [
                     *omissions,
                     *[
@@ -2296,6 +2649,13 @@ class Stage1AnalysisService:
             prepared=prepared,
             coverage=coverage,
             observation_records=observation_records,
+        )
+        prepared = replace(
+            prepared,
+            built_input=replace(
+                prepared.built_input,
+                visual_coverage=coverage,
+            ),
         )
         return prepared, coverage, observations
 
@@ -2374,6 +2734,22 @@ class Stage1AnalysisService:
             evidence_coverage_status=str(
                 coverage.get("evidence_coverage_status") or "incomplete"
             ),
+            required_raw_reinspection_unit_count=int(
+                coverage.get("required_raw_reinspection_unit_count") or 0
+            ),
+            closed_raw_reinspection_unit_count=int(
+                coverage.get("closed_raw_reinspection_unit_count") or 0
+            ),
+            unresolved_raw_reinspection_unit_ids=tuple(
+                str(item)
+                for item in (coverage.get("unresolved_raw_reinspection_unit_ids") or [])
+                if str(item)
+            ),
+            raw_reinspection_units=tuple(
+                dict(item)
+                for item in (coverage.get("raw_reinspection_units") or [])
+                if isinstance(item, Mapping)
+            ),
             require_complete_visual_coverage=parse_strict_bool(
                 prepared.stage1_input_settings.get("require_complete_visual_coverage"),
                 field="Stage1_Input.require_complete_visual_coverage",
@@ -2410,11 +2786,31 @@ class Stage1AnalysisService:
             coverage=coverage,
             observation_records=self._visual_observation_records.get(paper_key, []),
         )
-        if record is not None:
-            coverage["coverage_artifact_id"] = record.artifact_id
-            coverage["coverage_artifact_path"] = record.path
-            coverage["coverage_artifact_hash"] = record.content_hash
-            self._visual_coverage_records[paper_key] = record
+        coverage["coverage_artifact_id"] = record.artifact_id
+        coverage["coverage_artifact_path"] = record.path
+        coverage["coverage_artifact_hash"] = record.content_hash
+        try:
+            published_payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("final visual coverage readback failed") from exc
+        if not isinstance(published_payload, Mapping):
+            raise RuntimeError("final visual coverage readback is not an object")
+        for field_name in (
+            "coverage_status",
+            "scan_coverage_status",
+            "final_synthesis_modality",
+            "final_raw_visual_recheck_status",
+            "evidence_coverage_status",
+            "raw_reinspection_units",
+            "required_raw_reinspection_unit_count",
+            "closed_raw_reinspection_unit_count",
+            "unresolved_raw_reinspection_unit_ids",
+        ):
+            if hash_json(published_payload.get(field_name)) != hash_json(coverage.get(field_name)):
+                raise RuntimeError(
+                    f"final visual coverage readback mismatch: {field_name}"
+                )
+        self._visual_coverage_records[paper_key] = record
         return coverage
 
     def _call_visual_scan(
@@ -2552,7 +2948,7 @@ class Stage1AnalysisService:
         prepared: _PreparedStage1Item,
         coverage: Mapping[str, Any],
         observation_records: Sequence[ArtifactRecord],
-    ) -> ArtifactRecord | None:
+    ) -> ArtifactRecord:
         payload = {
             "artifact_type": "stage1_visual_coverage",
             "artifact_version": "v1",
@@ -2591,8 +2987,12 @@ class Stage1AnalysisService:
             except (OSError, TypeError, ValueError):
                 existing_is_intact = False
             if not existing_is_intact:
+                try:
+                    existing_file_hash = file_sha256(existing.path)
+                except (OSError, TypeError, ValueError):
+                    existing_file_hash = ""
                 repair_suffix = hashlib.sha256(
-                    f"{artifact_id}|{existing.content_hash}|{file_sha256(existing.path)}|"
+                    f"{artifact_id}|{existing.content_hash}|{existing_file_hash}|"
                     f"{len(self.registry.list_records())}".encode("utf-8")
                 ).hexdigest()[:12]
                 artifact_id = f"{artifact_id}:repair:{repair_suffix}"
@@ -2612,8 +3012,8 @@ class Stage1AnalysisService:
                 artifact_id=artifact_id,
                 depends_on=dependencies,
             )
-        except (OSError, RegistryError, TypeError, ValueError):
-            return None
+        except (OSError, RegistryError, TypeError, ValueError) as exc:
+            raise RuntimeError("visual coverage publication failed") from exc
 
     def _record_for_path(self, path: str) -> ArtifactRecord | None:
         normalized = str(Path(path).expanduser().resolve()).casefold() if path else ""

@@ -241,7 +241,10 @@ class Stage1InputBuilder:
                 required=[],
             )
         visual_coverage.update(
-            summarize_raw_reinspection_groups(selected_visual_refs)
+            summarize_raw_reinspection_groups(
+                selected_visual_refs,
+                planned_units=visual_coverage.get("raw_reinspection_units"),
+            )
         )
         planned_batches = plan_visual_scan_batches(
             page_refs,
@@ -289,8 +292,7 @@ class Stage1InputBuilder:
         transport_visual_refs = [
             item
             for item in selected_visual_refs
-            if str(item.get("image_path") or "").strip()
-            and os.path.isfile(str(item.get("image_path") or "").strip())
+            if str(item.get("visual_id") or "").strip()
         ]
 
         visual_appendix = self._build_visual_appendix(selected_visual_refs)
@@ -421,8 +423,6 @@ class Stage1InputBuilder:
             user_message_content.append(pdf_item)
         for visual in transport_visual_refs:
             image_path = str(visual.get("image_path") or "").strip()
-            if not image_path:
-                continue
             label = self._visual_label(visual)
             user_message_content.append({"type": "text", "text": label})
             user_message_content.append(
@@ -432,6 +432,34 @@ class Stage1InputBuilder:
                     "visual_id": str(visual.get("visual_id") or ""),
                     "artifact_type": str(visual.get("artifact_type") or ""),
                     "page_no": int(visual.get("page_no") or 0),
+                    "bbox": list(visual.get("bbox") or []),
+                    "image_bytes": int(visual.get("image_bytes") or 0),
+                    "image_sha256": str(visual.get("image_sha256") or ""),
+                    "raw_reinspection_group_id": str(
+                        visual.get("raw_reinspection_group_id") or ""
+                    ),
+                    "raw_reinspection_resolution": str(
+                        visual.get("raw_reinspection_resolution") or ""
+                    ),
+                    "ambiguous_candidate_ids": [
+                        str(item)
+                        for item in (visual.get("ambiguous_candidate_ids") or [])
+                        if str(item)
+                    ],
+                    "raw_reinspection_selected_ids": [
+                        str(item)
+                        for item in (visual.get("raw_reinspection_selected_ids") or [])
+                        if str(item)
+                    ],
+                    "raw_reinspection_fallback_reason": str(
+                        visual.get("raw_reinspection_fallback_reason") or ""
+                    ),
+                    "raw_reinspection_atomic": bool(
+                        visual.get("raw_reinspection_atomic")
+                    ),
+                    "raw_reinspection_fallback_ref": dict(
+                        visual.get("raw_reinspection_fallback_ref") or {}
+                    ),
                 }
             )
 
@@ -477,7 +505,9 @@ class Stage1InputBuilder:
         def _size(item: Mapping[str, Any]) -> int:
             image_path = str(item.get("image_path") or "")
             try:
-                return int(item.get("image_bytes") or os.path.getsize(image_path))
+                if image_path and os.path.isfile(image_path):
+                    return int(os.path.getsize(image_path))
+                return int(item.get("image_bytes") or 0)
             except OSError:
                 return 0
 
@@ -510,6 +540,50 @@ class Stage1InputBuilder:
                     )
                     group_cost = sum(_encoded(candidate) for candidate in group_items)
                     if group_unsafe or total + group_cost > max_bytes:
+                        fallback = next(
+                            (
+                                candidate.get("raw_reinspection_fallback_ref")
+                                for candidate in group_items
+                                if isinstance(candidate.get("raw_reinspection_fallback_ref"), Mapping)
+                                and candidate.get("raw_reinspection_fallback_ref")
+                            ),
+                            None,
+                        )
+                        if isinstance(fallback, Mapping):
+                            fallback_item = dict(fallback)
+                            fallback_path = str(fallback_item.get("image_path") or "").strip()
+                            fallback_size = _size(fallback_item)
+                            fallback_cost = _encoded(fallback_item)
+                            if (
+                                str(fallback_item.get("visual_id") or "").strip()
+                                and fallback_path
+                                and os.path.isfile(fallback_path)
+                                and 0 < fallback_size <= max_single_bytes
+                                and total + fallback_cost <= max_bytes
+                            ):
+                                fallback_item.update(
+                                    {
+                                        "raw_reinspection_group_id": group_id,
+                                        "raw_reinspection_resolution": "page_snapshot_fallback",
+                                        "raw_reinspection_selected_ids": [
+                                            str(fallback_item.get("visual_id") or "")
+                                        ],
+                                        "raw_reinspection_fallback_reason": str(
+                                            group_items[0].get("raw_reinspection_fallback_reason")
+                                            or "transport_preflight_group_not_admitted"
+                                        ),
+                                        "raw_reinspection_atomic": True,
+                                        "ambiguous_candidate_ids": [
+                                            str(item)
+                                            for item in (
+                                                group_items[0].get("ambiguous_candidate_ids") or []
+                                            )
+                                            if str(item)
+                                        ],
+                                    }
+                                )
+                                selected.append(fallback_item)
+                                total += fallback_cost
                         continue
                     selected.extend(dict(candidate) for candidate in group_items)
                     total += group_cost

@@ -6,6 +6,7 @@ import sys
 
 import pytest
 
+import offline_guard
 from offline_guard import OfflineNetworkError, live_api_skip_reason, offline_enabled
 
 
@@ -136,3 +137,42 @@ def test_openai_key_does_not_disable_offline_guard_for_deepseek_smoke(
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_API", "1")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     assert offline_enabled() is True
+
+
+def test_generic_live_key_and_opt_in_still_leave_ordinary_tests_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTO_GENERATE_OFFLINE_TESTS", "1")
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_API", "1")
+    monkeypatch.setenv("AUTO_GENERATE_LIVE_API_KEY", "generic-secret")
+    assert offline_enabled() is True
+
+
+def test_live_provider_scope_authorizes_only_deepseek_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_API", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    monkeypatch.setattr(offline_guard, "_ORIGINAL_GETADDRINFO", lambda *args, **kwargs: [])
+
+    with offline_guard.allow_live_provider("deepseek"):
+        offline_guard._assert_loopback("api.deepseek.com")
+        with pytest.raises(OfflineNetworkError):
+            offline_guard._assert_loopback("example.com")
+
+    with pytest.raises(OfflineNetworkError):
+        offline_guard._assert_loopback("api.deepseek.com")
+
+
+def test_unknown_provider_live_gate_is_fail_closed() -> None:
+    assert (
+        live_api_skip_reason(
+            {"live_api"},
+            {
+                "AUTO_GENERATE_RUN_LIVE_API": "1",
+                "AUTO_GENERATE_LIVE_API_KEY": "generic-secret",
+            },
+            provider="openai",
+        )
+        == "unsupported live API provider: openai"
+    )

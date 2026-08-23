@@ -74,6 +74,12 @@ def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
     normalized["raw_reinspection_fallback_reason"] = (
         visual.get("raw_reinspection_fallback_reason") or ""
     )
+    normalized["raw_reinspection_upgrade_reason"] = (
+        visual.get("raw_reinspection_upgrade_reason") or ""
+    )
+    normalized["raw_reinspection_fallback_ref"] = dict(
+        visual.get("raw_reinspection_fallback_ref") or {}
+    ) if isinstance(visual.get("raw_reinspection_fallback_ref"), dict) else {}
     normalized["raw_reinspection_atomic"] = bool(
         visual.get("raw_reinspection_atomic")
     )

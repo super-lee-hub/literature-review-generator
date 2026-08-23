@@ -1642,12 +1642,74 @@ def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mappi
             "page_status",
             "scan_batches",
             "coverage_status",
+            "scan_coverage_status",
+            "final_synthesis_modality",
+            "final_raw_visual_recheck_status",
+            "evidence_coverage_status",
+            "raw_reinspection_units",
+            "required_raw_reinspection_unit_count",
+            "closed_raw_reinspection_unit_count",
+            "unresolved_raw_reinspection_unit_ids",
             "omissions",
         ),
         "stage1_visual_coverage",
     )
     if str(root.get("coverage_status") or "") not in {"complete", "partial", "failed"}:
         raise ArtifactSchemaError("stage1_visual_coverage.coverage_status is invalid")
+    if str(root.get("scan_coverage_status") or "") not in {
+        "complete", "partial", "failed", "not_required"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.scan_coverage_status is invalid")
+    if str(root.get("final_synthesis_modality") or "") not in {
+        "multimodal", "text_only", "pdf_plus_text"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.final_synthesis_modality is invalid")
+    if str(root.get("final_raw_visual_recheck_status") or "") not in {
+        "complete", "partial", "not_run_fallback", "not_required"
+    }:
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage.final_raw_visual_recheck_status is invalid"
+        )
+    if str(root.get("evidence_coverage_status") or "") not in {
+        "complete", "degraded", "incomplete"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.evidence_coverage_status is invalid")
+    raw_units = root.get("raw_reinspection_units")
+    if not isinstance(raw_units, list):
+        raise ArtifactSchemaError("stage1_visual_coverage.raw_reinspection_units must be an array")
+    try:
+        required_units = int(root.get("required_raw_reinspection_unit_count") or 0)
+        closed_units = int(root.get("closed_raw_reinspection_unit_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage raw reinspection counts must be integers"
+        ) from exc
+    unresolved_units = root.get("unresolved_raw_reinspection_unit_ids")
+    if (
+        required_units < 0
+        or closed_units < 0
+        or closed_units > required_units
+        or len(raw_units) != required_units
+        or not isinstance(unresolved_units, list)
+        or any(not isinstance(item, Mapping) for item in raw_units)
+        or any(
+            not str(item.get("unit_id") or "")
+            or not isinstance(item.get("closed"), bool)
+            for item in raw_units
+            if isinstance(item, Mapping)
+        )
+        or len({str(item.get("unit_id") or "") for item in raw_units if isinstance(item, Mapping)})
+        != len(raw_units)
+        or sum(1 for item in raw_units if isinstance(item, Mapping) and item.get("closed") is True)
+        != closed_units
+        or [
+            str(item.get("unit_id") or "")
+            for item in raw_units
+            if isinstance(item, Mapping) and item.get("closed") is not True
+        ]
+        != [str(item) for item in unresolved_units]
+    ):
+        raise ArtifactSchemaError("stage1_visual_coverage raw reinspection closure is invalid")
     if not isinstance(root.get("page_status"), list) or not isinstance(root.get("scan_batches"), list):
         raise ArtifactSchemaError("stage1_visual_coverage page_status and scan_batches must be arrays")
 

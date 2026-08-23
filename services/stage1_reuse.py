@@ -164,6 +164,10 @@ class Stage1VisualEvidenceQualificationV1:
     final_synthesis_modality: str = "text_only"
     final_raw_visual_recheck_status: str = "not_required"
     evidence_coverage_status: str = "complete"
+    required_raw_reinspection_unit_count: int = 0
+    closed_raw_reinspection_unit_count: int = 0
+    unresolved_raw_reinspection_unit_ids: tuple[str, ...] = ()
+    raw_reinspection_units: tuple[Mapping[str, Any], ...] = ()
     require_complete_visual_coverage: bool = True
     visual_observation_artifact_version: str = ""
     visual_scan_prompt_id: str = ""
@@ -210,6 +214,20 @@ class Stage1VisualEvidenceQualificationV1:
                 _text(raw.get("final_raw_visual_recheck_status")) or "not_required"
             ),
             evidence_coverage_status=_text(raw.get("evidence_coverage_status")) or "complete",
+            required_raw_reinspection_unit_count=(
+                _as_int_or_none(raw.get("required_raw_reinspection_unit_count")) or 0
+            ),
+            closed_raw_reinspection_unit_count=(
+                _as_int_or_none(raw.get("closed_raw_reinspection_unit_count")) or 0
+            ),
+            unresolved_raw_reinspection_unit_ids=cls._strings(
+                raw.get("unresolved_raw_reinspection_unit_ids")
+            ),
+            raw_reinspection_units=tuple(
+                dict(item)
+                for item in (raw.get("raw_reinspection_units") or [])
+                if isinstance(item, Mapping)
+            ),
             require_complete_visual_coverage=_as_bool(
                 raw.get("require_complete_visual_coverage"), True
             ),
@@ -228,9 +246,13 @@ class Stage1VisualEvidenceQualificationV1:
             "observation_artifact_ids", "observation_artifact_hashes",
             "observation_artifact_paths", "required_page_ids", "sent_page_ids",
             "observed_page_ids", "render_failed_page_ids", "scan_failed_page_ids",
+            "unresolved_raw_reinspection_unit_ids",
         ):
             payload[field_name] = list(payload[field_name])
         payload["transport_omissions"] = [dict(item) for item in self.transport_omissions]
+        payload["raw_reinspection_units"] = [
+            dict(item) for item in self.raw_reinspection_units
+        ]
         return payload
 
     def qualification_issues(self) -> tuple[str, ...]:
@@ -269,6 +291,46 @@ class Stage1VisualEvidenceQualificationV1:
             issues.append("final_raw_visual_recheck_status_invalid")
         if self.evidence_coverage_status not in {"complete", "degraded", "incomplete"}:
             issues.append("evidence_coverage_status_invalid")
+        unit_ids = [
+            str(item.get("unit_id") or "")
+            for item in self.raw_reinspection_units
+            if isinstance(item, Mapping)
+        ]
+        if (
+            self.required_raw_reinspection_unit_count != len(self.raw_reinspection_units)
+            or len(unit_ids) != len(self.raw_reinspection_units)
+            or len(set(unit_ids)) != len(unit_ids)
+            or any(not unit_id for unit_id in unit_ids)
+        ):
+            issues.append("raw_reinspection_unit_count_invalid")
+        if (
+            self.closed_raw_reinspection_unit_count < 0
+            or self.closed_raw_reinspection_unit_count > self.required_raw_reinspection_unit_count
+            or any(
+                not isinstance(item, Mapping) or not isinstance(item.get("closed"), bool)
+                for item in self.raw_reinspection_units
+            )
+            or sum(
+                1
+                for item in self.raw_reinspection_units
+                if isinstance(item, Mapping) and item.get("closed") is True
+            )
+            != self.closed_raw_reinspection_unit_count
+            or len(self.unresolved_raw_reinspection_unit_ids)
+            != self.required_raw_reinspection_unit_count - self.closed_raw_reinspection_unit_count
+            or [
+                str(item.get("unit_id") or "")
+                for item in self.raw_reinspection_units
+                if isinstance(item, Mapping) and item.get("closed") is not True
+            ]
+            != list(self.unresolved_raw_reinspection_unit_ids)
+        ):
+            issues.append("raw_reinspection_closure_invalid")
+        if (
+            self.unresolved_raw_reinspection_unit_ids
+            and self.require_complete_visual_coverage
+        ):
+            issues.append("raw_reinspection_units_unresolved")
         if self.require_complete_visual_coverage and self.evidence_coverage_status != "complete":
             issues.append("evidence_not_complete_for_reuse")
         return tuple(dict.fromkeys(issues))
@@ -753,6 +815,11 @@ def _verify_visual_evidence_qualification(
             return False, "prior_visual_coverage_incomplete"
         if "evidence_not_complete_for_reuse" in issues:
             return False, "prior_visual_coverage_incomplete"
+        if (
+            "raw_reinspection_units_unresolved" in issues
+            and qualification.require_complete_visual_coverage
+        ):
+            return False, "prior_visual_coverage_incomplete"
         if any(
             issue in issues
             for issue in (
@@ -770,6 +837,7 @@ def _verify_visual_evidence_qualification(
         or qualification.required_nonblank_page_count
         or qualification.scan_coverage_status != "not_required"
         or qualification.observation_artifact_ids
+        or qualification.required_raw_reinspection_unit_count
     )
     expected_scan_identity = None
     expected_scan_schema_hash = ""
@@ -870,6 +938,28 @@ def _verify_visual_evidence_qualification(
             return False, "prior_visual_coverage_artifact_invalid"
         if not isinstance(coverage_payload, Mapping):
             return False, "prior_visual_coverage_artifact_invalid"
+        qualification_final_fields = {
+            "final_synthesis_modality": qualification.final_synthesis_modality,
+            "final_raw_visual_recheck_status": qualification.final_raw_visual_recheck_status,
+            "evidence_coverage_status": qualification.evidence_coverage_status,
+            "required_raw_reinspection_unit_count": (
+                qualification.required_raw_reinspection_unit_count
+            ),
+            "closed_raw_reinspection_unit_count": (
+                qualification.closed_raw_reinspection_unit_count
+            ),
+            "unresolved_raw_reinspection_unit_ids": list(
+                qualification.unresolved_raw_reinspection_unit_ids
+            ),
+            "raw_reinspection_units": [
+                dict(item) for item in qualification.raw_reinspection_units
+            ],
+        }
+        for field_name, declared in qualification_final_fields.items():
+            if field_name not in coverage_payload:
+                return False, "prior_visual_coverage_artifact_invalid"
+            if hash_json(coverage_payload.get(field_name)) != hash_json(declared):
+                return False, "prior_visual_coverage_artifact_invalid"
         for field_name in (
             "scan_coverage_status", "required_nonblank_page_count",
             "required_page_ids", "sent_visual_ids", "observed_visual_ids",

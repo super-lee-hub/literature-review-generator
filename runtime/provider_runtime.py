@@ -144,8 +144,23 @@ def _canonical_request_content(prompt: str, user_content: Any) -> Any:
                 has_text = True
             continue
         if item_type == "local_image_path":
-            path = str(raw.get("path") or "").strip()
-            identity = _canonical_file_identity(path)
+            frozen_bytes = 0
+            try:
+                frozen_bytes = int(raw.get("frozen_image_bytes") or 0)
+            except (TypeError, ValueError):
+                frozen_bytes = 0
+            frozen_hash = str(raw.get("frozen_image_sha256") or "").strip()
+            if bool(raw.get("transport_frozen")) and frozen_bytes > 0 and frozen_hash:
+                # The final preflight snapshot, not the mutable path, is the
+                # request identity used by expected calls and receipts.
+                identity = {
+                    "exists": True,
+                    "bytes": frozen_bytes,
+                    "sha256": frozen_hash,
+                }
+            else:
+                path = str(raw.get("path") or "").strip()
+                identity = _canonical_file_identity(path)
             if not identity["exists"] or identity["bytes"] <= 0:
                 continue
             normalized.append({
@@ -155,6 +170,22 @@ def _canonical_request_content(prompt: str, user_content: Any) -> Any:
                 "bbox": list(raw.get("bbox") or []),
                 "artifact_type": str(raw.get("artifact_type") or ""),
                 "detail": str(raw.get("detail") or "original"),
+                "raw_reinspection_group_id": str(raw.get("raw_reinspection_group_id") or ""),
+                "raw_reinspection_resolution": str(raw.get("raw_reinspection_resolution") or ""),
+                "raw_reinspection_atomic": bool(raw.get("raw_reinspection_atomic")),
+                "ambiguous_candidate_ids": [
+                    str(item)
+                    for item in (raw.get("ambiguous_candidate_ids") or [])
+                    if str(item)
+                ],
+                "raw_reinspection_selected_ids": [
+                    str(item)
+                    for item in (raw.get("raw_reinspection_selected_ids") or [])
+                    if str(item)
+                ],
+                "raw_reinspection_fallback_reason": str(
+                    raw.get("raw_reinspection_fallback_reason") or ""
+                ),
                 **identity,
             })
             continue

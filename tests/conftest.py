@@ -17,6 +17,7 @@ if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 from offline_guard import (  # noqa: E402
+    allow_live_provider,
     configure_offline_environment,
     install_offline_guard,
     live_api_skip_reason,
@@ -37,6 +38,27 @@ def temp_dir():
     """提供临时目录fixture"""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield tmpdir
+
+
+@pytest.fixture(autouse=True)
+def _provider_scoped_live_network(request):
+    """Allow only the explicitly marked provider during its live test."""
+
+    marker = request.node.get_closest_marker("live_api")
+    if marker is None:
+        yield
+        return
+    provider = str((marker.kwargs or {}).get("provider") or "").strip()
+    reason = live_api_skip_reason(
+        {item.name for item in request.node.iter_markers()},
+        os.environ,
+        provider=provider or None,
+    )
+    if reason is not None:
+        yield
+        return
+    with allow_live_provider(provider):
+        yield
 
 
 @pytest.fixture

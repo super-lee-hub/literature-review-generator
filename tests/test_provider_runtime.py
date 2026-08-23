@@ -309,6 +309,198 @@ def test_low_level_http_mock_budget_omission_matches_receipt_and_payload(monkeyp
     assert receipt.metadata["omissions"][0]["reason"] == "image_exceeds_request_byte_budget"
 
 
+def test_low_level_http_mock_never_sends_one_child_of_broken_atomic_group(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    first_image = tmp_path / "child-a.jpg"
+    fallback_image = tmp_path / "page-fallback.jpg"
+    first_image.write_bytes(b"child-a")
+    fallback_image.write_bytes(b"page-fallback")
+    second_image = tmp_path / "child-b-missing.jpg"
+    captured: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {"content": '{"answer":"ok"}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+    def post(url: str, **kwargs: object) -> Response:
+        captured["payload"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
+    ledger = ProviderRuntimeLedger(tmp_path / "receipts.jsonl")
+    runtime = ProviderRuntime(
+        ledger=ledger,
+        job_id="job-atomic",
+        attempt_id="attempt-atomic",
+        stage_name="stage1_analyze",
+        route="Primary_Reader_API",
+        node_id="paper-atomic",
+        call_id="stage1_synthesis:paper-atomic",
+        endpoint_type="chat_completions",
+    )
+    group = {
+        "raw_reinspection_group_id": "ambiguous-page-1",
+        "raw_reinspection_resolution": "all_children",
+        "raw_reinspection_atomic": True,
+        "ambiguous_candidate_ids": ["child-a", "child-b"],
+        "raw_reinspection_selected_ids": ["child-a", "child-b"],
+        "raw_reinspection_fallback_ref": {
+            "visual_id": "page-1",
+            "page_no": 1,
+            "artifact_type": "page_snapshot",
+            "image_path": str(fallback_image),
+        },
+    }
+    user_content = [
+        {"type": "text", "text": "atomic evidence"},
+        {"type": "text", "text": "child-a label"},
+        {
+            "type": "local_image_path",
+            "path": str(first_image),
+            "visual_id": "child-a",
+            "page_no": 1,
+            "artifact_type": "figure_crop",
+            **group,
+        },
+        {"type": "text", "text": "child-b label"},
+        {
+            "type": "local_image_path",
+            "path": str(second_image),
+            "visual_id": "child-b",
+            "page_no": 1,
+            "artifact_type": "figure_crop",
+            **group,
+        },
+    ]
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        {
+            "api_key": "secret",
+            "model": "deepseek-v4-flash-vision-exp",
+            "api_base": "https://api.deepseek.com/v1",
+            "provider_family": "deepseek",
+        },
+        "system",
+        user_content=user_content,
+        provider_runtime=runtime,
+        max_single_image_bytes=1_000,
+        max_request_image_bytes=10_000,
+    )
+
+    assert result["status"] == "success"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    wire_content = payload["messages"][1]["content"]
+    wire_images = [item for item in wire_content if item.get("type") == "image_url"]
+    assert len(wire_images) == 1
+    receipt = ledger.list_receipts()[0]
+    transport = result["transport_metadata"]
+    assert transport["sent_visual_ids"] == ["page-1"]
+    assert transport["raw_reinspection_groups"][0]["resolution"] == "page_snapshot_fallback"
+    assert transport["raw_reinspection_groups"][0]["actual_sent_ids"] == ["page-1"]
+    assert receipt.metadata["images_actually_sent_count"] == 1
+
+
+def test_low_level_http_mock_omits_broken_atomic_group_as_a_unit(monkeypatch, tmp_path) -> None:
+    first_image = tmp_path / "child-a.jpg"
+    first_image.write_bytes(b"child-a")
+    second_image = tmp_path / "child-b-missing.jpg"
+    captured: dict[str, object] = {}
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {"content": '{"answer":"ok"}'},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+    def post(url: str, **kwargs: object) -> Response:
+        captured["payload"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr(ai_interface, "_post_with_proxy_mode", post)
+    runtime = ProviderRuntime(
+        ledger=ProviderRuntimeLedger(tmp_path / "receipts.jsonl"),
+        job_id="job-atomic-no-fallback",
+        attempt_id="attempt-atomic-no-fallback",
+        stage_name="stage1_analyze",
+        route="Primary_Reader_API",
+        node_id="paper-atomic-no-fallback",
+        call_id="stage1_synthesis:paper-atomic-no-fallback",
+        endpoint_type="chat_completions",
+    )
+    group = {
+        "raw_reinspection_group_id": "ambiguous-page-2",
+        "raw_reinspection_resolution": "all_children",
+        "raw_reinspection_atomic": True,
+        "ambiguous_candidate_ids": ["child-a", "child-b"],
+        "raw_reinspection_selected_ids": ["child-a", "child-b"],
+    }
+    result = ai_interface._call_ai_api_detailed(
+        "prompt",
+        {
+            "api_key": "secret",
+            "model": "deepseek-v4-flash-vision-exp",
+            "api_base": "https://api.deepseek.com/v1",
+            "provider_family": "deepseek",
+        },
+        "system",
+        user_content=[
+            {"type": "text", "text": "atomic evidence"},
+            {
+                "type": "local_image_path",
+                "path": str(first_image),
+                "visual_id": "child-a",
+                "page_no": 2,
+                **group,
+            },
+            {
+                "type": "local_image_path",
+                "path": str(second_image),
+                "visual_id": "child-b",
+                "page_no": 2,
+                **group,
+            },
+        ],
+        provider_runtime=runtime,
+        max_single_image_bytes=1_000,
+        max_request_image_bytes=10_000,
+    )
+
+    assert result["status"] == "success"
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    wire_content = payload["messages"][1]["content"]
+    assert all(item.get("type") != "image_url" for item in wire_content)
+    transport = result["transport_metadata"]
+    assert transport["sent_visual_ids"] == []
+    assert transport["raw_reinspection_groups"][0]["resolution"] == "not_represented"
+    assert transport["omissions"][0]["raw_reinspection_group_id"] == "ambiguous-page-2"
+
+
 def test_http_parameter_mutation_is_recorded_without_changing_logical_request_hash(
     monkeypatch,
     tmp_path,

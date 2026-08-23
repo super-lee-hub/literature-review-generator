@@ -40,12 +40,30 @@ merely because it shares a page. The selected child carries
 `source_page_visual_id`, `source_observation_visual_id`, `object_attribution_*`,
 `post_scan_score`, and score components. If an ambiguous set does not fit the
 raw-image budget, the reducer retains the page snapshot as the safe fallback.
-Ambiguous attribution is atomic: the reducer admits the complete candidate set
-or one page snapshot, never a partial child set. This atomic decision covers
-reference count, encoded request bytes, per-image bytes, missing/unreadable
-children, overlap, dedupe groups, and transport constraints. The final coverage
-and provider transport metadata retain the group id, candidate ids, resolution,
-selected ids, fallback reason, transport status, and child-completion flag.
+Ambiguous attribution is atomic: the reducer schedules the complete candidate
+set as one raw-reinspection unit, or one page snapshot as its reserved fallback;
+it never admits a partial child set. The unit is considered before ordinary
+visual competition, so a global count/byte budget cannot silently consume its
+slot and erase the unit. If neither the children nor the fallback can be
+represented, the unit remains explicitly `not_represented` and unresolved in
+the coverage artifact. This atomic decision covers reference count, encoded
+request bytes, per-image bytes, missing/unreadable children, overlap, dedupe
+groups, and transport constraints. The final coverage and provider transport
+metadata retain the group id, candidate ids, resolution, selected ids, fallback
+reason, transport status, and child-completion flag.
+
+Attribution and raw necessity are separate decisions. An explicit
+`requires_raw_reinspection=false` is respected for an otherwise resolved child;
+manual-review or OCR-conflict safety policy may upgrade it, while an ambiguous
+page upgrades the whole candidate unit. A high attribution score alone is not
+permission to spend raw-image budget.
+
+Immediately before a synthesis HTTP request, local image bytes are snapshotted
+and frozen once. An `all_children` unit is admitted transactionally from that
+snapshot; if a child has disappeared or the actual request budget no longer
+fits, the frozen request contains the declared page fallback or no member of
+the unit. The provider request hash and receipt are computed from this frozen
+wire membership, not from a mutable path that may later change.
 
 The achieved reducer is recorded in the typed
 `visual_evidence_qualification` binding and distinguishes four independent
@@ -58,11 +76,17 @@ facts:
 - `evidence_coverage_status`: `complete`, `degraded`, or `incomplete`.
 
 These fields replace the old overloaded interpretation of `coverage_status`
-(which remains only as a compatibility alias). A backup response after a
+(which remains only as a Registry v1 scan-domain alias with
+`complete|partial|failed`; `not_required` is reduced to `complete` for the
+alias). A backup response after a
 complete page scan keeps `scan_coverage_status=complete`, but records
 `final_synthesis_modality=text_only`,
 `final_raw_visual_recheck_status=not_run_fallback`, and
-`evidence_coverage_status=degraded`; it is marked for manual review.
+`evidence_coverage_status=degraded`; it is marked for manual review. Final
+`evidence_coverage_status=complete` requires every required raw-reinspection
+unit to be closed at wire time; sending any image is not sufficient. The final
+coverage artifact is published only after its JSON readback matches these
+reducer facts.
 
 With `require_complete_visual_coverage=true`, exact reuse verifies the Registry
 records, content hashes, JSON type/version, the v2 observation prompt/schema
@@ -128,5 +152,8 @@ never sent to the DeepSeek endpoint. Without explicit opt-in, the result is
 `LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_LIVE_API_NOT_ENABLED`; without a
 DeepSeek-specific key, it is
 `LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_DEEPSEEK_KEY`. Offline and mocked tests
-do not substitute for live evidence. The smoke test never writes the key,
-response body, or synthetic PDF into the repository.
+do not substitute for live evidence. The pytest offline guard remains enabled
+for ordinary tests even when a generic live key and opt-in flag exist; a live
+DeepSeek test receives a temporary provider-scoped exception only for
+`api.deepseek.com` and its currently resolved addresses. The smoke test never
+writes the key, response body, or synthetic PDF into the repository.

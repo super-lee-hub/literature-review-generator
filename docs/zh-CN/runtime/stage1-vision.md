@@ -31,11 +31,24 @@ Stage 1 始终把 MinerU 或其他预处理器生成的 normalized full text 作
 定量或关系证据。被选择的 child 带有 `source_page_visual_id`、
 `source_observation_visual_id`、`object_attribution_*`、`post_scan_score` 和评分
 分量。如果 ambiguous 集合超出 raw-image 预算，reducer 会保留整页 snapshot
-作为安全回退。ambiguous 归因是原子的：要么保留完整候选 child 集合，要么保留
-一张整页 snapshot，绝不保留部分 child。原子决策同时覆盖引用数量、编码后的请求
-字节数、单图字节数、child 缺失/不可读、重叠、dedupe group 以及 transport 约束；
+作为安全回退。ambiguous 归因是原子的：reducer 把完整候选 child 集合作为一个
+raw-reinspection unit 调度，或为它预留一张整页 snapshot 作为 fallback，绝不保留
+部分 child。这个 unit 会在普通视觉候选竞争之前判断，因此全局数量/字节预算不能
+悄悄消耗它的名额并让它消失。如果 child 和 fallback 都无法表示，coverage artifact
+仍必须保留 `not_represented` 且未闭合的 unit。原子决策同时覆盖引用数量、编码后的
+请求字节数、单图字节数、child 缺失/不可读、重叠、dedupe group 以及 transport 约束；
 最终 coverage 和 provider transport metadata 会保存 group id、候选 id、resolution、
 selected id、回退原因、transport status 和 child 完成标志。
+
+归因和是否需要 raw 复核是两个独立决策。对其他条件正常的 resolved child，显式的
+`requires_raw_reinspection=false` 会被尊重；manual-review 或 OCR conflict 安全策略
+可以升级它，而 ambiguous page 会升级整个候选 unit。仅有很高的归因分数不能单独
+获得 raw-image 预算。
+
+在 synthesis HTTP 请求即将发出前，系统会一次性读取并冻结本地图片字节。`all_children`
+unit 以事务方式从这份快照中准入；如果 child 已消失或实际请求预算不再容纳完整 unit，
+冻结后的请求只能包含声明的整页 fallback，或不包含该 unit 的任何成员。provider request
+hash 和 receipt 绑定这份冻结后的 wire membership，不绑定之后可能变化的路径。
 
 最终 reducer 会在 typed `visual_evidence_qualification` binding 中记录四个
 相互独立的事实：
@@ -46,11 +59,15 @@ selected id、回退原因、transport status 和 child 完成标志。
   `not_run_fallback`、`not_required`；
 - `evidence_coverage_status`：`complete`、`degraded`、`incomplete`。
 
-旧的多义 `coverage_status` 只保留为兼容别名。完整页扫描后如果最终走 backup，
+旧的多义 `coverage_status` 只保留为 Registry v1 扫描域兼容别名，允许值为
+`complete|partial|failed`；`not_required` 会在别名层折算为 `complete`。完整页扫描后如果最终走 backup，
 仍保持 `scan_coverage_status=complete`，但记录
 `final_synthesis_modality=text_only`、
 `final_raw_visual_recheck_status=not_run_fallback`、
-`evidence_coverage_status=degraded`，并要求人工复核。
+`evidence_coverage_status=degraded`，并要求人工复核。只有所有必需的
+raw-reinspection unit 在 wire time 闭合，最终 `evidence_coverage_status` 才能是
+`complete`；“发送过任意图片”不能替代 unit closure。最终 coverage artifact 还必须
+通过 JSON readback，与 reducer 的这些事实逐项一致。
 
 当 `require_complete_visual_coverage=true` 时，exact reuse 必须重新验证
 Registry record、内容 hash、JSON type/version、v2 observation 的 Prompt/schema
@@ -104,7 +121,9 @@ python -m pytest -q tests/live/test_deepseek_vision_smoke.py -m live_api
 
 未显式 opt-in 时，结果必须是
 `LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_LIVE_API_NOT_ENABLED`；没有 DeepSeek 专用 key
-时是 `LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_DEEPSEEK_KEY`。smoke 只接受
+时是 `LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_DEEPSEEK_KEY`。普通测试即使存在通用 live key 和 opt-in 标志，pytest
+离线 guard 仍保持开启；只有 DeepSeek live 测试会临时获得 provider-scoped 例外，并且
+仅允许 `api.deepseek.com` 及其当前解析地址。smoke 只接受
 `DEEPSEEK_API_KEY` 或 `AUTO_GENERATE_DEEPSEEK_API_KEY`，不会把通用 live key 或
 `OPENAI_API_KEY` 发往 DeepSeek endpoint。离线和 mocked 测试不能替代 live 证据。
 测试不会把 key、响应正文或合成 PDF 写入仓库。

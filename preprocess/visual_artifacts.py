@@ -415,6 +415,14 @@ class Stage1VisualArtifactBuilder:
                 "selected_crops": [item.to_ref() for item in published_visuals if item.artifact_type != "page_snapshot"],
                 "scan_batches": [],
                 "coverage_status": "partial" if nonblank_pages else "complete",
+                "scan_coverage_status": "partial" if nonblank_pages else "not_required",
+                "final_synthesis_modality": "text_only",
+                "final_raw_visual_recheck_status": "not_required",
+                "evidence_coverage_status": "incomplete" if nonblank_pages else "complete",
+                "raw_reinspection_units": [],
+                "required_raw_reinspection_unit_count": 0,
+                "closed_raw_reinspection_unit_count": 0,
+                "unresolved_raw_reinspection_unit_ids": [],
                 "omissions": [item for item in page_status if item["status"] == "render_failed"],
             }
             manifest_payload["coverage_report"] = coverage_report

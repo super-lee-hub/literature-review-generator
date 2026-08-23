@@ -60,3 +60,19 @@ def test_v1_visual_observation_qualification_is_invalid_under_current_v2_contrac
 
     assert verified is False
     assert reason == "prior_visual_observation_contract_invalid"
+
+
+def test_explicit_degraded_policy_allows_unresolved_raw_unit_reuse_gate() -> None:
+    qualification = Stage1VisualEvidenceQualificationV1(
+        require_complete_visual_coverage=False,
+        evidence_coverage_status="degraded",
+        required_raw_reinspection_unit_count=1,
+        closed_raw_reinspection_unit_count=0,
+        unresolved_raw_reinspection_unit_ids=("ambiguous-page-4",),
+        raw_reinspection_units=(
+            {"unit_id": "ambiguous-page-4", "closed": False},
+        ),
+    )
+
+    assert "raw_reinspection_units_unresolved" not in qualification.qualification_issues()
+    assert qualification.complete_for_reuse() is True

@@ -103,6 +103,9 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
     assert summary["provider"]["final_synthesis_modality"] == "text_only"
     assert summary["provider"]["final_raw_visual_recheck_status"] == "not_run_fallback"
     assert summary["provider"]["evidence_coverage_status"] == "degraded"
-    assert summary["provider"]["visual_coverage_status"] == "degraded"
+    # ``visual_coverage_status`` is the Registry v1 scan-domain alias;
+    # final synthesis degradation is carried separately by
+    # ``evidence_coverage_status``.
+    assert summary["provider"]["visual_coverage_status"] == "complete"
     assert "final_raw_visual_recheck_missing" in summary["ai_summary"]["quality_audit"]["conflict_flags"]
     assert summary["ai_summary"]["quality_audit"]["needs_manual_review"] is True

@@ -1,5 +1,6 @@
 import base64
 import copy
+import hashlib
 import json
 import mimetypes
 import os
@@ -597,6 +598,354 @@ def _encode_local_pdf_as_data_url(path: str) -> Optional[str]:
     return f"data:application/pdf;base64,{encoded}"
 
 
+def _snapshot_local_image(
+    path: str,
+    *,
+    max_single_image_bytes: int,
+) -> Tuple[Optional[str], int, str, str]:
+    """Read one image exactly once for the final wire preflight.
+
+    The returned data URL is the frozen wire fact.  The transport must not
+    re-open the path after this function succeeds; a later delete or resize
+    therefore cannot turn an admitted atomic group into a partial request.
+    """
+
+    normalized = str(path or "").strip()
+    if not normalized or not os.path.isfile(normalized):
+        return None, 0, "", "missing_or_unreadable_local_image"
+    try:
+        with open(normalized, "rb") as handle:
+            image_bytes = handle.read(max_single_image_bytes + 1)
+    except OSError:
+        return None, 0, "", "missing_or_unreadable_local_image"
+    if not image_bytes:
+        return None, 0, "", "image_empty"
+    if len(image_bytes) > max_single_image_bytes:
+        return None, len(image_bytes), "", "image_exceeds_single_byte_budget"
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    mime_type = mimetypes.guess_type(normalized)[0] or "image/png"
+    return (
+        f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}",
+        len(image_bytes),
+        digest,
+        "",
+    )
+
+
+def _transport_visual_label(item: Mapping[str, Any]) -> str:
+    visual_id = str(item.get("visual_id") or "")
+    page_no = int(item.get("page_no") or 0)
+    bbox = item.get("bbox") or []
+    artifact_type = str(item.get("artifact_type") or "visual")
+    caption = " ".join(
+        " ".join(str(item.get(key) or "").split())
+        for key in ("caption_excerpt", "title_or_caption")
+    )[:360]
+    nearby = " ".join(str(item.get("nearby_text_excerpt") or "").split())[:500]
+    return (
+        f"[VISUAL OBJECT] visual_id={visual_id}; page_no={page_no}; bbox={bbox}; "
+        f"artifact_type={artifact_type}\n"
+        f"caption_excerpt={caption or '<none>'}\n"
+        f"nearby_text_excerpt={nearby or '<none>'}\n"
+        "The following image is evidence for this label only."
+    )
+
+
+def _drop_visual_label(output: List[Dict[str, Any]], visual_id: str) -> None:
+    marker = f"visual_id={visual_id}"
+    for index in range(len(output) - 1, -1, -1):
+        item = output[index]
+        if str(item.get("type") or "").strip().lower() not in {"text", "input_text"}:
+            break
+        if marker in str(item.get("text") or ""):
+            output.pop(index)
+            break
+
+
+def _frozen_local_image_item(
+    item: Mapping[str, Any],
+    *,
+    data_url: str,
+    image_bytes: int,
+    image_sha256: str,
+) -> Dict[str, Any]:
+    frozen = dict(item)
+    frozen["type"] = "local_image_path"
+    frozen["frozen_image_data_url"] = data_url
+    frozen["frozen_image_bytes"] = image_bytes
+    frozen["frozen_image_sha256"] = image_sha256
+    frozen["image_bytes"] = image_bytes
+    frozen["image_sha256"] = image_sha256
+    frozen["transport_frozen"] = True
+    return frozen
+
+
+def freeze_local_visual_transport_content(
+    user_content: Any,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Tuple[Any, Dict[str, Any]]:
+    """Freeze local visual membership before a provider POST.
+
+    Atomic ``all_children`` groups are admitted as one transaction.  If the
+    actual filesystem snapshot no longer satisfies the group contract, the
+    whole group is replaced by its declared page fallback, or omitted as one
+    explicit ``not_represented`` unit.  No child is ever sent alone.
+    """
+
+    max_request, max_single = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
+    if not isinstance(user_content, list):
+        return user_content, {
+            "planned_visual_ids": [],
+            "sent_visual_ids": [],
+            "omissions": [],
+            "raw_reinspection_groups": [],
+            "estimated_encoded_image_bytes": 0,
+        }
+
+    raw_items = [dict(item) for item in user_content if isinstance(item, Mapping)]
+    image_indices = [
+        index
+        for index, item in enumerate(raw_items)
+        if str(item.get("type") or "").strip().lower() == "local_image_path"
+    ]
+    groups: Dict[Tuple[str, str], List[int]] = {}
+    for index in image_indices:
+        item = raw_items[index]
+        group_id = str(item.get("raw_reinspection_group_id") or "").strip()
+        resolution = str(item.get("raw_reinspection_resolution") or "").strip()
+        if bool(item.get("raw_reinspection_atomic")) and group_id and resolution == "all_children":
+            groups.setdefault((group_id, resolution), []).append(index)
+
+    replacements: Dict[int, Optional[Dict[str, Any]]] = {}
+    processed: set[int] = set()
+    omissions: List[Dict[str, Any]] = []
+    group_reports: List[Dict[str, Any]] = []
+    encoded_bytes = 0
+    sent_visual_ids: List[str] = []
+
+    def admit_one(item: Mapping[str, Any], *, remaining: int) -> Tuple[Optional[Dict[str, Any]], str]:
+        frozen_url = str(item.get("frozen_image_data_url") or "").strip()
+        if frozen_url:
+            try:
+                frozen_bytes = int(item.get("frozen_image_bytes") or item.get("image_bytes") or 0)
+            except (TypeError, ValueError):
+                frozen_bytes = 0
+            frozen_hash = str(item.get("frozen_image_sha256") or item.get("image_sha256") or "")
+            estimated = estimate_encoded_image_bytes(frozen_bytes)
+            if frozen_bytes <= 0:
+                return None, "image_empty"
+            if frozen_bytes > max_single:
+                return None, "image_exceeds_single_byte_budget"
+            if estimated > remaining:
+                return None, "image_exceeds_request_byte_budget"
+            return _frozen_local_image_item(
+                item,
+                data_url=frozen_url,
+                image_bytes=frozen_bytes,
+                image_sha256=frozen_hash,
+            ), ""
+        data_url, image_size, image_hash, reason = _snapshot_local_image(
+            str(item.get("path") or ""),
+            max_single_image_bytes=max_single,
+        )
+        if reason:
+            return None, reason
+        estimated = estimate_encoded_image_bytes(image_size)
+        if estimated > remaining:
+            return None, "image_exceeds_request_byte_budget"
+        return _frozen_local_image_item(
+            item,
+            data_url=str(data_url),
+            image_bytes=image_size,
+            image_sha256=image_hash,
+        ), ""
+
+    for index in image_indices:
+        if index in processed:
+            continue
+        item = raw_items[index]
+        group_id = str(item.get("raw_reinspection_group_id") or "").strip()
+        resolution = str(item.get("raw_reinspection_resolution") or "").strip()
+        group_key = (group_id, resolution)
+        member_indices = groups.get(group_key) if group_key in groups else None
+        if member_indices:
+            processed.update(member_indices)
+            candidate_ids = [
+                str(raw_items[member].get("visual_id") or "")
+                for member in member_indices
+                if str(raw_items[member].get("visual_id") or "")
+            ]
+            snapshots: List[Tuple[int, Dict[str, Any]]] = []
+            group_reason = ""
+            for member in member_indices:
+                frozen, reason = admit_one(raw_items[member], remaining=max_request - encoded_bytes)
+                if reason:
+                    group_reason = reason
+                    break
+                if frozen is not None:
+                    snapshots.append((member, frozen))
+            group_cost = sum(
+                estimate_encoded_image_bytes(int(frozen.get("image_bytes") or 0))
+                for _member, frozen in snapshots
+            )
+            if not group_reason and len(snapshots) != len(member_indices):
+                group_reason = "atomic_group_member_not_admitted"
+            if not group_reason and encoded_bytes + group_cost > max_request:
+                group_reason = "image_exceeds_request_byte_budget"
+            if not group_reason:
+                for member, frozen in snapshots:
+                    frozen["transport_planned_visual_ids"] = list(candidate_ids)
+                    replacements[member] = frozen
+                encoded_bytes += group_cost
+                sent_visual_ids.extend(candidate_ids)
+                group_reports.append(
+                    {
+                        "group_id": group_id,
+                        "page_no": int(item.get("page_no") or 0),
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "resolution": "all_children",
+                        "selected_ids": candidate_ids,
+                        "actual_sent_ids": candidate_ids,
+                        "transport_status": "complete",
+                        "fallback_reason": "",
+                    }
+                )
+                continue
+
+            fallback = item.get("raw_reinspection_fallback_ref")
+            fallback_item = dict(fallback) if isinstance(fallback, Mapping) else {}
+            fallback_id = str(fallback_item.get("visual_id") or "").strip()
+            fallback_frozen: Optional[Dict[str, Any]] = None
+            fallback_reason = group_reason or "atomic_group_not_admitted"
+            if fallback_id:
+                # Selector/manifest refs use ``image_path`` while the local
+                # transport item uses ``path``.  Normalize the declared page
+                # fallback before the atomic admission attempt; otherwise a
+                # valid fallback would be misclassified as missing and the
+                # whole unit would be unnecessarily dropped.
+                fallback_item["path"] = str(
+                    fallback_item.get("path")
+                    or fallback_item.get("image_path")
+                    or ""
+                )
+                fallback_frozen, fallback_error = admit_one(
+                    {
+                        **fallback_item,
+                        "raw_reinspection_group_id": group_id,
+                        "raw_reinspection_resolution": "page_snapshot_fallback",
+                        "raw_reinspection_selected_ids": [fallback_id],
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "raw_reinspection_atomic": True,
+                    },
+                    remaining=max_request - encoded_bytes,
+                )
+                if fallback_error:
+                    fallback_frozen = None
+                    fallback_reason = f"{fallback_reason};fallback:{fallback_error}"
+            if fallback_frozen is not None:
+                fallback_frozen["transport_planned_visual_ids"] = list(candidate_ids)
+                replacements[member_indices[0]] = fallback_frozen
+                for member in member_indices[1:]:
+                    replacements[member] = None
+                encoded_bytes += estimate_encoded_image_bytes(
+                    int(fallback_frozen.get("image_bytes") or 0)
+                )
+                sent_visual_ids.append(fallback_id)
+                group_reports.append(
+                    {
+                        "group_id": group_id,
+                        "page_no": int(item.get("page_no") or 0),
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "resolution": "page_snapshot_fallback",
+                        "selected_ids": [fallback_id],
+                        "actual_sent_ids": [fallback_id],
+                        "transport_status": "complete",
+                        "fallback_reason": fallback_reason,
+                    }
+                )
+            else:
+                for member in member_indices:
+                    replacements[member] = None
+                    omissions.append(
+                        {
+                            "visual_id": str(raw_items[member].get("visual_id") or ""),
+                            "page_no": int(raw_items[member].get("page_no") or 0),
+                            "reason": "raw_reinspection_group_not_represented",
+                            "raw_reinspection_group_id": group_id,
+                            "raw_reinspection_resolution": "not_represented",
+                            "raw_reinspection_fallback_reason": fallback_reason,
+                            "raw_reinspection_planned_ids": candidate_ids,
+                        }
+                    )
+                group_reports.append(
+                    {
+                        "group_id": group_id,
+                        "page_no": int(item.get("page_no") or 0),
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "resolution": "not_represented",
+                        "selected_ids": [],
+                        "actual_sent_ids": [],
+                        "transport_status": "not_sent",
+                        "fallback_reason": fallback_reason,
+                    }
+                )
+            continue
+
+        processed.add(index)
+        frozen, reason = admit_one(item, remaining=max_request - encoded_bytes)
+        if frozen is None:
+            replacements[index] = None
+            omissions.append(
+                {
+                    "visual_id": str(item.get("visual_id") or ""),
+                    "page_no": int(item.get("page_no") or 0),
+                    "reason": reason or "local_image_not_admitted",
+                }
+            )
+            continue
+        visual_id = str(item.get("visual_id") or "")
+        replacements[index] = frozen
+        frozen["transport_planned_visual_ids"] = [visual_id] if visual_id else []
+        encoded_bytes += estimate_encoded_image_bytes(int(frozen.get("image_bytes") or 0))
+        if visual_id:
+            sent_visual_ids.append(visual_id)
+
+    normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw_items):
+        if str(item.get("type") or "").strip().lower() != "local_image_path":
+            normalized.append(item)
+            continue
+        replacement = replacements.get(index)
+        if replacement is None:
+            _drop_visual_label(normalized, str(item.get("visual_id") or ""))
+            continue
+        if replacement is not item and replacement.get("visual_id") != item.get("visual_id"):
+            _drop_visual_label(normalized, str(item.get("visual_id") or ""))
+            normalized.append({"type": "text", "text": _transport_visual_label(replacement)})
+        normalized.append(replacement)
+    planned_ids = [
+        str(raw_items[index].get("visual_id") or "")
+        for index in image_indices
+        if str(raw_items[index].get("visual_id") or "")
+    ]
+    return normalized, {
+        "planned_visual_ids": planned_ids,
+        "sent_visual_ids": sent_visual_ids,
+        "omissions": omissions,
+        "raw_reinspection_groups": group_reports,
+        "estimated_encoded_image_bytes": encoded_bytes,
+        "max_single_image_bytes": max_single,
+        "max_request_image_bytes": max_request,
+        "images_planned_count": len(planned_ids),
+        "images_actually_sent_count": len(sent_visual_ids),
+    }
+
+
 def _normalize_user_message_content_with_report(
     prompt: str,
     user_content: Any,
@@ -614,8 +963,51 @@ def _normalize_user_message_content_with_report(
 
     normalized: List[Dict[str, Any]] = []
     sent_visual_ids: List[str] = []
+    planned_visual_ids: List[str] = []
     omissions: List[Dict[str, Any]] = []
+    raw_group_reports: Dict[str, Dict[str, Any]] = {}
     encoded_bytes = 0
+
+    def note_raw_group(item: Mapping[str, Any], *, actual_visual_id: str = "") -> None:
+        group_id = str(item.get("raw_reinspection_group_id") or "").strip()
+        if not group_id:
+            return
+        candidate_ids = [
+            str(value)
+            for value in (
+                item.get("ambiguous_candidate_ids")
+                or item.get("transport_planned_visual_ids")
+                or []
+            )
+            if str(value)
+        ]
+        selected_ids = [
+            str(value)
+            for value in (item.get("raw_reinspection_selected_ids") or [])
+            if str(value)
+        ]
+        report = raw_group_reports.setdefault(
+            group_id,
+            {
+                "group_id": group_id,
+                "page_no": int(item.get("page_no") or 0),
+                "ambiguous_candidate_ids": candidate_ids,
+                "resolution": str(item.get("raw_reinspection_resolution") or ""),
+                "selected_ids": selected_ids,
+                "actual_sent_ids": [],
+                "fallback_reason": str(
+                    item.get("raw_reinspection_fallback_reason") or ""
+                ),
+            },
+        )
+        for value in candidate_ids:
+            if value not in report["ambiguous_candidate_ids"]:
+                report["ambiguous_candidate_ids"].append(value)
+        for value in selected_ids:
+            if value not in report["selected_ids"]:
+                report["selected_ids"].append(value)
+        if actual_visual_id and actual_visual_id not in report["actual_sent_ids"]:
+            report["actual_sent_ids"].append(actual_visual_id)
     for item in user_content:
         if not isinstance(item, dict):
             continue
@@ -627,28 +1019,50 @@ def _normalize_user_message_content_with_report(
             continue
         if item_type == "local_image_path":
             path = str(item.get("path") or "").strip()
-            try:
-                image_size = int(os.path.getsize(path))
-            except OSError:
-                image_size = 0
             visual_id = str(item.get("visual_id") or "")
             page_no = int(item.get("page_no") or 0)
-            if not path or not os.path.isfile(path) or image_size <= 0:
-                omissions.append({
-                    "visual_id": visual_id,
-                    "page_no": page_no,
-                    "reason": "missing_or_unreadable_local_image",
-                })
-                if logger:
-                    logger.warning(f"Skipping missing or unreadable local image input: {path}")
-                continue
-            if image_size > max_single:
-                omissions.append({
-                    "visual_id": visual_id,
-                    "page_no": page_no,
-                    "reason": "image_exceeds_single_byte_budget",
-                })
-                continue
+            planned_ids_for_item = [
+                str(value)
+                for value in (
+                    item.get("transport_planned_visual_ids")
+                    or item.get("ambiguous_candidate_ids")
+                    or ([visual_id] if visual_id else [])
+                )
+                if str(value)
+            ]
+            for value in planned_ids_for_item:
+                if value not in planned_visual_ids:
+                    planned_visual_ids.append(value)
+            note_raw_group(item)
+            frozen_url = str(item.get("frozen_image_data_url") or "").strip()
+            try:
+                image_size = int(item.get("frozen_image_bytes") or 0)
+            except (TypeError, ValueError):
+                image_size = 0
+            if frozen_url and image_size > 0:
+                data_url = frozen_url
+            else:
+                try:
+                    image_size = int(os.path.getsize(path))
+                except OSError:
+                    image_size = 0
+                if not path or not os.path.isfile(path) or image_size <= 0:
+                    omissions.append({
+                        "visual_id": visual_id,
+                        "page_no": page_no,
+                        "reason": "missing_or_unreadable_local_image",
+                    })
+                    if logger:
+                        logger.warning(f"Skipping missing or unreadable local image input: {path}")
+                    continue
+                if image_size > max_single:
+                    omissions.append({
+                        "visual_id": visual_id,
+                        "page_no": page_no,
+                        "reason": "image_exceeds_single_byte_budget",
+                    })
+                    continue
+                data_url = _encode_local_image_as_data_url(path, max_image_bytes=max_single)
             estimated = estimate_encoded_image_bytes(image_size)
             if encoded_bytes + estimated > max_request:
                 omissions.append({
@@ -657,7 +1071,6 @@ def _normalize_user_message_content_with_report(
                     "reason": "image_exceeds_request_byte_budget",
                 })
                 continue
-            data_url = _encode_local_image_as_data_url(path, max_image_bytes=max_single)
             if not data_url:
                 omissions.append({
                     "visual_id": visual_id,
@@ -674,7 +1087,9 @@ def _normalize_user_message_content_with_report(
                 }
             )
             encoded_bytes += estimated
-            sent_visual_ids.append(visual_id)
+            note_raw_group(item, actual_visual_id=visual_id)
+            if visual_id:
+                sent_visual_ids.append(visual_id)
             continue
         if item_type == "image_url":
             image_url = item.get("image_url")
@@ -726,18 +1141,26 @@ def _normalize_user_message_content_with_report(
 
     if not normalized:
         return prompt, {
+            "planned_visual_ids": planned_visual_ids,
             "sent_visual_ids": sent_visual_ids,
             "omissions": omissions,
+            "raw_reinspection_groups": list(raw_group_reports.values()),
+            "images_planned_count": len(planned_visual_ids),
             "images_actually_sent_count": len(sent_visual_ids),
+            "estimated_encoded_image_bytes": encoded_bytes,
         }
 
     has_text = any(item.get("type") == "text" for item in normalized)
     if not has_text and prompt:
         normalized.insert(0, {"type": "text", "text": prompt})
     return normalized, {
+        "planned_visual_ids": planned_visual_ids,
         "sent_visual_ids": sent_visual_ids,
         "omissions": omissions,
+        "raw_reinspection_groups": list(raw_group_reports.values()),
+        "images_planned_count": len(planned_visual_ids),
         "images_actually_sent_count": len(sent_visual_ids),
+        "estimated_encoded_image_bytes": encoded_bytes,
     }
 
 
@@ -780,47 +1203,18 @@ def _admit_local_images_to_budget(
     max_single_image_bytes: Optional[int] = None,
     max_request_image_bytes: Optional[int] = None,
 ) -> Tuple[Any, List[Dict[str, Any]]]:
-    """Keep the logical request identity aligned with images eligible for transport."""
+    """Freeze image membership once, preserving atomic raw-reinspection units."""
 
-    max_request, max_single = normalize_visual_byte_budgets(
-        max_request_image_bytes=max_request_image_bytes,
+    frozen, report = freeze_local_visual_transport_content(
+        user_content,
         max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
     )
-    if not isinstance(user_content, list):
-        return user_content, []
-
-    admitted: List[Dict[str, Any]] = []
-    omissions: List[Dict[str, Any]] = []
-    encoded_bytes = 0
-    for raw in user_content:
-        if not isinstance(raw, dict):
-            continue
-        if str(raw.get("type") or "").strip().lower() != "local_image_path":
-            admitted.append(dict(raw))
-            continue
-        visual_id = str(raw.get("visual_id") or "")
-        page_no = int(raw.get("page_no") or 0)
-        path = str(raw.get("path") or "").strip()
-        try:
-            image_size = int(os.path.getsize(path))
-        except OSError:
-            image_size = 0
-        reason = ""
-        if not path or not os.path.isfile(path) or image_size <= 0:
-            reason = "missing_or_unreadable_local_image"
-        elif image_size > max_single:
-            reason = "image_exceeds_single_byte_budget"
-        else:
-            estimated = estimate_encoded_image_bytes(image_size)
-            if encoded_bytes + estimated > max_request:
-                reason = "image_exceeds_request_byte_budget"
-            else:
-                encoded_bytes += estimated
-        if reason:
-            omissions.append({"visual_id": visual_id, "page_no": page_no, "reason": reason})
-            continue
-        admitted.append(dict(raw))
-    return admitted, omissions
+    return frozen, [
+        dict(item)
+        for item in (report.get("omissions") or [])
+        if isinstance(item, Mapping)
+    ]
 
 
 def _call_ai_api_detailed_uninstrumented(
@@ -1265,6 +1659,47 @@ def _call_ai_api_detailed(
         *admission_omissions,
         *list(transport_report.get("omissions") or []),
     ]
+    planned_ids = [
+        str(value)
+        for value in (transport_report.get("planned_visual_ids") or [])
+        if str(value)
+    ]
+    group_reports = {
+        str(item.get("group_id") or ""): dict(item)
+        for item in (transport_report.get("raw_reinspection_groups") or [])
+        if isinstance(item, Mapping) and str(item.get("group_id") or "")
+    }
+    for omission in admission_omissions:
+        if not isinstance(omission, Mapping):
+            continue
+        visual_id = str(omission.get("visual_id") or "")
+        if visual_id and visual_id not in planned_ids:
+            planned_ids.append(visual_id)
+        group_id = str(omission.get("raw_reinspection_group_id") or "").strip()
+        if not group_id or group_id in group_reports:
+            continue
+        candidate_ids = [
+            str(value)
+            for value in (omission.get("raw_reinspection_planned_ids") or [])
+            if str(value)
+        ]
+        group_reports[group_id] = {
+            "group_id": group_id,
+            "page_no": int(omission.get("page_no") or 0),
+            "ambiguous_candidate_ids": candidate_ids,
+            "resolution": str(
+                omission.get("raw_reinspection_resolution") or "not_represented"
+            ),
+            "selected_ids": [],
+            "actual_sent_ids": [],
+            "transport_status": "not_sent",
+            "fallback_reason": str(
+                omission.get("raw_reinspection_fallback_reason") or ""
+            ),
+        }
+    transport_report["planned_visual_ids"] = planned_ids
+    transport_report["images_planned_count"] = len(planned_ids)
+    transport_report["raw_reinspection_groups"] = list(group_reports.values())
     result = {
         **dict(result),
         "transport_metadata": {
