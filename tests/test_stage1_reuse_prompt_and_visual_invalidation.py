@@ -172,6 +172,66 @@ def test_current_visual_authority_rejects_non_array_fields(field_name: str) -> N
         Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(payload)
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    ["required_page_ids", "unresolved_raw_reinspection_unit_ids"],
+)
+def test_current_visual_authority_rejects_tuple_json_arrays(field_name: str) -> None:
+    payload = _coherent_relaxed_qualification()
+    payload[field_name] = tuple(payload[field_name])  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="current visual evidence qualification"):
+        Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(payload)
+
+
+@pytest.mark.parametrize("qualification_state", ["missing", "empty"])
+def test_current_visual_binding_cannot_downgrade_missing_qualification_to_legacy(
+    qualification_state: str,
+) -> None:
+    binding = Stage1ReusableSummaryBindingV1(
+        canonical_paper_key="paper-a",
+        source_mode="direct",
+        prompt_id="stage1.analysis.user.v3",
+        prompt_version="v3",
+        prompt_sha256="a" * 64,
+        visual_coverage_hash="b" * 64,
+        visual_scan_schema_hash="c" * 64,
+        extra={"require_complete_visual_coverage": True},
+    )
+    raw_binding = binding.to_dict()
+    if qualification_state == "missing":
+        raw_binding.pop("visual_evidence_qualification", None)
+    else:
+        raw_binding["visual_evidence_qualification"] = {}
+    previous = {
+        "paper_info": {"canonical_paper_key": "paper-a"},
+        "stage1_reuse": {"binding": raw_binding},
+    }
+
+    eligibility = evaluate_stage1_reuse(previous, binding)
+
+    assert eligibility.reusable is False
+    assert eligibility.reason == "current_visual_evidence_qualification_missing"
+
+
+def test_genuine_legacy_binding_without_current_visual_markers_keeps_legacy_path() -> None:
+    binding = Stage1ReusableSummaryBindingV1(
+        canonical_paper_key="paper-a",
+        source_mode="direct",
+        source_pdf_hash="legacy-semantic-hash",
+        visual_provenance_hash="legacy-visual-hash",
+    )
+    previous = {
+        "paper_info": {"canonical_paper_key": "paper-a"},
+        "stage1_reuse": {"binding": binding.to_dict()},
+    }
+
+    eligibility = evaluate_stage1_reuse(previous, binding)
+
+    assert eligibility.reusable is False
+    assert eligibility.reason == "source_authority_artifact_id_missing"
+
+
 def test_malformed_current_policy_blocks_reuse_before_projection() -> None:
     malformed = _coherent_relaxed_qualification()
     malformed["require_complete_visual_coverage"] = "truue"

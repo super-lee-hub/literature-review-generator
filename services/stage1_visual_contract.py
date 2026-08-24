@@ -29,6 +29,14 @@ def _string_array(value: Any) -> list[str] | None:
     return values
 
 
+def _json_string_array(value: Any) -> list[str] | None:
+    """Validate a serialized JSON string array without tuple coercion."""
+
+    if type(value) is not list or any(type(item) is not str for item in value):
+        return None
+    return list(value)
+
+
 def validate_visual_coverage_semantics(
     payload: Mapping[str, Any],
 ) -> tuple[str, ...]:
@@ -206,6 +214,90 @@ _CURRENT_INT_FIELDS = (
     "closed_raw_reinspection_unit_count",
 )
 
+_CURRENT_VISUAL_MARKER_FIELDS = (
+    "prompt_id",
+    "prompt_version",
+    "prompt_sha256",
+    "visual_coverage_hash",
+    "visual_scan_schema_hash",
+)
+
+
+def _current_visual_contract_markers(
+    value: Any,
+    *,
+    prefix: str = "",
+    depth: int = 0,
+) -> list[str]:
+    if not isinstance(value, Mapping) or depth > 2:
+        return []
+    markers: list[str] = []
+    for field_name in _CURRENT_VISUAL_MARKER_FIELDS:
+        if field_name in value and value.get(field_name) not in (None, ""):
+            markers.append(f"{prefix}{field_name}")
+    extra = value.get("extra")
+    if isinstance(extra, Mapping) and "require_complete_visual_coverage" in extra:
+        markers.append(f"{prefix}extra.require_complete_visual_coverage")
+    qualification = value.get("visual_evidence_qualification")
+    if qualification is not None and qualification != {}:
+        markers.append(f"{prefix}visual_evidence_qualification")
+    nested_binding = value.get("binding")
+    if isinstance(nested_binding, Mapping):
+        markers.extend(
+            _current_visual_contract_markers(
+                nested_binding,
+                prefix=f"{prefix}binding.",
+                depth=depth + 1,
+            )
+        )
+    return markers
+
+
+def current_visual_contract_markers(value: Any) -> tuple[str, ...]:
+    """Return positive markers that identify the current visual contract.
+
+    Empty fields emitted by the permissive dataclass projection are not
+    markers.  This is what preserves genuinely pre-current legacy bindings;
+    an explicitly populated current marker, including the policy key inside
+    ``extra``, must instead take the strict qualification path.
+    """
+
+    return tuple(dict.fromkeys(_current_visual_contract_markers(value)))
+
+
+def validate_current_visual_evidence_qualification_pair(
+    value: Any,
+) -> tuple[str, ...]:
+    """Validate top-level/nested qualification proof for a current manifest."""
+
+    if not current_visual_contract_markers(value):
+        return ()
+    if not isinstance(value, Mapping):
+        return ("manifest_mapping_invalid",)
+
+    nested_binding = value.get("binding")
+    nested_mapping = nested_binding if isinstance(nested_binding, Mapping) else {}
+    raw_values = {
+        "top_level": value.get("visual_evidence_qualification"),
+        "nested": nested_mapping.get("visual_evidence_qualification"),
+    }
+    issues: list[str] = []
+    valid_values: dict[str, Mapping[str, Any]] = {}
+    for label, raw in raw_values.items():
+        if raw is None or (isinstance(raw, Mapping) and not raw):
+            issues.append(f"{label}_qualification_missing")
+            continue
+        if not isinstance(raw, Mapping):
+            issues.append(f"{label}_qualification_invalid")
+            continue
+        if validate_current_visual_evidence_qualification(raw):
+            issues.append(f"{label}_qualification_invalid")
+            continue
+        valid_values[label] = raw
+    if not issues and dict(valid_values["top_level"]) != dict(valid_values["nested"]):
+        issues.append("qualification_mismatch")
+    return tuple(dict.fromkeys(issues))
+
 
 def validate_current_visual_evidence_qualification(
     value: Any,
@@ -222,7 +314,7 @@ def validate_current_visual_evidence_qualification(
         if field_name in value and type(value[field_name]) is not str:
             issues.append("qualification_string_type_invalid")
     for field_name in _CURRENT_STRING_ARRAY_FIELDS:
-        if field_name in value and _string_array(value[field_name]) is None:
+        if field_name in value and _json_string_array(value[field_name]) is None:
             issues.append("qualification_array_type_invalid")
     for field_name in _CURRENT_INT_FIELDS:
         if field_name in value and not _is_exact_nonnegative_int(value[field_name]):
@@ -254,6 +346,8 @@ def validate_current_visual_evidence_qualification(
 
 __all__ = [
     "VISUAL_OMISSION_SCOPES",
+    "current_visual_contract_markers",
     "validate_current_visual_evidence_qualification",
+    "validate_current_visual_evidence_qualification_pair",
     "validate_visual_coverage_semantics",
 ]

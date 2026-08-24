@@ -85,4 +85,6 @@ raw unit 时，authority 必须保留 degraded evidence，并将最终 raw reche
 或 fallback，不能改写为 complete。当前持久化的 qualification JSON 使用严格类型解析；
 布尔值、整数、数组或 omission 字段格式异常时，必须在任何宽松投影前阻断 reuse。Prompt
 文件由 Registry 的 SHA-256 authority 绑定；JSON policy 损坏、hash 漂移或缺少 placeholder
-都会 fail closed。
+都会 fail closed。仅当 binding 确实早于当前视觉标记、且不含任何当前视觉标记时，才允许因缺少
+`visual_evidence_qualification` 走 legacy 兼容路径；从当前 authority 中删除或置空该
+qualification 属于校验失败，绝不能降级为 legacy。

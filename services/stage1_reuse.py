@@ -11,7 +11,9 @@ from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.prompt_registry import PromptRegistry
 from services.stage1_visual_contract import (
     VISUAL_OMISSION_SCOPES,
+    current_visual_contract_markers,
     validate_current_visual_evidence_qualification,
+    validate_current_visual_evidence_qualification_pair,
     validate_visual_coverage_semantics,
 )
 from services.stage1_visual_scan import VISUAL_OBSERVATIONS_VERSION, VISUAL_SCAN_PROMPT_ID
@@ -799,19 +801,49 @@ def _typed_manifest_metadata(
     )
 
 
+def _current_raw_visual_qualification_issue(
+    raw_binding: Mapping[str, Any],
+) -> str:
+    """Reject current-looking bindings before permissive dataclass projection."""
+
+    if not current_visual_contract_markers(raw_binding):
+        return ""
+    candidate = raw_binding
+    nested = raw_binding.get("binding")
+    if isinstance(nested, Mapping):
+        candidate = nested
+    raw_qualification = candidate.get("visual_evidence_qualification")
+    if raw_qualification is None or (
+        isinstance(raw_qualification, Mapping) and not raw_qualification
+    ):
+        return "current_visual_evidence_qualification_missing"
+    try:
+        Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
+            raw_qualification
+        )
+    except (TypeError, ValueError):
+        return "current_visual_evidence_qualification_invalid"
+    return ""
+
+
 def _validate_manifest_self_binding(
     payload: Mapping[str, Any],
     *,
     binding: Stage1ReusableSummaryBindingV1,
     previous_summary: Mapping[str, Any],
 ) -> tuple[Stage1ReusableSummaryManifestV1 | None, str]:
-    if "visual_evidence_qualification" in payload:
-        try:
-            Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
-                payload.get("visual_evidence_qualification")
-            )
-        except (TypeError, ValueError):
+    qualification_boundary_issues = (
+        validate_current_visual_evidence_qualification_pair(payload)
+    )
+    if qualification_boundary_issues:
+        if "qualification_mismatch" in qualification_boundary_issues:
+            return None, "typed_manifest_visual_evidence_qualification_mismatch"
+        if any(
+            issue.endswith("_qualification_invalid")
+            for issue in qualification_boundary_issues
+        ):
             return None, "typed_manifest_visual_evidence_qualification_invalid"
+        return None, "typed_manifest_visual_evidence_qualification_missing"
     manifest = Stage1ReusableSummaryManifestV1.from_mapping(payload)
     if manifest.artifact_type != "stage1_reusable_summary_manifest":
         return None, "typed_manifest_type_invalid"
@@ -1733,24 +1765,19 @@ def evaluate_stage1_reuse(
             reuse_comparison={"equal": False, "missing_fields": ["binding"]},
         )
 
-    raw_visual_qualification = raw_binding.get("visual_evidence_qualification")
-    if raw_visual_qualification not in (None, {}):
-        try:
-            Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
-                raw_visual_qualification
-            )
-        except (TypeError, ValueError):
-            return Stage1ReuseEligibilityV1(
-                decision="identity_match_unverified",
-                canonical_paper_key=canonical_key,
-                reason="current_visual_evidence_qualification_invalid",
-                original_source_binding=dict(raw_binding),
-                current_source_binding=current_binding.to_dict(),
-                reuse_comparison={
-                    "equal": False,
-                    "missing_fields": ["valid_visual_evidence_qualification"],
-                },
-            )
+    qualification_issue = _current_raw_visual_qualification_issue(raw_binding)
+    if qualification_issue:
+        return Stage1ReuseEligibilityV1(
+            decision="identity_match_unverified",
+            canonical_paper_key=canonical_key,
+            reason=qualification_issue,
+            original_source_binding=dict(raw_binding),
+            current_source_binding=current_binding.to_dict(),
+            reuse_comparison={
+                "equal": False,
+                "missing_fields": ["valid_visual_evidence_qualification"],
+            },
+        )
 
     original = Stage1ReusableSummaryBindingV1.from_mapping(raw_binding)
     comparison = original.compare(current_binding)

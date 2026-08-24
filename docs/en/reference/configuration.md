@@ -97,6 +97,9 @@ An unresolved raw unit must remain represented as degraded evidence with a
 partial or fallback final raw-recheck status; it is never rewritten as
 complete. Persisted current qualification JSON is parsed with exact types, so
 malformed boolean, integer, array, or omission fields block reuse before any
-permissive projection.
+permissive projection. Absence of `visual_evidence_qualification` is a legacy
+compatibility path only when the binding is genuinely pre-current and has none
+of the current visual markers; removing or emptying that qualification from a
+current authority is a validation failure and must never downgrade to legacy.
 Prompt files are Registry-authorized by SHA-256; malformed JSON node policies,
 hash drift, and missing prompt placeholders fail closed.

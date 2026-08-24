@@ -250,3 +250,20 @@ def test_stage1_visual_coverage_validator_rejects_semantic_contradictions(
 
     with pytest.raises(ArtifactSchemaError, match="semantic"):
         validate_registered_artifact(record, path)
+
+
+def test_stage1_visual_coverage_validator_rejects_malformed_omission_array(
+    tmp_path: Path,
+) -> None:
+    payload = _stage1_visual_coverage_payload()
+    payload["transport_omissions"] = {"scope": "final_transport"}
+    path = tmp_path / "stage1_visual_coverage-malformed-omission.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    record = SimpleNamespace(
+        artifact_type="stage1_visual_coverage",
+        artifact_version="v1",
+        job_id="job-1",
+    )
+
+    with pytest.raises(ArtifactSchemaError, match="semantic"):
+        validate_registered_artifact(record, path)
