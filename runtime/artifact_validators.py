@@ -9,6 +9,7 @@ from typing import Any, Mapping
 import zipfile
 
 from outline.v3_models import compute_v3_hash
+from services.stage1_visual_contract import validate_visual_coverage_semantics
 
 
 class ArtifactSchemaError(ValueError):
@@ -1677,20 +1678,23 @@ def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mappi
     raw_units = root.get("raw_reinspection_units")
     if not isinstance(raw_units, list):
         raise ArtifactSchemaError("stage1_visual_coverage.raw_reinspection_units must be an array")
-    try:
-        required_units = int(root.get("required_raw_reinspection_unit_count") or 0)
-        closed_units = int(root.get("closed_raw_reinspection_unit_count") or 0)
-    except (TypeError, ValueError) as exc:
+    required_units = root.get("required_raw_reinspection_unit_count")
+    closed_units = root.get("closed_raw_reinspection_unit_count")
+    if (
+        type(required_units) is not int
+        or type(closed_units) is not int
+        or required_units < 0
+        or closed_units < 0
+    ):
         raise ArtifactSchemaError(
-            "stage1_visual_coverage raw reinspection counts must be integers"
-        ) from exc
+            "stage1_visual_coverage raw reinspection counts must be exact non-negative integers"
+        )
     unresolved_units = root.get("unresolved_raw_reinspection_unit_ids")
     if (
-        required_units < 0
-        or closed_units < 0
-        or closed_units > required_units
+        closed_units > required_units
         or len(raw_units) != required_units
         or not isinstance(unresolved_units, list)
+        or any(type(item) is not str for item in unresolved_units)
         or any(not isinstance(item, Mapping) for item in raw_units)
         or any(
             not str(item.get("unit_id") or "")
@@ -1712,13 +1716,13 @@ def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mappi
         raise ArtifactSchemaError("stage1_visual_coverage raw reinspection closure is invalid")
     if not isinstance(root.get("page_status"), list) or not isinstance(root.get("scan_batches"), list):
         raise ArtifactSchemaError("stage1_visual_coverage page_status and scan_batches must be arrays")
-    valid_omission_scopes = {"page_coverage", "raw_reinspection", "final_transport"}
-    for field_name in ("omissions", "transport_omissions"):
-        if field_name not in root:
-            continue
-        omissions = root.get(field_name)
-        if not isinstance(omissions, list):
-            raise ArtifactSchemaError(
+        valid_omission_scopes = {"page_coverage", "raw_reinspection", "final_transport"}
+        for field_name in ("omissions", "transport_omissions"):
+            if field_name not in root:
+                continue
+            omissions = root.get(field_name)
+            if not isinstance(omissions, list):
+                raise ArtifactSchemaError(
                 f"stage1_visual_coverage.{field_name} must be an array"
             )
         for omission in omissions:
@@ -1730,6 +1734,12 @@ def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mappi
                 raise ArtifactSchemaError(
                     f"stage1_visual_coverage.{field_name} omission contract is invalid"
                 )
+    semantic_issues = validate_visual_coverage_semantics(root)
+    if semantic_issues:
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage semantic validation failed: "
+            + ", ".join(semantic_issues)
+        )
 
 
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:

@@ -90,6 +90,13 @@ or failed page rendering is recorded in `stage1_visual_coverage/v1`; with
 reuse. `quality_audit.needs_manual_review=true` records degraded or incomplete
 evidence; it does not authorize reuse. An explicit
 `require_complete_visual_coverage=false` policy may reuse a verified degraded
-binding with that status preserved.
+binding with that status preserved. This switch relaxes only the final raw
+reinspection completeness gate: rendering, page scanning, observation
+integrity, and final-transport omissions remain fail-closed semantic gates.
+An unresolved raw unit must remain represented as degraded evidence with a
+partial or fallback final raw-recheck status; it is never rewritten as
+complete. Persisted current qualification JSON is parsed with exact types, so
+malformed boolean, integer, array, or omission fields block reuse before any
+permissive projection.
 Prompt files are Registry-authorized by SHA-256; malformed JSON node policies,
 hash drift, and missing prompt placeholders fail closed.

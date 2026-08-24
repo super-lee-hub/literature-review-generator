@@ -658,28 +658,51 @@ def _typed_transport_omission(
     visual_id: str = "",
     page_no: int = 0,
     default_scope: str = "final_transport",
+    raw_reinspection_group_id: str = "",
+    scope: str = "",
+    authority_blocking: bool | None = None,
     **extra: Any,
 ) -> Dict[str, Any]:
-    """Attach an explicit authority scope to every transport omission."""
+    """Attach an explicit authority scope without allowing semantic drift."""
 
     source = dict(item or {})
-    group_id = str(source.get("raw_reinspection_group_id") or "").strip()
-    scope = (
+    group_id = str(
+        raw_reinspection_group_id or source.get("raw_reinspection_group_id") or ""
+    ).strip()
+    resolved_scope = (
         "raw_reinspection"
         if group_id
-        else str(source.get("transport_omission_scope") or default_scope).strip()
+        else str(scope or source.get("transport_omission_scope") or default_scope).strip()
     )
-    authority_blocking = source.get("transport_omission_authority_blocking")
-    if not isinstance(authority_blocking, bool):
-        authority_blocking = scope != "raw_reinspection"
+    resolved_authority_blocking = authority_blocking
+    if not isinstance(resolved_authority_blocking, bool):
+        resolved_authority_blocking = source.get("transport_omission_authority_blocking")
+    if not isinstance(resolved_authority_blocking, bool):
+        resolved_authority_blocking = resolved_scope != "raw_reinspection"
     omission: Dict[str, Any] = {
         "visual_id": str(visual_id or source.get("visual_id") or ""),
         "page_no": int(page_no or source.get("page_no") or 0),
         "reason": str(reason or "transport_omission"),
-        "scope": scope,
-        "authority_blocking": authority_blocking,
+        "scope": resolved_scope,
+        "authority_blocking": resolved_authority_blocking,
     }
-    omission.update({key: value for key, value in extra.items() if value is not None})
+    if group_id:
+        omission["raw_reinspection_group_id"] = group_id
+    protected = {
+        "visual_id",
+        "page_no",
+        "reason",
+        "scope",
+        "authority_blocking",
+        "raw_reinspection_group_id",
+    }
+    omission.update(
+        {
+            key: value
+            for key, value in extra.items()
+            if value is not None and key not in protected
+        }
+    )
     return omission
 
 

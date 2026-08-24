@@ -18,6 +18,32 @@ from runtime.reconcile import _validate_validation_run_result
 from validation.run_result import ValidationRunResultError
 
 
+def _stage1_visual_coverage_payload() -> dict[str, object]:
+    return {
+        "artifact_type": "stage1_visual_coverage",
+        "artifact_version": "v1",
+        "job_id": "job-1",
+        "paper_key": "paper-a",
+        "total_pdf_pages": 1,
+        "nonblank_pages": [1],
+        "rendered_pages": [1],
+        "visually_scanned_pages": [1],
+        "page_status": [],
+        "scan_batches": [],
+        "coverage_status": "complete",
+        "scan_coverage_status": "complete",
+        "final_synthesis_modality": "text_only",
+        "final_raw_visual_recheck_status": "partial",
+        "evidence_coverage_status": "degraded",
+        "raw_reinspection_units": [{"unit_id": "unit-1", "closed": False}],
+        "required_raw_reinspection_unit_count": 1,
+        "closed_raw_reinspection_unit_count": 0,
+        "unresolved_raw_reinspection_unit_ids": ["unit-1"],
+        "omissions": [],
+        "transport_omissions": [],
+    }
+
+
 @pytest.mark.parametrize("artifact_type", ["final_outline", "coverage_audit"])
 @pytest.mark.parametrize("payload", [{}, {"hello": "world"}])
 def test_current_outline_artifacts_reject_placeholder_json(
@@ -166,3 +192,61 @@ def test_stage1_visual_observations_v2_binds_child_ids_to_persisted_refs(tmp_pat
     payload["child_candidate_ids"] = []
     path.write_text(json.dumps(payload), encoding="utf-8")
     validate_registered_artifact(record, path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.update(
+            final_raw_visual_recheck_status="complete"
+        ),
+        lambda payload: payload.update(evidence_coverage_status="complete"),
+        lambda payload: payload.update(
+            transport_omissions=[
+                {
+                    "visual_id": "figure-1",
+                    "page_no": 1,
+                    "reason": "raw_reinspection_group_not_represented",
+                    "scope": "raw_reinspection",
+                    "authority_blocking": False,
+                    "raw_reinspection_group_id": "unknown-unit",
+                    "raw_reinspection_resolution": "not_represented",
+                }
+            ]
+        ),
+        lambda payload: (
+            payload.update(
+                raw_reinspection_units=[{"unit_id": "unit-1", "closed": True}],
+                closed_raw_reinspection_unit_count=1,
+                unresolved_raw_reinspection_unit_ids=[],
+                transport_omissions=[
+                    {
+                        "visual_id": "figure-1",
+                        "page_no": 1,
+                        "reason": "raw_reinspection_group_not_represented",
+                        "scope": "raw_reinspection",
+                        "authority_blocking": False,
+                        "raw_reinspection_group_id": "unit-1",
+                        "raw_reinspection_resolution": "not_represented",
+                    }
+                ],
+            )
+        ),
+    ],
+)
+def test_stage1_visual_coverage_validator_rejects_semantic_contradictions(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    payload = _stage1_visual_coverage_payload()
+    mutation(payload)
+    path = tmp_path / "stage1_visual_coverage.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    record = SimpleNamespace(
+        artifact_type="stage1_visual_coverage",
+        artifact_version="v1",
+        job_id="job-1",
+    )
+
+    with pytest.raises(ArtifactSchemaError, match="semantic"):
+        validate_registered_artifact(record, path)

@@ -9,6 +9,11 @@ from typing import Any, Callable, Mapping
 
 from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.prompt_registry import PromptRegistry
+from services.stage1_visual_contract import (
+    VISUAL_OMISSION_SCOPES,
+    validate_current_visual_evidence_qualification,
+    validate_visual_coverage_semantics,
+)
 from services.stage1_visual_scan import VISUAL_OBSERVATIONS_VERSION, VISUAL_SCAN_PROMPT_ID
 from runtime.provider_runtime import hash_json
 
@@ -16,11 +21,7 @@ from runtime.provider_runtime import hash_json
 STAGE1_REUSE_BINDING_VERSION = "v1"
 STAGE1_REUSE_POLICY = "exact_summary_reuse_v1"
 
-_VISUAL_OMISSION_SCOPES = {
-    "page_coverage",
-    "raw_reinspection",
-    "final_transport",
-}
+_VISUAL_OMISSION_SCOPES = VISUAL_OMISSION_SCOPES
 
 _LEGACY_COMPARISON_FIELDS = (
     "canonical_paper_key",
@@ -246,6 +247,23 @@ class Stage1VisualEvidenceQualificationV1:
             visual_scan_schema_hash=_text(raw.get("visual_scan_schema_hash")),
         )
 
+    @classmethod
+    def from_current_mapping_strict(
+        cls,
+        value: Mapping[str, Any] | None,
+    ) -> "Stage1VisualEvidenceQualificationV1":
+        """Read a declared current authority without permissive projection."""
+
+        issues = validate_current_visual_evidence_qualification(value)
+        if issues:
+            raise ValueError(
+                "current visual evidence qualification is invalid: "
+                + ", ".join(issues)
+            )
+        # Validation happened against the serialized mapping before this
+        # projection.  The permissive reader is safe only after that gate.
+        return cls.from_mapping(value)
+
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         for field_name in (
@@ -265,6 +283,7 @@ class Stage1VisualEvidenceQualificationV1:
         issues: list[str] = []
         if self.artifact_type != "stage1_visual_evidence_qualification" or self.artifact_version != "v1":
             issues.append("qualification_type_invalid")
+        issues.extend(validate_visual_coverage_semantics(self.to_dict()))
         if self.required_nonblank_page_count != len(self.required_page_ids):
             issues.append("required_page_ids_incomplete")
         required = set(self.required_page_ids)
@@ -335,17 +354,25 @@ class Stage1VisualEvidenceQualificationV1:
             for item in self.transport_omissions
             if str(item.get("scope") or "") == "raw_reinspection"
         ]
-        if raw_reinspection_transport and not self.require_complete_visual_coverage:
+        if self.unresolved_raw_reinspection_unit_ids and not self.require_complete_visual_coverage:
             unresolved_ids = set(self.unresolved_raw_reinspection_unit_ids)
             omitted_group_ids = {
                 str(item.get("raw_reinspection_group_id") or "").strip()
                 for item in raw_reinspection_transport
             }
+            scan_complete = self.scan_coverage_status == "complete" or (
+                not self.required_page_ids
+                and self.scan_coverage_status == "not_required"
+            )
             if (
-                self.scan_coverage_status != "complete"
+                not scan_complete
                 or self.evidence_coverage_status != "degraded"
-                or not omitted_group_ids
-                or not omitted_group_ids.issubset(unresolved_ids)
+                or self.final_raw_visual_recheck_status
+                not in {"partial", "not_run_fallback"}
+                or (
+                    omitted_group_ids
+                    and not omitted_group_ids.issubset(unresolved_ids)
+                )
             ):
                 issues.append("raw_reinspection_relaxed_authority_invalid")
         if self.scan_coverage_status not in {"complete", "partial", "failed", "not_required"}:
@@ -501,11 +528,17 @@ class Stage1ReusableSummaryBindingV1:
             known[name] = bool(raw[name]) if name == "location_changed" else _text(raw[name])
         if "visual_evidence_qualification" in raw and isinstance(
             raw.get("visual_evidence_qualification"), Mapping
-        ):
+        ) and raw.get("visual_evidence_qualification"):
             known["visual_evidence_qualification"] = (
-                Stage1VisualEvidenceQualificationV1.from_mapping(
+                Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
                     raw.get("visual_evidence_qualification")
                 ).to_dict()
+            )
+        elif "visual_evidence_qualification" in raw and not isinstance(
+            raw.get("visual_evidence_qualification"), Mapping
+        ):
+            raise ValueError(
+                "current visual evidence qualification must be an object"
             )
         raw_extra_value = raw.get("extra")
         raw_extra: Mapping[str, Any] = (
@@ -694,7 +727,13 @@ class Stage1ReusableSummaryManifestV1:
         for name in cls.__dataclass_fields__:
             if name not in raw:
                 continue
-            if name in {"binding", "paper_info", "summary_payload", "visual_evidence_qualification"}:
+            if name == "visual_evidence_qualification" and raw[name]:
+                known[name] = Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
+                    raw[name]
+                ).to_dict()
+            elif name == "visual_evidence_qualification":
+                known[name] = {}
+            elif name in {"binding", "paper_info", "summary_payload"}:
                 known[name] = dict(raw[name]) if isinstance(raw[name], Mapping) else {}
             else:
                 known[name] = _text(raw[name])
@@ -766,6 +805,13 @@ def _validate_manifest_self_binding(
     binding: Stage1ReusableSummaryBindingV1,
     previous_summary: Mapping[str, Any],
 ) -> tuple[Stage1ReusableSummaryManifestV1 | None, str]:
+    if "visual_evidence_qualification" in payload:
+        try:
+            Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
+                payload.get("visual_evidence_qualification")
+            )
+        except (TypeError, ValueError):
+            return None, "typed_manifest_visual_evidence_qualification_invalid"
     manifest = Stage1ReusableSummaryManifestV1.from_mapping(payload)
     if manifest.artifact_type != "stage1_reusable_summary_manifest":
         return None, "typed_manifest_type_invalid"
@@ -868,12 +914,17 @@ def _verify_visual_evidence_qualification(
 ) -> tuple[bool, str]:
     """Verify visual coverage/observation bytes and the achieved reducer."""
 
-    if not raw_qualification:
+    if raw_qualification is None or raw_qualification == {}:
         # Bindings written before the typed qualification was introduced are
         # accepted only when they never opted into the complete-coverage gate.
         # Current Stage 1 bindings always carry the policy explicitly.
         return True, "visual_qualification_not_declared_legacy"
-    qualification = Stage1VisualEvidenceQualificationV1.from_mapping(raw_qualification)
+    try:
+        qualification = Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
+            raw_qualification
+        )
+    except (TypeError, ValueError):
+        return False, "prior_visual_coverage_artifact_invalid"
     issues = qualification.qualification_issues()
     if issues:
         if "transport_omission_contract_invalid" in issues:
@@ -1681,6 +1732,25 @@ def evaluate_stage1_reuse(
             current_source_binding=current_binding.to_dict(),
             reuse_comparison={"equal": False, "missing_fields": ["binding"]},
         )
+
+    raw_visual_qualification = raw_binding.get("visual_evidence_qualification")
+    if raw_visual_qualification not in (None, {}):
+        try:
+            Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
+                raw_visual_qualification
+            )
+        except (TypeError, ValueError):
+            return Stage1ReuseEligibilityV1(
+                decision="identity_match_unverified",
+                canonical_paper_key=canonical_key,
+                reason="current_visual_evidence_qualification_invalid",
+                original_source_binding=dict(raw_binding),
+                current_source_binding=current_binding.to_dict(),
+                reuse_comparison={
+                    "equal": False,
+                    "missing_fields": ["valid_visual_evidence_qualification"],
+                },
+            )
 
     original = Stage1ReusableSummaryBindingV1.from_mapping(raw_binding)
     comparison = original.compare(current_binding)

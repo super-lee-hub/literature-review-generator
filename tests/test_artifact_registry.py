@@ -206,6 +206,51 @@ def test_ready_transition_rejects_empty_artifact_hash(tmp_path) -> None:
     assert registry.get("candidate").status == "quarantined"  # type: ignore[union-attr]
 
 
+def test_ready_registration_rejects_semantically_impossible_stage1_coverage(tmp_path) -> None:
+    artifact_path = tmp_path / "stage1_visual_coverage.json"
+    artifact_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "stage1_visual_coverage",
+                "artifact_version": "v1",
+                "job_id": "job-123",
+                "paper_key": "paper-a",
+                "total_pdf_pages": 1,
+                "nonblank_pages": [1],
+                "rendered_pages": [1],
+                "visually_scanned_pages": [1],
+                "page_status": [],
+                "scan_batches": [],
+                "coverage_status": "complete",
+                "scan_coverage_status": "complete",
+                "final_synthesis_modality": "text_only",
+                "final_raw_visual_recheck_status": "complete",
+                "evidence_coverage_status": "complete",
+                "raw_reinspection_units": [{"unit_id": "unit-1", "closed": False}],
+                "required_raw_reinspection_unit_count": 1,
+                "closed_raw_reinspection_unit_count": 0,
+                "unresolved_raw_reinspection_unit_ids": ["unit-1"],
+                "omissions": [],
+                "transport_omissions": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry = ArtifactRegistry(tmp_path / "artifact_registry.json", "job-123")
+
+    with pytest.raises(UnverifiedArtifact, match="artifact schema is invalid.*semantic"):
+        registry.register_file(
+            artifact_id="stage1_visual_coverage:invalid",
+            artifact_role="stage1_visual_coverage",
+            artifact_type="stage1_visual_coverage",
+            artifact_version="v1",
+            path=artifact_path,
+            producer="tests",
+        )
+
+    assert registry.get("stage1_visual_coverage:invalid") is None
+
+
 def test_current_dependency_requires_explicit_identity() -> None:
     with pytest.raises(RegistryCorruption, match="missing required fields"):
         ArtifactDependencyRefV2.from_dict(

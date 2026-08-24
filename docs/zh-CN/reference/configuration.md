@@ -79,5 +79,10 @@ visual coverage 任一变化都会使 Stage 1 reuse 失效。页面渲染缺失�
 必须由 typed `visual_evidence_qualification` 验证为完整证据后才能 exact reuse。
 `quality_audit.needs_manual_review=true` 只记录降级或不完整证据，不能授权 reuse。
 显式设置 `require_complete_visual_coverage=false` 时，可以在验证 binding 完整性后复用
-降级结果，但必须保留该状态。Prompt 文件由 Registry 的 SHA-256 authority 绑定；JSON
-policy 损坏、hash 漂移或缺少 placeholder 都会 fail closed。
+降级结果，但必须保留该状态。该开关只放宽最终 raw reinspection 完整性，不放宽页面渲染、
+页面扫描、observation 完整性或 final transport omission 的 fail-closed 语义门槛。存在未解决
+raw unit 时，authority 必须保留 degraded evidence，并将最终 raw recheck 保持为 partial
+或 fallback，不能改写为 complete。当前持久化的 qualification JSON 使用严格类型解析；
+布尔值、整数、数组或 omission 字段格式异常时，必须在任何宽松投影前阻断 reuse。Prompt
+文件由 Registry 的 SHA-256 authority 绑定；JSON policy 损坏、hash 漂移或缺少 placeholder
+都会 fail closed。
