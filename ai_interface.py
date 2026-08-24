@@ -1,5 +1,6 @@
 import base64
 import copy
+import hashlib
 import json
 import mimetypes
 import os
@@ -17,17 +18,28 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
+from services.prompt_registry import default_prompt_registry
 from runtime.provider_context import ProviderContextProfile
-from runtime.provider_runtime import ProviderBudgetExceeded, ProviderRuntime
+from runtime.provider_runtime import (
+    ProviderBudgetExceeded,
+    ProviderRuntime,
+    canonical_provider_request_payload,
+)
 from summary_schema import (
     default_ai_summary,
     get_ai_summary,
     normalize_ai_summary,
 )
+from services.multimodal_capability import detect_multimodal_capability
+from services.stage1_visual_scan import (
+    DEFAULT_MAX_SINGLE_IMAGE_BYTES,
+    estimate_encoded_image_bytes,
+    normalize_visual_byte_budgets,
+)
 
 _DEFAULT_TIMEOUT_SECONDS = 600
 _DEFAULT_API_RETRY_ATTEMPTS = 3
-_MAX_LOCAL_IMAGE_INPUT_BYTES = 20 * 1024 * 1024
+_MAX_LOCAL_IMAGE_INPUT_BYTES = DEFAULT_MAX_SINGLE_IMAGE_BYTES
 _NON_RETRIABLE_HTTP_STATUSES = {400, 401, 402, 403, 404, 422}
 _QUOTA_ERROR_MARKERS = (
     "insufficient_user_quota",
@@ -65,6 +77,14 @@ _PAYLOAD_PARAMETER_ERROR_MARKERS = (
     "unrecognized parameter",
     "not allowed",
 )
+
+
+def _load_stage1_system_prompt(logger: Any = None) -> str:
+    """Load the canonical Stage 1 system prompt through prompt authority."""
+
+    # Prompt authority failures are production blockers. A generic fallback
+    # would make the receipt look valid while changing the actual prompt.
+    return default_prompt_registry().read("stage1.analysis.system.v3")
 
 
 def _api_result(
@@ -290,10 +310,15 @@ def _convert_chat_content_to_responses_content(content: Any) -> Any:
             image_url = item.get("image_url")
             if isinstance(image_url, dict):
                 url = str(image_url.get("url") or "").strip()
+                detail = str(image_url.get("detail") or item.get("detail") or "original").strip()
             else:
                 url = str(image_url or "").strip()
+                detail = str(item.get("detail") or "original").strip()
             if url:
-                converted.append({"type": "input_image", "image_url": url})
+                converted_item: Dict[str, Any] = {"type": "input_image", "image_url": url}
+                if detail:
+                    converted_item["detail"] = detail
+                converted.append(converted_item)
             continue
         if item_type == "input_text":
             converted.append({"type": "input_text", "text": str(item.get("text") or "")})
@@ -301,7 +326,10 @@ def _convert_chat_content_to_responses_content(content: Any) -> Any:
         if item_type == "input_image":
             image_url = str(item.get("image_url") or item.get("url") or "").strip()
             if image_url:
-                converted.append({"type": "input_image", "image_url": image_url})
+                converted_item = {"type": "input_image", "image_url": image_url}
+                if item.get("detail"):
+                    converted_item["detail"] = str(item.get("detail"))
+                converted.append(converted_item)
             continue
         if item_type == "input_file":
             file_item: Dict[str, Any] = {"type": "input_file"}
@@ -324,9 +352,17 @@ def build_chat_completions_payload(
     user_content: Any = None,
     logger: Any = None,
     capability: Optional[ModelCapability] = None,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     capability = capability or resolve_model_capability(api_config)
-    normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
+    normalized_user_content = _normalize_user_message_content(
+        prompt,
+        user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
     token_limit = _configured_positive_int(api_config.get("max_completion_tokens"), max_tokens)
     token_limit = _configured_positive_int(api_config.get("max_tokens"), token_limit)
     payload: Dict[str, Any] = {
@@ -355,9 +391,17 @@ def build_responses_payload(
     user_content: Any = None,
     logger: Any = None,
     capability: Optional[ModelCapability] = None,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     capability = capability or resolve_model_capability(api_config)
-    normalized_user_content = _normalize_user_message_content(prompt, user_content, logger=logger)
+    normalized_user_content = _normalize_user_message_content(
+        prompt,
+        user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
     max_output_tokens = _configured_positive_int(api_config.get("max_output_tokens"), max_tokens)
     payload: Dict[str, Any] = {
         "model": api_config.get("model") or "",
@@ -513,23 +557,28 @@ def _load_api_runtime_settings(api_config: Optional[Mapping[str, Any]] = None) -
     return timeout_seconds, retry_attempts
 
 
-def _encode_local_image_as_data_url(path: str) -> Optional[str]:
+def _encode_local_image_as_data_url(
+    path: str,
+    *,
+    max_image_bytes: int = _MAX_LOCAL_IMAGE_INPUT_BYTES,
+) -> Optional[str]:
     if not path:
         return None
     try:
         image_size = os.path.getsize(path)
     except OSError:
         return None
-    if image_size <= 0 or image_size > _MAX_LOCAL_IMAGE_INPUT_BYTES:
+    max_bytes = max(1, int(max_image_bytes or _MAX_LOCAL_IMAGE_INPUT_BYTES))
+    if image_size <= 0 or image_size > max_bytes:
         return None
 
     try:
         with open(path, "rb") as handle:
-            image_bytes = handle.read(_MAX_LOCAL_IMAGE_INPUT_BYTES + 1)
+            image_bytes = handle.read(max_bytes + 1)
     except OSError:
         return None
 
-    if not image_bytes or len(image_bytes) > _MAX_LOCAL_IMAGE_INPUT_BYTES:
+    if not image_bytes or len(image_bytes) > max_bytes:
         return None
 
     mime_type = mimetypes.guess_type(path)[0] or "image/png"
@@ -549,11 +598,469 @@ def _encode_local_pdf_as_data_url(path: str) -> Optional[str]:
     return f"data:application/pdf;base64,{encoded}"
 
 
-def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any = None) -> Any:
+def _snapshot_local_image(
+    path: str,
+    *,
+    max_single_image_bytes: int,
+) -> Tuple[Optional[str], int, str, str]:
+    """Read one image exactly once for the final wire preflight.
+
+    The returned data URL is the frozen wire fact.  The transport must not
+    re-open the path after this function succeeds; a later delete or resize
+    therefore cannot turn an admitted atomic group into a partial request.
+    """
+
+    normalized = str(path or "").strip()
+    if not normalized or not os.path.isfile(normalized):
+        return None, 0, "", "missing_or_unreadable_local_image"
+    try:
+        with open(normalized, "rb") as handle:
+            image_bytes = handle.read(max_single_image_bytes + 1)
+    except OSError:
+        return None, 0, "", "missing_or_unreadable_local_image"
+    if not image_bytes:
+        return None, 0, "", "image_empty"
+    if len(image_bytes) > max_single_image_bytes:
+        return None, len(image_bytes), "", "image_exceeds_single_byte_budget"
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    mime_type = mimetypes.guess_type(normalized)[0] or "image/png"
+    return (
+        f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}",
+        len(image_bytes),
+        digest,
+        "",
+    )
+
+
+def _transport_visual_label(item: Mapping[str, Any]) -> str:
+    visual_id = str(item.get("visual_id") or "")
+    page_no = int(item.get("page_no") or 0)
+    bbox = item.get("bbox") or []
+    artifact_type = str(item.get("artifact_type") or "visual")
+    caption = " ".join(
+        " ".join(str(item.get(key) or "").split())
+        for key in ("caption_excerpt", "title_or_caption")
+    )[:360]
+    nearby = " ".join(str(item.get("nearby_text_excerpt") or "").split())[:500]
+    return (
+        f"[VISUAL OBJECT] visual_id={visual_id}; page_no={page_no}; bbox={bbox}; "
+        f"artifact_type={artifact_type}\n"
+        f"caption_excerpt={caption or '<none>'}\n"
+        f"nearby_text_excerpt={nearby or '<none>'}\n"
+        "The following image is evidence for this label only."
+    )
+
+
+def _typed_transport_omission(
+    item: Mapping[str, Any] | None,
+    *,
+    reason: str,
+    visual_id: str = "",
+    page_no: int = 0,
+    default_scope: str = "final_transport",
+    raw_reinspection_group_id: str = "",
+    scope: str = "",
+    authority_blocking: bool | None = None,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """Attach an explicit authority scope without allowing semantic drift."""
+
+    source = dict(item or {})
+    group_id = str(
+        raw_reinspection_group_id or source.get("raw_reinspection_group_id") or ""
+    ).strip()
+    resolved_scope = (
+        "raw_reinspection"
+        if group_id
+        else str(scope or source.get("transport_omission_scope") or default_scope).strip()
+    )
+    resolved_authority_blocking = authority_blocking
+    if not isinstance(resolved_authority_blocking, bool):
+        resolved_authority_blocking = source.get("transport_omission_authority_blocking")
+    if not isinstance(resolved_authority_blocking, bool):
+        resolved_authority_blocking = resolved_scope != "raw_reinspection"
+    omission: Dict[str, Any] = {
+        "visual_id": str(visual_id or source.get("visual_id") or ""),
+        "page_no": int(page_no or source.get("page_no") or 0),
+        "reason": str(reason or "transport_omission"),
+        "scope": resolved_scope,
+        "authority_blocking": resolved_authority_blocking,
+    }
+    if group_id:
+        omission["raw_reinspection_group_id"] = group_id
+    protected = {
+        "visual_id",
+        "page_no",
+        "reason",
+        "scope",
+        "authority_blocking",
+        "raw_reinspection_group_id",
+    }
+    omission.update(
+        {
+            key: value
+            for key, value in extra.items()
+            if value is not None and key not in protected
+        }
+    )
+    return omission
+
+
+def _drop_visual_label(output: List[Dict[str, Any]], visual_id: str) -> None:
+    marker = f"visual_id={visual_id}"
+    for index in range(len(output) - 1, -1, -1):
+        item = output[index]
+        if str(item.get("type") or "").strip().lower() not in {"text", "input_text"}:
+            break
+        if marker in str(item.get("text") or ""):
+            output.pop(index)
+            break
+
+
+def _frozen_local_image_item(
+    item: Mapping[str, Any],
+    *,
+    data_url: str,
+    image_bytes: int,
+    image_sha256: str,
+) -> Dict[str, Any]:
+    frozen = dict(item)
+    frozen["type"] = "local_image_path"
+    frozen["frozen_image_data_url"] = data_url
+    frozen["frozen_image_bytes"] = image_bytes
+    frozen["frozen_image_sha256"] = image_sha256
+    frozen["image_bytes"] = image_bytes
+    frozen["image_sha256"] = image_sha256
+    frozen["transport_frozen"] = True
+    return frozen
+
+
+def freeze_local_visual_transport_content(
+    user_content: Any,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Tuple[Any, Dict[str, Any]]:
+    """Freeze local visual membership before a provider POST.
+
+    Atomic ``all_children`` groups are admitted as one transaction.  If the
+    actual filesystem snapshot no longer satisfies the group contract, the
+    whole group is replaced by its declared page fallback, or omitted as one
+    explicit ``not_represented`` unit.  No child is ever sent alone.
+    """
+
+    max_request, max_single = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
     if not isinstance(user_content, list):
-        return prompt
+        return user_content, {
+            "planned_visual_ids": [],
+            "sent_visual_ids": [],
+            "omissions": [],
+            "raw_reinspection_groups": [],
+            "estimated_encoded_image_bytes": 0,
+        }
+
+    raw_items = [dict(item) for item in user_content if isinstance(item, Mapping)]
+    image_indices = [
+        index
+        for index, item in enumerate(raw_items)
+        if str(item.get("type") or "").strip().lower() == "local_image_path"
+    ]
+    groups: Dict[Tuple[str, str], List[int]] = {}
+    for index in image_indices:
+        item = raw_items[index]
+        group_id = str(item.get("raw_reinspection_group_id") or "").strip()
+        resolution = str(item.get("raw_reinspection_resolution") or "").strip()
+        if bool(item.get("raw_reinspection_atomic")) and group_id and resolution == "all_children":
+            groups.setdefault((group_id, resolution), []).append(index)
+
+    replacements: Dict[int, Optional[Dict[str, Any]]] = {}
+    processed: set[int] = set()
+    omissions: List[Dict[str, Any]] = []
+    group_reports: List[Dict[str, Any]] = []
+    encoded_bytes = 0
+    sent_visual_ids: List[str] = []
+
+    def admit_one(item: Mapping[str, Any], *, remaining: int) -> Tuple[Optional[Dict[str, Any]], str]:
+        frozen_url = str(item.get("frozen_image_data_url") or "").strip()
+        if frozen_url:
+            try:
+                frozen_bytes = int(item.get("frozen_image_bytes") or item.get("image_bytes") or 0)
+            except (TypeError, ValueError):
+                frozen_bytes = 0
+            frozen_hash = str(item.get("frozen_image_sha256") or item.get("image_sha256") or "")
+            estimated = estimate_encoded_image_bytes(frozen_bytes)
+            if frozen_bytes <= 0:
+                return None, "image_empty"
+            if frozen_bytes > max_single:
+                return None, "image_exceeds_single_byte_budget"
+            if estimated > remaining:
+                return None, "image_exceeds_request_byte_budget"
+            return _frozen_local_image_item(
+                item,
+                data_url=frozen_url,
+                image_bytes=frozen_bytes,
+                image_sha256=frozen_hash,
+            ), ""
+        data_url, image_size, image_hash, reason = _snapshot_local_image(
+            str(item.get("path") or ""),
+            max_single_image_bytes=max_single,
+        )
+        if reason:
+            return None, reason
+        estimated = estimate_encoded_image_bytes(image_size)
+        if estimated > remaining:
+            return None, "image_exceeds_request_byte_budget"
+        return _frozen_local_image_item(
+            item,
+            data_url=str(data_url),
+            image_bytes=image_size,
+            image_sha256=image_hash,
+        ), ""
+
+    for index in image_indices:
+        if index in processed:
+            continue
+        item = raw_items[index]
+        group_id = str(item.get("raw_reinspection_group_id") or "").strip()
+        resolution = str(item.get("raw_reinspection_resolution") or "").strip()
+        group_key = (group_id, resolution)
+        member_indices = groups.get(group_key) if group_key in groups else None
+        if member_indices:
+            processed.update(member_indices)
+            candidate_ids = [
+                str(raw_items[member].get("visual_id") or "")
+                for member in member_indices
+                if str(raw_items[member].get("visual_id") or "")
+            ]
+            snapshots: List[Tuple[int, Dict[str, Any]]] = []
+            group_reason = ""
+            for member in member_indices:
+                frozen, reason = admit_one(raw_items[member], remaining=max_request - encoded_bytes)
+                if reason:
+                    group_reason = reason
+                    break
+                if frozen is not None:
+                    snapshots.append((member, frozen))
+            group_cost = sum(
+                estimate_encoded_image_bytes(int(frozen.get("image_bytes") or 0))
+                for _member, frozen in snapshots
+            )
+            if not group_reason and len(snapshots) != len(member_indices):
+                group_reason = "atomic_group_member_not_admitted"
+            if not group_reason and encoded_bytes + group_cost > max_request:
+                group_reason = "image_exceeds_request_byte_budget"
+            if not group_reason:
+                for member, frozen in snapshots:
+                    frozen["transport_planned_visual_ids"] = list(candidate_ids)
+                    replacements[member] = frozen
+                encoded_bytes += group_cost
+                sent_visual_ids.extend(candidate_ids)
+                group_reports.append(
+                    {
+                        "group_id": group_id,
+                        "page_no": int(item.get("page_no") or 0),
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "resolution": "all_children",
+                        "selected_ids": candidate_ids,
+                        "actual_sent_ids": candidate_ids,
+                        "transport_status": "complete",
+                        "fallback_reason": "",
+                    }
+                )
+                continue
+
+            fallback = item.get("raw_reinspection_fallback_ref")
+            fallback_item = dict(fallback) if isinstance(fallback, Mapping) else {}
+            fallback_id = str(fallback_item.get("visual_id") or "").strip()
+            fallback_frozen: Optional[Dict[str, Any]] = None
+            fallback_reason = group_reason or "atomic_group_not_admitted"
+            if fallback_id:
+                # Selector/manifest refs use ``image_path`` while the local
+                # transport item uses ``path``.  Normalize the declared page
+                # fallback before the atomic admission attempt; otherwise a
+                # valid fallback would be misclassified as missing and the
+                # whole unit would be unnecessarily dropped.
+                fallback_item["path"] = str(
+                    fallback_item.get("path")
+                    or fallback_item.get("image_path")
+                    or ""
+                )
+                fallback_frozen, fallback_error = admit_one(
+                    {
+                        **fallback_item,
+                        "raw_reinspection_group_id": group_id,
+                        "raw_reinspection_resolution": "page_snapshot_fallback",
+                        "raw_reinspection_selected_ids": [fallback_id],
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "raw_reinspection_atomic": True,
+                    },
+                    remaining=max_request - encoded_bytes,
+                )
+                if fallback_error:
+                    fallback_frozen = None
+                    fallback_reason = f"{fallback_reason};fallback:{fallback_error}"
+            if fallback_frozen is not None:
+                fallback_frozen["transport_planned_visual_ids"] = list(candidate_ids)
+                replacements[member_indices[0]] = fallback_frozen
+                for member in member_indices[1:]:
+                    replacements[member] = None
+                encoded_bytes += estimate_encoded_image_bytes(
+                    int(fallback_frozen.get("image_bytes") or 0)
+                )
+                sent_visual_ids.append(fallback_id)
+                group_reports.append(
+                    {
+                        "group_id": group_id,
+                        "page_no": int(item.get("page_no") or 0),
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "resolution": "page_snapshot_fallback",
+                        "selected_ids": [fallback_id],
+                        "actual_sent_ids": [fallback_id],
+                        "transport_status": "complete",
+                        "fallback_reason": fallback_reason,
+                    }
+                )
+            else:
+                for member in member_indices:
+                    replacements[member] = None
+                    omissions.append(
+                        _typed_transport_omission(
+                            raw_items[member],
+                            reason="raw_reinspection_group_not_represented",
+                            raw_reinspection_group_id=group_id,
+                            raw_reinspection_resolution="not_represented",
+                            raw_reinspection_fallback_reason=fallback_reason,
+                            raw_reinspection_planned_ids=candidate_ids,
+                        )
+                    )
+                group_reports.append(
+                    {
+                        "group_id": group_id,
+                        "page_no": int(item.get("page_no") or 0),
+                        "ambiguous_candidate_ids": candidate_ids,
+                        "resolution": "not_represented",
+                        "selected_ids": [],
+                        "actual_sent_ids": [],
+                        "transport_status": "not_sent",
+                        "fallback_reason": fallback_reason,
+                    }
+                )
+            continue
+
+        processed.add(index)
+        frozen, reason = admit_one(item, remaining=max_request - encoded_bytes)
+        if frozen is None:
+            replacements[index] = None
+            omissions.append(
+                _typed_transport_omission(
+                    item,
+                    reason=reason or "local_image_not_admitted",
+                )
+            )
+            continue
+        visual_id = str(item.get("visual_id") or "")
+        replacements[index] = frozen
+        frozen["transport_planned_visual_ids"] = [visual_id] if visual_id else []
+        encoded_bytes += estimate_encoded_image_bytes(int(frozen.get("image_bytes") or 0))
+        if visual_id:
+            sent_visual_ids.append(visual_id)
 
     normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw_items):
+        if str(item.get("type") or "").strip().lower() != "local_image_path":
+            normalized.append(item)
+            continue
+        replacement = replacements.get(index)
+        if replacement is None:
+            _drop_visual_label(normalized, str(item.get("visual_id") or ""))
+            continue
+        if replacement is not item and replacement.get("visual_id") != item.get("visual_id"):
+            _drop_visual_label(normalized, str(item.get("visual_id") or ""))
+            normalized.append({"type": "text", "text": _transport_visual_label(replacement)})
+        normalized.append(replacement)
+    planned_ids = [
+        str(raw_items[index].get("visual_id") or "")
+        for index in image_indices
+        if str(raw_items[index].get("visual_id") or "")
+    ]
+    return normalized, {
+        "planned_visual_ids": planned_ids,
+        "sent_visual_ids": sent_visual_ids,
+        "omissions": omissions,
+        "raw_reinspection_groups": group_reports,
+        "estimated_encoded_image_bytes": encoded_bytes,
+        "max_single_image_bytes": max_single,
+        "max_request_image_bytes": max_request,
+        "images_planned_count": len(planned_ids),
+        "images_actually_sent_count": len(sent_visual_ids),
+    }
+
+
+def _normalize_user_message_content_with_report(
+    prompt: str,
+    user_content: Any,
+    logger: Any = None,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Tuple[Any, Dict[str, Any]]:
+    max_request, max_single = normalize_visual_byte_budgets(
+        max_request_image_bytes=max_request_image_bytes,
+        max_single_image_bytes=max_single_image_bytes,
+    )
+    if not isinstance(user_content, list):
+        return prompt, {"sent_visual_ids": [], "omissions": [], "images_actually_sent_count": 0}
+
+    normalized: List[Dict[str, Any]] = []
+    sent_visual_ids: List[str] = []
+    planned_visual_ids: List[str] = []
+    omissions: List[Dict[str, Any]] = []
+    raw_group_reports: Dict[str, Dict[str, Any]] = {}
+    encoded_bytes = 0
+
+    def note_raw_group(item: Mapping[str, Any], *, actual_visual_id: str = "") -> None:
+        group_id = str(item.get("raw_reinspection_group_id") or "").strip()
+        if not group_id:
+            return
+        candidate_ids = [
+            str(value)
+            for value in (
+                item.get("ambiguous_candidate_ids")
+                or item.get("transport_planned_visual_ids")
+                or []
+            )
+            if str(value)
+        ]
+        selected_ids = [
+            str(value)
+            for value in (item.get("raw_reinspection_selected_ids") or [])
+            if str(value)
+        ]
+        report = raw_group_reports.setdefault(
+            group_id,
+            {
+                "group_id": group_id,
+                "page_no": int(item.get("page_no") or 0),
+                "ambiguous_candidate_ids": candidate_ids,
+                "resolution": str(item.get("raw_reinspection_resolution") or ""),
+                "selected_ids": selected_ids,
+                "actual_sent_ids": [],
+                "fallback_reason": str(
+                    item.get("raw_reinspection_fallback_reason") or ""
+                ),
+            },
+        )
+        for value in candidate_ids:
+            if value not in report["ambiguous_candidate_ids"]:
+                report["ambiguous_candidate_ids"].append(value)
+        for value in selected_ids:
+            if value not in report["selected_ids"]:
+                report["selected_ids"].append(value)
+        if actual_visual_id and actual_visual_id not in report["actual_sent_ids"]:
+            report["actual_sent_ids"].append(actual_visual_id)
     for item in user_content:
         if not isinstance(item, dict):
             continue
@@ -565,24 +1072,123 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
             continue
         if item_type == "local_image_path":
             path = str(item.get("path") or "").strip()
-            data_url = _encode_local_image_as_data_url(path)
+            visual_id = str(item.get("visual_id") or "")
+            page_no = int(item.get("page_no") or 0)
+            planned_ids_for_item = [
+                str(value)
+                for value in (
+                    item.get("transport_planned_visual_ids")
+                    or item.get("ambiguous_candidate_ids")
+                    or ([visual_id] if visual_id else [])
+                )
+                if str(value)
+            ]
+            for value in planned_ids_for_item:
+                if value not in planned_visual_ids:
+                    planned_visual_ids.append(value)
+            note_raw_group(item)
+            frozen_url = str(item.get("frozen_image_data_url") or "").strip()
+            try:
+                image_size = int(item.get("frozen_image_bytes") or 0)
+            except (TypeError, ValueError):
+                image_size = 0
+            if frozen_url and image_size > 0:
+                data_url = frozen_url
+            else:
+                try:
+                    image_size = int(os.path.getsize(path))
+                except OSError:
+                    image_size = 0
+                if not path or not os.path.isfile(path) or image_size <= 0:
+                    omissions.append(
+                        _typed_transport_omission(
+                            item,
+                            reason="missing_or_unreadable_local_image",
+                            visual_id=visual_id,
+                            page_no=page_no,
+                        )
+                    )
+                    if logger:
+                        logger.warning(f"Skipping missing or unreadable local image input: {path}")
+                    continue
+                if image_size > max_single:
+                    omissions.append(
+                        _typed_transport_omission(
+                            item,
+                            reason="image_exceeds_single_byte_budget",
+                            visual_id=visual_id,
+                            page_no=page_no,
+                        )
+                    )
+                    continue
+                data_url = _encode_local_image_as_data_url(path, max_image_bytes=max_single)
+            estimated = estimate_encoded_image_bytes(image_size)
+            if encoded_bytes + estimated > max_request:
+                omissions.append(
+                    _typed_transport_omission(
+                        item,
+                        reason="image_exceeds_request_byte_budget",
+                        visual_id=visual_id,
+                        page_no=page_no,
+                    )
+                )
+                continue
             if not data_url:
+                omissions.append(
+                    _typed_transport_omission(
+                        item,
+                        reason="missing_or_oversized_local_image",
+                        visual_id=visual_id,
+                        page_no=page_no,
+                    )
+                )
                 if logger:
                     logger.warning(f"Skipping missing or unreadable local image input: {path}")
                 continue
-            normalized.append({"type": "image_url", "image_url": {"url": data_url}})
+            normalized.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url, "detail": str(item.get("detail") or "original")},
+                }
+            )
+            encoded_bytes += estimated
+            note_raw_group(item, actual_visual_id=visual_id)
+            if visual_id:
+                sent_visual_ids.append(visual_id)
             continue
         if item_type == "image_url":
             image_url = item.get("image_url")
             if isinstance(image_url, dict) and image_url.get("url"):
-                normalized.append({"type": "image_url", "image_url": {"url": str(image_url.get("url"))}})
+                normalized.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": str(image_url.get("url")),
+                            "detail": str(image_url.get("detail") or item.get("detail") or "original"),
+                        },
+                    }
+                )
             elif isinstance(image_url, str) and image_url.strip():
-                normalized.append({"type": "image_url", "image_url": {"url": image_url.strip()}})
+                normalized.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url.strip(),
+                            "detail": str(item.get("detail") or "original"),
+                        },
+                    }
+                )
             continue
         if item_type == "local_pdf_path":
             path = str(item.get("path") or "").strip()
             data_url = _encode_local_pdf_as_data_url(path)
             if not data_url:
+                omissions.append(
+                    _typed_transport_omission(
+                        item,
+                        reason="missing_or_unreadable_local_pdf",
+                    )
+                )
                 if logger:
                     logger.warning(f"Skipping missing or unreadable local PDF input: {path}")
                 continue
@@ -604,12 +1210,81 @@ def _normalize_user_message_content(prompt: str, user_content: Any, logger: Any 
             continue
 
     if not normalized:
-        return prompt
+        return prompt, {
+            "planned_visual_ids": planned_visual_ids,
+            "sent_visual_ids": sent_visual_ids,
+            "omissions": omissions,
+            "raw_reinspection_groups": list(raw_group_reports.values()),
+            "images_planned_count": len(planned_visual_ids),
+            "images_actually_sent_count": len(sent_visual_ids),
+            "estimated_encoded_image_bytes": encoded_bytes,
+        }
 
     has_text = any(item.get("type") == "text" for item in normalized)
     if not has_text and prompt:
         normalized.insert(0, {"type": "text", "text": prompt})
+    return normalized, {
+        "planned_visual_ids": planned_visual_ids,
+        "sent_visual_ids": sent_visual_ids,
+        "omissions": omissions,
+        "raw_reinspection_groups": list(raw_group_reports.values()),
+        "images_planned_count": len(planned_visual_ids),
+        "images_actually_sent_count": len(sent_visual_ids),
+        "estimated_encoded_image_bytes": encoded_bytes,
+    }
+
+
+def _normalize_user_message_content(
+    prompt: str,
+    user_content: Any,
+    logger: Any = None,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Any:
+    normalized, _report = _normalize_user_message_content_with_report(
+        prompt,
+        user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
     return normalized
+
+
+def _text_only_user_content(user_content: Any) -> Any:
+    """Remove image/file parts when a fallback route is text-only."""
+
+    if not isinstance(user_content, list):
+        return user_content
+    text_items = [
+        dict(item)
+        for item in user_content
+        if isinstance(item, dict)
+        and str(item.get("type") or "").strip().lower() in {"text", "input_text"}
+        and str(item.get("text") or "").strip()
+    ]
+    return text_items or None
+
+
+def _admit_local_images_to_budget(
+    user_content: Any,
+    *,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Tuple[Any, List[Dict[str, Any]]]:
+    """Freeze image membership once, preserving atomic raw-reinspection units."""
+
+    frozen, report = freeze_local_visual_transport_content(
+        user_content,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
+    return frozen, [
+        dict(item)
+        for item in (report.get("omissions") or [])
+        if isinstance(item, Mapping)
+    ]
 
 
 def _call_ai_api_detailed_uninstrumented(
@@ -624,13 +1299,31 @@ def _call_ai_api_detailed_uninstrumented(
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
     max_retries_per_call: int = 0,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
+    removed_compat_params: Set[Any] = set()
+
+    def mutation_label(value: Any) -> str:
+        if isinstance(value, tuple) and tuple(str(item) for item in value) == ("reasoning", "display"):
+            return "removed_reasoning_display"
+        text = str(value or "").strip()
+        if text == "reasoning_effort:max_to_high":
+            return "reasoning_effort:max->high"
+        if text.startswith("removed_"):
+            return text
+        return f"removed_{text}" if text else ""
 
     def finish(result: Dict[str, Any]) -> Dict[str, Any]:
         enriched = dict(result)
         enriched["attempts"] = max(1, attempts_used)
+        enriched["fallback_or_payload_mutations"] = sorted(
+            label
+            for label in (mutation_label(item) for item in removed_compat_params)
+            if label
+        )
         return enriched
 
     try:
@@ -675,6 +1368,8 @@ def _call_ai_api_detailed_uninstrumented(
                 user_content=user_content,
                 logger=logger,
                 capability=capability,
+                max_single_image_bytes=max_single_image_bytes,
+                max_request_image_bytes=max_request_image_bytes,
             )
             response_parser = parse_responses_response
         else:
@@ -688,6 +1383,8 @@ def _call_ai_api_detailed_uninstrumented(
                 user_content=user_content,
                 logger=logger,
                 capability=capability,
+                max_single_image_bytes=max_single_image_bytes,
+                max_request_image_bytes=max_request_image_bytes,
             )
             response_parser = parse_chat_completions_response
 
@@ -701,7 +1398,6 @@ def _call_ai_api_detailed_uninstrumented(
                 return attempts_used < max_retries
             return attempt < max_retries
 
-        removed_compat_params: Set[Any] = set()
         while can_start_attempt():
             attempt += 1
             attempts_used += 1
@@ -734,6 +1430,32 @@ def _call_ai_api_detailed_uninstrumented(
                     ))
 
                 formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
+                if isinstance(response_data, dict):
+                    provider_model = str(response_data.get("model") or "").strip()
+                    usage = response_data.get("usage")
+                    formatted["provider_response_model"] = provider_model
+                    formatted["provider_usage_present"] = isinstance(usage, dict)
+                    if isinstance(usage, dict):
+                        usage_keys = {
+                            "input_tokens": ("prompt_tokens", "input_tokens"),
+                            "output_tokens": ("completion_tokens", "output_tokens"),
+                            "total_tokens": ("total_tokens",),
+                        }
+                        for result_key, candidates in usage_keys.items():
+                            for usage_key in candidates:
+                                raw_value = usage.get(usage_key)
+                                if isinstance(raw_value, bool) or not isinstance(
+                                    raw_value, (int, float, str)
+                                ):
+                                    continue
+                                try:
+                                    parsed_value = int(raw_value)
+                                except (TypeError, ValueError, OverflowError):
+                                    continue
+                                if parsed_value >= 0:
+                                    formatted[result_key] = parsed_value
+                                    break
+                        formatted["usage_status"] = "reported"
                 if (
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"
@@ -891,6 +1613,9 @@ def _call_ai_api_detailed(
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
     provider_runtime: Optional[ProviderRuntime] = None,
+    provider_route: Optional[str] = None,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call the transport only after bound-runtime and complete-budget admission."""
 
@@ -908,14 +1633,19 @@ def _call_ai_api_detailed(
             return default
         return parsed if parsed > 0 else default
 
-    request_payload: dict[str, Any] = {
-        "system": system_prompt,
-        "user": prompt,
-        "user_content": user_content,
-        "response_format": response_format,
-        "max_output_tokens": int(max_tokens),
-        "temperature": temperature,
-    }
+    admitted_user_content, admission_omissions = _admit_local_images_to_budget(
+        user_content,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
+    request_payload = canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=admitted_user_content,
+        response_format=response_format,
+        max_output_tokens=int(max_tokens),
+        temperature=temperature,
+    )
     capability = resolve_model_capability(api_config)
     profile = ProviderContextProfile.conservative(
         provider=str(api_config.get("provider_family") or capability.provider_family),
@@ -936,6 +1666,7 @@ def _call_ai_api_detailed(
                 "provider input exceeds verified context budget: "
                 f"{budget['estimated_input_tokens']} > {budget['input_budget']}"
             ),
+            route=provider_route,
         )
         blocked = _api_result(
             status="failed",
@@ -943,6 +1674,10 @@ def _call_ai_api_detailed(
             message="provider input exceeds verified context budget",
         )
         blocked["provider_receipt"] = receipt.to_dict()
+        blocked["transport_metadata"] = {
+            "successful_input_mode": "text_only",
+            "images_actually_sent_count": 0,
+        }
         return blocked
 
     estimated_tokens = int(budget["estimated_input_tokens"])
@@ -954,6 +1689,7 @@ def _call_ai_api_detailed(
             input_payload=request_payload,
             api_config=api_config,
             message=str(exc),
+            route=provider_route,
         )
         blocked = _api_result(
             status="failed",
@@ -961,6 +1697,10 @@ def _call_ai_api_detailed(
             message=str(exc),
         )
         blocked["provider_receipt"] = receipt.to_dict()
+        blocked["transport_metadata"] = {
+            "successful_input_mode": "text_only",
+            "images_actually_sent_count": 0,
+        }
         return blocked
 
     result = _call_ai_api_detailed_uninstrumented(
@@ -971,18 +1711,80 @@ def _call_ai_api_detailed(
         temperature=temperature,
         response_format=response_format,
         logger=logger,
-        user_content=user_content,
+        user_content=admitted_user_content,
         retry_attempts=retry_attempts,
         timeout_seconds=timeout_seconds,
         max_retries_per_call=provider_runtime.budget.max_retries_per_call,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
     )
+    _normalized_content, transport_report = _normalize_user_message_content_with_report(
+        prompt,
+        admitted_user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
+    transport_report["omissions"] = [
+        *admission_omissions,
+        *list(transport_report.get("omissions") or []),
+    ]
+    planned_ids = [
+        str(value)
+        for value in (transport_report.get("planned_visual_ids") or [])
+        if str(value)
+    ]
+    group_reports = {
+        str(item.get("group_id") or ""): dict(item)
+        for item in (transport_report.get("raw_reinspection_groups") or [])
+        if isinstance(item, Mapping) and str(item.get("group_id") or "")
+    }
+    for omission in admission_omissions:
+        if not isinstance(omission, Mapping):
+            continue
+        visual_id = str(omission.get("visual_id") or "")
+        if visual_id and visual_id not in planned_ids:
+            planned_ids.append(visual_id)
+        group_id = str(omission.get("raw_reinspection_group_id") or "").strip()
+        if not group_id or group_id in group_reports:
+            continue
+        candidate_ids = [
+            str(value)
+            for value in (omission.get("raw_reinspection_planned_ids") or [])
+            if str(value)
+        ]
+        group_reports[group_id] = {
+            "group_id": group_id,
+            "page_no": int(omission.get("page_no") or 0),
+            "ambiguous_candidate_ids": candidate_ids,
+            "resolution": str(
+                omission.get("raw_reinspection_resolution") or "not_represented"
+            ),
+            "selected_ids": [],
+            "actual_sent_ids": [],
+            "transport_status": "not_sent",
+            "fallback_reason": str(
+                omission.get("raw_reinspection_fallback_reason") or ""
+            ),
+        }
+    transport_report["planned_visual_ids"] = planned_ids
+    transport_report["images_planned_count"] = len(planned_ids)
+    transport_report["raw_reinspection_groups"] = list(group_reports.values())
+    result = {
+        **dict(result),
+        "transport_metadata": {
+            **transport_report,
+            "successful_input_mode": "multimodal" if transport_report.get("images_actually_sent_count", 0) else "text_only",
+        },
+    }
     receipt = provider_runtime.complete(
         admission=admission,
         prompt=prompt,
         input_payload=request_payload,
         api_config=api_config,
         result=result,
-        metadata={"request_budget": budget},
+        metadata={"request_budget": budget, **dict(result.get("transport_metadata") or {})},
+        route=provider_route,
     )
     enriched = dict(result)
     enriched["provider_receipt"] = receipt.to_dict()
@@ -1372,19 +2174,7 @@ def get_concept_profile(prompt: str, api_config: APIConfig, logger: Optional[Any
     Returns:
         概念配置字典，失败返回None
     """
-    # 读取API参数配置
-    try:
-        max_tokens = int(api_config.get('max_output_tokens', 4000))
-        temperature = float(api_config.get('temperature', 0.3))
-    except (ValueError, TypeError) as e:
-        if logger:
-            logger.warning(f"读取概念分析API参数配置失败，使用默认值: {e}")
-        max_tokens = 4000
-        temperature = 0.3
-
-    # 使用统一的API调用函数
-    system_prompt = "你是一位学术研究专家，专门研究概念的历史发展和理论演化。请基于提供的种子论文，深入分析并创建一个关于指定概念的全面学习笔记。"
-    return _call_ai_api(prompt, api_config, system_prompt, max_tokens=max_tokens, temperature=temperature, response_format="json", logger=logger)
+    raise RuntimeError("Concept Mode is not yet available in the current PR14 runtime")
 
 
 def get_concept_analysis(prompt: str, api_config: APIConfig, logger: Optional[Any] = None, config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -1400,19 +2190,7 @@ def get_concept_analysis(prompt: str, api_config: APIConfig, logger: Optional[An
     Returns:
         概念分析字典，失败返回None
     """
-    # 读取API参数配置
-    try:
-        max_tokens = int(api_config.get('max_output_tokens', 4000))
-        temperature = float(api_config.get('temperature', 0.3))
-    except (ValueError, TypeError) as e:
-        if logger:
-            logger.warning(f"读取概念分析API参数配置失败，使用默认值: {e}")
-        max_tokens = 4000
-        temperature = 0.3
-
-    # 使用统一的API调用函数
-    system_prompt = "你是一位专门研究概念的学术分析专家。请基于提供的概念学习笔记，对当前论文进行深度分析，评估其在该概念发展历程中的地位和贡献。"
-    return _call_ai_api(prompt, api_config, system_prompt, max_tokens=max_tokens, temperature=temperature, response_format="json", logger=logger)
+    raise RuntimeError("Concept Mode is not yet available in the current PR14 runtime")
 
 
 class ContextLengthExceededError(Exception):
@@ -1442,6 +2220,10 @@ def get_summary_from_ai_detailed(
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
     provider_runtime: Optional[ProviderRuntime] = None,
+    system_prompt: Optional[str] = None,
+    normalize_summary: bool = True,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Stage-1 reader call that preserves API failure classification."""
     if ('dummy' in (primary_api_config.get('api_key') or '') or
@@ -1540,16 +2322,7 @@ def get_summary_from_ai_detailed(
         max_tokens = 3000
         temperature = 0.3
 
-    try:
-        with open('prompts/prompt_system_analyze.txt', 'r', encoding='utf-8') as handle:
-            system_prompt = handle.read()
-    except Exception as exc:
-        if logger:
-            logger.warning(f"Unable to load system prompt, using default: {exc}")
-        system_prompt = (
-            "You are an academic literature analysis expert. Analyze the paper text "
-            "and return a structured JSON summary."
-        )
+    system_prompt = system_prompt or _load_stage1_system_prompt(logger)
 
     request_api_config: APIConfig = {
         **api_config,
@@ -1557,6 +2330,9 @@ def get_summary_from_ai_detailed(
         'model': model_name,
         'api_base': api_base,
     }
+    effective_user_content = user_content
+    if engine_type != "primary" or not detect_multimodal_capability(request_api_config).supports_image_input:
+        effective_user_content = _text_only_user_content(user_content)
 
     detailed = _call_ai_api_detailed(
         prompt_text,
@@ -1566,9 +2342,12 @@ def get_summary_from_ai_detailed(
         temperature=temperature,
         response_format="json",
         logger=logger,
-        user_content=user_content,
+        user_content=effective_user_content,
         retry_attempts=retry_attempts,
         provider_runtime=provider_runtime,
+        provider_route="Backup_Reader_API" if engine_type == "backup" else "Primary_Reader_API",
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
     )
     detailed["engine_type"] = engine_type
 
@@ -1577,7 +2356,7 @@ def get_summary_from_ai_detailed(
 
     ai_response = detailed.get("content")
     if isinstance(ai_response, dict):
-        detailed["content"] = normalize_ai_summary(ai_response)
+        detailed["content"] = normalize_ai_summary(ai_response) if normalize_summary else dict(ai_response)
         return detailed
     if ai_response:
         if logger:
@@ -1602,7 +2381,11 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                                       disable_engine_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
                                       is_engine_disabled_callback: Optional[Callable[[str], bool]] = None,
                                       skip_engines: Optional[Set[str]] = None,
-                                      provider_runtime: Optional[ProviderRuntime] = None) -> Optional[Dict[str, Any]]:
+                                      provider_runtime: Optional[ProviderRuntime] = None,
+                                      system_prompt: Optional[str] = None,
+                                      normalize_summary: bool = True,
+                                      max_single_image_bytes: Optional[int] = None,
+                                      max_request_image_bytes: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Stage-1 reader scheduler. Transient failures alternate engines:
     primary#1 -> backup#1 -> primary#2 -> backup#2. Quota/balance failures
@@ -1614,6 +2397,7 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
     engine_order = ["primary", "backup"]
     remaining = {engine: attempt_budget for engine in engine_order}
     last_result: Optional[Dict[str, Any]] = None
+    primary_failure_reason = ""
 
     def configured(engine: str) -> bool:
         cfg = primary_api_config if engine == "primary" else backup_api_config
@@ -1648,12 +2432,25 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
                 user_content=user_content,
                 retry_attempts=1,
                 provider_runtime=provider_runtime,
+                system_prompt=system_prompt,
+                normalize_summary=normalize_summary,
+                max_single_image_bytes=max_single_image_bytes,
+                max_request_image_bytes=max_request_image_bytes,
             )
             last_result = result
             if result.get("status") == "success":
+                if engine != "primary":
+                    result = {
+                        **dict(result),
+                        "fallback_reason": primary_failure_reason or "primary_reader_failed_before_backup",
+                    }
                 return result if return_detailed else result.get("content")
 
             error_kind = str(result.get("error_kind") or "")
+            if engine == "primary":
+                primary_failure_reason = str(
+                    result.get("message") or result.get("error_kind") or "primary_reader_failed"
+                )[:240]
             if error_kind == "quota_exhausted":
                 remaining[engine] = 0
                 if disable_engine_callback:
@@ -1680,7 +2477,8 @@ def get_summary_from_ai_with_fallback(prompt_text: str, primary_api_config: APIC
 
 def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_api_config: APIConfig,
                        engine_type: str = 'primary', logger: Optional[Any] = None,
-                       config: Optional[Dict[str, Any]] = None, user_content: Any = None) -> Optional[Dict[str, Any]]:
+                       config: Optional[Dict[str, Any]] = None, user_content: Any = None,
+                       system_prompt: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     调用AI API并返回结构化摘要（带重试机制和429错误处理）
 
@@ -1791,16 +2589,12 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         temperature = 0.3
 
     # 从外部文件读取系统提示词
-    try:
-        with open('prompts/prompt_system_analyze.txt', 'r', encoding='utf-8') as f:
-            system_prompt = f.read()
-    except Exception as e:
-        # 如果读取失败，使用默认提示词
-        if logger:
-            logger.warning(f"无法加载系统提示词文件，使用默认提示词: {e}")
-        system_prompt = """你是一个学术文献分析专家。请对提供的学术文本进行深度分析，并返回一个结构化摘要。请严格按照JSON格式返回结果，包含title、authors、year、journal、summary、key_points、methodology、findings、conclusions、relevance、limitations等字段。"""
+    system_prompt = system_prompt or _load_stage1_system_prompt(logger)
 
     # 使用统一的API调用函数
+    effective_user_content = user_content
+    if not detect_multimodal_capability(api_config).supports_image_input:
+        effective_user_content = _text_only_user_content(user_content)
     ai_response = _call_ai_api(
         prompt_text,
         api_config,
@@ -1809,7 +2603,7 @@ def get_summary_from_ai(prompt_text: str, primary_api_config: APIConfig, backup_
         temperature=temperature,
         response_format="json",
         logger=logger,
-        user_content=user_content,
+        user_content=effective_user_content,
     )
 
     if not ai_response:

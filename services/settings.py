@@ -10,14 +10,65 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, MutableMapping
 
+from services.config_values import normalize_stage1_config_sections
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 
 # Kept in the accepted schema only so older config files can be read and
 # normalized.  This field is not a current parser-routing control.
 _DEPRECATED_PREPROCESS_KEYS = frozenset({"strategy_policy"})
+_MIGRATION_ONLY_STAGE1_KEYS = frozenset(
+    {
+        "pdf_required_for_formal_precision",
+        "formal_precision_text_only_policy",
+        "pdf_verifier_api",
+    }
+)
+
+# Every accepted Stage 1 key has an explicit owner disposition.  Migration
+# keys remain readable so an older config can be normalized, while REMOVE
+# keys are rejected instead of being silently ignored.
+STAGE1_CONFIG_OWNERSHIP: Dict[str, Dict[str, str]] = {
+    "Stage1_Input": {
+        "mode": "INVARIANT",
+        "send_extracted_text": "ACTIVE",
+        "send_selected_visuals": "ACTIVE",
+        "send_original_pdf": "ACTIVE",
+        "pdf_required_for_formal_precision": "MIGRATION_ONLY",
+        "max_pdf_file_mb": "ACTIVE",
+        "formal_precision_text_only_policy": "MIGRATION_ONLY",
+        "force_pdf_file_input_for_provider": "ACTIVE",
+        "pdf_verifier_api": "MIGRATION_ONLY",
+        "image_transport": "INVARIANT",
+        "single_call_max_pages": "ACTIVE",
+        "visual_scan_batch_size": "ACTIVE",
+        "final_image_refs_max": "ACTIVE",
+        "require_complete_visual_coverage": "ACTIVE",
+        "max_request_image_bytes": "ACTIVE",
+        "max_single_image_bytes": "ACTIVE",
+    },
+    "Stage1_Visual": {
+        "enabled": "ACTIVE",
+        "max_visual_refs_per_paper": "REMOVE",
+        "visual_artifact_dir": "REMOVE",
+        "render_all_nonblank_pages": "INVARIANT",
+        "page_long_edge_px": "ACTIVE",
+        "crop_long_edge_px": "ACTIVE",
+        "page_max_pixels": "ACTIVE",
+        "crop_max_pixels": "ACTIVE",
+        "page_format": "ACTIVE",
+        "page_jpeg_quality": "ACTIVE",
+        "crop_format": "ACTIVE",
+        "crop_padding_ratio": "ACTIVE",
+        "table_crop_enabled": "ACTIVE",
+        "formula_crop_enabled": "ACTIVE",
+        "max_request_image_bytes": "REMOVE",
+        "max_single_image_bytes": "REMOVE",
+        "max_visual_artifact_bytes": "ACTIVE",
+    },
+}
 
 API_KEYS = frozenset(
     {
@@ -45,6 +96,7 @@ API_KEYS = frozenset(
         "pdf_file_input",
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
+        "experimental",
     }
 )
 
@@ -167,6 +219,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
     "GUI": frozenset({"language"}),
     "Stage1_Input": frozenset(
         {
+            "mode",
             "send_extracted_text",
             "send_selected_visuals",
             "send_original_pdf",
@@ -175,9 +228,32 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "formal_precision_text_only_policy",
             "force_pdf_file_input_for_provider",
             "pdf_verifier_api",
+            "image_transport",
+            "single_call_max_pages",
+            "visual_scan_batch_size",
+            "final_image_refs_max",
+            "require_complete_visual_coverage",
+            "max_request_image_bytes",
+            "max_single_image_bytes",
         }
     ),
-    "Stage1_Visual": frozenset({"enabled", "max_visual_refs_per_paper", "visual_artifact_dir"}),
+    "Stage1_Visual": frozenset(
+        {
+            "enabled",
+            "render_all_nonblank_pages",
+            "page_long_edge_px",
+            "crop_long_edge_px",
+            "page_max_pixels",
+            "crop_max_pixels",
+            "page_format",
+            "page_jpeg_quality",
+            "crop_format",
+            "crop_padding_ratio",
+            "table_crop_enabled",
+            "formula_crop_enabled",
+            "max_visual_artifact_bytes",
+        }
+    ),
     "Multimodal": frozenset({"enabled", "multimodal_api_key", "multimodal_model", "multimodal_api_base"}),
 }
 
@@ -360,17 +436,19 @@ class ApplicationSettings:
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ApplicationSettings":
         application = _section(config, "Application")
+        raw_sections = {
+            str(section): {str(key): value for key, value in values.items()}
+            for section, values in config.items()
+            if isinstance(values, Mapping)
+        }
+        normalized_sections = normalize_stage1_config_sections(raw_sections)
         return cls(
             config_schema=_int(application.get("config_schema"), CONFIG_SCHEMA_VERSION),
             validation=ValidationSettings.from_config(config),
             runtime=RuntimeSettings.from_config(config),
             outline=OutlineSettings.from_config(config),
             outline_stability=OutlineStabilitySettings.from_config(config),
-            sections={
-                str(section): {str(key): str(value) for key, value in values.items()}
-                for section, values in config.items()
-                if isinstance(values, Mapping)
-            },
+            sections=normalized_sections,
         )
 
     @classmethod
@@ -382,11 +460,15 @@ class ApplicationSettings:
                 if not (
                     str(section) == "Preprocess"
                     and str(key) in _DEPRECATED_PREPROCESS_KEYS
+                ) and not (
+                    str(section) == "Stage1_Input"
+                    and str(key) in _MIGRATION_ONLY_STAGE1_KEYS
                 )
             }
             for section, values in config.items()
             if isinstance(values, Mapping)
         }
+        normalized_sections = normalize_stage1_config_sections(normalized_sections)
         config.clear()
         config.update(normalized_sections)
         return cls.from_config(normalized_sections)
@@ -553,6 +635,7 @@ __all__ = [
     "CONFIG_KEYS",
     "CONFIG_SCHEMA_VERSION",
     "ApplicationSettings",
+    "STAGE1_CONFIG_OWNERSHIP",
     "ValidationSettings",
     "RuntimeSettings",
     "OutlineSettings",

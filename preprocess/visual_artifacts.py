@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - compatibility with older PyMuPDF relea
     import fitz  # type: ignore
 
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry, file_sha256
+from services.config_values import parse_bounded_float, parse_strict_bool
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact, utc_now_iso
 from services.queue_service import LocalPublicationContext
 
@@ -46,26 +47,42 @@ _VISUAL_KEYWORDS = (
 )
 
 _DEFAULT_SELECTION_POLICY: Dict[str, Any] = {
-    "policy_name": "stage1_visual_bundle_budgeted_v1",
+    "policy_name": "stage1_visual_coverage_v2",
     "text_is_primary": True,
-    "supported_artifact_types": ["page_snapshot", "figure_crop"],
-    "deferred_artifact_types": ["table_crop"],
+    "supported_artifact_types": ["page_snapshot", "figure_crop", "table_crop", "formula_crop"],
+    "deferred_artifact_types": [],
     "budgets": {
-        "page_snapshot_max": 4,
+        "page_snapshot_max": 0,
         "figure_crop_max": 6,
-        "total_visuals_max": 10,
+        "table_crop_max": 6,
+        "formula_crop_max": 4,
+        "total_visuals_max": 0,
         "figure_crop_max_per_page": 2,
+        "table_crop_max_per_page": 2,
+        "formula_crop_max_per_page": 2,
+    },
+    "rendering": {
+        "page_long_edge_px": 2200,
+        "crop_long_edge_px": 2400,
+        "page_max_pixels": 16000000,
+        "crop_max_pixels": 16000000,
+        "page_format": "jpeg",
+        "page_jpeg_quality": 92,
+        "crop_format": "png",
+        "crop_padding_ratio": 0.04,
+        "max_visual_artifact_bytes": 24000000,
     },
     "rendering_safety": {
         "max_rendered_pixels": 16000000,
         "max_rendered_dimension_px": 8000,
-        "max_visual_artifact_bytes": 20971520,
+        "max_visual_artifact_bytes": 24000000,
     },
     "selection_signals": [
         "image_rich_pages",
         "figure_and_framework_keywords",
         "nearby_caption_and_context_cues",
-        "deterministic_score_sorting",
+        "full_nonblank_page_coverage",
+        "deterministic_crop_candidate_sorting",
         "per_page_diversity_limits",
         "decorative_small_block_filtering",
     ],
@@ -127,6 +144,17 @@ def _paper_hash(paper_key: str) -> str:
     return hashlib.sha256(paper_key.encode("utf-8")).hexdigest()[:16]
 
 
+def _normalize_image_format(value: Any, default: str, *, strict: bool = False) -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized in {"jpg", "jpeg"}:
+        return "jpeg"
+    if normalized == "png":
+        return "png"
+    if strict:
+        raise ValueError(f"unsupported visual image format: {value}")
+    return default
+
+
 @dataclass(frozen=True)
 class VisualArtifactRecord:
     visual_id: str
@@ -143,6 +171,13 @@ class VisualArtifactRecord:
     selection_reason: str
     selection_score: float
     dedupe_group_id: str
+    width: int = 0
+    height: int = 0
+    render_scale: float = 0.0
+    estimated_dpi: int = 0
+    image_format: str = ""
+    image_bytes: int = 0
+    image_sha256: str = ""
 
     def to_ref(self) -> Dict[str, Any]:
         return asdict(self)
@@ -161,9 +196,14 @@ class Stage1VisualBundle:
     selected_visual_refs: List[Dict[str, Any]]
     selection_policy_snapshot: Dict[str, Any]
     bundle_metadata: Dict[str, Any]
+    all_visual_refs: List[Dict[str, Any]] = None  # type: ignore[assignment]
+    coverage_report: Dict[str, Any] = None  # type: ignore[assignment]
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["all_visual_refs"] = list(self.all_visual_refs or self.selected_visual_refs)
+        payload["coverage_report"] = dict(self.coverage_report or {})
+        return payload
 
 
 class Stage1VisualArtifactBuilder:
@@ -182,11 +222,60 @@ class Stage1VisualArtifactBuilder:
         output_dir: str,
         artifact_registry: ArtifactRegistry,
         preprocess_metadata: Mapping[str, Any] | None = None,
+        visual_settings: Mapping[str, Any] | None = None,
     ) -> Optional[Stage1VisualBundle]:
         if not source_pdf or not os.path.exists(source_pdf):
             return None
 
         policy = json.loads(json.dumps(_DEFAULT_SELECTION_POLICY))
+        configured_visual = dict(visual_settings or {})
+        rendering = policy["rendering"]
+        render_all = parse_strict_bool(
+            configured_visual.get("render_all_nonblank_pages"),
+            field="Stage1_Visual.render_all_nonblank_pages",
+            default=True,
+        )
+        if not render_all:
+            raise ValueError("render_all_nonblank_pages=false is unsupported")
+        for key, target in (
+            ("page_long_edge_px", "page_long_edge_px"),
+            ("crop_long_edge_px", "crop_long_edge_px"),
+            ("page_max_pixels", "page_max_pixels"),
+            ("crop_max_pixels", "crop_max_pixels"),
+            ("page_format", "page_format"),
+            ("page_jpeg_quality", "page_jpeg_quality"),
+            ("crop_format", "crop_format"),
+            ("crop_padding_ratio", "crop_padding_ratio"),
+            ("max_visual_artifact_bytes", "max_visual_artifact_bytes"),
+        ):
+            if key in configured_visual and str(configured_visual[key]).strip() != "":
+                raw_value = configured_visual[key]
+                if key in {"page_format", "crop_format"}:
+                    rendering[target] = _normalize_image_format(raw_value, rendering[target], strict=True)
+                else:
+                    if key == "crop_padding_ratio":
+                        rendering[target] = parse_bounded_float(
+                            raw_value,
+                            field="Stage1_Visual.crop_padding_ratio",
+                            minimum=0.0,
+                            maximum=0.25,
+                        )
+                    else:
+                        try:
+                            rendering[target] = (
+                                float(raw_value) if "." in str(raw_value) else int(raw_value)
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(f"invalid Stage1_Visual.{key}: {raw_value}") from exc
+        rendering["page_format"] = _normalize_image_format(rendering.get("page_format"), "jpeg", strict=True)
+        rendering["crop_format"] = _normalize_image_format(rendering.get("crop_format"), "png", strict=True)
+        policy["rendering_safety"]["max_rendered_pixels"] = int(
+            rendering.get("page_max_pixels") or policy["rendering_safety"]["max_rendered_pixels"]
+        )
+        policy["rendering_safety"]["max_visual_artifact_bytes"] = int(
+            rendering.get("max_visual_artifact_bytes")
+            or policy["rendering_safety"]["max_visual_artifact_bytes"]
+        )
         preprocess_metadata = dict(preprocess_metadata or {})
         artifact_hash = _paper_hash(paper_key)
         bundle_dir = os.path.abspath(output_dir)
@@ -216,6 +305,19 @@ class Stage1VisualArtifactBuilder:
         )
         page_candidates = self._select_page_candidates(page_index, policy)
         figure_candidates = self._select_figure_candidates(page_blocks, page_index, policy)
+        layout_candidates = self._select_layout_candidates(page_blocks, page_index, policy)
+        if not parse_strict_bool(
+            configured_visual.get("table_crop_enabled"),
+            field="Stage1_Visual.table_crop_enabled",
+            default=True,
+        ):
+            layout_candidates = [item for item in layout_candidates if item.get("artifact_type") != "table_crop"]
+        if not parse_strict_bool(
+            configured_visual.get("formula_crop_enabled"),
+            field="Stage1_Visual.formula_crop_enabled",
+            default=True,
+        ):
+            layout_candidates = [item for item in layout_candidates if item.get("artifact_type") != "formula_crop"]
 
         render_dir = tempfile.mkdtemp(prefix=".visual-render-", dir=bundle_dir)
         try:
@@ -223,6 +325,7 @@ class Stage1VisualArtifactBuilder:
                 source_pdf=source_pdf,
                 page_candidates=page_candidates,
                 figure_candidates=figure_candidates,
+                layout_candidates=layout_candidates,
                 policy=policy,
                 bundle_dir=render_dir,
                 paper_key=paper_key,
@@ -234,15 +337,17 @@ class Stage1VisualArtifactBuilder:
                 "candidate_counts": {
                     "page_snapshot": len(page_candidates),
                     "figure_crop": len(figure_candidates),
-                    "table_crop": 0,
+                    "table_crop": sum(1 for item in layout_candidates if item.get("artifact_type") == "table_crop"),
+                    "formula_crop": sum(1 for item in layout_candidates if item.get("artifact_type") == "formula_crop"),
                 },
                 "selected_counts": {
                     "page_snapshot": sum(1 for item in selected_visuals if item.artifact_type == "page_snapshot"),
                     "figure_crop": sum(1 for item in selected_visuals if item.artifact_type == "figure_crop"),
-                    "table_crop": 0,
+                    "table_crop": sum(1 for item in selected_visuals if item.artifact_type == "table_crop"),
+                    "formula_crop": sum(1 for item in selected_visuals if item.artifact_type == "formula_crop"),
                     "total": len(selected_visuals),
                 },
-                "deferred_artifact_types": ["table_crop"],
+                "deferred_artifact_types": [],
             }
 
             published_visuals: list[VisualArtifactRecord] = []
@@ -277,6 +382,60 @@ class Stage1VisualArtifactBuilder:
                 "budget_decisions": budget_decisions,
                 "visuals": [item.to_ref() for item in published_visuals],
             }
+            nonblank_pages = [
+                int(item.get("page_no") or 0)
+                for item in page_candidates
+                if int(item.get("page_no") or 0) > 0 and not bool(item.get("is_blank"))
+            ]
+            rendered_page_numbers = {
+                int(item.page_no)
+                for item in published_visuals
+                if item.artifact_type == "page_snapshot"
+            }
+            page_status = []
+            for page_no in range(1, len(page_index) + 1):
+                if page_no not in nonblank_pages:
+                    page_status.append({"page_no": page_no, "status": "skipped_blank", "skipped_reason": "blank_page"})
+                elif page_no in rendered_page_numbers:
+                    page_status.append({"page_no": page_no, "status": "rendered", "skipped_reason": ""})
+                else:
+                    page_status.append({"page_no": page_no, "status": "render_failed", "skipped_reason": "render_failed_or_safety_limit"})
+            coverage_report = {
+                "artifact_type": "stage1_visual_coverage",
+                "artifact_version": "v1",
+                "job_id": job_id,
+                "paper_key": paper_key,
+                "total_pdf_pages": len(page_index),
+                "nonblank_pages": len(nonblank_pages),
+                "rendered_pages": len(rendered_page_numbers),
+                "visually_scanned_pages": 0,
+                "skipped_pages": sum(1 for item in page_status if item["status"] == "skipped_blank"),
+                "failed_pages": sum(1 for item in page_status if item["status"] == "render_failed"),
+                "page_status": page_status,
+                "selected_crops": [item.to_ref() for item in published_visuals if item.artifact_type != "page_snapshot"],
+                "scan_batches": [],
+                "coverage_status": "partial" if nonblank_pages else "complete",
+                "scan_coverage_status": "partial" if nonblank_pages else "not_required",
+                "final_synthesis_modality": "text_only",
+                "final_raw_visual_recheck_status": "not_required",
+                "evidence_coverage_status": "incomplete" if nonblank_pages else "complete",
+                "raw_reinspection_units": [],
+                "required_raw_reinspection_unit_count": 0,
+                "closed_raw_reinspection_unit_count": 0,
+                "unresolved_raw_reinspection_unit_ids": [],
+                "omissions": [
+                    {
+                        "visual_id": f"page-{int(item['page_no']):03d}",
+                        "page_no": int(item["page_no"]),
+                        "reason": str(item.get("skipped_reason") or "render_failed"),
+                        "scope": "page_coverage",
+                        "authority_blocking": True,
+                    }
+                    for item in page_status
+                    if item["status"] == "render_failed"
+                ],
+            }
+            manifest_payload["coverage_report"] = coverage_report
             manifest_dependencies = [*depends_on, *(
                 ArtifactDependencyRefV2.from_record(record)
                 for record in visual_records
@@ -294,6 +453,24 @@ class Stage1VisualArtifactBuilder:
                 artifact_id=f"visual_manifest:{artifact_hash}",
             )
 
+            coverage_record = publish_json_artifact(
+                publication_context,
+                artifact_registry,
+                os.path.join(bundle_dir, "visual_coverage.json"),
+                coverage_report,
+                artifact_role="stage1_visual_coverage",
+                artifact_type="stage1_visual_coverage",
+                artifact_version="v1",
+                producer="preprocess.visual_artifacts.Stage1VisualArtifactBuilder",
+                depends_on=manifest_dependencies,
+                artifact_id=f"stage1_visual_coverage:{artifact_hash}",
+            )
+            coverage_report = {
+                **coverage_report,
+                "coverage_artifact_path": coverage_record.path,
+                "coverage_artifact_hash": coverage_record.content_hash,
+            }
+
             bundle = Stage1VisualBundle(
                 artifact_type="stage1_visual_bundle",
                 artifact_version="v1",
@@ -306,11 +483,17 @@ class Stage1VisualArtifactBuilder:
                 selected_visual_refs=[item.to_ref() for item in published_visuals],
                 selection_policy_snapshot=policy,
                 bundle_metadata=budget_decisions,
+                all_visual_refs=[item.to_ref() for item in published_visuals],
+                coverage_report=coverage_report,
             )
-            bundle_dependencies = [ArtifactDependencyRefV2.from_record(manifest_record), *(
+            bundle_dependencies = [
+                ArtifactDependencyRefV2.from_record(manifest_record),
+                ArtifactDependencyRefV2.from_record(coverage_record),
+                *(
                 ArtifactDependencyRefV2.from_record(record)
                 for record in visual_records
-            )]
+                ),
+            ]
             bundle_record = publish_json_artifact(
                 publication_context,
                 artifact_registry,
@@ -465,17 +648,12 @@ class Stage1VisualArtifactBuilder:
             text = str(item.get("text") or "")
             image_count = int(item.get("image_count", 0) or 0)
             cue_hits = _count_keyword_hits(text)
-            if image_count <= 0 and cue_hits <= 0:
-                continue
-
             score = float(min(image_count, 4) * 2 + cue_hits * 1.5)
-            if bool(item.get("low_quality", False)):
-                score -= 0.5
-            reason_parts = []
+            reason_parts = ["full_nonblank_page_coverage"]
             if image_count > 0:
-                reason_parts.append(f"image_rich_page:{image_count}")
+                reason_parts.append(f"image_count:{image_count}")
             if cue_hits > 0:
-                reason_parts.append(f"keyword_hits:{cue_hits}")
+                reason_parts.append(f"layout_cues:{cue_hits}")
 
             candidates.append(
                 {
@@ -489,9 +667,8 @@ class Stage1VisualArtifactBuilder:
                 }
             )
 
-        candidates.sort(key=lambda item: (-float(item["score"]), int(item["page_no"])))
-        limit = int(policy.get("budgets", {}).get("page_snapshot_max", 4) or 4)
-        return candidates[:limit]
+        candidates.sort(key=lambda item: int(item["page_no"]))
+        return candidates
 
     def _select_figure_candidates(
         self,
@@ -572,6 +749,7 @@ class Stage1VisualArtifactBuilder:
                         "caption_excerpt": _truncate(caption_excerpt),
                         "nearby_text_excerpt": _truncate(nearby_text_excerpt),
                         "dedupe_group_id": dedupe_group_id,
+                        "artifact_type": "figure_crop",
                     }
                 )
 
@@ -604,6 +782,86 @@ class Stage1VisualArtifactBuilder:
             if len(deduped) >= total_limit:
                 break
         return deduped
+
+    def _select_layout_candidates(
+        self,
+        page_blocks: Iterable[Mapping[str, Any]],
+        page_index: Iterable[Mapping[str, Any]],
+        policy: Mapping[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Find deterministic table/formula regions from text layout metadata."""
+
+        page_text_by_no = {
+            int(item.get("page_number", 0) or 0): str(item.get("text") or "")
+            for item in page_index
+            if int(item.get("page_number", 0) or 0) > 0
+        }
+        candidates: List[Dict[str, Any]] = []
+        budgets = policy.get("budgets", {}) if isinstance(policy, Mapping) else {}
+        per_page = {
+            "table_crop": max(1, int(budgets.get("table_crop_max_per_page", 2) or 2)),
+            "formula_crop": max(1, int(budgets.get("formula_crop_max_per_page", 2) or 2)),
+        }
+        for page_entry in page_blocks:
+            page_no = int(page_entry.get("page_number", 0) or 0)
+            block_payload = page_entry.get("blocks")
+            if page_no <= 0 or not isinstance(block_payload, Mapping):
+                continue
+            blocks = block_payload.get("blocks")
+            if not isinstance(blocks, list):
+                continue
+            text_blocks = []
+            for block in blocks:
+                if not isinstance(block, Mapping) or block.get("type") != 0:
+                    continue
+                bbox = _normalize_bbox(block.get("bbox"))
+                text = _block_text(block)
+                if bbox and text:
+                    text_blocks.append({"bbox": bbox, "text": text})
+            page_height = float(block_payload.get("height", 0.0) or 0.0)
+            for artifact_type, pattern in (
+                ("table_crop", r"\b(?:table|tab\.|表)\s*\d*"),
+                ("formula_crop", r"(?:formula|equation|公式|∑|∫|β\s*=|p\s*[<=>])"),
+            ):
+                hits = [item for item in text_blocks if re.search(pattern, item["text"], flags=re.IGNORECASE)]
+                for index, hit in enumerate(hits[: per_page[artifact_type]], start=1):
+                    x0, y0, x1, y1 = hit["bbox"]
+                    nearby = [item for item in text_blocks if abs(float(item["bbox"][1]) - y0) <= 260]
+                    if nearby:
+                        x0 = min(float(item["bbox"][0]) for item in nearby)
+                        y0 = min(float(item["bbox"][1]) for item in nearby)
+                        x1 = max(float(item["bbox"][2]) for item in nearby)
+                        y1 = max(float(item["bbox"][3]) for item in nearby)
+                    y0 = max(0.0, y0 - 18.0)
+                    y1 = min(page_height or y1, y1 + 18.0)
+                    bbox = _normalize_bbox([x0, y0, x1, y1])
+                    if not bbox:
+                        continue
+                    seed = f"{artifact_type}:{page_no}:{hit['text']}"
+                    candidates.append({
+                        "page_no": page_no,
+                        "bbox": bbox,
+                        "score": round(2.0 + len(nearby) * 0.1, 2),
+                        "selection_reason": f"{artifact_type}_caption_or_layout_candidate",
+                        "caption_excerpt": _truncate(hit["text"]),
+                        "nearby_text_excerpt": _truncate(" ".join(item["text"] for item in nearby[:5])),
+                        "dedupe_group_id": self._dedupe_group_id(page_no, seed, bbox),
+                        "artifact_type": artifact_type,
+                    })
+        candidates.sort(key=lambda item: (int(item["page_no"]), float(item["bbox"][1]), str(item["artifact_type"])))
+        limits = {
+            "table_crop": max(0, int(budgets.get("table_crop_max", 6) or 6)),
+            "formula_crop": max(0, int(budgets.get("formula_crop_max", 4) or 4)),
+        }
+        result: List[Dict[str, Any]] = []
+        counts = {key: 0 for key in limits}
+        for item in candidates:
+            artifact_type = str(item.get("artifact_type") or "")
+            if artifact_type not in limits or counts[artifact_type] >= limits[artifact_type]:
+                continue
+            result.append(item)
+            counts[artifact_type] += 1
+        return result
 
     def _extract_nearby_text(
         self,
@@ -663,9 +921,16 @@ class Stage1VisualArtifactBuilder:
         image_path: str,
         policy: Mapping[str, Any],
         clip: Optional[Any] = None,
+        image_format: str = "png",
+        jpeg_quality: int = 92,
+        max_rendered_pixels: Optional[int] = None,
     ) -> bool:
         safety = policy.get("rendering_safety", {}) if isinstance(policy, Mapping) else {}
-        max_pixels = int(safety.get("max_rendered_pixels", 16_000_000) or 16_000_000)
+        max_pixels = int(
+            max_rendered_pixels
+            or safety.get("max_rendered_pixels", 16_000_000)
+            or 16_000_000
+        )
         max_dimension = int(safety.get("max_rendered_dimension_px", 8_000) or 8_000)
         max_bytes = int(safety.get("max_visual_artifact_bytes", 20 * 1024 * 1024) or (20 * 1024 * 1024))
 
@@ -696,7 +961,19 @@ class Stage1VisualArtifactBuilder:
             return False
 
         pixmap = page.get_pixmap(matrix=matrix, clip=rect if clip is not None else None, alpha=False)
-        pixmap.save(image_path)
+        normalized_format = _normalize_image_format(image_format, "png")
+        if normalized_format == "jpeg":
+            try:
+                encoded = pixmap.tobytes(output="jpeg", jpg_quality=max(1, min(int(jpeg_quality), 100)))
+                with open(image_path, "wb") as handle:
+                    handle.write(encoded)
+            except (AttributeError, TypeError, ValueError, OSError):
+                # Older PyMuPDF releases do not expose jpg_quality on tobytes;
+                # retain the configured format and let the safety check below
+                # decide whether the fallback output is acceptable.
+                pixmap.save(image_path)
+        else:
+            pixmap.save(image_path)
         try:
             if os.path.getsize(image_path) > max_bytes:
                 os.remove(image_path)
@@ -707,42 +984,132 @@ class Stage1VisualArtifactBuilder:
             return False
         return True
 
+    @staticmethod
+    def _image_metadata(image_path: str, *, render_scale: float) -> Dict[str, Any]:
+        width = 0
+        height = 0
+        try:
+            pixmap = fitz.Pixmap(image_path)
+            width = int(pixmap.width)
+            height = int(pixmap.height)
+        except Exception:
+            pass
+        try:
+            image_bytes = int(os.path.getsize(image_path))
+        except OSError:
+            image_bytes = 0
+        digest = ""
+        try:
+            digest = file_sha256(image_path)
+        except (OSError, TypeError, ValueError):
+            pass
+        return {
+            "width": width,
+            "height": height,
+            "render_scale": round(float(render_scale), 4),
+            "estimated_dpi": max(1, int(round(float(render_scale) * 72.0))),
+            "image_format": Path(image_path).suffix.lstrip(".").lower(),
+            "image_bytes": image_bytes,
+            "image_sha256": digest,
+        }
+
+    @staticmethod
+    def _is_blank_page(page: Any) -> bool:
+        """Skip truly blank pages while retaining scanned/image/drawn pages."""
+
+        try:
+            if str(page.get_text("text") or "").strip():
+                return False
+            if page.get_images(full=True) or page.get_drawings():
+                return False
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(0.18, 0.18), alpha=False)
+            samples = bytes(pixmap.samples)
+            if not samples:
+                return True
+            channels = max(int(pixmap.n), 1)
+            nonwhite = 0
+            sample_count = len(samples) // channels
+            for offset in range(0, len(samples), channels):
+                if any(int(channel) < 245 for channel in samples[offset: offset + min(channels, 3)]):
+                    nonwhite += 1
+            return nonwhite <= max(2, int(sample_count * 0.002))
+        except Exception:
+            return False
+
     def _materialize_visuals(
         self,
         *,
         source_pdf: str,
         page_candidates: List[Dict[str, Any]],
         figure_candidates: List[Dict[str, Any]],
+        layout_candidates: List[Dict[str, Any]],
         policy: Mapping[str, Any],
         bundle_dir: str,
         paper_key: str,
         artifact_hash: str,
     ) -> List[VisualArtifactRecord]:
-        total_limit = int(policy.get("budgets", {}).get("total_visuals_max", 10) or 10)
-        page_limit = int(policy.get("budgets", {}).get("page_snapshot_max", 4) or 4)
-        figure_limit = int(policy.get("budgets", {}).get("figure_crop_max", 6) or 6)
-
-        selected_pages = page_candidates[: min(page_limit, total_limit)]
-        remaining_budget = max(total_limit - len(selected_pages), 0)
-        selected_figures = figure_candidates[: min(figure_limit, remaining_budget)]
+        budgets = policy.get("budgets", {}) if isinstance(policy, Mapping) else {}
+        total_limit = int(budgets.get("total_visuals_max", 0) or 0)
+        crop_candidates = [*figure_candidates, *layout_candidates]
+        selected_pages = list(page_candidates)
+        selected_crops = crop_candidates
+        if total_limit > 0:
+            selected_crops = crop_candidates[: max(total_limit - len(selected_pages), 0)]
 
         doc = fitz.open(source_pdf)
         try:
             visuals: List[VisualArtifactRecord] = []
 
+            rendering = policy.get("rendering", {}) if isinstance(policy, Mapping) else {}
+            page_target = max(1, int(rendering.get("page_long_edge_px", 2200) or 2200))
+            crop_target = max(1, int(rendering.get("crop_long_edge_px", 2400) or 2400))
+            padding_ratio = parse_bounded_float(
+                rendering.get("crop_padding_ratio"),
+                field="Stage1_Visual.crop_padding_ratio",
+                minimum=0.0,
+                maximum=0.25,
+                default=0.04,
+            )
+            page_format = _normalize_image_format(rendering.get("page_format"), "jpeg")
+            crop_format = _normalize_image_format(rendering.get("crop_format"), "png")
+            page_max_pixels = max(
+                1,
+                int(rendering.get("page_max_pixels") or 16_000_000),
+            )
+            crop_max_pixels = max(
+                1,
+                int(rendering.get("crop_max_pixels") or 16_000_000),
+            )
+            page_extension = "jpg" if page_format == "jpeg" else "png"
+            crop_extension = "jpg" if crop_format == "jpeg" else "png"
+            try:
+                page_jpeg_quality = max(1, min(int(rendering.get("page_jpeg_quality", 92) or 92), 100))
+            except (TypeError, ValueError):
+                page_jpeg_quality = 92
+
             for page_candidate in selected_pages:
                 page_no = int(page_candidate["page_no"])
                 page = doc.load_page(page_no - 1)
+                if self._is_blank_page(page):
+                    page_candidate["is_blank"] = True
+                    continue
+                page_candidate["is_blank"] = False
                 bbox = [0.0, 0.0, round(float(page.rect.width), 2), round(float(page.rect.height), 2)]
-                image_path = os.path.join(bundle_dir, f"page_snapshot_p{page_no:03d}.png")
+                page_long_edge = max(float(page.rect.width), float(page.rect.height), 1.0)
+                render_scale = min(max(page_target / page_long_edge, 0.5), 6.0)
+                image_path = os.path.join(bundle_dir, f"page_snapshot_p{page_no:03d}.{page_extension}")
                 if not self._render_pixmap_if_safe(
                     page=page,
-                    matrix=fitz.Matrix(1.4, 1.4),
+                    matrix=fitz.Matrix(render_scale, render_scale),
                     image_path=image_path,
                     policy=policy,
+                    image_format=page_format,
+                    jpeg_quality=page_jpeg_quality,
+                    max_rendered_pixels=page_max_pixels,
                 ):
                     continue
                 artifact_id = f"page_snapshot:{artifact_hash}:p{page_no:03d}"
+                image_metadata = self._image_metadata(image_path, render_scale=render_scale)
                 visuals.append(
                     VisualArtifactRecord(
                         visual_id=f"page-{page_no:03d}",
@@ -759,41 +1126,59 @@ class Stage1VisualArtifactBuilder:
                         selection_reason=str(page_candidate.get("selection_reason") or "image_rich_page"),
                         selection_score=round(float(page_candidate.get("score", 0.0) or 0.0), 2),
                         dedupe_group_id=str(page_candidate.get("dedupe_group_id") or f"page:{page_no}"),
+                        **image_metadata,
                     )
                 )
 
-            for index, figure_candidate in enumerate(selected_figures, start=1):
-                page_no = int(figure_candidate["page_no"])
-                bbox = _normalize_bbox(figure_candidate.get("bbox"))
+            for index, crop_candidate in enumerate(selected_crops, start=1):
+                page_no = int(crop_candidate["page_no"])
+                bbox = _normalize_bbox(crop_candidate.get("bbox"))
                 if not bbox:
                     continue
                 page = doc.load_page(page_no - 1)
-                image_path = os.path.join(bundle_dir, f"figure_crop_p{page_no:03d}_{index:02d}.png")
+                x0, y0, x1, y1 = bbox
+                pad_x = (x1 - x0) * padding_ratio
+                pad_y = (y1 - y0) * padding_ratio
+                clip = fitz.Rect(
+                    max(0.0, x0 - pad_x),
+                    max(0.0, y0 - pad_y),
+                    min(float(page.rect.width), x1 + pad_x),
+                    min(float(page.rect.height), y1 + pad_y),
+                )
+                clip_long_edge = max(float(clip.width), float(clip.height), 1.0)
+                render_scale = min(max(crop_target / clip_long_edge, 0.75), 8.0)
+                artifact_type = str(crop_candidate.get("artifact_type") or "figure_crop")
+                image_path = os.path.join(bundle_dir, f"{artifact_type}_p{page_no:03d}_{index:02d}.{crop_extension}")
                 if not self._render_pixmap_if_safe(
                     page=page,
-                    matrix=fitz.Matrix(1.8, 1.8),
-                    clip=fitz.Rect(bbox),
+                    matrix=fitz.Matrix(render_scale, render_scale),
+                    clip=clip,
                     image_path=image_path,
                     policy=policy,
+                    image_format=crop_format,
+                    jpeg_quality=page_jpeg_quality,
+                    max_rendered_pixels=crop_max_pixels,
                 ):
                     continue
-                artifact_id = f"figure_crop:{artifact_hash}:p{page_no:03d}:c{index:02d}"
+                artifact_id = f"{artifact_type}:{artifact_hash}:p{page_no:03d}:c{index:02d}"
+                image_metadata = self._image_metadata(image_path, render_scale=render_scale)
                 visuals.append(
                     VisualArtifactRecord(
-                        visual_id=f"figure-{page_no:03d}-{index:02d}",
+                        visual_id=f"{artifact_type.removesuffix('_crop')}-{page_no:03d}-{index:02d}",
                         artifact_id=artifact_id,
                         paper_key=paper_key,
                         source_pdf=source_pdf,
                         page_no=page_no,
-                        bbox=bbox,
-                        artifact_type="figure_crop",
-                        source_type="image_block",
+                        bbox=[round(float(clip.x0), 2), round(float(clip.y0), 2), round(float(clip.x1), 2), round(float(clip.y1), 2)],
+                        artifact_type=artifact_type,
+                        source_type="layout_crop",
                         image_path=os.path.abspath(image_path),
-                        caption_excerpt=str(figure_candidate.get("caption_excerpt") or ""),
-                        nearby_text_excerpt=str(figure_candidate.get("nearby_text_excerpt") or ""),
-                        selection_reason=str(figure_candidate.get("selection_reason") or "large_image_block"),
-                        selection_score=round(float(figure_candidate.get("score", 0.0) or 0.0), 2),
-                        dedupe_group_id=str(figure_candidate.get("dedupe_group_id") or ""),
+                        caption_excerpt=str(crop_candidate.get("caption_excerpt") or ""),
+                        nearby_text_excerpt=str(crop_candidate.get("nearby_text_excerpt") or ""),
+                        selection_reason=str(crop_candidate.get("selection_reason") or "layout_crop"),
+                        selection_score=round(float(crop_candidate.get("score", 0.0) or 0.0), 2),
+                        dedupe_group_id=str(crop_candidate.get("dedupe_group_id") or ""),
+                        **image_metadata,
                     )
                 )
             return visuals

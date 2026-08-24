@@ -148,7 +148,7 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert parser["GUI"]["language"] == "en"
     assert parser["Styling"]["font_name"] == "Calibri"
     assert "API_Parameters" not in parser
-    assert parser["Primary_Reader_API"]["max_output_tokens"] == "3000"
+    assert parser["Primary_Reader_API"]["max_output_tokens"] == "6000"
     assert parser["Writer_API"]["max_output_tokens"] == "32000"
 
     assert parser["Primary_Reader_API"]["model"] == "deepseek-r1"

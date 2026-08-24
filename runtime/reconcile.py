@@ -37,6 +37,9 @@ from runtime.artifact_validators import (
     validate_registered_artifact,
     validate_current_outline_artifact,
 )
+from services.stage1_visual_contract import (
+    validate_current_visual_evidence_qualification_pair,
+)
 from summary_schema import (
     ROUTE_CONFIDENCE_VALUES,
     is_canonical_ai_summary,
@@ -317,6 +320,13 @@ def _validate_stage1_reusable_summary_manifest(record: ArtifactRecord, path: Pat
         ),
         label="stage1_reusable_summary_manifest",
     )
+    qualification_issues = validate_current_visual_evidence_qualification_pair(payload)
+    if qualification_issues:
+        raise ReconcileValidationError(
+            "stage1_reusable_summary_manifest visual_evidence_qualification boundary "
+            "is invalid: "
+            + ", ".join(qualification_issues)
+        )
     for label in (
         "source_summary_artifact_hash",
         "summary_payload_hash",

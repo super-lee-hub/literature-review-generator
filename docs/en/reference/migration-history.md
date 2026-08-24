@@ -2,7 +2,7 @@
 
 > Audience: maintainers / AI agents.
 > This document tracks migration-era behavior and compatibility decisions.
-> Source: MIGRATION_NOTES.md (full migration).
+> Source: the archived migration-era evidence in [`../../archive/`](../../archive/); the complete migration record is preserved in Git history.
 
 ## Week 1 Migration Notes
 

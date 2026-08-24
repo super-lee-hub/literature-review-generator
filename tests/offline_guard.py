@@ -7,31 +7,47 @@ import os
 import re
 import socket
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Collection, Mapping, MutableMapping, Sequence
+from typing import Any, Collection, Iterator, Mapping, MutableMapping, Sequence
 
 
 class OfflineNetworkError(OSError):
     """Raised when a test attempts to access a non-loopback network target."""
 
 
-_LIVE_API_CREDENTIAL_ENV_NAMES = (
-    "AUTO_GENERATE_LIVE_API_KEY",
-    "OPENAI_API_KEY",
-    "DEEPSEEK_API_KEY",
-)
+_PROVIDER_CREDENTIAL_ENV_NAMES = {
+    "deepseek": ("DEEPSEEK_API_KEY", "AUTO_GENERATE_DEEPSEEK_API_KEY"),
+}
+_PROVIDER_ALLOWED_EXTERNAL_HOSTS = {
+    "deepseek": {"api.deepseek.com"},
+}
+
+
+def _credential_present(value: Any) -> bool:
+    """Treat empty and whitespace-only values as absent credentials."""
+
+    return bool(str(value or "").strip())
 
 
 def live_api_skip_reason(
     marker_names: Collection[str],
     environment: Mapping[str, str],
+    *,
+    provider: str | None = None,
 ) -> str | None:
     if "live_api" not in marker_names:
         return None
     if environment.get("AUTO_GENERATE_RUN_LIVE_API") != "1":
         return "live API test not explicitly enabled"
-    if not any(environment.get(name) for name in _LIVE_API_CREDENTIAL_ENV_NAMES):
-        return "live API credential is not configured"
+    provider_name = str(provider or "").strip().casefold()
+    if not provider_name:
+        return "live API provider is required"
+    if provider_name and provider_name not in _PROVIDER_CREDENTIAL_ENV_NAMES:
+        return f"unsupported live API provider: {provider_name}"
+    credential_names = _PROVIDER_CREDENTIAL_ENV_NAMES[provider_name]
+    if not any(_credential_present(environment.get(name)) for name in credential_names):
+        return f"{provider_name} live API credential is not configured"
     return None
 
 
@@ -72,11 +88,85 @@ def _loopback_host(host: Any) -> bool:
         return False
 
 
+_AUTHORIZED_EXTERNAL_HOSTS: set[str] = set()
+_AUTHORIZED_EXTERNAL_IPS: set[str] = set()
+
+
+def _normalized_host(host: Any) -> str:
+    if isinstance(host, bytes):
+        host = host.decode("ascii", errors="ignore")
+    return str(host or "").strip().rstrip(".").lower()
+
+
 def _assert_loopback(host: Any) -> None:
-    if not _loopback_host(host):
+    normalized = _normalized_host(host)
+    if not _loopback_host(host) and (
+        normalized not in _AUTHORIZED_EXTERNAL_HOSTS
+        and normalized not in _AUTHORIZED_EXTERNAL_IPS
+    ):
         raise OfflineNetworkError(
             f"external network access is disabled during pytest: host={host!r}"
         )
+
+
+@contextmanager
+def allow_live_provider(provider: str) -> Iterator[None]:
+    """Temporarily authorize one provider's exact live endpoint.
+
+    The offline socket guard remains installed.  Only the provider endpoint
+    and the IPs currently resolved for that endpoint are admitted inside this
+    scope; ordinary tests remain fail-closed even when a live key is present.
+    """
+
+    provider_name = str(provider or "").strip().casefold()
+    allowed_hosts = _PROVIDER_ALLOWED_EXTERNAL_HOSTS.get(provider_name)
+    credential_names = _PROVIDER_CREDENTIAL_ENV_NAMES.get(provider_name)
+    if not allowed_hosts or not credential_names:
+        raise OfflineNetworkError(f"unsupported live API provider: {provider_name or '<empty>'}")
+    if os.environ.get("AUTO_GENERATE_RUN_LIVE_API") != "1":
+        raise OfflineNetworkError("live API test is not explicitly enabled")
+    if not any(_credential_present(os.environ.get(name)) for name in credential_names):
+        raise OfflineNetworkError(f"{provider_name} live API credential is not configured")
+
+    previous_hosts = set(_AUTHORIZED_EXTERNAL_HOSTS)
+    previous_ips = set(_AUTHORIZED_EXTERNAL_IPS)
+    previous_no_proxy = os.environ.get("NO_PROXY")
+    previous_lower_no_proxy = os.environ.get("no_proxy")
+    try:
+        _AUTHORIZED_EXTERNAL_HOSTS.update(allowed_hosts)
+        for host in allowed_hosts:
+            try:
+                resolved = _ORIGINAL_GETADDRINFO(host, 443, 0, socket.SOCK_STREAM)
+            except OSError:
+                resolved = []
+            for result in resolved:
+                address = result[4][0] if len(result) > 4 and result[4] else ""
+                if address:
+                    _AUTHORIZED_EXTERNAL_IPS.add(_normalized_host(address))
+        no_proxy_values = [
+            item.strip()
+            for item in str(previous_no_proxy or "").split(",")
+            if item.strip()
+        ]
+        for host in allowed_hosts:
+            if host not in no_proxy_values:
+                no_proxy_values.append(host)
+        os.environ["NO_PROXY"] = ",".join(no_proxy_values)
+        os.environ["no_proxy"] = os.environ["NO_PROXY"]
+        yield
+    finally:
+        _AUTHORIZED_EXTERNAL_HOSTS.clear()
+        _AUTHORIZED_EXTERNAL_HOSTS.update(previous_hosts)
+        _AUTHORIZED_EXTERNAL_IPS.clear()
+        _AUTHORIZED_EXTERNAL_IPS.update(previous_ips)
+        if previous_no_proxy is None:
+            os.environ.pop("NO_PROXY", None)
+        else:
+            os.environ["NO_PROXY"] = previous_no_proxy
+        if previous_lower_no_proxy is None:
+            os.environ.pop("no_proxy", None)
+        else:
+            os.environ["no_proxy"] = previous_lower_no_proxy
 
 
 def _guarded_connect(sock: socket.socket, address: Any) -> Any:
@@ -150,6 +240,7 @@ def _child_environment(env: Mapping[str, str] | None) -> MutableMapping[str, str
         "HTTPS_PROXY",
         "ALL_PROXY",
         "NO_PROXY",
+        "no_proxy",
     ):
         if name in os.environ:
             merged[name] = os.environ[name]
@@ -182,6 +273,7 @@ def configure_offline_environment() -> None:
     os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:9")
     os.environ.setdefault("ALL_PROXY", "http://127.0.0.1:9")
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+    os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
     tests_dir = Path(__file__).resolve().parent
     sitecustomize_dir = tests_dir / "offline_sitecustomize"

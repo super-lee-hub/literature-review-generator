@@ -302,6 +302,28 @@ def default_ai_summary() -> Dict[str, Any]:
     }
 
 
+def build_summary_schema_contract() -> str:
+    """Return the deterministic schema contract injected into Stage 1 prompts."""
+
+    contract = {
+        "schema_version": SCHEMA_VERSION,
+        "default_structure": default_ai_summary(),
+        "allowed_values": {
+            "paper_type": list(PAPER_TYPES),
+            "classification_status": list(CLASSIFICATION_STATUSES),
+            "route_confidence": list(ROUTE_CONFIDENCE_VALUES),
+            "paper_subtype": {key: list(value) for key, value in SUBTYPE_VOCAB.items()},
+        },
+        "null_and_empty_rules": {
+            "missing_scalar": None,
+            "missing_list": [],
+            "missing_object_branch": None,
+            "invented_facts": "forbidden",
+        },
+    }
+    return json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _normalize_empirical_details(value: Any) -> Dict[str, Any]:
     normalized = _empty_empirical_details()
     if not isinstance(value, Mapping):

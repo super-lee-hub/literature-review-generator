@@ -78,6 +78,16 @@ The current validation service is `ValidationExecutionService`. Its
 adjudication reuse authority is bound to the appropriate provider ledger,
 receipt, source closure, attempt identity, and Registry dependency closure.
 
+## Stage 1 and prompt authority
+
+Stage 1 is vision-first with the experimental
+`deepseek-v4-flash-vision-exp`. MinerU text remains primary evidence, every
+non-blank PDF page is rendered and tracked in visual coverage, and long papers
+use recoverable visual-scan batches before final synthesis. Vision failures
+fall back to `deepseek-v4-flash`. Validation remains text-only
+`deepseek-v4-flash`. Production prompts are loaded through the hash-verified
+[Prompt inventory](./docs/en/reference/prompt-inventory.md).
+
 ## Queue and maintenance commands
 
 The current parser also exposes `doctor`, `queue-list`, `queue-add`,
@@ -99,5 +109,7 @@ separate opt-in scopes and are not implied by offline evidence.
 
 See [AGENTS.md](./AGENTS.md), the [runtime truth sources](./docs/en/runtime/truth-sources.md),
 the [architecture map](./docs/en/developer/architecture.md), and the
-[feature matrix](./docs/en/reference/feature-matrix.md) for maintainer and AI
+[feature matrix](./docs/en/reference/feature-matrix.md), [Stage 1 Vision
+pipeline](./docs/en/runtime/stage1-vision.md), and [configuration
+reference](./docs/en/reference/configuration.md) for maintainer and AI
 contracts.

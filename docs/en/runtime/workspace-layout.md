@@ -1,7 +1,7 @@
 # Workspace Layout & Artifact Registry
 
 > Audience: Maintainers, AI agents.
-> Source: AGENTS.md §7; TRUTH_SOURCES.md.
+> Source: AGENTS.md and [runtime truth sources](./truth-sources.md).
 
 ## Current Output Directory
 

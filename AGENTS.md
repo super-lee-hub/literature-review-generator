@@ -28,8 +28,8 @@ current orchestration engine.
 ## Recommended reading order
 
 1. `AGENTS.md`
-2. `TRUTH_SOURCES.md` -> `docs/en/runtime/truth-sources.md`
-3. `FEATURE_MATRIX.md` -> `docs/en/reference/feature-matrix.md`
+2. `docs/en/runtime/truth-sources.md`
+3. `docs/en/reference/feature-matrix.md`
 4. `runtime/job_spec.py`
 5. `reviewctl.py`
 6. `runtime/control_plane.py`

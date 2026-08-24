@@ -46,6 +46,7 @@ from context_manager import estimate_tokens
 from summary_schema import get_core_analysis
 from validation.llm_adjudicator import build_adjudication_packet, run_adjudication_stage
 from services.model_selection import get_validator_api_config
+from services.prompt_registry import PromptRegistry, PromptRegistryError
 from services.repair_policy import (
     ValidationRepairPolicy,
     parse_repair_policy,
@@ -292,17 +293,12 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
             return ai_result
 
         # 使用严格验证提示词，只检查客观事实错误
-        prompt_file_path: str = 'prompts/prompt_validate_analysis_strict.txt'
         try:
-            with open(prompt_file_path, 'r', encoding='utf-8') as f:
-                prompt_template = f.read()
-        except FileNotFoundError:
-            generator_instance.logger.error(f"提示词文件不存在: {prompt_file_path}，跳过验证。")
-            return ai_result
-        except UnicodeDecodeError:
-            generator_instance.logger.error(f"提示词文件编码错误: {prompt_file_path}，跳过验证。")
-            return ai_result
-        except Exception as e:
+            prompt_template = PromptRegistry().read(
+                "validation.legacy.summary_fact_check.v1",
+                allow_non_active=True,
+            )
+        except PromptRegistryError as e:
             generator_instance.logger.error(f"读取提示词文件失败: {e}，跳过验证。")
             return ai_result
 
@@ -318,7 +314,10 @@ def validate_paper_analysis(generator_instance: Any, pdf_text: str, ai_result: D
             generator_instance.logger.error(f"生成验证提示词失败: {e}，跳过验证。")
             return ai_result
 
-        system_prompt = "你是一位严谨的学术事实核查员。你的任务是对比论文原文和AI生成的摘要，找出并修正摘要中的任何不准确之处。"
+        system_prompt = PromptRegistry().read(
+            "validation.legacy.summary_fact_check.system.v1",
+            allow_non_active=True,
+        )
 
         # 调用验证API
         try:
@@ -500,8 +499,10 @@ def _validate_claims_for_single_paper(
             max_tokens = 8192
             temperature = 0.3
 
-        with open('prompts/prompt_validate_claims_batch.txt', 'r', encoding='utf-8') as f:
-            prompt_template: str = f.read()
+        prompt_template: str = PromptRegistry().read(
+            "validation.legacy.claims_batch.v1",
+            allow_non_active=True,
+        )
 
         summary_str: str = json.dumps(source_summary, ensure_ascii=False, indent=2)
         sentences_str: str = json.dumps(sentences, ensure_ascii=False, indent=2)
@@ -509,7 +510,10 @@ def _validate_claims_for_single_paper(
         final_prompt = prompt_template.replace('{{SOURCE_SUMMARY}}', summary_str)
         final_prompt = final_prompt.replace('{{SENTENCES_TO_VALIDATE}}', sentences_str)
 
-        system_prompt = "你是一位严谨的学术编辑，负责批量核查文稿中引用的准确性。你的任务是判断一个句子列表中的每句话是否都得到了其引用的文献摘要的支持。"
+        system_prompt = PromptRegistry().read(
+            "validation.legacy.claims_batch.system.v1",
+            allow_non_active=True,
+        )
 
         return _call_ai_api(
             final_prompt,
@@ -1447,7 +1451,7 @@ def _rewrite_block_with_ai(
         f"Claim bundle summary:\n{claim_text}\n\n"
         f"Evidence excerpts:\n{json.dumps(evidence_excerpt_list[:8], ensure_ascii=False, indent=2)}"
     )
-    system_prompt = "Return JSON only with rewritten_claim_unit. Preserve all citation tokens exactly."
+    system_prompt = PromptRegistry().read("validation.repair_rewrite.system.v1")
     try:
         response = _call_validation_api(
             generator_instance,

@@ -1,5 +1,5 @@
 [Application]
-config_schema = 3
+config_schema = 4
 
 [Paths]
 zotero_report =
@@ -10,16 +10,16 @@ output_path = ./output
 # live directly in each provider section.
 [Primary_Reader_API]
 api_key = YOUR_PRIMARY_READER_API_KEY_HERE
-model = deepseek-v4-pro
+model = deepseek-v4-flash-vision-exp
 api_base = https://api.deepseek.com
 proxy_mode = environment
 endpoint_type = chat_completions
 provider_family = deepseek
 thinking = enabled
-reasoning_effort = max
+reasoning_effort = high
 max_context_tokens = 1000000
-max_output_tokens = 3000
-temperature = 0.3
+max_output_tokens = 6000
+temperature = 0.0
 connect_timeout_seconds = 30
 read_timeout_seconds = 600
 total_timeout_seconds = 600
@@ -32,11 +32,13 @@ omit_temperature_when_reasoning = true
 
 [Backup_Reader_API]
 api_key = YOUR_BACKUP_READER_API_KEY_HERE
-model = gemini-2.5-pro
-api_base = https://api.videocaptioner.cn/v1
+model = deepseek-v4-flash
+api_base = https://api.deepseek.com
 proxy_mode = environment
 endpoint_type = chat_completions
-provider_family = generic
+provider_family = deepseek
+thinking = enabled
+reasoning_effort = high
 max_context_tokens = 128000
 max_output_tokens = 8192
 temperature = 0.3
@@ -113,7 +115,7 @@ safety_margin_tokens = 1024
 
 [Validator_API]
 api_key = YOUR_VALIDATOR_API_KEY_HERE
-model = deepseek-v4-pro
+model = deepseek-v4-flash
 api_base = https://api.deepseek.com
 proxy_mode = environment
 endpoint_type = chat_completions
@@ -222,19 +224,34 @@ enable_local_rag = false
 rag_backend = chroma
 
 [Stage1_Input]
+mode = vision_first
 send_extracted_text = true
 send_selected_visuals = true
 send_original_pdf = never
-pdf_required_for_formal_precision = false
 max_pdf_file_mb = 50
-formal_precision_text_only_policy = rich_mineru_evidence
 force_pdf_file_input_for_provider = false
-pdf_verifier_api = disabled
+image_transport = base64
+single_call_max_pages = 12
+visual_scan_batch_size = 10
+final_image_refs_max = 8
+require_complete_visual_coverage = true
+max_request_image_bytes = 36000000
+max_single_image_bytes = 24000000
 
 [Stage1_Visual]
-enabled = false
-max_visual_refs_per_paper = 5
-visual_artifact_dir = ./output/_visual_artifacts
+enabled = true
+render_all_nonblank_pages = true
+page_long_edge_px = 2200
+crop_long_edge_px = 2400
+page_max_pixels = 16000000
+crop_max_pixels = 16000000
+page_format = jpeg
+page_jpeg_quality = 92
+crop_format = png
+crop_padding_ratio = 0.04
+table_crop_enabled = true
+formula_crop_enabled = true
+max_visual_artifact_bytes = 24000000
 
 [Queue]
 enabled = false
@@ -250,9 +267,3 @@ font_size_heading2 = 14
 
 [GUI]
 language = zh-CN
-
-[Multimodal]
-enabled = false
-multimodal_api_key = YOUR_MULTIMODAL_API_KEY_HERE
-multimodal_model = gpt-4-vision-preview
-multimodal_api_base = https://api.openai.com/v1

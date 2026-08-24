@@ -33,6 +33,7 @@ from services.job_workspace import (
     publish_bytes_artifact,
     publish_json_artifact,
 )
+from services.prompt_registry import PromptRegistry
 from validation.adjudication_reuse import (
     ADJUDICATION_REUSE_ARTIFACT_TYPE,
     ADJUDICATION_REUSE_ARTIFACT_VERSION,
@@ -114,6 +115,8 @@ class ValidationExecutionService:
         self.job_id = str(self.job_id or self.workspace.job_id)
         self.attempt_id = str(self.attempt_id or "validation")
         self.summaries = [dict(item) for item in self.summaries if isinstance(item, Mapping)]
+        self._validation_prompt_identity = PromptRegistry().identity("validation.adjudicator.system.v2")
+        self._validation_user_prompt_identity = PromptRegistry().identity("validation.adjudicator.user.v2")
         self.paper_artifact_records = tuple(self.paper_artifact_records or ())
         self.visual_artifact_records = tuple(self.visual_artifact_records or ())
         if self.publication_context is None:
@@ -278,9 +281,15 @@ class ValidationExecutionService:
                 logical_attempt_identity=self.attempt_id,
                 endpoint_type=endpoint_type,
                 schema_hash=resolved_schema_hash,
+                prompt_id=self._validation_user_prompt_identity.prompt_id,
+                prompt_version=self._validation_user_prompt_identity.version,
+                prompt_sha256=self._validation_user_prompt_identity.sha256,
             )
         if not isinstance(runtime, ProviderRuntime):
             raise TypeError("provider_factory must return ProviderRuntime")
+        runtime.prompt_id = self._validation_user_prompt_identity.prompt_id
+        runtime.prompt_version = self._validation_user_prompt_identity.version
+        runtime.prompt_sha256 = self._validation_user_prompt_identity.sha256
         self._expected_provider_calls[resolved_call] = ExpectedProviderCall(
             call_id=resolved_call,
             job_id=self.job_id,
@@ -290,6 +299,9 @@ class ValidationExecutionService:
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.attempt_id,
             expected_call_graph_hash=self.expected_call_graph_hash,
+            prompt_id=self._validation_user_prompt_identity.prompt_id,
+            prompt_version=self._validation_user_prompt_identity.version,
+            prompt_sha256=self._validation_user_prompt_identity.sha256,
             max_attempts=max(1, retry_limit + 1),
             usage_required=endpoint_type not in {"internal", "fixture"},
         )

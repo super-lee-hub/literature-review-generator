@@ -67,8 +67,10 @@ def _visual_config_overrides() -> dict[str, Mapping[str, Any]]:
         },
         "Multimodal": {"enabled": "true"},
         "Primary_Reader_API": {
-            "endpoint_type": "responses",
-            "supports_image_input": "true",
+            "model": "deepseek-v4-flash-vision-exp",
+            "api_base": "https://api.deepseek.com",
+            "provider_family": "deepseek",
+            "endpoint_type": "chat_completions",
         },
     }
 

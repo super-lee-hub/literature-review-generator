@@ -1,10 +1,18 @@
+import configparser
+from pathlib import Path
+
 from services.configuration_service import (
     default_config_sections,
     ensure_config_sections,
     normalize_api_base,
     write_env_file,
 )
-from services.settings import ApplicationSettings
+from services.settings import (
+    CONFIG_KEYS,
+    STAGE1_CONFIG_OWNERSHIP,
+    ApplicationSettings,
+    validate_config_keys,
+)
 
 
 def test_normalize_api_base_strips_chat_completion_suffix() -> None:
@@ -24,8 +32,8 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert 'Retry_Settings' not in config
     assert 'API_Parameters' not in config
     assert 'Validation' in config
-    assert config['Preprocess']['parser_mode'] == 'local'
-    assert config['Preprocess']['primary_parser'] == 'local'
+    assert config['Preprocess']['parser_mode'] == 'hybrid'
+    assert config['Preprocess']['primary_parser'] == 'mineru_remote'
     assert config['Preprocess']['use_markdown_as_stage1_input'] == 'true'
     assert config['Validation']['stage1_enabled'] == 'false'
     assert config['Runtime']['retain_checkpoints_after_completion'] == 'false'
@@ -91,3 +99,61 @@ def test_write_env_file_allows_clearing_existing_keys(tmp_path) -> None:
     assert "MINERU_API_TOKEN=\n" in content
     assert "old-key" not in content
     assert "old-token" not in content
+
+
+def test_stage1_defaults_match_config_example_outside_secret_placeholders() -> None:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    parser.read(Path(__file__).resolve().parents[1] / "config.ini.example", encoding="utf-8")
+    example = {section: dict(parser.items(section)) for section in parser.sections()}
+    defaults = default_config_sections()
+    secret_sections = {
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Validator_API",
+    }
+
+    for section, values in defaults.items():
+        expected = {
+            key: value
+            for key, value in values.items()
+            if not (section in secret_sections and key == "api_key")
+        }
+        actual = {
+            key: value
+            for key, value in example[section].items()
+            if not (section in secret_sections and key == "api_key")
+        }
+        assert actual == expected, f"config.ini.example drifted from default_config_sections in [{section}]"
+
+
+def test_stage1_config_ownership_covers_every_accepted_key_and_rejects_removed_visual_knobs() -> None:
+    for section in ("Stage1_Input", "Stage1_Visual"):
+        assert set(CONFIG_KEYS[section]) <= set(STAGE1_CONFIG_OWNERSHIP[section])
+        assert set(STAGE1_CONFIG_OWNERSHIP[section].values()) <= {
+            "ACTIVE", "INVARIANT", "MIGRATION_ONLY", "REMOVE"
+        }
+
+    for key in ("max_visual_refs_per_paper", "visual_artifact_dir", "max_request_image_bytes", "max_single_image_bytes"):
+        section = "Stage1_Visual"
+        assert STAGE1_CONFIG_OWNERSHIP[section][key] == "REMOVE"
+        assert validate_config_keys({section: {key: "1"}})
+
+
+def test_stage1_migration_only_pdf_keys_are_readable_but_not_retained() -> None:
+    config = {
+        "Stage1_Input": {
+            "pdf_required_for_formal_precision": "true",
+            "formal_precision_text_only_policy": "block",
+            "pdf_verifier_api": "Validator_API",
+            "mode": "vision_first",
+            "image_transport": "base64",
+        }
+    }
+
+    ApplicationSettings.from_mutable_config(config)
+
+    assert set(config["Stage1_Input"]) == {"mode", "image_transport"}

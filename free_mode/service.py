@@ -12,36 +12,11 @@ from free_mode.profile_manager import normalize_profile, save_profile
 from models import APIConfig
 from runtime.provider_runtime import ProviderBudgetV1, ProviderBudgetExceeded, ProviderRuntime, ProviderRuntimeLedger
 from services.model_selection import get_free_mode_api_config
+from services.prompt_registry import PromptRegistry
 
 
-FREE_MODE_PROFILE_SYSTEM_PROMPT = """你是一个学术文献综述规划助手。
-你的任务不是直接写综述，而是把用户的自然语言想法转化为一个可执行的综述 prompt profile。
-你必须返回 JSON，并且严格包含以下字段：
-research_goal, concept_relationship, focus_points, exclusions, theory_or_variable_focus,
-outline_preferences, writing_constraints, generated_prompt, conversation_notes。
-如果用户没有给出某项信息，允许返回空字符串或空数组，不要硬猜。"""
-
-
-FREE_MODE_CHAT_SYSTEM_PROMPT = """你是一个学术文献综述自由模式规划助手。
-你的职责是和用户多轮澄清写作意图，然后逐步沉淀成适合后续综述生成流程的 prompt profile。
-你不能直接开始写综述正文；你要做的是帮助用户把想法变清楚、变可执行。
-
-每次都必须返回 JSON，且严格包含以下字段：
-assistant_message, ready_to_apply, missing_information, profile。
-
-字段要求：
-1. assistant_message: 给用户的自然语言回复。先简短总结已明确的信息，再提出 1-2 个最关键的问题；如果已经足够清楚，就说明可以应用到本次任务。
-2. ready_to_apply: 布尔值。只有当研究目标、概念关系或主线、以及生成 prompt 已经基本清楚时才返回 true。
-3. missing_information: 字符串数组。列出仍然缺失但最影响后续综述执行的信息；如果已经足够清楚，可返回空数组。
-4. profile: 一个 JSON 对象，并且严格包含以下字段：
-research_goal, concept_relationship, focus_points, exclusions, theory_or_variable_focus,
-outline_preferences, writing_constraints, generated_prompt, conversation_notes。
-
-profile 规则：
-- generated_prompt 必须是给后续综述流程使用的优化 prompt，而不是综述正文。
-- conversation_notes 应该是对已确认关键信息的简短项目符号式摘要。
-- 如果用户明确说想写 A 到 B 的推导、比较、机制、边界条件、变量链路或 research gap，要尽量结构化到 profile 里。
-- 如果信息还不够，不要强行补全，只保留已经明确的部分。"""
+def _prompt_registry() -> PromptRegistry:
+    return PromptRegistry()
 
 
 def _get_free_mode_parameters(config: Dict[str, Any], logger: Any = None) -> tuple[int, float]:
@@ -107,6 +82,7 @@ def _new_free_mode_provider_runtime(
     prompt: str,
     config: Dict[str, Any],
     provider_runtime: Optional[ProviderRuntime],
+    prompt_id: str = "",
 ) -> Optional[ProviderRuntime]:
     if provider_runtime is not None:
         return provider_runtime
@@ -120,6 +96,7 @@ def _new_free_mode_provider_runtime(
     except (TypeError, ValueError):
         retry_limit = 2
     prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:24]
+    prompt_identity = _prompt_registry().identity(prompt_id) if prompt_id else None
     return ProviderRuntime(
         budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=retry_limit),
         ledger=ProviderRuntimeLedger(ledger_path),
@@ -131,6 +108,9 @@ def _new_free_mode_provider_runtime(
         call_id=f"free-mode:{stage_name}:{prompt_hash}",
         endpoint_type=str(api_config.get("endpoint_type") or "chat_completions"),
         schema_hash=hashlib.sha256(b"free-mode-provider-request-v1").hexdigest(),
+        prompt_id=prompt_identity.prompt_id if prompt_identity else "",
+        prompt_version=prompt_identity.version if prompt_identity else "",
+        prompt_sha256=prompt_identity.sha256 if prompt_identity else "",
     )
 
 
@@ -178,6 +158,7 @@ def _call_free_mode_api(
     temperature: float,
     logger: Any,
     provider_runtime: Optional[ProviderRuntime],
+    prompt_id: str = "",
 ) -> Any:
     call_kwargs: Dict[str, Any] = {
         "max_tokens": max_tokens,
@@ -186,6 +167,11 @@ def _call_free_mode_api(
         "logger": logger,
     }
     if provider_runtime is not None:
+        if prompt_id:
+            identity = _prompt_registry().identity(prompt_id)
+            provider_runtime.prompt_id = identity.prompt_id
+            provider_runtime.prompt_version = identity.version
+            provider_runtime.prompt_sha256 = identity.sha256
         call_kwargs["provider_runtime"] = provider_runtime
     response = _call_ai_api(
         prompt=prompt,
@@ -236,15 +222,17 @@ def plan_free_mode_chat_turn(
         prompt=prompt,
         config=config,
         provider_runtime=provider_runtime,
+        prompt_id="free_mode.chat.system.v1",
     )
     response = _call_free_mode_api(
         prompt=prompt,
         api_config=free_mode_api,
-        system_prompt=FREE_MODE_CHAT_SYSTEM_PROMPT,
+        system_prompt=_prompt_registry().read("free_mode.chat.system.v1"),
         max_tokens=max_tokens,
         temperature=temperature,
         logger=logger,
         provider_runtime=runtime,
+        prompt_id="free_mode.chat.system.v1",
     )
     if not isinstance(response, dict):
         return None
@@ -295,15 +283,17 @@ def generate_free_mode_profile(
         prompt=prompt,
         config=config,
         provider_runtime=provider_runtime,
+        prompt_id="free_mode.profile.system.v1",
     )
     response = _call_free_mode_api(
         prompt=prompt,
         api_config=free_mode_api,
-        system_prompt=FREE_MODE_PROFILE_SYSTEM_PROMPT,
+        system_prompt=_prompt_registry().read("free_mode.profile.system.v1"),
         max_tokens=max_tokens,
         temperature=temperature,
         logger=logger,
         provider_runtime=runtime,
+        prompt_id="free_mode.profile.system.v1",
     )
     if not isinstance(response, dict):
         return None

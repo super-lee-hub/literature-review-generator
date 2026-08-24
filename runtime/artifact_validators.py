@@ -9,6 +9,10 @@ from typing import Any, Mapping
 import zipfile
 
 from outline.v3_models import compute_v3_hash
+from services.stage1_visual_contract import (
+    validate_current_visual_evidence_qualification_pair,
+    validate_visual_coverage_semantics,
+)
 
 
 class ArtifactSchemaError(ValueError):
@@ -93,6 +97,8 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "free_mode_intent_input",
         "free_mode_review_intent_projection",
         "validation_adjudication_reuse_record",
+        "stage1_visual_observations",
+        "stage1_visual_coverage",
     }
 )
 
@@ -507,6 +513,9 @@ def _validate_provider_expected_call_graph(record: Any, _path: str | Path, root:
                 "stage_name",
                 "node_id",
                 "prompt_hash",
+                "prompt_id",
+                "prompt_version",
+                "prompt_sha256",
                 "input_hash",
                 "config_hash",
                 "schema_hash",
@@ -654,6 +663,13 @@ def _validate_stage1_reusable_summary_manifest(
         ),
         "stage1_reusable_summary_manifest",
     )
+    qualification_issues = validate_current_visual_evidence_qualification_pair(root)
+    if qualification_issues:
+        raise ArtifactSchemaError(
+            "stage1_reusable_summary_manifest visual_evidence_qualification boundary "
+            "is invalid: "
+            + ", ".join(qualification_issues)
+        )
     for label in (
         "source_summary_artifact_hash",
         "summary_payload_hash",
@@ -808,6 +824,13 @@ def _validate_stage1_portable_summary_manifest(
         or not isinstance(root.get("binding"), Mapping)
     ):
         raise ArtifactSchemaError("stage1 portable summary manifest identity is invalid")
+    qualification_issues = validate_current_visual_evidence_qualification_pair(root)
+    if qualification_issues:
+        raise ArtifactSchemaError(
+            "stage1 portable summary manifest visual_evidence_qualification boundary "
+            "is invalid: "
+            + ", ".join(qualification_issues)
+        )
     from runtime.provider_runtime import hash_json
 
     manifest_content_hash = str(root.get("manifest_content_hash") or "")
@@ -1420,7 +1443,6 @@ def _validate_validation_adjudication_reuse_record(
             "citation_set_key",
             "stage",
             "canonical_adjudication_packet_hash",
-            "prompt_version",
             "validation_schema_version",
             "provider",
             "model",
@@ -1428,6 +1450,9 @@ def _validate_validation_adjudication_reuse_record(
             "redacted_provider_config_hash",
             "call_id",
             "prompt_hash",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
             "input_hash",
             "schema_hash",
             "provider_output_artifact_id",
@@ -1446,6 +1471,274 @@ def _validate_validation_adjudication_reuse_record(
         raise ArtifactSchemaError("validation_adjudication_reuse_record.stage is invalid")
     if not isinstance(root.get("current_input_dependency_hashes"), Mapping):
         raise ArtifactSchemaError("validation_adjudication_reuse_record input dependency hashes must be an object")
+
+
+def _validate_stage1_visual_observations(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_observations",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "batch_index",
+            "call_id",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "visual_ids",
+            "status",
+            "observations",
+        ),
+        "stage1_visual_observations",
+    )
+    if not isinstance(root.get("visual_ids"), list) or not isinstance(root.get("observations"), list):
+        raise ArtifactSchemaError("stage1_visual_observations visual_ids and observations must be arrays")
+    if str(root.get("status") or "") not in {"success", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_observations.status is invalid")
+
+
+def _validate_stage1_visual_observations_v2(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
+    """Validate the current page-observation/child-attribution artifact.
+
+    The owning Stage 1 service performs the context-bound validation before
+    publication.  The Registry validator repeats the schema check from the
+    persisted payload so a ready record cannot later drift into an untyped v2
+    artifact.  Failed provider calls retain their diagnostic envelope without
+    being treated as successful observations.
+    """
+
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_observations",),
+        expected_version="v2",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "batch_index",
+            "call_id",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "visual_ids",
+            "child_candidate_ids",
+            "child_candidate_refs",
+            "schema_hash",
+            "status",
+            "observations",
+            "error",
+        ),
+        "stage1_visual_observations",
+    )
+    if not isinstance(root.get("visual_ids"), list):
+        raise ArtifactSchemaError("stage1_visual_observations visual_ids must be an array")
+    if not isinstance(root.get("child_candidate_ids"), list):
+        raise ArtifactSchemaError("stage1_visual_observations child_candidate_ids must be an array")
+    if not isinstance(root.get("child_candidate_refs"), list):
+        raise ArtifactSchemaError("stage1_visual_observations child_candidate_refs must be an array")
+    if not isinstance(root.get("observations"), list):
+        raise ArtifactSchemaError("stage1_visual_observations observations must be an array")
+    visual_ids = [str(item).strip() for item in root.get("visual_ids") or []]
+    if not visual_ids or any(not item for item in visual_ids) or len(set(visual_ids)) != len(visual_ids):
+        raise ArtifactSchemaError("stage1_visual_observations visual_ids must be unique non-empty strings")
+    child_ids = [str(item).strip() for item in root.get("child_candidate_ids") or []]
+    if any(not item for item in child_ids) or len(set(child_ids)) != len(child_ids):
+        raise ArtifactSchemaError(
+            "stage1_visual_observations child_candidate_ids must be unique non-empty strings"
+        )
+    reference_ids: list[str] = []
+    for index, candidate in enumerate(root.get("child_candidate_refs") or []):
+        if not isinstance(candidate, Mapping):
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] must be an object"
+            )
+        if set(candidate) - {"visual_id", "page_no", "artifact_type", "bbox"}:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] has unexpected fields"
+            )
+        candidate_id = str(candidate.get("visual_id") or "").strip()
+        if not candidate_id:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] visual_id is missing"
+            )
+        reference_ids.append(candidate_id)
+        try:
+            page_no = int(candidate.get("page_no") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] page_no is invalid"
+            ) from exc
+        if page_no <= 0:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] page_no is invalid"
+            )
+        if str(candidate.get("artifact_type") or "") not in {
+            "figure_crop",
+            "table_crop",
+            "formula_crop",
+        }:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] artifact_type is invalid"
+            )
+        bbox = candidate.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] bbox is invalid"
+            )
+        try:
+            bbox_values = [float(value) for value in bbox]
+        except (TypeError, ValueError) as exc:
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] bbox is not numeric"
+            ) from exc
+        if any(value < 0 for value in bbox_values):
+            raise ArtifactSchemaError(
+                f"stage1_visual_observations child_candidate_refs[{index}] bbox is negative"
+            )
+    if len(set(reference_ids)) != len(reference_ids) or reference_ids != child_ids:
+        raise ArtifactSchemaError(
+            "stage1_visual_observations child_candidate_ids do not match child_candidate_refs"
+        )
+    for field in ("prompt_id", "prompt_version", "call_id", "schema_hash"):
+        if not str(root.get(field) or "").strip():
+            raise ArtifactSchemaError(f"stage1_visual_observations.{field} is missing")
+    for field in ("prompt_sha256", "schema_hash"):
+        digest = str(root.get(field) or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
+            raise ArtifactSchemaError(f"stage1_visual_observations.{field} is not a SHA-256 hex digest")
+    status = str(root.get("status") or "")
+    if status not in {"success", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_observations.status is invalid")
+    if status == "failed":
+        if not str(root.get("error") or ""):
+            raise ArtifactSchemaError("failed stage1_visual_observations must include an error")
+        if root.get("observations"):
+            raise ArtifactSchemaError("failed stage1_visual_observations must not include observations")
+        return
+
+    try:
+        from services.stage1_visual_scan import validate_current_visual_observations_v2
+
+        validate_current_visual_observations_v2(
+            root,
+            allowed_visual_ids=[str(item) for item in root.get("visual_ids") or []],
+            sent_visual_ids=[str(item) for item in root.get("visual_ids") or []],
+            candidate_refs=[
+                dict(item)
+                for item in root.get("child_candidate_refs") or []
+                if isinstance(item, Mapping)
+            ],
+        )
+    except (ValueError, TypeError, ImportError) as exc:
+        raise ArtifactSchemaError(f"stage1_visual_observations v2 schema is invalid: {exc}") from exc
+
+
+def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_coverage",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "total_pdf_pages",
+            "nonblank_pages",
+            "rendered_pages",
+            "visually_scanned_pages",
+            "page_status",
+            "scan_batches",
+            "coverage_status",
+            "scan_coverage_status",
+            "final_synthesis_modality",
+            "final_raw_visual_recheck_status",
+            "evidence_coverage_status",
+            "raw_reinspection_units",
+            "required_raw_reinspection_unit_count",
+            "closed_raw_reinspection_unit_count",
+            "unresolved_raw_reinspection_unit_ids",
+            "omissions",
+        ),
+        "stage1_visual_coverage",
+    )
+    if str(root.get("coverage_status") or "") not in {"complete", "partial", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_coverage.coverage_status is invalid")
+    if str(root.get("scan_coverage_status") or "") not in {
+        "complete", "partial", "failed", "not_required"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.scan_coverage_status is invalid")
+    if str(root.get("final_synthesis_modality") or "") not in {
+        "multimodal", "text_only", "pdf_plus_text"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.final_synthesis_modality is invalid")
+    if str(root.get("final_raw_visual_recheck_status") or "") not in {
+        "complete", "partial", "not_run_fallback", "not_required"
+    }:
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage.final_raw_visual_recheck_status is invalid"
+        )
+    if str(root.get("evidence_coverage_status") or "") not in {
+        "complete", "degraded", "incomplete"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.evidence_coverage_status is invalid")
+    raw_units = root.get("raw_reinspection_units")
+    if not isinstance(raw_units, list):
+        raise ArtifactSchemaError("stage1_visual_coverage.raw_reinspection_units must be an array")
+    required_units = root.get("required_raw_reinspection_unit_count")
+    closed_units = root.get("closed_raw_reinspection_unit_count")
+    if (
+        type(required_units) is not int
+        or type(closed_units) is not int
+        or required_units < 0
+        or closed_units < 0
+    ):
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage raw reinspection counts must be exact non-negative integers"
+        )
+    unresolved_units = root.get("unresolved_raw_reinspection_unit_ids")
+    if (
+        closed_units > required_units
+        or len(raw_units) != required_units
+        or not isinstance(unresolved_units, list)
+        or any(type(item) is not str for item in unresolved_units)
+        or any(not isinstance(item, Mapping) for item in raw_units)
+        or any(
+            not str(item.get("unit_id") or "")
+            or not isinstance(item.get("closed"), bool)
+            for item in raw_units
+            if isinstance(item, Mapping)
+        )
+        or len({str(item.get("unit_id") or "") for item in raw_units if isinstance(item, Mapping)})
+        != len(raw_units)
+        or sum(1 for item in raw_units if isinstance(item, Mapping) and item.get("closed") is True)
+        != closed_units
+        or [
+            str(item.get("unit_id") or "")
+            for item in raw_units
+            if isinstance(item, Mapping) and item.get("closed") is not True
+        ]
+        != [str(item) for item in unresolved_units]
+    ):
+        raise ArtifactSchemaError("stage1_visual_coverage raw reinspection closure is invalid")
+    if not isinstance(root.get("page_status"), list) or not isinstance(root.get("scan_batches"), list):
+        raise ArtifactSchemaError("stage1_visual_coverage page_status and scan_batches must be arrays")
+    semantic_issues = validate_visual_coverage_semantics(root)
+    if semantic_issues:
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage semantic validation failed: "
+            + ", ".join(semantic_issues)
+        )
 
 
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
@@ -1491,6 +1784,9 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("free_mode_intent_input", "v1"): _validate_free_mode_intent_input,
         ("free_mode_review_intent_projection", "v1"): _validate_free_mode_review_intent_projection,
         ("validation_adjudication_reuse_record", "v1"): _validate_validation_adjudication_reuse_record,
+        ("stage1_visual_observations", "v1"): _validate_stage1_visual_observations,
+        ("stage1_visual_observations", "v2"): _validate_stage1_visual_observations_v2,
+        ("stage1_visual_coverage", "v1"): _validate_stage1_visual_coverage,
     }
     validator = validators.get((artifact_type, version))
     if validator is None:

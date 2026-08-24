@@ -1,0 +1,166 @@
+{
+  "registry_version": "v1",
+  "prompts": [
+    {
+      "prompt_id": "free_mode.chat.system.v1",
+      "path": "prompts/active/free_mode/system_chat_v1.txt",
+      "version": "v1",
+      "status": "ACTIVE",
+      "owner": "free_mode.service.plan_free_mode_chat_turn",
+      "required_placeholders": [],
+      "output_contract": "free mode planner JSON",
+      "sha256": "f2d1f82e4ee6f86410ef2a4ef88ecf7b750d0ecaee0963e44ca7d2716ac9cae4"
+    },
+    {
+      "prompt_id": "free_mode.profile.system.v1",
+      "path": "prompts/active/free_mode/system_profile_v1.txt",
+      "version": "v1",
+      "status": "ACTIVE",
+      "owner": "free_mode.service.build_free_mode_profile",
+      "required_placeholders": [],
+      "output_contract": "free mode profile JSON",
+      "sha256": "8439dfb967b9ae4da3dd9dd3d2d03625cc1f19ac4c5d43eee9d9fc0de5c3b44b"
+    },
+    {
+      "prompt_id": "stage1.analysis.system.v3",
+      "path": "prompts/active/stage1/system_analysis_v3.txt",
+      "version": "v3",
+      "status": "ACTIVE",
+      "owner": "services.stage1_analysis_service.Stage1AnalysisService",
+      "required_placeholders": [],
+      "output_contract": "summary_v2_lite canonical JSON",
+      "sha256": "457f5ada41241f4800bf77dc46d2bae1ac821d3c50f7e781a2b3cb994a543595"
+    },
+    {
+      "prompt_id": "stage1.analysis.user.v3",
+      "path": "prompts/active/stage1/user_analysis_v3.txt",
+      "version": "v3",
+      "status": "ACTIVE",
+      "owner": "services.stage1_analysis_service.Stage1AnalysisService",
+      "required_placeholders": ["PAPER_FULL_TEXT", "VISUAL_COVERAGE_JSON", "VISUAL_OBSERVATIONS_JSON", "SUMMARY_SCHEMA_CONTRACT"],
+      "output_contract": "summary_v2_lite canonical JSON",
+      "sha256": "3d60446608ef78acf37662731d53117a7a932760f12149214c995a1330622408"
+    },
+    {
+      "prompt_id": "stage1.visual_scan.system.v1",
+      "path": "prompts/legacy/stage1/system_visual_scan_v1.txt",
+      "version": "v1",
+      "status": "LEGACY",
+      "owner": "services.stage1_analysis_service.Stage1AnalysisService",
+      "required_placeholders": [],
+      "output_contract": "stage1_visual_observations/v1 JSON",
+      "sha256": "d5a29e63c4ddb97123bfdfc31afeffcbd48647ae531f0775f7a9709003589fb1"
+    },
+    {
+      "prompt_id": "stage1.visual_scan.system.v2",
+      "path": "prompts/active/stage1/system_visual_scan_v2.txt",
+      "version": "v2",
+      "status": "ACTIVE",
+      "owner": "services.stage1_analysis_service.Stage1AnalysisService",
+      "required_placeholders": [],
+      "output_contract": "stage1_visual_observations/v2 JSON",
+      "sha256": "0e71eea430506a8a79a22415b03e76c1ffcf4efdc6309ad29a0661fbeabfb992"
+    },
+    {
+      "prompt_id": "outline.node.system.v3",
+      "path": "prompts/active/outline/system_outline_node_v3.txt",
+      "version": "v3",
+      "status": "ACTIVE",
+      "owner": "outline.v3_executor.OutlineV3Executor",
+      "required_placeholders": [],
+      "output_contract": "Outline Intelligence v3 node JSON",
+      "sha256": "0f20717d78abc496f516cc7d1ff31c269d59ad01287c440efbe8101c9c923d34"
+    },
+    {
+      "prompt_id": "outline.node.policies.v3",
+      "path": "prompts/active/outline/node_policies_v3.json",
+      "version": "v3",
+      "status": "ACTIVE",
+      "owner": "outline.v3_executor.OutlineV3Executor",
+      "required_placeholders": [],
+      "output_contract": "node role policy map JSON",
+      "required_roles": ["relation_adjudicator", "candidate_generator", "structure_critic", "coverage_critic", "evidence_critic", "arbitrator"],
+      "sha256": "54e966b7ff70a16ddda0ae37298c30ccc1fa6e1277974ce38c862cf1cd293ca0"
+    },
+    {
+      "prompt_id": "review.section_writer.system.v3",
+      "path": "prompts/active/review/system_section_writer_v3.txt",
+      "version": "v3",
+      "status": "ACTIVE",
+      "owner": "services.review_generation_service.ReviewGenerationService",
+      "required_placeholders": [],
+      "output_contract": "non-empty JSON blocks with local citation tokens",
+      "sha256": "902b6bc3756c63479e1ecfce64b867b3547ecec97a3782e88568c9a15146875c"
+    },
+    {
+      "prompt_id": "validation.repair_rewrite.system.v1",
+      "path": "prompts/active/validation/system_repair_rewrite_v1.txt",
+      "version": "v1",
+      "status": "ACTIVE",
+      "owner": "validator._rewrite_block_with_ai",
+      "required_placeholders": [],
+      "output_contract": "rewritten_claim_unit JSON",
+      "sha256": "5dc0ab75daabce636659a06ad54a9d52b34b239aa4bfc8ce2bf856145c61794f"
+    },
+    {
+      "prompt_id": "validation.adjudicator.system.v2",
+      "path": "prompts/active/validation/system_adjudicator_v2.txt",
+      "version": "v2",
+      "status": "ACTIVE",
+      "owner": "validation.llm_adjudicator.run_adjudication_stage",
+      "required_placeholders": [],
+      "output_contract": "validation adjudication JSON",
+      "sha256": "78a972f8ef9e602fc77e9ef6c0e225579b9953964a8d9e014d24ecdc06def1ca"
+    },
+    {
+      "prompt_id": "validation.adjudicator.user.v2",
+      "path": "prompts/active/validation/user_adjudicator_v2.txt",
+      "version": "v2",
+      "status": "ACTIVE",
+      "owner": "validation.llm_adjudicator.run_adjudication_stage",
+      "required_placeholders": ["ADJUDICATION_STAGE", "ADJUDICATION_PACKET_JSON"],
+      "output_contract": "validation adjudication JSON",
+      "sha256": "8118b89e7822d02cfc048364db58d3808bb0bc3403a102abb223bd990e0680be"
+    },
+    {
+      "prompt_id": "validation.legacy.summary_fact_check.system.v1",
+      "path": "prompts/legacy/system_summary_fact_check_v1.txt",
+      "version": "v1",
+      "status": "LEGACY",
+      "owner": "validator.validate_summary_with_ai",
+      "required_placeholders": [],
+      "output_contract": "legacy summary fact-check JSON",
+      "sha256": "ae3eb3c8c8626050b0521c2f5b89843009ca22f082aefbeeee977f73b9022dc8"
+    },
+    {
+      "prompt_id": "validation.legacy.claims_batch.system.v1",
+      "path": "prompts/legacy/system_claims_batch_v1.txt",
+      "version": "v1",
+      "status": "LEGACY",
+      "owner": "validator._validate_claims_for_single_paper",
+      "required_placeholders": [],
+      "output_contract": "legacy batch validation JSON",
+      "sha256": "dda18ac49682673463186354c9f6e80e9cf6f093d3fe2180bead1da52a15f856"
+    },
+    {
+      "prompt_id": "validation.legacy.summary_fact_check.v1",
+      "path": "prompts/legacy/prompt_validate_analysis_strict.txt",
+      "version": "v1",
+      "status": "LEGACY",
+      "owner": "validator.validate_summary_with_ai",
+      "required_placeholders": ["PAPER_FULL_TEXT", "GENERATED_SUMMARY"],
+      "output_contract": "legacy summary fact-check JSON",
+      "sha256": "70fc33bd89cfbecf7b3606361e3278235b19451f2ee5081c65db436cabaac1f6"
+    },
+    {
+      "prompt_id": "validation.legacy.claims_batch.v1",
+      "path": "prompts/legacy/prompt_validate_claims_batch.txt",
+      "version": "v1",
+      "status": "LEGACY",
+      "owner": "validator._validate_claims_for_single_paper",
+      "required_placeholders": ["SOURCE_SUMMARY", "SENTENCES_TO_VALIDATE"],
+      "output_contract": "legacy batch validation JSON",
+      "sha256": "d7ac08ba13d086466c5d8f643cc2b3d4ae966fd37a2a196ff186997ac29ebe9c"
+    }
+  ]
+}

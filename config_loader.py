@@ -74,6 +74,12 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
         section = config[section_name]
         config_dict[section_name] = {str(key): str(value) for key, value in section.items()}
 
+    if "Multimodal" in config_dict:
+        logger.warning(
+            "[Multimodal] is deprecated and read only for migration; "
+            "Stage1 vision capability now comes from Primary_Reader_API.model."
+        )
+
     config_origin = os.path.dirname(os.path.abspath(config_path))
     for key, raw_value in list(config_dict.get("Paths", {}).items()):
         value = str(raw_value or "").strip()

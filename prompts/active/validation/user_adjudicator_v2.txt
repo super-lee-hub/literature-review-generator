@@ -1,0 +1,20 @@
+请对以下 citation validation packet 进行语义裁决。
+
+当前裁决阶段：
+
+{{ADJUDICATION_STAGE}}
+
+Packet：
+
+{{ADJUDICATION_PACKET_JSON}}
+
+请逐一检查：
+
+1. 目标 claim unit 究竟表达了什么；
+2. 它预期由哪些 paper_ids 支持；
+3. 每篇论文的 source-grounded evidence 是否支持、部分支持、没有覆盖、明确反驳或来自错误来源；
+4. 多篇论文是否形成有效的联合支持；
+5. 问题位于 summary、review、citation mapping，还是证据本身不足；
+6. 是否可以安全自动修复，还是必须人工复核。
+
+只输出 system prompt 规定的 JSON。

@@ -9,6 +9,7 @@
 | [truth-sources.md](./truth-sources.md) | 各阶段规范产物、数据契约、当前真实主链 |
 | [compatibility.md](./compatibility.md) | 兼容性路径、已弃用 API、移除时间线 |
 | [workspace-layout.md](./workspace-layout.md) | Job workspace 结构、输出目录、产物注册、硬约束 |
+| [stage1-vision.md](./stage1-vision.md) | Stage 1 MinerU 文本、全页视觉覆盖、批处理和 fallback |
 
 ## 内容范围
 

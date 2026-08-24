@@ -59,6 +59,7 @@ from runtime.outline_v3_replay import ModelCallReplayKey, ModelCallReplayStore
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact
 from services.queue_service import LocalPublicationContext
+from services.prompt_registry import PromptRegistry
 
 
 Provider = Callable[[str, Mapping[str, Any]], Any]
@@ -254,6 +255,9 @@ class OutlineV3Executor:
         self.summaries = [dict(item) for item in summaries]
         self.workspace = workspace
         self.registry = artifact_registry or self._build_registry()
+        self.prompt_registry = PromptRegistry()
+        self._outline_prompt_identity = self.prompt_registry.identity("outline.node.system.v3")
+        self._outline_policy_identity = self.prompt_registry.identity("outline.node.policies.v3")
         self.publication_context = (
             publication_context
             or getattr(self.registry, "publication_context", None)
@@ -968,6 +972,9 @@ class OutlineV3Executor:
             "prompt_template_hash": prompt_template_hash,
             "prompt_payload_hash": prompt_payload_hash,
             "prompt_hash": hash_text(json.dumps(prompt, sort_keys=True, ensure_ascii=False)) if prompt is not None else "",
+            "prompt_id": self._outline_prompt_identity.prompt_id if provider_node else "",
+            "prompt_version": self._outline_prompt_identity.version if provider_node else "",
+            "prompt_sha256": self._outline_prompt_identity.sha256 if provider_node else "",
             "provider_config_hash": hash_json(api_config) if api_config is not None else "",
             "schema_hash": _hash_payload({"node_id": self._semantic_node_id(node_id), "expect_json": True}),
             "context_profile_hash": self._context_profile_hash() if provider_node else "",
@@ -993,7 +1000,7 @@ class OutlineV3Executor:
             model=self.profile.model,
             provider=semantic_node_id,
             prompt=request,
-            prompt_template_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
+            prompt_template_hash=self._outline_prompt_identity.sha256,
             prompt_payload_hash=hash_json(request),
             api_config=api_config,
         )
@@ -1046,6 +1053,9 @@ class OutlineV3Executor:
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
             expected_call_graph_hash=self.expected_call_graph_hash,
+            prompt_id=str(binding.get("prompt_id") or ""),
+            prompt_version=str(binding.get("prompt_version") or ""),
+            prompt_sha256=str(binding.get("prompt_sha256") or ""),
             prompt_hash=str(binding.get("prompt_hash") or ""),
             input_hash=str(binding.get("prompt_payload_hash") or ""),
             config_hash=str(binding.get("provider_config_hash") or ""),
@@ -1070,6 +1080,9 @@ class OutlineV3Executor:
                 closure_epoch_id=self.closure_epoch_id,
                 logical_attempt_identity=self.logical_attempt_identity,
                 expected_call_graph_hash=self.expected_call_graph_hash,
+                prompt_id=self._outline_prompt_identity.prompt_id,
+                prompt_version=self._outline_prompt_identity.version,
+                prompt_sha256=self._outline_prompt_identity.sha256,
                 max_attempts=1,
                 usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
             )
@@ -1094,6 +1107,9 @@ class OutlineV3Executor:
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
             expected_call_graph_hash=self.expected_call_graph_hash,
+            prompt_id=self._outline_prompt_identity.prompt_id,
+            prompt_version=self._outline_prompt_identity.version,
+            prompt_sha256=self._outline_prompt_identity.sha256,
             prompt_hash=hash_text(prompt),
             input_hash=hash_json(request),
             config_hash=hash_json(api_config),
@@ -1483,6 +1499,7 @@ class OutlineV3Executor:
         input_artifact_hashes: Sequence[str] = (),
         transport_node_id: str | None = None,
     ) -> dict[str, Any]:
+        request = self._attach_prompt_authority(node_id, request)
         budget = self.profile.estimate_request(request)
         api_config = {
             "provider_family": self.profile.provider,
@@ -1505,7 +1522,7 @@ class OutlineV3Executor:
             model_route=self.profile.provider,
             model_name=self.profile.model,
             provider=self.profile.provider,
-            prompt_template_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
+            prompt_template_hash=self._outline_prompt_identity.sha256,
             prompt_payload_hash=hash_json(request),
             input_artifact_hashes=sorted(str(item) for item in input_artifact_hashes if str(item)),
             config_hash=hash_json(api_config),
@@ -1570,6 +1587,9 @@ class OutlineV3Executor:
             logical_attempt_identity=self.logical_attempt_identity,
             endpoint_type=self.profile.endpoint_type,
             schema_hash=str(binding["schema_hash"]),
+            prompt_id=self._outline_prompt_identity.prompt_id,
+            prompt_version=self._outline_prompt_identity.version,
+            prompt_sha256=self._outline_prompt_identity.sha256,
         )
         if not budget["within_budget"]:
             receipt = runtime.blocked_receipt(prompt=json.dumps(request, sort_keys=True, ensure_ascii=False), input_payload=request, api_config=api_config, message="provider input exceeds verified context budget")
@@ -1660,6 +1680,31 @@ class OutlineV3Executor:
                 binding=binding,
             )
         return _as_dict(completion.content)
+
+    def _attach_prompt_authority(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Make the Registry-owned system prompt part of every provider input."""
+
+        enriched = dict(request)
+        # The node policy map is an authority input.  A malformed or edited
+        # file must stop the outline run instead of silently becoming an empty
+        # policy map.
+        policies = self.prompt_registry.read_json("outline.node.policies.v3")
+        enriched["_prompt_authority"] = {
+            "prompt_id": self._outline_prompt_identity.prompt_id,
+            "prompt_version": self._outline_prompt_identity.version,
+            "prompt_sha256": self._outline_prompt_identity.sha256,
+            "system_prompt": self.prompt_registry.read("outline.node.system.v3"),
+            "policy_prompt_id": self._outline_policy_identity.prompt_id,
+            "policy_prompt_version": self._outline_policy_identity.version,
+            "policy_prompt_sha256": self._outline_policy_identity.sha256,
+            "node_id": str(node_id),
+            "node_policies": policies,
+        }
+        return enriched
 
     def _artifact(self, cls: type[OutlineArtifact], payload: Mapping[str, Any], deps: Mapping[str, str] | None = None, diagnostics: Sequence[Mapping[str, Any]] = ()) -> OutlineArtifact:
         return cls(

@@ -37,6 +37,7 @@ from services.job_workspace import (
 )
 from services.settings import ApplicationSettings
 from services.queue_service import LocalPublicationContext
+from services.prompt_registry import PromptRegistry, PromptRegistryError
 
 
 WriterCallable = Callable[..., Mapping[str, Any]]
@@ -78,6 +79,8 @@ class ReviewGenerationService:
             or LocalPublicationContext()
         )
         self.settings = settings
+        self.prompt_registry = PromptRegistry()
+        self._review_prompt_identity = self.prompt_registry.identity("review.section_writer.system.v3")
         self.summaries = [dict(item) for item in summaries]
         self.writer = writer
         self.cancellation_checker = cancellation_checker
@@ -178,6 +181,9 @@ class ReviewGenerationService:
                 closure_epoch_id=self.closure_epoch_id,
                 logical_attempt_identity=self.attempt_id,
                 expected_call_graph_hash=self.expected_call_graph_hash,
+                prompt_id=self._review_prompt_identity.prompt_id,
+                prompt_version=self._review_prompt_identity.version,
+                prompt_sha256=self._review_prompt_identity.sha256,
                 prompt_hash=str(binding["prompt_hash"]),
                 input_hash=str(binding["prompt_payload_hash"]),
                 config_hash=str(binding["writer_config_hash"]),
@@ -220,6 +226,9 @@ class ReviewGenerationService:
                 closure_epoch_id=self.closure_epoch_id,
                 logical_attempt_identity=self.attempt_id,
                 expected_call_graph_hash=self.expected_call_graph_hash,
+                prompt_id=self._review_prompt_identity.prompt_id,
+                prompt_version=self._review_prompt_identity.version,
+                prompt_sha256=self._review_prompt_identity.sha256,
                 prompt_hash=str(binding["prompt_hash"]),
                 input_hash=str(binding["prompt_payload_hash"]),
                 config_hash=str(binding["writer_config_hash"]),
@@ -417,7 +426,10 @@ class ReviewGenerationService:
             "writer_endpoint": str(writer_config.get("endpoint_type") or "responses"),
             "writer_config_hash": hash_json(_redact_mapping(dict(writer_config))),
             "system_prompt_hash": hash_text(self._system_prompt()),
-            "prompt_template_hash": hash_text("review-writer-v3:section-json-v1"),
+            "prompt_id": self._review_prompt_identity.prompt_id,
+            "prompt_version": self._review_prompt_identity.version,
+            "prompt_sha256": self._review_prompt_identity.sha256,
+            "prompt_template_hash": self._review_prompt_identity.sha256,
             "prompt_hash": hash_text(str(request_payload.get("user") or "")),
             "prompt_payload_hash": hash_json(request_payload),
             "output_schema_hash": runtime.schema_hash,
@@ -1059,6 +1071,9 @@ class ReviewGenerationService:
             logical_attempt_identity=self.attempt_id,
             endpoint_type=str(config.get("endpoint_type") or "responses"),
             schema_hash=hashlib.sha256(b"review_draft_v3_writer_section").hexdigest(),
+            prompt_id=self._review_prompt_identity.prompt_id,
+            prompt_version=self._review_prompt_identity.version,
+            prompt_sha256=self._review_prompt_identity.sha256,
         )
 
     def _ensure_receipt(
@@ -1160,10 +1175,9 @@ class ReviewGenerationService:
 
     @staticmethod
     def _system_prompt() -> str:
-        path = Path(__file__).resolve().parents[1] / "prompts" / "prompt_system_section.txt"
         try:
-            return path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+            return PromptRegistry().read("review.section_writer.system.v3")
+        except PromptRegistryError:
             return "You are an academic literature review writer. Return only the requested JSON object."
 
 

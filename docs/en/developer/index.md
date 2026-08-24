@@ -18,7 +18,7 @@
 - Technical constraints and compatibility rules
 
 **What does NOT belong here:**
-- User guides → see root [README.en.md](../../README.en.md)
+- User guides → see root [README.en.md](../../../README.en.md)
 - AI agent handoff → see [../ai/index.md](../ai/index.md)
 - Runtime truth and artifacts → see [../runtime/index.md](../runtime/index.md)
 - CLI flags and config reference → see [../reference/index.md](../reference/index.md)

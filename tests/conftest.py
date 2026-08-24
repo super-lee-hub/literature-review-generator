@@ -17,6 +17,7 @@ if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 from offline_guard import (  # noqa: E402
+    allow_live_provider,
     configure_offline_environment,
     install_offline_guard,
     live_api_skip_reason,
@@ -37,6 +38,27 @@ def temp_dir():
     """提供临时目录fixture"""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield tmpdir
+
+
+@pytest.fixture(autouse=True)
+def _provider_scoped_live_network(request):
+    """Allow only the explicitly marked provider during its live test."""
+
+    marker = request.node.get_closest_marker("live_api")
+    if marker is None:
+        yield
+        return
+    provider = str((marker.kwargs or {}).get("provider") or "").strip()
+    reason = live_api_skip_reason(
+        {item.name for item in request.node.iter_markers()},
+        os.environ,
+        provider=provider or None,
+    )
+    if reason is not None:
+        yield
+        return
+    with allow_live_provider(provider):
+        yield
 
 
 @pytest.fixture
@@ -215,7 +237,17 @@ def pytest_collection_modifyitems(config, items):
         if marker_names & _OPTIONAL_MARKERS:
             _OPTIONAL_NODEIDS.add(item.nodeid)
 
-        live_api_reason = live_api_skip_reason(marker_names, os.environ)
+        live_marker = item.get_closest_marker("live_api")
+        live_provider = (
+            str((live_marker.kwargs or {}).get("provider") or "")
+            if live_marker is not None
+            else ""
+        )
+        live_api_reason = live_api_skip_reason(
+            marker_names,
+            os.environ,
+            provider=live_provider or None,
+        )
         if live_api_reason is not None:
             item.add_marker(pytest.mark.skip(reason=live_api_reason))
         if "playwright" in marker_names and os.environ.get("AUTO_GENERATE_RUN_PLAYWRIGHT") != "1":

@@ -9,6 +9,7 @@
 | [truth-sources.md](./truth-sources.md) | Stage-specific canonical artifacts, data contracts, current main pipeline |
 | [compatibility.md](./compatibility.md) | Compatibility paths, deprecated APIs, removal timeline |
 | [workspace-layout.md](./workspace-layout.md) | Job workspace structure, output directories, artifact registry, hard constraints |
+| [stage1-vision.md](./stage1-vision.md) | Stage 1 MinerU text, full-page visual coverage, batching, and fallback |
 
 ## Content Scope
 
