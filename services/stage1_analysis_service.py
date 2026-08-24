@@ -1507,6 +1507,15 @@ class Stage1AnalysisService:
                                 "visual_id": visual_id,
                                 "page_no": int(raw.get("page_no") or 0),
                                 "reason": reason,
+                                "scope": (
+                                    "raw_reinspection"
+                                    if group_id
+                                    else str(
+                                        raw.get("transport_omission_scope")
+                                        or "final_transport"
+                                    )
+                                ),
+                                "authority_blocking": False if group_id else True,
                                 **(
                                     {
                                         "raw_reinspection_group_id": group_id,
@@ -2128,8 +2137,22 @@ class Stage1AnalysisService:
             and engine_type != "backup"
             and final_omissions
         )
-        if scan_incomplete or direct_incomplete or raw_recheck_incomplete:
+        require_complete_visual_coverage = parse_strict_bool(
+            prepared.stage1_input_settings.get("require_complete_visual_coverage"),
+            field="Stage1_Input.require_complete_visual_coverage",
+            default=True,
+        )
+        if (
+            scan_incomplete
+            or direct_incomplete
+            or (raw_recheck_incomplete and require_complete_visual_coverage)
+        ):
             evidence_status = "incomplete"
+        elif raw_recheck_incomplete:
+            # The explicit relaxed policy applies only after page coverage is
+            # complete.  Preserve the unresolved raw unit and omission facts,
+            # but classify the final authority as verified degraded evidence.
+            evidence_status = "degraded"
         elif not required_page_ids:
             evidence_status = "complete"
         elif final_modality == "multimodal" and not raw_recheck_incomplete and actual_visual_ids:
@@ -2426,6 +2449,8 @@ class Stage1AnalysisService:
                         "visual_id": str(ref.get("visual_id") or ""),
                         "page_no": int(ref.get("page_no") or 0),
                         "reason": "provider_does_not_support_image_input",
+                        "scope": "page_coverage",
+                        "authority_blocking": True,
                     }
                     for ref in planned_batch.visual_refs
                 )
@@ -2638,7 +2663,13 @@ class Stage1AnalysisService:
                 "omissions": [
                     *omissions,
                     *[
-                        item
+                        {
+                            "visual_id": f"page-{int(item.get('page_no') or 0):03d}",
+                            "page_no": int(item.get("page_no") or 0),
+                            "reason": str(item.get("skipped_reason") or item.get("status") or ""),
+                            "scope": "page_coverage",
+                            "authority_blocking": True,
+                        }
                         for item in page_status
                         if item.get("status") in {"render_failed", "scan_failed"}
                     ],
@@ -2805,6 +2836,8 @@ class Stage1AnalysisService:
             "required_raw_reinspection_unit_count",
             "closed_raw_reinspection_unit_count",
             "unresolved_raw_reinspection_unit_ids",
+            "omissions",
+            "transport_omissions",
         ):
             if hash_json(published_payload.get(field_name)) != hash_json(coverage.get(field_name)):
                 raise RuntimeError(

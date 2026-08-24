@@ -16,6 +16,12 @@ from runtime.provider_runtime import hash_json
 STAGE1_REUSE_BINDING_VERSION = "v1"
 STAGE1_REUSE_POLICY = "exact_summary_reuse_v1"
 
+_VISUAL_OMISSION_SCOPES = {
+    "page_coverage",
+    "raw_reinspection",
+    "final_transport",
+}
+
 _LEGACY_COMPARISON_FIELDS = (
     "canonical_paper_key",
     "source_paper_id",
@@ -279,8 +285,69 @@ class Stage1VisualEvidenceQualificationV1:
             issues.append("required_page_render_failed")
         if self.scan_failed_page_ids:
             issues.append("required_page_scan_failed")
-        if self.transport_omissions:
-            issues.append("required_visual_transport_omitted")
+        invalid_omissions = [
+            item
+            for item in self.transport_omissions
+            if (
+                str(item.get("scope") or "") not in _VISUAL_OMISSION_SCOPES
+                or not isinstance(item.get("authority_blocking"), bool)
+                or (
+                    str(item.get("scope") or "") != "raw_reinspection"
+                    and item.get("authority_blocking") is not True
+                )
+                or (
+                    str(item.get("scope") or "") == "raw_reinspection"
+                    and not str(item.get("raw_reinspection_group_id") or "").strip()
+                )
+            )
+        ]
+        if invalid_omissions:
+            issues.append("transport_omission_contract_invalid")
+        page_coverage_omissions = [
+            item
+            for item in self.transport_omissions
+            if str(item.get("scope") or "") == "page_coverage"
+            and item.get("authority_blocking") is True
+        ]
+        final_transport_omissions = [
+            item
+            for item in self.transport_omissions
+            if str(item.get("scope") or "") == "final_transport"
+            and item.get("authority_blocking") is True
+        ]
+        raw_reinspection_omissions = [
+            item
+            for item in self.transport_omissions
+            if str(item.get("scope") or "") == "raw_reinspection"
+            and (
+                self.require_complete_visual_coverage
+                or item.get("authority_blocking") is not False
+            )
+        ]
+        if page_coverage_omissions:
+            issues.append("page_coverage_transport_omitted")
+        if final_transport_omissions:
+            issues.append("final_transport_omitted")
+        if raw_reinspection_omissions:
+            issues.append("raw_reinspection_transport_omitted")
+        raw_reinspection_transport = [
+            item
+            for item in self.transport_omissions
+            if str(item.get("scope") or "") == "raw_reinspection"
+        ]
+        if raw_reinspection_transport and not self.require_complete_visual_coverage:
+            unresolved_ids = set(self.unresolved_raw_reinspection_unit_ids)
+            omitted_group_ids = {
+                str(item.get("raw_reinspection_group_id") or "").strip()
+                for item in raw_reinspection_transport
+            }
+            if (
+                self.scan_coverage_status != "complete"
+                or self.evidence_coverage_status != "degraded"
+                or not omitted_group_ids
+                or not omitted_group_ids.issubset(unresolved_ids)
+            ):
+                issues.append("raw_reinspection_relaxed_authority_invalid")
         if self.scan_coverage_status not in {"complete", "partial", "failed", "not_required"}:
             issues.append("scan_coverage_status_invalid")
         if self.final_synthesis_modality not in {"multimodal", "text_only", "pdf_plus_text"}:
@@ -809,9 +876,21 @@ def _verify_visual_evidence_qualification(
     qualification = Stage1VisualEvidenceQualificationV1.from_mapping(raw_qualification)
     issues = qualification.qualification_issues()
     if issues:
+        if "transport_omission_contract_invalid" in issues:
+            return False, "prior_visual_coverage_artifact_invalid"
         if any(issue in issues for issue in ("required_page_observations_missing", "required_page_inputs_not_sent")):
             return False, "prior_visual_observation_incomplete"
-        if any(issue in issues for issue in ("required_page_render_failed", "required_page_scan_failed", "required_visual_transport_omitted")):
+        if any(
+            issue in issues
+            for issue in (
+                "required_page_render_failed",
+                "required_page_scan_failed",
+                "page_coverage_transport_omitted",
+                "final_transport_omitted",
+                "raw_reinspection_transport_omitted",
+                "raw_reinspection_relaxed_authority_invalid",
+            )
+        ):
             return False, "prior_visual_coverage_incomplete"
         if "evidence_not_complete_for_reuse" in issues:
             return False, "prior_visual_coverage_incomplete"
@@ -960,6 +1039,15 @@ def _verify_visual_evidence_qualification(
                 return False, "prior_visual_coverage_artifact_invalid"
             if hash_json(coverage_payload.get(field_name)) != hash_json(declared):
                 return False, "prior_visual_coverage_artifact_invalid"
+        declared_omissions = [dict(item) for item in qualification.transport_omissions]
+        actual_omissions = [
+            dict(item)
+            for field_name in ("omissions", "transport_omissions")
+            for item in (coverage_payload.get(field_name) or [])
+            if isinstance(item, Mapping)
+        ]
+        if hash_json(actual_omissions) != hash_json(declared_omissions):
+            return False, "prior_visual_coverage_artifact_invalid"
         for field_name in (
             "scan_coverage_status", "required_nonblank_page_count",
             "required_page_ids", "sent_visual_ids", "observed_visual_ids",

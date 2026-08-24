@@ -16,18 +16,18 @@ class OfflineNetworkError(OSError):
     """Raised when a test attempts to access a non-loopback network target."""
 
 
-_LIVE_API_CREDENTIAL_ENV_NAMES = (
-    "AUTO_GENERATE_LIVE_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "AUTO_GENERATE_DEEPSEEK_API_KEY",
-)
-
 _PROVIDER_CREDENTIAL_ENV_NAMES = {
     "deepseek": ("DEEPSEEK_API_KEY", "AUTO_GENERATE_DEEPSEEK_API_KEY"),
 }
 _PROVIDER_ALLOWED_EXTERNAL_HOSTS = {
     "deepseek": {"api.deepseek.com"},
 }
+
+
+def _credential_present(value: Any) -> bool:
+    """Treat empty and whitespace-only values as absent credentials."""
+
+    return bool(str(value or "").strip())
 
 
 def live_api_skip_reason(
@@ -41,15 +41,13 @@ def live_api_skip_reason(
     if environment.get("AUTO_GENERATE_RUN_LIVE_API") != "1":
         return "live API test not explicitly enabled"
     provider_name = str(provider or "").strip().casefold()
+    if not provider_name:
+        return "live API provider is required"
     if provider_name and provider_name not in _PROVIDER_CREDENTIAL_ENV_NAMES:
         return f"unsupported live API provider: {provider_name}"
-    credential_names = _PROVIDER_CREDENTIAL_ENV_NAMES.get(
-        provider_name, _LIVE_API_CREDENTIAL_ENV_NAMES
-    )
-    if not any(environment.get(name) for name in credential_names):
-        if provider_name:
-            return f"{provider_name} live API credential is not configured"
-        return "live API credential is not configured"
+    credential_names = _PROVIDER_CREDENTIAL_ENV_NAMES[provider_name]
+    if not any(_credential_present(environment.get(name)) for name in credential_names):
+        return f"{provider_name} live API credential is not configured"
     return None
 
 
@@ -127,7 +125,7 @@ def allow_live_provider(provider: str) -> Iterator[None]:
         raise OfflineNetworkError(f"unsupported live API provider: {provider_name or '<empty>'}")
     if os.environ.get("AUTO_GENERATE_RUN_LIVE_API") != "1":
         raise OfflineNetworkError("live API test is not explicitly enabled")
-    if not any(os.environ.get(name) for name in credential_names):
+    if not any(_credential_present(os.environ.get(name)) for name in credential_names):
         raise OfflineNetworkError(f"{provider_name} live API credential is not configured")
 
     previous_hosts = set(_AUTHORIZED_EXTERNAL_HOSTS)

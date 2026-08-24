@@ -1712,6 +1712,24 @@ def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mappi
         raise ArtifactSchemaError("stage1_visual_coverage raw reinspection closure is invalid")
     if not isinstance(root.get("page_status"), list) or not isinstance(root.get("scan_batches"), list):
         raise ArtifactSchemaError("stage1_visual_coverage page_status and scan_batches must be arrays")
+    valid_omission_scopes = {"page_coverage", "raw_reinspection", "final_transport"}
+    for field_name in ("omissions", "transport_omissions"):
+        if field_name not in root:
+            continue
+        omissions = root.get(field_name)
+        if not isinstance(omissions, list):
+            raise ArtifactSchemaError(
+                f"stage1_visual_coverage.{field_name} must be an array"
+            )
+        for omission in omissions:
+            if (
+                not isinstance(omission, Mapping)
+                or str(omission.get("scope") or "") not in valid_omission_scopes
+                or not isinstance(omission.get("authority_blocking"), bool)
+            ):
+                raise ArtifactSchemaError(
+                    f"stage1_visual_coverage.{field_name} omission contract is invalid"
+                )
 
 
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:

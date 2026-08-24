@@ -423,6 +423,9 @@ class Stage1InputBuilder:
             user_message_content.append(pdf_item)
         for visual in transport_visual_refs:
             image_path = str(visual.get("image_path") or "").strip()
+            raw_reinspection_group_id = str(
+                visual.get("raw_reinspection_group_id") or ""
+            )
             label = self._visual_label(visual)
             user_message_content.append({"type": "text", "text": label})
             user_message_content.append(
@@ -435,9 +438,7 @@ class Stage1InputBuilder:
                     "bbox": list(visual.get("bbox") or []),
                     "image_bytes": int(visual.get("image_bytes") or 0),
                     "image_sha256": str(visual.get("image_sha256") or ""),
-                    "raw_reinspection_group_id": str(
-                        visual.get("raw_reinspection_group_id") or ""
-                    ),
+                    "raw_reinspection_group_id": raw_reinspection_group_id,
                     "raw_reinspection_resolution": str(
                         visual.get("raw_reinspection_resolution") or ""
                     ),
@@ -459,6 +460,12 @@ class Stage1InputBuilder:
                     ),
                     "raw_reinspection_fallback_ref": dict(
                         visual.get("raw_reinspection_fallback_ref") or {}
+                    ),
+                    "transport_omission_scope": (
+                        "raw_reinspection" if raw_reinspection_group_id else "final_transport"
+                    ),
+                    "transport_omission_authority_blocking": (
+                        False if raw_reinspection_group_id else True
                     ),
                 }
             )

@@ -258,7 +258,15 @@ def build_visual_scan_user_content(
             if encoded_bytes + estimated > request_limit:
                 reason = "image_exceeds_request_byte_budget"
         if reason:
-            omissions.append({"visual_id": visual_id, "page_no": int(visual.get("page_no") or 0), "reason": reason})
+            omissions.append(
+                {
+                    "visual_id": visual_id,
+                    "page_no": int(visual.get("page_no") or 0),
+                    "reason": reason,
+                    "scope": "page_coverage",
+                    "authority_blocking": True,
+                }
+            )
             continue
         estimated = estimate_encoded_image_bytes(raw_bytes)
         encoded_bytes += estimated
@@ -287,6 +295,8 @@ def build_visual_scan_user_content(
             "artifact_type": str(visual.get("artifact_type") or ""),
             "image_sha256": str(visual.get("image_sha256") or _file_sha256(path)),
             "image_bytes": raw_bytes,
+            "transport_omission_scope": "page_coverage",
+            "transport_omission_authority_blocking": True,
         })
     report = {
         "identity_version": VISUAL_INPUT_IDENTITY_VERSION,

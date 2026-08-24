@@ -651,6 +651,38 @@ def _transport_visual_label(item: Mapping[str, Any]) -> str:
     )
 
 
+def _typed_transport_omission(
+    item: Mapping[str, Any] | None,
+    *,
+    reason: str,
+    visual_id: str = "",
+    page_no: int = 0,
+    default_scope: str = "final_transport",
+    **extra: Any,
+) -> Dict[str, Any]:
+    """Attach an explicit authority scope to every transport omission."""
+
+    source = dict(item or {})
+    group_id = str(source.get("raw_reinspection_group_id") or "").strip()
+    scope = (
+        "raw_reinspection"
+        if group_id
+        else str(source.get("transport_omission_scope") or default_scope).strip()
+    )
+    authority_blocking = source.get("transport_omission_authority_blocking")
+    if not isinstance(authority_blocking, bool):
+        authority_blocking = scope != "raw_reinspection"
+    omission: Dict[str, Any] = {
+        "visual_id": str(visual_id or source.get("visual_id") or ""),
+        "page_no": int(page_no or source.get("page_no") or 0),
+        "reason": str(reason or "transport_omission"),
+        "scope": scope,
+        "authority_blocking": authority_blocking,
+    }
+    omission.update({key: value for key, value in extra.items() if value is not None})
+    return omission
+
+
 def _drop_visual_label(output: List[Dict[str, Any]], visual_id: str) -> None:
     marker = f"visual_id={visual_id}"
     for index in range(len(output) - 1, -1, -1):
@@ -872,15 +904,14 @@ def freeze_local_visual_transport_content(
                 for member in member_indices:
                     replacements[member] = None
                     omissions.append(
-                        {
-                            "visual_id": str(raw_items[member].get("visual_id") or ""),
-                            "page_no": int(raw_items[member].get("page_no") or 0),
-                            "reason": "raw_reinspection_group_not_represented",
-                            "raw_reinspection_group_id": group_id,
-                            "raw_reinspection_resolution": "not_represented",
-                            "raw_reinspection_fallback_reason": fallback_reason,
-                            "raw_reinspection_planned_ids": candidate_ids,
-                        }
+                        _typed_transport_omission(
+                            raw_items[member],
+                            reason="raw_reinspection_group_not_represented",
+                            raw_reinspection_group_id=group_id,
+                            raw_reinspection_resolution="not_represented",
+                            raw_reinspection_fallback_reason=fallback_reason,
+                            raw_reinspection_planned_ids=candidate_ids,
+                        )
                     )
                 group_reports.append(
                     {
@@ -901,11 +932,10 @@ def freeze_local_visual_transport_content(
         if frozen is None:
             replacements[index] = None
             omissions.append(
-                {
-                    "visual_id": str(item.get("visual_id") or ""),
-                    "page_no": int(item.get("page_no") or 0),
-                    "reason": reason or "local_image_not_admitted",
-                }
+                _typed_transport_omission(
+                    item,
+                    reason=reason or "local_image_not_admitted",
+                )
             )
             continue
         visual_id = str(item.get("visual_id") or "")
@@ -1047,36 +1077,48 @@ def _normalize_user_message_content_with_report(
                 except OSError:
                     image_size = 0
                 if not path or not os.path.isfile(path) or image_size <= 0:
-                    omissions.append({
-                        "visual_id": visual_id,
-                        "page_no": page_no,
-                        "reason": "missing_or_unreadable_local_image",
-                    })
+                    omissions.append(
+                        _typed_transport_omission(
+                            item,
+                            reason="missing_or_unreadable_local_image",
+                            visual_id=visual_id,
+                            page_no=page_no,
+                        )
+                    )
                     if logger:
                         logger.warning(f"Skipping missing or unreadable local image input: {path}")
                     continue
                 if image_size > max_single:
-                    omissions.append({
-                        "visual_id": visual_id,
-                        "page_no": page_no,
-                        "reason": "image_exceeds_single_byte_budget",
-                    })
+                    omissions.append(
+                        _typed_transport_omission(
+                            item,
+                            reason="image_exceeds_single_byte_budget",
+                            visual_id=visual_id,
+                            page_no=page_no,
+                        )
+                    )
                     continue
                 data_url = _encode_local_image_as_data_url(path, max_image_bytes=max_single)
             estimated = estimate_encoded_image_bytes(image_size)
             if encoded_bytes + estimated > max_request:
-                omissions.append({
-                    "visual_id": visual_id,
-                    "page_no": page_no,
-                    "reason": "image_exceeds_request_byte_budget",
-                })
+                omissions.append(
+                    _typed_transport_omission(
+                        item,
+                        reason="image_exceeds_request_byte_budget",
+                        visual_id=visual_id,
+                        page_no=page_no,
+                    )
+                )
                 continue
             if not data_url:
-                omissions.append({
-                    "visual_id": visual_id,
-                    "page_no": page_no,
-                    "reason": "missing_or_oversized_local_image",
-                })
+                omissions.append(
+                    _typed_transport_omission(
+                        item,
+                        reason="missing_or_oversized_local_image",
+                        visual_id=visual_id,
+                        page_no=page_no,
+                    )
+                )
                 if logger:
                     logger.warning(f"Skipping missing or unreadable local image input: {path}")
                 continue
@@ -1118,7 +1160,12 @@ def _normalize_user_message_content_with_report(
             path = str(item.get("path") or "").strip()
             data_url = _encode_local_pdf_as_data_url(path)
             if not data_url:
-                omissions.append({"visual_id": "", "reason": "missing_or_unreadable_local_pdf"})
+                omissions.append(
+                    _typed_transport_omission(
+                        item,
+                        reason="missing_or_unreadable_local_pdf",
+                    )
+                )
                 if logger:
                     logger.warning(f"Skipping missing or unreadable local PDF input: {path}")
                 continue

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from services.stage1_reuse import (
     Stage1ReusableSummaryBindingV1,
     Stage1VisualEvidenceQualificationV1,
@@ -76,3 +78,150 @@ def test_explicit_degraded_policy_allows_unresolved_raw_unit_reuse_gate() -> Non
 
     assert "raw_reinspection_units_unresolved" not in qualification.qualification_issues()
     assert qualification.complete_for_reuse() is True
+
+
+def test_explicit_degraded_policy_allows_typed_raw_transport_omission() -> None:
+    qualification = Stage1VisualEvidenceQualificationV1(
+        require_complete_visual_coverage=False,
+        required_nonblank_page_count=1,
+        required_page_ids=("page-004",),
+        sent_page_ids=("page-004",),
+        observed_page_ids=("page-004",),
+        scan_coverage_status="complete",
+        evidence_coverage_status="degraded",
+        visual_observation_artifact_version="v2",
+        visual_scan_prompt_id="stage1.visual_scan.system.v2",
+        visual_scan_prompt_version="v2",
+        visual_scan_prompt_sha256="a" * 64,
+        visual_scan_schema_hash="b" * 64,
+        required_raw_reinspection_unit_count=1,
+        closed_raw_reinspection_unit_count=0,
+        unresolved_raw_reinspection_unit_ids=("ambiguous-page-4",),
+        raw_reinspection_units=(
+            {"unit_id": "ambiguous-page-4", "closed": False},
+        ),
+        transport_omissions=(
+            {
+                "visual_id": "figure-4-a",
+                "page_no": 4,
+                "reason": "raw_reinspection_group_not_represented",
+                "scope": "raw_reinspection",
+                "authority_blocking": False,
+                "raw_reinspection_group_id": "ambiguous-page-4",
+                "raw_reinspection_resolution": "not_represented",
+            },
+        ),
+    )
+
+    assert "raw_reinspection_transport_omitted" not in qualification.qualification_issues()
+    assert qualification.complete_for_reuse() is True
+
+
+@pytest.mark.parametrize(
+    ("scan_coverage_status", "evidence_coverage_status"),
+    [("partial", "degraded"), ("complete", "complete")],
+)
+def test_relaxed_raw_omission_requires_complete_degraded_authority(
+    scan_coverage_status: str,
+    evidence_coverage_status: str,
+) -> None:
+    qualification = Stage1VisualEvidenceQualificationV1(
+        require_complete_visual_coverage=False,
+        required_nonblank_page_count=1,
+        required_page_ids=("page-004",),
+        sent_page_ids=("page-004",),
+        observed_page_ids=("page-004",),
+        scan_coverage_status=scan_coverage_status,
+        evidence_coverage_status=evidence_coverage_status,
+        visual_observation_artifact_version="v2",
+        visual_scan_prompt_id="stage1.visual_scan.system.v2",
+        visual_scan_prompt_version="v2",
+        visual_scan_prompt_sha256="a" * 64,
+        visual_scan_schema_hash="b" * 64,
+        required_raw_reinspection_unit_count=1,
+        closed_raw_reinspection_unit_count=0,
+        unresolved_raw_reinspection_unit_ids=("ambiguous-page-4",),
+        raw_reinspection_units=(
+            {"unit_id": "ambiguous-page-4", "closed": False},
+        ),
+        transport_omissions=(
+            {
+                "visual_id": "figure-4-a",
+                "page_no": 4,
+                "reason": "raw_reinspection_group_not_represented",
+                "scope": "raw_reinspection",
+                "authority_blocking": False,
+                "raw_reinspection_group_id": "ambiguous-page-4",
+                "raw_reinspection_resolution": "not_represented",
+            },
+        ),
+    )
+
+    assert "raw_reinspection_relaxed_authority_invalid" in qualification.qualification_issues()
+    assert qualification.complete_for_reuse() is False
+
+
+def test_raw_reinspection_omission_must_bind_unresolved_unit() -> None:
+    qualification = Stage1VisualEvidenceQualificationV1(
+        require_complete_visual_coverage=False,
+        scan_coverage_status="complete",
+        evidence_coverage_status="degraded",
+        required_raw_reinspection_unit_count=1,
+        closed_raw_reinspection_unit_count=0,
+        unresolved_raw_reinspection_unit_ids=("ambiguous-page-4",),
+        raw_reinspection_units=(
+            {"unit_id": "ambiguous-page-4", "closed": False},
+        ),
+        transport_omissions=(
+            {
+                "visual_id": "figure-4-a",
+                "page_no": 4,
+                "reason": "raw_reinspection_group_not_represented",
+                "scope": "raw_reinspection",
+                "authority_blocking": False,
+                "raw_reinspection_group_id": "different-unit",
+            },
+        ),
+    )
+
+    assert "raw_reinspection_relaxed_authority_invalid" in qualification.qualification_issues()
+    assert qualification.complete_for_reuse() is False
+
+
+@pytest.mark.parametrize("scope", ["page_coverage", "final_transport"])
+def test_non_raw_omissions_cannot_be_nonblocking(scope: str) -> None:
+    qualification = Stage1VisualEvidenceQualificationV1(
+        require_complete_visual_coverage=False,
+        transport_omissions=(
+            {
+                "visual_id": "visual-1",
+                "page_no": 1,
+                "reason": "transport_omission",
+                "scope": scope,
+                "authority_blocking": False,
+            },
+        ),
+    )
+
+    assert "transport_omission_contract_invalid" in qualification.qualification_issues()
+    assert qualification.complete_for_reuse() is False
+
+
+def test_degraded_policy_does_not_relax_typed_page_coverage_omission() -> None:
+    qualification = Stage1VisualEvidenceQualificationV1(
+        require_complete_visual_coverage=False,
+        scan_coverage_status="partial",
+        evidence_coverage_status="incomplete",
+        transport_omissions=(
+            {
+                "visual_id": "page-4",
+                "page_no": 4,
+                "reason": "scan_failed",
+                "scope": "page_coverage",
+                "authority_blocking": True,
+            },
+        ),
+    )
+
+    assert "page_coverage_transport_omitted" in qualification.qualification_issues()
+    assert qualification.complete_for_reuse() is False

@@ -625,3 +625,180 @@ def test_explicit_degraded_visual_policy_allows_reuse_with_status_preserved(tmp_
     assert len(calls) == first_call_count
     assert second.actual_provider_transport_count == 0
     assert second.summaries[0]["stage1_reuse"]["decision"] == "exact_summary_reuse"
+
+
+@pytest.mark.parametrize(
+    ("require_complete", "expected_reused"),
+    [(False, True), (True, False)],
+)
+def test_real_not_represented_raw_unit_respects_reuse_policy(
+    tmp_path: Path,
+    require_complete: bool,
+    expected_reused: bool,
+) -> None:
+    """Exercise the actual scan -> freeze -> qualification -> reuse chain."""
+
+    pdf_path = tmp_path / f"not-represented-{require_complete}.pdf"
+    document = fitz.open()
+    for page_no in range(13):
+        page = document.new_page()
+        page.insert_text(
+            (72, 72),
+            f"Page {page_no + 1} framework evidence\n"
+            "Results: treatment improved the outcome by 17.3 percent.",
+        )
+    document.save(pdf_path)
+    document.close()
+    calls: list[str] = []
+
+    def reader(**kwargs: Any) -> dict[str, Any]:
+        if kwargs.get("purpose") == "visual_scan":
+            batch = kwargs["visual_scan_batch"]
+            observations = _long_scan_content(batch)["observations"]
+            for observation in observations:
+                if int(observation.get("page_no") or 0) != 7:
+                    continue
+                candidates = [
+                    dict(item)
+                    for item in (batch.get("child_candidates") or [])
+                    if isinstance(item, dict)
+                    and int(item.get("page_no") or 0) == 7
+                ]
+                observation["candidate_attribution_status"] = "ambiguous"
+                observation["raw_reinspection_candidates"] = [
+                    {
+                        "candidate_visual_id": str(item["candidate_visual_id"]),
+                        "evidence_kinds": ["visible_text"],
+                        "reason": "the page resolution cannot distinguish the two objects",
+                        "confidence": "low",
+                        "requires_raw_reinspection": True,
+                    }
+                    for item in candidates
+                ]
+            calls.append("visual_scan")
+            return {
+                "status": "success",
+                "content": {
+                    "artifact_type": "stage1_visual_observations",
+                    "artifact_version": "v2",
+                    "observations": observations,
+                },
+            }
+        calls.append("synthesis")
+        return {"status": "success", "content": _canonical_summary()}
+
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader,
+        config_overrides=_long_visual_config(require_complete=require_complete),
+    )
+    original_build_visual_bundle = service._build_visual_bundle
+
+    def build_bundle_with_ambiguous_pair(
+        item: Any,
+        preprocess_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        visual_bundle = original_build_visual_bundle(item, preprocess_metadata)
+        refs = [
+            dict(ref)
+            for ref in (visual_bundle.get("all_visual_refs") or [])
+            if isinstance(ref, dict)
+        ]
+        source = next(
+            ref
+            for ref in refs
+            if int(ref.get("page_no") or 0) == 7
+            and str(ref.get("artifact_type") or "") == "page_snapshot"
+        )
+        child_a = {
+            **source,
+            "visual_id": "figure-007-raw-a",
+            "artifact_type": "figure_crop",
+            "bbox": [0, 0, 100, 100],
+            "selection_score": 1.0,
+            "dedupe_group_id": "raw-not-represented",
+        }
+        child_b = {
+            **child_a,
+            "visual_id": "figure-007-raw-b",
+            "bbox": [5, 5, 95, 95],
+            "selection_score": 0.9,
+        }
+        refs.extend([child_a, child_b])
+        visual_bundle["all_visual_refs"] = refs
+        visual_bundle["selected_visual_refs"] = refs
+        return visual_bundle
+
+    service._build_visual_bundle = build_bundle_with_ambiguous_pair  # type: ignore[method-assign]
+
+    original_freeze = service._freeze_synthesis_visual_transport
+
+    def freeze_after_filesystem_mutation(prepared: Any) -> Any:
+        targets: dict[Path, bytes] = {}
+        for item in prepared.built_input.user_message_content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "local_image_path":
+                continue
+            if not str(item.get("raw_reinspection_group_id") or "").strip():
+                continue
+            path = Path(str(item.get("path") or ""))
+            if path.is_file():
+                targets[path] = path.read_bytes()
+            fallback = item.get("raw_reinspection_fallback_ref")
+            if isinstance(fallback, dict):
+                fallback_path = Path(str(fallback.get("image_path") or ""))
+                if fallback_path.is_file():
+                    targets[fallback_path] = fallback_path.read_bytes()
+        for path in targets:
+            path.unlink()
+        try:
+            return original_freeze(prepared)
+        finally:
+            for path, content in targets.items():
+                path.write_bytes(content)
+
+    service._freeze_synthesis_visual_transport = freeze_after_filesystem_mutation  # type: ignore[method-assign]
+    first = service.run(bundle)
+
+    summary = first.summaries[0]
+    coverage = summary["stage1_input"]["visual_coverage"]
+    omission = next(
+        item
+        for item in coverage["transport_omissions"]
+        if item.get("reason") == "raw_reinspection_group_not_represented"
+    )
+    assert omission["scope"] == "raw_reinspection"
+    assert omission["authority_blocking"] is False
+    assert coverage["scan_coverage_status"] == "complete"
+    assert coverage["evidence_coverage_status"] == (
+        "degraded" if not require_complete else "incomplete"
+    )
+    assert coverage["unresolved_raw_reinspection_unit_ids"]
+    assert summary["ai_summary"]["quality_audit"]["needs_manual_review"] is True
+    first_call_count = len(calls)
+
+    second = service.run(bundle, existing_summaries=first.summaries)
+
+    assert second.reused_count == (1 if expected_reused else 0)
+    assert second.generated_count == (0 if expected_reused else 1)
+    if expected_reused:
+        assert len(calls) == first_call_count
+        reused_qualification = second.summaries[0]["stage1_reuse"]["binding"][
+            "visual_evidence_qualification"
+        ]
+        assert reused_qualification["evidence_coverage_status"] == "degraded"
+        assert reused_qualification["final_raw_visual_recheck_status"] != "complete"
+        assert reused_qualification["unresolved_raw_reinspection_unit_ids"]
+
+        service.settings.sections["Stage1_Input"][
+            "require_complete_visual_coverage"
+        ] = "true"
+        switched_to_strict = service.run(bundle, existing_summaries=first.summaries)
+        assert switched_to_strict.reused_count == 0
+        assert switched_to_strict.generated_count == 1
+        assert len(calls) > first_call_count
+    else:
+        assert len(calls) > first_call_count
+        assert second.summaries[0]["stage1_reuse"]["decision"] != "exact_summary_reuse"

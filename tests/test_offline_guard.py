@@ -60,7 +60,7 @@ def test_python_subprocess_inherits_offline_guard() -> None:
         (
             {"live_api"},
             {"AUTO_GENERATE_RUN_LIVE_API": "1"},
-            "live API credential is not configured",
+            "live API provider is required",
         ),
         (
             {"live_api"},
@@ -73,7 +73,7 @@ def test_python_subprocess_inherits_offline_guard() -> None:
                 "AUTO_GENERATE_RUN_LIVE_API": "1",
                 "AUTO_GENERATE_LIVE_API_KEY": "test-key",
             },
-            None,
+            "live API provider is required",
         ),
     ],
 )
@@ -122,6 +122,48 @@ def test_provider_aware_deepseek_live_gate_never_uses_other_provider_keys(
     assert (
         live_api_skip_reason({"live_api"}, environment, provider="deepseek")
         == expected_reason
+    )
+
+
+@pytest.mark.parametrize("credential_name", ["DEEPSEEK_API_KEY", "AUTO_GENERATE_DEEPSEEK_API_KEY"])
+@pytest.mark.parametrize("credential_value", ["", "   ", "\t\r\n"])
+def test_whitespace_only_deepseek_credentials_are_not_present(
+    credential_name: str,
+    credential_value: str,
+) -> None:
+    environment = {
+        "AUTO_GENERATE_RUN_LIVE_API": "1",
+        credential_name: credential_value,
+    }
+
+    assert (
+        live_api_skip_reason({"live_api"}, environment, provider="deepseek")
+        == "deepseek live API credential is not configured"
+    )
+
+
+def test_allow_live_provider_rejects_whitespace_only_deepseek_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_API", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "   ")
+    monkeypatch.delenv("AUTO_GENERATE_DEEPSEEK_API_KEY", raising=False)
+
+    with pytest.raises(OfflineNetworkError, match="credential is not configured"):
+        with offline_guard.allow_live_provider("deepseek"):
+            pass
+
+
+def test_providerless_live_marker_fails_closed() -> None:
+    assert (
+        live_api_skip_reason(
+            {"live_api"},
+            {
+                "AUTO_GENERATE_RUN_LIVE_API": "1",
+                "AUTO_GENERATE_LIVE_API_KEY": "generic-secret",
+            },
+        )
+        == "live API provider is required"
     )
 
 

@@ -423,7 +423,17 @@ class Stage1VisualArtifactBuilder:
                 "required_raw_reinspection_unit_count": 0,
                 "closed_raw_reinspection_unit_count": 0,
                 "unresolved_raw_reinspection_unit_ids": [],
-                "omissions": [item for item in page_status if item["status"] == "render_failed"],
+                "omissions": [
+                    {
+                        "visual_id": f"page-{int(item['page_no']):03d}",
+                        "page_no": int(item["page_no"]),
+                        "reason": str(item.get("skipped_reason") or "render_failed"),
+                        "scope": "page_coverage",
+                        "authority_blocking": True,
+                    }
+                    for item in page_status
+                    if item["status"] == "render_failed"
+                ],
             }
             manifest_payload["coverage_report"] = coverage_report
             manifest_dependencies = [*depends_on, *(
