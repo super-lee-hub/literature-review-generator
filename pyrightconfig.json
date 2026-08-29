@@ -13,6 +13,18 @@
     "**/output",
     "**/tmp"
   ],
+  // Pyright's default virtual-environment name is ".venv", but this project
+  // uses "venv". Without this, Pyright falls back to whatever interpreter it
+  // finds on PATH -- on a machine with a conda install that can be an unrelated
+  // environment, which produced 19 errors that do not exist in the code (six
+  // unresolved imports for packages that are declared and installed, and
+  // thirteen bogus FunctionType attribute errors). Pointing at the project
+  // environment makes a plain `python -m pyright` agree with CI.
+  //
+  // CI installs into its own interpreter and has no "venv" directory, in which
+  // case Pyright falls back to the default environment exactly as before.
+  "venvPath": ".",
+  "venv": "venv",
   "executionEnvironments": [
     {
       "root": "."
