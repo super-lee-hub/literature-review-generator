@@ -829,6 +829,12 @@ class InternalStageExecutorRegistry:
             endpoint_type=capability.endpoint_type,
             model_context_limit=model_context_limit,
             max_output_tokens=max_output_tokens,
+            # Admission knobs are read from the role's own section. Left to the
+            # conservative defaults, every role would silently inherit the
+            # Outline model's headroom, which is wrong for a cheaper critic or a
+            # larger-context generator.
+            reasoning_reserve=self._positive_int(api_config.get("reasoning_reserve_tokens"), 2_048),
+            safety_margin=self._positive_int(api_config.get("safety_margin_tokens"), 1_024),
         )
         return OutlineRoleRoute(
             role=role,
@@ -838,6 +844,8 @@ class InternalStageExecutorRegistry:
             endpoint_type=capability.endpoint_type,
             profile=profile,
             transport=self._outline_provider(session, profile, api_config),
+            # Gateway identity only; safe_host() strips anything credential-shaped.
+            api_base=str(api_config.get("api_base") or "").strip(),
         )
 
     def _execute_outline(

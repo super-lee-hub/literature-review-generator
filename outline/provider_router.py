@@ -23,6 +23,8 @@ bug this module exists to close.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -77,6 +79,24 @@ INTENDED_SHARED_IDENTITY_ROLES = frozenset({GENERATION_ROLE, ARBITRATION_ROLE})
 ProviderTransport = Callable[[str, Mapping[str, Any]], Any]
 
 
+def safe_host(api_base: str) -> str:
+    """Reduce a base URL to a bare host, dropping anything that could be secret.
+
+    ``https://user:pass@gate.test/v1?key=abc`` becomes ``gate.test``. Persisted
+    node identity needs to distinguish gateways, so the host is kept -- but
+    credentials, paths and query strings are not.
+    """
+
+    text = str(api_base or "").strip()
+    if not text:
+        return ""
+    host = text.split("://", 1)[-1] if "://" in text else text
+    host = host.split("/", 1)[0].split("?", 1)[0]
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    return host.strip().lower()
+
+
 def semantic_role(node_id: str) -> str:
     """Collapse a concrete node id onto its semantic role.
 
@@ -103,12 +123,53 @@ class OutlineRoleRoute:
     endpoint_type: str
     profile: ProviderContextProfile
     transport: ProviderTransport | None = None
+    # Gateway identity. This is a host, never a credential: userinfo, path and
+    # query are stripped before it is ever stored, so nothing secret can leak
+    # into a binding, receipt, replay key, registry record or log.
+    api_base: str = ""
 
     @property
     def identity(self) -> tuple[str, str, str]:
-        """The identity that receipts and replay hashes must bind to."""
+        """Routing-plan identity: which model serves this role."""
 
         return (self.provider_name, self.model, self.endpoint_type)
+
+    @property
+    def binding_identity(self) -> tuple[str, str, str, str]:
+        """Durable node identity, used for bindings, receipts and replay keys.
+
+        Wider than ``identity`` on purpose. The same model behind a different
+        gateway is a different execution target, so changing ``api_base`` must
+        invalidate that node's reuse just as a model change would.
+        """
+
+        return (self.provider_name, self.model, self.endpoint_type, safe_host(self.api_base))
+
+    @property
+    def api_base_host(self) -> str:
+        return safe_host(self.api_base)
+
+    def safe_config_fingerprint(self) -> str:
+        """A secret-free fingerprint of everything that shapes this node's call.
+
+        Deliberately assembled from an allow-list rather than by hashing the raw
+        provider config, which would pull credentials into a persisted hash.
+        """
+
+        payload = {
+            "config_section": self.config_section,
+            "provider": self.provider_name,
+            "model": self.model,
+            "endpoint_type": self.endpoint_type,
+            "api_base_host": self.api_base_host,
+            "model_context_limit": int(getattr(self.profile, "model_context_limit", 0) or 0),
+            "max_output_tokens": int(getattr(self.profile, "max_output_tokens", 0) or 0),
+            "reasoning_reserve": int(getattr(self.profile, "reasoning_reserve", 0) or 0),
+            "safety_margin": int(getattr(self.profile, "safety_margin", 0) or 0),
+            "tokenizer_strategy": str(getattr(self.profile, "tokenizer_strategy", "") or ""),
+        }
+        encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -117,6 +178,9 @@ class OutlineRoleRoute:
             "provider": self.provider_name,
             "model": self.model,
             "endpoint_type": self.endpoint_type,
+            "api_base_host": self.api_base_host,
+            "binding_identity": list(self.binding_identity),
+            "config_fingerprint": self.safe_config_fingerprint(),
         }
 
 

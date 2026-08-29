@@ -474,6 +474,43 @@ class OutlineV3Executor:
             transport=self.provider if callable(self.provider) else None,
         )
 
+    def _resolve_node_transport(self, node_id: str, route: OutlineRoleRoute) -> Any:
+        """Return the transport that must execute one node.
+
+        When a role router is configured it is authoritative. Falling back to the
+        executor's single provider here would silently collapse every node onto
+        the Outline model -- the exact defect role routing exists to prevent --
+        so a routed node without a transport fails closed instead.
+
+        Without a router the pre-existing single-provider behaviour is kept, so
+        older single-model callers are unaffected.
+        """
+
+        if self.router is not None:
+            if route.transport is None:
+                raise OutlineV3ExecutionError(
+                    f"no transport configured for routed node {node_id} "
+                    f"(role {route.role!r}, section {route.config_section!r}); "
+                    "refusing to fall back to the Outline provider"
+                )
+            return route.transport
+        return self.provider
+
+    def _node_route(self, node_id: str, transport_node_id: str | None = None) -> OutlineRoleRoute:
+        """Resolve the route that must execute one concrete node.
+
+        A stability node carries its own durable audit identity
+        (``stability:<audit>:<base>``) but must still execute on the *base*
+        node's provider route, otherwise a stability audit would fall back to
+        whatever provider the executor was constructed with. The stability
+        prefix is therefore stripped before the semantic role is resolved.
+        """
+
+        effective = str(transport_node_id or node_id)
+        if effective.startswith("stability:"):
+            effective = effective.rsplit(":", 1)[-1]
+        return self._role_route(effective)
+
     def _compute_current_coverage_contract_hash(self) -> str:
         try:
             evidence = build_outline_evidence_views(self.summaries, self.job_id)
@@ -962,8 +999,14 @@ class OutlineV3Executor:
         prompt_template_hash: str = "",
         prompt_payload_hash: str = "",
         api_config: Mapping[str, Any] | None = None,
+        route: OutlineRoleRoute | None = None,
     ) -> dict[str, Any]:
-        """Build the complete current binding before attempting node reuse."""
+        """Build the complete current binding before attempting node reuse.
+
+        ``route`` carries the node's real provider identity. When it is omitted a
+        provider node falls back to the executor-level profile, which is only
+        correct for the pre-router single-provider path.
+        """
 
         if artifact_type == "outline_artifact":
             artifact_type = self._artifact_type_for_node(node_id)
@@ -974,14 +1017,34 @@ class OutlineV3Executor:
             "provider_receipt_closure", "stage_health",
         }
         provider_node = node_id in self._provider_node_ids() or node_id.startswith("stability:")
+        resolved_route = route if route is not None else (self._node_route(node_id) if provider_node else None)
+        if provider_node and resolved_route is not None:
+            bind_provider = resolved_route.provider_name
+            bind_model = resolved_route.model
+            bind_endpoint = resolved_route.endpoint_type
+            bind_section = resolved_route.config_section
+        else:
+            bind_provider = self.profile.provider if provider_node else "local"
+            bind_model = self.profile.model if provider_node else model
+            bind_endpoint = self.profile.endpoint_type if provider_node else "internal"
+            bind_section = ""
         config = dict(api_config or {})
         if provider_node:
             config.update({
-                "provider": self.profile.provider,
-                "model": self.profile.model,
-                "endpoint_type": self.profile.endpoint_type,
+                "provider": bind_provider,
+                "model": bind_model,
+                "endpoint_type": bind_endpoint,
+                "config_section": bind_section,
                 "route": provider,
             })
+            if resolved_route is not None:
+                # Gateway identity and a secret-free fingerprint of the knobs
+                # that shape this node's call. The raw provider config is
+                # deliberately not hashed here: it can carry credentials.
+                config.update({
+                    "api_base_host": resolved_route.api_base_host,
+                    "route_fingerprint": resolved_route.safe_config_fingerprint(),
+                })
         candidate_sensitive = (
             node_id in review_nodes
             or node_id.startswith("candidate_")
@@ -1005,10 +1068,10 @@ class OutlineV3Executor:
             "coverage_contract_hash": self._coverage_contract_hash if node_id in review_nodes else "",
             "quality_gate_hash": self.quality_gate.content_hash if node_id in review_nodes else "",
             "candidate_count": self.candidate_count if node_id in review_nodes or node_id.startswith("candidate_") else 0,
-            "provider_route": provider if provider_node else "local",
-            "provider_family": self.profile.provider if provider_node else "local",
-            "model_name": self.profile.model if provider_node else model,
-            "endpoint_type": self.profile.endpoint_type if provider_node else "internal",
+            "provider_route": (bind_section or provider) if provider_node else "local",
+            "provider_family": bind_provider,
+            "model_name": bind_model,
+            "endpoint_type": bind_endpoint,
             "prompt_template_hash": prompt_template_hash,
             "prompt_payload_hash": prompt_payload_hash,
             "prompt_hash": hash_text(json.dumps(prompt, sort_keys=True, ensure_ascii=False)) if prompt is not None else "",
@@ -1021,13 +1084,26 @@ class OutlineV3Executor:
             "relevant_runtime_config_hash": _hash_payload(relevant_config),
         }
 
-    def _provider_binding(self, node_id: str, request: Mapping[str, Any], *, expect_json: bool, input_artifact_hashes: Sequence[str]) -> dict[str, Any]:
+    def _provider_binding(
+        self,
+        node_id: str,
+        request: Mapping[str, Any],
+        *,
+        expect_json: bool,
+        input_artifact_hashes: Sequence[str],
+        route: OutlineRoleRoute | None = None,
+    ) -> dict[str, Any]:
         semantic_node_id = self._semantic_node_id(node_id)
+        resolved_route = route if route is not None else self._node_route(node_id)
         api_config = {
-            "provider_family": self.profile.provider,
-            "model": self.profile.model,
-            "api_base": "internal",
-            "endpoint_type": self.profile.endpoint_type,
+            "provider_family": resolved_route.provider_name,
+            "model": resolved_route.model,
+            # Gateway host only. A base URL is persisted nowhere in full, so
+            # neither a path nor a credential can reach a binding or a receipt.
+            "api_base": resolved_route.api_base_host,
+            "endpoint_type": resolved_route.endpoint_type,
+            "config_section": resolved_route.config_section,
+            "route_fingerprint": resolved_route.safe_config_fingerprint(),
         }
         return self.build_current_node_binding(
             node_id,
@@ -1037,12 +1113,13 @@ class OutlineV3Executor:
                 f"input_{index}": value
                 for index, value in enumerate(sorted(str(item) for item in input_artifact_hashes if str(item)))
             },
-            model=self.profile.model,
+            model=resolved_route.model,
             provider=semantic_node_id,
             prompt=request,
             prompt_template_hash=self._outline_prompt_identity.sha256,
             prompt_payload_hash=hash_json(request),
             api_config=api_config,
+            route=resolved_route,
         )
 
     def _replay_record_is_valid(self, record: Any, binding: Mapping[str, Any]) -> bool:
@@ -1540,18 +1617,28 @@ class OutlineV3Executor:
         transport_node_id: str | None = None,
     ) -> dict[str, Any]:
         request = self._attach_prompt_authority(node_id, request)
-        budget = self.profile.estimate_request(request)
+        # The route is the runtime authority for this node. Budget, binding,
+        # replay identity, receipt and the actual transport all derive from it;
+        # using the executor-level profile here would collapse every node onto
+        # the Outline model and defeat the point of role routing.
+        route = self._node_route(node_id, transport_node_id)
+        profile = route.profile
+        budget = profile.estimate_request(request)
         api_config = {
-            "provider_family": self.profile.provider,
-            "model": self.profile.model,
-            "api_base": "internal",
-            "endpoint_type": self.profile.endpoint_type,
+            "provider_family": route.provider_name,
+            "model": route.model,
+            # Gateway host only; no path and no credential is ever persisted.
+            "api_base": route.api_base_host,
+            "endpoint_type": route.endpoint_type,
+            "config_section": route.config_section,
+            "route_fingerprint": route.safe_config_fingerprint(),
         }
         binding = self._provider_binding(
             node_id,
             request,
             expect_json=expect_json,
             input_artifact_hashes=input_artifact_hashes,
+            route=route,
         )
         call_id = self._register_expected_from_binding(node_id, binding)
         semantic_node_id = self._semantic_node_id(node_id)
@@ -1559,9 +1646,9 @@ class OutlineV3Executor:
             node_id=semantic_node_id,
             node_version="v3",
             schema_version="outline-v3",
-            model_route=self.profile.provider,
-            model_name=self.profile.model,
-            provider=self.profile.provider,
+            model_route=route.config_section or route.provider_name,
+            model_name=route.model,
+            provider=route.provider_name,
             prompt_template_hash=self._outline_prompt_identity.sha256,
             prompt_payload_hash=hash_json(request),
             input_artifact_hashes=sorted(str(item) for item in input_artifact_hashes if str(item)),
@@ -1625,7 +1712,7 @@ class OutlineV3Executor:
             call_id=call_id,
             closure_epoch_id=self.closure_epoch_id,
             logical_attempt_identity=self.logical_attempt_identity,
-            endpoint_type=self.profile.endpoint_type,
+            endpoint_type=route.endpoint_type,
             schema_hash=str(binding["schema_hash"]),
             prompt_id=self._outline_prompt_identity.prompt_id,
             prompt_version=self._outline_prompt_identity.version,
@@ -1641,7 +1728,8 @@ class OutlineV3Executor:
                 f"outline provider call budget exhausted before {node_id}"
             )
         self._provider_call_count += 1
-        if self.provider is None:
+        transport = self._resolve_node_transport(node_id, route)
+        if transport is None:
             if node_id.startswith("stability:"):
                 raise OutlineV3ExecutionError(
                     "stability audit requires a configured provider; fixture responses are not admissible"
@@ -1651,9 +1739,9 @@ class OutlineV3Executor:
             self._transport_call_count += 1
             provider_node_id = str(transport_node_id or node_id)
             raw = (
-                self.provider(provider_node_id, request)
-                if callable(self.provider)
-                else self.provider.call(provider_node_id, request)
+                transport(provider_node_id, request)
+                if callable(transport)
+                else transport.call(provider_node_id, request)
             )
         response = _provider_result(raw)
         completion = ProviderCompletionEvaluator.evaluate(response, minimum_output=2, expect_json=expect_json)
