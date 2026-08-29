@@ -25,12 +25,17 @@ Bridge 会在 workspace 中记录规范化 source input 和执行模式，包括
 - Stage 1 使用当前 preprocessing、source identity、summary 和 reuse contracts。
 - Stage 2 仅使用 Outline Intelligence v3。
 - Stage 3 通过 `services/review_generation_service.py` 生成
-  `review_draft` artifact version v3、`citation_manifest` v3 和 DOCX。
+  `review_draft` artifact version v3、`citation_manifest` v3 和 DOCX。它是一个 Review
+  阶段；`Writer_API` 是该阶段内部按 adopted outline section 调用一次的 provider。
 - Validation 使用 `ValidationExecutionService`、`current_validation`、
   `adjudication_reuse` 和带 Registry dependency 的 `closure`。
 
 Concept Mode is currently disabled。过时请求在当前边界失败，不会转化为 provider
 调用。
+
+Outline v3 将候选生成与最终仲裁路由到配置的 Claude Opus 5，将结构/证据审查路由到
+配置的 GPT-5.6-sol Responses，将关系/覆盖度审查路由到配置的 DeepSeek V4 Pro。第三方
+gateway host 只作为传输身份记录，不能证明其上游是官方服务。
 
 ## Resume 与 authority
 

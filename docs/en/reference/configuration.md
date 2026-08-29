@@ -103,6 +103,24 @@ explicitly instead of silently degrading to single-model self-review.
 A role that cannot be resolved is never quietly remapped onto `Outline_API`. It
 is recorded as a diagnostic, and resolving that node fails closed.
 
+The shipped role mapping is:
+
+| Outline role | API section | Model | Wire endpoint / network ownership |
+| --- | --- | --- | --- |
+| Relation adjudication | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions, DeepSeek official API |
+| Candidate generation | `Outline_API` | Claude Opus 5 | Native Anthropic Messages through `chat.178266.xyz`, third-party gateway |
+| Structure critique | `Writer_API` | GPT-5.6-sol | OpenAI Responses-compatible transport through `ai.saigou.work`, third-party gateway |
+| Coverage critique | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions, DeepSeek official API |
+| Evidence critique | `Writer_API` | GPT-5.6-sol | OpenAI Responses-compatible transport through `ai.saigou.work`, third-party gateway |
+| Arbitration | `Outline_API` | Claude Opus 5 | Native Anthropic Messages through `chat.178266.xyz`, third-party gateway |
+
+The endpoint/protocol and the model brand are separate facts. A request sent to
+`chat.178266.xyz` or `ai.saigou.work` is a request to a third-party gateway; the
+project does not claim that the gateway is an official Anthropic or OpenAI
+connection merely because it serves a Claude or GPT model name. The runtime
+persists the gateway host and a secret-free route fingerprint in bindings and
+receipts, while credentials remain in `.env` or the local credential store.
+
 ## Anthropic Messages Transport
 
 `endpoint_type` supports `chat_completions`, `responses`, and `anthropic`. With
@@ -122,9 +140,37 @@ is recorded as a diagnostic, and resolving that node fails closed.
 * the response `content` is a block list, and only blocks with `type == "text"`
   count as answer content.
 
+For Claude Opus 5, the current request policy is adaptive thinking with
+`output_config.effort`; the legacy `enabled` plus `budget_tokens` form is not
+sent. `thinking_budget_tokens` is retained only for manually configured legacy
+Claude generations that still require it.
+
 A Claude model name alone does **not** trigger protocol inference: the same model
 id may be served by an Anthropic endpoint or by an OpenAI-compatible gateway, and
 guessing from the name would select the wrong wire format.
+
+## Stage 3 Review and Writer
+
+“Stage 3 Review” and “Writer” are two layers of one stage, not two independent
+pipeline stages. Stage 3 is the review-generation workflow; `Writer_API` is the
+provider/model it calls once per adopted Outline v3 section. The Writer produces
+structured section blocks and citation tokens. The runtime then publishes the
+canonical `review_draft/v3`, `citation_manifest/v3`, and DOCX artifacts and
+closes the Stage 3 provider receipts. The separate `Validator_API` is used only
+when the validation stage is requested.
+
+## Explicit configuration migration
+
+The loader is fail-closed and does not silently rewrite old files. Migrate an
+older config explicitly, with an atomic same-directory replace and a backup:
+
+```bash
+python -m reviewctl config-migrate --config config.ini
+```
+
+Use `--dry-run` to inspect the report. Ambiguous legacy `[API_Parameters]` keys
+are preserved in a marked comment block by default; `--drop-unknown-legacy` is
+the explicit opt-in to discard them.
 
 ## Migration and Evidence
 

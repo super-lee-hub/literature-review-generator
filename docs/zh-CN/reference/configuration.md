@@ -92,6 +92,22 @@ critiques。因此只有「某个 critique 与候选生成撞成同一 provider�
 无法解析的角色不会被悄悄改指到 `Outline_API`——它们会被记录为诊断，节点取路由时
 fail-closed 抛错。
 
+当前发布的角色映射如下：
+
+| Outline 角色 | API section | 模型 | 传输协议 / 网络归属 |
+| --- | --- | --- | --- |
+| 关系裁决 | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions，DeepSeek 官方 API |
+| 候选大纲生成 | `Outline_API` | Claude Opus 5 | 原生 Anthropic Messages，经 `chat.178266.xyz`，第三方 gateway |
+| 结构审查 | `Writer_API` | GPT-5.6-sol | OpenAI Responses 兼容协议，经 `ai.saigou.work`，第三方 gateway |
+| 覆盖度审查 | `Free_Mode_API` | DeepSeek V4 Pro | DeepSeek Chat Completions，DeepSeek 官方 API |
+| 证据审查 | `Writer_API` | GPT-5.6-sol | OpenAI Responses 兼容协议，经 `ai.saigou.work`，第三方 gateway |
+| 最终仲裁 | `Outline_API` | Claude Opus 5 | 原生 Anthropic Messages，经 `chat.178266.xyz`，第三方 gateway |
+
+端点/协议和模型品牌是两件事。请求发往 `chat.178266.xyz` 或 `ai.saigou.work`，
+只能证明程序请求发给了第三方 gateway；项目不会因为返回的是 Claude 或 GPT 模型名，
+就声称这是 Anthropic 或 OpenAI 官方直连。运行时只把 gateway host 和不含 secret 的
+route fingerprint 写入 binding/receipt；凭据留在 `.env` 或本地安全凭据存储中。
+
 ## Anthropic Messages 传输
 
 `endpoint_type` 当前支持 `chat_completions`、`responses` 与 `anthropic`。配置为
@@ -106,8 +122,33 @@ fail-closed 抛错。
 * 该协议没有 `response_format` 参数，请求 JSON 时改为向 system prompt 追加指令；
 * 响应的 `content` 是 block 列表，只有 `type == "text"` 的块才作为回答内容。
 
+对 Claude Opus 5，当前请求策略是 adaptive thinking，并使用
+`output_config.effort` 控制深度；不会发送旧式 `enabled + budget_tokens` 组合。
+`thinking_budget_tokens` 仅为仍要求手工 extended thinking 的旧版 Claude 保留。
+
 Claude 模型名本身**不会**触发协议推断：同名模型既可能挂在 Anthropic 端点，也可能挂在
 OpenAI 兼容的第三方网关，仅凭名字猜测会选错线格式。
+
+## Stage 3 Review 与 Writer
+
+“Stage 3 Review”和“Writer”是同一阶段里的两个层次，不是两个独立阶段。Stage 3
+是综述生成工作流；`Writer_API` 是它调用的 provider/model，按已 adoption 的
+Outline v3 section 各调用一次。Writer 产出结构化 section block 和 citation token，
+随后 runtime 发布 canonical 的 `review_draft/v3`、`citation_manifest/v3` 和 DOCX，
+并完成 Stage 3 provider receipt closure。`Validator_API` 只在显式请求 validation 阶段时
+使用。
+
+## 显式配置迁移
+
+loader 采用 fail-closed，不会偷偷改写旧配置。对旧配置执行显式迁移时，会在同目录原子
+替换并先写备份：
+
+```bash
+python -m reviewctl config-migrate --config config.ini
+```
+
+可先用 `--dry-run` 查看报告。无法明确归属的旧 `[API_Parameters]` 键默认保存在标记过
+的注释块中；只有显式加 `--drop-unknown-legacy` 才会丢弃。
 
 ## 迁移与证据
 

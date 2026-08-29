@@ -94,6 +94,24 @@ Free Mode input is typed at the spec boundary. Use either `free_mode_idea` or
 Concept Mode is currently disabled. Stale Concept Mode requests are rejected;
 the runtime does not silently downgrade them or make a provider call.
 
+## Current model routing and endpoint ownership
+
+| Work step | Model | Endpoint ownership |
+| --- | --- | --- |
+| PDF preprocessing | MinerU `vlm` | MinerU official service |
+| Stage 1 primary reader | DeepSeek V4 Flash Vision | DeepSeek official API |
+| Stage 1 fallback / validation | DeepSeek V4 Flash | DeepSeek official API |
+| Free Mode and Outline relation/coverage critique | DeepSeek V4 Pro | DeepSeek official API |
+| Outline candidate generation / arbitration | Claude Opus 5 | Native Anthropic Messages through `chat.178266.xyz`, third-party gateway |
+| Outline structure/evidence critique | GPT-5.6-sol | OpenAI Responses-compatible transport through `ai.saigou.work`, third-party gateway |
+| Stage 3 Review Writer | GPT-5.6-sol | `Writer_API`, same third-party Responses gateway |
+
+Stage 3 Review is one stage. `Writer_API` is the provider called once per
+adopted outline section inside it; it is not a separate pipeline stage. A
+gateway host identifies where this project sends the request, not whether the
+gateway's upstream is officially operated by Anthropic or OpenAI. Live provider
+verification is an opt-in check and is not claimed by offline tests.
+
 ## Existing jobs and validation
 
 ```bash

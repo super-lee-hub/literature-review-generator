@@ -56,6 +56,14 @@ class ExpectedProviderCall:
     reuse_evidence_artifact_id: str = ""
     reuse_evidence_artifact_hash: str = ""
     reuse_evidence_record_hash: str = ""
+    # Optional provider identity. Older stage callers may omit these fields;
+    # current routed Outline calls populate them so closure validation proves
+    # the receipt came from the route that was expected, not only from a
+    # matching prompt/config hash.
+    provider: str = ""
+    model: str = ""
+    endpoint: str = ""
+    endpoint_type: str = ""
     # A transport node may have a declared primary and backup request identity.
     # Each variant is still exact; this is not a wildcard for mismatched calls.
     request_variants: tuple[Mapping[str, Any], ...] = ()
@@ -94,6 +102,10 @@ class ExpectedProviderCall:
             reuse_evidence_artifact_id=str(payload.get("reuse_evidence_artifact_id") or ""),
             reuse_evidence_artifact_hash=str(payload.get("reuse_evidence_artifact_hash") or ""),
             reuse_evidence_record_hash=str(payload.get("reuse_evidence_record_hash") or ""),
+            provider=str(payload.get("provider") or ""),
+            model=str(payload.get("model") or ""),
+            endpoint=str(payload.get("endpoint") or ""),
+            endpoint_type=str(payload.get("endpoint_type") or ""),
             request_variants=tuple(
                 dict(item)
                 for item in (payload.get("request_variants") or ())
@@ -303,6 +315,16 @@ class ProviderReceiptClosure:
                 and str(getattr(current, field) or "") != str(getattr(contract, field) or "")
                 and not (variant_matches and field in {"input_hash", "config_hash"})
             }
+            for field, actual_field in (
+                ("provider", "provider"),
+                ("model", "model"),
+                ("endpoint", "endpoint"),
+                ("endpoint_type", "endpoint_type"),
+            ):
+                expected_value = str(getattr(contract, field) or "")
+                actual_value = str(getattr(current, actual_field) or "")
+                if expected_value and expected_value != actual_value:
+                    identity_mismatches[field] = (actual_value, expected_value)
             # A variant must explicitly bind both input and config identity;
             # partial variants are never allowed to excuse a mismatch.
             if variant_matches and not any(

@@ -95,6 +95,10 @@ optional Validation → optional Repair + Recheck
 
 > 第三方 gateway 只表示程序请求发送到该服务地址。项目不会据此声称其上游一定为 OpenAI / Anthropic 官方直连，也不会把 provider gateway 身份和模型品牌混为一谈。
 
+这里的“Stage 3 Review”和“Review Writer”不是两个独立阶段：Review 是阶段，
+`Writer_API` 是该阶段按 adopted outline section 调用的写作 provider，最终生成
+`review_draft/v3`、`citation_manifest/v3` 和 DOCX。
+
 ## 快速开始
 
 ```bash

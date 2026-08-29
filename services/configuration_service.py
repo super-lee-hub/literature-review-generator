@@ -37,6 +37,7 @@ PROVIDER_PRESETS: Dict[str, ProviderPreset] = {
     "openai": ProviderPreset("OpenAI", "https://api.openai.com/v1"),
     "openai_compatible": ProviderPreset("OpenAI Compatible", "https://api.openai.com/v1"),
     "aihubmix": ProviderPreset("AIHubMix", "https://aihubmix.com/v1"),
+    "anthropic": ProviderPreset("Anthropic", "https://api.anthropic.com", append_v1=False),
     "deepseek": ProviderPreset("DeepSeek", "https://api.deepseek.com", append_v1=False),
     "siliconflow": ProviderPreset("SiliconFlow", "https://api.siliconflow.cn/v1"),
     "videocaptioner": ProviderPreset("VideoCaptioner", "https://api.videocaptioner.cn/v1"),
@@ -130,7 +131,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "reasoning_effort": "high",
             "force_highest_reasoning": "true",
             "text_verbosity": "high",
-            "max_context_tokens": "128000",
+            "max_context_tokens": "1000000",
             "max_output_tokens": "32000",
             "temperature": "0.0",
             "connect_timeout_seconds": "30",
@@ -149,6 +150,8 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "proxy_mode": "environment",
             "endpoint_type": "anthropic",
             "provider_family": "anthropic",
+            "anthropic_path": "/v1/messages",
+            "anthropic_version": "2023-06-01",
             # "high" is the documented default. xhigh/max are supported but need
             # a very large max_tokens; that is a deliberate operator choice, not
             # something a shipped default should impose.
@@ -529,8 +532,6 @@ def save_config_and_env(
                 or normalized["Outline_API"].get("api_base", "")
             )
             for inherited_key in (
-                "endpoint_type",
-                "provider_family",
                 "reasoning_effort",
                 "reasoning_display",
                 "text_verbosity",
@@ -567,8 +568,34 @@ def normalize_for_save(config_sections: MutableMapping[str, Dict[str, str]]) -> 
         section.pop("provider", None)
 
 
-def test_api_endpoint(api_key: str, api_base: str, model: str, proxy_mode: str = "environment") -> tuple[bool, str]:
+def test_api_endpoint(
+    api_key: str,
+    api_base: str,
+    model: str,
+    proxy_mode: str = "environment",
+    *,
+    endpoint_type: str = "",
+    provider_family: str = "",
+    anthropic_path: str = "",
+    anthropic_version: str = "",
+) -> tuple[bool, str]:
     """Wrapper used by the GUI setup page."""
 
-    normalized_base = normalize_api_base(api_base)
-    return test_api_connection(api_key=api_key, api_base=normalized_base, model=model, proxy_mode=proxy_mode)
+    normalized_endpoint = str(endpoint_type or "").strip().casefold().replace("-", "_")
+    normalized_family = str(provider_family or "").strip().casefold().replace("-", "_")
+    normalization_provider = (
+        "anthropic"
+        if normalized_endpoint == "anthropic" or normalized_family == "anthropic"
+        else normalized_family if normalized_family in PROVIDER_PRESETS else "custom"
+    )
+    normalized_base = normalize_api_base(api_base, provider=normalization_provider)
+    return test_api_connection(
+        api_key=api_key,
+        api_base=normalized_base,
+        model=model,
+        proxy_mode=proxy_mode,
+        provider_family=normalized_family,
+        endpoint_type=normalized_endpoint,
+        anthropic_path=anthropic_path,
+        anthropic_version=anthropic_version,
+    )

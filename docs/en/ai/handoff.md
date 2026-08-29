@@ -34,7 +34,11 @@ Stage 1-specific work should then use `summary_schema.py`,
 - `AgentRuntimeRunner` and `AgentRuntimeBridge` own the AI-native execution
   path.
 - Outline Intelligence v3 is the only current Outline path.
+- Outline role routing is node-level and fail-closed: Claude Opus 5 generates
+  and arbitrates, GPT-5.6-sol critiques structure/evidence, and DeepSeek V4 Pro
+  adjudicates relations/coverage under `[OutlineModels]`.
 - Stage 3 truth is `review_draft` v3 plus `citation_manifest` v3 and DOCX.
+  Review is the stage; `Writer_API` is its per-section provider.
 - Validation truth is owned by `ValidationExecutionService` and its
   Registry-backed closure/adjudication authority.
 - `main.py` is a small compatibility-free shim into `reviewctl`, not the old

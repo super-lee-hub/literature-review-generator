@@ -779,6 +779,18 @@ class InternalStageExecutorRegistry:
             return default
         return parsed if parsed > 0 else default
 
+    @staticmethod
+    def _nonnegative_int(value: Any, default: int) -> int:
+        """Read an optional budget knob while preserving an explicit zero."""
+
+        if value is None or str(value).strip() == "":
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= 0 else default
+
     def _outline_provider(
         self,
         session: AgentRuntimeSession,
@@ -833,8 +845,8 @@ class InternalStageExecutorRegistry:
             # conservative defaults, every role would silently inherit the
             # Outline model's headroom, which is wrong for a cheaper critic or a
             # larger-context generator.
-            reasoning_reserve=self._positive_int(api_config.get("reasoning_reserve_tokens"), 2_048),
-            safety_margin=self._positive_int(api_config.get("safety_margin_tokens"), 1_024),
+            reasoning_reserve=self._nonnegative_int(api_config.get("reasoning_reserve_tokens"), 2_048),
+            safety_margin=self._nonnegative_int(api_config.get("safety_margin_tokens"), 1_024),
         )
         return OutlineRoleRoute(
             role=role,
@@ -844,8 +856,10 @@ class InternalStageExecutorRegistry:
             endpoint_type=capability.endpoint_type,
             profile=profile,
             transport=self._outline_provider(session, profile, api_config),
-            # Gateway identity only; safe_host() strips anything credential-shaped.
+            # The route stores only an allow-listed, secret-free identity. The
+            # closure still retains the private config for the actual transport.
             api_base=str(api_config.get("api_base") or "").strip(),
+            config_identity=dict(api_config),
         )
 
     def _execute_outline(

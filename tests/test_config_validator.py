@@ -1,6 +1,6 @@
 import pytest
 
-from config_validator import validate_all_config
+from config_validator import test_api_connection as probe_api_connection, validate_all_config
 from services.config_values import StrictConfigValueError
 from services.settings import ApplicationSettings
 
@@ -30,6 +30,42 @@ def _base_config():
             "provider_family": "aihubmix_openai",
             "reasoning_effort": "high",
         },
+    }
+
+
+def test_anthropic_connection_uses_native_messages_headers_and_path(monkeypatch):
+    calls = {}
+
+    class Response:
+        status_code = 200
+
+    def fake_post(url, *, headers, json, timeout):
+        calls.update(url=url, headers=headers, json=json, timeout=timeout)
+        return Response()
+
+    monkeypatch.setattr("config_validator.requests.post", fake_post)
+    monkeypatch.setattr("config_validator.should_bypass_environment_proxy", lambda _config: False)
+
+    ok, message = probe_api_connection(
+        "anthropic-secret",
+        "https://chat.example.test",
+        "claude-opus-5",
+        provider_family="anthropic",
+        endpoint_type="anthropic",
+        anthropic_path="/v1/messages",
+        anthropic_version="2023-06-01",
+    )
+
+    assert ok is True
+    assert "Anthropic API" in message
+    assert calls["url"] == "https://chat.example.test/v1/messages"
+    assert calls["headers"]["x-api-key"] == "anthropic-secret"
+    assert calls["headers"]["anthropic-version"] == "2023-06-01"
+    assert "Authorization" not in calls["headers"]
+    assert calls["json"] == {
+        "model": "claude-opus-5",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
     }
 
 

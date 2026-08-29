@@ -201,6 +201,14 @@ class APIConfig(TypedDict):
     max_context_tokens: NotRequired[Any]
     force_highest_reasoning: NotRequired[Any]
     omit_temperature_when_reasoning: NotRequired[Any]
+    # Native Anthropic Messages transport. These fields are optional because
+    # OpenAI-compatible and DeepSeek routes do not use them.
+    anthropic_path: NotRequired[str]
+    anthropic_version: NotRequired[str]
+    # Legacy manual extended thinking only; adaptive Claude models use
+    # reasoning_effort/output_config.effort instead.
+    thinking_budget_tokens: NotRequired[Any]
+    experimental: NotRequired[Any]
 
 
 SummariesList = List[ProcessingResult]

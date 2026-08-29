@@ -1208,13 +1208,23 @@ class WorkspaceController:
         }
         self.api_cards: Dict[str, Dict[str, str]] = {}
         for section_name in API_ENV_MAPPING:
-            api_base = self.sections.get(section_name, {}).get("api_base", "")
+            section = self.sections.get(section_name, {})
+            api_base = section.get("api_base", "")
+            configured_family = str(section.get("provider_family", "") or "").strip()
+            provider = configured_family if configured_family in PROVIDER_PRESETS else _guess_provider(api_base)
             self.api_cards[section_name] = {
-                "provider": _guess_provider(api_base),
-                "model": self.sections.get(section_name, {}).get("model", ""),
+                # ``provider`` is the UI preset/gateway selector. Keep the
+                # wire-level family separately: a custom gateway may still
+                # speak native Anthropic Messages or OpenAI Responses.
+                "provider": provider,
+                "provider_family": configured_family or provider,
+                "model": section.get("model", ""),
                 "api_base": api_base,
                 "api_key": self.env_values.get(API_ENV_MAPPING[section_name], ""),
-                "proxy_mode": self.sections.get(section_name, {}).get("proxy_mode", "environment") or "environment",
+                "proxy_mode": section.get("proxy_mode", "environment") or "environment",
+                "endpoint_type": section.get("endpoint_type", "chat_completions") or "chat_completions",
+                "anthropic_path": section.get("anthropic_path", "/v1/messages") or "/v1/messages",
+                "anthropic_version": section.get("anthropic_version", "2023-06-01") or "2023-06-01",
             }
         
         # 初始化队列服务
@@ -1983,10 +1993,26 @@ class WorkspaceController:
         api_keys: Dict[str, str] = {}
         for section_name, card in self.api_cards.items():
             updated_sections.setdefault(section_name, {})
-            updated_sections[section_name]["provider_family"] = card["provider"]
+            endpoint_type = str(card.get("endpoint_type", "") or "").strip().casefold()
+            if endpoint_type == "anthropic":
+                provider_family = "anthropic"
+            elif endpoint_type in {"responses", "response"}:
+                provider_family = "openai_responses"
+            elif card.get("provider") == "deepseek":
+                provider_family = "deepseek"
+            else:
+                provider_family = str(card.get("provider_family") or card.get("provider") or "generic")
+            updated_sections[section_name]["provider_family"] = provider_family
             updated_sections[section_name]["model"] = card["model"]
             updated_sections[section_name]["api_base"] = card["api_base"]
             updated_sections[section_name]["proxy_mode"] = card.get("proxy_mode", "environment") or "environment"
+            updated_sections[section_name]["endpoint_type"] = endpoint_type or "chat_completions"
+            if endpoint_type == "anthropic":
+                updated_sections[section_name]["anthropic_path"] = card.get("anthropic_path", "/v1/messages") or "/v1/messages"
+                updated_sections[section_name]["anthropic_version"] = card.get("anthropic_version", "2023-06-01") or "2023-06-01"
+            else:
+                updated_sections[section_name].pop("anthropic_path", None)
+                updated_sections[section_name].pop("anthropic_version", None)
             api_keys[section_name] = card["api_key"]
 
         extra_env_values = self._collect_extra_env_values()
@@ -2692,6 +2718,10 @@ class WorkspaceController:
             api_base,
             card["model"],
             card.get("proxy_mode", "environment"),
+            endpoint_type=card.get("endpoint_type", ""),
+            provider_family=card.get("provider_family", ""),
+            anthropic_path=card.get("anthropic_path", ""),
+            anthropic_version=card.get("anthropic_version", ""),
         )
         self.show_api_feedback(section_name, message, tone="positive" if ok else "negative")
         self.notify(f"{section_name}: {message}", color="positive" if ok else "negative", multi_line=True)
@@ -3432,6 +3462,26 @@ def _render_api_card(controller: WorkspaceController, section_name: str, title: 
                 label=controller.t("代理模式"),
             )
             proxy_select.bind_value(card, "proxy_mode")
+            endpoint_select = ui.select(
+                {
+                    "chat_completions": "OpenAI-compatible Chat Completions",
+                    "responses": "OpenAI Responses",
+                    "anthropic": "Anthropic Messages",
+                },
+                value=card.get("endpoint_type", "chat_completions"),
+                label=controller.t("传输协议"),
+            )
+            endpoint_select.bind_value(card, "endpoint_type")
+
+        with ui.row().classes("w-full gap-3").bind_visibility_from(card, "endpoint_type", value="anthropic"):
+            ui.input(
+                "Anthropic API path",
+                value=card.get("anthropic_path", "/v1/messages"),
+            ).bind_value(card, "anthropic_path")
+            ui.input(
+                "Anthropic version header",
+                value=card.get("anthropic_version", "2023-06-01"),
+            ).bind_value(card, "anthropic_version")
 
         provider_select.on("update:model-value", lambda _: controller.preview_api_config(section_name))
         model_input.on("blur", lambda _: controller.preview_api_config(section_name))
@@ -3441,6 +3491,7 @@ def _render_api_card(controller: WorkspaceController, section_name: str, title: 
         api_key_input.on("blur", lambda _: controller.preview_api_config(section_name))
         api_key_input.on("update:model-value", lambda _: controller.preview_api_config(section_name))
         proxy_select.on("update:model-value", lambda _: controller.preview_api_config(section_name))
+        endpoint_select.on("update:model-value", lambda _: controller.preview_api_config(section_name))
 
         def apply_preset() -> None:
             provider = provider_select.value or "custom"

@@ -37,8 +37,16 @@ code uses it. It is not an alternate public peer to `RuntimeJobSpec`.
 - Stage 1 uses the current source identity, preprocessing, summary, and reuse
   contracts.
 - Stage 2 is Outline Intelligence v3 only. Do not use or describe Outline v2.
+- Outline v3 role routing is real node-level routing: Claude Opus 5 handles
+  candidate generation/arbitration, GPT-5.6-sol handles structure/evidence
+  critique, and DeepSeek V4 Pro handles relation/coverage critique when the
+  shipped `[OutlineModels]` mapping is used. Each route owns its transport,
+  context budget, binding, receipt, and replay identity; missing routes fail
+  closed.
 - Stage 3 produces `review_draft` with `artifact_version=v3`,
   `citation_manifest` v3, and DOCX through the current review service.
+- Stage 3 Review is one stage; `Writer_API` is the provider called once per
+  adopted outline section inside that stage.
 - Validation uses `ValidationExecutionService`, `current_validation`,
   `adjudication_reuse`, and Registry-backed `closure` evidence.
 - Free Mode uses `free_mode_intent_input/v1`, projects to `ReviewIntent`, and

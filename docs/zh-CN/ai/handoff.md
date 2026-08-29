@@ -32,7 +32,10 @@ Stage 1 专题再读取 `summary_schema.py`、`preprocess/service.py` 和
 - `RuntimeJobSpec` 是当前 durable run specification。
 - AI-native 执行由 `AgentRuntimeRunner` 与 `AgentRuntimeBridge` 负责。
 - Outline Intelligence v3 是唯一当前 Outline 路径。
+- Outline 角色是节点级且 fail-closed：Claude Opus 5 生成并仲裁，GPT-5.6-sol 审查
+  结构/证据，DeepSeek V4 Pro 裁决关系/覆盖度，具体由 `[OutlineModels]` 决定。
 - Stage 3 真源是 `review_draft` v3、`citation_manifest` v3 和 DOCX。
+  Review 是阶段，`Writer_API` 是阶段内部按 section 调用的 provider。
 - Validation 真源由 `ValidationExecutionService` 及其 Registry-backed
   closure/adjudication authority 负责。
 - `main.py` 是进入 `reviewctl` 的小型 compatibility-free shim，不是旧的编排 CLI。

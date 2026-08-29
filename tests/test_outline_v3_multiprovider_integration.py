@@ -268,6 +268,17 @@ def test_receipts_record_three_distinct_provider_identities(tmp_path: Path) -> N
     assert observed.get("gpt-5.6-sol") == {"responses"}, observed
     assert observed.get("deepseek-v4-pro") == {"chat_completions"}, observed
 
+    # The receipt must close against the node's real binding, including the
+    # gateway host and route-specific config fingerprint, not merely the plan.
+    for receipt in receipts:
+        binding = executor._dag.get(receipt.node_id).execution_binding
+        assert receipt.provider == binding["provider_family"]
+        assert receipt.model == binding["model_name"]
+        assert receipt.endpoint_type == binding["endpoint_type"]
+        assert receipt.endpoint == binding["api_base_host"]
+        assert receipt.config_hash == binding["provider_config_hash"]
+        assert binding["route_fingerprint"]
+
 
 def test_node_bindings_carry_the_executing_section(tmp_path: Path) -> None:
     router, transports = _build()

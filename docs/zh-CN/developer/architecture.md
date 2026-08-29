@@ -41,6 +41,7 @@ Stage 2:
 
 Stage 3:
 services/review_generation_service.py
+  -> Writer_API：每个已 adoption 的 outline section 一次 provider call
   -> review_draft artifact_version=v3
   -> citation_manifest v3
   -> DOCX
@@ -61,6 +62,15 @@ services/job_workspace.py + services/artifact_registry.py
 Stage 1 identity、artifact dependency、provider receipt closure、queue fencing、
 validation adjudication authority 和 publication boundary 都是 runtime 语义契约。
 只修改文档时不得削弱这些契约。
+
+Stage 3 Review 是阶段契约，Writer 是该阶段内部配置的生成 provider，并不是两个独立
+pipeline stage。Writer 接收每个有 evidence binding 的已 adoption outline section，产出
+带 citation token 的结构化 blocks，bridge 再把这些调用组装为 canonical review draft、
+citation manifest 和 DOCX。
+
+Outline v3 的角色由 `outline/provider_router.py` 解析：Claude Opus 5 负责候选生成与最终
+仲裁，GPT-5.6-sol 负责结构/证据审查，DeepSeek V4 Pro 负责关系/覆盖度审查。配置中的
+gateway host 只是传输身份，不是官方上游连接的证明。
 
 ## 查找入口
 

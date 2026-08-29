@@ -17,6 +17,7 @@ import pytest
 
 from services.config_migration import (
     VISION_PRIMARY_MODEL,
+    migrate_config_file,
     migrate_config_text,
 )
 from services.settings import CONFIG_SCHEMA_VERSION, validate_config_keys
@@ -129,6 +130,23 @@ def test_custom_primary_model_is_left_alone() -> None:
     _assert_valid_and_idempotent(migrated)
 
 
+def test_pro_model_on_custom_provider_is_not_mistaken_for_legacy_default() -> None:
+    text = (
+        "[Application]\nconfig_schema = 3\n"
+        "[Primary_Reader_API]\n"
+        "model = deepseek-v4-pro\n"
+        "provider_family = generic\n"
+        "api_base = https://custom.example.test/v1\n"
+        "[Stage1_Input]\nmode = text_only\n"
+    )
+
+    migrated, report = migrate_config_text(text)
+
+    assert _parse(migrated)["Primary_Reader_API"]["model"] == "deepseek-v4-pro"
+    assert not any("promoted" in change for change in report.changes)
+    _assert_valid_and_idempotent(migrated)
+
+
 def test_vision_promotion_can_be_disabled() -> None:
     text = "[Primary_Reader_API]\nmodel = deepseek-v4-pro\n"
     migrated, _ = migrate_config_text(text, promote_vision_primary=False)
@@ -231,6 +249,45 @@ def test_already_current_config_is_left_untouched() -> None:
 
     assert migrated == text
     assert report.changed is False
+
+
+def test_file_migration_is_atomic_backed_up_and_idempotent(tmp_path) -> None:
+    path = tmp_path / "config.ini"
+    path.write_text(
+        "[Primary_Reader_API]\nmodel = deepseek-v4-pro\nmax_tokens = 4000\n",
+        encoding="utf-8",
+    )
+
+    first = migrate_config_file(path)
+    assert first.changed is True
+    backups = sorted(tmp_path.glob("config.ini.backup_before_*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == (
+        "[Primary_Reader_API]\nmodel = deepseek-v4-pro\nmax_tokens = 4000\n"
+    )
+    migrated_bytes = path.read_bytes()
+
+    second = migrate_config_file(path)
+    assert second.changed is False
+    assert path.read_bytes() == migrated_bytes
+    assert len(list(tmp_path.glob("config.ini.backup_before_*"))) == 1
+
+
+def test_file_migration_failure_preserves_original_config(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "config.ini"
+    original = "[Primary_Reader_API]\nmodel = deepseek-v4-pro\nmax_tokens = 4000\n"
+    path.write_text(original, encoding="utf-8")
+
+    def fail_replace(_source, _target):
+        raise OSError("simulated atomic replace failure")
+
+    monkeypatch.setattr("services.config_migration.os.replace", fail_replace)
+    with pytest.raises(OSError, match="simulated atomic replace failure"):
+        migrate_config_file(path)
+
+    assert path.read_text(encoding="utf-8") == original
+    assert len(list(tmp_path.glob("config.ini.backup_before_*"))) == 1
+    assert not list(tmp_path.glob(".config.ini.*.tmp"))
 
 
 @pytest.mark.parametrize(

@@ -28,6 +28,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 from runtime.provider_context import ProviderContextProfile
 
@@ -78,6 +79,72 @@ INTENDED_SHARED_IDENTITY_ROLES = frozenset({GENERATION_ROLE, ARBITRATION_ROLE})
 
 ProviderTransport = Callable[[str, Mapping[str, Any]], Any]
 
+_ROUTE_CONFIG_KEYS = frozenset(
+    {
+        "provider_family",
+        "model",
+        "endpoint_type",
+        "api_base",
+        "anthropic_path",
+        "anthropic_version",
+        "thinking",
+        "reasoning_effort",
+        "reasoning_display",
+        "text_verbosity",
+        "max_context_tokens",
+        "max_output_tokens",
+        "temperature",
+        "reasoning_reserve_tokens",
+        "safety_margin_tokens",
+        "force_highest_reasoning",
+        "omit_temperature_when_reasoning",
+    }
+)
+
+
+def safe_endpoint(api_base: str) -> str:
+    """Keep the non-secret endpoint identity while dropping credentials/query data."""
+
+    text = str(api_base or "").strip()
+    if not text:
+        return ""
+    parsed = urlsplit(text)
+    if not parsed.scheme or not parsed.netloc:
+        # The config validator normally rejects this, but identity construction
+        # must still never persist userinfo or query material from a malformed
+        # value.
+        return safe_host(text)
+    hostname = parsed.hostname or ""
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.casefold(), netloc.casefold(), path, "", ""))
+
+
+def safe_config_identity(config: Mapping[str, Any] | None) -> dict[str, str]:
+    """Allow-list route knobs that shape transport without copying secrets."""
+
+    source = config or {}
+    identity: dict[str, str] = {}
+    for key in sorted(_ROUTE_CONFIG_KEYS):
+        if key not in source:
+            continue
+        value = source.get(key)
+        if key == "api_base":
+            normalized = safe_endpoint(str(value or ""))
+        else:
+            normalized = str(value or "").strip()
+        if normalized:
+            identity[key] = normalized
+    return identity
+
 
 def safe_host(api_base: str) -> str:
     """Reduce a base URL to a bare host, dropping anything that could be secret.
@@ -127,6 +194,13 @@ class OutlineRoleRoute:
     # query are stripped before it is ever stored, so nothing secret can leak
     # into a binding, receipt, replay key, registry record or log.
     api_base: str = ""
+    # Allow-listed, secret-free provider settings that affect the wire request
+    # or admission budget. This is intentionally not the raw API section.
+    config_identity: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "api_base", safe_endpoint(self.api_base))
+        object.__setattr__(self, "config_identity", safe_config_identity(self.config_identity))
 
     @property
     def identity(self) -> tuple[str, str, str]:
@@ -161,12 +235,13 @@ class OutlineRoleRoute:
             "provider": self.provider_name,
             "model": self.model,
             "endpoint_type": self.endpoint_type,
-            "api_base_host": self.api_base_host,
+            "api_base": safe_endpoint(self.api_base),
             "model_context_limit": int(getattr(self.profile, "model_context_limit", 0) or 0),
             "max_output_tokens": int(getattr(self.profile, "max_output_tokens", 0) or 0),
             "reasoning_reserve": int(getattr(self.profile, "reasoning_reserve", 0) or 0),
             "safety_margin": int(getattr(self.profile, "safety_margin", 0) or 0),
             "tokenizer_strategy": str(getattr(self.profile, "tokenizer_strategy", "") or ""),
+            "config_identity": safe_config_identity(self.config_identity),
         }
         encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
@@ -179,6 +254,7 @@ class OutlineRoleRoute:
             "model": self.model,
             "endpoint_type": self.endpoint_type,
             "api_base_host": self.api_base_host,
+            "api_base": safe_endpoint(self.api_base),
             "binding_identity": list(self.binding_identity),
             "config_fingerprint": self.safe_config_fingerprint(),
         }

@@ -130,6 +130,17 @@ def _existing_keys(lines: List[str], section_index: int) -> Dict[str, int]:
     return keys
 
 
+def _section_values(lines: List[str], section_index: int) -> Dict[str, str]:
+    """Read one section's scalar values without re-parsing the whole file."""
+
+    values: Dict[str, str] = {}
+    for key, line_index in _existing_keys(lines, section_index).items():
+        match = _KV_RE.match(lines[line_index])
+        if match:
+            values[key] = match.group("value").strip()
+    return values
+
+
 def _section_bounds(lines: List[str], section_index: int) -> Tuple[int, int]:
     start = section_index
     end = len(lines)
@@ -161,6 +172,39 @@ def _declared_schema(sections: Mapping[str, int], lines: List[str]) -> int:
     return 0
 
 
+def _legacy_primary_default_is_unambiguous(
+    sections: Mapping[str, int],
+    lines: List[str],
+    declared_schema: int,
+) -> bool:
+    """Recognize only the shipped pre-vision primary default.
+
+    The model name by itself is not enough: an operator may intentionally use
+    ``deepseek-v4-pro`` behind a custom gateway or for a non-vision Stage 1
+    policy. The promotion therefore requires an older schema plus the old
+    DeepSeek provider/base context and a missing or explicit ``vision_first``
+    input mode. Ambiguous configurations remain untouched.
+    """
+
+    if declared_schema >= CONFIG_SCHEMA_VERSION:
+        return False
+    primary_index = sections.get("Primary_Reader_API")
+    if primary_index is None:
+        return False
+    primary = _section_values(lines, primary_index)
+    if primary.get("model", "").casefold() != LEGACY_PRIMARY_MODEL:
+        return False
+    provider_family = primary.get("provider_family", "").casefold().replace("-", "_")
+    if provider_family not in {"", "deepseek"}:
+        return False
+    api_base = primary.get("api_base", "").rstrip("/").casefold()
+    if api_base not in {"", "https://api.deepseek.com", "https://api.deepseek.com/v1"}:
+        return False
+    stage1_index = sections.get("Stage1_Input")
+    stage1 = _section_values(lines, stage1_index) if stage1_index is not None else {}
+    return stage1.get("mode", "").casefold() in {"", "vision_first"}
+
+
 def migrate_config_text(
     text: str,
     *,
@@ -190,7 +234,11 @@ def migrate_config_text(
     # current revision, so its model choice is treated as deliberate.
     declared_schema = _declared_schema(sections, lines)
     is_legacy_schema = declared_schema < CONFIG_SCHEMA_VERSION
-    promote_vision_primary = promote_vision_primary and is_legacy_schema
+    promote_vision_primary = promote_vision_primary and _legacy_primary_default_is_unambiguous(
+        sections,
+        lines,
+        declared_schema,
+    )
 
     # ------------------------------------------------------------------
     # Phase 1: relocate [API_Parameters] values into their provider sections.
@@ -411,8 +459,14 @@ def migrate_config_file(
         return report
 
     if backup:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = target.with_name(f"{target.name}.backup_before_{stamp}")
+        suffix = 1
+        while backup_path.exists():
+            backup_path = target.with_name(
+                f"{target.name}.backup_before_{stamp}_{suffix}"
+            )
+            suffix += 1
         with open(backup_path, "wb") as handle:
             handle.write(target.read_bytes())
             handle.flush()

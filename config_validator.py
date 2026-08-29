@@ -310,10 +310,64 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
     return True, messages
 
 
-def test_api_connection(api_key: str, api_base: str, model: str, proxy_mode: str = "environment") -> Tuple[bool, str]:
-    """Probe a provider model list without exposing credentials in errors."""
+def test_api_connection(
+    api_key: str,
+    api_base: str,
+    model: str,
+    proxy_mode: str = "environment",
+    *,
+    provider_family: str = "",
+    endpoint_type: str = "",
+    anthropic_path: str = "",
+    anthropic_version: str = "",
+) -> Tuple[bool, str]:
+    """Probe the configured wire protocol without exposing credentials.
+
+    OpenAI-compatible providers expose a model-list endpoint. Native Anthropic
+    Messages providers are probed with a one-token request instead: the native
+    endpoint is the meaningful connectivity check, and it must use
+    ``x-api-key`` plus ``anthropic-version`` rather than an OpenAI Bearer
+    header.
+    """
 
     base = api_base.rstrip("/")
+    normalized_endpoint = _normalize_config_text(endpoint_type).replace("-", "_").casefold()
+    normalized_family = _normalize_config_text(provider_family).replace("-", "_").casefold()
+
+    if normalized_endpoint == "anthropic" or normalized_family == "anthropic":
+        path = _normalize_config_text(anthropic_path) or "v1/messages"
+        path = "/" + path.lstrip("/")
+        if base.casefold().endswith("/v1") and path.casefold().startswith("/v1/"):
+            path = path[3:]
+        url = f"{base}{path}"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": _normalize_config_text(anthropic_version) or "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        try:
+            if should_bypass_environment_proxy({"proxy_mode": proxy_mode}):
+                with requests.Session() as session:
+                    session.trust_env = False
+                    response = session.post(url, headers=headers, json=payload, timeout=10)
+            else:
+                response = requests.post(url, headers=headers, json=payload, timeout=10)
+            if response.status_code == 200:
+                return True, f"Anthropic API 连通成功，模型'{model}'可用"
+            return False, f"Anthropic API请求失败：HTTP {response.status_code}"
+        except requests.exceptions.Timeout:
+            return False, "连接超时：API服务器响应时间过长"
+        except requests.exceptions.RequestException:
+            # Do not echo the exception: a malformed endpoint may contain
+            # userinfo/query material, and request libraries include the URL in
+            # their error text. Credentials must never reach UI/log output.
+            return False, "请求异常：无法连接 Anthropic API 服务器"
+
     base = re.sub(r"/chat/completions/?$", "", base, flags=re.IGNORECASE)
     base = re.sub(r"/v1/chat/completions/?$", "/v1", base, flags=re.IGNORECASE)
     base = re.sub(r"/models/?$", "", base, flags=re.IGNORECASE)
@@ -341,8 +395,10 @@ def test_api_connection(api_key: str, api_base: str, model: str, proxy_mode: str
         return False, f"模型不可用：指定模型'{model}'不存在或无权访问"
     except requests.exceptions.Timeout:
         return False, "连接超时：API服务器响应时间过长"
-    except requests.exceptions.RequestException as exc:
-        return False, f"请求异常：{exc}"
+    except requests.exceptions.RequestException:
+        # Keep provider errors safe even when an endpoint was entered with
+        # credential-shaped URL material.
+        return False, "请求异常：无法连接 API 服务器"
 
 
 def validate_zotero_library_path(library_path: str) -> Tuple[bool, str]:

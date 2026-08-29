@@ -115,6 +115,9 @@ class OutlineProviderCallPlan:
     confidence: str
     upper_bound: bool
     transport_expected: bool
+    config_section: str = ""
+    api_base_host: str = ""
+    route_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -321,6 +324,18 @@ class OutlineV3Executor:
                 )
             )
         )
+        self._pricing_unknown_due_to_multiple_routes = False
+        if self.router is not None:
+            route_identities = {
+                tuple(route.binding_identity)
+                for route in self.router.routes.values()
+            }
+            if len(route_identities) > 1:
+                # Outline v3 can have different providers, gateways, and token
+                # prices per node. A stage-wide rate tuple must not be applied
+                # to all of them as if it were one provider invoice.
+                self._pricing_is_explicit = False
+                self._pricing_unknown_due_to_multiple_routes = True
         self.input_cost_per_1k_tokens = (
             float(input_cost_per_1k_tokens) if input_cost_per_1k_tokens is not None else None
         )
@@ -511,6 +526,67 @@ class OutlineV3Executor:
             effective = effective.rsplit(":", 1)[-1]
         return self._role_route(effective)
 
+    @staticmethod
+    def _profile_identity(profile: ProviderContextProfile) -> dict[str, Any]:
+        return {
+            "provider": profile.provider,
+            "model": profile.model,
+            "endpoint_type": profile.endpoint_type,
+            "model_context_limit": profile.model_context_limit,
+            "verified_context_limit": profile.verified_context_limit,
+            "input_budget": profile.input_budget,
+            "max_output_tokens": profile.max_output_tokens,
+            "reasoning_reserve": profile.reasoning_reserve,
+            "safety_margin": profile.safety_margin,
+            "tokenizer_strategy": profile.tokenizer_strategy,
+        }
+
+    @staticmethod
+    def _route_api_identity(route: OutlineRoleRoute) -> dict[str, str]:
+        return {
+            "provider_family": route.provider_name,
+            "model": route.model,
+            "api_base": route.api_base,
+            "api_base_host": route.api_base_host,
+            "endpoint_type": route.endpoint_type,
+            "config_section": route.config_section,
+            "route_fingerprint": route.safe_config_fingerprint(),
+        }
+
+    @staticmethod
+    def _route_transport_identity(route: OutlineRoleRoute) -> dict[str, str]:
+        """Return the exact secret-free config identity used by transport receipts.
+
+        The wider route identity above is useful for stage manifests, but the
+        provider receipt, node binding, replay key, and resume hydration must
+        hash one byte-for-byte equivalent mapping.  Keeping this narrower
+        helper in one place prevents a binding from becoming stale merely
+        because one caller included an informational field such as
+        ``api_base_host``.
+        """
+
+        return {
+            "provider_family": route.provider_name,
+            "model": route.model,
+            "api_base": route.api_base_host,
+            "endpoint_type": route.endpoint_type,
+            "config_section": route.config_section,
+            "route_fingerprint": route.safe_config_fingerprint(),
+        }
+
+    def _provider_configured(self) -> bool:
+        """Return whether the configured execution surface can transport calls."""
+
+        if self.router is None:
+            return self.provider is not None
+        try:
+            return all(
+                self.router.route_for(node_id).transport is not None
+                for node_id in self._provider_node_ids()
+            )
+        except (KeyError, TypeError, AttributeError):
+            return False
+
     def _compute_current_coverage_contract_hash(self) -> str:
         try:
             evidence = build_outline_evidence_views(self.summaries, self.job_id)
@@ -542,25 +618,29 @@ class OutlineV3Executor:
         replay_binding["semantic_node_id"] = semantic
         return hash_json(replay_binding)
 
-    def _context_profile_hash(self) -> str:
-        # The per-role route identity is part of the context hash.  Binding it
-        # here is what stops a Claude-era receipt from being replayed onto a
-        # differently routed GPT or DeepSeek node after a role is reconfigured.
+    def _context_profile_hash(self, route: OutlineRoleRoute | None = None) -> str:
+        """Hash either one node route or the stage-wide routing manifest.
+
+        Provider-node bindings use the first form so changing an unrelated
+        critic route does not invalidate every earlier node. The constructor's
+        stage closure uses the second form to retain a complete routing-manifest
+        identity for the whole outline attempt.
+        """
+
+        if route is not None:
+            return _hash_payload({
+                "route": self._route_api_identity(route),
+                "profile": self._profile_identity(route.profile),
+            })
         route_identities = {
-            node_id: list(self._role_route(node_id).identity)
-            for node_id in self._provider_node_ids()
+            role: {
+                "identity": list(route.binding_identity),
+                "config_fingerprint": route.safe_config_fingerprint(),
+            }
+            for role, route in (self.router.routes.items() if self.router is not None else ())
         }
         return _hash_payload({
-            "provider": self.profile.provider,
-            "model": self.profile.model,
-            "endpoint_type": self.profile.endpoint_type,
-            "model_context_limit": self.profile.model_context_limit,
-            "verified_context_limit": self.profile.verified_context_limit,
-            "input_budget": self.profile.input_budget,
-            "max_output_tokens": self.profile.max_output_tokens,
-            "reasoning_reserve": self.profile.reasoning_reserve,
-            "safety_margin": self.profile.safety_margin,
-            "tokenizer_strategy": self.profile.tokenizer_strategy,
+            "executor_profile": self._profile_identity(self.profile),
             "role_routes": route_identities,
         })
 
@@ -716,6 +796,10 @@ class OutlineV3Executor:
                     assumptions.append(
                         "pricing is unknown because an explicit pricing source and complete rate set were not supplied"
                     )
+                if self._pricing_unknown_due_to_multiple_routes:
+                    assumptions.append(
+                        "pricing is unknown because one stage-wide rate set cannot represent the configured provider routes"
+                    )
                 if node_id.endswith("_provider_generation"):
                     assumptions.append("candidate generation output is included in the upper bound")
                 if critic_input_upper_bound:
@@ -726,6 +810,11 @@ class OutlineV3Executor:
                         assumptions.append(
                             "arbitration input also includes three critic outputs at configured max_output_tokens"
                         )
+                rate_input = self.input_cost_per_1k_tokens if self._pricing_is_explicit else None
+                rate_output = self.output_cost_per_1k_tokens if self._pricing_is_explicit else None
+                rate_reasoning = self.reasoning_cost_per_1k_tokens if self._pricing_is_explicit else None
+                rate_cache_read = self.cache_read_cost_per_1k_tokens if self._pricing_is_explicit else None
+                rate_cache_write = self.cache_write_cost_per_1k_tokens if self._pricing_is_explicit else None
                 plans.append(
                     OutlineProviderCallPlan(
                         artifact_type="outline_provider_call_plan",
@@ -746,11 +835,11 @@ class OutlineV3Executor:
                         estimated_cached_input_tokens=estimated_cached,
                         estimated_cache_write_tokens=estimated_cache_write,
                         estimated_total_tokens=total,
-                        input_cost_per_1k_tokens=self.input_cost_per_1k_tokens,
-                        output_cost_per_1k_tokens=self.output_cost_per_1k_tokens,
-                        reasoning_cost_per_1k_tokens=self.reasoning_cost_per_1k_tokens,
-                        cache_read_cost_per_1k_tokens=self.cache_read_cost_per_1k_tokens,
-                        cache_write_cost_per_1k_tokens=self.cache_write_cost_per_1k_tokens,
+                        input_cost_per_1k_tokens=rate_input,
+                        output_cost_per_1k_tokens=rate_output,
+                        reasoning_cost_per_1k_tokens=rate_reasoning,
+                        cache_read_cost_per_1k_tokens=rate_cache_read,
+                        cache_write_cost_per_1k_tokens=rate_cache_write,
                         estimated_cost=cost,
                         pricing_source=self.pricing_source,
                         pricing_policy=self.pricing_policy,
@@ -759,6 +848,9 @@ class OutlineV3Executor:
                         confidence="medium",
                         upper_bound=True,
                         transport_expected=transport_expected,
+                        config_section=route.config_section,
+                        api_base_host=route.api_base_host,
+                        route_fingerprint=route.safe_config_fingerprint(),
                     )
                 )
         return tuple(plans)
@@ -830,15 +922,15 @@ class OutlineV3Executor:
             "pricing_model": self.pricing_model,
             "pricing_version": self.pricing_version,
             "pricing_effective_date": self.pricing_effective_date,
-            "provider_configured": self.provider is not None,
+            "provider_configured": self._provider_configured(),
             "preflight_status": "accepted",
         }
         preflight_path = self._path(
             f"outline_v3/stability/stability_preflight_{self.closure_epoch_id[:24]}.json"
         )
-        if self.stability_mode != "off" and self.provider is None:
+        if self.stability_mode != "off" and not self._provider_configured():
             self.stability_preflight["preflight_status"] = "rejected"
-            self.stability_preflight["rejection_reason"] = "stability_provider_missing"
+            self.stability_preflight["rejection_reason"] = "stability_provider_or_route_missing"
         elif self.max_provider_calls is not None and estimated_provider_calls > self.max_provider_calls:
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_provider_calls_exceeded"
@@ -855,7 +947,11 @@ class OutlineV3Executor:
         ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "max_estimated_total_tokens_exceeded"
-        elif estimated_input_per_call > self.profile.input_budget:
+        elif any(
+            item.estimated_input_tokens
+            > self._role_route(item.node_id).profile.input_budget
+            for item in transport_plans
+        ):
             self.stability_preflight["preflight_status"] = "rejected"
             self.stability_preflight["rejection_reason"] = "source_prompt_exceeds_input_budget"
         elif (
@@ -1028,7 +1124,10 @@ class OutlineV3Executor:
             bind_model = self.profile.model if provider_node else model
             bind_endpoint = self.profile.endpoint_type if provider_node else "internal"
             bind_section = ""
-        config = dict(api_config or {})
+        route_config = dict(api_config or {})
+        if provider_node and not route_config and resolved_route is not None:
+            route_config = self._route_transport_identity(resolved_route)
+        config = dict(route_config)
         if provider_node:
             config.update({
                 "provider": bind_provider,
@@ -1072,15 +1171,24 @@ class OutlineV3Executor:
             "provider_family": bind_provider,
             "model_name": bind_model,
             "endpoint_type": bind_endpoint,
+            "api_base_host": resolved_route.api_base_host if provider_node and resolved_route is not None else "",
+            "route_fingerprint": resolved_route.safe_config_fingerprint() if provider_node and resolved_route is not None else "",
             "prompt_template_hash": prompt_template_hash,
             "prompt_payload_hash": prompt_payload_hash,
             "prompt_hash": hash_text(json.dumps(prompt, sort_keys=True, ensure_ascii=False)) if prompt is not None else "",
             "prompt_id": self._outline_prompt_identity.prompt_id if provider_node else "",
             "prompt_version": self._outline_prompt_identity.version if provider_node else "",
             "prompt_sha256": self._outline_prompt_identity.sha256 if provider_node else "",
-            "provider_config_hash": hash_json(api_config) if api_config is not None else "",
+            # The receipt and replay layers hash the exact transport identity,
+            # not the enriched binding-only metadata below.  Hashing the
+            # latter would make every fresh call look stale on resume.
+            "provider_config_hash": hash_json(route_config) if provider_node else "",
             "schema_hash": _hash_payload({"node_id": self._semantic_node_id(node_id), "expect_json": True}),
-            "context_profile_hash": self._context_profile_hash() if provider_node else "",
+            "context_profile_hash": (
+                self._context_profile_hash(resolved_route)
+                if provider_node and resolved_route is not None
+                else (self._context_profile_hash() if provider_node else "")
+            ),
             "relevant_runtime_config_hash": _hash_payload(relevant_config),
         }
 
@@ -1095,16 +1203,7 @@ class OutlineV3Executor:
     ) -> dict[str, Any]:
         semantic_node_id = self._semantic_node_id(node_id)
         resolved_route = route if route is not None else self._node_route(node_id)
-        api_config = {
-            "provider_family": resolved_route.provider_name,
-            "model": resolved_route.model,
-            # Gateway host only. A base URL is persisted nowhere in full, so
-            # neither a path nor a credential can reach a binding or a receipt.
-            "api_base": resolved_route.api_base_host,
-            "endpoint_type": resolved_route.endpoint_type,
-            "config_section": resolved_route.config_section,
-            "route_fingerprint": resolved_route.safe_config_fingerprint(),
-        }
+        api_config = self._route_transport_identity(resolved_route)
         return self.build_current_node_binding(
             node_id,
             artifact_type="outline_artifact",
@@ -1150,6 +1249,14 @@ class OutlineV3Executor:
                 return False
             if receipt.config_hash != str(binding.get("provider_config_hash") or ""):
                 return False
+            if str(binding.get("provider_family") or "") and receipt.provider != str(binding.get("provider_family") or ""):
+                return False
+            if str(binding.get("model_name") or "") and receipt.model != str(binding.get("model_name") or ""):
+                return False
+            if str(binding.get("endpoint_type") or "") and receipt.endpoint_type != str(binding.get("endpoint_type") or ""):
+                return False
+            if str(binding.get("api_base_host") or "") and receipt.endpoint != str(binding.get("api_base_host") or ""):
+                return False
             if receipt.schema_hash != str(binding.get("schema_hash") or ""):
                 return False
             if receipt.finish_reason == "length" or receipt.incomplete_reason:
@@ -1178,7 +1285,11 @@ class OutlineV3Executor:
             config_hash=str(binding.get("provider_config_hash") or ""),
             schema_hash=str(binding.get("schema_hash") or _hash_payload({"node_id": semantic_node_id, "expect_json": True})),
             max_attempts=1,
-            usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
+            provider=str(binding.get("provider_family") or ""),
+            model=str(binding.get("model_name") or ""),
+            endpoint=str(binding.get("api_base_host") or ""),
+            endpoint_type=str(binding.get("endpoint_type") or ""),
+            usage_required=str(binding.get("endpoint_type") or "") not in {"internal", "fixture"},
         )
         return call_id
 
@@ -1188,6 +1299,12 @@ class OutlineV3Executor:
         known_ids = {f"outline:{node_id}" for node_id in self._provider_node_ids()}
         for call_id in sorted(known_ids):
             node_id = call_id.removeprefix("outline:")
+            try:
+                route = self._node_route(node_id)
+                route_identity = self._route_transport_identity(route)
+            except (KeyError, TypeError, AttributeError):
+                route = None
+                route_identity = {}
             self._expected_provider_calls[call_id] = ExpectedProviderCall(
                 call_id=call_id,
                 job_id=self.job_id,
@@ -1200,8 +1317,14 @@ class OutlineV3Executor:
                 prompt_id=self._outline_prompt_identity.prompt_id,
                 prompt_version=self._outline_prompt_identity.version,
                 prompt_sha256=self._outline_prompt_identity.sha256,
+                provider=route.provider_name if route is not None else self.profile.provider,
+                model=route.model if route is not None else self.profile.model,
+                endpoint=route.api_base_host if route is not None else "",
+                endpoint_type=route.endpoint_type if route is not None else self.profile.endpoint_type,
+                config_hash=hash_json(route_identity) if route_identity else "",
                 max_attempts=1,
-                usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
+                usage_required=(route.endpoint_type if route is not None else self.profile.endpoint_type)
+                not in {"internal", "fixture"},
             )
 
     def _record_expected_provider_call(
@@ -1232,7 +1355,11 @@ class OutlineV3Executor:
             config_hash=hash_json(api_config),
             schema_hash=_hash_payload({"node_id": semantic_node_id, "expect_json": expect_json}),
             max_attempts=1,
-            usage_required=self.profile.endpoint_type not in {"internal", "fixture"},
+            provider=str(api_config.get("provider_family") or ""),
+            model=str(api_config.get("model") or ""),
+            endpoint=str(api_config.get("api_base") or ""),
+            endpoint_type=str(api_config.get("endpoint_type") or ""),
+            usage_required=str(api_config.get("endpoint_type") or "") not in {"internal", "fixture"},
         )
         return call_id
 
@@ -1624,21 +1751,12 @@ class OutlineV3Executor:
         route = self._node_route(node_id, transport_node_id)
         profile = route.profile
         budget = profile.estimate_request(request)
-        api_config = {
-            "provider_family": route.provider_name,
-            "model": route.model,
-            # Gateway host only; no path and no credential is ever persisted.
-            "api_base": route.api_base_host,
-            "endpoint_type": route.endpoint_type,
-            "config_section": route.config_section,
-            "route_fingerprint": route.safe_config_fingerprint(),
-        }
+        api_config = self._route_transport_identity(route)
         binding = self._provider_binding(
             node_id,
             request,
             expect_json=expect_json,
             input_artifact_hashes=input_artifact_hashes,
-            route=route,
         )
         call_id = self._register_expected_from_binding(node_id, binding)
         semantic_node_id = self._semantic_node_id(node_id)
@@ -1895,7 +2013,13 @@ class OutlineV3Executor:
                     model_name=str(binding.get("model_name") or ""),
                     provider=str(binding.get("provider_family") or ""),
                     config_snapshot={"candidate_count": self.candidate_count},
-                    budget_snapshot={"input_budget": self.profile.input_budget},
+                    budget_snapshot={
+                        "input_budget": (
+                            self._node_route(node_id).profile.input_budget
+                            if node_id in self._provider_node_ids() or node_id.startswith("stability:")
+                            else self.profile.input_budget
+                        )
+                    },
                     receipt_ids=tuple(self.receipts),
                     diagnostics=(f"{type(exc).__name__}: {exc}",),
                     execution_binding=binding,
@@ -1912,7 +2036,8 @@ class OutlineV3Executor:
         # Recovery tests use it to model a worker failure after transport
         # success but before the node output is persisted.
         self._check(node_id, phase="provider_success")
-        return self._artifact(cls, content, deps), tuple(deps), self.profile.model, self.profile.provider
+        route = self._node_route(node_id)
+        return self._artifact(cls, content, deps), tuple(deps), route.model, route.provider_name
 
     def _validate_candidate_payload(
         self,
