@@ -1,18 +1,55 @@
-# auto-generate — English user guide
+# 📚 auto-generate — Traceable, Recoverable AI Literature Review Workbench
 
-`auto-generate` is a local, corpus-controlled, full-text-first literature
-analysis and review-writing workbench. The pipeline is:
+[![Windows tests](https://github.com/super-lee-hub/literature-review-generator/actions/workflows/windows-tests.yml/badge.svg)](https://github.com/super-lee-hub/literature-review-generator/actions/workflows/windows-tests.yml)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/super-lee-hub/literature-review-generator)
 
-```text
-PDF folder or Zotero report + library
-  -> preprocessing and Stage 1 structured summaries
-  -> Outline Intelligence v3
-  -> review_draft v3 + citation_manifest v3 + DOCX
-  -> optional validation and repair
+[中文指南](./README.zh-CN.md) · [DeepWiki](https://deepwiki.com/super-lee-hub/literature-review-generator)
+
+`auto-generate` turns a literature-review workflow — reading papers, extracting
+evidence, building an outline, drafting, validating citations, repairing errors,
+and resuming interrupted jobs — into a corpus-controlled and auditable local
+pipeline.
+
+It is not just a "send PDFs to one LLM and ask it to write a review" script.
+
+Its current design combines full-text and visual Stage 1 reading, durable
+artifacts, machine-trackable citations, evidence-grounded validation, guarded
+repair, queue execution, and multi-model outline review.
+
+## Why it is different
+
+- **Full-text + visual evidence:** Stage 1 can inspect PDF pages, figures,
+  tables, formulas, captions, and normalized text.
+- **Multi-model outline review:** Claude generates and arbitrates; GPT and
+  DeepSeek provide independent specialist critiques. A critique that collapses
+  onto the generator's own model is reported as self-review, never hidden.
+- **Machine-trackable citations:** `review_draft` and `citation_manifest` are
+  durable truth sources rather than post-hoc `(Author, Year)` guessing.
+- **Evidence-grounded validation:** citation claims can be checked against source
+  chunks, pages, captions, OCR, and visual observations.
+- **Guarded repair:** repairs are dependency-bound block/span patches instead of
+  uncontrolled chapter rewrites.
+- **Durable runtime:** JobWorkspace, Artifact Registry, provider receipts, replay
+  and resume semantics make long jobs recoverable.
+- **Queue execution:** multiple PDF or Zotero jobs can run sequentially with
+  retry/cancel/resume support.
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+python setup_wizard.py
+python launch_gui.py
 ```
 
-The source corpus, workspace, artifact registry, stage closures, and validation
-evidence remain inspectable and resumable.
+For the durable CLI:
+
+```bash
+python -m reviewctl --help
+python -m reviewctl plan --spec examples/runtime_specs/direct-run-all.json
+python -m reviewctl run --spec my-run.json
+```
 
 ## Choose an entry point
 
@@ -26,16 +63,10 @@ evidence remain inspectable and resumable.
 `main.py` is a small compatibility-free shim into `reviewctl`. It is not the
 current orchestration engine and is not the public direct-run CLI.
 
-## Quick start
+## CLI runtime
 
-```bash
-pip install -r requirements.txt
-python setup_wizard.py
-python launch_gui.py
-```
-
-For CLI use, edit a version-controlled `RuntimeJobSpec` example. The examples
-use placeholders only:
+Edit a version-controlled `RuntimeJobSpec` example. The examples use
+placeholders only:
 
 ```bash
 python -m reviewctl plan --spec examples/runtime_specs/direct-run-all.json

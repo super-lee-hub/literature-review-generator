@@ -47,6 +47,11 @@ from runtime.outline_v3_dag import OutlineNodeDAG, OutlineNodeStore
 from runtime.provider_completion import ProviderCompletionEvaluator
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
+from outline.provider_router import (
+    OutlineProviderRouter,
+    OutlineRoleRoute,
+    semantic_role,
+)
 from runtime.provider_runtime import (
     ProviderBudgetV1,
     ProviderRuntime,
@@ -195,6 +200,7 @@ class OutlineV3Executor:
         artifact_registry: ArtifactRegistry | None = None,
         provider: Provider | Any | None = None,
         provider_profile: ProviderContextProfile | None = None,
+        provider_router: OutlineProviderRouter | None = None,
         candidate_count: int = 5,
         review_intent: Mapping[str, Any] | None = None,
         quality_gate: OutlineQualityGate | Mapping[str, Any] | None = None,
@@ -271,6 +277,10 @@ class OutlineV3Executor:
             model_context_limit=128_000,
             max_output_tokens=4_096,
         )
+        # Role-aware routing is opt-in so existing single-provider callers keep
+        # working, but when it is supplied every node must resolve through it.
+        self.router = provider_router
+        self.routing_diagnostics: tuple[str, ...] = tuple(provider_router.diagnostics) if provider_router else ()
         self.candidate_count = min(12, int(candidate_count))
         self.stability_mode = normalized_stability_mode
         self.max_provider_calls = int(max_provider_calls) if max_provider_calls is not None else None
@@ -444,6 +454,26 @@ class OutlineV3Executor:
             "arbitration",
         )
 
+    def _role_route(self, node_id: str) -> OutlineRoleRoute:
+        """Resolve the provider route that must serve one concrete node.
+
+        With a role router configured this is authoritative and fail-closed.
+        Without one, the pre-existing single-provider behaviour is preserved so
+        existing single-model callers are unaffected.
+        """
+
+        if self.router is not None:
+            return self.router.route_for(node_id)
+        return OutlineRoleRoute(
+            role=semantic_role(node_id),
+            config_section="",
+            provider_name=self.profile.provider,
+            model=self.profile.model,
+            endpoint_type=self.profile.endpoint_type,
+            profile=self.profile,
+            transport=self.provider if callable(self.provider) else None,
+        )
+
     def _compute_current_coverage_contract_hash(self) -> str:
         try:
             evidence = build_outline_evidence_views(self.summaries, self.job_id)
@@ -476,6 +506,13 @@ class OutlineV3Executor:
         return hash_json(replay_binding)
 
     def _context_profile_hash(self) -> str:
+        # The per-role route identity is part of the context hash.  Binding it
+        # here is what stops a Claude-era receipt from being replayed onto a
+        # differently routed GPT or DeepSeek node after a role is reconfigured.
+        route_identities = {
+            node_id: list(self._role_route(node_id).identity)
+            for node_id in self._provider_node_ids()
+        }
         return _hash_payload({
             "provider": self.profile.provider,
             "model": self.profile.model,
@@ -487,6 +524,7 @@ class OutlineV3Executor:
             "reasoning_reserve": self.profile.reasoning_reserve,
             "safety_margin": self.profile.safety_margin,
             "tokenizer_strategy": self.profile.tokenizer_strategy,
+            "role_routes": route_identities,
         })
 
     def _stability_variant_plan(
@@ -588,6 +626,8 @@ class OutlineV3Executor:
         plans: list[OutlineProviderCallPlan] = []
         for variant_name, variant_summaries, transport_expected in self._provider_call_plan_variants():
             for node_id in self._provider_node_ids():
+                route = self._role_route(node_id)
+                profile = route.profile
                 representative_request = {
                     "job_id": self.job_id,
                     "stage_name": "outline_v3",
@@ -597,14 +637,14 @@ class OutlineV3Executor:
                     "candidate_count": self.candidate_count,
                     "evidence_bound": True,
                 }
-                budget = self.profile.estimate_request(representative_request)
+                budget = profile.estimate_request(representative_request)
                 estimated_input = max(
                     1,
-                    int(budget.get("estimated_input_tokens") or self.profile.estimate_tokens(representative_request)),
+                    int(budget.get("estimated_input_tokens") or profile.estimate_tokens(representative_request)),
                 )
                 base_input_estimate = estimated_input
-                estimated_output = max(1, int(self.profile.max_output_tokens))
-                estimated_reasoning = max(0, int(self.profile.reasoning_reserve))
+                estimated_output = max(1, int(profile.max_output_tokens))
+                estimated_reasoning = max(0, int(profile.reasoning_reserve))
                 candidate_output_upper_bound = self.candidate_count * estimated_output
                 critic_input_upper_bound = 0
                 if node_id in {"structure_critique", "coverage_critique", "evidence_critique"}:
@@ -660,9 +700,9 @@ class OutlineV3Executor:
                         variant_name=variant_name,
                         node_id=node_id,
                         call_id=self._provider_call_id(node_id),
-                        provider=self.profile.provider,
-                        model=self.profile.model,
-                        endpoint_type=self.profile.endpoint_type,
+                        provider=route.provider_name,
+                        model=route.model,
+                        endpoint_type=route.endpoint_type,
                         estimated_input_tokens=estimated_input,
                         estimated_output_tokens=estimated_output,
                         estimated_reasoning_tokens=estimated_reasoning,

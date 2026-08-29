@@ -80,6 +80,52 @@ crops use PNG with about 4% padding. Pixel and byte limits are enforced before
 publication. Each visual manifest records dimensions, scale, estimated DPI,
 format, byte count, and SHA-256.
 
+## Outline Role Routing
+
+Each semantic role in `[OutlineModels]` resolves to its own API section via
+`OutlineProviderRouter` in `outline/provider_router.py`:
+
+| Role | Key | Note |
+| --- | --- | --- |
+| Relation adjudication | `relation_adjudicator_model` | Prefer a model distinct from generation |
+| Candidate generation | `outline_model` | Strong reasoning model |
+| Structure critique | `structure_critic_model` | Should differ from generation |
+| Coverage critique | `coverage_critic_model` | Should differ from generation |
+| Evidence critique | `evidence_critic_model` | Should differ from generation |
+| Arbitration | `arbitrator_model` | Normally the same model as generation |
+
+Generation and arbitration sharing one model is **intentional**: the arbitrator
+must absorb peer critiques using the same reasoning model that produced the
+candidates. Consequently only a *critique* collapsing onto the generator's
+provider counts as self-review, and the executor reports that diagnostic
+explicitly instead of silently degrading to single-model self-review.
+
+A role that cannot be resolved is never quietly remapped onto `Outline_API`. It
+is recorded as a diagnostic, and resolving that node fails closed.
+
+## Anthropic Messages Transport
+
+`endpoint_type` supports `chat_completions`, `responses`, and `anthropic`. With
+`anthropic`, the native Anthropic Messages protocol is used:
+
+* requests go to `<api_base>/<anthropic_path>`, default `v1/messages`,
+  overridable with `anthropic_path`;
+* authentication uses `x-api-key` and `anthropic-version` headers rather than a
+  Bearer token; the default version is `2023-06-01`, overridable with
+  `anthropic_version`;
+* the system prompt is the top-level `system` field, not a system message inside
+  `messages`;
+* the token limit is `max_tokens`, and with extended thinking `max_tokens` must
+  exceed `thinking_budget_tokens` — the builder raises it automatically;
+* the protocol has no `response_format` parameter, so a JSON request appends an
+  instruction to the system prompt instead;
+* the response `content` is a block list, and only blocks with `type == "text"`
+  count as answer content.
+
+A Claude model name alone does **not** trigger protocol inference: the same model
+id may be served by an Anthropic endpoint or by an OpenAI-compatible gateway, and
+guessing from the name would select the wrong wire format.
+
 ## Migration and Evidence
 
 Changing the model, capability, prompt identity/hash, schema, preprocess

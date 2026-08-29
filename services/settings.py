@@ -97,6 +97,13 @@ API_KEYS = frozenset(
         "force_highest_reasoning",
         "omit_temperature_when_reasoning",
         "experimental",
+        # Native Anthropic Messages transport.  The path is configurable because
+        # gateways do not agree on whether the base URL already includes the
+        # version segment; the version header is configurable because Anthropic
+        # pins it per API revision.
+        "anthropic_path",
+        "anthropic_version",
+        "thinking_budget_tokens",
     }
 )
 
@@ -149,6 +156,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
     "OutlineModels": frozenset(
         {
             "outline_model",
+            "relation_adjudicator_model",
             "structure_critic_model",
             "coverage_critic_model",
             "evidence_critic_model",
@@ -543,6 +551,9 @@ class ApplicationSettings:
     def outline_model(self) -> str:
         return str(self.section("OutlineModels").get("outline_model", "Outline_API")).strip()
 
+    def relation_adjudicator_model(self) -> str:
+        return str(self.section("OutlineModels").get("relation_adjudicator_model", "Free_Mode_API")).strip()
+
     def structure_critic_model(self) -> str:
         return str(self.section("OutlineModels").get("structure_critic_model", "Writer_API")).strip()
 
@@ -573,6 +584,8 @@ class ApplicationSettings:
             errors.append("Outline.candidate_count must not exceed 12")
         if not self.outline_model():
             errors.append("OutlineModels.outline_model is not configured")
+        if not self.relation_adjudicator_model():
+            errors.append("OutlineModels.relation_adjudicator_model is not configured")
         if not self.structure_critic_model():
             errors.append("OutlineModels.structure_critic_model is not configured")
         if not self.coverage_critic_model():

@@ -1,0 +1,322 @@
+"""Idempotent migration from legacy ``config.ini`` shapes to the current schema.
+
+Why this module exists
+----------------------
+The runtime loader is deliberately fail-closed: ``validate_config_keys()``
+rejects any key or section it does not recognise, so a config written against an
+older schema cannot reach the legacy handling that would otherwise upgrade it.
+The migration must therefore happen *before* validation, as an explicit and
+reviewable step rather than silently on every run.
+
+Design rules
+------------
+* **Idempotent.** Running twice produces byte-identical output the second time.
+* **Line-preserving.** Comments, blank lines and ordering survive; this is a
+  textual rewrite, not a parse-and-reprint, so nothing the user wrote is lost.
+* **Semantics over name matching.** A legacy section is only mapped when its
+  historical meaning is established. Anything ambiguous is reported as a warning
+  and left for a human instead of being guessed at.
+
+Established by git archaeology (commit ``2f89c6b``, PR #14): ``[Retry_Settings]``
+and ``[Stage2_Retry]`` had no reader even before the typed ``[Runtime]`` retry
+keys were introduced, so they are dead configuration. They are dropped rather
+ than mapped, which is behaviour-preserving because the current ``[Runtime]``
+defaults already match what those sections asked for.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+from services.settings import CONFIG_SCHEMA_VERSION
+
+# Legacy sections with no reader in any supported revision. Dropped, not mapped.
+DEAD_SECTIONS: frozenset[str] = frozenset({"Retry_Settings", "Stage2_Retry"})
+
+# The old catch-all parameter block. Values with an unambiguous per-provider home
+# are relocated; anything else is reported rather than guessed at.
+API_PARAMETERS_SECTION = "API_Parameters"
+
+API_PARAMETER_TARGETS: Dict[str, Tuple[str, str]] = {
+    "primary_max_tokens": ("Primary_Reader_API", "max_output_tokens"),
+    "backup_max_tokens": ("Backup_Reader_API", "max_output_tokens"),
+    "writer_max_tokens": ("Writer_API", "max_output_tokens"),
+    "outline_max_tokens": ("Outline_API", "max_output_tokens"),
+    "free_mode_max_tokens": ("Free_Mode_API", "max_output_tokens"),
+    "validator_max_tokens": ("Validator_API", "max_output_tokens"),
+    "primary_temperature": ("Primary_Reader_API", "temperature"),
+    "backup_temperature": ("Backup_Reader_API", "temperature"),
+    "writer_temperature": ("Writer_API", "temperature"),
+    "outline_temperature": ("Outline_API", "temperature"),
+    "free_mode_temperature": ("Free_Mode_API", "temperature"),
+    "validator_temperature": ("Validator_API", "temperature"),
+}
+
+# timeout_seconds was a single global knob; the current schema is per-provider.
+API_PARAMETER_TIMEOUT_SECTIONS: Tuple[str, ...] = (
+    "Primary_Reader_API",
+    "Backup_Reader_API",
+    "Writer_API",
+    "Outline_API",
+    "Free_Mode_API",
+    "Validator_API",
+)
+
+DROPPED_KEYS: Dict[str, frozenset[str]] = {
+    # Fixture providers are test-injected; production config must not enable one.
+    "Outline": frozenset({"test_dev_fixture_mode"}),
+}
+
+# The pre-vision default. Only rewritten when it is still exactly this value, so
+# a user who deliberately chose a different model keeps their choice.
+LEGACY_PRIMARY_MODEL = "deepseek-v4-pro"
+VISION_PRIMARY_MODEL = "deepseek-v4-flash-vision-exp"
+
+_SECTION_RE = re.compile(r"^\s*\[\s*(?P<name>[^\]]+?)\s*\]\s*$")
+_KV_RE = re.compile(r"^\s*(?P<key>[^=:\s][^=:]*?)\s*(?P<sep>[=:])\s*(?P<value>.*?)\s*$")
+
+
+@dataclass
+class MigrationReport:
+    """What the migration did, suitable for logging or a CLI summary."""
+
+    changed: bool = False
+    changes: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    def note(self, message: str) -> None:
+        self.changed = True
+        self.changes.append(message)
+
+    def warn(self, message: str) -> None:
+        self.warnings.append(message)
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "changed": self.changed,
+            "changes": list(self.changes),
+            "warnings": list(self.warnings),
+        }
+
+
+def _index_sections(lines: List[str]) -> Dict[str, int]:
+    """Map section name -> index of its header line."""
+
+    sections: Dict[str, int] = {}
+    for index, line in enumerate(lines):
+        match = _SECTION_RE.match(line)
+        if match:
+            sections.setdefault(match.group("name"), index)
+    return sections
+
+
+def _existing_keys(lines: List[str], section_index: int) -> Dict[str, int]:
+    """Map key -> line index for the keys belonging to one section."""
+
+    keys: Dict[str, int] = {}
+    for offset in range(section_index + 1, len(lines)):
+        line = lines[offset]
+        if _SECTION_RE.match(line):
+            break
+        match = _KV_RE.match(line)
+        if match:
+            keys.setdefault(match.group("key").strip(), offset)
+    return keys
+
+
+def _section_bounds(lines: List[str], section_index: int) -> Tuple[int, int]:
+    start = section_index
+    end = len(lines)
+    for offset in range(section_index + 1, len(lines)):
+        if _SECTION_RE.match(lines[offset]):
+            end = offset
+            break
+    return start, end
+
+
+def migrate_config_text(
+    text: str,
+    *,
+    promote_vision_primary: bool = True,
+) -> Tuple[str, MigrationReport]:
+    """Rewrite legacy config text into the current schema.
+
+    Returns ``(new_text, report)``. Pure: the caller decides whether to write.
+    """
+
+    report = MigrationReport()
+    lines = text.splitlines(keepends=True)
+    sections = _index_sections(lines)
+
+    # ------------------------------------------------------------------
+    # Phase 1: relocate [API_Parameters] values into their provider sections.
+    # Done first so phase 2 sees a stable picture of which keys already exist.
+    # ------------------------------------------------------------------
+    relocated: Dict[str, Dict[str, str]] = {}
+    if API_PARAMETERS_SECTION in sections:
+        index = sections[API_PARAMETERS_SECTION]
+        _start, end = _section_bounds(lines, index)
+        for offset in range(index + 1, end):
+            match = _KV_RE.match(lines[offset])
+            if not match:
+                continue
+            key = match.group("key").strip()
+            value = match.group("value").strip()
+            if not value:
+                continue
+            if key in API_PARAMETER_TARGETS:
+                target_section, target_key = API_PARAMETER_TARGETS[key]
+                relocated.setdefault(target_section, {})[target_key] = value
+            elif key == "timeout_seconds":
+                for target_section in API_PARAMETER_TIMEOUT_SECTIONS:
+                    relocated.setdefault(target_section, {})["total_timeout_seconds"] = value
+            else:
+                report.warn(
+                    f"[API_Parameters].{key} has no unambiguous home in the current "
+                    "schema and was dropped rather than guessed at"
+                )
+
+    for target_section, values in relocated.items():
+        if target_section not in sections:
+            report.warn(
+                f"[API_Parameters] values for [{target_section}] were dropped because "
+                "that section does not exist in this config"
+            )
+            continue
+        existing = _existing_keys(lines, sections[target_section])
+        for target_key, value in values.items():
+            if target_key in existing:
+                continue  # Never overwrite a value the user set explicitly.
+            if target_key == "max_output_tokens" and "max_tokens" in existing:
+                # The section carries its own legacy max_tokens, which phase 2
+                # renames into max_output_tokens. The provider section is the
+                # more specific home for a limit, so it outranks the dissolved
+                # catch-all rather than the other way round.
+                report.warn(
+                    f"[API_Parameters] value for [{target_section}].max_output_tokens "
+                    "was skipped because the section sets max_tokens itself"
+                )
+                continue
+            insert_at = sections[target_section] + 1
+            for line_index in existing.values():
+                insert_at = max(insert_at, line_index + 1)
+            lines.insert(insert_at, f"{target_key} = {value}\n")
+            existing[target_key] = insert_at
+            report.note(f"moved [API_Parameters] value into [{target_section}].{target_key}")
+        # Indices shifted; re-index before the next target section.
+        sections = _index_sections(lines)
+
+    # ------------------------------------------------------------------
+    # Phase 2: per-line rewrites and removals.
+    # ------------------------------------------------------------------
+    # Decide max_tokens handling against the post-phase-1 text rather than the
+    # partially built output: relocated [API_Parameters] values are appended at
+    # the end of a section, so they sit *after* max_tokens in line order and
+    # would otherwise be invisible at the moment max_tokens is processed, which
+    # previously produced a duplicate max_output_tokens key.
+    output_tokens_state: Dict[str, str] = {}
+    scan_section = ""
+    for line in lines:
+        header = _SECTION_RE.match(line)
+        if header:
+            scan_section = header.group("name")
+            if scan_section.endswith("_API"):
+                output_tokens_state.setdefault(scan_section, "absent")
+            continue
+        if not scan_section.endswith("_API"):
+            continue
+        match = _KV_RE.match(line)
+        if match and match.group("key").strip() == "max_output_tokens":
+            output_tokens_state[scan_section] = "set" if match.group("value").strip() else "empty"
+
+    output: List[str] = []
+    current_section = ""
+    skip_section = False
+    saw_application_section = "Application" in sections
+
+    for line in lines:
+        header = _SECTION_RE.match(line)
+        if header:
+            current_section = header.group("name")
+            skip_section = (
+                current_section in DEAD_SECTIONS or current_section == API_PARAMETERS_SECTION
+            )
+            if current_section in DEAD_SECTIONS:
+                report.note(
+                    f"removed dead legacy section [{current_section}] "
+                    "(no reader in any supported revision; [Runtime] defaults match it)"
+                )
+            elif current_section == API_PARAMETERS_SECTION:
+                report.note(f"removed [{API_PARAMETERS_SECTION}] after relocating its values")
+            if not skip_section:
+                output.append(line)
+            continue
+
+        if skip_section:
+            continue
+
+        match = _KV_RE.match(line)
+        if not match:
+            output.append(line)
+            continue
+
+        key = match.group("key").strip()
+        value = match.group("value").strip()
+
+        if key in DROPPED_KEYS.get(current_section, frozenset()):
+            report.note(f"removed [{current_section}].{key} (not accepted by the current schema)")
+            continue
+
+        if current_section == "Application" and key == "config_schema":
+            if value != str(CONFIG_SCHEMA_VERSION):
+                report.note(
+                    f"updated [Application].config_schema {value or '(unset)'} -> {CONFIG_SCHEMA_VERSION}"
+                )
+            output.append(f"config_schema = {CONFIG_SCHEMA_VERSION}\n")
+            continue
+
+        if key == "max_output_tokens" and not value and output_tokens_state.get(current_section) == "empty":
+            # Placeholder left by an earlier revision; filled from max_tokens below.
+            continue
+
+        if key == "max_tokens" and current_section.endswith("_API"):
+            state = output_tokens_state.get(current_section, "absent")
+            if state == "set":
+                report.note(
+                    f"dropped [{current_section}].max_tokens "
+                    "(max_output_tokens is already set and takes precedence)"
+                )
+                continue
+            if state == "empty":
+                report.note(f"filled [{current_section}].max_output_tokens from legacy max_tokens")
+            else:
+                report.note(f"renamed [{current_section}].max_tokens -> max_output_tokens")
+            output.append(f"max_output_tokens = {value}\n")
+            continue
+
+        if (
+            promote_vision_primary
+            and current_section == "Primary_Reader_API"
+            and key == "model"
+            and value == LEGACY_PRIMARY_MODEL
+        ):
+            report.note(
+                f"promoted [Primary_Reader_API].model {LEGACY_PRIMARY_MODEL} -> {VISION_PRIMARY_MODEL} "
+                "(legacy default; a custom model would have been left alone)"
+            )
+            output.append(f"model = {VISION_PRIMARY_MODEL}\n")
+            continue
+
+        output.append(line)
+
+    if not saw_application_section:
+        # The schema stamp is what lets the runtime tell a current config from a
+        # legacy one, so it is added rather than left to be inferred.
+        if output and not output[-1].endswith("\n"):
+            output.append("\n")
+        output.append(f"\n[Application]\nconfig_schema = {CONFIG_SCHEMA_VERSION}\n")
+        report.note(f"added [Application].config_schema = {CONFIG_SCHEMA_VERSION}")
+
+    return "".join(output), report

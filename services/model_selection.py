@@ -92,3 +92,13 @@ def get_free_mode_api_config(config: Dict[str, Any] | None) -> APIConfig:
 
 def get_validator_api_config(config: Dict[str, Any] | None) -> APIConfig:
     return _section_to_api_config((config or {}).get("Validator_API"))
+
+
+def get_api_config_for_section(config: Dict[str, Any] | None, section_name: str) -> APIConfig:
+    """Resolve any API section by name.
+
+    Used by Outline role routing so each ``[OutlineModels]`` role can select its
+    own section without duplicating the normalization rules above.
+    """
+
+    return _section_to_api_config((config or {}).get(str(section_name or "").strip()))

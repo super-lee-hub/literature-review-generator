@@ -34,8 +34,9 @@ from validation.execution_service import ValidationExecutionService
 from validation.repair_transaction import RepairPromotionTransaction, current_artifact_record
 from outline.v3_executor import OutlineV3Executor
 from outline.adoption_transaction import current_adoption_record
+from outline.provider_router import OutlineRoleRoute, build_outline_provider_router
 from services.model_capabilities import resolve_model_capability
-from services.model_selection import get_outline_api_config
+from services.model_selection import get_api_config_for_section, get_outline_api_config
 from services.settings import ApplicationSettings
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -801,6 +802,44 @@ class InternalStageExecutorRegistry:
 
         return call
 
+    def _outline_route_for_section(
+        self,
+        *,
+        session: AgentRuntimeSession,
+        role: str,
+        section_name: str,
+    ) -> OutlineRoleRoute | None:
+        """Resolve one ``[OutlineModels]`` role to its own provider route.
+
+        Returns ``None`` when the selected section cannot produce a usable
+        route, which the router records as a diagnostic instead of silently
+        substituting the Outline provider.
+        """
+
+        api_config = get_api_config_for_section(dict(session.stage_host.config), section_name)
+        model = str(api_config.get("model") or "").strip()
+        if not model:
+            return None
+        capability = resolve_model_capability(api_config)
+        model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
+        max_output_tokens = self._positive_int(api_config.get("max_output_tokens"), 4_096)
+        profile = ProviderContextProfile.conservative(
+            provider=capability.provider_family,
+            model=model,
+            endpoint_type=capability.endpoint_type,
+            model_context_limit=model_context_limit,
+            max_output_tokens=max_output_tokens,
+        )
+        return OutlineRoleRoute(
+            role=role,
+            config_section=str(section_name).strip(),
+            provider_name=capability.provider_family,
+            model=model,
+            endpoint_type=capability.endpoint_type,
+            profile=profile,
+            transport=self._outline_provider(session, profile, api_config),
+        )
+
     def _execute_outline(
         self,
         *,
@@ -829,6 +868,15 @@ class InternalStageExecutorRegistry:
             max_output_tokens=max_output_tokens,
         )
         provider = self._outline_provider(session, profile, api_config)
+        provider_router = build_outline_provider_router(
+            settings=settings,
+            config=dict(session.stage_host.config),
+            route_resolver=lambda role, section: self._outline_route_for_section(
+                session=session, role=role, section_name=section
+            ),
+        )
+        for diagnostic in provider_router.diagnostics:
+            session.stage_host.logger.warning("outline routing: %s", diagnostic)
         stability = settings.outline_stability_settings()
         free_mode_review_intent: Mapping[str, Any] | None = None
         if self.bridge.free_mode_envelope is not None:
@@ -841,6 +889,7 @@ class InternalStageExecutorRegistry:
             artifact_registry=session.context.registry,
             provider=provider,
             provider_profile=profile,
+            provider_router=provider_router,
             candidate_count=settings.outline_candidate_count(),
             quality_gate=settings.outline_quality_gate(),
             review_intent=free_mode_review_intent,

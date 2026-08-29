@@ -126,6 +126,46 @@ def _queue_command(args: argparse.Namespace) -> dict[str, Any]:
     raise ControlPlaneError(f"unsupported queue command: {command}")
 
 
+def _config_migrate_command(args: argparse.Namespace) -> dict[str, Any]:
+    """Explicitly migrate a legacy config file onto the current schema.
+
+    The runtime loader is fail-closed: it rejects unknown keys and sections
+    before any legacy handling could run, so this step has to happen before
+    validation. It is deliberately *not* run implicitly on every invocation --
+    silently rewriting a user's config in the background would be worse than
+    refusing to start.
+    """
+
+    from datetime import datetime
+
+    from services.config_migration import migrate_config_text
+
+    path = Path(args.migrate_config)
+    if not path.exists():
+        return {"status": "failed", "error": f"config file not found: {path}"}
+
+    raw = path.read_text(encoding="utf-8")
+    migrated, report = migrate_config_text(raw)
+
+    backup_path: Path | None = None
+    if report.changed and not args.dry_run:
+        if not args.no_backup:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = path.with_name(f"{path.name}.backup_before_{stamp}")
+            backup_path.write_bytes(path.read_bytes())
+        path.write_text(migrated, encoding="utf-8")
+
+    return {
+        "status": "ok",
+        "config": str(path),
+        "changed": report.changed,
+        "dry_run": bool(args.dry_run),
+        "backup": str(backup_path) if backup_path else None,
+        "changes": report.changes,
+        "warnings": report.warnings,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="reviewctl")
     parser.add_argument("--repo-root", default="")
@@ -136,6 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--workspace", default="")
     doctor.add_argument("--repo-root", dest="doctor_repo_root", default="")
     doctor.add_argument("--config", dest="doctor_config", default="")
+
+    config_migrate = subparsers.add_parser("config-migrate")
+    config_migrate.add_argument("--config", dest="migrate_config", required=True)
+    config_migrate.add_argument("--dry-run", action="store_true")
+    config_migrate.add_argument("--no-backup", action="store_true")
 
     plan = subparsers.add_parser("plan")
     plan.add_argument("--spec", required=True)
@@ -243,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
                 config_path=(getattr(args, "doctor_config", "") or args.config or None),
                 workspace=args.workspace or None,
             )
+        elif args.command == "config-migrate":
+            payload = _config_migrate_command(args)
         elif args.command == "plan":
             payload = control.plan(args.spec)
         elif args.command == "run":

@@ -341,6 +341,198 @@ def _convert_chat_content_to_responses_content(content: Any) -> Any:
     return converted or [{"type": "input_text", "text": ""}]
 
 
+ANTHROPIC_JSON_INSTRUCTION = (
+    "Return only a single valid JSON object and nothing else. "
+    "Do not wrap it in markdown code fences and do not add commentary."
+)
+
+DEFAULT_ANTHROPIC_PATH = "v1/messages"
+DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _split_data_url(url: str) -> Tuple[str, str]:
+    """Split a ``data:`` URL into ``(media_type, base64_payload)``."""
+
+    if not url.startswith("data:"):
+        return "", ""
+    header, _, payload = url.partition(",")
+    media_type = header[len("data:") :].split(";", 1)[0].strip()
+    return (media_type or "image/png"), payload.strip()
+
+
+def _convert_chat_content_to_anthropic_content(content: Any) -> Any:
+    """Convert normalized OpenAI-style content parts into Anthropic blocks.
+
+    Anthropic splits text and images into typed blocks and represents inline
+    images as base64 sources rather than ``image_url`` wrappers.  Parts with no
+    Anthropic equivalent are dropped here; the caller's visual omission report
+    is what surfaces that to the operator, so nothing disappears silently.
+    """
+
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return content
+
+    converted: List[Dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type in {"text", "input_text"}:
+            text = str(item.get("text") or item.get("content") or "").strip()
+            if text:
+                converted.append({"type": "text", "text": text})
+            continue
+        if item_type == "image_url":
+            image_url = item.get("image_url")
+            url = ""
+            if isinstance(image_url, dict):
+                url = str(image_url.get("url") or "").strip()
+            elif isinstance(image_url, str):
+                url = image_url.strip()
+            if not url:
+                continue
+            if url.startswith("data:"):
+                media_type, data = _split_data_url(url)
+                if data:
+                    converted.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": data},
+                        }
+                    )
+            else:
+                converted.append({"type": "image", "source": {"type": "url", "url": url}})
+    return converted or None
+
+
+def build_anthropic_messages_payload(
+    prompt: str,
+    api_config: APIConfig,
+    system_prompt: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    response_format: str,
+    user_content: Any = None,
+    logger: Any = None,
+    capability: Optional[ModelCapability] = None,
+    max_single_image_bytes: Optional[int] = None,
+    max_request_image_bytes: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build a native Anthropic Messages request body.
+
+    Three wire differences matter and are handled here rather than being fudged
+    into the OpenAI shape: the system prompt is a top-level ``system`` field, the
+    token limit is ``max_tokens``, and there is no response_format parameter, so
+    a JSON request is expressed as a prompt instruction instead.
+    """
+
+    capability = capability or resolve_model_capability(api_config)
+    normalized_user_content = _normalize_user_message_content(
+        prompt,
+        user_content,
+        logger=logger,
+        max_single_image_bytes=max_single_image_bytes,
+        max_request_image_bytes=max_request_image_bytes,
+    )
+
+    token_limit = _configured_positive_int(api_config.get("max_tokens"), max_tokens)
+    token_limit = _configured_positive_int(api_config.get("max_output_tokens"), token_limit)
+    # Anthropic rejects a request whose max_tokens does not exceed the extended
+    # thinking budget, so the limit is raised rather than letting the call fail.
+    thinking_budget = _configured_positive_int(api_config.get("thinking_budget_tokens"), 0)
+    if thinking_budget:
+        token_limit = max(token_limit, thinking_budget + 1)
+
+    system_text = str(system_prompt or "").strip()
+    if response_format == "json":
+        system_text = f"{system_text}\n\n{ANTHROPIC_JSON_INSTRUCTION}" if system_text else ANTHROPIC_JSON_INSTRUCTION
+        if logger:
+            logger.info(
+                "Anthropic Messages has no native JSON response mode; a JSON-only "
+                "instruction was appended to the system prompt instead."
+            )
+
+    payload: Dict[str, Any] = {
+        "model": api_config.get("model") or "",
+        "max_tokens": token_limit,
+        "system": system_text,
+        "messages": [
+            {
+                "role": "user",
+                "content": _convert_chat_content_to_anthropic_content(normalized_user_content),
+            }
+        ],
+    }
+    if not _config_bool(api_config.get("omit_temperature_when_reasoning")):
+        payload["temperature"] = temperature
+    apply_reasoning_policy(payload, api_config, capability, logger=logger)
+    return payload
+
+
+def parse_anthropic_messages_response(response_data: Dict[str, Any]) -> Tuple[str, str]:
+    """Extract text and a normalized finish reason from a Messages response.
+
+    Anthropic returns content as a block list that can interleave thinking and
+    text blocks; only text blocks are answer content.
+    """
+
+    blocks = response_data.get("content")
+    texts: List[str] = []
+    if isinstance(blocks, list):
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "").strip().lower() != "text":
+                continue
+            text = block.get("text")
+            if text:
+                texts.append(str(text))
+    content = "\n".join(texts).strip()
+
+    stop_reason = str(response_data.get("stop_reason") or "").strip().lower()
+    finish_reason = {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "tool_use": "tool_calls",
+        "pause_turn": "stop",
+        "refusal": "stop",
+    }.get(stop_reason, stop_reason or "stop")
+    return content, finish_reason
+
+
+def anthropic_request_target(
+    api_base: str,
+    api_config: APIConfig,
+    api_key: str,
+) -> Tuple[str, Dict[str, str]]:
+    """Resolve the Anthropic Messages URL and headers.
+
+    Anthropic does not take a Bearer token: it authenticates with ``x-api-key``
+    and pins an ``anthropic-version`` header. Sending the OpenAI-style header
+    fails at the gateway, so this contract is kept in one place and unit-tested
+    rather than being rebuilt inline at the call site.
+
+    The path is configurable because gateways disagree on whether the configured
+    base URL already contains the version segment.
+    """
+
+    suffix = str(api_config.get("anthropic_path") or "").strip().strip("/")
+    suffix = suffix or DEFAULT_ANTHROPIC_PATH
+    url = f"{str(api_base or '').rstrip('/')}/{suffix}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": str(
+            api_config.get("anthropic_version") or DEFAULT_ANTHROPIC_VERSION
+        ).strip(),
+    }
+    return url, headers
+
+
 def build_chat_completions_payload(
     prompt: str,
     api_config: APIConfig,
@@ -1351,13 +1543,33 @@ def _call_ai_api_detailed_uninstrumented(
         )
         if max_retries_per_call:
             max_retries = min(max_retries, max(1, int(max_retries_per_call)) + 1)
-        endpoint_suffix = "responses" if capability.endpoint_type == "responses" else "chat/completions"
-        api_url = f"{api_base.rstrip('/')}/{endpoint_suffix}"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-        if capability.endpoint_type == "responses":
+        if capability.endpoint_type == "anthropic":
+            api_url, headers = anthropic_request_target(api_base, api_config, api_key)
+        else:
+            endpoint_suffix = (
+                "responses" if capability.endpoint_type == "responses" else "chat/completions"
+            )
+            api_url = f"{api_base.rstrip('/')}/{endpoint_suffix}"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+        if capability.endpoint_type == "anthropic":
+            payload = build_anthropic_messages_payload(
+                prompt,
+                api_config,
+                system_prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format=response_format,
+                user_content=user_content,
+                logger=logger,
+                capability=capability,
+                max_single_image_bytes=max_single_image_bytes,
+                max_request_image_bytes=max_request_image_bytes,
+            )
+            response_parser = parse_anthropic_messages_response
+        elif capability.endpoint_type == "responses":
             payload = build_responses_payload(
                 prompt,
                 api_config,

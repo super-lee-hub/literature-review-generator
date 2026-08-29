@@ -7,16 +7,23 @@ from typing import Any, Dict, Iterable, Literal, Optional, Set
 
 from models import APIConfig
 
-EndpointType = Literal["chat_completions", "responses"]
+EndpointType = Literal["chat_completions", "responses", "anthropic"]
 ProviderFamily = Literal[
     "openai_responses",
     "claude_chat_reasoning",
     "aihubmix_openai",
     "aihubmix_claude",
+    "anthropic",
     "deepseek",
     "generic",
 ]
-ReasoningParamStyle = Literal["responses_reasoning", "chat_reasoning", "deepseek_thinking", "none"]
+ReasoningParamStyle = Literal[
+    "responses_reasoning",
+    "chat_reasoning",
+    "deepseek_thinking",
+    "anthropic_thinking",
+    "none",
+]
 
 
 @dataclass(frozen=True)
@@ -46,8 +53,18 @@ def _truthy(value: Any) -> bool:
     return _lower(value) in {"1", "true", "yes", "y", "on", "enabled", "enable"}
 
 
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _normalize_endpoint(value: Any) -> EndpointType:
     endpoint = _lower(value).replace("-", "_")
+    if endpoint in {"anthropic", "anthropic_messages", "messages"}:
+        return "anthropic"
     if endpoint in {"responses", "response"}:
         return "responses"
     return "chat_completions"
@@ -60,6 +77,7 @@ def _infer_provider_family(api_config: APIConfig) -> ProviderFamily:
         "claude_chat_reasoning",
         "aihubmix_openai",
         "aihubmix_claude",
+        "anthropic",
         "deepseek",
         "generic",
     }:
@@ -74,6 +92,12 @@ def _infer_provider_family(api_config: APIConfig) -> ProviderFamily:
             return "aihubmix_claude"
         if model.startswith("gpt-"):
             return "aihubmix_openai"
+    # An explicitly configured Anthropic transport is authoritative.  Model-name
+    # inference is deliberately NOT used here: a Claude model id alone cannot
+    # tell an Anthropic Messages endpoint from an OpenAI-compatible gateway that
+    # proxies Claude, and guessing would silently pick the wrong wire format.
+    if _normalize_endpoint(api_config.get("endpoint_type")) == "anthropic":
+        return "anthropic"
     return "generic"
 
 
@@ -107,6 +131,23 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
             supports_pdf_file_input=explicit_pdf_input,
             reasoning_param_style="chat_reasoning",
             highest_reasoning_effort="xhigh",
+            max_token_param="max_tokens",
+            disallowed_when_reasoning={"temperature", "top_p"},
+        )
+
+    if provider_family == "anthropic" or endpoint_type == "anthropic":
+        # Native Anthropic Messages API.  Its wire contract differs from both
+        # OpenAI protocols: the system prompt is a top-level field rather than a
+        # message, the token limit is max_tokens, extended thinking uses a
+        # budget_tokens sub-field, and temperature is rejected while thinking is
+        # active.
+        return ModelCapability(
+            endpoint_type="anthropic",
+            provider_family="anthropic",
+            supports_reasoning=True,
+            supports_pdf_file_input=False,
+            reasoning_param_style="anthropic_thinking",
+            highest_reasoning_effort="max",
             max_token_param="max_tokens",
             disallowed_when_reasoning={"temperature", "top_p"},
         )
@@ -162,6 +203,12 @@ def is_reasoning_active(payload: Dict[str, Any], capability: ModelCapability) ->
         return bool(payload.get("reasoning"))
     if capability.reasoning_param_style == "deepseek_thinking":
         return bool(payload.get("thinking") or payload.get("reasoning_effort"))
+    if capability.reasoning_param_style == "anthropic_thinking":
+        # An explicitly disabled thinking block must not count as active: Anthropic
+        # only rejects temperature while thinking is *enabled*. Key presence alone
+        # would strip temperature from configurations that legitimately allow it.
+        thinking = payload.get("thinking")
+        return isinstance(thinking, dict) and str(thinking.get("type") or "").casefold() == "enabled"
     return False
 
 
@@ -200,6 +247,20 @@ def apply_reasoning_policy(
         payload["thinking"] = thinking_payload
         if effort:
             payload["reasoning_effort"] = effort
+    elif capability.reasoning_param_style == "anthropic_thinking":
+        # budget_tokens is numeric while the thinking switch is a string, so the
+        # payload is widened to Dict[str, Any] rather than forcing one type.
+        thinking_payload: Dict[str, Any] = dict(
+            _normalize_thinking_payload(api_config.get("thinking")) or {"type": "enabled"}
+        )
+        if thinking_payload.get("type") == "enabled":
+            # Anthropic accepts a bare {"type": "enabled"} and picks a default
+            # budget, so an absent budget is a valid configuration rather than a
+            # value that must be invented here.
+            budget = _positive_int(api_config.get("thinking_budget_tokens"), 0)
+            if budget > 0:
+                thinking_payload["budget_tokens"] = budget
+        payload["thinking"] = thinking_payload
 
     if is_reasoning_active(payload, capability) and (
         _truthy(api_config.get("omit_temperature_when_reasoning"))

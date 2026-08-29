@@ -71,6 +71,44 @@ JPEG 质量、padding，以及 table/formula crop 开关。当前传输预算统
 像素和字节安全上限。每个 visual manifest 记录宽高、scale、estimated DPI、格式、
 字节数和 SHA-256。
 
+## Outline 角色化路由
+
+`[OutlineModels]` 的每个语义角色都会解析到自己的 API section，由
+`outline/provider_router.py` 中的 `OutlineProviderRouter` 执行：
+
+| 角色     | 配置键                          | 说明         |
+| ------ | ---------------------------- | ---------- |
+| 关系裁决   | `relation_adjudicator_model` | 建议与候选生成不同  |
+| 候选大纲生成 | `outline_model`              | 强推理模型      |
+| 结构审查   | `structure_critic_model`     | 应与生成模型不同   |
+| 覆盖度审查  | `coverage_critic_model`      | 应与生成模型不同   |
+| 证据审查   | `evidence_critic_model`      | 应与生成模型不同   |
+| 最终仲裁   | `arbitrator_model`           | 通常与生成模型相同  |
+
+生成与仲裁共用同一模型是**刻意设计**：仲裁必须用产出候选的同一个推理模型去吸收 peer
+critiques。因此只有「某个 critique 与候选生成撞成同一 provider」才算 self-review；
+系统会明确报出该诊断，不会静默降级为单模型自审。
+
+无法解析的角色不会被悄悄改指到 `Outline_API`——它们会被记录为诊断，节点取路由时
+fail-closed 抛错。
+
+## Anthropic Messages 传输
+
+`endpoint_type` 当前支持 `chat_completions`、`responses` 与 `anthropic`。配置为
+`anthropic` 时使用原生 Anthropic Messages 协议：
+
+* 请求发往 `<api_base>/<anthropic_path>`，默认 `v1/messages`，可用 `anthropic_path` 覆盖；
+* 鉴权使用 `x-api-key` 与 `anthropic-version` 头，而非 Bearer token；默认版本
+  `2023-06-01`，可用 `anthropic_version` 覆盖；
+* system prompt 位于顶层 `system` 字段，而不是 messages 中的一条 system 消息；
+* 令牌上限是 `max_tokens`；开启 extended thinking 时 `max_tokens` 必须大于
+  `thinking_budget_tokens`，构造请求时会自动抬高；
+* 该协议没有 `response_format` 参数，请求 JSON 时改为向 system prompt 追加指令；
+* 响应的 `content` 是 block 列表，只有 `type == "text"` 的块才作为回答内容。
+
+Claude 模型名本身**不会**触发协议推断：同名模型既可能挂在 Anthropic 端点，也可能挂在
+OpenAI 兼容的第三方网关，仅凭名字猜测会选错线格式。
+
 ## 迁移与证据
 
 model、capability、Prompt identity/hash、schema、预处理证据、visual manifest 或

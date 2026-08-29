@@ -167,10 +167,24 @@ technical_shard_target_tokens = 0
 allow_bibliometric_provider = false
 
 [OutlineModels]
+# Role-aware routing: each semantic role resolves to its own API section, so the
+# outline is genuinely reviewed by different models instead of one model grading
+# its own candidates.
+#
+# Recommended shape: the generator and the arbitrator share one strong reasoning
+# model (the arbitrator must absorb peer critiques using the model that produced
+# the candidates), while the critiques come from *different* models. A critique
+# that resolves to the generator's own model is self-review; the executor emits
+# an explicit routing diagnostic instead of hiding it.
+#
+# Note on gateways: a section's api_base only records where requests are sent.
+# A third-party gateway is not evidence that the upstream is the official
+# OpenAI or Anthropic service, and the two must not be conflated.
 outline_model = Outline_API
+relation_adjudicator_model = Free_Mode_API
 structure_critic_model = Writer_API
-coverage_critic_model = Primary_Reader_API
-evidence_critic_model = Primary_Reader_API
+coverage_critic_model = Free_Mode_API
+evidence_critic_model = Writer_API
 arbitrator_model = Outline_API
 
 [OutlineCostControl]

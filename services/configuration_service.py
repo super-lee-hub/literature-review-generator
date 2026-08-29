@@ -300,9 +300,10 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "OutlineModels": {
             "outline_model": "Outline_API",
+            "relation_adjudicator_model": "Free_Mode_API",
             "structure_critic_model": "Writer_API",
-            "coverage_critic_model": "Primary_Reader_API",
-            "evidence_critic_model": "Primary_Reader_API",
+            "coverage_critic_model": "Free_Mode_API",
+            "evidence_critic_model": "Writer_API",
             "arbitrator_model": "Outline_API",
         },
         "OutlineCostControl": {
