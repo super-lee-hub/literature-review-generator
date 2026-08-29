@@ -136,31 +136,37 @@ def _config_migrate_command(args: argparse.Namespace) -> dict[str, Any]:
     refusing to start.
     """
 
-    from datetime import datetime
-
-    from services.config_migration import migrate_config_text
+    from services.config_migration import migrate_config_file, migrate_config_text
 
     path = Path(args.migrate_config)
     if not path.exists():
         return {"status": "failed", "error": f"config file not found: {path}"}
 
-    raw = path.read_text(encoding="utf-8")
-    migrated, report = migrate_config_text(raw)
-
-    backup_path: Path | None = None
-    if report.changed and not args.dry_run:
-        if not args.no_backup:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = path.with_name(f"{path.name}.backup_before_{stamp}")
-            backup_path.write_bytes(path.read_bytes())
-        path.write_text(migrated, encoding="utf-8")
+    if args.dry_run:
+        # Nothing is written, so the pure transform is enough.
+        _migrated, report = migrate_config_text(
+            path.read_text(encoding="utf-8"),
+            unknown_legacy="drop" if args.drop_unknown_legacy else "preserve",
+        )
+        backups: list[str] = []
+    else:
+        report = migrate_config_file(
+            path,
+            backup=not args.no_backup,
+            drop_unknown_legacy=bool(args.drop_unknown_legacy),
+        )
+        backups = [
+            change.split(" ", 2)[-1]
+            for change in report.changes
+            if change.startswith("wrote backup ")
+        ]
 
     return {
         "status": "ok",
         "config": str(path),
         "changed": report.changed,
         "dry_run": bool(args.dry_run),
-        "backup": str(backup_path) if backup_path else None,
+        "backup": backups[-1] if backups else None,
         "changes": report.changes,
         "warnings": report.warnings,
     }
@@ -181,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
     config_migrate.add_argument("--config", dest="migrate_config", required=True)
     config_migrate.add_argument("--dry-run", action="store_true")
     config_migrate.add_argument("--no-backup", action="store_true")
+    config_migrate.add_argument(
+        "--drop-unknown-legacy",
+        action="store_true",
+        help="Discard [API_Parameters] keys with no home in the current schema "
+        "(default: preserve them in a marked legacy block)",
+    )
 
     plan = subparsers.add_parser("plan")
     plan.add_argument("--spec", required=True)

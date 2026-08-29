@@ -163,12 +163,32 @@ def test_api_parameters_never_overwrite_explicit_values() -> None:
 
 
 def test_unmappable_api_parameters_are_reported_not_guessed() -> None:
+    """Unmapped keys are preserved for the operator, not silently discarded."""
+
     text = "[API_Parameters]\nconcept_max_tokens = 3000\n"
     migrated, report = migrate_config_text(text)
 
     assert any("concept_max_tokens" in warning for warning in report.warnings)
+    # The section itself must not survive: it is not valid in the current schema.
+    assert "API_Parameters" not in _parse(migrated)
+    # ...but the value must still be there, as a comment, and must not break the
+    # parser or the strict key validator.
+    assert "# concept_max_tokens = 3000" in migrated
+    _assert_valid_and_idempotent(migrated)
+
+
+def test_unmappable_api_parameters_can_be_dropped_explicitly() -> None:
+    text = "[API_Parameters]\nconcept_max_tokens = 3000\n"
+    migrated, report = migrate_config_text(text, unknown_legacy="drop")
+
+    assert "concept_max_tokens" not in migrated
     assert "API_Parameters" not in _parse(migrated)
     _assert_valid_and_idempotent(migrated)
+
+
+def test_unknown_legacy_rejects_an_invalid_mode() -> None:
+    with pytest.raises(ValueError):
+        migrate_config_text("[Paths]\noutput_path = ./out\n", unknown_legacy="guess")
 
 
 def test_relocated_value_does_not_collide_with_legacy_max_tokens() -> None:

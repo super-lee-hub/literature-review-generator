@@ -26,9 +26,13 @@ defaults already match what those sections asked for.
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 from services.settings import CONFIG_SCHEMA_VERSION
 
@@ -136,25 +140,64 @@ def _section_bounds(lines: List[str], section_index: int) -> Tuple[int, int]:
     return start, end
 
 
+LEGACY_BLOCK_HEADER = "# --- preserved by config-migrate: no unambiguous home in the current schema ---"
+LEGACY_BLOCK_FOOTER = "# --- end preserved legacy block ---"
+
+
+def _declared_schema(sections: Mapping[str, int], lines: List[str]) -> int:
+    """Read the schema stamp the incoming config declares, or 0 when absent."""
+
+    index = sections.get("Application")
+    if index is None:
+        return 0
+    for key, line_index in _existing_keys(lines, index).items():
+        if key == "config_schema":
+            match = _KV_RE.match(lines[line_index])
+            if match:
+                try:
+                    return int(str(match.group("value")).strip())
+                except (TypeError, ValueError):
+                    return 0
+    return 0
+
+
 def migrate_config_text(
     text: str,
     *,
     promote_vision_primary: bool = True,
+    unknown_legacy: str = "preserve",
 ) -> Tuple[str, MigrationReport]:
     """Rewrite legacy config text into the current schema.
 
     Returns ``(new_text, report)``. Pure: the caller decides whether to write.
+
+    ``unknown_legacy`` controls ``[API_Parameters]`` keys with no unambiguous
+    home. The default ``"preserve"`` keeps them in a clearly marked block, on the
+    grounds that discarding a setting the user wrote is not a decision a
+    migration should make silently. ``"drop"`` removes them, and is what the
+    explicit ``--drop-unknown-legacy`` flag selects.
     """
+
+    if unknown_legacy not in {"preserve", "drop"}:
+        raise ValueError(f"unknown_legacy must be 'preserve' or 'drop', got {unknown_legacy!r}")
 
     report = MigrationReport()
     lines = text.splitlines(keepends=True)
     sections = _index_sections(lines)
+
+    # Only a config that still declares an older schema is evidence of the legacy
+    # default. A config already on the current schema has been touched by a
+    # current revision, so its model choice is treated as deliberate.
+    declared_schema = _declared_schema(sections, lines)
+    is_legacy_schema = declared_schema < CONFIG_SCHEMA_VERSION
+    promote_vision_primary = promote_vision_primary and is_legacy_schema
 
     # ------------------------------------------------------------------
     # Phase 1: relocate [API_Parameters] values into their provider sections.
     # Done first so phase 2 sees a stable picture of which keys already exist.
     # ------------------------------------------------------------------
     relocated: Dict[str, Dict[str, str]] = {}
+    preserved: Dict[str, str] = {}
     if API_PARAMETERS_SECTION in sections:
         index = sections[API_PARAMETERS_SECTION]
         _start, end = _section_bounds(lines, index)
@@ -173,9 +216,11 @@ def migrate_config_text(
                 for target_section in API_PARAMETER_TIMEOUT_SECTIONS:
                     relocated.setdefault(target_section, {})["total_timeout_seconds"] = value
             else:
+                preserved.setdefault(key, value)
                 report.warn(
                     f"[API_Parameters].{key} has no unambiguous home in the current "
-                    "schema and was dropped rather than guessed at"
+                    "schema and was preserved in a marked legacy block rather than "
+                    "guessed at"
                 )
 
     for target_section, values in relocated.items():
@@ -243,6 +288,23 @@ def migrate_config_text(
             skip_section = (
                 current_section in DEAD_SECTIONS or current_section == API_PARAMETERS_SECTION
             )
+            if current_section == API_PARAMETERS_SECTION and preserved and unknown_legacy == "preserve":
+                # Discarding a setting the user wrote is not a decision a
+                # migration should make on its own, so the unmapped keys are kept
+                # in a block that is visibly marked as unmigrated.
+                # Preserved as comments, not as a live section: [API_Parameters]
+                # is not a valid section in the current schema, so keeping it
+                # real would leave the config unable to load at all. Commented
+                # lines stay visible to the operator and invisible to the parser.
+                output.append(f"{LEGACY_BLOCK_HEADER}\n")
+                for key, value in preserved.items():
+                    output.append(f"# {key} = {value}\n")
+                output.append(f"{LEGACY_BLOCK_FOOTER}\n")
+                report.note(
+                    f"preserved {len(preserved)} unmapped [{API_PARAMETERS_SECTION}] "
+                    "key(s) in a marked legacy block"
+                )
+                continue
             if current_section in DEAD_SECTIONS:
                 report.note(
                     f"removed dead legacy section [{current_section}] "
@@ -320,3 +382,54 @@ def migrate_config_text(
         report.note(f"added [Application].config_schema = {CONFIG_SCHEMA_VERSION}")
 
     return "".join(output), report
+
+
+def migrate_config_file(
+    path: Union[str, Path],
+    *,
+    backup: bool = True,
+    drop_unknown_legacy: bool = False,
+    promote_vision_primary: bool = True,
+) -> MigrationReport:
+    """Migrate a config file in place, safely.
+
+    The rewrite is written to a temporary file in the same directory, flushed and
+    fsync'd, and only then swapped in with an atomic replace. An interruption
+    therefore leaves the original config intact rather than half-written -- which
+    matters more than usual here, because a truncated config.ini cannot be loaded
+    at all. The backup is completed and fsync'd before the swap begins.
+    """
+
+    target = Path(path)
+    raw = target.read_text(encoding="utf-8")
+    migrated, report = migrate_config_text(
+        raw,
+        promote_vision_primary=promote_vision_primary,
+        unknown_legacy="drop" if drop_unknown_legacy else "preserve",
+    )
+    if not report.changed:
+        return report
+
+    if backup:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = target.with_name(f"{target.name}.backup_before_{stamp}")
+        with open(backup_path, "wb") as handle:
+            handle.write(target.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        report.note(f"wrote backup {backup_path.name}")
+
+    directory = str(target.parent)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(migrated)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target)
+    except BaseException:
+        # A failed migration must never destroy the config it was migrating.
+        Path(temp_name).unlink(missing_ok=True)
+        raise
+
+    return report
