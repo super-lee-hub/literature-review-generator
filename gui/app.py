@@ -3833,8 +3833,8 @@ def launch_gui(
                 _render_api_card(controller, "Primary_Reader_API", "阅读模型", "优先负责文献分析与阶段一抽取。")
                 _render_api_card(controller, "Backup_Reader_API", "备用阅读模型", "当主阅读模型失败或限流时，系统可以兜底。")
                 _render_api_card(controller, "Writer_API", "写作模型", "负责大段综述写作与章节生成。")
-                _render_api_card(controller, "Outline_API", "大纲模型", "优先负责框架大纲规划；未配置时可回退到写作模型。")
-                _render_api_card(controller, "Free_Mode_API", "自由模式对话模型", "优先负责自由模式前置对话规划；未配置时可回退到大纲模型。")
+                _render_api_card(controller, "Outline_API", "大纲模型", "负责候选大纲生成与最终仲裁；这是角色路由目标，必须完整配置，不再回退到写作模型。")
+                _render_api_card(controller, "Free_Mode_API", "自由模式对话模型", "负责自由模式规划，以及关系裁决与覆盖度审查；同样是路由目标，必须完整配置，不再回退到大纲模型。")
                 _render_api_card(controller, "Validator_API", "验证模型", "用于综述校验和质量复查。")
                 _render_mineru_api_card(controller)
 

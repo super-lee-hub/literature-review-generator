@@ -16,6 +16,7 @@ import pytest
 from ai_interface import (
     DEFAULT_ANTHROPIC_PATH,
     DEFAULT_ANTHROPIC_VERSION,
+    _call_ai_api_detailed_uninstrumented,
     _convert_chat_content_to_anthropic_content,
     anthropic_request_target,
     build_anthropic_messages_payload,
@@ -26,10 +27,12 @@ from services.model_capabilities import (
     _normalize_endpoint,
     anthropic_effort_levels,
     anthropic_model_key,
+    anthropic_temperature_deprecated,
     anthropic_thinking_mode,
     apply_reasoning_policy,
     is_reasoning_active,
     resolve_anthropic_effort,
+    resolve_anthropic_messages_url,
     resolve_model_capability,
 )
 
@@ -121,6 +124,173 @@ def test_request_target_honours_configured_path_and_version() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Canonical URL resolution (one resolver, shared by runtime and probe)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "api_base,anthropic_path,expected",
+    [
+        # Bare host: the default path is appended once.
+        ("https://host", "", "https://host/v1/messages"),
+        ("https://host/", "", "https://host/v1/messages"),
+        # The base already carries /v1: it must not be repeated.
+        ("https://host/v1", "", "https://host/v1/messages"),
+        ("https://host/v1/", "", "https://host/v1/messages"),
+        ("https://host/v1", "v1/messages", "https://host/v1/messages"),
+        ("https://host/v1", "/v1/messages", "https://host/v1/messages"),
+        # The base already points straight at the endpoint.
+        ("https://host/v1/messages", "", "https://host/v1/messages"),
+        ("https://host/v1/messages", "v1/messages", "https://host/v1/messages"),
+        ("https://host/v1/messages/", "/v1/messages/", "https://host/v1/messages"),
+        # A base path that only looks similar is preserved, not stripped.
+        ("https://host/proxy", "", "https://host/proxy/v1/messages"),
+        ("https://host/api/v1", "v1/messages", "https://host/api/v1/messages"),
+        # Custom explicit paths are honoured, never rewritten.
+        ("https://host", "v2/messages", "https://host/v2/messages"),
+        ("https://host/v1", "custom/gateway/messages", "https://host/v1/custom/gateway/messages"),
+        ("https://host", "/custom/messages", "https://host/custom/messages"),
+        # A custom gateway path that shares a leading segment still splices once.
+        ("https://host/v1", "v1/gateway/messages", "https://host/v1/gateway/messages"),
+        # Ports and non-default hosts survive.
+        ("https://host:8443/v1", "", "https://host:8443/v1/messages"),
+    ],
+)
+def test_anthropic_url_is_joined_exactly_once(
+    api_base: str, anthropic_path: str, expected: str
+) -> None:
+    assert resolve_anthropic_messages_url(api_base, anthropic_path) == expected
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "https://host",
+        "https://host/",
+        "https://host/v1",
+        "https://host/v1/",
+        "https://host/v1/messages",
+    ],
+)
+def test_resolved_url_never_duplicates_a_segment(api_base: str) -> None:
+    url = resolve_anthropic_messages_url(api_base, "v1/messages")
+
+    assert url.count("/v1/") <= 1, url
+    assert url.count("/messages") == 1, url
+
+
+def test_resolved_url_preserves_the_configured_host_identity() -> None:
+    """The host that was configured must be the host that is requested."""
+
+    for api_base in ("https://gate.test/v1", "https://gate.test:9443", "https://gate.test/v1/messages"):
+        url = resolve_anthropic_messages_url(api_base, "v1/messages")
+        assert url.split("://", 1)[1].split("/", 1)[0] == api_base.split("://", 1)[1].split("/", 1)[0].rstrip("/")
+
+
+def test_runtime_and_connection_probe_resolve_the_same_url(monkeypatch) -> None:
+    """The bug this replaces: probe PASSes against a URL the runtime never requests.
+
+    Both sides are driven through the same base/path inputs and must land on the
+    same string, for every shape of base that a gateway operator might enter.
+    """
+
+    from config_validator import test_api_connection
+
+    captured: list[str] = []
+
+    class _Response:
+        status_code = 200
+
+        def json(self) -> dict[str, object]:
+            return {"content": [{"type": "text", "text": "ok"}]}
+
+    def _fake_post(url: str, **_kwargs: object) -> _Response:
+        captured.append(url)
+        return _Response()
+
+    monkeypatch.setattr("config_validator.requests.post", _fake_post)
+
+    for api_base in ("https://gate.test", "https://gate.test/", "https://gate.test/v1", "https://gate.test/v1/", "https://gate.test/v1/messages"):
+        for configured_path in ("", "v1/messages", "/v1/messages"):
+            captured.clear()
+            runtime_url, _headers = anthropic_request_target(
+                api_base, {"anthropic_path": configured_path}, "k"
+            )
+            test_api_connection(
+                "k",
+                api_base,
+                "claude-opus-5",
+                endpoint_type="anthropic",
+                provider_family="anthropic",
+                anthropic_path=configured_path,
+            )
+            assert captured == [runtime_url], (
+                f"probe requested {captured} but runtime would request {runtime_url!r} "
+                f"for api_base={api_base!r} path={configured_path!r}"
+            )
+
+
+def test_production_path_posts_to_the_canonical_url(monkeypatch) -> None:
+    """Through the real transport, not just the string helper.
+
+    A unit test of the resolver would still pass if the runtime simply never
+    called it. This drives the transport that actually builds the URL and body
+    (``_call_ai_api_detailed_uninstrumented``) with a mocked socket, and asserts
+    both where it connected and what it sent.
+    """
+
+    requested: list[str] = []
+    sent: list[dict[str, Any]] = []
+
+    class _Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "model": "claude-opus-5",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }
+
+    def _fake_post(url: str, **kwargs: Any) -> _Response:
+        requested.append(url)
+        sent.append(dict(kwargs.get("json") or {}))
+        return _Response()
+
+    monkeypatch.setattr("ai_interface.requests.post", _fake_post)
+    monkeypatch.setattr("ai_interface.should_bypass_environment_proxy", lambda _config: False)
+
+    for api_base, expected_url in (
+        ("https://gate.test", "https://gate.test/v1/messages"),
+        ("https://gate.test/v1", "https://gate.test/v1/messages"),
+        ("https://gate.test/v1/messages", "https://gate.test/v1/messages"),
+    ):
+        requested.clear()
+        sent.clear()
+        result = _call_ai_api_detailed_uninstrumented(
+            "hello",
+            {**ANTHROPIC_CONFIG, "api_key": "k", "api_base": api_base},
+            "sys",
+            max_tokens=1024,
+            temperature=0.7,
+            response_format="text",
+        )
+        assert result.get("status") == "success", result
+        assert requested == [expected_url], f"api_base={api_base!r} produced {requested}"
+
+        body = sent[0]
+        assert body["thinking"] == {"type": "adaptive"}
+        # Opus 5: effort stays at the documented default and temperature is gone.
+        assert body["output_config"] == {"effort": "high"}
+        assert "temperature" not in body
+
+
+# ---------------------------------------------------------------------------
 # Payload construction
 # ---------------------------------------------------------------------------
 
@@ -180,14 +350,114 @@ def test_temperature_is_omitted_while_thinking_is_active() -> None:
     assert "temperature" not in payload
 
 
-def test_temperature_is_kept_when_thinking_is_disabled() -> None:
+def test_temperature_is_withheld_on_opus_5_even_when_thinking_is_disabled() -> None:
+    """Current generation: temperature is deprecated, not merely reasoning-gated.
+
+    Anthropic's API usage primer: "On Claude 4.7 and later models and Claude
+    Mythos Preview, ``temperature`` is deprecated and only its default value is
+    accepted, even when thinking is off."
+
+    This test previously asserted ``payload["temperature"] == 0.7``. That pinned
+    a request the provider is documented to reject, and it is exactly the
+    assumption that had to be broken.
+    """
+
     config = {**ANTHROPIC_CONFIG, "thinking": "disabled"}
     payload = build_anthropic_messages_payload(
         "hello", config, "sys", max_tokens=1024, temperature=0.7, response_format="text",
     )
 
-    assert payload["temperature"] == 0.7
+    assert "temperature" not in payload
     assert not is_reasoning_active(payload, resolve_model_capability(config))
+
+
+@pytest.mark.parametrize(
+    "model,expected_deprecated",
+    [
+        ("claude-opus-5", True),
+        ("claude-opus-4-8", True),
+        ("claude-opus-4-7", True),
+        ("claude-sonnet-5", True),
+        # Named explicitly by the deprecation note despite its version stamp.
+        ("claude-mythos-preview", True),
+        # 4.6 and earlier are not in the note: only the "thinking enabled -> 1"
+        # rule applies to them.
+        ("claude-opus-4-6", False),
+        ("claude-opus-4-5", False),
+        ("claude-sonnet-4-5", False),
+        ("claude-opus-4-1", False),
+    ],
+)
+def test_temperature_deprecation_follows_the_model_generation(
+    model: str, expected_deprecated: bool
+) -> None:
+    assert anthropic_temperature_deprecated(model) is expected_deprecated
+
+
+def test_legacy_claude_keeps_temperature_when_thinking_is_disabled() -> None:
+    """The legacy contract still applies where the protocol still allows it.
+
+    The deprecation note is scoped to 4.7+ and Mythos Preview, so a manual
+    generation with thinking off keeps its configured sampling.
+    """
+
+    config = {
+        **ANTHROPIC_CONFIG,
+        "model": "claude-opus-4-5-20251101",
+        "thinking": "disabled",
+    }
+    payload = build_anthropic_messages_payload(
+        "hello", config, "sys", max_tokens=1024, temperature=0.7, response_format="text",
+    )
+
+    assert payload["temperature"] == 0.7
+
+
+def test_legacy_claude_drops_temperature_when_thinking_is_enabled() -> None:
+    """"Temperature must be set to 1 (or left unset) whenever thinking is
+    enabled, on all models" -- including the legacy generations."""
+
+    config = {
+        **ANTHROPIC_CONFIG,
+        "model": "claude-opus-4-5-20251101",
+        "thinking_budget_tokens": "2000",
+        "max_output_tokens": "8000",
+    }
+    payload = build_anthropic_messages_payload(
+        "hello", config, "sys", max_tokens=1024, temperature=0.7, response_format="text",
+    )
+
+    assert payload["thinking"]["type"] == "enabled"
+    assert "temperature" not in payload
+
+
+def test_unrecognised_model_on_anthropic_gets_no_custom_temperature() -> None:
+    """Generic Anthropic-compatible: fail conservative.
+
+    There is no Claude generation evidence for an unknown model on an
+    Anthropic-shaped endpoint, so nothing is relaxed on a guess. Withholding a
+    sampling knob costs the caller determinism tuning; sending an unsupported
+    one costs a 400.
+    """
+
+    config = {**ANTHROPIC_CONFIG, "model": "some-gateway-model"}
+    payload = build_anthropic_messages_payload(
+        "hello", config, "sys", max_tokens=1024, temperature=0.7, response_format="text",
+    )
+
+    assert "temperature" not in payload
+
+
+def test_top_p_and_top_k_never_reach_the_anthropic_transport() -> None:
+    """They are not part of this transport's emitted sampling contract."""
+
+    config = {**ANTHROPIC_CONFIG, "model": "claude-opus-4-5-20251101", "thinking": "disabled"}
+    payload = build_anthropic_messages_payload(
+        "hello", config, "sys", max_tokens=1024, temperature=0.7, response_format="text",
+    )
+
+    assert "top_p" not in payload
+    assert "top_k" not in payload
 
 
 def test_json_response_format_is_an_instruction_not_a_parameter() -> None:
@@ -302,7 +572,9 @@ def test_disabled_thinking_withholds_effort() -> None:
 
     assert payload["thinking"] == {"type": "disabled"}
     assert "output_config" not in payload
-    assert payload["temperature"] == 0.3
+    # Opus 5 deprecates temperature outright, so disabling thinking does not
+    # bring a custom value back.
+    assert "temperature" not in payload
 
 
 def test_non_claude_model_through_anthropic_gets_no_thinking_block() -> None:

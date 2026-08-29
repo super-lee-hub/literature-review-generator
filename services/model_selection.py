@@ -86,17 +86,23 @@ def get_writer_api_config(config: Dict[str, Any] | None) -> APIConfig:
 
 
 def get_outline_api_config(config: Dict[str, Any] | None) -> APIConfig:
-    outline_section = (config or {}).get("Outline_API")
-    if _section_has_effective_route(outline_section):
-        return _section_to_api_config(outline_section)
-    return get_writer_api_config(config)
+    """Resolve ``[Outline_API]`` on its own, with no Writer fallback.
+
+    Role-aware routing treats an API section as the route authority: the
+    section's ``api_base``, ``endpoint_type`` and ``provider_family`` are one
+    indivisible wire contract. The old fallback copied just the model and
+    address from ``[Writer_API]`` and left the transport behind, which is how a
+    Writer gateway ended up being addressed with the Anthropic Messages
+    protocol. An incomplete section is now an incomplete section.
+    """
+
+    return _section_to_api_config((config or {}).get("Outline_API"))
 
 
 def get_free_mode_api_config(config: Dict[str, Any] | None) -> APIConfig:
-    free_mode_section = (config or {}).get("Free_Mode_API")
-    if _section_has_effective_route(free_mode_section):
-        return _section_to_api_config(free_mode_section)
-    return get_outline_api_config(config)
+    """Resolve ``[Free_Mode_API]`` on its own, with no Outline fallback."""
+
+    return _section_to_api_config((config or {}).get("Free_Mode_API"))
 
 
 def get_validator_api_config(config: Dict[str, Any] | None) -> APIConfig:

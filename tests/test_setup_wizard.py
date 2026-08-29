@@ -2,7 +2,13 @@ import configparser
 
 from services.configuration_service import read_env_file
 from services.environment_service import RuntimeEnvironment
-from setup_wizard import run_setup_wizard
+from services.settings import CONFIG_SCHEMA_VERSION
+from setup_wizard import (
+    _config_requires_explicit_migration,
+    _load_existing_config_sections,
+    _migrate_existing_config_explicitly,
+    run_setup_wizard,
+)
 
 
 def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) -> None:
@@ -51,13 +57,13 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
 
             # --- Outline_API ---
             "",                                # provider (default: videocaptioner)
-            "-",                               # model (clear → fallback to Writer)
-            "-",                               # api_base (clear → fallback to Writer)
-            "",                                # api_key
-            "",                                # endpoint_type (default: anthropic from defaults)
-            "",                                # anthropic_path (default: /v1/messages)
-            "",                                # anthropic_version (default: 2023-06-01)
-            "",                                # Anthropic effort (default: high)
+            "claude-opus-5",                   # model (complete route, no Writer fallback)
+            "https://api.anthropic.com/v1",    # api_base (its own address)
+            "outline-key",                     # api_key
+            "anthropic",                       # endpoint_type
+            "/v1/messages",                    # anthropic_path
+            "2023-06-01",                      # anthropic_version
+            "high",                            # Anthropic effort
 
             # --- Free_Mode_API ---
             "",                                # provider (default: videocaptioner)
@@ -194,10 +200,13 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert parser["Primary_Reader_API"]["model"] == "deepseek-r1"
     assert parser["Primary_Reader_API"]["endpoint_type"] == "chat_completions"
 
-    assert parser["Outline_API"]["model"] == "claude-writer"
-    # Outline_API model and api_base were cleared ("-"), so they inherit from Writer_API.
-    assert parser["Outline_API"]["api_base"] == "https://ai.saigou.work/v1"
+    assert parser["Outline_API"]["model"] == "claude-opus-5"
+    # Outline_API is its own route authority: it must not have borrowed Writer's
+    # gateway address or protocol. This is the mongrel-route regression guard.
+    assert parser["Outline_API"]["api_base"] == "https://api.anthropic.com/v1"
     assert parser["Outline_API"]["endpoint_type"] == "anthropic"
+    assert parser["Outline_API"]["provider_family"] == "anthropic"
+    assert parser["Outline_API"]["api_base"] != parser["Writer_API"]["api_base"]
     assert parser["Outline_API"]["anthropic_path"] == "/v1/messages"
     assert parser["Outline_API"]["anthropic_version"] == "2023-06-01"
     assert parser["Outline_API"]["reasoning_effort"] == "high"
@@ -220,6 +229,7 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert env_data["LLM_PRIMARY_READER_API"] == "old-primary"
     assert env_data["LLM_BACKUP_READER_API"] == "backup-key"
     assert env_data["LLM_WRITER_API"] == "writer-key"
+    assert env_data["LLM_OUTLINE_API"] == "outline-key"
     assert env_data["LLM_FREE_MODE_API"] == "free-key"
     assert env_data["LLM_VALIDATOR_API"] == "validator-key"
     assert env_data["MINERU_BASE_URL"] == "https://mineru.net/api/v4"
@@ -229,3 +239,104 @@ def test_run_setup_wizard_covers_extended_config_and_env(monkeypatch, tmp_path) 
     assert env_data["ALLOW_LOCAL_PARSE_FALLBACK"] == "false"
 
     assert list(answers) == []
+
+
+def test_wizard_migrates_legacy_config_before_strict_load(tmp_path, monkeypatch) -> None:
+    """D: a legacy config must migrate *before* the strict current-schema load.
+
+    The wizard's ordering used to call the strict ``_load_existing_config_sections``
+    first, so a config carrying ``[Retry_Settings]`` / ``[Stage2_Retry]`` /
+    ``[API_Parameters]`` raised before the operator was ever offered a migration.
+    The regression asserts the detect -> migrate -> load contract directly, using
+    the same functions ``run_setup_wizard`` now calls in that order.
+    """
+
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        "[Application]\n"
+        "config_schema = 11\n"
+        "\n"
+        "[Primary_Reader_API]\n"
+        "model = deepseek-v4-flash\n"
+        "api_base = https://api.deepseek.com/v1\n"
+        "api_key = legacy-primary\n"
+        "\n"
+        "[Retry_Settings]\n"
+        "max_retry_rounds = 5\n"
+        "base_retry_delay = 2\n"
+        "\n"
+        "[Stage2_Retry]\n"
+        "stage2_retry_limit = 3\n"
+        "\n"
+        "[API_Parameters]\n"
+        "primary_max_tokens = 8000\n"
+        "validator_max_tokens = 9999\n"
+        "timeout_seconds = 120\n"
+        "temperature = 0.7\n",
+        encoding="utf-8",
+    )
+
+    # Detect: the legacy config is recognised before any strict load.
+    assert _config_requires_explicit_migration(str(config_path)) is True
+
+    # Migrate: confirm the rewrite (the wizard gates this behind a yes/no prompt).
+    monkeypatch.setattr("setup_wizard._prompt_yes_no", lambda *args, **kwargs: True)
+    _migrate_existing_config_explicitly(str(config_path))
+
+    # Strict load after migration must not raise and must drop legacy keys.
+    sections = _load_existing_config_sections(str(config_path))
+
+    # 1) a backup was taken before the rewrite
+    backups = list(tmp_path.glob("config.ini.backup_before_*"))
+    assert len(backups) == 1
+
+    # 2) dead legacy sections are gone
+    assert "Retry_Settings" not in sections
+    assert "Stage2_Retry" not in sections
+    assert "API_Parameters" not in sections
+
+    # 3) relocated value landed in its provider section
+    assert sections["Primary_Reader_API"]["max_output_tokens"] == "8000"
+
+    # 4) the user's model choice was preserved, not promoted
+    assert sections["Primary_Reader_API"]["model"] == "deepseek-v4-flash"
+
+    # 5) timeout was relocated into the reader section
+    assert sections["Primary_Reader_API"]["total_timeout_seconds"] == "120"
+
+    # 6) a known-mapping key whose target section is missing (validator_max_tokens
+    #    but no [Validator_API]) was preserved in the legacy block, not dropped (H#1)
+    raw = config_path.read_text(encoding="utf-8")
+    assert "# Validator_API.max_output_tokens = 9999" in raw
+
+    # 7) schema stamped to current
+    assert sections["Application"]["config_schema"] == str(CONFIG_SCHEMA_VERSION)
+
+
+def test_migration_preserves_known_key_with_missing_target_section() -> None:
+    """H#1: a known [API_Parameters] mapping whose home section is absent must be
+    preserved in the legacy block, never silently dropped.
+    """
+
+    from services.config_migration import migrate_config_text
+
+    text = (
+        "[Application]\n"
+        "config_schema = 11\n"
+        "\n"
+        "[Primary_Reader_API]\n"
+        "model = deepseek-v4-flash\n"
+        "api_base = https://api.deepseek.com/v1\n"
+        "\n"
+        "[API_Parameters]\n"
+        "validator_max_tokens = 9999\n"
+        "temperature = 0.7\n"
+    )
+    new_text, report = migrate_config_text(text)
+    # No warning should claim the value was dropped.
+    assert not any("were dropped" in warning for warning in report.warnings)
+    # Both keys survive in the marked legacy block.
+    assert "# Validator_API.max_output_tokens = 9999" in new_text
+    assert "# temperature = 0.7" in new_text
+    # And the dead [API_Parameters] section itself is gone.
+    assert "[API_Parameters]" not in new_text

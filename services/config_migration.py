@@ -273,9 +273,16 @@ def migrate_config_text(
 
     for target_section, values in relocated.items():
         if target_section not in sections:
+            # A known-mapping key whose home section is absent is not evidence of
+            # a typo to discard; the operator may simply not have enabled that
+            # provider. Keep it in the preserved legacy block rather than
+            # dropping it silently, so the migration never loses a setting the
+            # user wrote.
+            for target_key, value in values.items():
+                preserved.setdefault(f"{target_section}.{target_key}", value)
             report.warn(
-                f"[API_Parameters] values for [{target_section}] were dropped because "
-                "that section does not exist in this config"
+                f"[API_Parameters] values for [{target_section}] were preserved in the "
+                "legacy block because that section does not exist in this config"
             )
             continue
         existing = _existing_keys(lines, sections[target_section])

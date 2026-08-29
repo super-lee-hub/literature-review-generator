@@ -1221,27 +1221,86 @@ class OutlineV3Executor:
             route=resolved_route,
         )
 
+    def _replay_receipt_index(self) -> dict[str, Any]:
+        """Index every provider receipt by id across the current and all prior
+        closure epochs.
+
+        Replay reuse is keyed on the per-node provider config hash, so a receipt
+        produced by an earlier closure remains valid for a node whose own route
+        has not changed. The current-epoch ledger is consulted first; any ids
+        still missing are resolved from prior-epoch ledgers discovered through
+        the registry. Resolution is defensive: a corrupt or unreadable prior
+        ledger is skipped, never allowed to abort replay validation.
+        """
+
+        index: dict[str, Any] = {}
+        try:
+            for receipt in self._receipt_ledger.list_receipts():
+                index.setdefault(str(getattr(receipt, "receipt_id", "") or ""), receipt)
+        except Exception:
+            pass
+        try:
+            from runtime.provider_runtime import ProviderRuntimeLedger
+
+            for record in self.registry.list_records():
+                if str(getattr(record, "artifact_type", "") or "") != "provider_receipt_ledger":
+                    continue
+                if str(getattr(record, "status", "") or "") != "ready":
+                    continue
+                metadata = getattr(record, "metadata", {}) or {}
+                if str(metadata.get("stage_name") or "") != "outline_v3":
+                    continue
+                if str(metadata.get("closure_epoch_id") or "") == self.closure_epoch_id:
+                    continue  # already covered by the current ledger
+                path = getattr(record, "path", None)
+                if not path:
+                    continue
+                try:
+                    ledger = ProviderRuntimeLedger(path=str(path))
+                    for receipt in ledger.list_receipts():
+                        index.setdefault(str(getattr(receipt, "receipt_id", "") or ""), receipt)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return index
+
     def _replay_record_is_valid(self, record: Any, binding: Mapping[str, Any]) -> bool:
         normalized_hash = str(getattr(record, "normalized_output_hash", "") or getattr(record, "output_hash", ""))
         if not normalized_hash or not getattr(record, "receipt_ids", None):
             return False
+        wanted_ids = {str(value) for value in record.receipt_ids}
         expected_receipts = {
-            str(item.receipt_id): item
-            for item in self._receipt_ledger.list_receipts()
-            if str(item.receipt_id) in set(str(value) for value in record.receipt_ids)
+            receipt_id: receipt
+            for receipt_id, receipt in self._replay_receipt_index().items()
+            if receipt_id in wanted_ids
         }
-        if len(expected_receipts) != len(set(str(value) for value in record.receipt_ids)):
+        if len(expected_receipts) != len(wanted_ids):
             return False
         semantic_node_id = str(binding.get("semantic_node_id") or self._semantic_node_id(str(binding.get("node_id") or "")))
         semantic_call_id = f"outline:{semantic_node_id}"
+        # Per-node selective replay: a receipt from a prior closure epoch is still
+        # trustworthy when its own provider config (config_hash), prompt, input
+        # and schema all still match. We no longer hard-fail on a differing global
+        # closure_epoch_id -- that binding used to blanket-invalidate every node
+        # the moment any single route changed, which is the bug F fixes. The
+        # per-node provider_config_hash check below remains the authoritative
+        # gate, so reuse is verified, never forged.
+        prior_epoch_reused = any(
+            str(getattr(receipt, "closure_epoch_id", "")) != self.closure_epoch_id
+            for receipt in expected_receipts.values()
+        )
+        if prior_epoch_reused:
+            self.replay_diagnostics.append(
+                f"node {semantic_node_id}: reused {len(expected_receipts)} prior-epoch "
+                "receipt(s); per-node config matched so reuse is verified, not forged"
+            )
         for receipt in expected_receipts.values():
             if receipt.status != "success" or receipt.response_hash != normalized_hash:
                 return False
             if receipt.job_id != self.job_id or receipt.attempt_id != semantic_call_id:
                 return False
             if receipt.node_id != semantic_node_id or receipt.call_id != semantic_call_id:
-                return False
-            if receipt.closure_epoch_id != self.closure_epoch_id:
                 return False
             if receipt.prompt_hash != str(binding.get("prompt_hash") or ""):
                 return False

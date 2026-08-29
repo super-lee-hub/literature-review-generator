@@ -12,9 +12,14 @@ from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mappi
 from models import APIConfig
 from config_loader import load_config
 from services.model_capabilities import (
+    DEFAULT_ANTHROPIC_MESSAGES_PATH,
+    DEFAULT_ANTHROPIC_VERSION,
     ModelCapability,
+    anthropic_temperature_allowed,
+    anthropic_thinking_will_be_active,
     apply_reasoning_policy,
     remove_payload_path,
+    resolve_anthropic_messages_url,
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
@@ -346,8 +351,11 @@ ANTHROPIC_JSON_INSTRUCTION = (
     "Do not wrap it in markdown code fences and do not add commentary."
 )
 
-DEFAULT_ANTHROPIC_PATH = "v1/messages"
-DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
+# Re-exported from ``services.model_capabilities`` so there is exactly one
+# definition of the Anthropic wire defaults. The runtime, the connection probe
+# and the setup wizard all resolve the URL through the same helper below.
+# ``DEFAULT_ANTHROPIC_VERSION`` is imported directly and is not re-declared.
+DEFAULT_ANTHROPIC_PATH = DEFAULT_ANTHROPIC_MESSAGES_PATH
 
 # Anthropic's own guidance for xhigh/max effort is to start at 64k tokens.
 ANTHROPIC_HIGH_EFFORT_TOKEN_FLOOR = 65_536
@@ -471,8 +479,26 @@ def build_anthropic_messages_payload(
             }
         ],
     }
-    if not _config_bool(api_config.get("omit_temperature_when_reasoning")):
+    # Anthropic's sampling contract is generation-specific, not a global
+    # "thinking on/off" switch. Two rules decide this, both from the current
+    # API usage primer:
+    #   * temperature must be 1 or unset whenever thinking is enabled;
+    #   * on Claude 4.7+ and Mythos Preview it is deprecated outright, so
+    #     thinking=disabled does not restore it.
+    # An unrecognised model gets the conservative answer (withhold) rather than
+    # an optimistic one, because there is no generation evidence to relax on.
+    thinking_active = anthropic_thinking_will_be_active(api_config, capability)
+    if (
+        not _config_bool(api_config.get("omit_temperature_when_reasoning"))
+        and anthropic_temperature_allowed(
+            str(api_config.get("model") or ""), thinking_active=thinking_active
+        )
+    ):
         payload["temperature"] = temperature
+    # top_p / top_k are not part of this transport's emitted contract at all;
+    # stripping them keeps a stray value from reaching a strict gateway.
+    payload.pop("top_p", None)
+    payload.pop("top_k", None)
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
 
     # Anthropic needs a large max_tokens at the top effort levels: thinking,
@@ -547,11 +573,14 @@ def anthropic_request_target(
 
     The path is configurable because gateways disagree on whether the configured
     base URL already contains the version segment.
+
+    The join itself is delegated to :func:`resolve_anthropic_messages_url`, which
+    is also what the "test connection" probe uses. Duplicating the rule here is
+    what previously allowed a probe to succeed against a URL the runtime would
+    never request.
     """
 
-    suffix = str(api_config.get("anthropic_path") or "").strip().strip("/")
-    suffix = suffix or DEFAULT_ANTHROPIC_PATH
-    url = f"{str(api_base or '').rstrip('/')}/{suffix}"
+    url = resolve_anthropic_messages_url(api_base, str(api_config.get("anthropic_path") or ""))
     headers = {
         "Content-Type": "application/json",
         "x-api-key": api_key,

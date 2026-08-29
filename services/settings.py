@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, MutableMapping
 
 from services.config_values import normalize_stage1_config_sections
+from services.model_capabilities import resolve_model_capability
 from services.repair_policy import DEFAULT_REPAIR_POLICY, parse_repair_policy
 
 
@@ -432,6 +433,42 @@ class OutlineStabilitySettings:
         )
 
 
+# The stored fields that make an API section usable as a role route. They are
+# one indivisible wire contract: a section referenced by [OutlineModels] must
+# stand on its own. ``api_key`` is deliberately absent -- it is always resolved
+# from ``.env`` at load time, so a persisted config legitimately carries an empty
+# key; flagging it would fail-closed every real config. ``provider_family`` is
+# derived via resolve_model_capability, never stored, so it is also absent.
+# Protocol mismatches (endpoint_type vs derived provider_family) are reported by
+# outline_routing_diagnostics, not treated as a missing stored field.
+ROUTE_REQUIRED_FIELDS: tuple[str, ...] = (
+    "model",
+    "api_base",
+    "endpoint_type",
+)
+
+
+def _missing_route_fields(section: Mapping[str, Any]) -> list[str]:
+    """Return the route fields a section still needs, or ``[]`` if complete."""
+
+    missing: list[str] = []
+    for key in ROUTE_REQUIRED_FIELDS:
+        if not str(section.get(key) or "").strip():
+            missing.append(key)
+    return missing
+
+
+def _route_identity(section: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Which model actually serves a section, as the router sees it."""
+
+    capability = resolve_model_capability(dict(section))  # type: ignore[arg-type]
+    return (
+        capability.provider_family,
+        str(section.get("model") or "").strip(),
+        capability.endpoint_type,
+    )
+
+
 @dataclass(frozen=True)
 class ApplicationSettings:
     config_schema: int = CONFIG_SCHEMA_VERSION
@@ -558,10 +595,14 @@ class ApplicationSettings:
         return str(self.section("OutlineModels").get("structure_critic_model", "Writer_API")).strip()
 
     def coverage_critic_model(self) -> str:
-        return str(self.section("OutlineModels").get("coverage_critic_model", "Primary_Reader_API")).strip()
+        # These fallbacks used to be Primary_Reader_API, which predates role
+        # routing. They now match the shipped [OutlineModels] table so a config
+        # missing one key still resolves to the documented role rather than to a
+        # section that was never meant to serve a critique.
+        return str(self.section("OutlineModels").get("coverage_critic_model", "Free_Mode_API")).strip()
 
     def evidence_critic_model(self) -> str:
-        return str(self.section("OutlineModels").get("evidence_critic_model", "Primary_Reader_API")).strip()
+        return str(self.section("OutlineModels").get("evidence_critic_model", "Writer_API")).strip()
 
     def arbitrator_model(self) -> str:
         return str(self.section("OutlineModels").get("arbitrator_model", "Outline_API")).strip()
@@ -575,26 +616,74 @@ class ApplicationSettings:
     def outline_max_retry_count(self) -> int:
         return _int(self.section("OutlineCostControl").get("max_outline_retry_count"), 2)
 
+    def outline_role_sections(self) -> dict[str, str]:
+        """Every ``[OutlineModels]`` role and the API section it resolves to."""
+
+        return {
+            "outline_model": self.outline_model(),
+            "relation_adjudicator_model": self.relation_adjudicator_model(),
+            "structure_critic_model": self.structure_critic_model(),
+            "coverage_critic_model": self.coverage_critic_model(),
+            "evidence_critic_model": self.evidence_critic_model(),
+            "arbitrator_model": self.arbitrator_model(),
+        }
+
     def validate_outline_config(self) -> list[str]:
+        """Errors only. Non-fatal routing observations come from
+        :meth:`outline_routing_diagnostics` so a deliberate single-model setup
+        stays legal while still being reported.
+        """
+
         errors: list[str] = []
         count = self.outline_candidate_count()
         if count < 1:
             errors.append("Outline.candidate_count must be at least 1")
         if count > 12:
             errors.append("Outline.candidate_count must not exceed 12")
-        if not self.outline_model():
-            errors.append("OutlineModels.outline_model is not configured")
-        if not self.relation_adjudicator_model():
-            errors.append("OutlineModels.relation_adjudicator_model is not configured")
-        if not self.structure_critic_model():
-            errors.append("OutlineModels.structure_critic_model is not configured")
-        if not self.coverage_critic_model():
-            errors.append("OutlineModels.coverage_critic_model is not configured")
-        if not self.evidence_critic_model():
-            errors.append("OutlineModels.evidence_critic_model is not configured")
-        if not self.arbitrator_model():
-            errors.append("OutlineModels.arbitrator_model is not configured")
+
+        for role_key, section_name in self.outline_role_sections().items():
+            if not section_name:
+                errors.append(f"OutlineModels.{role_key} is not configured")
+                continue
+            section = self.sections.get(section_name)
+            if section is None:
+                errors.append(
+                    f"OutlineModels.{role_key} points at [{section_name}], which does not exist"
+                )
+                continue
+            missing = _missing_route_fields(section)
+            if missing:
+                errors.append(
+                    f"OutlineModels.{role_key} points at [{section_name}], which is not a "
+                    f"complete route: missing {', '.join(missing)}. A section referenced by "
+                    "[OutlineModels] must stand on its own; it is no longer completed by "
+                    "inheriting part of another provider."
+                )
         return errors
+
+    def outline_routing_diagnostics(self) -> list[str]:
+        """Report review relationships that carry no independent judgement."""
+
+        roles = self.outline_role_sections()
+        generator_section = roles.get("outline_model") or ""
+        generator = self.sections.get(generator_section)
+        diagnostics: list[str] = []
+        if generator is None:
+            return diagnostics
+
+        generator_identity = _route_identity(generator)
+        for role_key in ("structure_critic_model", "coverage_critic_model", "evidence_critic_model"):
+            section_name = roles.get(role_key) or ""
+            section = self.sections.get(section_name)
+            if section is None or not section_name:
+                continue
+            if section_name == generator_section or _route_identity(section) == generator_identity:
+                diagnostics.append(
+                    f"[OutlineModels].{role_key} resolves to the same provider identity as "
+                    f"the candidate generator ({generator_identity[1]!r} via {generator_section}); "
+                    "this critique is self-review and carries no independent judgement"
+                )
+        return diagnostics
 
 
 def validate_config_keys(config: Mapping[str, Mapping[str, Any]]) -> list[str]:

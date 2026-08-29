@@ -36,7 +36,7 @@ from outline.v3_executor import OutlineV3Executor
 from outline.adoption_transaction import current_adoption_record
 from outline.provider_router import OutlineRoleRoute, build_outline_provider_router
 from services.model_capabilities import resolve_model_capability
-from services.model_selection import get_api_config_for_section, get_outline_api_config
+from services.model_selection import get_api_config_for_section
 from services.settings import ApplicationSettings
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -873,9 +873,19 @@ class InternalStageExecutorRegistry:
             raise RuntimeError("Outline v3 requires a canonical Stage 1 summary source")
 
         settings = session.context.settings
-        route_name = settings.outline_model()
-        api_config = get_outline_api_config(dict(session.stage_host.config))
-        model = str(api_config.get("model") or route_name or "outline-v3")
+        route_name = str(settings.outline_model() or "").strip() or "Outline_API"
+        # Resolve the section the generator role actually names. The stage-level
+        # provider used to come from get_outline_api_config(), which silently
+        # fell back to [Writer_API]; under role routing that produced a
+        # stage provider inconsistent with the [OutlineModels] route table.
+        api_config = get_api_config_for_section(dict(session.stage_host.config), route_name)
+        model = str(api_config.get("model") or "").strip()
+        if not model:
+            raise RuntimeError(
+                f"Outline v3 requires a complete [{route_name}] section: it needs its own "
+                "api_key, model, api_base, endpoint_type and provider_family. Routed API "
+                "sections are no longer completed by inheriting part of another provider."
+            )
         capability = resolve_model_capability(api_config)
         model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(

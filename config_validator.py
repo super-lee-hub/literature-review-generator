@@ -11,7 +11,9 @@ from typing import Any, Dict, List, Tuple
 import requests  # type: ignore
 
 from services.model_capabilities import (
+    DEFAULT_ANTHROPIC_VERSION,
     resolve_anthropic_effort,
+    resolve_anthropic_messages_url,
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
@@ -304,6 +306,9 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
     outline_errors = settings.validate_outline_config()
     if outline_errors:
         return False, outline_errors
+    # A critique that shares the generator's identity is legal but must never be
+    # invisible, so it is surfaced as a warning rather than silently accepted.
+    messages.extend(settings.outline_routing_diagnostics())
     preprocess = config_dict.get("Preprocess", {})
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]
@@ -335,14 +340,13 @@ def test_api_connection(
     normalized_family = _normalize_config_text(provider_family).replace("-", "_").casefold()
 
     if normalized_endpoint == "anthropic" or normalized_family == "anthropic":
-        path = _normalize_config_text(anthropic_path) or "v1/messages"
-        path = "/" + path.lstrip("/")
-        if base.casefold().endswith("/v1") and path.casefold().startswith("/v1/"):
-            path = path[3:]
-        url = f"{base}{path}"
+        # Same resolver the runtime uses. A probe that builds its own URL can
+        # pass while the real request 400s on a duplicated /v1, which is the
+        # most misleading failure this validator could produce.
+        url = resolve_anthropic_messages_url(base, _normalize_config_text(anthropic_path))
         headers = {
             "x-api-key": api_key,
-            "anthropic-version": _normalize_config_text(anthropic_version) or "2023-06-01",
+            "anthropic-version": _normalize_config_text(anthropic_version) or DEFAULT_ANTHROPIC_VERSION,
             "Content-Type": "application/json",
         }
         payload = {

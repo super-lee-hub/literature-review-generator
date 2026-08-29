@@ -90,6 +90,7 @@ _ROUTE_CONFIG_KEYS = frozenset(
         "thinking",
         "reasoning_effort",
         "reasoning_display",
+        "thinking_budget_tokens",
         "text_verbosity",
         "max_context_tokens",
         "max_output_tokens",

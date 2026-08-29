@@ -5,8 +5,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Literal, Optional, Set, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from models import APIConfig
+
+DEFAULT_ANTHROPIC_MESSAGES_PATH = "v1/messages"
+DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
 EndpointType = Literal["chat_completions", "responses", "anthropic"]
 ProviderFamily = Literal[
@@ -175,6 +179,133 @@ def resolve_anthropic_effort(requested: Any, model: str) -> str:
         return allowed[-1] if _truthy(requested) else ""
     supported = [level for level in allowed if ANTHROPIC_EFFORT_LADDER.index(level) <= wanted]
     return supported[-1] if supported else allowed[0]
+
+
+# ---------------------------------------------------------------------------
+# Canonical Anthropic Messages URL resolution.
+#
+# The production transport and the "test connection" probe used to build this
+# URL in two different places with two different rules. The probe stripped a
+# duplicated ``/v1``; the runtime did not. That divergence is worse than a plain
+# bug, because it produces the single most confusing failure mode available:
+#
+#     setup "Test connection" -> PASS
+#     the real Outline run     -> 400 / unreachable
+#
+# Everything that needs the URL therefore goes through one resolver.
+# ---------------------------------------------------------------------------
+
+
+def _path_segments(value: str) -> list[str]:
+    return [segment for segment in str(value or "").split("/") if segment]
+
+
+def resolve_anthropic_messages_url(api_base: str, anthropic_path: str = "") -> str:
+    """Join an API base and an Anthropic Messages path exactly once.
+
+    Guarantees, all covered by tests:
+
+    * ``/v1`` is never duplicated, whether the base carries it or the path does;
+    * ``/messages`` is never duplicated when the base already points at it;
+    * a custom explicit path is preserved rather than rewritten;
+    * the resolved URL keeps the caller's scheme, host, port and userinfo, so
+      the host that was configured is the host that is actually requested.
+
+    The join is an overlap splice rather than a strip-and-append: the longest
+    suffix of the base path that is also a prefix of the configured path is
+    collapsed. Stripping unconditionally would break a gateway whose base ends
+    in a *different* segment that merely looks like a version, and would also
+    mangle an operator-supplied custom path.
+    """
+
+    base_text = str(api_base or "").strip()
+    path_segments = _path_segments(anthropic_path) or _path_segments(DEFAULT_ANTHROPIC_MESSAGES_PATH)
+    if not path_segments:
+        return base_text
+
+    parsed = urlsplit(base_text)
+    base_segments = _path_segments(parsed.path) if (parsed.scheme and parsed.netloc) else _path_segments(base_text)
+
+    overlap = 0
+    for size in range(min(len(base_segments), len(path_segments)), 0, -1):
+        if base_segments[len(base_segments) - size:] == path_segments[:size]:
+            overlap = size
+            break
+
+    merged = base_segments[: len(base_segments) - overlap] + path_segments
+
+    if parsed.scheme and parsed.netloc:
+        return urlunsplit((parsed.scheme, parsed.netloc, "/" + "/".join(merged), parsed.query, ""))
+    # No scheme/host to preserve: the validator rejects such a base anyway, so
+    # the join stays textual and simply must not duplicate segments.
+    joined = "/".join(merged)
+    return f"/{joined}" if base_text.startswith("/") else joined
+
+
+# ---------------------------------------------------------------------------
+# Anthropic sampling parameters.
+#
+# Quoted from the current Anthropic API usage primer:
+#
+#   "Temperature must be set to 1 (or left unset) whenever thinking is enabled,
+#    on all models."
+#
+#   "On Claude 4.7 and later models and Claude Mythos Preview, ``temperature``
+#    is deprecated and only its default value is accepted, even when thinking is
+#    off."
+#
+# The second sentence is the one that matters here: turning thinking *off* does
+# not restore a custom temperature on the current generation. A test that
+# asserted "thinking disabled -> temperature kept" was therefore locking in a
+# request the provider is documented to reject.
+# ---------------------------------------------------------------------------
+
+# Mythos Preview is named explicitly by the deprecation note even though its
+# version stamp does not place it in the 4.7+ series.
+ANTHROPIC_TEMPERATURE_DEPRECATED_KEYS = frozenset({"mythos-preview"})
+_ANTHROPIC_VERSION_KEY_RE = re.compile(r"^(?P<family>[a-z]+)-(?P<major>\d+)(?:-(?P<minor>\d+))?$")
+
+
+def anthropic_temperature_deprecated(model: str) -> bool:
+    """Whether this Claude generation accepts only the default temperature."""
+
+    if anthropic_thinking_mode(model) == "none":
+        return False
+    key = anthropic_model_key(model)
+    if key in ANTHROPIC_TEMPERATURE_DEPRECATED_KEYS:
+        return True
+    match = _ANTHROPIC_VERSION_KEY_RE.match(key)
+    if match is None:
+        return False
+    return (int(match.group("major")), int(match.group("minor") or 0)) >= (4, 7)
+
+
+def anthropic_thinking_will_be_active(api_config: APIConfig, capability: ModelCapability) -> bool:
+    """Whether the request this config produces will carry an active thinking block."""
+
+    if capability.anthropic_thinking_mode == "none":
+        return False
+    return _text(api_config.get("thinking")).casefold() != "disabled"
+
+
+def anthropic_temperature_allowed(model: str, *, thinking_active: bool) -> bool:
+    """Whether a caller-supplied ``temperature`` may be sent to this model.
+
+    Three cases, in the order the current contract decides them:
+
+    * thinking active  -> temperature must be 1 or unset, on every model;
+    * current generation (4.7+, Mythos Preview) -> deprecated regardless of
+      thinking, so thinking=disabled does not bring it back;
+    * an unrecognised model on an Anthropic-shaped endpoint -> withheld. There
+      is no generation evidence to relax on, and this repository resolves that
+      kind of ambiguity fail-closed rather than optimistically.
+    """
+
+    if anthropic_thinking_mode(model) == "none":
+        return False
+    if thinking_active:
+        return False
+    return not anthropic_temperature_deprecated(model)
 
 
 def _normalize_endpoint(value: Any) -> EndpointType:

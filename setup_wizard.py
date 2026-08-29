@@ -163,6 +163,16 @@ def _provider_family_for_endpoint(
 
 
 def _load_existing_config_sections(config_path: str) -> Dict[str, Dict[str, str]]:
+    """Strictly load an existing config into the current schema.
+
+    This is *strict*: ``ensure_config_sections`` runs ``validate_config_keys``,
+    so a config still carrying ``[Retry_Settings]``, ``[Stage2_Retry]`` or
+    ``[API_Parameters]`` raises here. Callers must therefore have completed
+    :func:`_migrate_existing_config_explicitly` first -- see
+    :func:`run_setup_wizard`, where that ordering bug used to make a legacy
+    config explode before the operator was ever offered a migration.
+    """
+
     if not os.path.exists(config_path):
         return ensure_config_sections()
 
@@ -212,6 +222,12 @@ def _migrate_existing_config_explicitly(config_path: str) -> None:
         print(f"迁移提示：{warning}")
 
 
+# API sections that [OutlineModels] can point a semantic role at. Each one is a
+# complete route authority: model, api_base, endpoint_type and provider_family
+# together describe one wire contract, so none of them may be left blank with
+# the expectation that another provider will supply it.
+ROUTED_API_SECTIONS = frozenset({"Outline_API", "Writer_API", "Free_Mode_API"})
+
 ENDPOINT_TYPES = ("chat_completions", "responses", "anthropic")
 ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
@@ -229,8 +245,12 @@ def _collect_api_section(
     default_provider: str,
 ) -> None:
     print(f"\n[{title}]")
-    allow_fallback = section_name in {"Outline_API", "Free_Mode_API"}
     current_section = sections[section_name]
+    # A section referenced by [OutlineModels] is a complete route authority, so
+    # it cannot be left blank to be filled in from another provider. Allowing
+    # that here is what produced a Writer gateway addressed with the Anthropic
+    # Messages protocol.
+    allow_empty = section_name not in ROUTED_API_SECTIONS
     provider_default = current_section.get("provider_family", "") or _guess_provider(
         current_section.get("api_base", ""), default_provider
     )
@@ -240,22 +260,21 @@ def _collect_api_section(
 
     model_label = "模型名称"
     api_base_label = "API Base URL"
-    if section_name == "Outline_API":
-        model_label = "模型名称（留空时回退到 Writer_API）"
-        api_base_label = "API Base URL（留空时回退到 Writer_API）"
-    elif section_name == "Free_Mode_API":
-        model_label = "模型名称（留空时回退到 Outline_API）"
-        api_base_label = "API Base URL（留空时回退到 Outline_API）"
+    if not allow_empty:
+        print(
+            f"{section_name} 是角色路由目标，必须完整配置；"
+            "不要留空去继承别的 provider（那会拼出错误协议）。"
+        )
 
     model = _prompt(
         model_label,
         default=current_section.get("model", ""),
-        allow_empty=allow_fallback,
+        allow_empty=allow_empty,
     )
     api_base = _prompt(
         api_base_label,
         default=current_section.get("api_base", ""),
-        allow_empty=allow_fallback,
+        allow_empty=allow_empty,
     )
     api_key = _prompt_secret(
         "API Key（将写入 .env）",
@@ -275,8 +294,6 @@ def _collect_api_section(
     )
 
     effective_provider = _guess_provider(api_base, provider) if api_base else provider
-    if allow_fallback and not api_base:
-        effective_provider = provider
     current_section["provider_family"] = _provider_family_for_endpoint(
         effective_provider,
         endpoint_type,
@@ -543,7 +560,6 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
 
     runtime = detect_runtime_environment()
     existing_env = read_env_file(env_path)
-    sections = _load_existing_config_sections(config_path)
     api_keys = {
         section_name: existing_env.get(env_key, "")
         for section_name, env_key in API_ENV_MAPPING.items()
@@ -560,8 +576,14 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
     if os.path.exists(config_path) or os.path.exists(env_path):
         print("检测到现有配置，直接回车会保留当前值；输入 - 可以清空可选项。")
 
+    # Legacy detection and migration must complete *before* anything loads the
+    # config against the current schema. _load_existing_config_sections() is
+    # strict, so loading first meant a config carrying [Retry_Settings],
+    # [Stage2_Retry] or [API_Parameters] raised here -- before the operator was
+    # ever asked whether to migrate, and with no file written yet either way.
     if os.path.exists(config_path) and _config_requires_explicit_migration(config_path):
         _migrate_existing_config_explicitly(config_path)
+    sections = _load_existing_config_sections(config_path)
 
     print("\n[当前运行环境]")
     print(f"解释器环境: {runtime.display_name}")

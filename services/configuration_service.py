@@ -155,7 +155,15 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             # "high" is the documented default. xhigh/max are supported but need
             # a very large max_tokens; that is a deliberate operator choice, not
             # something a shipped default should impose.
+            #
+            # force_highest_reasoning must stay false here. Left true, it
+            # overrides the reasoning_effort above and silently requests the
+            # model's top level -- "max" for Opus 5 -- so the shipped default
+            # would read "high" while paying for, and being truncated by, "max".
+            # An operator who wants max sets it explicitly and raises
+            # max_output_tokens with it.
             "reasoning_effort": "high",
+            "force_highest_reasoning": "false",
             "max_context_tokens": "200000",
             "max_output_tokens": "16000",
             "temperature": "0.0",
@@ -166,7 +174,6 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "transport_retries": "2",
             "reasoning_reserve_tokens": "4096",
             "safety_margin_tokens": "2048",
-            "force_highest_reasoning": "true",
         },
         "Free_Mode_API": {
             "api_key": "loaded_from_.env_file",
@@ -414,15 +421,17 @@ def ensure_config_sections(
         merged["Validator_API"]["provider_family"] = "deepseek"
     merged["Application"]["config_schema"] = str(CONFIG_SCHEMA_VERSION)
 
-    # Outline API should inherit writer defaults if still blank.
-    if not merged["Outline_API"].get("model"):
-        merged["Outline_API"]["model"] = merged["Writer_API"].get("model", "")
-    if not merged["Outline_API"].get("api_base"):
-        merged["Outline_API"]["api_base"] = merged["Writer_API"].get("api_base", "")
-    if not merged["Free_Mode_API"].get("model"):
-        merged["Free_Mode_API"]["model"] = merged["Outline_API"].get("model", "")
-    if not merged["Free_Mode_API"].get("api_base"):
-        merged["Free_Mode_API"]["api_base"] = merged["Outline_API"].get("api_base", "")
+    # There is deliberately no Outline -> Writer / Free_Mode -> Outline
+    # inheritance here any more.
+    #
+    # The old fallback copied only ``model`` and ``api_base``, leaving
+    # ``endpoint_type``/``provider_family`` at the target section's own value.
+    # Clearing Outline_API therefore produced a mongrel route: the Writer
+    # gateway's address speaking the Anthropic Messages protocol. Under the
+    # role-aware router an API section *is* the route authority, so a section
+    # referenced by [OutlineModels] has to stand on its own. An incomplete one
+    # is reported by ApplicationSettings.validate_outline_config() instead of
+    # being quietly completed from a provider with a different wire format.
 
     ApplicationSettings.from_mutable_config(merged)
     return merged
@@ -499,48 +508,13 @@ def save_config_and_env(
     # written.  Primary_Reader_API capability is the sole visual authority.
     normalized.pop("Multimodal", None)
 
-    for section_name, env_key in API_ENV_MAPPING.items():
+    # No cross-section inheritance. These blocks used to copy part of another
+    # section's identity onto Outline_API / Free_Mode_API (and in the Outline
+    # case only assigned each key back to itself, so it inherited nothing at
+    # all). Every section now persists exactly what its own route needs.
+    for section_name, _env_key in API_ENV_MAPPING.items():
         normalized.setdefault(section_name, {})
         normalized[section_name]["api_key"] = "loaded_from_.env_file"
-        if section_name == "Outline_API":
-            normalized[section_name]["model"] = (
-                normalized[section_name].get("model")
-                or normalized["Writer_API"].get("model", "")
-            )
-            normalized[section_name]["api_base"] = (
-                normalized[section_name].get("api_base")
-                or normalized["Writer_API"].get("api_base", "")
-            )
-            for inherited_key in (
-                "endpoint_type",
-                "provider_family",
-                "reasoning_effort",
-                "reasoning_display",
-                "force_highest_reasoning",
-            ):
-                normalized[section_name][inherited_key] = normalized[section_name].get(
-                    inherited_key,
-                    "",
-                )
-        if section_name == "Free_Mode_API":
-            normalized[section_name]["model"] = (
-                normalized[section_name].get("model")
-                or normalized["Outline_API"].get("model", "")
-            )
-            normalized[section_name]["api_base"] = (
-                normalized[section_name].get("api_base")
-                or normalized["Outline_API"].get("api_base", "")
-            )
-            for inherited_key in (
-                "reasoning_effort",
-                "reasoning_display",
-                "text_verbosity",
-                "max_output_tokens",
-                "force_highest_reasoning",
-                "omit_temperature_when_reasoning",
-            ):
-                if not normalized[section_name].get(inherited_key):
-                    normalized[section_name][inherited_key] = normalized["Outline_API"].get(inherited_key, "")
 
     write_config_file(normalized, config_path=config_path)
     env_payload = {
@@ -561,10 +535,10 @@ def normalize_for_save(config_sections: MutableMapping[str, Dict[str, str]]) -> 
             continue
         provider = section.get("provider", "custom")
         api_base = section.get("api_base", "")
-        if not api_base and section_name in {"Outline_API", "Free_Mode_API"}:
-            section["api_base"] = ""
-        else:
-            section["api_base"] = normalize_api_base(api_base, provider=provider)
+        # An empty base used to be left blank here on the assumption that a
+        # fallback would fill it in later. There is no fallback any more, so a
+        # routed section either carries its own base or is incomplete.
+        section["api_base"] = normalize_api_base(api_base, provider=provider) if api_base else ""
         section.pop("provider", None)
 
 

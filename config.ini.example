@@ -81,8 +81,12 @@ endpoint_type = anthropic
 provider_family = anthropic
 anthropic_path = /v1/messages
 anthropic_version = 2023-06-01
+# "high" is the documented default and the level that is actually sent. Leave
+# force_highest_reasoning false: setting it true overrides the line above and
+# silently asks for the model's top level ("max" on Opus 5), which needs a much
+# larger max_output_tokens than the 16000 below.
 reasoning_effort = high
-force_highest_reasoning = true
+force_highest_reasoning = false
 max_context_tokens = 200000
 max_output_tokens = 16000
 temperature = 0.0

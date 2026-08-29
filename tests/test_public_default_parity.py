@@ -114,6 +114,58 @@ def test_documented_transport_combos_are_valid(sections: Mapping[str, Mapping[st
         assert errors == [], f"shipped default [{section_name}] fails validation: {errors}"
 
 
+def test_anthropic_default_sends_the_effort_it_advertises(
+    sections: Mapping[str, Mapping[str, str]],
+) -> None:
+    """The shipped default must send "high", not silently escalate to "max".
+
+    ``force_highest_reasoning = true`` overrides ``reasoning_effort`` with the
+    model's top level, which for Opus 5 is "max". The config then reads "high"
+    while requesting "max": more expensive, slower, and far more likely to hit
+    the 16k output ceiling. Asserting on the config string alone cannot catch
+    this, so the check runs the default all the way to the request body.
+    """
+
+    from ai_interface import build_anthropic_messages_payload
+
+    section = dict(sections.get("Outline_API") or {})
+    if not section or str(section.get("endpoint_type") or "").strip() != "anthropic":
+        pytest.skip("Outline_API is not an Anthropic route in these defaults")
+
+    assert str(section.get("reasoning_effort") or "").strip() == "high"
+    assert str(section.get("force_highest_reasoning") or "").strip().lower() != "true", (
+        "Outline_API sets force_highest_reasoning, which overrides reasoning_effort "
+        "with the model's top level and makes the shipped default request more "
+        "than it advertises"
+    )
+
+    payload = build_anthropic_messages_payload(
+        "hello", section, "sys", max_tokens=1024, temperature=0.3, response_format="text",
+    )
+    assert payload["output_config"]["effort"] == "high", (
+        f"the default Anthropic request sends effort={payload['output_config']['effort']!r} "
+        "while the configuration advertises high"
+    )
+
+
+def test_an_explicit_top_effort_is_not_rewritten_by_the_defaults(
+    sections: Mapping[str, Mapping[str, str]],
+) -> None:
+    """A user who asks for max must get max -- the fix is about the default."""
+
+    from ai_interface import build_anthropic_messages_payload
+
+    section = dict(sections.get("Outline_API") or {})
+    if not section or str(section.get("endpoint_type") or "").strip() != "anthropic":
+        pytest.skip("Outline_API is not an Anthropic route in these defaults")
+
+    section["reasoning_effort"] = "max"
+    payload = build_anthropic_messages_payload(
+        "hello", section, "sys", max_tokens=1024, temperature=0.3, response_format="text",
+    )
+    assert payload["output_config"]["effort"] == "max"
+
+
 def test_no_secret_is_shipped_in_the_public_defaults(sections: Mapping[str, Mapping[str, str]]) -> None:
     import re
 
