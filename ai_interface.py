@@ -349,6 +349,9 @@ ANTHROPIC_JSON_INSTRUCTION = (
 DEFAULT_ANTHROPIC_PATH = "v1/messages"
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 
+# Anthropic's own guidance for xhigh/max effort is to start at 64k tokens.
+ANTHROPIC_HIGH_EFFORT_TOKEN_FLOOR = 65_536
+
 
 def _split_data_url(url: str) -> Tuple[str, str]:
     """Split a ``data:`` URL into ``(media_type, base64_payload)``."""
@@ -440,11 +443,13 @@ def build_anthropic_messages_payload(
 
     token_limit = _configured_positive_int(api_config.get("max_tokens"), max_tokens)
     token_limit = _configured_positive_int(api_config.get("max_output_tokens"), token_limit)
-    # Anthropic rejects a request whose max_tokens does not exceed the extended
-    # thinking budget, so the limit is raised rather than letting the call fail.
-    thinking_budget = _configured_positive_int(api_config.get("thinking_budget_tokens"), 0)
-    if thinking_budget:
-        token_limit = max(token_limit, thinking_budget + 1)
+    # Only manual extended thinking has a budget, and it must sit below
+    # max_tokens because thinking tokens count against that ceiling. Adaptive
+    # thinking has no budget at all, so this does not apply there.
+    if capability.anthropic_thinking_mode == "manual":
+        thinking_budget = _configured_positive_int(api_config.get("thinking_budget_tokens"), 0)
+        if thinking_budget:
+            token_limit = max(token_limit, thinking_budget + 1)
 
     system_text = str(system_prompt or "").strip()
     if response_format == "json":
@@ -469,6 +474,22 @@ def build_anthropic_messages_payload(
     if not _config_bool(api_config.get("omit_temperature_when_reasoning")):
         payload["temperature"] = temperature
     apply_reasoning_policy(payload, api_config, capability, logger=logger)
+
+    # Anthropic needs a large max_tokens at the top effort levels: thinking,
+    # tool calls and subagent work all draw on the same ceiling. The configured
+    # limit is respected rather than silently raised -- this is a cost decision,
+    # not something the transport should decide for the caller -- but it is
+    # reported, because an undersized limit surfaces as truncation far from here.
+    effort = str((payload.get("output_config") or {}).get("effort") or "").casefold()
+    if effort in {"xhigh", "max"} and token_limit < ANTHROPIC_HIGH_EFFORT_TOKEN_FLOOR:
+        if logger:
+            logger.warning(
+                "Anthropic %s effort needs a large max_tokens (64k is a reasonable "
+                "starting point); configured limit is %d, so the response may be "
+                "truncated.",
+                effort,
+                token_limit,
+            )
     return payload
 
 
@@ -492,14 +513,22 @@ def parse_anthropic_messages_response(response_data: Dict[str, Any]) -> Tuple[st
                 texts.append(str(text))
     content = "\n".join(texts).strip()
 
+    # Not every Anthropic stop reason is terminal. Collapsing a truncated or
+    # refused response onto "stop" lets it be adopted as a finished artifact,
+    # which is the worst possible outcome for a citation-bearing outline, so
+    # each non-terminal outcome keeps its own value and is treated as incomplete
+    # downstream -- even when the partial content happens to be valid JSON.
     stop_reason = str(response_data.get("stop_reason") or "").strip().lower()
     finish_reason = {
         "end_turn": "stop",
         "stop_sequence": "stop",
         "max_tokens": "length",
-        "tool_use": "tool_calls",
-        "pause_turn": "stop",
-        "refusal": "stop",
+        # The context window was exhausted: this is a prefix, not an answer.
+        "model_context_window_exceeded": "length",
+        "pause_turn": "incomplete_continuation",
+        "refusal": "refusal",
+        # Outline has no tool loop, so a tool request cannot be completed here.
+        "tool_use": "anthropic_tool_use",
     }.get(stop_reason, stop_reason or "stop")
     return content, finish_reason
 

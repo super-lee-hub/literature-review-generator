@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Literal, Optional, Set
+from typing import Any, Dict, Iterable, Literal, Optional, Set, Tuple
 
 from models import APIConfig
 
@@ -37,6 +38,11 @@ class ModelCapability:
     max_token_param: str = "max_tokens"
     supports_text_verbosity: bool = False
     disallowed_when_reasoning: Set[str] = field(default_factory=set)
+    # Anthropic only. How this model wants its thinking configured:
+    # "manual" (enabled + budget_tokens), "adaptive" (adaptive + output_config.effort),
+    # or "none" (send no thinking block at all).
+    anthropic_thinking_mode: str = "none"
+    anthropic_effort_levels: Tuple[str, ...] = ()
 
 
 def _text(value: Any) -> str:
@@ -59,6 +65,116 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+# ---------------------------------------------------------------------------
+# Anthropic thinking modes.
+#
+# Anthropic changed the thinking contract across model generations, and the
+# current generation rejects the legacy form outright:
+#
+#   * Claude 4.5 and earlier that support thinking -- manual extended thinking
+#     only (``{"type": "enabled", "budget_tokens": N}``); ``adaptive`` is a 400.
+#   * Claude 4.6 -- both modes; manual is deprecated but still succeeds.
+#   * Claude 4.7 and later (Opus 4.7/4.8, Opus 5, Sonnet 5, Fable 5, Mythos 5)
+#     -- adaptive only; ``{"type": "enabled"}`` is a 400.
+#
+# This derives the *thinking mode* from the model id. It deliberately does not
+# derive the transport protocol: whether an endpoint speaks Anthropic Messages
+# at all stays an explicit ``endpoint_type`` setting, because the same model id
+# may be served by an Anthropic endpoint or by an OpenAI-compatible gateway.
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_EFFORT_LADDER: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+ANTHROPIC_MANUAL_ONLY_MODELS = frozenset(
+    {"opus-4-5", "sonnet-4-5", "haiku-4-5", "opus-4-1", "opus-4", "sonnet-4", "haiku-4"}
+)
+ANTHROPIC_ADAPTIVE_ONLY_MODELS = frozenset(
+    {"opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5", "mythos-5"}
+)
+ANTHROPIC_BOTH_MODES = frozenset({"opus-4-6", "sonnet-4-6", "mythos-preview"})
+
+# Effort support is narrower than the thinking mode: Opus 4.5 tops out at high,
+# and the 4.6 models support max but not xhigh.
+ANTHROPIC_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
+    "opus-4-5": ("low", "medium", "high"),
+    "opus-4-6": ("low", "medium", "high", "max"),
+    "sonnet-4-6": ("low", "medium", "high", "max"),
+    "mythos-preview": ("low", "medium", "high", "max"),
+}
+
+
+def anthropic_model_key(model: str) -> str:
+    """Reduce an Anthropic model id to its canonical ``family-version`` key.
+
+    ``claude-opus-4-6-20260206`` -> ``opus-4-6``; ``claude-opus-5[1m]`` -> ``opus-5``.
+    """
+
+    text = _lower(model).split("[", 1)[0].strip()
+    if text.startswith("claude-"):
+        text = text[len("claude-"):]
+    text = re.sub(r"-\d{6,8}$", "", text)
+    return text
+
+
+def anthropic_thinking_mode(model: str) -> str:
+    """Return ``manual``, ``adaptive`` or ``none`` for one model id.
+
+    ``none`` means "do not send a thinking block at all". That is the safe answer
+    for a model this mapping does not recognise, which includes non-Claude models
+    served through an Anthropic-shaped gateway: sending ``adaptive`` to a bridge
+    that has never heard of it would fail the request.
+    """
+
+    lowered = _lower(model)
+    if lowered and not lowered.startswith("claude-"):
+        return "none"
+    key = anthropic_model_key(model)
+    if key in ANTHROPIC_ADAPTIVE_ONLY_MODELS:
+        return "adaptive"
+    if key in ANTHROPIC_MANUAL_ONLY_MODELS:
+        return "manual"
+    if key in ANTHROPIC_BOTH_MODES:
+        # Both work here; adaptive is the documented recommendation.
+        return "adaptive"
+    # An unrecognised *Claude* model is assumed to be current-generation rather
+    # than legacy: the current generation rejects the legacy form outright, so
+    # guessing adaptive fails far less badly than guessing manual.
+    return "adaptive" if key.startswith(("opus-", "sonnet-", "haiku-", "fable-", "mythos-")) else "none"
+
+
+def anthropic_effort_levels(model: str) -> tuple[str, ...]:
+    """Effort levels one model accepts. Empty when effort is not applicable."""
+
+    if anthropic_thinking_mode(model) == "none":
+        return ()
+    return ANTHROPIC_EFFORT_LEVELS.get(anthropic_model_key(model), ANTHROPIC_EFFORT_LADDER)
+
+
+def resolve_anthropic_effort(requested: Any, model: str) -> str:
+    """Clamp a configured effort onto the levels the model actually accepts.
+
+    Anthropic rejects an unknown effort value outright, so an unsupported level
+    is stepped down the ladder rather than forwarded.
+    """
+
+    allowed = anthropic_effort_levels(model)
+    if not allowed:
+        return ""
+    value = _text(requested).casefold()
+    if not value:
+        return ""
+    if value == "auto_highest":
+        return allowed[-1]
+    if value in allowed:
+        return value
+    try:
+        wanted = ANTHROPIC_EFFORT_LADDER.index(value)
+    except ValueError:
+        return allowed[-1] if _truthy(requested) else ""
+    supported = [level for level in allowed if ANTHROPIC_EFFORT_LADDER.index(level) <= wanted]
+    return supported[-1] if supported else allowed[0]
 
 
 def _normalize_endpoint(value: Any) -> EndpointType:
@@ -141,15 +257,21 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
         # message, the token limit is max_tokens, extended thinking uses a
         # budget_tokens sub-field, and temperature is rejected while thinking is
         # active.
+        thinking_mode = anthropic_thinking_mode(model)
+        effort_levels = anthropic_effort_levels(model)
         return ModelCapability(
             endpoint_type="anthropic",
             provider_family="anthropic",
-            supports_reasoning=True,
+            supports_reasoning=thinking_mode != "none",
             supports_pdf_file_input=False,
             reasoning_param_style="anthropic_thinking",
-            highest_reasoning_effort="max",
+            # The highest level this model actually accepts. Sending "max" to a
+            # model that tops out at "high" would be rejected.
+            highest_reasoning_effort=effort_levels[-1] if effort_levels else "",
             max_token_param="max_tokens",
             disallowed_when_reasoning={"temperature", "top_p"},
+            anthropic_thinking_mode=thinking_mode,
+            anthropic_effort_levels=effort_levels,
         )
 
     if provider_family == "deepseek":
@@ -204,11 +326,13 @@ def is_reasoning_active(payload: Dict[str, Any], capability: ModelCapability) ->
     if capability.reasoning_param_style == "deepseek_thinking":
         return bool(payload.get("thinking") or payload.get("reasoning_effort"))
     if capability.reasoning_param_style == "anthropic_thinking":
-        # An explicitly disabled thinking block must not count as active: Anthropic
-        # only rejects temperature while thinking is *enabled*. Key presence alone
-        # would strip temperature from configurations that legitimately allow it.
+        # Both "enabled" (legacy manual) and "adaptive" (current) mean thinking
+        # is on, so temperature must be withheld. Key presence alone would strip
+        # temperature from configurations that legitimately allow it.
         thinking = payload.get("thinking")
-        return isinstance(thinking, dict) and str(thinking.get("type") or "").casefold() == "enabled"
+        if not isinstance(thinking, dict):
+            return False
+        return str(thinking.get("type") or "").casefold() in {"enabled", "adaptive"}
     return False
 
 
@@ -248,19 +372,49 @@ def apply_reasoning_policy(
         if effort:
             payload["reasoning_effort"] = effort
     elif capability.reasoning_param_style == "anthropic_thinking":
-        # budget_tokens is numeric while the thinking switch is a string, so the
-        # payload is widened to Dict[str, Any] rather than forcing one type.
-        thinking_payload: Dict[str, Any] = dict(
-            _normalize_thinking_payload(api_config.get("thinking")) or {"type": "enabled"}
-        )
-        if thinking_payload.get("type") == "enabled":
-            # Anthropic accepts a bare {"type": "enabled"} and picks a default
-            # budget, so an absent budget is a valid configuration rather than a
-            # value that must be invented here.
-            budget = _positive_int(api_config.get("thinking_budget_tokens"), 0)
-            if budget > 0:
-                thinking_payload["budget_tokens"] = budget
-        payload["thinking"] = thinking_payload
+        mode = capability.anthropic_thinking_mode
+        if mode == "none":
+            return
+
+        model_id = str(api_config.get("model") or "")
+        disabled = _text(api_config.get("thinking")).casefold() == "disabled"
+
+        if mode == "manual":
+            # Legacy manual extended thinking. Correct for Claude 4.5 and
+            # earlier; sending it to 4.7+ yields a 400, which is why the mode is
+            # derived from the model rather than assumed.
+            thinking_payload: Dict[str, Any] = {"type": "disabled"} if disabled else {"type": "enabled"}
+            if not disabled:
+                # A bare {"type": "enabled"} is legal; Anthropic picks a default
+                # budget, so an absent budget is a valid configuration rather
+                # than a value to be invented here.
+                budget = _positive_int(api_config.get("thinking_budget_tokens"), 0)
+                if budget > 0:
+                    thinking_payload["budget_tokens"] = budget
+            payload["thinking"] = thinking_payload
+            return
+
+        # Adaptive thinking: there is no budget_tokens. Depth is effort-driven.
+        if disabled:
+            # Opus 5 rejects {"type": "disabled"} at xhigh/max, so effort is
+            # withheld here rather than producing a guaranteed 400.
+            payload["thinking"] = {"type": "disabled"}
+            return
+        payload["thinking"] = {"type": "adaptive"}
+        # The generic fallback is the model's top effort level, which for Opus 5
+        # is "max" -- but Anthropic documents the unset default as "high", and
+        # max demands a very large max_tokens. Forcing max on every call would be
+        # a silent cost and truncation regression, so an unconfigured effort
+        # follows the documented default and only force_highest_reasoning (or an
+        # explicit auto_highest) climbs the ladder.
+        configured_effort = _text(api_config.get("reasoning_effort"))
+        force_highest = _truthy(api_config.get("force_highest_reasoning")) or _lower(
+            configured_effort
+        ) == "auto_highest"
+        raw_effort = capability.highest_reasoning_effort if force_highest else (configured_effort or "high")
+        resolved = resolve_anthropic_effort(raw_effort, model_id)
+        if resolved:
+            payload["output_config"] = {"effort": resolved}
 
     if is_reasoning_active(payload, capability) and (
         _truthy(api_config.get("omit_temperature_when_reasoning"))
