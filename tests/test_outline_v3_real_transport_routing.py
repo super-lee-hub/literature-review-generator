@@ -210,7 +210,7 @@ def test_three_distinct_transports_are_actually_used(tmp_path: Path) -> None:
     assert len(models_used) == 3, f"expected three distinct models to run, got {sorted(models_used)}"
 
 
-def test_routed_node_without_transport_fails_closed() -> None:
+def test_routed_node_without_transport_fails_closed(tmp_path: Path) -> None:
     """A route with no transport must not fall back to the single provider."""
 
     routes = {
@@ -229,7 +229,7 @@ def test_routed_node_without_transport_fails_closed() -> None:
         for role, identity in ROLE_MODEL.items()
     }
     router = OutlineProviderRouter(routes=routes, diagnostics=collect_routing_diagnostics(routes))
-    executor = _executor(Path("."), router=router, poison=ExplodingProvider())
+    executor = _executor(tmp_path / "no-transport", router=router, poison=ExplodingProvider())
 
     with pytest.raises(Exception) as excinfo:  # noqa: BLE001
         executor._resolve_node_transport("structure_critique", routes["structure_critique"])
