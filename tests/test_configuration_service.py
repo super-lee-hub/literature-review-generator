@@ -44,14 +44,18 @@ def test_ensure_config_sections_includes_outline_free_mode_and_preprocess() -> N
     assert config['Outline_API']['proxy_mode'] == 'environment'
     assert config['Validator_API']['proxy_mode'] == 'environment'
     assert config['Writer_API']['endpoint_type'] == 'responses'
-    assert config['Writer_API']['provider_family'] == 'aihubmix_openai'
+    # The shipped Writer default is a third-party Responses gateway, not AIHubMix.
+    assert config['Writer_API']['provider_family'] == 'openai_responses'
     assert config['Writer_API']['max_output_tokens'] == '32000'
     assert config['Writer_API']['text_verbosity'] == 'high'
     assert config['Writer_API']['max_output_tokens'] == '32000'
     assert config['Outline_API']['max_output_tokens'] == '16000'
     assert config['Primary_Reader_API']['thinking'] == 'enabled'
     assert config['Primary_Reader_API']['max_context_tokens'] == '1000000'
-    assert config['Outline_API']['reasoning_display'] == 'summarized'
+    # The Outline default is now a native Anthropic Messages endpoint; depth is
+    # effort-driven there, so reasoning_display no longer applies.
+    assert 'reasoning_display' not in config['Outline_API']
+    assert config['Outline_API']['endpoint_type'] == 'anthropic'
     assert config['Validator_API']['reasoning_effort'] == 'max'
     assert config['OutlineQualityGate']['coverage_scope'] == 'full'
     assert config['OutlineQualityGate']['min_effective_sections'] == '3'

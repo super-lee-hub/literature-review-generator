@@ -122,11 +122,11 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Writer_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "gpt-5.5",
-            "api_base": PROVIDER_PRESETS["aihubmix"].default_api_base,
+            "model": "gpt-5.6-sol",
+            "api_base": "https://ai.saigou.work/v1",
             "proxy_mode": "environment",
             "endpoint_type": "responses",
-            "provider_family": "aihubmix_openai",
+            "provider_family": "openai_responses",
             "reasoning_effort": "high",
             "force_highest_reasoning": "true",
             "text_verbosity": "high",
@@ -144,13 +144,15 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Outline_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "claude-opus-4-7",
-            "api_base": PROVIDER_PRESETS["aihubmix"].default_api_base,
+            "model": "claude-opus-5",
+            "api_base": "https://chat.178266.xyz",
             "proxy_mode": "environment",
-            "endpoint_type": "chat_completions",
-            "provider_family": "aihubmix_claude",
-            "reasoning_effort": "xhigh",
-            "reasoning_display": "summarized",
+            "endpoint_type": "anthropic",
+            "provider_family": "anthropic",
+            # "high" is the documented default. xhigh/max are supported but need
+            # a very large max_tokens; that is a deliberate operator choice, not
+            # something a shipped default should impose.
+            "reasoning_effort": "high",
             "max_context_tokens": "200000",
             "max_output_tokens": "16000",
             "temperature": "0.0",
@@ -165,13 +167,15 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Free_Mode_API": {
             "api_key": "loaded_from_.env_file",
-            "model": "claude-opus-4-7",
-            "api_base": PROVIDER_PRESETS["aihubmix"].default_api_base,
+            # Deliberately a different model from Outline_API: this section also
+            # serves the coverage critique, so making it the same model as the
+            # candidate generator would ship a self-reviewing default.
+            "model": "deepseek-v4-pro",
+            "api_base": "https://api.deepseek.com",
             "proxy_mode": "environment",
             "endpoint_type": "chat_completions",
-            "provider_family": "aihubmix_claude",
-            "reasoning_effort": "xhigh",
-            "reasoning_display": "summarized",
+            "provider_family": "deepseek",
+            "reasoning_effort": "max",
             "max_context_tokens": "128000",
             "max_output_tokens": "6000",
             "temperature": "0.4",
