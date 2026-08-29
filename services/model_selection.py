@@ -30,6 +30,15 @@ _API_CONFIG_OPTIONAL_FIELDS = (
     "pdf_file_input",
     "force_highest_reasoning",
     "omit_temperature_when_reasoning",
+    # Native Anthropic Messages transport. Without these in the allow-list the
+    # values are dropped between config and runtime, so a documented setting
+    # would be accepted by the schema and then have no effect at all.
+    "anthropic_path",
+    "anthropic_version",
+    # Manual extended thinking only (Claude 4.5 and earlier; deprecated but
+    # still accepted on 4.6). Adaptive models ignore it, because effort controls
+    # depth there.
+    "thinking_budget_tokens",
 )
 
 

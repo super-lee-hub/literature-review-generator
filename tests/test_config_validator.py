@@ -40,14 +40,102 @@ def test_validate_all_config_accepts_default_reasoning_transport_combo():
     assert not any("provider_family" in warning or "endpoint_type" in warning for warning in warnings)
 
 
-def test_validate_all_config_warns_for_mismatched_provider_endpoint_combo():
+def _anthropic_outline(config):
+    """Point [Outline_API] at a native Anthropic Messages endpoint."""
+
+    config.setdefault("Outline_API", {}).update(
+        {
+            "api_key": "sk-anthropic",
+            "model": "claude-opus-5",
+            "api_base": "https://chat.178266.xyz",
+            "endpoint_type": "anthropic",
+            "provider_family": "anthropic",
+        }
+    )
+    return config
+
+
+def test_validate_all_config_accepts_native_anthropic_combo():
+    """provider_family=anthropic + endpoint_type=anthropic is a real, supported pair."""
+
+    config = _anthropic_outline(_base_config())
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert not any("anthropic" in message for message in messages), messages
+
+
+def test_validate_all_config_rejects_half_configured_anthropic():
+    """Either half alone is impossible: the transport cannot be built."""
+
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["endpoint_type"] = "responses"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any("requires endpoint_type=anthropic" in message for message in messages)
+
+
+def test_validate_all_config_rejects_anthropic_endpoint_without_the_family():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["provider_family"] = "deepseek"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any("requires provider_family=anthropic" in message for message in messages)
+
+
+def test_thinking_is_accepted_on_the_anthropic_transport():
+    """It used to be rejected as 'only valid for DeepSeek reasoning'."""
+
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["thinking"] = "enabled"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert not any("thinking is only valid" in message for message in messages), messages
+
+
+def test_thinking_budget_tokens_warns_on_adaptive_models():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["thinking_budget_tokens"] = "4096"
+
+    valid, messages = validate_all_config(config)
+
+    # A warning, not an error: budget_tokens is simply ignored on adaptive models.
+    assert valid is True
+    assert any("thinking_budget_tokens" in message for message in messages)
+
+
+def test_unsupported_effort_level_is_reported():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["model"] = "claude-opus-4-5-20251101"
+    config["Outline_API"]["reasoning_effort"] = "xhigh"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert any("will be reduced to" in message for message in messages), messages
+
+
+def test_validate_all_config_rejects_mismatched_provider_endpoint_combo():
+    """An impossible transport combination is an error, not an advisory.
+
+    Previously this only produced a warning while ``valid`` stayed True, so
+    ``doctor`` looked green on a section that cannot build a request.
+    """
+
     config = _base_config()
     config["Writer_API"]["endpoint_type"] = "chat_completions"
 
-    valid, warnings = validate_all_config(config)
+    valid, messages = validate_all_config(config)
 
-    assert valid is True
-    assert any("selected provider family requires endpoint_type=responses" in warning for warning in warnings)
+    assert valid is False
+    assert any("selected provider family requires endpoint_type=responses" in message for message in messages)
 
 
 def test_validate_all_config_accepts_custom_openai_responses_provider():

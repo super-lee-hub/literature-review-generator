@@ -10,7 +10,10 @@ from typing import Any, Dict, List, Tuple
 
 import requests  # type: ignore
 
-from services.model_capabilities import resolve_model_capability
+from services.model_capabilities import (
+    resolve_anthropic_effort,
+    resolve_model_capability,
+)
 from services.proxy_policy import should_bypass_environment_proxy
 from services.repair_policy import parse_repair_policy
 from services.config_values import (
@@ -28,10 +31,19 @@ def _normalize_config_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) -> List[str]:
-    """Validate provider/endpoint/reasoning fields that shape request payloads."""
+def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Validate provider/endpoint/reasoning fields that shape request payloads.
+
+    Returns ``(errors, warnings)``. An impossible transport combination is an
+    error, not a warning: the request cannot be built at all, so reporting it as
+    an advisory would let ``doctor`` look green while the section is unusable.
+    Reasoning fields that merely degrade -- an effort level that gets clamped, a
+    budget token that no longer applies -- stay warnings, because the transport
+    still produces a valid request.
+    """
 
     messages: List[str] = []
+    errors: List[str] = []
     provider_family = _normalize_config_text(section.get("provider_family")).replace("-", "_").lower()
     endpoint_type = _normalize_config_text(section.get("endpoint_type")).replace("-", "_").lower()
     api_base = _normalize_config_text(section.get("api_base")).lower()
@@ -44,17 +56,25 @@ def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) ->
         "claude_chat_reasoning",
         "aihubmix_openai",
         "aihubmix_claude",
+        "anthropic",
         "deepseek",
         "generic",
     }
     if provider_family and provider_family not in known_families:
-        messages.append(f"[{section_name}] provider_family={provider_family!r} is not supported")
-    if endpoint_type and endpoint_type not in {"chat_completions", "responses", "response"}:
-        messages.append(f"[{section_name}] endpoint_type={endpoint_type!r} is not supported")
+        errors.append(f"[{section_name}] provider_family={provider_family!r} is not supported")
+    if endpoint_type and endpoint_type not in {"chat_completions", "responses", "response", "anthropic"}:
+        errors.append(f"[{section_name}] endpoint_type={endpoint_type!r} is not supported")
     if provider_family in {"aihubmix_openai", "openai_responses"} and endpoint_type not in {"", "responses", "response"}:
-        messages.append(f"[{section_name}] the selected provider family requires endpoint_type=responses")
+        errors.append(f"[{section_name}] the selected provider family requires endpoint_type=responses")
     if provider_family in {"claude_chat_reasoning", "aihubmix_claude", "deepseek"} and endpoint_type not in {"", "chat_completions"}:
-        messages.append(f"[{section_name}] the selected provider family requires endpoint_type=chat_completions")
+        errors.append(f"[{section_name}] the selected provider family requires endpoint_type=chat_completions")
+    # Anthropic Messages is a different wire contract from both OpenAI
+    # protocols, so the pairing is checked in both directions. A half-configured
+    # section would otherwise be silently routed down the wrong transport.
+    if provider_family == "anthropic" and endpoint_type not in {"", "anthropic"}:
+        errors.append(f"[{section_name}] provider_family=anthropic requires endpoint_type=anthropic")
+    if endpoint_type == "anthropic" and provider_family not in {"", "anthropic"}:
+        errors.append(f"[{section_name}] endpoint_type=anthropic requires provider_family=anthropic")
     if provider_family == "deepseek" and api_base and "deepseek" not in api_base:
         messages.append(f"[{section_name}] provider_family=deepseek should use a DeepSeek api_base")
     if provider_family.startswith("aihubmix") and api_base and "aihubmix" not in api_base:
@@ -65,9 +85,30 @@ def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) ->
         messages.append(f"[{section_name}] reasoning fields are set but the selected model does not support reasoning")
     if reasoning_display and capability.reasoning_param_style != "chat_reasoning":
         messages.append(f"[{section_name}] reasoning_display is only valid for chat reasoning providers")
-    if thinking and capability.reasoning_param_style != "deepseek_thinking":
-        messages.append(f"[{section_name}] thinking is only valid for DeepSeek reasoning")
-    return messages
+    # Anthropic exposes thinking through the same key, but the mode differs by
+    # model generation; DeepSeek is no longer the only valid style.
+    if thinking and capability.reasoning_param_style not in {"deepseek_thinking", "anthropic_thinking"}:
+        messages.append(
+            f"[{section_name}] thinking is only valid for DeepSeek reasoning or the "
+            "Anthropic Messages transport"
+        )
+    if _normalize_config_text(section.get("thinking_budget_tokens")) and capability.anthropic_thinking_mode != "manual":
+        messages.append(
+            f"[{section_name}] thinking_budget_tokens applies only to manual extended "
+            "thinking (Claude 4.5 and earlier); on adaptive models depth is controlled "
+            "by reasoning_effort instead"
+        )
+    # An effort level the model does not accept is a rejected request, so it is
+    # reported here rather than surfacing as a runtime failure far from the cause.
+    model_id = _normalize_config_text(section.get("model"))
+    if reasoning_effort and capability.anthropic_effort_levels:
+        resolved = resolve_anthropic_effort(reasoning_effort, model_id)
+        if resolved and resolved != reasoning_effort.lower():
+            messages.append(
+                f"[{section_name}] reasoning_effort={reasoning_effort!r} is not supported by "
+                f"this model and will be reduced to {resolved!r}"
+            )
+    return errors, messages
 
 
 def validate_file_path(path: str, allow_empty: bool = False) -> Tuple[bool, str]:
@@ -179,7 +220,10 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_api_key(str(config_dict[section_name]["api_key"]), allow_empty=True)
         if not valid:
             messages.append(f"[{section_name}] {error}")
-        messages.extend(_validate_api_transport_combo(section_name, config_dict[section_name]))
+        combo_errors, combo_warnings = _validate_api_transport_combo(section_name, config_dict[section_name])
+        if combo_errors:
+            return False, combo_errors
+        messages.extend(combo_warnings)
         valid, error = validate_url(str(config_dict[section_name]["api_base"]), allow_empty=True)
         if not valid:
             messages.append(f"[{section_name}] {error}")
@@ -193,7 +237,10 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_config_section(config_dict, section_name, ["api_key", "model", "api_base"])
         if not valid:
             return False, [error]
-        messages.extend(_validate_api_transport_combo(section_name, section))
+        combo_errors, combo_warnings = _validate_api_transport_combo(section_name, section)
+        if combo_errors:
+            return False, combo_errors
+        messages.extend(combo_warnings)
         valid, error = validate_url(str(section["api_base"]), allow_empty=True)
         if not valid:
             messages.append(f"[{section_name}] {error}")
