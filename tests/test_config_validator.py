@@ -2,13 +2,14 @@ import pytest
 
 from config_validator import test_api_connection as probe_api_connection, validate_all_config
 from services.config_values import StrictConfigValueError
+from services.configuration_service import default_config_sections
 from services.settings import ApplicationSettings
 
 
 def _base_config():
-    return {
-        "Paths": {"output_path": "./output"},
-        "Primary_Reader_API": {
+    config = default_config_sections()
+    config["Paths"].update({"output_path": "./output"})
+    config["Primary_Reader_API"].update({
             "api_key": "sk-primary",
             "model": "deepseek-v4-pro",
             "api_base": "https://api.deepseek.com",
@@ -16,21 +17,31 @@ def _base_config():
             "provider_family": "deepseek",
             "thinking": "enabled",
             "reasoning_effort": "max",
-        },
-        "Backup_Reader_API": {
+        })
+    config["Backup_Reader_API"].update({
             "api_key": "sk-backup",
             "model": "gemini-2.5-pro",
             "api_base": "https://api.videocaptioner.cn/v1",
-        },
-        "Writer_API": {
+            "provider_family": "generic",
+            "endpoint_type": "chat_completions",
+            "thinking": "",
+            "reasoning_effort": "",
+        })
+    config["Writer_API"].update({
             "api_key": "sk-writer",
             "model": "gpt-5.5",
             "api_base": "https://aihubmix.com/v1",
             "endpoint_type": "responses",
             "provider_family": "aihubmix_openai",
             "reasoning_effort": "high",
-        },
-    }
+        })
+    for section_name, api_key in (
+        ("Outline_API", "sk-outline"),
+        ("Free_Mode_API", "sk-free"),
+        ("Validator_API", "sk-validator"),
+    ):
+        config[section_name]["api_key"] = api_key
+    return config
 
 
 def test_anthropic_connection_uses_native_messages_headers_and_path(monkeypatch):
@@ -156,6 +167,36 @@ def test_unsupported_effort_level_is_reported():
 
     assert valid is True
     assert any("will be reduced to" in message for message in messages), messages
+
+
+def test_invalid_anthropic_effort_typo_is_an_error():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["reasoning_effort"] = "hihg"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any("reasoning_effort" in message and "invalid" in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_fragment"),
+    [
+        (lambda config: config.pop("Outline_API"), "Outline_API"),
+        (lambda config: config["Outline_API"].update(model=""), "model"),
+        (lambda config: config["Outline_API"].update(api_base=""), "api_base"),
+        (lambda config: config["Outline_API"].pop("endpoint_type"), "endpoint_type"),
+    ],
+    ids=("missing-section", "missing-model", "missing-base", "missing-endpoint"),
+)
+def test_current_config_rejects_incomplete_routed_outline_section(mutation, expected_fragment):
+    config = _base_config()
+    mutation(config)
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any(expected_fragment in message for message in messages), messages
 
 
 def test_validate_all_config_rejects_mismatched_provider_endpoint_combo():

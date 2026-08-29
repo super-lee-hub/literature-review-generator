@@ -201,7 +201,10 @@ def plan_free_mode_chat_turn(
     free_mode_api = get_free_mode_api_config(config)
     if not free_mode_api.get("api_key") or not free_mode_api.get("model"):
         if logger:
-            logger.error("Free_Mode_API 未配置，且无法回退到可用的 Outline_API。")
+            logger.error(
+                "Free_Mode_API 未完整配置。自由模式不再从 Outline_API "
+                "隐式继承 provider route。"
+            )
         return None
 
     transcript = _serialize_conversation(messages)
@@ -254,7 +257,10 @@ def generate_free_mode_profile(
     free_mode_api = get_free_mode_api_config(config)
     if not free_mode_api.get("api_key") or not free_mode_api.get("model"):
         if logger:
-            logger.error("Free_Mode_API 未配置，无法生成自由模式 profile。")
+            logger.error(
+                "Free_Mode_API 未完整配置。自由模式不再从 Outline_API "
+                "隐式继承 provider route。"
+            )
         return None
 
     max_tokens, temperature = _get_free_mode_parameters(config, logger=logger)

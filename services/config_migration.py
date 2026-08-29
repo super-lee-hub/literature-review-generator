@@ -359,6 +359,12 @@ def migrate_config_text(
                     f"preserved {len(preserved)} unmapped [{API_PARAMETERS_SECTION}] "
                     "key(s) in a marked legacy block"
                 )
+                # The section is still removed because every mappable value was
+                # relocated (some into live sections, some into this legacy
+                # block). The "relocating" note must fire here too, otherwise a
+                # non-empty legacy block would suppress it and make the migration
+                # look like a pure drop.
+                report.note(f"removed [{API_PARAMETERS_SECTION}] after relocating its values")
                 continue
             if current_section in DEAD_SECTIONS:
                 report.note(

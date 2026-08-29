@@ -61,7 +61,13 @@ from runtime.provider_runtime import (
     hash_text,
 )
 from runtime.outline_v3_replay import ModelCallReplayKey, ModelCallReplayStore
-from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRecord, ArtifactRegistry
+from services.artifact_registry import (
+    ArtifactDependencyRefV2,
+    ArtifactRecord,
+    ArtifactRegistry,
+    RegistryError,
+    file_sha256,
+)
 from services.job_workspace import publish_bytes_artifact, publish_json_artifact
 from services.queue_service import LocalPublicationContext
 from services.prompt_registry import PromptRegistry
@@ -440,6 +446,11 @@ class OutlineV3Executor:
         self._expected_provider_calls: dict[str, ExpectedProviderCall] = {}
         self._pending_replays: dict[str, tuple[ModelCallReplayKey, str, str]] = {}
         self._replay_evidence: list[dict[str, Any]] = []
+        self._replay_receipt_sources: dict[str, ArtifactRecord] = {}
+        self._replay_receipt_diagnostics: list[str] = []
+        self._replay_receipt_index_cache: dict[str, Any] | None = None
+        self._verified_reuse_records: dict[str, ArtifactRecord] = {}
+        self._verified_reuse_source_receipt_ids: dict[str, str] = {}
         self._node_store = OutlineNodeStore(self.workspace, self.registry)
         self._dag = self._node_store.ensure(self.job_id, candidate_count=self.candidate_count)
         self._hydrate_expected_provider_calls()
@@ -1221,49 +1232,185 @@ class OutlineV3Executor:
             route=resolved_route,
         )
 
-    def _replay_receipt_index(self) -> dict[str, Any]:
-        """Index every provider receipt by id across the current and all prior
-        closure epochs.
+    @staticmethod
+    def _receipt_record_hash(receipt: Any) -> str:
+        """Hash the canonical receipt record without retaining raw content."""
 
-        Replay reuse is keyed on the per-node provider config hash, so a receipt
-        produced by an earlier closure remains valid for a node whose own route
-        has not changed. The current-epoch ledger is consulted first; any ids
-        still missing are resolved from prior-epoch ledgers discovered through
-        the registry. Resolution is defensive: a corrupt or unreadable prior
-        ledger is skipped, never allowed to abort replay validation.
+        to_dict = getattr(receipt, "to_dict", None)
+        payload = to_dict() if callable(to_dict) else receipt
+        return hash_json(payload)
+
+    def _replay_receipt_index(self) -> dict[str, Any]:
+        """Index only Registry-authorized receipts from current/prior epochs.
+
+        A replay record is not authority by itself. Historical ledgers are
+        accepted only after their Registry record, file hash, artifact schema,
+        and dependency closure all verify. The local current-epoch staging file
+        is included for same-epoch resume, then reconciled with its immutable
+        Registry publication when one exists.
         """
 
-        index: dict[str, Any] = {}
-        try:
-            for receipt in self._receipt_ledger.list_receipts():
-                index.setdefault(str(getattr(receipt, "receipt_id", "") or ""), receipt)
-        except Exception:
-            pass
-        try:
-            from runtime.provider_runtime import ProviderRuntimeLedger
+        if self._replay_receipt_index_cache is not None:
+            return dict(self._replay_receipt_index_cache)
 
-            for record in self.registry.list_records():
-                if str(getattr(record, "artifact_type", "") or "") != "provider_receipt_ledger":
+        index: dict[str, Any] = {}
+        sources: dict[str, ArtifactRecord] = {}
+        invalid_ids: set[str] = set()
+        diagnostics: list[str] = []
+
+        def reject(source: str, reason: str) -> None:
+            message = f"replay receipt source rejected: {source} ({reason})"
+            diagnostics.append(message)
+
+        def ingest(
+            receipts: Sequence[Any],
+            *,
+            source_record: ArtifactRecord | None,
+            source_epoch: str,
+            source_label: str,
+        ) -> None:
+            if not receipts:
+                reject(source_label, "empty ledger")
+                return
+            local_ids: set[str] = set()
+            for receipt in receipts:
+                receipt_id = str(getattr(receipt, "receipt_id", "") or "")
+                if not receipt_id:
+                    reject(source_label, "receipt id missing")
+                    return
+                if receipt_id in local_ids:
+                    invalid_ids.add(receipt_id)
+                    index.pop(receipt_id, None)
+                    sources.pop(receipt_id, None)
+                    reject(source_label, f"duplicate receipt id {receipt_id}")
+                    return
+                local_ids.add(receipt_id)
+                if (
+                    str(getattr(receipt, "job_id", "") or "") != self.job_id
+                    or str(getattr(receipt, "stage_name", "") or "") != "outline_v3"
+                    or str(getattr(receipt, "closure_epoch_id", "") or "") != source_epoch
+                ):
+                    reject(source_label, f"receipt {receipt_id} has an out-of-scope identity")
+                    return
+
+            for receipt in receipts:
+                receipt_id = str(receipt.receipt_id)
+                if receipt_id in invalid_ids:
                     continue
-                if str(getattr(record, "status", "") or "") != "ready":
+                previous = index.get(receipt_id)
+                if previous is None:
+                    index[receipt_id] = receipt
+                    if source_record is not None:
+                        sources[receipt_id] = source_record
                     continue
-                metadata = getattr(record, "metadata", {}) or {}
-                if str(metadata.get("stage_name") or "") != "outline_v3":
+                same_record = self._receipt_record_hash(previous) == self._receipt_record_hash(receipt)
+                previous_epoch = str(getattr(previous, "closure_epoch_id", "") or "")
+                previous_source = sources.get(receipt_id)
+                duplicate_registry_source = (
+                    same_record
+                    and previous_epoch == source_epoch
+                    and previous_source is not None
+                    and source_record is not None
+                    and previous_source.artifact_id != source_record.artifact_id
+                )
+                if same_record and previous_epoch == source_epoch and not duplicate_registry_source:
+                    # The local staging copy and its immutable Registry copy
+                    # describe the same call. Prefer the Registry record as
+                    # the source authority when it is available.
+                    if source_record is not None and previous_source is None:
+                        sources[receipt_id] = source_record
                     continue
-                if str(metadata.get("closure_epoch_id") or "") == self.closure_epoch_id:
-                    continue  # already covered by the current ledger
-                path = getattr(record, "path", None)
-                if not path:
-                    continue
-                try:
-                    ledger = ProviderRuntimeLedger(path=str(path))
-                    for receipt in ledger.list_receipts():
-                        index.setdefault(str(getattr(receipt, "receipt_id", "") or ""), receipt)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return index
+                invalid_ids.add(receipt_id)
+                index.pop(receipt_id, None)
+                sources.pop(receipt_id, None)
+                reject(source_label, f"conflicting receipt id {receipt_id}")
+
+        try:
+            current_receipts = self._receipt_ledger.list_receipts()
+        except Exception as exc:  # ledger parser errors are a fail-closed input
+            current_receipts = ()
+            reject("current runtime ledger", type(exc).__name__)
+        if current_receipts:
+            ingest(
+                current_receipts,
+                source_record=None,
+                source_epoch=self.closure_epoch_id,
+                source_label="current runtime ledger",
+            )
+
+        try:
+            registry_records = self.registry.list_records()
+        except Exception as exc:
+            registry_records = []
+            reject("provider receipt Registry", type(exc).__name__)
+        for record in registry_records:
+            if str(getattr(record, "artifact_type", "") or "") != "provider_receipt_ledger":
+                continue
+            if str(getattr(record, "status", "") or "") != "ready":
+                continue
+            if str(getattr(record, "job_id", "") or "") != self.job_id:
+                reject(str(getattr(record, "artifact_id", "") or "<unknown>"), "wrong job")
+                continue
+            metadata = getattr(record, "metadata", {}) or {}
+            if not isinstance(metadata, Mapping):
+                reject(str(getattr(record, "artifact_id", "") or "<unknown>"), "metadata is not an object")
+                continue
+            if str(metadata.get("stage_name") or "") != "outline_v3":
+                continue
+            source_epoch = str(metadata.get("closure_epoch_id") or "")
+            if not source_epoch:
+                reject(str(getattr(record, "artifact_id", "") or "<unknown>"), "closure epoch missing")
+                continue
+            source_label = str(getattr(record, "artifact_id", "") or "<unknown ledger>")
+            try:
+                # This validates the Registry record's current file bytes,
+                # schema, and every ready dependency before any receipt is read.
+                self.registry.verify_ready_dependencies(
+                    [ArtifactDependencyRefV2.from_record(record)]
+                )
+                before_hash = file_sha256(record.path)
+                ledger = ProviderRuntimeLedger(record.path)
+                receipts = ledger.list_receipts()
+                after_hash = file_sha256(record.path)
+                if before_hash != after_hash or before_hash != record.content_hash:
+                    raise RegistryError("receipt ledger bytes changed during verification")
+            except Exception as exc:
+                reject(source_label, type(exc).__name__)
+                continue
+            ingest(
+                receipts,
+                source_record=record,
+                source_epoch=source_epoch,
+                source_label=source_label,
+            )
+
+        for message in dict.fromkeys(diagnostics):
+            if message not in self._replay_receipt_diagnostics:
+                self._replay_receipt_diagnostics.append(message)
+            if message not in self.replay_diagnostics:
+                self.replay_diagnostics.append(message)
+        self._replay_receipt_sources = sources
+        result = {
+            receipt_id: receipt
+            for receipt_id, receipt in index.items()
+            if receipt_id not in invalid_ids
+        }
+        self._replay_receipt_index_cache = dict(result)
+        return result
+
+    def _node_execution_identity_hash(self, node_id: str) -> str:
+        """Hash one upstream node's output and execution authority together."""
+
+        node = self._dag.get(node_id)
+        if node is None:
+            return ""
+        return hash_json(
+            {
+                "node_id": node.node_id,
+                "output_hash": node.output_hash,
+                "execution_binding": dict(node.execution_binding),
+            }
+        )
 
     def _replay_record_is_valid(self, record: Any, binding: Mapping[str, Any]) -> bool:
         normalized_hash = str(getattr(record, "normalized_output_hash", "") or getattr(record, "output_hash", ""))
@@ -1279,13 +1426,6 @@ class OutlineV3Executor:
             return False
         semantic_node_id = str(binding.get("semantic_node_id") or self._semantic_node_id(str(binding.get("node_id") or "")))
         semantic_call_id = f"outline:{semantic_node_id}"
-        # Per-node selective replay: a receipt from a prior closure epoch is still
-        # trustworthy when its own provider config (config_hash), prompt, input
-        # and schema all still match. We no longer hard-fail on a differing global
-        # closure_epoch_id -- that binding used to blanket-invalidate every node
-        # the moment any single route changed, which is the bug F fixes. The
-        # per-node provider_config_hash check below remains the authoritative
-        # gate, so reuse is verified, never forged.
         prior_epoch_reused = any(
             str(getattr(receipt, "closure_epoch_id", "")) != self.closure_epoch_id
             for receipt in expected_receipts.values()
@@ -1323,6 +1463,364 @@ class OutlineV3Executor:
             if bool(binding.get("endpoint_type") not in {"internal", "fixture"}) and receipt.usage_status not in {"reported", "provider_not_supported"}:
                 return False
         return True
+
+    @staticmethod
+    def _artifact_record_hash(record: ArtifactRecord) -> str:
+        """Hash the complete Registry record, including its dependencies."""
+
+        return hash_json(asdict(record))
+
+    def _verify_replay_output_authority(
+        self,
+        replay_record: Any,
+        current_record: ArtifactRecord,
+        payload: Mapping[str, Any],
+    ) -> tuple[str, str] | None:
+        """Verify replay outputs against current Registry authority."""
+
+        output_ids = [
+            str(item).strip()
+            for item in (getattr(replay_record, "output_artifact_ids", None) or ())
+            if str(item).strip()
+        ]
+        if not output_ids or current_record.artifact_id not in output_ids:
+            return None
+        try:
+            self.registry.verify_ready_dependencies(
+                [ArtifactDependencyRefV2.from_record(current_record)]
+            )
+        except Exception:
+            return None
+
+        expected_content_hash = str(getattr(replay_record, "registered_artifact_hash", "") or "")
+        expected_node_hash = str(getattr(replay_record, "node_output_hash", "") or "")
+        resolved_content_hash = ""
+        resolved_file_hash = ""
+        for artifact_id in output_ids:
+            registered = self.registry.get(artifact_id)
+            if registered is None or registered.status != "ready" or registered.job_id != self.job_id:
+                return None
+            try:
+                self.registry.verify_ready_dependencies(
+                    [ArtifactDependencyRefV2.from_record(registered)]
+                )
+                envelope = json.loads(Path(registered.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                return None
+            if not isinstance(envelope, Mapping):
+                return None
+            embedded_content_hash = str(envelope.get("content_hash") or "")
+            embedded_payload = envelope.get("payload")
+            if not embedded_content_hash or not isinstance(embedded_payload, Mapping):
+                return None
+            if hash_json(embedded_payload) != str(getattr(replay_record, "normalized_output_hash", "") or getattr(replay_record, "output_hash", "")):
+                return None
+            if expected_content_hash and embedded_content_hash != expected_content_hash:
+                return None
+            if expected_node_hash and embedded_content_hash != expected_node_hash:
+                return None
+            if registered.artifact_id == current_record.artifact_id:
+                if registered.content_hash != current_record.content_hash:
+                    return None
+                if hash_json(payload) != hash_json(embedded_payload):
+                    return None
+            resolved_content_hash = embedded_content_hash
+            resolved_file_hash = registered.content_hash
+        if not resolved_content_hash or not resolved_file_hash:
+            return None
+        return resolved_content_hash, resolved_file_hash
+
+    def _materialize_verified_reuse_evidence(
+        self,
+        node_id: str,
+        binding: Mapping[str, Any],
+        replay_record: Any,
+        current_record: ArtifactRecord,
+        payload: Mapping[str, Any],
+    ) -> ArtifactRecord | None:
+        """Register durable evidence for a validated prior-epoch replay."""
+
+        receipt_ids = [
+            str(item).strip()
+            for item in (getattr(replay_record, "receipt_ids", None) or ())
+            if str(item).strip()
+        ]
+        if len(receipt_ids) != 1:
+            self.replay_diagnostics.append(
+                f"node {node_id}: prior-epoch replay must bind exactly one receipt"
+            )
+            return None
+        receipt_id = receipt_ids[0]
+        receipt_index = self._replay_receipt_index()
+        source_receipt = receipt_index.get(receipt_id)
+        source_ledger = self._replay_receipt_sources.get(receipt_id)
+        if source_receipt is None or source_ledger is None:
+            self.replay_diagnostics.append(
+                f"node {node_id}: prior-epoch receipt authority is unavailable"
+            )
+            return None
+        try:
+            self.registry.verify_ready_dependencies(
+                [ArtifactDependencyRefV2.from_record(source_ledger)]
+            )
+        except (OSError, RegistryError, TypeError, ValueError):
+            self.replay_diagnostics.append(
+                f"node {node_id}: prior-epoch receipt ledger authority changed"
+            )
+            return None
+        source_epoch = str(getattr(source_receipt, "closure_epoch_id", "") or "")
+        if not source_epoch or source_epoch == self.closure_epoch_id:
+            return None
+        output_authority = self._verify_replay_output_authority(
+            replay_record,
+            current_record,
+            payload,
+        )
+        if output_authority is None:
+            self.replay_diagnostics.append(
+                f"node {node_id}: replay output Registry authority is invalid"
+            )
+            return None
+        registered_content_hash, registered_file_hash = output_authority
+        call_id = f"outline:{self._semantic_node_id(node_id)}"
+        base_payload: dict[str, Any] = {
+            "artifact_type": "provider_verified_reuse",
+            "artifact_version": "v1",
+            "job_id": self.job_id,
+            "stage_name": "outline_v3",
+            "current_logical_attempt_identity": self.logical_attempt_identity,
+            "current_closure_epoch_id": self.closure_epoch_id,
+            "call_id": call_id,
+            "node_id": self._semantic_node_id(node_id),
+            "current_binding": {
+                "call_id": call_id,
+                "node_id": self._semantic_node_id(node_id),
+                "prompt_hash": str(binding.get("prompt_hash") or ""),
+                "input_hash": str(binding.get("prompt_payload_hash") or ""),
+                "config_hash": str(binding.get("provider_config_hash") or ""),
+                "schema_hash": str(binding.get("schema_hash") or ""),
+                "provider": str(binding.get("provider_family") or ""),
+                "model": str(binding.get("model_name") or ""),
+                "endpoint": str(binding.get("api_base_host") or ""),
+                "endpoint_type": str(binding.get("endpoint_type") or ""),
+            },
+            "source_authority": {
+                "source_closure_epoch_id": source_epoch,
+                "source_receipt_ledger_artifact_id": source_ledger.artifact_id,
+                "source_receipt_ledger_content_hash": source_ledger.content_hash,
+                "source_receipt_id": receipt_id,
+                "source_receipt_record_hash": self._receipt_record_hash(source_receipt),
+            },
+            "reused_output": {
+                "replay_key_hash": str(getattr(replay_record.key, "key_hash", "") or ""),
+                "normalized_output_hash": str(
+                    getattr(replay_record, "normalized_output_hash", "")
+                    or getattr(replay_record, "output_hash", "")
+                ),
+                "registered_artifact_id": current_record.artifact_id,
+                "registered_artifact_content_hash": registered_content_hash,
+                "registered_artifact_file_hash": registered_file_hash,
+            },
+        }
+        base_payload["content_hash"] = hash_json(base_payload)
+        evidence_id = (
+            f"outline-v3:provider-verified-reuse:{self.closure_epoch_id}:"
+            f"{hash_text(call_id)[:24]}"
+        )
+        safe_node = re.sub(r"[^A-Za-z0-9_.-]+", "_", self._semantic_node_id(node_id))
+        evidence_path = self._path(
+            f"outline_v3/reuse/{safe_node}_{self.closure_epoch_id[:24]}.json"
+        )
+        existing = self.registry.get(evidence_id)
+        if existing is not None:
+            if existing.status != "ready":
+                return None
+            try:
+                self.registry.verify_ready_dependencies(
+                    [ArtifactDependencyRefV2.from_record(existing)]
+                )
+                existing_payload = json.loads(Path(existing.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                return None
+            if existing_payload != base_payload:
+                self.replay_diagnostics.append(
+                    f"node {node_id}: verified reuse evidence identity changed"
+                )
+                return None
+            evidence_record = existing
+        else:
+            dependencies: list[ArtifactDependencyRefV2] = []
+            for dependency in (source_ledger, current_record):
+                dependency_ref = ArtifactDependencyRefV2.from_record(dependency)
+                if all(item.artifact_id != dependency_ref.artifact_id for item in dependencies):
+                    dependencies.append(dependency_ref)
+            try:
+                evidence_record = publish_json_artifact(
+                    self.publication_context,
+                    self.registry,
+                    evidence_path,
+                    base_payload,
+                    artifact_role="provider_verified_reuse",
+                    artifact_type="provider_verified_reuse",
+                    artifact_version="v1",
+                    producer="outline.v3_executor.OutlineV3Executor",
+                    artifact_id=evidence_id,
+                    depends_on=dependencies,
+                    metadata={
+                        "job_id": self.job_id,
+                        "stage_name": "outline_v3",
+                        "current_closure_epoch_id": self.closure_epoch_id,
+                        "source_closure_epoch_id": source_epoch,
+                        "call_id": call_id,
+                        "node_id": self._semantic_node_id(node_id),
+                    },
+                )
+            except (OSError, RegistryError, TypeError, ValueError) as exc:
+                self.replay_diagnostics.append(
+                    f"node {node_id}: verified reuse evidence registration failed "
+                    f"({type(exc).__name__})"
+                )
+                return None
+        self._verified_reuse_records[call_id] = evidence_record
+        self._verified_reuse_source_receipt_ids[call_id] = receipt_id
+        self.artifact_records[evidence_record.artifact_id] = evidence_record
+        self.artifact_paths[evidence_record.artifact_id] = evidence_record.path
+        return evidence_record
+
+    def _verify_verified_reuse_evidence(
+        self,
+        expected_calls: Sequence[ExpectedProviderCall],
+    ) -> list[ArtifactRecord]:
+        """Re-verify every reuse authority before the current closure closes."""
+
+        records: list[ArtifactRecord] = []
+        receipt_index = self._replay_receipt_index()
+        for expected in expected_calls:
+            if not expected.verified_reuse:
+                continue
+            evidence_id = str(expected.reuse_evidence_artifact_id or "")
+            evidence = self.registry.get(evidence_id)
+            if evidence is None or evidence.status != "ready":
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence is not ready for {expected.call_id}"
+                )
+            try:
+                self.registry.verify_ready_dependencies(
+                    [ArtifactDependencyRefV2.from_record(evidence)]
+                )
+                payload = json.loads(Path(evidence.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RegistryError) as exc:
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence cannot be verified for {expected.call_id}"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence payload is invalid for {expected.call_id}"
+                )
+            if str(payload.get("content_hash") or "") != hash_json(
+                {key: value for key, value in payload.items() if key != "content_hash"}
+            ):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence content hash is invalid for {expected.call_id}"
+                )
+            if (
+                expected.reuse_evidence_artifact_hash != evidence.content_hash
+                or expected.reuse_evidence_record_hash != self._artifact_record_hash(evidence)
+            ):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence Registry identity changed for {expected.call_id}"
+                )
+            if (
+                str(payload.get("job_id") or "") != self.job_id
+                or str(payload.get("stage_name") or "") != "outline_v3"
+                or str(payload.get("current_logical_attempt_identity") or "") != self.logical_attempt_identity
+                or str(payload.get("current_closure_epoch_id") or "") != self.closure_epoch_id
+                or str(payload.get("call_id") or "") != expected.call_id
+                or str(payload.get("node_id") or "") != expected.node_id
+            ):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence current identity changed for {expected.call_id}"
+                )
+            binding = payload.get("current_binding")
+            if not isinstance(binding, Mapping) or any(
+                str(binding.get(field) or "") != expected_value
+                for field, expected_value in {
+                    "call_id": expected.call_id,
+                    "node_id": expected.node_id,
+                    "prompt_hash": expected.prompt_hash,
+                    "input_hash": expected.input_hash,
+                    "config_hash": expected.config_hash,
+                    "schema_hash": expected.schema_hash,
+                    "provider": expected.provider,
+                    "model": expected.model,
+                    "endpoint": expected.endpoint,
+                    "endpoint_type": expected.endpoint_type,
+                }.items()
+            ):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence binding mismatch for {expected.call_id}"
+                )
+            source = payload.get("source_authority")
+            reused = payload.get("reused_output")
+            if not isinstance(source, Mapping) or not isinstance(reused, Mapping):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence authority is incomplete for {expected.call_id}"
+                )
+            source_receipt_id = str(source.get("source_receipt_id") or "")
+            source_receipt = receipt_index.get(source_receipt_id)
+            source_ledger_id = str(source.get("source_receipt_ledger_artifact_id") or "")
+            source_ledger = self.registry.get(source_ledger_id)
+            if source_receipt is None or source_ledger is None or source_ledger.status != "ready":
+                raise OutlineV3ExecutionError(
+                    f"verified reuse source authority is unavailable for {expected.call_id}"
+                )
+            try:
+                self.registry.verify_ready_dependencies(
+                    [ArtifactDependencyRefV2.from_record(source_ledger)]
+                )
+            except (OSError, RegistryError, TypeError, ValueError) as exc:
+                raise OutlineV3ExecutionError(
+                    f"verified reuse source ledger is not authoritative for {expected.call_id}"
+                ) from exc
+            if (
+                str(source.get("source_closure_epoch_id") or "")
+                != str(getattr(source_receipt, "closure_epoch_id", "") or "")
+                or str(source.get("source_closure_epoch_id") or "") == self.closure_epoch_id
+                or str(source.get("source_receipt_ledger_content_hash") or "") != source_ledger.content_hash
+                or str(source.get("source_receipt_record_hash") or "") != self._receipt_record_hash(source_receipt)
+                or str(reused.get("replay_key_hash") or "") == ""
+                or str(reused.get("normalized_output_hash") or "") != expected.normalized_output_hash
+                or str(reused.get("registered_artifact_id") or "") == ""
+                or str(reused.get("registered_artifact_content_hash") or "") != expected.artifact_content_hash
+                or str(reused.get("registered_artifact_file_hash") or "") != expected.registry_file_hash
+            ):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence source/output mismatch for {expected.call_id}"
+                )
+            reused_artifact = self.registry.get(
+                str(reused.get("registered_artifact_id") or "")
+            )
+            if (
+                reused_artifact is None
+                or reused_artifact.status != "ready"
+                or reused_artifact.job_id != self.job_id
+                or str(reused_artifact.path) != str(expected.artifact_path)
+                or reused_artifact.content_hash != expected.registry_file_hash
+            ):
+                raise OutlineV3ExecutionError(
+                    f"verified reuse registered output mismatch for {expected.call_id}"
+                )
+            dependency_ids = {
+                str(dependency.artifact_id)
+                for dependency in evidence.depends_on
+                if str(dependency.artifact_id)
+            }
+            if source_ledger.artifact_id not in dependency_ids or str(reused.get("registered_artifact_id") or "") not in dependency_ids:
+                raise OutlineV3ExecutionError(
+                    f"verified reuse evidence dependencies are incomplete for {expected.call_id}"
+                )
+            records.append(evidence)
+        return records
 
     def _register_expected_from_binding(self, node_id: str, binding: Mapping[str, Any]) -> str:
         semantic_node_id = str(binding.get("semantic_node_id") or self._semantic_node_id(node_id))
@@ -1624,21 +2122,64 @@ class OutlineV3Executor:
             normalized_hash = replay.record.normalized_output_hash or replay.record.output_hash
             if payload_hash != normalized_hash:
                 return None
-            self.receipts.extend(replay.record.receipt_ids)
             call_id = self._register_expected_from_binding(node_id, binding)
-            self._expected_provider_calls[call_id] = replace(
-                self._expected_provider_calls[call_id],
-                provider_response_hash=normalized_hash,
-                output_hash=normalized_hash,
-                normalized_output_hash=normalized_hash,
-                artifact_payload_hash=hash_json(payload),
-                artifact_content_hash=node.output_hash,
-                registry_file_hash=record.content_hash,
-                artifact_path=record.path,
-                registered_artifact_hash=node.output_hash,
-                replay_output_hash=replay.record.output_hash,
-                node_output_hash=node.output_hash,
+            replay_receipts = self._replay_receipt_index()
+            prior_epoch_reused = any(
+                str(getattr(replay_receipts.get(str(receipt_id)), "closure_epoch_id", "") or "")
+                != self.closure_epoch_id
+                for receipt_id in replay.record.receipt_ids
+                if str(receipt_id) in replay_receipts
             )
+            if prior_epoch_reused:
+                reuse_evidence = self._materialize_verified_reuse_evidence(
+                    node_id,
+                    binding,
+                    replay.record,
+                    record,
+                    payload,
+                )
+                if reuse_evidence is None:
+                    # A prior receipt is never promoted into the current
+                    # ledger. If its authority cannot be materialized, rerun
+                    # this node through the configured transport instead.
+                    return None
+                expected = self._expected_provider_calls[call_id]
+                self._expected_provider_calls[call_id] = replace(
+                    expected,
+                    provider_response_hash=normalized_hash,
+                    output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                    artifact_payload_hash=hash_json(payload),
+                    artifact_content_hash=node.output_hash,
+                    registry_file_hash=record.content_hash,
+                    artifact_path=record.path,
+                    registered_artifact_hash=node.output_hash,
+                    replay_output_hash=replay.record.output_hash,
+                    node_output_hash=node.output_hash,
+                    verified_reuse=True,
+                    reuse_evidence_artifact_id=reuse_evidence.artifact_id,
+                    reuse_evidence_artifact_hash=reuse_evidence.content_hash,
+                    reuse_evidence_record_hash=self._artifact_record_hash(reuse_evidence),
+                )
+            else:
+                # A same-epoch replay is an ordinary observed receipt. Keep it
+                # visible to the current closure and do not label it reuse.
+                for receipt_id in replay.record.receipt_ids:
+                    if str(receipt_id) not in self.receipts:
+                        self.receipts.append(str(receipt_id))
+                self._expected_provider_calls[call_id] = replace(
+                    self._expected_provider_calls[call_id],
+                    provider_response_hash=normalized_hash,
+                    output_hash=normalized_hash,
+                    normalized_output_hash=normalized_hash,
+                    artifact_payload_hash=hash_json(payload),
+                    artifact_content_hash=node.output_hash,
+                    registry_file_hash=record.content_hash,
+                    artifact_path=record.path,
+                    registered_artifact_hash=node.output_hash,
+                    replay_output_hash=replay.record.output_hash,
+                    node_output_hash=node.output_hash,
+                )
             self._replay_evidence.append({
                 "node_id": node_id,
                 "semantic_node_id": node_id,
@@ -1646,6 +2187,12 @@ class OutlineV3Executor:
                 "key_hash": replay_key.key_hash,
                 "lookup_status": "hit",
                 "provider_invoked": False,
+                "verified_reuse": prior_epoch_reused,
+                "reuse_evidence_artifact_id": (
+                    self._expected_provider_calls[call_id].reuse_evidence_artifact_id
+                    if prior_epoch_reused
+                    else ""
+                ),
                 "reused_artifact_ids": list(replay.record.output_artifact_ids),
                 "reused_receipt_ids": list(replay.record.receipt_ids),
                 "reused_artifact_id": str(replay.record.output_artifact_ids[0]) if replay.record.output_artifact_ids else "",
@@ -1847,20 +2394,66 @@ class OutlineV3Executor:
                 payload = replay_payload.get("payload") if isinstance(replay_payload, Mapping) else None
                 normalized_hash = replay_lookup.record.normalized_output_hash or replay_lookup.record.output_hash
                 if isinstance(payload, Mapping) and hash_json(payload) == normalized_hash:
-                    self.receipts.extend(replay_lookup.record.receipt_ids)
-                    self._expected_provider_calls[call_id] = replace(
-                        self._expected_provider_calls[call_id],
-                        provider_response_hash=normalized_hash,
-                        output_hash=normalized_hash,
-                        normalized_output_hash=normalized_hash,
-                        artifact_payload_hash=hash_json(payload),
-                        artifact_content_hash=(replay_lookup.record.registered_artifact_hash or replay_record.content_hash),
-                        registry_file_hash=replay_record.content_hash,
-                        artifact_path=replay_record.path,
-                        registered_artifact_hash=replay_lookup.record.registered_artifact_hash or replay_record.content_hash,
-                        replay_output_hash=replay_lookup.record.output_hash,
-                        node_output_hash=replay_lookup.record.node_output_hash or replay_record.content_hash,
+                    replay_receipts = self._replay_receipt_index()
+                    prior_epoch_reused = any(
+                        str(getattr(replay_receipts.get(str(receipt_id)), "closure_epoch_id", "") or "")
+                        != self.closure_epoch_id
+                        for receipt_id in replay_lookup.record.receipt_ids
+                        if str(receipt_id) in replay_receipts
                     )
+                    if prior_epoch_reused:
+                        reuse_evidence = self._materialize_verified_reuse_evidence(
+                            node_id,
+                            binding,
+                            replay_lookup.record,
+                            replay_record,
+                            payload,
+                        )
+                        if reuse_evidence is None:
+                            # A replay hit with untrusted historical authority
+                            # is a miss for execution purposes; fall through
+                            # to a real provider transport.
+                            continue
+                        expected = self._expected_provider_calls[call_id]
+                        self._expected_provider_calls[call_id] = replace(
+                            expected,
+                            provider_response_hash=normalized_hash,
+                            output_hash=normalized_hash,
+                            normalized_output_hash=normalized_hash,
+                            artifact_payload_hash=hash_json(payload),
+                            artifact_content_hash=(replay_lookup.record.registered_artifact_hash or replay_record.content_hash),
+                            registry_file_hash=replay_record.content_hash,
+                            artifact_path=replay_record.path,
+                            registered_artifact_hash=replay_lookup.record.registered_artifact_hash or replay_record.content_hash,
+                            replay_output_hash=replay_lookup.record.output_hash,
+                            node_output_hash=replay_lookup.record.node_output_hash or replay_record.content_hash,
+                            verified_reuse=True,
+                            reuse_evidence_artifact_id=reuse_evidence.artifact_id,
+                            reuse_evidence_artifact_hash=reuse_evidence.content_hash,
+                            reuse_evidence_record_hash=self._artifact_record_hash(reuse_evidence),
+                        )
+                        self._verified_reuse_source_receipt_ids[call_id] = str(
+                            replay_lookup.record.receipt_ids[0]
+                        )
+                    else:
+                        # Same-epoch replay is an observed current receipt, not
+                        # a verified-reuse exception.
+                        for receipt_id in replay_lookup.record.receipt_ids:
+                            if str(receipt_id) not in self.receipts:
+                                self.receipts.append(str(receipt_id))
+                        self._expected_provider_calls[call_id] = replace(
+                            self._expected_provider_calls[call_id],
+                            provider_response_hash=normalized_hash,
+                            output_hash=normalized_hash,
+                            normalized_output_hash=normalized_hash,
+                            artifact_payload_hash=hash_json(payload),
+                            artifact_content_hash=(replay_lookup.record.registered_artifact_hash or replay_record.content_hash),
+                            registry_file_hash=replay_record.content_hash,
+                            artifact_path=replay_record.path,
+                            registered_artifact_hash=replay_lookup.record.registered_artifact_hash or replay_record.content_hash,
+                            replay_output_hash=replay_lookup.record.output_hash,
+                            node_output_hash=replay_lookup.record.node_output_hash or replay_record.content_hash,
+                        )
                     self._replay_evidence.append({
                         "node_id": node_id,
                         "semantic_node_id": semantic_node_id,
@@ -1868,6 +2461,12 @@ class OutlineV3Executor:
                         "key_hash": replay_key.key_hash,
                         "lookup_status": "hit",
                         "provider_invoked": False,
+                        "verified_reuse": prior_epoch_reused,
+                        "reuse_evidence_artifact_id": (
+                            self._expected_provider_calls[call_id].reuse_evidence_artifact_id
+                            if prior_epoch_reused
+                            else ""
+                        ),
                         "reused_artifact_ids": list(replay_lookup.record.output_artifact_ids),
                         "reused_receipt_ids": list(replay_lookup.record.receipt_ids),
                         "reused_artifact_id": str(replay_lookup.record.output_artifact_ids[0]) if replay_lookup.record.output_artifact_ids else "",
@@ -2532,6 +3131,12 @@ class OutlineV3Executor:
                 )
 
             generation_hashes = {candidate_id: _hash_payload(self._payloads.get(f"{candidate_id}_provider_generation", {})) for candidate_id in candidate_ids}
+            generation_binding_hashes = {
+                candidate_id: self._node_execution_identity_hash(
+                    f"{candidate_id}_provider_generation"
+                )
+                for candidate_id in candidate_ids
+            }
             candidate_contents = {
                 candidate_id: {
                     "candidate_id": candidate_id,
@@ -2587,7 +3192,7 @@ class OutlineV3Executor:
             }
             for node_id, cls in (("structure_critique", StructureCritique), ("coverage_critique", CoverageCritique), ("evidence_critique", EvidenceCritique)):
                 request = critique_requests[node_id]
-                critique_deps = {"candidate_generations": _hash_payload(generation_hashes), "coverage_contract": _hash_payload(contract)}
+                critique_deps = {"candidate_generations": _hash_payload(generation_binding_hashes), "coverage_contract": _hash_payload(contract)}
                 critiques[node_id] = self._run_node(
                     node_id,
                     lambda request=request, cls=cls, node_id=node_id, critique_deps=critique_deps: self._run_provider_node(node_id, request, cls, critique_deps),
@@ -2609,9 +3214,9 @@ class OutlineV3Executor:
                 "selection_rule": "coverage_then_evidence_then_structure",
             }
             arbitration_deps = {
-                "structure_critique": _hash_payload(critiques["structure_critique"]),
-                "coverage_critique": _hash_payload(critiques["coverage_critique"]),
-                "evidence_critique": _hash_payload(critiques["evidence_critique"]),
+                "structure_critique": self._node_execution_identity_hash("structure_critique"),
+                "coverage_critique": self._node_execution_identity_hash("coverage_critique"),
+                "evidence_critique": self._node_execution_identity_hash("evidence_critique"),
             }
             arbitration = self._run_node(
                 "arbitration",
@@ -3350,14 +3955,28 @@ class OutlineV3Executor:
                 for receipt in job_receipts
                 if not str(receipt.call_id or "").startswith("outline:stability:")
             ]
-            out_of_scope_receipts = [
-                receipt for receipt in all_receipts if receipt not in current_receipts
-            ]
             canonical_expected = [
                 expected
                 for expected in self._expected_provider_calls.values()
                 if not str(expected.call_id or "").startswith("outline:stability:")
             ]
+            reuse_evidence_records = self._verify_verified_reuse_evidence(canonical_expected)
+            replay_receipts = self._replay_receipt_index()
+            reused_receipt_ids = {
+                receipt_id
+                for expected in canonical_expected
+                if expected.verified_reuse
+                for receipt_id in (self._verified_reuse_source_receipt_ids.get(expected.call_id, ""),)
+                if receipt_id in replay_receipts
+            }
+            out_of_scope_receipts = [
+                receipt for receipt in all_receipts if receipt not in current_receipts
+            ]
+            out_of_scope_receipts.extend(
+                receipt
+                for receipt_id, receipt in replay_receipts.items()
+                if receipt_id in reused_receipt_ids and receipt not in out_of_scope_receipts
+            )
             closure = ProviderReceiptClosure.evaluate(
                 canonical_expected,
                 current_receipts,
@@ -3373,19 +3992,32 @@ class OutlineV3Executor:
                 "closure_epoch_id": self.closure_epoch_id,
                 "expected_call_graph_hash": self.expected_call_graph_hash,
                 "expected_calls": [asdict(expected) for expected in canonical_expected],
+                "verified_reuse_evidence_ids": [
+                    record.artifact_id for record in reuse_evidence_records
+                ],
             }
-            closure_dependency_ids = ["provider_receipts"]
+            closure_dependency_ids: list[str] = []
+            if "provider_receipts" in self.artifact_records:
+                closure_dependency_ids.append("provider_receipts")
+            closure_dependency_ids.extend(
+                record.artifact_id for record in reuse_evidence_records
+            )
             closure_dependency_ids.extend(
                 expected.node_id
                 for expected in canonical_expected
                 if expected.node_id in self.artifact_records
             )
+            closure_dependencies = {
+                key: self.artifact_records[key].content_hash
+                for key in closure_dependency_ids
+                if key in self.artifact_records
+            }
             closure_payload = self._persist(
                 "provider_receipt_closure",
                 self._artifact(
                     ProviderReceiptClosureArtifact,
                     closure_contract,
-                    {"provider_receipts": self.artifact_records["provider_receipts"].content_hash},
+                    closure_dependencies,
                 ),
                 depends_on=tuple(dict.fromkeys(closure_dependency_ids)),
                 model="deterministic",

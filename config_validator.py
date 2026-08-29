@@ -29,6 +29,16 @@ class ConfigValidationError(Exception):
     """Raised when a configuration value violates a current contract."""
 
 
+_ANTHROPIC_EFFORT_VALUES = frozenset({
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "auto_highest",
+})
+
+
 def _normalize_config_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -103,7 +113,12 @@ def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) ->
     # An effort level the model does not accept is a rejected request, so it is
     # reported here rather than surfacing as a runtime failure far from the cause.
     model_id = _normalize_config_text(section.get("model"))
-    if reasoning_effort and capability.anthropic_effort_levels:
+    if endpoint_type == "anthropic" and reasoning_effort.casefold() not in _ANTHROPIC_EFFORT_VALUES:
+        errors.append(
+            f"[{section_name}] reasoning_effort={reasoning_effort!r} is invalid; "
+            "Anthropic effort must be low/medium/high/xhigh/max/auto_highest"
+        )
+    elif reasoning_effort and capability.anthropic_effort_levels:
         resolved = resolve_anthropic_effort(reasoning_effort, model_id)
         if resolved and resolved != reasoning_effort.lower():
             messages.append(

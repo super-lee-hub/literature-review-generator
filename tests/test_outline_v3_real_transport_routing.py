@@ -17,6 +17,8 @@ These tests close that gap:
 
 from __future__ import annotations
 
+from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -29,6 +31,7 @@ from outline.provider_router import (
     semantic_role,
 )
 from outline.v3_executor import OutlineV3Executor
+from outline.v3_models import OutlineQualityGate
 from runtime.provider_context import ProviderContextProfile
 from services.artifact_registry import ArtifactRegistry
 from services.job_workspace import JobWorkspace
@@ -100,7 +103,20 @@ class SentinelTransport:
         self.invocations.append(str(node_id))
         # Delegate to the project's configured fixture provider so the response
         # is valid for the node; only the invocation is being asserted here.
-        return _configured_test_provider(node_id, request)
+        response = dict(_configured_test_provider(node_id, request))
+        # Routed provider receipts require usage evidence for non-fixture
+        # endpoint types. The sentinel represents a successful transport, so
+        # provide deterministic usage metadata rather than testing an unrelated
+        # usage-reporting failure.
+        response.update(
+            {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "usage_status": "reported",
+            }
+        )
+        return response
 
 
 def _build_router() -> tuple[OutlineProviderRouter, dict[str, SentinelTransport]]:
@@ -300,3 +316,201 @@ def test_stability_variants_use_the_same_role_transports(tmp_path: Path) -> None
             assert semantic_role(node_id) == role, (
                 f"stability variant {node_id!r} ran on the {role} transport"
             )
+
+
+def _route_change_router(
+    base_router: OutlineProviderRouter,
+) -> tuple[OutlineProviderRouter, dict[str, SentinelTransport]]:
+    """Clone the router while changing only the evidence-critic route."""
+
+    routes: dict[str, OutlineRoleRoute] = {}
+    transports: dict[str, SentinelTransport] = {}
+    for role, route in base_router.routes.items():
+        identity = route.identity
+        api_base = route.api_base
+        profile = route.profile
+        if role == "evidence_critique":
+            identity = ("openai_responses", "gpt-5.6-sol-v2", "responses")
+            api_base = "https://ai.saigou-alt.work/v1"
+            profile = ProviderContextProfile.conservative(
+                provider=identity[0],
+                model=identity[1],
+                endpoint_type=identity[2],
+                model_context_limit=200_000,
+                max_output_tokens=8_000,
+            )
+        transport = SentinelTransport(role, identity)
+        transports[role] = transport
+        routes[role] = replace(
+            route,
+            model=identity[1],
+            provider_name=identity[0],
+            endpoint_type=identity[2],
+            profile=profile,
+            transport=transport,
+            api_base=api_base,
+        )
+    return OutlineProviderRouter(
+        routes=routes,
+        diagnostics=collect_routing_diagnostics(routes),
+    ), transports
+
+
+def _selective_replay_quality_gate() -> OutlineQualityGate:
+    # The transport/replay test intentionally uses a compact fixture with
+    # repeated paper assignments. Relax only semantic quality thresholds so the
+    # assertion reaches the current closure rather than adoption policy.
+    return OutlineQualityGate(
+        coverage_scope="full",
+        min_canonical_coverage_full=0.0,
+        min_canonical_coverage_local=0.0,
+        min_effective_sections=1,
+        max_duplicate_assignments=20,
+        block_placeholder_sections=True,
+        block_empty_research_streams=False,
+    )
+
+
+def test_route_only_change_reuses_unchanged_nodes_and_closes_current_epoch(
+    tmp_path: Path,
+) -> None:
+    """Exercise run -> replay -> Registry -> current closure end to end."""
+
+    first_router, first_transports = _build_router()
+    first = _executor(
+        tmp_path,
+        router=first_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    first_result = first.run()
+    assert first_result.ok is True, first_result
+
+    second_router, second_transports = _route_change_router(first_router)
+    second = _executor(
+        tmp_path,
+        router=second_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        logical_attempt_identity=first.logical_attempt_identity,
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    second_result = second.run()
+    assert second_result.ok is True, second_result
+
+    changed_roles = {
+        role for role, transport in second_transports.items() if transport.invocations
+    }
+    assert changed_roles == {"evidence_critique", "arbitration"}, changed_roles
+    assert all(first_transports[role].invocations for role in ROLE_MODEL)
+
+    closure_record = second.registry.get("outline-v3:provider_receipt_closure")
+    assert closure_record is not None
+    closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
+    assert closure_payload["complete"] is True, closure_payload
+    assert set(closure_payload["verified_reuse_call_ids"]) >= {
+        "outline:relation_adjudication",
+        "outline:candidate_1_provider_generation",
+        "outline:candidate_2_provider_generation",
+        "outline:structure_critique",
+        "outline:coverage_critique",
+    }
+    assert len(second._receipt_ledger.list_receipts()) == 2
+    assert all(
+        receipt.closure_epoch_id == second.closure_epoch_id
+        for receipt in second._receipt_ledger.list_receipts()
+    )
+    reuse_records = [
+        record
+        for record in second.registry.list_records()
+        if record.artifact_type == "provider_verified_reuse"
+    ]
+    assert reuse_records
+    assert all(record.status == "ready" for record in reuse_records)
+
+
+def test_tampered_prior_receipt_ledger_blocks_verified_reuse(
+    tmp_path: Path,
+) -> None:
+    """A valid-looking but Registry-tampered prior ledger is never trusted."""
+
+    first_router, _first_transports = _build_router()
+    first = _executor(
+        tmp_path,
+        router=first_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    first_result = first.run()
+    assert first_result.ok is True, first_result
+    ledger_record = first.registry.get("outline_v3_provider_receipts")
+    assert ledger_record is not None
+    ledger_path = Path(ledger_record.path)
+    ledger_path.write_bytes(ledger_path.read_bytes() + b"\n")
+
+    second_router, second_transports = _route_change_router(first_router)
+    second = _executor(
+        tmp_path,
+        router=second_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        logical_attempt_identity=first.logical_attempt_identity,
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    second_result = second.run()
+    assert second_result.ok is True, second_result
+    assert all(transport.invocations for transport in second_transports.values())
+    closure_record = second.registry.get("outline-v3:provider_receipt_closure")
+    assert closure_record is not None
+    closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
+    assert closure_payload["complete"] is True, closure_payload
+    assert closure_payload["verified_reuse_call_ids"] == []
+    assert not [
+        record
+        for record in second.registry.list_records()
+        if record.artifact_type == "provider_verified_reuse"
+    ]
+    assert any(
+        "replay receipt source rejected" in diagnostic
+        for diagnostic in second.replay_diagnostics
+    )
+
+
+def test_all_prior_epoch_reuse_closes_without_current_provider_receipts(
+    tmp_path: Path,
+) -> None:
+    """A fully replayed new epoch must still produce a complete closure."""
+
+    first_router, first_transports = _build_router()
+    first = _executor(
+        tmp_path,
+        router=first_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    assert first.run().ok is True
+
+    second_router, second_transports = _build_router()
+    second = _executor(
+        tmp_path,
+        router=second_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        logical_attempt_identity=f"{first.logical_attempt_identity}:new-epoch",
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    result = second.run()
+    assert result.ok is True, result
+    assert all(first_transports[role].invocations for role in ROLE_MODEL)
+    assert all(not transport.invocations for transport in second_transports.values())
+    assert second._receipt_ledger.list_receipts() == ()
+
+    closure_record = second.registry.get("outline-v3:provider_receipt_closure")
+    assert closure_record is not None
+    closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
+    assert closure_payload["complete"] is True, closure_payload
+    assert len(closure_payload["verified_reuse_call_ids"]) == len(ROLE_MODEL) + 1
+    assert closure_payload["observed_call_ids"] == []
