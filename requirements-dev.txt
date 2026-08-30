@@ -1,9 +1,9 @@
 -r requirements.txt
 
 # Testing and development
-pytest
+pytest==9.1.1
 pytest-mock
-pyright
+pyright==1.1.411
 
 # Optional GUI end-to-end tests
 playwright

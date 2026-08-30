@@ -22,7 +22,12 @@ specification 是 `RuntimeJobSpec`。
 ## 当前契约
 
 - Outline Intelligence v3 是唯一生产 Outline 路径。
+- Outline v3 按 `[OutlineModels]` 做真实的节点级路由：Claude Opus 5 负责候选生成/最终
+  仲裁，GPT-5.6-sol 负责结构/证据审查，DeepSeek V4 Pro 负责关系/覆盖度审查；每条
+  route 都有自己的 transport、budget、binding、receipt 和 replay identity，缺失时
+  fail-closed。
 - Stage 3 输出 `review_draft` artifact version v3、`citation_manifest` v3 和 DOCX。
+  Review 是阶段契约，`Writer_API` 是阶段内部按 section 调用的 provider，不是另一个阶段。
 - Validation 使用 `ValidationExecutionService`、`current_validation`、
   `adjudication_reuse` 和 Registry-backed `closure` 证据。
 - Free Mode 使用 `free_mode_intent_input/v1`、`ReviewIntent` projection 和

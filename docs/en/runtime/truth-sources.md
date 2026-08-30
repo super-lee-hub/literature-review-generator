@@ -204,6 +204,12 @@ unaffected upstream nodes. A final outline is adoptable only after the
 coverage, quality, stability, stage-health, identity, and canonical-completion
 gates pass; adoption writes a versioned identity and a current-pointer record.
 
+The shipped route map is deliberately heterogeneous: Claude Opus 5 handles
+candidate generation and arbitration, GPT-5.6-sol handles structure/evidence
+critique, and DeepSeek V4 Pro handles relation/coverage critique. Each node's
+binding and receipt records a secret-free provider/model/endpoint identity; a
+third-party gateway is not treated as proof of official upstream access.
+
 The stability policy is explicit: `off`, `smoke` (the default), or `full`.
 Smoke executes one additional full reversed-summary decision chain plus exact
 replay; full executes the comprehensive release/audit matrix. Stability writes

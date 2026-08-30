@@ -41,6 +41,7 @@ Outline Intelligence v3 only
 
 Stage 3:
 services/review_generation_service.py
+  -> Writer_API, one provider call per adopted outline section
   -> review_draft artifact_version=v3
   -> citation_manifest v3
   -> DOCX
@@ -61,6 +62,19 @@ services/job_workspace.py + services/artifact_registry.py
 Stage 1 identity, artifact dependencies, provider receipt closure, queue
 fencing, validation adjudication authority, and publication boundaries are
 semantic runtime contracts. Documentation changes must not weaken them.
+
+Stage 3 Review is the stage contract; Writer is the configured generation
+provider inside that stage. They are not separate pipeline stages. The Writer
+receives each evidence-bound adopted outline section, emits structured blocks
+with citation tokens, and the bridge assembles those calls into the canonical
+review draft, citation manifest, and DOCX.
+
+Outline v3 role routing is resolved by `outline/provider_router.py`: Claude Opus
+5 handles candidate generation and arbitration through the configured native
+Anthropic-shaped route, GPT-5.6-sol handles structure/evidence critique through
+the configured Responses route, and DeepSeek V4 Pro handles relation/coverage
+critique through the DeepSeek route. The configured gateway host is recorded as
+transport identity; it is not evidence of an official upstream connection.
 
 ## Where to look
 

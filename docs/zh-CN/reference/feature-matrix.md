@@ -8,6 +8,8 @@ committed-range whitespace gates。
 | 能力 | 当前状态 | 边界 |
 | --- | --- | --- |
 | Outline Intelligence v3 | `E2E_VERIFIED` | 唯一当前生产 Outline 路径 |
+| Outline 角色化多 provider transport | `OFFLINE_VERIFIED` | offline/fake transport 与 receipt closure 已验证；live provider `NOT VERIFIED` |
+| 原生 Anthropic Messages transport | `OFFLINE_VERIFIED` | 协议与 stop fail-closed 已离线验证；live API `NOT VERIFIED` |
 | Free Mode typed intent | `E2E_VERIFIED` | `free_mode_intent_input/v1` |
 | Free Mode -> ReviewIntent | `E2E_VERIFIED` | literal idea projection 与 writer binding |
 | Free Mode Writer replay binding | `E2E_VERIFIED` | replay 时保持 context 与 identity 绑定 |
@@ -16,7 +18,7 @@ committed-range whitespace gates。
 | Validation adjudication single-flight | `E2E_VERIFIED` | 仅声明 single-host 范围 |
 | Registry-backed durable adjudication reuse | `E2E_VERIFIED` | provisional 与 durable closure-bound authority |
 | `reviewctl` control plane | `E2E_VERIFIED` | `RuntimeJobSpec` -> `AgentRuntimeRunner` |
-| Stage 3 review contract | `E2E_VERIFIED` | `review_draft` v3、`citation_manifest` v3、DOCX |
+| Stage 3 Review / Writer 契约 | `E2E_VERIFIED` | 一个 Review 阶段；`Writer_API` 按 adopted section 调用并产出 `review_draft` v3、`citation_manifest` v3、DOCX |
 | Queue fencing/publication | `E2E_VERIFIED` | 当前 lease 与 Registry boundary |
 | JobOutcome / CurrentArtifactSet | `E2E_VERIFIED` | Registry-backed canonical authority |
 | Repair/promotion 与 export admission | `E2E_VERIFIED` | 当前 transaction 与 dependency gates |

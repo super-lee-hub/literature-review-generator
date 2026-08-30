@@ -1096,6 +1096,57 @@ class ArtifactRegistry:
                 owner_record=owner_record,
             )
 
+    def verify_ready_artifact_closure(
+        self,
+        root: ArtifactRecord | ArtifactDependencyRefV2 | Mapping[str, Any],
+        *,
+        external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
+    ) -> ArtifactRecord:
+        """Verify one ready artifact and its complete dependency closure.
+
+        ``verify_ready_dependencies`` is intentionally a shallow normalizer for
+        callers that only need to validate explicit dependency references.  A
+        replay or publication authority must use this method instead: it reads
+        the latest durable Registry snapshot under the transaction lock, binds
+        the supplied root identity to that snapshot, then recursively verifies
+        every local and external dependency, including cycles.
+        """
+
+        if isinstance(root, ArtifactRecord):
+            root_ref = ArtifactDependencyRefV2.from_record(root)
+        elif isinstance(root, ArtifactDependencyRefV2):
+            root_ref = ArtifactDependencyRefV2.from_dict(root.to_dict())
+        elif isinstance(root, Mapping):
+            root_ref = ArtifactDependencyRefV2.from_dict(root)
+        else:
+            raise TypeError(f"unsupported artifact closure root: {type(root).__name__}")
+        if root_ref.dependency_kind != "local_job":
+            raise UnverifiedDependency(
+                "artifact closure root must be local to this Registry: "
+                f"{root_ref.job_id}/{root_ref.artifact_id}"
+            )
+
+        with self._transaction_lock():
+            _revision, artifacts = self._read_registry_unlocked()
+            normalized_root = self._verify_ready_dependency(
+                root_ref,
+                artifacts=artifacts,
+                owner_job_id=self.job_id,
+                external_registry_resolver=external_registry_resolver,
+            )
+            target = artifacts.get(normalized_root.artifact_id)
+            if target is None:
+                raise UnverifiedDependency(
+                    f"dependency is not registered: {self.job_id}/{normalized_root.artifact_id}"
+                )
+            self._verify_ready_dependency_closure(
+                target,
+                artifacts=artifacts,
+                external_registry_resolver=external_registry_resolver,
+                dependency_stack=set(),
+            )
+            return self._copy_record(target)
+
     def register_file(
         self,
         *,

@@ -10,7 +10,12 @@ from typing import Any, Dict, List, Tuple
 
 import requests  # type: ignore
 
-from services.model_capabilities import resolve_model_capability
+from services.model_capabilities import (
+    DEFAULT_ANTHROPIC_VERSION,
+    resolve_anthropic_effort,
+    resolve_anthropic_messages_url,
+    resolve_model_capability,
+)
 from services.proxy_policy import should_bypass_environment_proxy
 from services.repair_policy import parse_repair_policy
 from services.config_values import (
@@ -24,14 +29,33 @@ class ConfigValidationError(Exception):
     """Raised when a configuration value violates a current contract."""
 
 
+_ANTHROPIC_EFFORT_VALUES = frozenset({
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "auto_highest",
+})
+
+
 def _normalize_config_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) -> List[str]:
-    """Validate provider/endpoint/reasoning fields that shape request payloads."""
+def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Validate provider/endpoint/reasoning fields that shape request payloads.
+
+    Returns ``(errors, warnings)``. An impossible transport combination is an
+    error, not a warning: the request cannot be built at all, so reporting it as
+    an advisory would let ``doctor`` look green while the section is unusable.
+    Reasoning fields that merely degrade -- an effort level that gets clamped, a
+    budget token that no longer applies -- stay warnings, because the transport
+    still produces a valid request.
+    """
 
     messages: List[str] = []
+    errors: List[str] = []
     provider_family = _normalize_config_text(section.get("provider_family")).replace("-", "_").lower()
     endpoint_type = _normalize_config_text(section.get("endpoint_type")).replace("-", "_").lower()
     api_base = _normalize_config_text(section.get("api_base")).lower()
@@ -44,17 +68,25 @@ def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) ->
         "claude_chat_reasoning",
         "aihubmix_openai",
         "aihubmix_claude",
+        "anthropic",
         "deepseek",
         "generic",
     }
     if provider_family and provider_family not in known_families:
-        messages.append(f"[{section_name}] provider_family={provider_family!r} is not supported")
-    if endpoint_type and endpoint_type not in {"chat_completions", "responses", "response"}:
-        messages.append(f"[{section_name}] endpoint_type={endpoint_type!r} is not supported")
+        errors.append(f"[{section_name}] provider_family={provider_family!r} is not supported")
+    if endpoint_type and endpoint_type not in {"chat_completions", "responses", "response", "anthropic"}:
+        errors.append(f"[{section_name}] endpoint_type={endpoint_type!r} is not supported")
     if provider_family in {"aihubmix_openai", "openai_responses"} and endpoint_type not in {"", "responses", "response"}:
-        messages.append(f"[{section_name}] the selected provider family requires endpoint_type=responses")
+        errors.append(f"[{section_name}] the selected provider family requires endpoint_type=responses")
     if provider_family in {"claude_chat_reasoning", "aihubmix_claude", "deepseek"} and endpoint_type not in {"", "chat_completions"}:
-        messages.append(f"[{section_name}] the selected provider family requires endpoint_type=chat_completions")
+        errors.append(f"[{section_name}] the selected provider family requires endpoint_type=chat_completions")
+    # Anthropic Messages is a different wire contract from both OpenAI
+    # protocols, so the pairing is checked in both directions. A half-configured
+    # section would otherwise be silently routed down the wrong transport.
+    if provider_family == "anthropic" and endpoint_type not in {"", "anthropic"}:
+        errors.append(f"[{section_name}] provider_family=anthropic requires endpoint_type=anthropic")
+    if endpoint_type == "anthropic" and provider_family not in {"", "anthropic"}:
+        errors.append(f"[{section_name}] endpoint_type=anthropic requires provider_family=anthropic")
     if provider_family == "deepseek" and api_base and "deepseek" not in api_base:
         messages.append(f"[{section_name}] provider_family=deepseek should use a DeepSeek api_base")
     if provider_family.startswith("aihubmix") and api_base and "aihubmix" not in api_base:
@@ -65,9 +97,35 @@ def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) ->
         messages.append(f"[{section_name}] reasoning fields are set but the selected model does not support reasoning")
     if reasoning_display and capability.reasoning_param_style != "chat_reasoning":
         messages.append(f"[{section_name}] reasoning_display is only valid for chat reasoning providers")
-    if thinking and capability.reasoning_param_style != "deepseek_thinking":
-        messages.append(f"[{section_name}] thinking is only valid for DeepSeek reasoning")
-    return messages
+    # Anthropic exposes thinking through the same key, but the mode differs by
+    # model generation; DeepSeek is no longer the only valid style.
+    if thinking and capability.reasoning_param_style not in {"deepseek_thinking", "anthropic_thinking"}:
+        messages.append(
+            f"[{section_name}] thinking is only valid for DeepSeek reasoning or the "
+            "Anthropic Messages transport"
+        )
+    if _normalize_config_text(section.get("thinking_budget_tokens")) and capability.anthropic_thinking_mode != "manual":
+        messages.append(
+            f"[{section_name}] thinking_budget_tokens applies only to manual extended "
+            "thinking (Claude 4.5 and earlier); on adaptive models depth is controlled "
+            "by reasoning_effort instead"
+        )
+    # An effort level the model does not accept is a rejected request, so it is
+    # reported here rather than surfacing as a runtime failure far from the cause.
+    model_id = _normalize_config_text(section.get("model"))
+    if endpoint_type == "anthropic" and reasoning_effort and reasoning_effort.casefold() not in _ANTHROPIC_EFFORT_VALUES:
+        errors.append(
+            f"[{section_name}] reasoning_effort={reasoning_effort!r} is invalid; "
+            "Anthropic effort must be low/medium/high/xhigh/max/auto_highest"
+        )
+    elif reasoning_effort and capability.anthropic_effort_levels:
+        resolved = resolve_anthropic_effort(reasoning_effort, model_id)
+        if resolved and resolved != reasoning_effort.lower():
+            messages.append(
+                f"[{section_name}] reasoning_effort={reasoning_effort!r} is not supported by "
+                f"this model and will be reduced to {resolved!r}"
+            )
+    return errors, messages
 
 
 def validate_file_path(path: str, allow_empty: bool = False) -> Tuple[bool, str]:
@@ -179,7 +237,10 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_api_key(str(config_dict[section_name]["api_key"]), allow_empty=True)
         if not valid:
             messages.append(f"[{section_name}] {error}")
-        messages.extend(_validate_api_transport_combo(section_name, config_dict[section_name]))
+        combo_errors, combo_warnings = _validate_api_transport_combo(section_name, config_dict[section_name])
+        if combo_errors:
+            return False, combo_errors
+        messages.extend(combo_warnings)
         valid, error = validate_url(str(config_dict[section_name]["api_base"]), allow_empty=True)
         if not valid:
             messages.append(f"[{section_name}] {error}")
@@ -193,7 +254,10 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_config_section(config_dict, section_name, ["api_key", "model", "api_base"])
         if not valid:
             return False, [error]
-        messages.extend(_validate_api_transport_combo(section_name, section))
+        combo_errors, combo_warnings = _validate_api_transport_combo(section_name, section)
+        if combo_errors:
+            return False, combo_errors
+        messages.extend(combo_warnings)
         valid, error = validate_url(str(section["api_base"]), allow_empty=True)
         if not valid:
             messages.append(f"[{section_name}] {error}")
@@ -257,16 +321,72 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
     outline_errors = settings.validate_outline_config()
     if outline_errors:
         return False, outline_errors
+    # A critique that shares the generator's identity is legal but must never be
+    # invisible, so it is surfaced as a warning rather than silently accepted.
+    messages.extend(settings.outline_routing_diagnostics())
     preprocess = config_dict.get("Preprocess", {})
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]
     return True, messages
 
 
-def test_api_connection(api_key: str, api_base: str, model: str, proxy_mode: str = "environment") -> Tuple[bool, str]:
-    """Probe a provider model list without exposing credentials in errors."""
+def test_api_connection(
+    api_key: str,
+    api_base: str,
+    model: str,
+    proxy_mode: str = "environment",
+    *,
+    provider_family: str = "",
+    endpoint_type: str = "",
+    anthropic_path: str = "",
+    anthropic_version: str = "",
+) -> Tuple[bool, str]:
+    """Probe the configured wire protocol without exposing credentials.
+
+    OpenAI-compatible providers expose a model-list endpoint. Native Anthropic
+    Messages providers are probed with a one-token request instead: the native
+    endpoint is the meaningful connectivity check, and it must use
+    ``x-api-key`` plus ``anthropic-version`` rather than an OpenAI Bearer
+    header.
+    """
 
     base = api_base.rstrip("/")
+    normalized_endpoint = _normalize_config_text(endpoint_type).replace("-", "_").casefold()
+    normalized_family = _normalize_config_text(provider_family).replace("-", "_").casefold()
+
+    if normalized_endpoint == "anthropic" or normalized_family == "anthropic":
+        # Same resolver the runtime uses. A probe that builds its own URL can
+        # pass while the real request 400s on a duplicated /v1, which is the
+        # most misleading failure this validator could produce.
+        url = resolve_anthropic_messages_url(base, _normalize_config_text(anthropic_path))
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": _normalize_config_text(anthropic_version) or DEFAULT_ANTHROPIC_VERSION,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        try:
+            if should_bypass_environment_proxy({"proxy_mode": proxy_mode}):
+                with requests.Session() as session:
+                    session.trust_env = False
+                    response = session.post(url, headers=headers, json=payload, timeout=10)
+            else:
+                response = requests.post(url, headers=headers, json=payload, timeout=10)
+            if response.status_code == 200:
+                return True, f"Anthropic API 连通成功，模型'{model}'可用"
+            return False, f"Anthropic API请求失败：HTTP {response.status_code}"
+        except requests.exceptions.Timeout:
+            return False, "连接超时：API服务器响应时间过长"
+        except requests.exceptions.RequestException:
+            # Do not echo the exception: a malformed endpoint may contain
+            # userinfo/query material, and request libraries include the URL in
+            # their error text. Credentials must never reach UI/log output.
+            return False, "请求异常：无法连接 Anthropic API 服务器"
+
     base = re.sub(r"/chat/completions/?$", "", base, flags=re.IGNORECASE)
     base = re.sub(r"/v1/chat/completions/?$", "/v1", base, flags=re.IGNORECASE)
     base = re.sub(r"/models/?$", "", base, flags=re.IGNORECASE)
@@ -294,8 +414,10 @@ def test_api_connection(api_key: str, api_base: str, model: str, proxy_mode: str
         return False, f"模型不可用：指定模型'{model}'不存在或无权访问"
     except requests.exceptions.Timeout:
         return False, "连接超时：API服务器响应时间过长"
-    except requests.exceptions.RequestException as exc:
-        return False, f"请求异常：{exc}"
+    except requests.exceptions.RequestException:
+        # Keep provider errors safe even when an endpoint was entered with
+        # credential-shaped URL material.
+        return False, "请求异常：无法连接 API 服务器"
 
 
 def validate_zotero_library_path(library_path: str) -> Tuple[bool, str]:

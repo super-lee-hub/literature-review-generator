@@ -1,14 +1,15 @@
 import pytest
 
-from config_validator import validate_all_config
+from config_validator import test_api_connection as probe_api_connection, validate_all_config
 from services.config_values import StrictConfigValueError
+from services.configuration_service import default_config_sections
 from services.settings import ApplicationSettings
 
 
 def _base_config():
-    return {
-        "Paths": {"output_path": "./output"},
-        "Primary_Reader_API": {
+    config = default_config_sections()
+    config["Paths"].update({"output_path": "./output"})
+    config["Primary_Reader_API"].update({
             "api_key": "sk-primary",
             "model": "deepseek-v4-pro",
             "api_base": "https://api.deepseek.com",
@@ -16,20 +17,66 @@ def _base_config():
             "provider_family": "deepseek",
             "thinking": "enabled",
             "reasoning_effort": "max",
-        },
-        "Backup_Reader_API": {
+        })
+    config["Backup_Reader_API"].update({
             "api_key": "sk-backup",
             "model": "gemini-2.5-pro",
             "api_base": "https://api.videocaptioner.cn/v1",
-        },
-        "Writer_API": {
+            "provider_family": "generic",
+            "endpoint_type": "chat_completions",
+            "thinking": "",
+            "reasoning_effort": "",
+        })
+    config["Writer_API"].update({
             "api_key": "sk-writer",
             "model": "gpt-5.5",
             "api_base": "https://aihubmix.com/v1",
             "endpoint_type": "responses",
             "provider_family": "aihubmix_openai",
             "reasoning_effort": "high",
-        },
+        })
+    for section_name, api_key in (
+        ("Outline_API", "sk-outline"),
+        ("Free_Mode_API", "sk-free"),
+        ("Validator_API", "sk-validator"),
+    ):
+        config[section_name]["api_key"] = api_key
+    return config
+
+
+def test_anthropic_connection_uses_native_messages_headers_and_path(monkeypatch):
+    calls = {}
+
+    class Response:
+        status_code = 200
+
+    def fake_post(url, *, headers, json, timeout):
+        calls.update(url=url, headers=headers, json=json, timeout=timeout)
+        return Response()
+
+    monkeypatch.setattr("config_validator.requests.post", fake_post)
+    monkeypatch.setattr("config_validator.should_bypass_environment_proxy", lambda _config: False)
+
+    ok, message = probe_api_connection(
+        "anthropic-secret",
+        "https://chat.example.test",
+        "claude-opus-5",
+        provider_family="anthropic",
+        endpoint_type="anthropic",
+        anthropic_path="/v1/messages",
+        anthropic_version="2023-06-01",
+    )
+
+    assert ok is True
+    assert "Anthropic API" in message
+    assert calls["url"] == "https://chat.example.test/v1/messages"
+    assert calls["headers"]["x-api-key"] == "anthropic-secret"
+    assert calls["headers"]["anthropic-version"] == "2023-06-01"
+    assert "Authorization" not in calls["headers"]
+    assert calls["json"] == {
+        "model": "claude-opus-5",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
     }
 
 
@@ -40,14 +87,146 @@ def test_validate_all_config_accepts_default_reasoning_transport_combo():
     assert not any("provider_family" in warning or "endpoint_type" in warning for warning in warnings)
 
 
-def test_validate_all_config_warns_for_mismatched_provider_endpoint_combo():
+def _anthropic_outline(config):
+    """Point [Outline_API] at a native Anthropic Messages endpoint."""
+
+    config.setdefault("Outline_API", {}).update(
+        {
+            "api_key": "sk-anthropic",
+            "model": "claude-opus-5",
+            "api_base": "https://chat.178266.xyz",
+            "endpoint_type": "anthropic",
+            "provider_family": "anthropic",
+        }
+    )
+    return config
+
+
+def test_validate_all_config_accepts_native_anthropic_combo():
+    """provider_family=anthropic + endpoint_type=anthropic is a real, supported pair."""
+
+    config = _anthropic_outline(_base_config())
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert not any("anthropic" in message for message in messages), messages
+
+
+@pytest.mark.parametrize("effort", [None, ""])
+def test_validate_all_config_accepts_unconfigured_anthropic_effort(effort):
+    config = _anthropic_outline(_base_config())
+    if effort is None:
+        config["Outline_API"].pop("reasoning_effort", None)
+    else:
+        config["Outline_API"]["reasoning_effort"] = effort
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert not any("reasoning_effort" in message and "invalid" in message for message in messages), messages
+
+
+def test_validate_all_config_rejects_half_configured_anthropic():
+    """Either half alone is impossible: the transport cannot be built."""
+
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["endpoint_type"] = "responses"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any("requires endpoint_type=anthropic" in message for message in messages)
+
+
+def test_validate_all_config_rejects_anthropic_endpoint_without_the_family():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["provider_family"] = "deepseek"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any("requires provider_family=anthropic" in message for message in messages)
+
+
+def test_thinking_is_accepted_on_the_anthropic_transport():
+    """It used to be rejected as 'only valid for DeepSeek reasoning'."""
+
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["thinking"] = "enabled"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert not any("thinking is only valid" in message for message in messages), messages
+
+
+def test_thinking_budget_tokens_warns_on_adaptive_models():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["thinking_budget_tokens"] = "4096"
+
+    valid, messages = validate_all_config(config)
+
+    # A warning, not an error: budget_tokens is simply ignored on adaptive models.
+    assert valid is True
+    assert any("thinking_budget_tokens" in message for message in messages)
+
+
+def test_unsupported_effort_level_is_reported():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["model"] = "claude-opus-4-5-20251101"
+    config["Outline_API"]["reasoning_effort"] = "xhigh"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert any("will be reduced to" in message for message in messages), messages
+
+
+def test_invalid_anthropic_effort_typo_is_an_error():
+    config = _anthropic_outline(_base_config())
+    config["Outline_API"]["reasoning_effort"] = "hihg"
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any("reasoning_effort" in message and "invalid" in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_fragment"),
+    [
+        (lambda config: config.pop("Outline_API"), "Outline_API"),
+        (lambda config: config["Outline_API"].update(model=""), "model"),
+        (lambda config: config["Outline_API"].update(api_base=""), "api_base"),
+        (lambda config: config["Outline_API"].pop("endpoint_type"), "endpoint_type"),
+    ],
+    ids=("missing-section", "missing-model", "missing-base", "missing-endpoint"),
+)
+def test_current_config_rejects_incomplete_routed_outline_section(mutation, expected_fragment):
+    config = _base_config()
+    mutation(config)
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is False
+    assert any(expected_fragment in message for message in messages), messages
+
+
+def test_validate_all_config_rejects_mismatched_provider_endpoint_combo():
+    """An impossible transport combination is an error, not an advisory.
+
+    Previously this only produced a warning while ``valid`` stayed True, so
+    ``doctor`` looked green on a section that cannot build a request.
+    """
+
     config = _base_config()
     config["Writer_API"]["endpoint_type"] = "chat_completions"
 
-    valid, warnings = validate_all_config(config)
+    valid, messages = validate_all_config(config)
 
-    assert valid is True
-    assert any("selected provider family requires endpoint_type=responses" in warning for warning in warnings)
+    assert valid is False
+    assert any("selected provider family requires endpoint_type=responses" in message for message in messages)
 
 
 def test_validate_all_config_accepts_custom_openai_responses_provider():

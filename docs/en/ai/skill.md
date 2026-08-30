@@ -22,7 +22,13 @@ uses it; `RuntimeJobSpec` is the public durable run specification.
 ## Current contracts
 
 - Outline Intelligence v3 is the only production Outline path.
+- Outline v3 routes candidate generation/arbitration to Claude Opus 5,
+  structure/evidence critique to GPT-5.6-sol, and relation/coverage critique to
+  DeepSeek V4 Pro according to `[OutlineModels]`; each route has its own
+  transport, budget, binding, receipt, and replay identity.
 - Stage 3 emits `review_draft` artifact version v3 and `citation_manifest` v3.
+  Review is the stage contract; `Writer_API` is the per-section provider inside
+  that stage, not a separate stage.
 - Validation uses `ValidationExecutionService`, `current_validation`,
   `adjudication_reuse`, and Registry-backed `closure` evidence.
 - Free Mode uses `free_mode_intent_input/v1`, the `ReviewIntent` projection,

@@ -34,8 +34,9 @@ from validation.execution_service import ValidationExecutionService
 from validation.repair_transaction import RepairPromotionTransaction, current_artifact_record
 from outline.v3_executor import OutlineV3Executor
 from outline.adoption_transaction import current_adoption_record
+from outline.provider_router import OutlineRoleRoute, build_outline_provider_router
 from services.model_capabilities import resolve_model_capability
-from services.model_selection import get_outline_api_config
+from services.model_selection import get_api_config_for_section
 from services.settings import ApplicationSettings
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -778,6 +779,18 @@ class InternalStageExecutorRegistry:
             return default
         return parsed if parsed > 0 else default
 
+    @staticmethod
+    def _nonnegative_int(value: Any, default: int) -> int:
+        """Read an optional budget knob while preserving an explicit zero."""
+
+        if value is None or str(value).strip() == "":
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= 0 else default
+
     def _outline_provider(
         self,
         session: AgentRuntimeSession,
@@ -801,6 +814,54 @@ class InternalStageExecutorRegistry:
 
         return call
 
+    def _outline_route_for_section(
+        self,
+        *,
+        session: AgentRuntimeSession,
+        role: str,
+        section_name: str,
+    ) -> OutlineRoleRoute | None:
+        """Resolve one ``[OutlineModels]`` role to its own provider route.
+
+        Returns ``None`` when the selected section cannot produce a usable
+        route, which the router records as a diagnostic instead of silently
+        substituting the Outline provider.
+        """
+
+        api_config = get_api_config_for_section(dict(session.stage_host.config), section_name)
+        model = str(api_config.get("model") or "").strip()
+        if not model:
+            return None
+        capability = resolve_model_capability(api_config)
+        model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
+        max_output_tokens = self._positive_int(api_config.get("max_output_tokens"), 4_096)
+        profile = ProviderContextProfile.conservative(
+            provider=capability.provider_family,
+            model=model,
+            endpoint_type=capability.endpoint_type,
+            model_context_limit=model_context_limit,
+            max_output_tokens=max_output_tokens,
+            # Admission knobs are read from the role's own section. Left to the
+            # conservative defaults, every role would silently inherit the
+            # Outline model's headroom, which is wrong for a cheaper critic or a
+            # larger-context generator.
+            reasoning_reserve=self._nonnegative_int(api_config.get("reasoning_reserve_tokens"), 2_048),
+            safety_margin=self._nonnegative_int(api_config.get("safety_margin_tokens"), 1_024),
+        )
+        return OutlineRoleRoute(
+            role=role,
+            config_section=str(section_name).strip(),
+            provider_name=capability.provider_family,
+            model=model,
+            endpoint_type=capability.endpoint_type,
+            profile=profile,
+            transport=self._outline_provider(session, profile, api_config),
+            # The route stores only an allow-listed, secret-free identity. The
+            # closure still retains the private config for the actual transport.
+            api_base=str(api_config.get("api_base") or "").strip(),
+            config_identity=dict(api_config),
+        )
+
     def _execute_outline(
         self,
         *,
@@ -812,9 +873,19 @@ class InternalStageExecutorRegistry:
             raise RuntimeError("Outline v3 requires a canonical Stage 1 summary source")
 
         settings = session.context.settings
-        route_name = settings.outline_model()
-        api_config = get_outline_api_config(dict(session.stage_host.config))
-        model = str(api_config.get("model") or route_name or "outline-v3")
+        route_name = str(settings.outline_model() or "").strip() or "Outline_API"
+        # Resolve the section the generator role actually names. The stage-level
+        # provider used to come from get_outline_api_config(), which silently
+        # fell back to [Writer_API]; under role routing that produced a
+        # stage provider inconsistent with the [OutlineModels] route table.
+        api_config = get_api_config_for_section(dict(session.stage_host.config), route_name)
+        model = str(api_config.get("model") or "").strip()
+        if not model:
+            raise RuntimeError(
+                f"Outline v3 requires a complete [{route_name}] section: it needs its own "
+                "api_key, model, api_base, endpoint_type and provider_family. Routed API "
+                "sections are no longer completed by inheriting part of another provider."
+            )
         capability = resolve_model_capability(api_config)
         model_context_limit = self._positive_int(api_config.get("max_context_tokens"), 128_000)
         max_output_tokens = self._positive_int(
@@ -829,6 +900,15 @@ class InternalStageExecutorRegistry:
             max_output_tokens=max_output_tokens,
         )
         provider = self._outline_provider(session, profile, api_config)
+        provider_router = build_outline_provider_router(
+            settings=settings,
+            config=dict(session.stage_host.config),
+            route_resolver=lambda role, section: self._outline_route_for_section(
+                session=session, role=role, section_name=section
+            ),
+        )
+        for diagnostic in provider_router.diagnostics:
+            session.stage_host.logger.warning("outline routing: %s", diagnostic)
         stability = settings.outline_stability_settings()
         free_mode_review_intent: Mapping[str, Any] | None = None
         if self.bridge.free_mode_envelope is not None:
@@ -841,6 +921,7 @@ class InternalStageExecutorRegistry:
             artifact_registry=session.context.registry,
             provider=provider,
             provider_profile=profile,
+            provider_router=provider_router,
             candidate_count=settings.outline_candidate_count(),
             quality_gate=settings.outline_quality_gate(),
             review_intent=free_mode_review_intent,

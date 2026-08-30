@@ -20,6 +20,15 @@ class ProviderCompletion:
 class ProviderCompletionEvaluator:
     """Normalize transport responses before they can be treated as success."""
 
+    # finish_reason -> completion status. These map onto each other one-to-one
+    # and are deliberately Anthropic-specific strings, so adding them cannot
+    # change how an OpenAI-shaped response is judged.
+    NON_TERMINAL_FINISH_REASONS: dict[str, str] = {
+        "refusal": "refused",
+        "incomplete_continuation": "incomplete_continuation",
+        "anthropic_tool_use": "unsupported_tool_use",
+    }
+
     @classmethod
     def evaluate(
         cls,
@@ -40,6 +49,18 @@ class ProviderCompletionEvaluator:
             return ProviderCompletion("transport_failed", content, str(response.get("error_kind") or "transient_network"), finish_reason, incomplete_reason, str(response.get("message") or ""))
         if finish_reason == "length":
             return ProviderCompletion("incomplete_length", content, "invalid_response", finish_reason, incomplete_reason)
+        if finish_reason in cls.NON_TERMINAL_FINISH_REASONS:
+            # Non-terminal finishes that still carry content. Adopting one of
+            # these as a finished artifact would publish a truncated outline or a
+            # refusal as though it were a complete result, so content presence
+            # is not allowed to override this check.
+            return ProviderCompletion(
+                cls.NON_TERMINAL_FINISH_REASONS[finish_reason],
+                content,
+                "invalid_response",
+                finish_reason,
+                incomplete_reason,
+            )
         if incomplete_reason or response_status == "incomplete":
             return ProviderCompletion("incomplete_reasoning_budget", content, "invalid_response", finish_reason, incomplete_reason)
         if content is None or (isinstance(content, str) and not content.strip()):

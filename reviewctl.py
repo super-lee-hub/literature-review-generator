@@ -126,6 +126,52 @@ def _queue_command(args: argparse.Namespace) -> dict[str, Any]:
     raise ControlPlaneError(f"unsupported queue command: {command}")
 
 
+def _config_migrate_command(args: argparse.Namespace) -> dict[str, Any]:
+    """Explicitly migrate a legacy config file onto the current schema.
+
+    The runtime loader is fail-closed: it rejects unknown keys and sections
+    before any legacy handling could run, so this step has to happen before
+    validation. It is deliberately *not* run implicitly on every invocation --
+    silently rewriting a user's config in the background would be worse than
+    refusing to start.
+    """
+
+    from services.config_migration import migrate_config_file, migrate_config_text
+
+    path = Path(args.migrate_config)
+    if not path.exists():
+        return {"status": "failed", "error": f"config file not found: {path}"}
+
+    if args.dry_run:
+        # Nothing is written, so the pure transform is enough.
+        _migrated, report = migrate_config_text(
+            path.read_text(encoding="utf-8"),
+            unknown_legacy="drop" if args.drop_unknown_legacy else "preserve",
+        )
+        backups: list[str] = []
+    else:
+        report = migrate_config_file(
+            path,
+            backup=not args.no_backup,
+            drop_unknown_legacy=bool(args.drop_unknown_legacy),
+        )
+        backups = [
+            change.split(" ", 2)[-1]
+            for change in report.changes
+            if change.startswith("wrote backup ")
+        ]
+
+    return {
+        "status": "ok",
+        "config": str(path),
+        "changed": report.changed,
+        "dry_run": bool(args.dry_run),
+        "backup": backups[-1] if backups else None,
+        "changes": report.changes,
+        "warnings": report.warnings,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="reviewctl")
     parser.add_argument("--repo-root", default="")
@@ -136,6 +182,17 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--workspace", default="")
     doctor.add_argument("--repo-root", dest="doctor_repo_root", default="")
     doctor.add_argument("--config", dest="doctor_config", default="")
+
+    config_migrate = subparsers.add_parser("config-migrate")
+    config_migrate.add_argument("--config", dest="migrate_config", required=True)
+    config_migrate.add_argument("--dry-run", action="store_true")
+    config_migrate.add_argument("--no-backup", action="store_true")
+    config_migrate.add_argument(
+        "--drop-unknown-legacy",
+        action="store_true",
+        help="Discard [API_Parameters] keys with no home in the current schema "
+        "(default: preserve them in a marked legacy block)",
+    )
 
     plan = subparsers.add_parser("plan")
     plan.add_argument("--spec", required=True)
@@ -223,6 +280,8 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
         return 0 if bool(payload.get("ok")) else 1
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
+    if command == "config-migrate":
+        return 0 if payload.get("status") == "ok" else 1
     if command in {"retry-node", "repair-apply", "repair-promote", "cancel", "adopt", "queue-add", "queue-run", "queue-retry", "queue-cancel", "queue-remove", "queue-export", "queue-import"}:
         return 0 if payload.get("status") in {"available", "complete", "succeeded", "already_adopted", "planned", "requested", "added", "completed", "removed", "exported", "imported", "promoted", "already_promoted"} else 1
     if command in {"run", "resume"}:
@@ -243,6 +302,8 @@ def main(argv: list[str] | None = None) -> int:
                 config_path=(getattr(args, "doctor_config", "") or args.config or None),
                 workspace=args.workspace or None,
             )
+        elif args.command == "config-migrate":
+            payload = _config_migrate_command(args)
         elif args.command == "plan":
             payload = control.plan(args.spec)
         elif args.command == "run":

@@ -89,6 +89,7 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "export_bundle",
         "forensic_attestation",
         "provider_receipt_ledger",
+        "provider_verified_reuse",
         "review_section",
         "stage1_portable_summary_source",
         "stage1_portable_summary_manifest",
@@ -629,6 +630,109 @@ def _validate_stage1_summary_reuse_record(record: Any, _path: str | Path, root: 
     expected_hash = str(canonical.pop("content_hash") or "")
     if hash_json(canonical) != expected_hash:
         raise ArtifactSchemaError("stage1_summary_reuse_record.content_hash does not match content")
+
+
+def _validate_provider_verified_reuse(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    """Validate one current-epoch, receipt-backed provider reuse authority."""
+
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("provider_verified_reuse",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        (
+            "stage_name",
+            "current_logical_attempt_identity",
+            "current_closure_epoch_id",
+            "call_id",
+            "node_id",
+            "current_binding",
+            "source_authority",
+            "reused_output",
+            "content_hash",
+        ),
+        "provider_verified_reuse",
+    )
+    if str(root.get("stage_name") or "") != "outline_v3":
+        raise ArtifactSchemaError("provider_verified_reuse stage_name is invalid")
+    current_epoch = str(root.get("current_closure_epoch_id") or "")
+    if not current_epoch:
+        raise ArtifactSchemaError("provider_verified_reuse current closure epoch is missing")
+
+    binding = _require_nonempty_mapping(root.get("current_binding"), "provider_verified_reuse.current_binding")
+    _require_fields(
+        binding,
+        (
+            "call_id",
+            "node_id",
+            "prompt_hash",
+            "input_hash",
+            "config_hash",
+            "schema_hash",
+            "provider",
+            "model",
+            "endpoint",
+            "endpoint_type",
+        ),
+        "provider_verified_reuse.current_binding",
+    )
+    if str(binding.get("call_id") or "") != str(root.get("call_id") or ""):
+        raise ArtifactSchemaError("provider_verified_reuse binding call_id mismatch")
+    if str(binding.get("node_id") or "") != str(root.get("node_id") or ""):
+        raise ArtifactSchemaError("provider_verified_reuse binding node_id mismatch")
+
+    source = _require_nonempty_mapping(root.get("source_authority"), "provider_verified_reuse.source_authority")
+    _require_fields(
+        source,
+        (
+            "source_closure_epoch_id",
+            "source_receipt_ledger_artifact_id",
+            "source_receipt_ledger_content_hash",
+            "source_receipt_id",
+            "source_receipt_record_hash",
+        ),
+        "provider_verified_reuse.source_authority",
+    )
+    if str(source.get("source_closure_epoch_id") or "") == current_epoch:
+        raise ArtifactSchemaError("provider_verified_reuse source must be a prior closure epoch")
+
+    reused = _require_nonempty_mapping(root.get("reused_output"), "provider_verified_reuse.reused_output")
+    _require_fields(
+        reused,
+        (
+            "replay_key_hash",
+            "normalized_output_hash",
+            "registered_artifact_id",
+            "registered_artifact_content_hash",
+            "registered_artifact_file_hash",
+        ),
+        "provider_verified_reuse.reused_output",
+    )
+    for label, value in (
+        ("prompt_hash", binding.get("prompt_hash")),
+        ("input_hash", binding.get("input_hash")),
+        ("config_hash", binding.get("config_hash")),
+        ("schema_hash", binding.get("schema_hash")),
+        ("source_receipt_ledger_content_hash", source.get("source_receipt_ledger_content_hash")),
+        ("source_receipt_record_hash", source.get("source_receipt_record_hash")),
+        ("replay_key_hash", reused.get("replay_key_hash")),
+        ("normalized_output_hash", reused.get("normalized_output_hash")),
+        ("registered_artifact_content_hash", reused.get("registered_artifact_content_hash")),
+        ("registered_artifact_file_hash", reused.get("registered_artifact_file_hash")),
+    ):
+        digest = str(value or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
+            raise ArtifactSchemaError(f"provider_verified_reuse.{label} must be a SHA-256 hex digest")
+
+    from runtime.provider_runtime import hash_json
+
+    canonical = dict(root)
+    expected_hash = str(canonical.pop("content_hash") or "")
+    if hash_json(canonical) != expected_hash:
+        raise ArtifactSchemaError("provider_verified_reuse.content_hash does not match content")
 
 
 def _validate_stage1_reusable_summary_manifest(
@@ -1767,6 +1871,7 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("validation_disposition", "v1"): _validate_validation_disposition,
         ("lease_publication_manifest", "v1"): _validate_lease_publication_manifest,
         ("provider_receipt_ledger", "v1"): _validate_receipt_ledger,
+        ("provider_verified_reuse", "v1"): _validate_provider_verified_reuse,
         ("repair_plan", "v1"): _validate_repair_plan,
         ("repair_apply_result", "v1"): _validate_repair_apply,
         ("repair_report", "v1"): _validate_repair_report,

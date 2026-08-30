@@ -52,15 +52,15 @@ safety_margin_tokens = 1024
 
 [Writer_API]
 api_key = YOUR_WRITER_API_KEY_HERE
-model = gpt-5.5
-api_base = https://aihubmix.com/v1
+model = gpt-5.6-sol
+api_base = https://ai.saigou.work/v1
 proxy_mode = environment
 endpoint_type = responses
-provider_family = aihubmix_openai
+provider_family = openai_responses
 reasoning_effort = high
 force_highest_reasoning = true
 text_verbosity = high
-max_context_tokens = 128000
+max_context_tokens = 1000000
 max_output_tokens = 32000
 temperature = 0.0
 connect_timeout_seconds = 30
@@ -74,14 +74,19 @@ omit_temperature_when_reasoning = true
 
 [Outline_API]
 api_key = YOUR_OUTLINE_API_KEY_HERE
-model = claude-opus-4-7
-api_base = https://aihubmix.com/v1
+model = claude-opus-5
+api_base = https://chat.178266.xyz
 proxy_mode = environment
-endpoint_type = chat_completions
-provider_family = aihubmix_claude
-reasoning_effort = xhigh
-reasoning_display = summarized
-force_highest_reasoning = true
+endpoint_type = anthropic
+provider_family = anthropic
+anthropic_path = /v1/messages
+anthropic_version = 2023-06-01
+# "high" is the documented default and the level that is actually sent. Leave
+# force_highest_reasoning false: setting it true overrides the line above and
+# silently asks for the model's top level ("max" on Opus 5), which needs a much
+# larger max_output_tokens than the 16000 below.
+reasoning_effort = high
+force_highest_reasoning = false
 max_context_tokens = 200000
 max_output_tokens = 16000
 temperature = 0.0
@@ -95,13 +100,12 @@ safety_margin_tokens = 2048
 
 [Free_Mode_API]
 api_key = YOUR_FREE_MODE_API_KEY_HERE
-model = claude-opus-4-7
-api_base = https://aihubmix.com/v1
+model = deepseek-v4-pro
+api_base = https://api.deepseek.com
 proxy_mode = environment
 endpoint_type = chat_completions
-provider_family = aihubmix_claude
-reasoning_effort = xhigh
-reasoning_display = summarized
+provider_family = deepseek
+reasoning_effort = max
 max_context_tokens = 128000
 max_output_tokens = 6000
 temperature = 0.4
@@ -167,10 +171,24 @@ technical_shard_target_tokens = 0
 allow_bibliometric_provider = false
 
 [OutlineModels]
+# Role-aware routing: each semantic role resolves to its own API section, so the
+# outline is genuinely reviewed by different models instead of one model grading
+# its own candidates.
+#
+# Recommended shape: the generator and the arbitrator share one strong reasoning
+# model (the arbitrator must absorb peer critiques using the model that produced
+# the candidates), while the critiques come from *different* models. A critique
+# that resolves to the generator's own model is self-review; the executor emits
+# an explicit routing diagnostic instead of hiding it.
+#
+# Note on gateways: a section's api_base only records where requests are sent.
+# A third-party gateway is not evidence that the upstream is the official
+# OpenAI or Anthropic service, and the two must not be conflated.
 outline_model = Outline_API
+relation_adjudicator_model = Free_Mode_API
 structure_critic_model = Writer_API
-coverage_critic_model = Primary_Reader_API
-evidence_critic_model = Primary_Reader_API
+coverage_critic_model = Free_Mode_API
+evidence_critic_model = Writer_API
 arbitrator_model = Outline_API
 
 [OutlineCostControl]

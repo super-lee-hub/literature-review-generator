@@ -2,7 +2,7 @@ from services.model_capabilities import resolve_model_capability
 from services.model_selection import get_free_mode_api_config, get_outline_api_config, get_writer_api_config
 
 
-def test_get_outline_api_config_falls_back_to_writer_when_outline_key_is_placeholder() -> None:
+def test_get_outline_api_config_resolves_its_own_section_without_writer_fallback() -> None:
     config = {
         "Writer_API": {
             "api_key": "writer-key",
@@ -19,15 +19,15 @@ def test_get_outline_api_config_falls_back_to_writer_when_outline_key_is_placeho
 
     api_config = get_outline_api_config(config)
 
-    assert api_config == {
-        "api_key": "writer-key",
-        "model": "writer-model",
-        "api_base": "https://writer.example.com/v1",
-        "proxy_mode": "direct",
-    }
+    # No mongrel fallback: [Outline_API] is its own route authority, even when
+    # incomplete. It must not borrow the Writer gateway's model/address.
+    assert api_config["model"] == "outline-model"
+    assert api_config["api_base"] == "https://outline.example.com/v1"
+    assert api_config["model"] != "writer-model"
+    assert api_config["api_base"] != "https://writer.example.com/v1"
 
 
-def test_get_free_mode_api_config_falls_back_to_outline_when_free_mode_key_is_placeholder() -> None:
+def test_get_free_mode_api_config_resolves_its_own_section_without_outline_fallback() -> None:
     config = {
         "Outline_API": {
             "api_key": "outline-key",
@@ -36,7 +36,7 @@ def test_get_free_mode_api_config_falls_back_to_outline_when_free_mode_key_is_pl
             "proxy_mode": "environment",
         },
         "Free_Mode_API": {
-            "api_key": "YOUR_FREE_MODE_API_KEY_HERE",
+            "api_key": "free-key",
             "model": "planner-model",
             "api_base": "https://planner.example.com/v1",
         },
@@ -44,12 +44,10 @@ def test_get_free_mode_api_config_falls_back_to_outline_when_free_mode_key_is_pl
 
     api_config = get_free_mode_api_config(config)
 
-    assert api_config == {
-        "api_key": "outline-key",
-        "model": "outline-model",
-        "api_base": "https://outline.example.com/v1",
-        "proxy_mode": "environment",
-    }
+    assert api_config["model"] == "planner-model"
+    assert api_config["api_base"] == "https://planner.example.com/v1"
+    assert api_config["model"] != "outline-model"
+    assert api_config["api_base"] != "https://outline.example.com/v1"
 
 
 def test_api_config_preserves_reasoning_transport_fields() -> None:

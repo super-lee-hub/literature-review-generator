@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -256,3 +257,130 @@ def test_current_dependency_requires_explicit_identity() -> None:
         ArtifactDependencyRefV2.from_dict(
             {"artifact_type": "source_pdf", "path": "/tmp/source.pdf", "content_hash": "abc123"}
         )
+
+
+def test_verify_ready_artifact_closure_rejects_transitive_tamper(tmp_path) -> None:
+    registry = ArtifactRegistry(tmp_path / "artifact_registry.json", "job-123")
+
+    def write_artifact(name: str, value: str):
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps({"ok": value}), encoding="utf-8")
+        return path
+
+    leaf = registry.register_file(
+        artifact_id="leaf",
+        artifact_role="test",
+        artifact_type="test_node",
+        artifact_version="v1",
+        path=write_artifact("leaf", "leaf"),
+        producer="tests",
+    )
+    middle = registry.register_file(
+        artifact_id="middle",
+        artifact_role="test",
+        artifact_type="test_node",
+        artifact_version="v1",
+        path=write_artifact("middle", "middle"),
+        producer="tests",
+        depends_on=[ArtifactDependencyRefV2.from_record(leaf)],
+    )
+    root = registry.register_file(
+        artifact_id="root",
+        artifact_role="test",
+        artifact_type="test_node",
+        artifact_version="v1",
+        path=write_artifact("root", "root"),
+        producer="tests",
+        depends_on=[ArtifactDependencyRefV2.from_record(middle)],
+    )
+
+    assert registry.verify_ready_artifact_closure(root).artifact_id == "root"
+
+    Path(leaf.path).write_text(json.dumps({"ok": "tampered"}), encoding="utf-8")
+
+    with pytest.raises(UnverifiedDependency, match="dependency content hash changed: leaf"):
+        registry.verify_ready_artifact_closure(root)
+
+
+def test_verify_ready_artifact_closure_rejects_dependency_cycle(tmp_path) -> None:
+    registry_path = tmp_path / "artifact_registry.json"
+    registry = ArtifactRegistry(registry_path, "job-123")
+    first_path = tmp_path / "first.json"
+    second_path = tmp_path / "second.json"
+    first_path.write_text(json.dumps({"ok": "first"}), encoding="utf-8")
+    second_path.write_text(json.dumps({"ok": "second"}), encoding="utf-8")
+    first = registry.register_file(
+        artifact_id="first",
+        artifact_role="test",
+        artifact_type="test_node",
+        artifact_version="v1",
+        path=first_path,
+        producer="tests",
+    )
+    second = registry.register_file(
+        artifact_id="second",
+        artifact_role="test",
+        artifact_type="test_node",
+        artifact_version="v1",
+        path=second_path,
+        producer="tests",
+    )
+
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    records = {item["artifact_id"]: item for item in payload["artifacts"]}
+    records["first"]["depends_on"] = [ArtifactDependencyRefV2.from_record(second).to_dict()]
+    records["second"]["depends_on"] = [ArtifactDependencyRefV2.from_record(first).to_dict()]
+    payload["artifacts"] = list(records.values())
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+    registry.reload()
+
+    with pytest.raises(UnverifiedDependency, match="cycle detected"):
+        registry.verify_ready_artifact_closure(registry.get("first"))
+
+
+def test_verify_ready_artifact_closure_walks_external_registry(tmp_path) -> None:
+    remote_dir = tmp_path / "remote"
+    local_dir = tmp_path / "local"
+    remote_dir.mkdir()
+    local_dir.mkdir()
+    remote = ArtifactRegistry(remote_dir / "artifact_registry.json", "job-remote")
+    remote_path = tmp_path / "remote" / "source.json"
+    remote_path.write_text(json.dumps({"ok": "remote"}), encoding="utf-8")
+    remote_record = remote.register_file(
+        artifact_id="remote-source",
+        artifact_role="test",
+        artifact_type="test_node",
+        artifact_version="v1",
+        path=remote_path,
+        producer="tests",
+    )
+
+    local = ArtifactRegistry(local_dir / "artifact_registry.json", "job-local")
+    local_path = local_dir / "root.json"
+    local_path.write_text(json.dumps({"ok": "local"}), encoding="utf-8")
+    dependency = ArtifactDependencyRefV2(
+        dependency_kind="external_job",
+        job_id="job-remote",
+        artifact_id=remote_record.artifact_id,
+        artifact_type=remote_record.artifact_type,
+        path=remote_record.path,
+        content_hash=remote_record.content_hash,
+    )
+    resolver = lambda job_id: remote if job_id == "job-remote" else None
+    root = local.register_file(
+        artifact_id="local-root",
+        artifact_role="test",
+        artifact_type="test_node",
+        artifact_version="v1",
+        path=local_path,
+        producer="tests",
+        depends_on=[dependency],
+        external_registry_resolver=resolver,
+    )
+
+    assert local.verify_ready_artifact_closure(root, external_registry_resolver=resolver).artifact_id == "local-root"
+
+    remote_path.write_text(json.dumps({"ok": "tampered"}), encoding="utf-8")
+
+    with pytest.raises(UnverifiedDependency, match="remote-source"):
+        local.verify_ready_artifact_closure(root, external_registry_resolver=resolver)

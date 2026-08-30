@@ -9,6 +9,8 @@ and committed-range whitespace checks.
 | Capability | Current status | Boundary |
 | --- | --- | --- |
 | Outline Intelligence v3 | `E2E_VERIFIED` | Only current production Outline path |
+| Outline role-aware multi-provider transport | `OFFLINE_VERIFIED` | Fake transport and receipt closure verified; live providers `NOT VERIFIED` |
+| Native Anthropic Messages transport | `OFFLINE_VERIFIED` | Protocol and fail-closed stop handling verified offline; live API `NOT VERIFIED` |
 | Free Mode typed intent | `E2E_VERIFIED` | `free_mode_intent_input/v1` |
 | Free Mode -> ReviewIntent | `E2E_VERIFIED` | Literal idea projection and writer binding |
 | Free Mode Writer replay binding | `E2E_VERIFIED` | Context and identity remain bound on replay |
@@ -17,7 +19,7 @@ and committed-range whitespace checks.
 | Validation adjudication single-flight | `E2E_VERIFIED` | Single-host scope only |
 | Registry-backed durable adjudication reuse | `E2E_VERIFIED` | Provisional and durable closure-bound authority |
 | `reviewctl` control plane | `E2E_VERIFIED` | `RuntimeJobSpec` -> `AgentRuntimeRunner` |
-| Stage 3 review contract | `E2E_VERIFIED` | `review_draft` v3, `citation_manifest` v3, DOCX |
+| Stage 3 Review / Writer contract | `E2E_VERIFIED` | One Review stage; `Writer_API` runs per adopted section and emits `review_draft` v3, `citation_manifest` v3, DOCX |
 | Queue fencing/publication | `E2E_VERIFIED` | Current lease and Registry boundary |
 | JobOutcome / CurrentArtifactSet | `E2E_VERIFIED` | Registry-backed canonical authority |
 | Repair/promotion and export admission | `E2E_VERIFIED` | Current transaction and dependency gates |

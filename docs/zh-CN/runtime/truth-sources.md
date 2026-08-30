@@ -158,6 +158,11 @@ hash，保留 replay receipt，并且 resume 只重跑失败节点的依赖闭�
 只有在 coverage、stage-health、identity 和 canonical-completion gate 全部通过后
 才可 adoption。
 
+当前发布的 route map 是异构的：Claude Opus 5 负责候选生成与最终仲裁，GPT-5.6-sol
+负责结构/证据审查，DeepSeek V4 Pro 负责关系/覆盖度审查。每个 node 的 binding 和
+receipt 记录不含 secret 的 provider/model/endpoint identity；第三方 gateway 不会被当作
+官方上游连接的证明。
+
 Stability policy 为 `off`、默认的 `smoke` 和 `full`。Smoke 执行一个额外的完整
 reversed-summary decision chain 加 exact replay；full 执行完整 release/audit
 矩阵。每个 node 都持久化 call/token/cost plan，并在 transport 前进行 preflight。

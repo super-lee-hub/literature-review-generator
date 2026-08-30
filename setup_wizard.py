@@ -24,6 +24,7 @@ from services.environment_service import (
     recommended_conda_activate_command,
     recommended_conda_create_command,
 )
+from services.settings import CONFIG_SCHEMA_VERSION
 
 DEFAULT_MINERU_ENV_VALUES: Dict[str, str] = {
     "MINERU_BASE_URL": "https://mineru.net/api/v4",
@@ -95,6 +96,19 @@ def _prompt_provider(default: str = "custom") -> str:
     return provider if provider in PROVIDER_PRESETS else "custom"
 
 
+def _prompt_choice(label: str, choices: Sequence[str], default: str = "") -> str:
+    """Prompt for one of a fixed set of choices."""
+    choices_str = " / ".join(choices)
+    hint = f" [{choices_str}]" if not default else f" [{choices_str}，默认 {default}]"
+    while True:
+        value = input(f"{label}{hint}: ").strip()
+        if not value and default:
+            return default
+        if value in choices:
+            return value
+        print(f"请输入以下之一: {', '.join(choices)}")
+
+
 def _parse_bool(value: str | bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -113,7 +127,52 @@ def _guess_provider(api_base: str, fallback: str) -> str:
     return fallback if fallback in PROVIDER_PRESETS else "custom"
 
 
+def _provider_family_for_endpoint(
+    provider: str,
+    endpoint_type: str,
+    *,
+    model: str,
+    current_family: str = "",
+) -> str:
+    """Resolve the wire-level family independently from the gateway preset."""
+
+    endpoint = str(endpoint_type or "").strip().casefold().replace("-", "_")
+    provider_name = str(provider or "").strip().casefold().replace("-", "_")
+    existing = str(current_family or "").strip().casefold().replace("-", "_")
+    if endpoint == "anthropic":
+        return "anthropic"
+    if endpoint in {"responses", "response"}:
+        return "openai_responses"
+    if provider_name == "deepseek":
+        return "deepseek"
+    if provider_name == "aihubmix":
+        lowered_model = str(model or "").casefold()
+        if "claude" in lowered_model or "opus" in lowered_model:
+            return "aihubmix_claude"
+        if lowered_model.startswith("gpt-"):
+            return "aihubmix_openai"
+    if provider_name == "custom" and existing in {
+        "claude_chat_reasoning",
+        "aihubmix_claude",
+        "aihubmix_openai",
+        "deepseek",
+        "generic",
+    }:
+        return existing
+    return "generic"
+
+
 def _load_existing_config_sections(config_path: str) -> Dict[str, Dict[str, str]]:
+    """Strictly load an existing config into the current schema.
+
+    This is *strict*: ``ensure_config_sections`` runs ``validate_config_keys``,
+    so a config still carrying ``[Retry_Settings]``, ``[Stage2_Retry]`` or
+    ``[API_Parameters]`` raises here. Callers must therefore have completed
+    :func:`_migrate_existing_config_explicitly` first -- see
+    :func:`run_setup_wizard`, where that ordering bug used to make a legacy
+    config explode before the operator was ever offered a migration.
+    """
+
     if not os.path.exists(config_path):
         return ensure_config_sections()
 
@@ -126,6 +185,58 @@ def _load_existing_config_sections(config_path: str) -> Dict[str, Dict[str, str]
     return ensure_config_sections(existing)
 
 
+def _config_requires_explicit_migration(config_path: str) -> bool:
+    """Detect old/legacy config before strict current-schema normalization."""
+
+    try:
+        parser = configparser.ConfigParser()
+        parser.read(config_path, encoding="utf-8")
+        raw_schema = parser.get("Application", "config_schema", fallback="").strip()
+        schema = int(raw_schema) if raw_schema else 0
+    except (OSError, configparser.Error, TypeError, ValueError):
+        return True
+    legacy_sections = {"Retry_Settings", "Stage2_Retry", "API_Parameters"}
+    return schema < CONFIG_SCHEMA_VERSION or bool(legacy_sections & set(parser.sections()))
+
+
+def _migrate_existing_config_explicitly(config_path: str) -> None:
+    """Ask before rewriting a legacy config and show only safe migration facts."""
+
+    from services.config_migration import migrate_config_file
+
+    print(
+        "检测到旧版或 legacy config。向导不会在后台偷偷迁移；"
+        "继续前需要显式确认并先生成备份。"
+    )
+    if not _prompt_yes_no("现在显式迁移这个 config.ini", False):
+        raise RuntimeError(
+            "旧版配置未迁移。请先运行 python -m reviewctl config-migrate "
+            f"--config {config_path}，或重新运行向导并确认迁移。"
+        )
+    report = migrate_config_file(config_path)
+    print(
+        f"已完成显式配置迁移：changed={report.changed}, "
+        f"changes={len(report.changes)}, warnings={len(report.warnings)}"
+    )
+    for warning in report.warnings:
+        print(f"迁移提示：{warning}")
+
+
+# API sections that [OutlineModels] can point a semantic role at. Each one is a
+# complete route authority: model, api_base, endpoint_type and provider_family
+# together describe one wire contract, so none of them may be left blank with
+# the expectation that another provider will supply it.
+ROUTED_API_SECTIONS = frozenset({"Outline_API", "Writer_API", "Free_Mode_API"})
+
+ENDPOINT_TYPES = ("chat_completions", "responses", "anthropic")
+ANTHROPIC_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+# Anthropic-specific fields only make sense when endpoint_type is anthropic.
+# They are left empty for other transports so the validator does not flag a
+# pairing mismatch.
+ANTHROPIC_ONLY_KEYS = ("anthropic_path", "anthropic_version", "thinking_budget_tokens")
+
+
 def _collect_api_section(
     sections: Dict[str, Dict[str, str]],
     api_keys: Dict[str, str],
@@ -134,42 +245,100 @@ def _collect_api_section(
     default_provider: str,
 ) -> None:
     print(f"\n[{title}]")
-    allow_fallback = section_name in {"Outline_API", "Free_Mode_API"}
     current_section = sections[section_name]
-    provider_default = _guess_provider(current_section.get("api_base", ""), default_provider)
+    # A section referenced by [OutlineModels] is a complete route authority, so
+    # it cannot be left blank to be filled in from another provider. Allowing
+    # that here is what produced a Writer gateway addressed with the Anthropic
+    # Messages protocol.
+    allow_empty = section_name not in ROUTED_API_SECTIONS
+    provider_default = current_section.get("provider_family", "") or _guess_provider(
+        current_section.get("api_base", ""), default_provider
+    )
+    if provider_default not in PROVIDER_PRESETS:
+        provider_default = _guess_provider(current_section.get("api_base", ""), default_provider)
     provider = _prompt_provider(default=provider_default)
 
     model_label = "模型名称"
     api_base_label = "API Base URL"
-    if section_name == "Outline_API":
-        model_label = "模型名称（留空时回退到 Writer_API）"
-        api_base_label = "API Base URL（留空时回退到 Writer_API）"
-    elif section_name == "Free_Mode_API":
-        model_label = "模型名称（留空时回退到 Outline_API）"
-        api_base_label = "API Base URL（留空时回退到 Outline_API）"
+    if not allow_empty:
+        print(
+            f"{section_name} 是角色路由目标，必须完整配置；"
+            "不要留空去继承别的 provider（那会拼出错误协议）。"
+        )
 
     model = _prompt(
         model_label,
         default=current_section.get("model", ""),
-        allow_empty=allow_fallback,
+        allow_empty=allow_empty,
     )
     api_base = _prompt(
         api_base_label,
         default=current_section.get("api_base", ""),
-        allow_empty=allow_fallback,
+        allow_empty=allow_empty,
     )
     api_key = _prompt_secret(
         "API Key（将写入 .env）",
         current_value=api_keys.get(section_name, ""),
     )
 
+    # Transport selection: the user must be able to pick the Anthropic native
+    # protocol for Claude models instead of being silently locked into an
+    # OpenAI-compatible transport.
+    current_endpoint = current_section.get("endpoint_type", "chat_completions")
+    if current_endpoint not in ENDPOINT_TYPES:
+        current_endpoint = "chat_completions"
+    endpoint_type = _prompt_choice(
+        "传输协议",
+        ENDPOINT_TYPES,
+        default=current_endpoint,
+    )
+
     effective_provider = _guess_provider(api_base, provider) if api_base else provider
-    current_section["provider_family"] = "custom" if allow_fallback and not api_base else effective_provider
+    current_section["provider_family"] = _provider_family_for_endpoint(
+        effective_provider,
+        endpoint_type,
+        model=model,
+        current_family=current_section.get("provider_family", ""),
+    )
     current_section["model"] = model
     current_section["api_base"] = (
-        normalize_api_base(api_base, provider=effective_provider) if api_base else ""
+        normalize_api_base(
+            api_base,
+            provider="anthropic" if endpoint_type == "anthropic" else effective_provider,
+        )
+        if api_base
+        else ""
     )
+    current_section["endpoint_type"] = endpoint_type
     api_keys[section_name] = api_key
+
+    if endpoint_type == "anthropic":
+        # Anthropic native transport needs its own path and version header.
+        # These are almost always "/v1/messages" and "2023-06-01" but a gateway
+        # may disagree, so the wizard lets the operator override.
+        current_section["anthropic_path"] = _prompt(
+            "Anthropic API 路径",
+            default=current_section.get("anthropic_path", "/v1/messages"),
+            allow_empty=False,
+        )
+        current_section["anthropic_version"] = _prompt(
+            "Anthropic API 版本头",
+            default=current_section.get("anthropic_version", "2023-06-01"),
+            allow_empty=False,
+        )
+        current_effort = current_section.get("reasoning_effort", "high")
+        if current_effort not in ANTHROPIC_EFFORT_LEVELS:
+            current_effort = "high"
+        current_section["reasoning_effort"] = _prompt_choice(
+            "Anthropic thinking effort",
+            ANTHROPIC_EFFORT_LEVELS,
+            default=current_effort,
+        )
+    else:
+        # Clear stale Anthropic fields so the validator does not flag a
+        # pairing mismatch from a previous run.
+        for key in ANTHROPIC_ONLY_KEYS:
+            current_section.pop(key, None)
 
 
 def _collect_preprocess_section(
@@ -350,12 +519,47 @@ def _collect_simple_fields(section: Dict[str, str], title: str, fields: Sequence
         section[key] = _prompt(label, section[key], allow_empty=False)
 
 
+def _collect_outline_models_section(
+    sections: Dict[str, Dict[str, str]],
+) -> None:
+    """Prompt for per-role Outline model routing.
+
+    Each role maps to an API section name, so the outline is genuinely
+    reviewed by different models instead of one model grading its own
+    candidates.
+    """
+
+    outline_models = sections.get("OutlineModels")
+    if not outline_models:
+        return
+
+    # The sections the wizard has already configured are the valid targets.
+    valid_targets = [s for s in API_ENV_MAPPING if s in sections]
+    print("\n[大纲角色路由]")
+    print("每个角色映射到已配置的 API section。批评者不应与生成者相同。")
+
+    role_labels: Sequence[tuple[str, str]] = (
+        ("outline_model", "生成者（outline_model）"),
+        ("relation_adjudicator_model", "关系裁决者（relation_adjudicator_model）"),
+        ("structure_critic_model", "结构批评者（structure_critic_model）"),
+        ("coverage_critic_model", "覆盖批评者（coverage_critic_model）"),
+        ("evidence_critic_model", "证据批评者（evidence_critic_model）"),
+        ("arbitrator_model", "最终仲裁者（arbitrator_model）"),
+    )
+
+    for key, label in role_labels:
+        current = outline_models.get(key, "Outline_API")
+        if current not in valid_targets:
+            current = "Outline_API"
+        value = _prompt_choice(label, valid_targets, default=current)
+        outline_models[key] = value
+
+
 def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") -> None:
     """Run the interactive setup wizard and persist config/.env."""
 
     runtime = detect_runtime_environment()
     existing_env = read_env_file(env_path)
-    sections = _load_existing_config_sections(config_path)
     api_keys = {
         section_name: existing_env.get(env_key, "")
         for section_name, env_key in API_ENV_MAPPING.items()
@@ -371,6 +575,15 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
     print("这个向导会同时生成 config.ini 和 .env。API Key 与 MinerU Token 会写入 .env。")
     if os.path.exists(config_path) or os.path.exists(env_path):
         print("检测到现有配置，直接回车会保留当前值；输入 - 可以清空可选项。")
+
+    # Legacy detection and migration must complete *before* anything loads the
+    # config against the current schema. _load_existing_config_sections() is
+    # strict, so loading first meant a config carrying [Retry_Settings],
+    # [Stage2_Retry] or [API_Parameters] raised here -- before the operator was
+    # ever asked whether to migrate, and with no file written yet either way.
+    if os.path.exists(config_path) and _config_requires_explicit_migration(config_path):
+        _migrate_existing_config_explicitly(config_path)
+    sections = _load_existing_config_sections(config_path)
 
     print("\n[当前运行环境]")
     print(f"解释器环境: {runtime.display_name}")
@@ -400,6 +613,8 @@ def run_setup_wizard(config_path: str = "config.ini", env_path: str = ".env") ->
     _collect_api_section(sections, api_keys, "Writer_API", "写作引擎", "videocaptioner")
     _collect_api_section(sections, api_keys, "Outline_API", "大纲引擎", "videocaptioner")
     _collect_api_section(sections, api_keys, "Free_Mode_API", "自由模式对话引擎", "videocaptioner")
+
+    _collect_outline_models_section(sections)
 
     _collect_simple_fields(
         sections["Runtime"],

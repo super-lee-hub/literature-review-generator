@@ -11,7 +11,7 @@ from ai_interface import _call_ai_api
 from free_mode.profile_manager import normalize_profile, save_profile
 from models import APIConfig
 from runtime.provider_runtime import ProviderBudgetV1, ProviderBudgetExceeded, ProviderRuntime, ProviderRuntimeLedger
-from services.model_selection import get_free_mode_api_config
+from services.model_selection import get_free_mode_api_config, has_complete_api_route
 from services.prompt_registry import PromptRegistry
 
 
@@ -198,11 +198,15 @@ def plan_free_mode_chat_turn(
 ) -> Optional[Dict[str, Any]]:
     """Plan one conversational turn and update the free-mode profile draft."""
 
-    free_mode_api = get_free_mode_api_config(config)
-    if not free_mode_api.get("api_key") or not free_mode_api.get("model"):
+    free_mode_section = (config or {}).get("Free_Mode_API")
+    if not has_complete_api_route(free_mode_section):
         if logger:
-            logger.error("Free_Mode_API 未配置，且无法回退到可用的 Outline_API。")
+            logger.error(
+                "Free_Mode_API 未完整配置。自由模式不再从 Outline_API "
+                "隐式继承 provider route。"
+            )
         return None
+    free_mode_api = get_free_mode_api_config(config)
 
     transcript = _serialize_conversation(messages)
     if not transcript:
@@ -251,11 +255,15 @@ def generate_free_mode_profile(
 ) -> Optional[Dict[str, Any]]:
     """Generate and persist a free-mode profile from user intent or a chat transcript."""
 
-    free_mode_api = get_free_mode_api_config(config)
-    if not free_mode_api.get("api_key") or not free_mode_api.get("model"):
+    free_mode_section = (config or {}).get("Free_Mode_API")
+    if not has_complete_api_route(free_mode_section):
         if logger:
-            logger.error("Free_Mode_API 未配置，无法生成自由模式 profile。")
+            logger.error(
+                "Free_Mode_API 未完整配置。自由模式不再从 Outline_API "
+                "隐式继承 provider route。"
+            )
         return None
+    free_mode_api = get_free_mode_api_config(config)
 
     max_tokens, temperature = _get_free_mode_parameters(config, logger=logger)
     note_lines = _normalize_string_list(conversation_notes or [])
