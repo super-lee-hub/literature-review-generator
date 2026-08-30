@@ -113,6 +113,20 @@ def test_validate_all_config_accepts_native_anthropic_combo():
     assert not any("anthropic" in message for message in messages), messages
 
 
+@pytest.mark.parametrize("effort", [None, ""])
+def test_validate_all_config_accepts_unconfigured_anthropic_effort(effort):
+    config = _anthropic_outline(_base_config())
+    if effort is None:
+        config["Outline_API"].pop("reasoning_effort", None)
+    else:
+        config["Outline_API"]["reasoning_effort"] = effort
+
+    valid, messages = validate_all_config(config)
+
+    assert valid is True
+    assert not any("reasoning_effort" in message and "invalid" in message for message in messages), messages
+
+
 def test_validate_all_config_rejects_half_configured_anthropic():
     """Either half alone is impossible: the transport cannot be built."""
 

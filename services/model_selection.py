@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, cast
+from typing import Any, Dict, Mapping, cast
 
 from models import APIConfig
 
@@ -51,9 +51,30 @@ def _has_meaningful_api_key(value: Any) -> bool:
     return bool(api_key) and not _API_KEY_PLACEHOLDER_RE.fullmatch(api_key)
 
 
-def _section_has_effective_route(section: Dict[str, Any] | None) -> bool:
+def has_complete_api_route(section: Mapping[str, Any] | None) -> bool:
+    """Return whether a standalone API section has an explicit safe route.
+
+    ``_section_to_api_config`` retains legacy normalization for callers that
+    intentionally resolve an incomplete/legacy section.  Independent runtime
+    entrypoints must check the raw section first, otherwise a missing
+    ``api_base`` would silently become the unrelated OpenAI default.  The
+    endpoint type remains optional here because the capability resolver has a
+    documented model/provider inference path; when it is supplied, the global
+    configuration validator owns its compatibility checks.
+    """
+
     section = section or {}
-    return _has_meaningful_api_key(section.get("api_key")) and bool(_normalize_text(section.get("model")))
+    return (
+        _has_meaningful_api_key(section.get("api_key"))
+        and bool(_normalize_text(section.get("model")))
+        and bool(_normalize_text(section.get("api_base")))
+    )
+
+
+def _section_has_effective_route(section: Dict[str, Any] | None) -> bool:
+    """Backward-compatible private alias for the raw route completeness check."""
+
+    return has_complete_api_route(section)
 
 
 def _section_to_api_config(section: Dict[str, Any] | None) -> APIConfig:

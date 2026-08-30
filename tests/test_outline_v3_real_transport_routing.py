@@ -33,7 +33,7 @@ from outline.provider_router import (
 from outline.v3_executor import OutlineV3Executor
 from outline.v3_models import OutlineQualityGate
 from runtime.provider_context import ProviderContextProfile
-from services.artifact_registry import ArtifactRegistry
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace
 
 from test_outline_v3_semantic_execution import (
@@ -320,8 +320,16 @@ def test_stability_variants_use_the_same_role_transports(tmp_path: Path) -> None
 
 def _route_change_router(
     base_router: OutlineProviderRouter,
+    *,
+    changed_role: str = "evidence_critique",
+    changed_identity: tuple[str, str, str] = (
+        "openai_responses",
+        "gpt-5.6-sol-v2",
+        "responses",
+    ),
+    changed_api_base: str = "https://ai.saigou-alt.work/v1",
 ) -> tuple[OutlineProviderRouter, dict[str, SentinelTransport]]:
-    """Clone the router while changing only the evidence-critic route."""
+    """Clone the router while changing only one role route."""
 
     routes: dict[str, OutlineRoleRoute] = {}
     transports: dict[str, SentinelTransport] = {}
@@ -329,9 +337,9 @@ def _route_change_router(
         identity = route.identity
         api_base = route.api_base
         profile = route.profile
-        if role == "evidence_critique":
-            identity = ("openai_responses", "gpt-5.6-sol-v2", "responses")
-            api_base = "https://ai.saigou-alt.work/v1"
+        if role == changed_role:
+            identity = changed_identity
+            api_base = changed_api_base
             profile = ProviderContextProfile.conservative(
                 provider=identity[0],
                 model=identity[1],
@@ -514,3 +522,88 @@ def test_all_prior_epoch_reuse_closes_without_current_provider_receipts(
     assert closure_payload["complete"] is True, closure_payload
     assert len(closure_payload["verified_reuse_call_ids"]) == len(ROLE_MODEL) + 1
     assert closure_payload["observed_call_ids"] == []
+
+
+def test_transitive_dependency_tamper_rejects_reuse_and_reruns_descendants(
+    tmp_path: Path,
+) -> None:
+    """A deep registered dependency blocks reuse on the real provider path."""
+
+    first_router, _first_transports = _build_router()
+    first = _executor(
+        tmp_path,
+        router=first_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    assert first.run().ok is True
+
+    leaf_path = tmp_path / "tamper-leaf.json"
+    middle_path = tmp_path / "tamper-middle.json"
+    leaf_path.write_text(json.dumps({"ok": "leaf"}), encoding="utf-8")
+    middle_path.write_text(json.dumps({"ok": "middle"}), encoding="utf-8")
+    leaf = first.registry.register_file(
+        artifact_id="tamper:leaf",
+        artifact_role="tamper_fixture",
+        artifact_type="tamper_fixture",
+        artifact_version="v1",
+        path=leaf_path,
+        producer="tests",
+    )
+    middle = first.registry.register_file(
+        artifact_id="tamper:middle",
+        artifact_role="tamper_fixture",
+        artifact_type="tamper_fixture",
+        artifact_version="v1",
+        path=middle_path,
+        producer="tests",
+        depends_on=[ArtifactDependencyRefV2.from_record(leaf)],
+    )
+    candidate_record = first.registry.get("outline-v3:candidate_1_provider_generation")
+    assert candidate_record is not None
+    first.registry.update_record(
+        candidate_record.artifact_id,
+        depends_on=[*candidate_record.depends_on, ArtifactDependencyRefV2.from_record(middle)],
+    )
+    # Leave the candidate output bytes unchanged; only a two-level registered
+    # dependency beneath its Registry record is now invalid.
+    leaf_path.write_bytes(leaf_path.read_bytes() + b"\n")
+
+    second_router, second_transports = _build_router()
+    second = _executor(
+        tmp_path,
+        router=second_router,
+        poison=ExplodingProvider(),
+        stability_mode="off",
+        logical_attempt_identity=f"{first.logical_attempt_identity}:transitive-tamper",
+        quality_gate=_selective_replay_quality_gate(),
+    )
+    result = second.run()
+
+    assert result.ok is True, result
+    assert len(second_transports["candidate_provider_generation"].invocations) == 1
+    assert all(
+        not transport.invocations
+        for role, transport in second_transports.items()
+        if role != "candidate_provider_generation"
+    )
+    current_receipts = second._receipt_ledger.list_receipts()
+    assert len(current_receipts) == 1
+    assert current_receipts[0].attempt_id == "outline:candidate_1_provider_generation"
+    assert any(
+        "replay output Registry authority is invalid" in diagnostic
+        for diagnostic in second.replay_diagnostics
+    )
+
+    closure_record = second.registry.get("outline-v3:provider_receipt_closure")
+    assert closure_record is not None
+    closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))["payload"]
+    assert closure_payload["complete"] is True, closure_payload
+    assert "outline:candidate_1_provider_generation" not in closure_payload["verified_reuse_call_ids"]
+    assert not [
+        record
+        for record in second.registry.list_records()
+        if record.artifact_type == "provider_verified_reuse"
+        and record.metadata.get("call_id") == "outline:candidate_1_provider_generation"
+    ]

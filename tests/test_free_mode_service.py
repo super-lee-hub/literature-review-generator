@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from free_mode.profile_manager import get_profile_path
 from free_mode.service import generate_free_mode_profile, plan_free_mode_chat_turn
 
@@ -174,3 +176,34 @@ def test_generate_free_mode_profile_does_not_complete_an_incomplete_free_route(
 
     assert profile is None
     assert called["value"] is False
+
+
+@pytest.mark.parametrize(
+    "free_route",
+    [
+        {"api_key": "free-key", "model": "free-model", "api_base": ""},
+        {"api_key": "free-key", "model": "", "api_base": "https://free.example.com/v1"},
+    ],
+    ids=("missing-api-base", "missing-model"),
+)
+def test_generate_free_mode_profile_rejects_partial_dedicated_route(
+    tmp_path: Path, monkeypatch, free_route
+) -> None:
+    called = {"value": False}
+
+    def fake_call_ai_api(*_args, **_kwargs):
+        called["value"] = True
+        raise AssertionError("partial Free_Mode_API must fail before transport")
+
+    monkeypatch.setattr("free_mode.service._call_ai_api", fake_call_ai_api)
+
+    profile = generate_free_mode_profile(
+        user_idea="不完整的独立路由",
+        config={"Free_Mode_API": free_route},
+        output_dir=str(tmp_path),
+        project_name="partial",
+    )
+
+    assert profile is None
+    assert called["value"] is False
+    assert not Path(get_profile_path(str(tmp_path), "partial")).exists()

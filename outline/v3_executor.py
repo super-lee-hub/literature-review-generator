@@ -1365,9 +1365,7 @@ class OutlineV3Executor:
             try:
                 # This validates the Registry record's current file bytes,
                 # schema, and every ready dependency before any receipt is read.
-                self.registry.verify_ready_dependencies(
-                    [ArtifactDependencyRefV2.from_record(record)]
-                )
+                self.registry.verify_ready_artifact_closure(record)
                 before_hash = file_sha256(record.path)
                 ledger = ProviderRuntimeLedger(record.path)
                 receipts = ledger.list_receipts()
@@ -1486,9 +1484,7 @@ class OutlineV3Executor:
         if not output_ids or current_record.artifact_id not in output_ids:
             return None
         try:
-            self.registry.verify_ready_dependencies(
-                [ArtifactDependencyRefV2.from_record(current_record)]
-            )
+            self.registry.verify_ready_artifact_closure(current_record)
         except Exception:
             return None
 
@@ -1501,11 +1497,9 @@ class OutlineV3Executor:
             if registered is None or registered.status != "ready" or registered.job_id != self.job_id:
                 return None
             try:
-                self.registry.verify_ready_dependencies(
-                    [ArtifactDependencyRefV2.from_record(registered)]
-                )
+                self.registry.verify_ready_artifact_closure(registered)
                 envelope = json.loads(Path(registered.path).read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError):
                 return None
             if not isinstance(envelope, Mapping):
                 return None
@@ -1560,9 +1554,7 @@ class OutlineV3Executor:
             )
             return None
         try:
-            self.registry.verify_ready_dependencies(
-                [ArtifactDependencyRefV2.from_record(source_ledger)]
-            )
+            self.registry.verify_ready_artifact_closure(source_ledger)
         except (OSError, RegistryError, TypeError, ValueError):
             self.replay_diagnostics.append(
                 f"node {node_id}: prior-epoch receipt ledger authority changed"
@@ -1636,11 +1628,9 @@ class OutlineV3Executor:
             if existing.status != "ready":
                 return None
             try:
-                self.registry.verify_ready_dependencies(
-                    [ArtifactDependencyRefV2.from_record(existing)]
-                )
+                self.registry.verify_ready_artifact_closure(existing)
                 existing_payload = json.loads(Path(existing.path).read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            except (OSError, UnicodeError, json.JSONDecodeError, RegistryError, TypeError, ValueError):
                 return None
             if existing_payload != base_payload:
                 self.replay_diagnostics.append(
@@ -1705,9 +1695,7 @@ class OutlineV3Executor:
                     f"verified reuse evidence is not ready for {expected.call_id}"
                 )
             try:
-                self.registry.verify_ready_dependencies(
-                    [ArtifactDependencyRefV2.from_record(evidence)]
-                )
+                self.registry.verify_ready_artifact_closure(evidence)
                 payload = json.loads(Path(evidence.path).read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RegistryError) as exc:
                 raise OutlineV3ExecutionError(
@@ -1775,9 +1763,7 @@ class OutlineV3Executor:
                     f"verified reuse source authority is unavailable for {expected.call_id}"
                 )
             try:
-                self.registry.verify_ready_dependencies(
-                    [ArtifactDependencyRefV2.from_record(source_ledger)]
-                )
+                self.registry.verify_ready_artifact_closure(source_ledger)
             except (OSError, RegistryError, TypeError, ValueError) as exc:
                 raise OutlineV3ExecutionError(
                     f"verified reuse source ledger is not authoritative for {expected.call_id}"
@@ -2096,7 +2082,7 @@ class OutlineV3Executor:
         if record is None or record.status != "ready":
             return None
         try:
-            self.registry.verify_ready_dependencies([ArtifactDependencyRefV2.from_record(record)])
+            self.registry.verify_ready_artifact_closure(record)
         except Exception:
             return None
         if node_id in self._provider_node_ids():

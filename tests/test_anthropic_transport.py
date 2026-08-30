@@ -533,6 +533,17 @@ def test_effort_defaults_to_high_for_opus_5() -> None:
     assert payload["output_config"]["effort"] == "high"
 
 
+def test_blank_effort_uses_the_same_adaptive_high_default() -> None:
+    config = {**ANTHROPIC_CONFIG, "reasoning_effort": ""}
+    payload = build_anthropic_messages_payload(
+        "hello", config, "sys",
+        max_tokens=1024, temperature=0.3, response_format="text",
+    )
+
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["output_config"]["effort"] == "high"
+
+
 def test_force_highest_reasoning_uses_the_models_top_effort() -> None:
     config = {**ANTHROPIC_CONFIG, "force_highest_reasoning": "true"}
     payload = build_anthropic_messages_payload(
