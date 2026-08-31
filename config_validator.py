@@ -281,6 +281,12 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
             ("max_pdf_file_mb", 1, 1000000),
             ("single_call_max_pages", 1, 1000000),
             ("visual_scan_batch_size", 1, 1000000),
+            ("stage1_visual_scan_max_output_tokens", 1, 1000000),
+            ("stage1_synthesis_max_output_tokens", 1, 1000000),
+            ("stage1_length_retry_max_attempts", 0, 10),
+            ("stage1_length_retry_ceiling_tokens", 1, 1000000),
+            ("stage1_request_timeout_seconds", 30, 3600),
+            ("stage1_semantic_retry_max_attempts", 0, 3),
             ("final_image_refs_max", 0, 1000000),
             ("max_request_image_bytes", 1, 2000000000),
             ("max_single_image_bytes", 1, 2000000000),
@@ -289,6 +295,28 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 valid, error = validate_numeric_range(str(stage1_input[key]), minimum, maximum)
                 if not valid:
                     return False, [f"[Stage1_Input] {key} {error}"]
+        visual_budget = stage1_input.get("stage1_visual_scan_max_output_tokens")
+        synthesis_budget = stage1_input.get("stage1_synthesis_max_output_tokens")
+        retry_ceiling = stage1_input.get("stage1_length_retry_ceiling_tokens")
+        if retry_ceiling is not None:
+            try:
+                ceiling_value = int(str(retry_ceiling).strip())
+            except (TypeError, ValueError):
+                ceiling_value = 0
+            for name, value in (
+                ("stage1_visual_scan_max_output_tokens", visual_budget),
+                ("stage1_synthesis_max_output_tokens", synthesis_budget),
+            ):
+                if value is None:
+                    continue
+                try:
+                    budget_value = int(str(value).strip())
+                except (TypeError, ValueError):
+                    continue
+                if budget_value > ceiling_value:
+                    return False, [
+                        f"[Stage1_Input] {name} cannot exceed stage1_length_retry_ceiling_tokens"
+                    ]
 
     stage1_visual = normalized_stage1.get("Stage1_Visual", {})
     if isinstance(stage1_visual, dict):

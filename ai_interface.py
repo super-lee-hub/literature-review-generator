@@ -686,6 +686,22 @@ def parse_responses_response(response_data: Dict[str, Any]) -> Tuple[str, str]:
 
 
 def _format_success_result(content: Any, response_format: str, response: Any, finish_reason: str, logger: Any = None) -> Dict[str, Any]:
+    if response_format == "json" and finish_reason in {
+        "length",
+        "incomplete_continuation",
+        "refusal",
+        "anthropic_tool_use",
+    }:
+        message = f"JSON provider response terminated with non-terminal finish reason: {finish_reason}"
+        if logger:
+            logger.warning(message)
+        return _api_result(
+            status="failed",
+            error_kind="invalid_response",
+            http_status=getattr(response, "status_code", None),
+            message=message,
+            finish_reason=finish_reason,
+        )
     if response_format == "json":
         parsed_content = _smart_json_parser(str(content or ""))
         if parsed_content is not None:
@@ -2053,7 +2069,11 @@ def _call_ai_api_detailed(
         input_payload=request_payload,
         api_config=api_config,
         result=result,
-        metadata={"request_budget": budget, **dict(result.get("transport_metadata") or {})},
+        metadata={
+            "request_budget": budget,
+            "requested_output_tokens": int(max_tokens),
+            **dict(result.get("transport_metadata") or {}),
+        },
         route=provider_route,
     )
     enriched = dict(result)
@@ -2489,6 +2509,7 @@ def get_summary_from_ai_detailed(
     config: Optional[Dict[str, Any]] = None,
     user_content: Any = None,
     retry_attempts: Optional[int] = None,
+    timeout_seconds: Optional[int] = None,
     provider_runtime: Optional[ProviderRuntime] = None,
     system_prompt: Optional[str] = None,
     normalize_summary: bool = True,
@@ -2614,6 +2635,7 @@ def get_summary_from_ai_detailed(
         logger=logger,
         user_content=effective_user_content,
         retry_attempts=retry_attempts,
+        timeout_seconds=timeout_seconds,
         provider_runtime=provider_runtime,
         provider_route="Backup_Reader_API" if engine_type == "backup" else "Primary_Reader_API",
         max_single_image_bytes=max_single_image_bytes,

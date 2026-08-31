@@ -27,7 +27,16 @@
 - `send_original_pdf = never`
 - `image_transport = base64`
 - `single_call_max_pages = 12`
-- `visual_scan_batch_size = 10`
+- `visual_scan_batch_size = 1`（未显式配置时的安全默认值；可按 provider 输出稳定性上调）
+- `stage1_visual_scan_max_output_tokens = 16000`
+- `stage1_synthesis_max_output_tokens = 32000`
+- `stage1_length_retry_max_attempts = 2`；收到 `finish_reason=length` 时只在同一
+  primary route 上按预算序列有限升级，仍不完整才进入 backup
+- `stage1_length_retry_ceiling_tokens = 65536`
+- `stage1_request_timeout_seconds = 300`；这是长 Stage 1 请求的 timeout，和 output
+  token budget 是两个独立控制项
+- `stage1_semantic_retry_max_attempts = 1`；视觉 JSON 已能解析但未通过 v2 schema 时，
+  只在同一 primary 请求上做有限重试，不能把非法 observation 当成有效证据
 - `final_image_refs_max = 8`
 - `require_complete_visual_coverage = true`
 - `max_request_image_bytes = 36000000` 原始图片字节预算，为 base64 膨胀预留空间，

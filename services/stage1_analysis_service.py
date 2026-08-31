@@ -51,6 +51,13 @@ from services.job_workspace import (
 from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
+from services.stage1_output_budget import (
+    stage1_output_budget_sequence,
+    stage1_output_budget_snapshot,
+    stage1_request_timeout_seconds,
+    stage1_semantic_retry_max_attempts,
+)
+from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
 from services.prompt_registry import PromptRegistry
 from services.stage1_visual_scan import (
     VisualScanBatch,
@@ -86,6 +93,13 @@ _PLACEHOLDER_RE = re.compile(
     r"(?:$|\b)",
     re.IGNORECASE,
 )
+_PAGE_MARKER_ONLY_RE = re.compile(r"(?m)^\s*(?:--- Page \d+ ---|## Page \d+)\s*$")
+
+
+def _has_substantive_stage1_text(value: Any) -> bool:
+    text = _PAGE_MARKER_ONLY_RE.sub("", str(value or ""))
+    text = text.replace("...", "").strip()
+    return bool(text)
 
 
 @dataclass(frozen=True)
@@ -313,7 +327,10 @@ class Stage1AnalysisService:
             raise RuntimeError(
                 f"Stage 1 source PDF is missing for {self._paper_key(item)}: {source_pdf or '<empty>'}"
             )
-        preprocess = self._preprocess(source_pdf)
+        preprocess = self._preprocess(
+            source_pdf,
+            source_role=str(item.paper_info.get("source_attachment_role") or ""),
+        )
         preprocess_metadata = self._preprocess_metadata(preprocess)
         evidence_manifest = build_evidence_manifest_v1(
             job_id=self.job_id,
@@ -568,6 +585,22 @@ class Stage1AnalysisService:
                 "source_kind": "stage1_provider_generated",
                 "provider_transport_count": 1,
                 "prompt_authority": prompt_authority,
+                "stage1_output_budget_plans": {
+                    "visual_scan": stage1_output_budget_snapshot(
+                        "visual_scan",
+                        stage1_input_settings,
+                    ),
+                    "synthesis": stage1_output_budget_snapshot(
+                        "synthesis",
+                        stage1_input_settings,
+                    ),
+                },
+            "stage1_request_timeout_seconds": stage1_request_timeout_seconds(
+                stage1_input_settings,
+            ),
+            "stage1_semantic_retry_max_attempts": stage1_semantic_retry_max_attempts(
+                stage1_input_settings,
+            ),
                 "visual_coverage_hash": hash_json(visual_identity.get("coverage_plan") or {}),
                 "visual_scan_schema_hash": self._visual_scan_schema_hash(),
                 "require_complete_visual_coverage": parse_strict_bool(
@@ -1016,6 +1049,7 @@ class Stage1AnalysisService:
                 "prompt_id": identity.prompt_id,
                 "prompt_version": identity.version,
                 "prompt_sha256": identity.sha256,
+                "evidence_kinds": list(VISUAL_EVIDENCE_KINDS),
             }
         )
 
@@ -1144,8 +1178,18 @@ class Stage1AnalysisService:
                     max_single_image_bytes=max_single,
                     max_request_image_bytes=max_request,
                 )
-                effective_config = self._effective_provider_config(item.primary_config)
                 scan_identity = self.prompt_registry.identity(VISUAL_SCAN_PROMPT_ID)
+                scan_variants = self._stage1_request_variants(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    user_content=effective_scan_content,
+                    provider_config=item.primary_config,
+                    stage1_input_settings=item.stage1_input_settings,
+                    stage="visual_scan",
+                )
+                semantic_retry_max_attempts = stage1_semantic_retry_max_attempts(
+                    item.stage1_input_settings
+                )
                 graph_seed.append(
                     {
                         "call_id": self._visual_scan_call_id(paper_key, batch_index),
@@ -1158,47 +1202,44 @@ class Stage1AnalysisService:
                         "prompt_id": scan_identity.prompt_id,
                         "prompt_version": scan_identity.version,
                         "prompt_sha256": scan_identity.sha256,
-                        "input_hash": self._request_hash(prompt, system_prompt, effective_scan_content, effective_config, response_format="json"),
-                        "config_hash": hash_json(_redact_mapping(effective_config)),
+                        "input_hash": scan_variants[0]["input_hash"],
+                        "config_hash": scan_variants[0]["config_hash"],
                         "schema_hash": self._visual_scan_schema_hash(),
                         "artifact_path": self._visual_observation_path(paper_key, batch_index),
-                        "max_attempts": max(1, self.settings.runtime.node_retry_limit + 1),
+                        "max_attempts": len(scan_variants) * (semantic_retry_max_attempts + 1),
                         "usage_required": False,
+                        "request_variants": scan_variants,
                     }
                 )
             synthesis_content = item.built_input.user_message_content
-            primary_config = self._effective_provider_config(item.primary_config)
-            backup_config = self._effective_provider_config(item.backup_config)
+            synthesis_system_prompt = self.prompt_registry.read("stage1.analysis.system.v3")
+            primary_variants = self._stage1_request_variants(
+                prompt=item.built_input.prompt_text,
+                system_prompt=synthesis_system_prompt,
+                user_content=synthesis_content,
+                provider_config=item.primary_config,
+                stage1_input_settings=item.stage1_input_settings,
+                stage="synthesis",
+            )
+            backup_variants = self._stage1_request_variants(
+                prompt=item.built_input.prompt_text,
+                system_prompt=synthesis_system_prompt,
+                user_content=self._text_only_content(synthesis_content),
+                provider_config=item.backup_config,
+                stage1_input_settings=item.stage1_input_settings,
+                stage="synthesis",
+            )
             primary_hash = (
                 ""
                 if scan_call_planned
-                else self._request_hash(
-                    item.built_input.prompt_text,
-                    self.prompt_registry.read("stage1.analysis.system.v3"),
-                    synthesis_content,
-                    primary_config,
-                    response_format="json",
-                )
+                else primary_variants[0]["input_hash"]
             )
-            backup_content = self._text_only_content(synthesis_content)
-            backup_hash = self._request_hash(
-                item.built_input.prompt_text,
-                self.prompt_registry.read("stage1.analysis.system.v3"),
-                backup_content,
-                backup_config,
-                response_format="json",
-                default_max_tokens=8192,
-            )
+            backup_hash = backup_variants[0]["input_hash"]
             variants = []
             if primary_hash:
-                variants.append({
-                    "input_hash": primary_hash,
-                    "config_hash": hash_json(_redact_mapping(primary_config)),
-                })
-            variants.append({
-                "input_hash": backup_hash,
-                "config_hash": hash_json(_redact_mapping(backup_config)),
-            })
+                variants.extend(primary_variants)
+            variants.extend(backup_variants[:1])
+            primary_config_hash = primary_variants[0]["config_hash"]
             graph_seed.append(
                 {
                     "call_id": self._synthesis_call_id(paper_key),
@@ -1212,15 +1253,12 @@ class Stage1AnalysisService:
                     "prompt_version": item.built_input.prompt_version,
                     "prompt_sha256": item.built_input.prompt_sha256,
                     "input_hash": primary_hash,
-                    "config_hash": hash_json(_redact_mapping(primary_config)),
+                    "config_hash": primary_config_hash,
                     "schema_hash": self._schema_hash(),
                     "artifact_path": self._paper_artifact_path(item.item),
-                    "max_attempts": max(1, self.settings.runtime.node_retry_limit + 1),
+                    "max_attempts": len(primary_variants) + 1 if primary_hash else 1,
                     "usage_required": False,
-                "request_variants": variants if primary_hash else ({
-                    "input_hash": backup_hash,
-                    "config_hash": hash_json(_redact_mapping(backup_config)),
-                },),
+                    "request_variants": tuple(variants),
                 }
             )
         graph_hash = hash_json({
@@ -1238,12 +1276,36 @@ class Stage1AnalysisService:
                     "schema_hash": item["schema_hash"],
                     "artifact_path": item["artifact_path"],
                     "max_attempts": item["max_attempts"],
+                    "request_variants": list(item.get("request_variants") or ()),
                 }
                 for item in graph_seed
             ],
         })
         config_hash = hash_json({
             "primary_reader": [item.primary_config for item in prepared],
+            "stage1_input": [
+                _redact_mapping(item.stage1_input_settings)
+                for item in prepared
+            ],
+            "stage1_output_budget_plans": [
+                {
+                    "visual_scan": stage1_output_budget_snapshot(
+                        "visual_scan",
+                        item.stage1_input_settings,
+                    ),
+                    "synthesis": stage1_output_budget_snapshot(
+                        "synthesis",
+                        item.stage1_input_settings,
+                    ),
+                    "timeout_seconds": stage1_request_timeout_seconds(
+                        item.stage1_input_settings,
+                    ),
+                    "semantic_retry_max_attempts": stage1_semantic_retry_max_attempts(
+                        item.stage1_input_settings,
+                    ),
+                }
+                for item in prepared
+            ],
             "stage": "stage1_analyze",
         })
         epoch = compute_closure_epoch_id(
@@ -1376,6 +1438,39 @@ class Stage1AnalysisService:
         return effective
 
     @staticmethod
+    def _stage1_provider_config(
+        config: Mapping[str, Any],
+        *,
+        stage: str,
+        output_tokens: int,
+        timeout_seconds: int,
+        retry_index: int,
+    ) -> dict[str, Any]:
+        """Bind one stage budget/timeout to provider identity without changing route."""
+
+        effective = Stage1AnalysisService._effective_provider_config(config)
+        effective.update(
+            {
+                "max_output_tokens": str(int(output_tokens)),
+                "stage1_output_stage": str(stage),
+                "stage1_output_budget_tokens": str(int(output_tokens)),
+                "stage1_length_retry_index": str(int(retry_index)),
+                "stage1_request_timeout_seconds": str(int(timeout_seconds)),
+            }
+        )
+        return effective
+
+    @staticmethod
+    def _is_length_result(result: Mapping[str, Any]) -> bool:
+        finish_reason = str(result.get("finish_reason") or "").strip().casefold()
+        if finish_reason in {"length", "max_tokens", "incomplete_continuation"}:
+            return True
+        return (
+            str(result.get("error_kind") or "").strip().casefold() == "invalid_response"
+            and "length" in str(result.get("message") or "").strip().casefold()
+        )
+
+    @staticmethod
     def _request_parameters(
         api_config: Mapping[str, Any],
         *,
@@ -1414,6 +1509,44 @@ class Stage1AnalysisService:
             max_output_tokens=max_tokens,
             temperature=temperature,
         ))
+
+    @staticmethod
+    def _stage1_request_variants(
+        *,
+        prompt: str,
+        system_prompt: str,
+        user_content: Any,
+        provider_config: Mapping[str, Any],
+        stage1_input_settings: Mapping[str, Any],
+        stage: str,
+    ) -> tuple[dict[str, Any], ...]:
+        """Build exact request/config identities for bounded length retries."""
+
+        timeout_seconds = stage1_request_timeout_seconds(stage1_input_settings)
+        variants: list[dict[str, Any]] = []
+        for retry_index, output_tokens in enumerate(
+            stage1_output_budget_sequence(stage, stage1_input_settings)
+        ):
+            staged_config = Stage1AnalysisService._stage1_provider_config(
+                provider_config,
+                stage=stage,
+                output_tokens=output_tokens,
+                timeout_seconds=timeout_seconds,
+                retry_index=retry_index,
+            )
+            variants.append(
+                {
+                    "input_hash": Stage1AnalysisService._request_hash(
+                        prompt,
+                        system_prompt,
+                        user_content,
+                        staged_config,
+                        response_format="json",
+                    ),
+                    "config_hash": hash_json(_redact_mapping(staged_config)),
+                }
+            )
+        return tuple(variants)
 
     @staticmethod
     def _transport_metadata_for_content(
@@ -1589,35 +1722,37 @@ class Stage1AnalysisService:
         paper_key = self._paper_key(prepared.item)
         prompt = prepared.built_input.prompt_text
         system_prompt = self.prompt_registry.read("stage1.analysis.system.v3")
-        primary_config = self._effective_provider_config(prepared.primary_config)
-        backup_config = self._effective_provider_config(prepared.backup_config)
-        primary_hash = self._request_hash(
-            prompt,
-            system_prompt,
-            prepared.built_input.user_message_content,
-            primary_config,
-            response_format="json",
+        primary_variants = self._stage1_request_variants(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            user_content=prepared.built_input.user_message_content,
+            provider_config=prepared.primary_config,
+            stage1_input_settings=prepared.stage1_input_settings,
+            stage="synthesis",
         )
-        backup_hash = self._request_hash(
-            prompt,
-            system_prompt,
-            self._text_only_content(prepared.built_input.user_message_content),
-            backup_config,
-            response_format="json",
-            default_max_tokens=8192,
+        backup_variants = self._stage1_request_variants(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            user_content=self._text_only_content(prepared.built_input.user_message_content),
+            provider_config=prepared.backup_config,
+            stage1_input_settings=prepared.stage1_input_settings,
+            stage="synthesis",
         )
-        primary_config_hash = hash_json(_redact_mapping(primary_config))
-        backup_config_hash = hash_json(_redact_mapping(backup_config))
+        primary_hash = primary_variants[0]["input_hash"]
+        primary_config_hash = primary_variants[0]["config_hash"]
+        request_variants = (*primary_variants, *backup_variants[:1])
         self.expected_calls = tuple(
             replace(
                 expected,
                 input_hash=primary_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.input_hash,
                 config_hash=primary_config_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.config_hash,
                 prompt_hash=hash_text(prompt) if expected.call_id == self._synthesis_call_id(paper_key) else expected.prompt_hash,
-                request_variants=(
-                    {"input_hash": primary_hash, "config_hash": primary_config_hash},
-                    {"input_hash": backup_hash, "config_hash": backup_config_hash},
-                ) if expected.call_id == self._synthesis_call_id(paper_key) else expected.request_variants,
+                max_attempts=(len(request_variants)
+                              if expected.call_id == self._synthesis_call_id(paper_key)
+                              else expected.max_attempts),
+                request_variants=request_variants
+                if expected.call_id == self._synthesis_call_id(paper_key)
+                else expected.request_variants,
             )
             for expected in self.expected_calls
         )
@@ -1628,9 +1763,13 @@ class Stage1AnalysisService:
         prepared: _PreparedStage1Item,
     ) -> tuple[dict[str, Any], tuple[str, ...]]:
         item = prepared.item
+        synthesis_budgets = stage1_output_budget_sequence(
+            "synthesis",
+            prepared.stage1_input_settings,
+        )
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
-                max_calls=max(2, self.settings.runtime.node_retry_limit + 2),
+                max_calls=len(synthesis_budgets) + 1,
                 max_retries_per_call=self.settings.runtime.node_retry_limit,
             ),
             ledger=self.receipt_ledger,
@@ -1881,6 +2020,7 @@ class Stage1AnalysisService:
             built_input=prepared.built_input,
             primary_config=prepared.primary_config,
             backup_config=prepared.backup_config,
+            stage1_input_settings=prepared.stage1_input_settings,
             runtime=runtime,
         )
         engine_type = str(provider_result.get("engine_type") or "primary").strip().lower()
@@ -1888,7 +2028,23 @@ class Stage1AnalysisService:
         provider_config = (
             prepared.backup_config if engine_type == "backup" else prepared.primary_config
         )
-        effective_provider_config = self._effective_provider_config(provider_config)
+        terminal_output_budget = int(
+            provider_result.get("stage1_terminal_output_tokens")
+            or synthesis_budgets[0]
+        )
+        terminal_retry_index = max(
+            0,
+            len(provider_result.get("stage1_requested_output_budgets") or ()) - 1,
+        )
+        effective_provider_config = self._stage1_provider_config(
+            provider_config,
+            stage="synthesis",
+            output_tokens=terminal_output_budget,
+            timeout_seconds=stage1_request_timeout_seconds(
+                prepared.stage1_input_settings,
+            ),
+            retry_index=terminal_retry_index,
+        )
         request_content = (
             self._text_only_content(prepared.built_input.user_message_content)
             if engine_type == "backup"
@@ -2199,6 +2355,23 @@ class Stage1AnalysisService:
             ai_summary=ai_summary,
         )
         eligibility = prepared.reuse_eligibility
+        stage1_input_metadata = prepared.built_input.to_metadata_dict()
+        stage1_input_metadata["output_budget_plan"] = {
+            "visual_scan": stage1_output_budget_snapshot(
+                "visual_scan",
+                prepared.stage1_input_settings,
+            ),
+            "synthesis": stage1_output_budget_snapshot(
+                "synthesis",
+                prepared.stage1_input_settings,
+            ),
+            "request_timeout_seconds": stage1_request_timeout_seconds(
+                prepared.stage1_input_settings,
+            ),
+            "semantic_retry_max_attempts": stage1_semantic_retry_max_attempts(
+                prepared.stage1_input_settings,
+            ),
+        }
         summary = {
             "status": "success",
             "paper_info": {
@@ -2213,7 +2386,7 @@ class Stage1AnalysisService:
             "processing_time": "",
             "ai_summary": ai_summary,
             "preprocess": prepared.preprocess_metadata,
-            "stage1_input": prepared.built_input.to_metadata_dict(),
+            "stage1_input": stage1_input_metadata,
             "provider": {
                 "route": provider_route,
                 "model": str(provider_config.get("model") or ""),
@@ -2255,6 +2428,22 @@ class Stage1AnalysisService:
                 ),
                 "raw_reinspection_fallback_reason": str(
                     transport_metadata.get("raw_reinspection_fallback_reason") or ""
+                ),
+                "requested_output_budgets": list(
+                    provider_result.get("stage1_requested_output_budgets") or []
+                ),
+                "length_retries": int(
+                    provider_result.get("stage1_length_retries") or 0
+                ),
+                "semantic_retries": int(
+                    coverage.get("semantic_retries") or 0
+                ),
+                "terminal_output_tokens": int(
+                    provider_result.get("stage1_terminal_output_tokens")
+                    or terminal_output_budget
+                ),
+                "request_timeout_seconds": stage1_request_timeout_seconds(
+                    prepared.stage1_input_settings,
                 ),
             },
             "stage1_reuse": {
@@ -2353,6 +2542,7 @@ class Stage1AnalysisService:
                     "failed_pages": failed_page_count,
                     "page_status": page_status,
                     "scan_batches": list(coverage.get("scan_batches") or []),
+                    "semantic_retries": int(coverage.get("semantic_retries") or 0),
                     "scan_coverage_status": "not_required",
                     "coverage_status": "not_required",
                     "final_synthesis_modality": str(
@@ -2403,6 +2593,7 @@ class Stage1AnalysisService:
         observed_visual_ids: set[str] = set()
         failed_pages: set[int] = set()
         omissions: list[dict[str, Any]] = []
+        semantic_retry_total = 0
         planned_visual_ids = [
             str(value)
             for value in (coverage.get("planned_visual_ids") or [])
@@ -2498,22 +2689,19 @@ class Stage1AnalysisService:
                 max_request_image_bytes=max_request,
             )
             prompt, system_prompt = self._visual_scan_request(prepared, batch)
-            effective_config = self._effective_provider_config(prepared.primary_config)
-            max_tokens, temperature = self._request_parameters(
-                effective_config,
-                default_max_tokens=3000,
+            visual_budgets = stage1_output_budget_sequence(
+                "visual_scan",
+                prepared.stage1_input_settings,
             )
-            input_payload = canonical_provider_request_payload(
-                prompt=prompt,
-                system_prompt=system_prompt,
-                user_content=scan_content,
-                response_format="json",
-                max_output_tokens=max_tokens,
-                temperature=temperature,
+            semantic_retry_limit = stage1_semantic_retry_max_attempts(
+                prepared.stage1_input_settings
+            )
+            request_timeout_seconds = stage1_request_timeout_seconds(
+                prepared.stage1_input_settings,
             )
             runtime = ProviderRuntime(
                 budget=ProviderBudgetV1(
-                    max_calls=max(1, self.settings.runtime.node_retry_limit + 1),
+                    max_calls=len(visual_budgets) * (semantic_retry_limit + 1),
                     max_retries_per_call=self.settings.runtime.node_retry_limit,
                 ),
                 ledger=self.receipt_ledger,
@@ -2531,26 +2719,135 @@ class Stage1AnalysisService:
                 closure_epoch_id=self.closure_epoch_id,
                 logical_attempt_identity=self.attempt_id,
             )
-            result = self._call_visual_scan(
-                prepared=prepared,
-                batch=batch,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                user_content=scan_content,
-                runtime=runtime,
-            )
-            self._ensure_receipt(
-                runtime,
-                prompt=prompt,
-                input_payload=input_payload,
-                api_config=effective_config,
-                route="Primary_Reader_API",
-                result=result,
-            )
+            result: Mapping[str, Any] = {
+                "status": "failed",
+                "error_kind": "invalid_response",
+                "message": "visual scan did not run",
+            }
+            effective_config: dict[str, Any] = {}
+            attempted_budgets: list[int] = []
+            length_retry_count = 0
+            semantic_retry_count = 0
+            semantic_validation_status = "not_evaluated"
+            semantic_validation_error = ""
+            semantic_valid = False
+            semantic_retry_index_terminal = 0
+            budget_retry_required = False
+            for retry_index, output_budget in enumerate(visual_budgets):
+                budget_retry_required = False
+                for semantic_retry_index in range(semantic_retry_limit + 1):
+                    semantic_retry_index_terminal = semantic_retry_index
+                    effective_config = self._stage1_provider_config(
+                        prepared.primary_config,
+                        stage="visual_scan",
+                        output_tokens=output_budget,
+                        timeout_seconds=request_timeout_seconds,
+                        retry_index=retry_index,
+                    )
+                    max_tokens, temperature = self._request_parameters(
+                        effective_config,
+                        default_max_tokens=output_budget,
+                    )
+                    input_payload = canonical_provider_request_payload(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        user_content=scan_content,
+                        response_format="json",
+                        max_output_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                    result = self._call_visual_scan(
+                        prepared=prepared,
+                        batch=batch,
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        user_content=scan_content,
+                        runtime=runtime,
+                        primary_config=effective_config,
+                        timeout_seconds=request_timeout_seconds,
+                    )
+                    normalized_content, semantic_error = self._validate_visual_observation_result(
+                        batch=batch,
+                        result=result,
+                    )
+                    is_length_result = self._is_length_result(result)
+                    transport_success = (
+                        str(result.get("status") or "").strip().lower() == "success"
+                    )
+                    semantic_valid = normalized_content is not None and not is_length_result
+                    if semantic_valid:
+                        result = {**dict(result), "content": normalized_content}
+                        semantic_validation_status = "passed"
+                        semantic_validation_error = ""
+                    elif is_length_result:
+                        semantic_validation_status = "not_evaluated"
+                        semantic_validation_error = "finish_reason=length"
+                    else:
+                        semantic_validation_status = "failed"
+                        semantic_validation_error = semantic_error
+                    receipt_semantic_retry_count = semantic_retry_count + (
+                        1
+                        if transport_success
+                        and not semantic_valid
+                        and not is_length_result
+                        and semantic_retry_index < semantic_retry_limit
+                        else 0
+                    )
+                    self._ensure_receipt(
+                        runtime,
+                        prompt=prompt,
+                        input_payload=input_payload,
+                        api_config=effective_config,
+                        route="Primary_Reader_API",
+                        result=result,
+                        semantic_metadata={
+                            "transport_status": "success" if transport_success else "failed",
+                            "semantic_validation_status": semantic_validation_status,
+                            "semantic_validation_error": semantic_validation_error,
+                            "semantic_retry_count": receipt_semantic_retry_count,
+                            "semantic_retry_index": semantic_retry_index,
+                        },
+                        force=bool(
+                            self.reader is not None
+                            and (retry_index > 0 or semantic_retry_index > 0)
+                        ),
+                    )
+                    attempted_budgets.append(output_budget)
+                    if semantic_valid:
+                        break
+                    if (
+                        transport_success
+                        and not is_length_result
+                        and semantic_error
+                        and semantic_retry_index < semantic_retry_limit
+                    ):
+                        semantic_retry_count += 1
+                        if self.logger:
+                            self.logger.warning(
+                                "Stage 1 visual scan response failed semantic validation; "
+                                "retrying the same primary request "
+                                f"({semantic_retry_index + 1}/{semantic_retry_limit})."
+                            )
+                        continue
+                    if is_length_result and retry_index < len(visual_budgets) - 1:
+                        budget_retry_required = True
+                        length_retry_count += 1
+                        if self.logger:
+                            self.logger.warning(
+                                "Stage 1 visual scan response was truncated; escalating output budget "
+                                f"from {output_budget} to {visual_budgets[retry_index + 1]} tokens."
+                            )
+                    break
+                if semantic_valid or not budget_retry_required:
+                    break
             payload, record, valid = self._publish_visual_observation(
                 prepared=prepared,
                 batch=batch,
                 result=result,
+                semantic_validation_status=semantic_validation_status,
+                semantic_validation_error=semantic_validation_error,
+                semantic_retry_count=semantic_retry_count,
+                semantic_retry_index=semantic_retry_index_terminal,
             )
             if record is not None:
                 observation_records.append(record)
@@ -2588,8 +2885,20 @@ class Stage1AnalysisService:
                     "observation_artifact_hash": record.content_hash if record is not None else "",
                     "error": str(payload.get("error") or "") if not valid else "",
                     "effective_transport": dict(effective_report),
+                    "requested_output_budgets": attempted_budgets,
+                    "length_retries": length_retry_count,
+                    "semantic_retries": semantic_retry_count,
+                    "transport_status": (
+                        "success"
+                        if str(result.get("status") or "").strip().lower() == "success"
+                        else "failed"
+                    ),
+                    "semantic_validation_status": semantic_validation_status,
+                    "semantic_validation_error": semantic_validation_error,
+                    "terminal_output_tokens": attempted_budgets[-1] if attempted_budgets else 0,
                 }
             )
+            semantic_retry_total += semantic_retry_count
 
         self._visual_observation_records[paper_key] = observation_records
         observed_pages = {
@@ -2634,6 +2943,7 @@ class Stage1AnalysisService:
                 "failed_pages": failed_count,
                 "page_status": page_status,
                 "scan_batches": scan_results,
+                "semantic_retries": semantic_retry_total,
                 "observation_artifact_ids": [record.artifact_id for record in observation_records],
                 "observation_artifact_hashes": [record.content_hash for record in observation_records],
                 "observation_artifact_paths": [record.path for record in observation_records],
@@ -2855,13 +3165,16 @@ class Stage1AnalysisService:
         system_prompt: str,
         user_content: Any,
         runtime: ProviderRuntime,
+        primary_config: Mapping[str, Any] | None = None,
+        timeout_seconds: int | None = None,
     ) -> Mapping[str, Any]:
+        active_primary_config = dict(primary_config or prepared.primary_config)
         if self.reader is not None:
             value = self.reader(
                 purpose="visual_scan",
                 prompt_text=prompt,
                 system_prompt=system_prompt,
-                primary_api_config=dict(prepared.primary_config),
+                primary_api_config=active_primary_config,
                 backup_api_config=dict(prepared.backup_config),
                 user_content=user_content,
                 provider_runtime=runtime,
@@ -2873,7 +3186,7 @@ class Stage1AnalysisService:
 
             value = get_summary_from_ai_detailed(
                 prompt,
-                cast(APIConfig, dict(prepared.primary_config)),
+                cast(APIConfig, active_primary_config),
                 cast(APIConfig, dict(prepared.backup_config)),
                 engine_type="primary",
                 logger=self.logger,
@@ -2883,6 +3196,7 @@ class Stage1AnalysisService:
                 provider_runtime=runtime,
                 system_prompt=system_prompt,
                 normalize_summary=False,
+                timeout_seconds=timeout_seconds,
                 max_single_image_bytes=prepared.stage1_input_settings.get("max_single_image_bytes"),
                 max_request_image_bytes=prepared.stage1_input_settings.get("max_request_image_bytes"),
             )
@@ -2894,30 +3208,53 @@ class Stage1AnalysisService:
             }
         return dict(value)
 
+    def _validate_visual_observation_result(
+        self,
+        *,
+        batch: VisualScanBatch,
+        result: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Return normalized content or a semantic validation diagnostic."""
+
+        content = result.get("content")
+        if str(result.get("status") or "").strip().lower() != "success":
+            return None, str(
+                result.get("message") or result.get("error_kind") or "visual_scan_failed"
+            )
+        if not isinstance(content, Mapping):
+            return None, "visual scan returned a non-object"
+        try:
+            normalized = validate_current_visual_observations_v2(
+                content,
+                allowed_visual_ids=batch.visual_ids,
+                expected_visual_refs=batch.visual_refs,
+                sent_visual_ids=batch.visual_ids,
+                candidate_refs=batch.child_candidates,
+            )
+        except ValueError as exc:
+            return None, str(exc)
+        return dict(normalized), ""
+
     def _publish_visual_observation(
         self,
         *,
         prepared: _PreparedStage1Item,
         batch: VisualScanBatch,
         result: Mapping[str, Any],
+        semantic_validation_status: str | None = None,
+        semantic_validation_error: str = "",
+        semantic_retry_count: int = 0,
+        semantic_retry_index: int = 0,
     ) -> tuple[dict[str, Any], ArtifactRecord | None, bool]:
-        content = result.get("content")
-        valid = False
-        error = ""
-        if str(result.get("status") or "").strip().lower() == "success" and isinstance(content, Mapping):
-            try:
-                content = validate_current_visual_observations_v2(
-                    content,
-                    allowed_visual_ids=batch.visual_ids,
-                    expected_visual_refs=batch.visual_refs,
-                    sent_visual_ids=batch.visual_ids,
-                    candidate_refs=batch.child_candidates,
-                )
-                valid = True
-            except ValueError as exc:
-                error = str(exc)
-        else:
-            error = str(result.get("message") or result.get("error_kind") or "visual_scan_failed")
+        content, validation_error = self._validate_visual_observation_result(
+            batch=batch,
+            result=result,
+        )
+        valid = content is not None
+        error = str(semantic_validation_error or validation_error or "")
+        validation_status = str(
+            semantic_validation_status or ("passed" if valid else "failed")
+        )
         payload = {
             "artifact_type": "stage1_visual_observations",
             "artifact_version": VISUAL_OBSERVATIONS_VERSION,
@@ -2968,6 +3305,17 @@ class Stage1AnalysisService:
                 producer="services.stage1_analysis_service.Stage1AnalysisService",
                 artifact_id=self._visual_scan_call_id(self._paper_key(prepared.item), batch.batch_index),
                 depends_on=dependencies,
+                metadata={
+                    "transport_status": (
+                        "success"
+                        if str(result.get("status") or "").strip().lower() == "success"
+                        else "failed"
+                    ),
+                    "semantic_validation_status": validation_status,
+                    "semantic_validation_error": error,
+                    "semantic_retry_count": int(max(0, semantic_retry_count)),
+                    "semantic_retry_index": int(max(0, semantic_retry_index)),
+                },
             )
         except (OSError, RegistryError, TypeError, ValueError) as exc:
             payload["status"] = "failed"
@@ -3724,6 +4072,7 @@ class Stage1AnalysisService:
         bound: list[ExpectedProviderCall] = []
         paper_ids: list[str] = []
         stable_source_ids: list[str] = []
+        expected_output_ids: list[str] = []
         all_records = self.registry.list_records()
         for expected in self.expected_calls:
             receipt = by_call.get(expected.call_id)
@@ -3752,6 +4101,17 @@ class Stage1AnalysisService:
                 else None
             )
             output_record = source_record or visual_record or paper_record
+            if output_record is not None:
+                try:
+                    output_is_intact = (
+                        output_record.status == "ready"
+                        and Path(output_record.path).is_file()
+                        and file_sha256(output_record.path) == output_record.content_hash
+                    )
+                except (OSError, TypeError, ValueError):
+                    output_is_intact = False
+                if output_is_intact:
+                    expected_output_ids.append(output_record.artifact_id)
             if source_record is not None:
                 stable_source_ids.append(source_record.artifact_id)
             if paper_record is not None and source_record is None:
@@ -3832,6 +4192,7 @@ class Stage1AnalysisService:
             "summary_source_manifest",
             *sorted(set(paper_ids)),
             *sorted(set(stable_source_ids)),
+            *sorted(set(expected_output_ids)),
             *[record.artifact_id for record in reuse_records],
         )
         if self.expected_calls:
@@ -4039,7 +4400,10 @@ class Stage1AnalysisService:
                 f"Stage 1 source PDF is missing for {self._paper_key(item)}: {source_pdf or '<empty>'}"
             )
 
-        preprocess = self._preprocess(source_pdf)
+        preprocess = self._preprocess(
+            source_pdf,
+            source_role=str(item.paper_info.get("source_attachment_role") or ""),
+        )
         preprocess_metadata = self._preprocess_metadata(preprocess)
         evidence_manifest = build_evidence_manifest_v1(
             job_id=self.job_id,
@@ -4084,9 +4448,10 @@ class Stage1AnalysisService:
             prompt_values={"SUMMARY_SCHEMA_CONTRACT": build_summary_schema_contract()},
         )
 
+        synthesis_budgets = stage1_output_budget_sequence("synthesis", stage1_settings)
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
-                max_calls=max(2, self.settings.runtime.node_retry_limit + 2),
+                max_calls=len(synthesis_budgets) + 1,
                 max_retries_per_call=self.settings.runtime.node_retry_limit,
             ),
             ledger=self.receipt_ledger,
@@ -4107,13 +4472,30 @@ class Stage1AnalysisService:
             built_input=built_input,
             primary_config=primary_config,
             backup_config=dict(self.settings.section("Backup_Reader_API")),
+            stage1_input_settings=stage1_settings,
             runtime=runtime,
         )
         legacy_engine = str(provider_result.get("engine_type") or "primary").strip().lower()
-        legacy_config = self._effective_provider_config(
+        legacy_base_config = (
             dict(self.settings.section("Backup_Reader_API"))
             if legacy_engine == "backup"
             else primary_config
+        )
+        legacy_budgets = stage1_output_budget_sequence("synthesis", stage1_settings)
+        legacy_output_budget = int(
+            provider_result.get("stage1_terminal_output_tokens")
+            or legacy_budgets[0]
+        )
+        legacy_retry_index = max(
+            0,
+            len(provider_result.get("stage1_requested_output_budgets") or ()) - 1,
+        )
+        legacy_config = self._stage1_provider_config(
+            legacy_base_config,
+            stage="synthesis",
+            output_tokens=legacy_output_budget,
+            timeout_seconds=stage1_request_timeout_seconds(stage1_settings),
+            retry_index=legacy_retry_index,
         )
         legacy_content = (
             self._text_only_content(built_input.user_message_content)
@@ -4166,7 +4548,7 @@ class Stage1AnalysisService:
             tuple(receipt.receipt_id for receipt in runtime.receipts),
         )
 
-    def _preprocess(self, source_pdf: str) -> Any:
+    def _preprocess(self, source_pdf: str, *, source_role: str = "") -> Any:
         preprocess_config = {
             str(section): dict(values) if isinstance(values, Mapping) else values
             for section, values in self.config.items()
@@ -4180,21 +4562,26 @@ class Stage1AnalysisService:
         if result is None:
             raise RuntimeError(f"Stage 1 preprocessing failed or was disabled for {source_pdf}")
         reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
-        if has_blocking_stage1_reason(reasons):
+        scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
+        if has_blocking_stage1_reason(reasons) and not scanned_primary:
             raise RuntimeError(
                 f"Stage 1 preprocessing is incomplete for {source_pdf}: {', '.join(reasons)}"
             )
         if not str(result.stage1_input_text or "").strip():
             fallback_text = str(result.plain_text or result.markdown_text or "").strip()
-            if fallback_text:
+            if fallback_text and _has_substantive_stage1_text(fallback_text):
                 result = replace(
                     result,
                     stage1_input_text=fallback_text,
                     selected_text_source="plain_text_fallback",
                     stage1_quality_level="fallback",
                 )
-        if not str(result.stage1_input_text or "").strip():
+        if not str(result.stage1_input_text or "").strip() and not scanned_primary:
             raise RuntimeError(f"Stage 1 preprocessing produced empty input for {source_pdf}")
+        if scanned_primary and not list(getattr(result, "page_index", []) or []):
+            raise RuntimeError(
+                f"SCANNED_PRIMARY preprocessing produced no page index for {source_pdf}"
+            )
         return result
 
     def _preprocess_metadata(self, result: Any) -> dict[str, Any]:
@@ -4252,6 +4639,7 @@ class Stage1AnalysisService:
         built_input: Any,
         primary_config: Mapping[str, Any],
         backup_config: Mapping[str, Any],
+        stage1_input_settings: Mapping[str, Any],
         runtime: ProviderRuntime,
     ) -> Mapping[str, Any]:
         if self.reader is not None:
@@ -4264,26 +4652,103 @@ class Stage1AnalysisService:
                 provider_runtime=runtime,
                 paper_info=dict(item.paper_info),
             )
-        else:
-            from ai_interface import get_summary_from_ai_with_fallback
+            if not isinstance(value, Mapping):
+                raise RuntimeError(f"Stage 1 reader returned a non-object for {self._paper_key(item)}")
+            return dict(value)
 
-            visual_coverage = built_input.visual_coverage or {}
-            value = get_summary_from_ai_with_fallback(
+        from ai_interface import get_summary_from_ai_detailed
+
+        visual_coverage = built_input.visual_coverage or {}
+        system_prompt = self.prompt_registry.read("stage1.analysis.system.v3")
+        request_timeout_seconds = stage1_request_timeout_seconds(stage1_input_settings)
+        synthesis_budgets = stage1_output_budget_sequence(
+            "synthesis",
+            stage1_input_settings,
+        )
+        primary_result: Mapping[str, Any] = {
+            "status": "failed",
+            "error_kind": "invalid_response",
+            "message": "primary Stage 1 reader did not run",
+        }
+        attempted_budgets: list[int] = []
+        for retry_index, output_budget in enumerate(synthesis_budgets):
+            staged_primary_config = self._stage1_provider_config(
+                primary_config,
+                stage="synthesis",
+                output_tokens=output_budget,
+                timeout_seconds=request_timeout_seconds,
+                retry_index=retry_index,
+            )
+            primary_result = get_summary_from_ai_detailed(
                 built_input.prompt_text,
-                cast(APIConfig, dict(primary_config)),
+                cast(APIConfig, staged_primary_config),
                 cast(APIConfig, dict(backup_config)),
+                engine_type="primary",
                 logger=self.logger,
                 config=self.config,
                 user_content=built_input.user_message_content,
-                return_detailed=True,
+                retry_attempts=1,
+                timeout_seconds=request_timeout_seconds,
                 provider_runtime=runtime,
-                system_prompt=self.prompt_registry.read("stage1.analysis.system.v3"),
+                system_prompt=system_prompt,
+                normalize_summary=False,
                 max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
                 max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
             )
-        if not isinstance(value, Mapping):
-            raise RuntimeError(f"Stage 1 reader returned a non-object for {self._paper_key(item)}")
-        return dict(value)
+            attempted_budgets.append(output_budget)
+            if str(primary_result.get("status") or "").strip().casefold() == "success":
+                return {
+                    **dict(primary_result),
+                    "stage1_output_stage": "synthesis",
+                    "stage1_requested_output_budgets": attempted_budgets,
+                    "stage1_length_retries": max(0, len(attempted_budgets) - 1),
+                    "stage1_terminal_output_tokens": output_budget,
+                    "stage1_request_timeout_seconds": request_timeout_seconds,
+                }
+            if not self._is_length_result(primary_result) or retry_index >= len(synthesis_budgets) - 1:
+                break
+            if self.logger:
+                self.logger.warning(
+                    "Stage 1 synthesis response was truncated; escalating output budget "
+                    f"from {output_budget} to {synthesis_budgets[retry_index + 1]} tokens."
+                )
+
+        backup_config_for_stage = self._stage1_provider_config(
+            backup_config,
+            stage="synthesis",
+            output_tokens=synthesis_budgets[0],
+            timeout_seconds=request_timeout_seconds,
+            retry_index=0,
+        )
+        backup_result = get_summary_from_ai_detailed(
+            built_input.prompt_text,
+            cast(APIConfig, dict(primary_config)),
+            cast(APIConfig, backup_config_for_stage),
+            engine_type="backup",
+            logger=self.logger,
+            config=self.config,
+            user_content=built_input.user_message_content,
+            retry_attempts=1,
+            timeout_seconds=request_timeout_seconds,
+            provider_runtime=runtime,
+            system_prompt=system_prompt,
+            normalize_summary=False,
+            max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
+            max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
+        )
+        return {
+            **dict(backup_result),
+            "fallback_reason": str(
+                primary_result.get("message")
+                or primary_result.get("error_kind")
+                or "primary_reader_failed_before_backup"
+            )[:240],
+            "stage1_output_stage": "synthesis",
+            "stage1_requested_output_budgets": attempted_budgets,
+            "stage1_length_retries": max(0, len(attempted_budgets) - 1),
+            "stage1_terminal_output_tokens": synthesis_budgets[0],
+            "stage1_request_timeout_seconds": request_timeout_seconds,
+        }
 
     @staticmethod
     def _canonical_substantive_summary(provider_result: Mapping[str, Any]) -> dict[str, Any]:
@@ -4326,14 +4791,23 @@ class Stage1AnalysisService:
         api_config: Mapping[str, Any],
         route: str,
         result: Mapping[str, Any],
+        semantic_metadata: Mapping[str, Any] | None = None,
+        force: bool = False,
     ) -> None:
-        if runtime.receipts:
+        if runtime.receipts and not force:
             return
         try:
             admission = runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
             receipt_metadata: dict[str, Any] = {
                 "execution_mode": "injected_reader",
+                "requested_output_tokens": int(
+                    input_payload.get("max_output_tokens") or 0
+                ) if isinstance(input_payload, Mapping) else 0,
             }
+            if semantic_metadata:
+                receipt_metadata.update(
+                    {str(key): value for key, value in semantic_metadata.items()}
+                )
             transport_metadata = result.get("transport_metadata")
             if isinstance(transport_metadata, Mapping):
                 receipt_metadata.update(

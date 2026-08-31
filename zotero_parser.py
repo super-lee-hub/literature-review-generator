@@ -352,6 +352,7 @@ def _parse_entry_lines(
     current_end = 0
     current_parts: List[str] = []
     section = ""
+    section_last_field = ""
     title_parts: List[str] = []
     title_start = 0
     title_end = 0
@@ -369,6 +370,7 @@ def _parse_entry_lines(
         )
 
     def assign(field_name: str, source_key: str, parts: Sequence[str], start: int, end: int) -> None:
+        nonlocal section_last_field
         value = _normalize_field_value(field_name, parts)
         if not value:
             return
@@ -377,6 +379,7 @@ def _parse_entry_lines(
             paper.setdefault(field_name, []).extend(values)
         elif field_name in {"attachments", "tags"}:
             paper.setdefault(field_name, []).append(value)
+            section_last_field = field_name
         else:
             if paper.get(field_name):
                 diagnostics.append(
@@ -410,7 +413,13 @@ def _parse_entry_lines(
         stripped = raw_line.strip()
         if not stripped:
             flush_current()
-            section = ""
+            # Zotero's standard export places a blank separator between the
+            # "Tags"/"Attachments" heading and its bullet list.  Preserve
+            # those list sections across that separator so attachment paths
+            # remain available to the deterministic PDF matcher.
+            if section not in {"tags", "attachments"}:
+                section = ""
+            section_last_field = ""
             continue
 
         normalized_line = _normalized_key(stripped.rstrip(":："))
@@ -435,6 +444,7 @@ def _parse_entry_lines(
             current_end = line_number
             current_parts = [value] if value else []
             section = ""
+            section_last_field = ""
             saw_field = True
             continue
 
@@ -449,6 +459,21 @@ def _parse_entry_lines(
             wrapped_fields_joined += 1
             continue
         if section:
+            if section_last_field == section and paper.get(section):
+                values = paper[section]
+                values[-1] = _normalize_field_value(section, [str(values[-1]), stripped])
+                existing_sources = sources.get(section, [])
+                if existing_sources:
+                    source = existing_sources[-1]
+                    existing_sources[-1] = ZoteroFieldSourceV1(
+                        field=source.field,
+                        source_key=source.source_key,
+                        line_start=source.line_start,
+                        line_end=line_number,
+                        parser_route=source.parser_route,
+                    )
+                wrapped_fields_joined += 1
+                continue
             assign(section, section, [stripped], line_number, line_number)
             continue
 

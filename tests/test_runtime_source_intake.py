@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import fitz  # type: ignore
 
 from runtime.source_intake import (
     build_direct_source_bundle,
@@ -36,7 +37,11 @@ def test_build_zotero_source_bundle_uses_parser_and_file_matching(monkeypatch, t
     report_path.write_text("stub", encoding="utf-8")
     library_path.mkdir()
     matched_pdf = library_path / "matched.pdf"
-    matched_pdf.write_bytes(b"%PDF-1.4\n%matched\n")
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 72), "A Zotero Paper\nSmith, John\n2024")
+    document.save(matched_pdf)
+    document.close()
 
     monkeypatch.setattr(
         "runtime.source_intake.parse_zotero_report_result",

@@ -1718,6 +1718,49 @@ def _validate_stage1_visual_observations_v2(record: Any, path: str | Path, root:
         digest = str(root.get(field) or "")
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
             raise ArtifactSchemaError(f"stage1_visual_observations.{field} is not a SHA-256 hex digest")
+    from services.stage1_visual_scan import VISUAL_SCAN_PROMPT_ID
+
+    if root.get("prompt_id") == VISUAL_SCAN_PROMPT_ID:
+        metadata = getattr(record, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            raise ArtifactSchemaError(
+                "stage1_visual_observations v3 prompt requires validation metadata"
+            )
+        required_metadata = (
+            "transport_status",
+            "semantic_validation_status",
+            "semantic_validation_error",
+            "semantic_retry_count",
+            "semantic_retry_index",
+        )
+        missing_metadata = [key for key in required_metadata if key not in metadata]
+        if missing_metadata:
+            raise ArtifactSchemaError(
+                "stage1_visual_observations validation metadata is missing: "
+                + ", ".join(missing_metadata)
+            )
+        if metadata.get("transport_status") not in {"success", "failed"}:
+            raise ArtifactSchemaError(
+                "stage1_visual_observations transport_status is invalid"
+            )
+        if metadata.get("semantic_validation_status") not in {
+            "passed",
+            "failed",
+            "not_evaluated",
+        }:
+            raise ArtifactSchemaError(
+                "stage1_visual_observations semantic_validation_status is invalid"
+            )
+        if not isinstance(metadata.get("semantic_validation_error"), str):
+            raise ArtifactSchemaError(
+                "stage1_visual_observations semantic_validation_error must be a string"
+            )
+        for field_name in ("semantic_retry_count", "semantic_retry_index"):
+            value = metadata.get(field_name)
+            if type(value) is not int or value < 0:
+                raise ArtifactSchemaError(
+                    f"stage1_visual_observations {field_name} must be a non-negative integer"
+                )
     status = str(root.get("status") or "")
     if status not in {"success", "failed"}:
         raise ArtifactSchemaError("stage1_visual_observations.status is invalid")

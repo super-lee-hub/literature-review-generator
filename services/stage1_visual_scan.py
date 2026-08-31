@@ -17,12 +17,16 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from services.prompt_registry import PromptRegistry
+from services.stage1_visual_schema import (
+    VISUAL_EVIDENCE_KINDS_SET,
+    visual_evidence_kinds_json,
+)
 
 
 VISUAL_INPUT_IDENTITY_VERSION = "stage1_visual_input_identity/v1"
 VISUAL_OBSERVATIONS_ARTIFACT_TYPE = "stage1_visual_observations"
 VISUAL_OBSERVATIONS_VERSION = "v2"
-VISUAL_SCAN_PROMPT_ID = "stage1.visual_scan.system.v2"
+VISUAL_SCAN_PROMPT_ID = "stage1.visual_scan.system.v3"
 DEFAULT_MAX_REQUEST_IMAGE_BYTES = 36_000_000
 DEFAULT_MAX_SINGLE_IMAGE_BYTES = 24_000_000
 _BASE64_NUMERATOR = 4
@@ -332,16 +336,7 @@ _RAW_REINSPECTION_FIELDS = {
     "requires_raw_reinspection",
 }
 _ATTRIBUTION_STATUSES = {"resolved", "ambiguous", "no_matching_candidate"}
-_EVIDENCE_KINDS = {
-    "quantitative_values",
-    "significance_markers",
-    "ocr_conflict",
-    "relationships",
-    "axes_or_headers",
-    "visible_text",
-    "layout_observations",
-    "manual_review",
-}
+_EVIDENCE_KINDS = VISUAL_EVIDENCE_KINDS_SET
 _ARTIFACT_TYPES = {"page_snapshot", "figure_crop", "table_crop", "formula_crop"}
 _CONFIDENCE = {"high", "medium", "low"}
 
@@ -1660,7 +1655,10 @@ def build_visual_scan_prompt(batch: VisualScanBatch, *, ocr_by_visual_id: Mappin
         )
         + "\nReturn exactly one observation for every image actually sent; use low confidence and manual review when unclear."
     )
-    return user_text, registry.read(VISUAL_SCAN_PROMPT_ID)
+    return user_text, registry.render(
+        VISUAL_SCAN_PROMPT_ID,
+        {"EVIDENCE_KINDS_JSON": visual_evidence_kinds_json()},
+    )
 
 
 __all__ = [

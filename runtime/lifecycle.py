@@ -54,6 +54,51 @@ class BootstrappedRuntimeContext:
     resumed_from_attempt: int | None = None
 
 
+def _source_remediation_resume_allowed(
+    persisted_report: Mapping[str, Any],
+    current_fingerprint: Mapping[str, Any],
+    *,
+    source_canonical_ready: bool,
+    prior_outcome: Mapping[str, Any],
+    provider_receipt_count: int,
+) -> bool:
+    """Allow only a source-only fingerprint refresh after a blocked intake.
+
+    Canonical attachment selection is a deterministic source remediation.  It
+    may legitimately change the source inventory hash after an earlier run
+    stopped before any stage completed, but it must never make a partially
+    executed provider job resumable with different inputs.
+    """
+
+    if not source_canonical_ready or provider_receipt_count != 0:
+        return False
+    if str(persisted_report.get("state") or "") not in {"non_resumable", "blocked"}:
+        return False
+    if (
+        str(prior_outcome.get("job_status") or "") != "completed"
+        or str(prior_outcome.get("job_disposition") or "") != "needs_review"
+        or bool(prior_outcome.get("canonical_ready"))
+        or list(prior_outcome.get("completed_stages") or [])
+    ):
+        return False
+    old_fingerprint = persisted_report.get("fingerprint_bundle")
+    if not isinstance(old_fingerprint, Mapping):
+        return False
+    if (
+        str(old_fingerprint.get("config_hash") or "")
+        != str(current_fingerprint.get("config_hash") or "")
+        or str(old_fingerprint.get("request_hash") or "")
+        != str(current_fingerprint.get("request_hash") or "")
+    ):
+        return False
+    return (
+        bool(str(old_fingerprint.get("source_hash") or ""))
+        and bool(str(current_fingerprint.get("source_hash") or ""))
+        and str(old_fingerprint.get("source_hash"))
+        != str(current_fingerprint.get("source_hash"))
+    )
+
+
 def _required_stages_for_request(
     request: Any,
     *,
@@ -279,7 +324,40 @@ def bootstrap_job_runtime(
         if str(persisted_report.get("job_id") or "") != workspace.job_id:
             raise RuntimeError("resume state report belongs to another job")
         if persisted_report.get("fingerprint_bundle") != fingerprint_bundle_dict:
-            raise RuntimeError("resume fingerprint does not match the persisted job inputs")
+            prior_outcome: dict[str, Any] = {}
+            prior_outcome_record = registry.get("job_outcome")
+            if (
+                prior_outcome_record is not None
+                and prior_outcome_record.status == "ready"
+                and Path(prior_outcome_record.path).is_file()
+            ):
+                try:
+                    with open(prior_outcome_record.path, "r", encoding="utf-8") as handle:
+                        loaded_outcome = json.load(handle)
+                    if isinstance(loaded_outcome, Mapping):
+                        prior_outcome = dict(loaded_outcome)
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    prior_outcome = {}
+            provider_receipt_count = sum(
+                1
+                for record in registry.list_records()
+                if record.status == "ready"
+                and str(record.artifact_type or "").casefold()
+                in {
+                    "provider_receipt",
+                    "provider_receipt_closure",
+                    "stage1_provider_receipt",
+                    "stage1_provider_receipts",
+                }
+            )
+            if not _source_remediation_resume_allowed(
+                persisted_report,
+                fingerprint_bundle_dict,
+                source_canonical_ready=bool(source_canonical_ready),
+                prior_outcome=prior_outcome,
+                provider_receipt_count=provider_receipt_count,
+            ):
+                raise RuntimeError("resume fingerprint does not match the persisted job inputs")
         if resume_preflight is not None:
             resume_preflight(workspace)
 

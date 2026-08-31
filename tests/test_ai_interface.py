@@ -666,3 +666,52 @@ def test_stage1_reader_scheduler_disables_quota_engine_for_round(monkeypatch) ->
     assert result == {"ok": True}
     assert calls == ["primary", "backup", "primary"]
     assert disabled == ["backup"]
+
+
+def test_json_length_response_is_incomplete_and_can_trigger_fallback() -> None:
+    response = Mock()
+    response.status_code = 200
+
+    result = ai_interface._format_success_result(
+        '{"summary": "prefix"}',
+        "json",
+        response,
+        "length",
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_kind"] == "invalid_response"
+    assert result["finish_reason"] == "length"
+
+
+def test_stage1_reader_scheduler_falls_back_after_length_termination(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_detailed(*_args, engine_type="primary", **_kwargs):
+        calls.append(engine_type)
+        if engine_type == "primary":
+            return {
+                "status": "failed",
+                "content": {"partial": True},
+                "engine_type": "primary",
+                "error_kind": "invalid_response",
+                "finish_reason": "length",
+                "message": "truncated",
+            }
+        return {
+            "status": "success",
+            "content": {"complete": True},
+            "engine_type": "backup",
+        }
+
+    monkeypatch.setattr(ai_interface, "_load_api_runtime_settings", lambda: (600, 1))
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+
+    result = ai_interface.get_summary_from_ai_with_fallback(
+        "prompt",
+        {"api_key": "primary", "model": "m1"},
+        {"api_key": "backup", "model": "m2"},
+    )
+
+    assert result == {"complete": True}
+    assert calls == ["primary", "backup"]

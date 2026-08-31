@@ -1,6 +1,6 @@
 import main
 
-from services.paper_identity import normalize_doi, normalize_paper_identity
+from services.paper_identity import normalize_doi, normalize_paper_identity, normalized_title_key
 
 
 def test_valid_doi_and_doi_url_normalize():
@@ -66,3 +66,12 @@ def test_runtime_paper_key_prefers_stable_source_identity():
 
     assert main.LiteratureReviewGenerator.get_paper_key(paper) == "short source title_smith_lee"
     assert main.LiteratureReviewGenerator.get_paper_key(mutated_after_ai_backfill) == "short source title_smith_lee"
+
+
+def test_title_key_normalizes_cjk_line_wrap_spaces_and_compatibility_forms():
+    assert normalized_title_key("平台赞助披露如何影响消费者的互动行为") == normalized_title_key(
+        "平台赞助披露如何影响消费者的 互动行为"
+    )
+    assert normalized_title_key("Eﬀects of Influencer Marketing") == normalized_title_key(
+        "Effects of Influencer Marketing"
+    )

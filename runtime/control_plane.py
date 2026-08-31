@@ -227,6 +227,10 @@ class ReviewControlPlane:
         payload["control_plane_version"] = CONTROL_PLANE_VERSION
         payload["canonical_ready"] = bool(result.canonical_ready)
         payload["success"] = bool(result.success)
+        payload["SUMMARY_SCHEMA_READY"] = bool(result.summary_schema_ready)
+        payload["VISUAL_QUALIFICATION_READY"] = bool(result.visual_qualification_ready)
+        payload["STAGE1_AUTHORITY_READY"] = bool(result.stage1_authority_ready)
+        payload["STAGE1_REUSE_ELIGIBLE"] = bool(result.stage1_reuse_eligible)
         return payload
 
     def status(self, *, job_id: str | None = None, workspace: str | Path | None = None) -> dict[str, Any]:

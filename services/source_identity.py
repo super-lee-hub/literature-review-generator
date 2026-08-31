@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import difflib
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -19,6 +21,83 @@ ArtifactStatus = Literal["ready", "quarantined", "invalid"]
 
 IDENTITY_POLICY_VERSION = "source-identity-v1"
 _DOI_SEARCH = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9&]+", re.IGNORECASE)
+_METADATA_AUTHOR_NOISE = {"cnki", "administrator", "wds", "rundonglee"}
+
+
+def _normalized_pdf_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return text.translate(
+        str.maketrans(
+            {
+                "‐": "-",
+                "‑": "-",
+                "‒": "-",
+                "–": "-",
+                "—": "-",
+                "―": "-",
+            }
+        )
+    )
+
+
+def _compact_identity_text(value: Any) -> str:
+    text = _normalized_pdf_text(value).casefold()
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"[^\w\u3400-\u9fff]+", "", text, flags=re.UNICODE)
+
+
+def _title_variants(value: Any) -> tuple[str, ...]:
+    raw = _normalized_pdf_text(value)
+    variants: list[str] = []
+    for candidate in (raw, re.split(r"[:：]", raw, maxsplit=1)[-1]):
+        compact = _compact_identity_text(candidate)
+        if compact and compact not in variants:
+            variants.append(compact)
+    return tuple(variants)
+
+
+def _title_evidence_matches(expected_title: Any, source_text: Any) -> bool:
+    variants = _title_variants(expected_title)
+    if not variants:
+        return False
+    raw_text = _normalized_pdf_text(source_text)
+    compact_text = _compact_identity_text(raw_text)
+    if any(variant in compact_text for variant in variants):
+        return True
+
+    # A small OCR error (for example ``~onsumers``) or a broken title over
+    # several PDF text lines should not turn a visibly exact title into a
+    # missing source.  Acceptance still requires an author/year match in
+    # evaluate_source_identity.
+    lines = [
+        _compact_identity_text(line)
+        for line in raw_text.splitlines()
+        if _compact_identity_text(line)
+    ]
+    for variant in variants:
+        minimum_length = max(12, int(len(variant) * 0.65))
+        for start in range(len(lines)):
+            combined = ""
+            for end in range(start, min(len(lines), start + 4)):
+                combined += lines[end]
+                if len(combined) > int(len(variant) * 1.35):
+                    break
+                if len(combined) < minimum_length:
+                    continue
+                ratio = difflib.SequenceMatcher(None, variant, combined).ratio()
+                if ratio >= 0.88:
+                    return True
+    return False
+
+
+def _is_expected_doi_artifact(candidate: str, expected_doi: str) -> bool:
+    if not expected_doi or not candidate.startswith(expected_doi):
+        return False
+    suffix = candidate[len(expected_doi) :]
+    return bool(
+        re.fullmatch(r"/\d+", suffix)
+        or re.fullmatch(r"(?:wileylogo|wiley|logo)", suffix, flags=re.IGNORECASE)
+    )
 
 
 def _stable_hash(payload: Mapping[str, Any]) -> str:
@@ -45,7 +124,7 @@ def _normalize_identity_input(value: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "title": str(value.get("title") or "").strip(),
         "authors": normalized_authors,
-        "year": _safe_year(value.get("year")),
+        "year": _safe_year(value.get("year") or value.get("date")),
         "doi": normalize_doi(value.get("doi")),
     }
 
@@ -200,50 +279,78 @@ def _first_page_identity_observation(
 ) -> dict[str, Any]:
     expected_value = _normalize_identity_input(expected)
     metadata_title = str(metadata.get("title") or "").strip()
-    normalized_text = normalized_title_key(first_page_text)
-    expected_title_key = normalized_title_key(expected_value["title"])
+    normalized_text = _compact_identity_text(first_page_text)
+    year_evidence_text = _normalized_pdf_text(first_page_text).casefold()
+    expected_title_key = _compact_identity_text(expected_value["title"])
+    title_confirmed = _title_evidence_matches(expected_value["title"], first_page_text)
     title = metadata_title
-    if expected_title_key != "unknown_title" and expected_title_key in normalized_text:
+    if title_confirmed:
         title = expected_value["title"]
     identity_evidence_text = normalized_text
-    if expected_title_key != "unknown_title" and expected_title_key in normalized_text:
+    if title_confirmed and expected_title_key:
         identity_evidence_text = normalized_text.replace(expected_title_key, " ", 1)
 
     metadata_author = str(metadata.get("author") or "").strip()
-    observed_authors = [metadata_author] if metadata_author else []
-    if not observed_authors:
-        expected_authors = expected_value["authors"]
-        expected_author_key = (
-            normalized_title_key(expected_authors[0]) if expected_authors else "unknown_title"
-        )
-        first_author_is_observed = bool(
-            expected_authors
-            and expected_author_key != "unknown_title"
-            and expected_author_key in identity_evidence_text
-        )
-        if first_author_is_observed:
-            observed_authors = [expected_authors[0]]
+    expected_authors = expected_value["authors"]
+    expected_author_key = (
+        _compact_identity_text(expected_authors[0]) if expected_authors else ""
+    )
+    first_author_is_observed = bool(
+        expected_author_key and expected_author_key in identity_evidence_text
+    )
+    if first_author_is_observed:
+        # Prefer the article's visible author over exporter/editor metadata.
+        observed_authors = [expected_authors[0]]
+    elif metadata_author and _compact_identity_text(metadata_author) not in _METADATA_AUTHOR_NOISE:
+        observed_authors = [metadata_author]
+    else:
+        observed_authors = []
 
     expected_year = expected_value["year"]
     observed_year = (
         expected_year
         if expected_year
         and re.search(
-            rf"(?<!\d){re.escape(expected_year)}(?!\d)", identity_evidence_text
+            rf"(?<!\d){re.escape(expected_year)}(?!\d)", year_evidence_text
         )
         else ""
     )
 
     doi_candidates: list[str] = []
+    expected_doi = normalize_doi(expected_value.get("doi"))
     for raw_value in [
         metadata.get("subject"),
         metadata.get("keywords"),
         first_page_text,
     ]:
-        for match in _DOI_SEARCH.finditer(str(raw_value or "")):
+        for match in _DOI_SEARCH.finditer(_normalized_pdf_text(raw_value)):
             doi = normalize_doi(match.group(0))
             if doi and doi not in doi_candidates:
                 doi_candidates.append(doi)
+    if expected_doi in doi_candidates:
+        # Some PDF generators concatenate the text immediately following a
+        # DOI with the DOI token (for example ``10.x/abcjournal``).  When the
+        # exact expected DOI is independently present, discard only that
+        # alphanumeric prefix-extension artifact; genuinely different DOI
+        # candidates remain fail-closed ambiguous.
+        doi_candidates = [
+            candidate
+            for candidate in doi_candidates
+            if candidate == expected_doi
+            or not (
+                candidate.startswith(expected_doi)
+                and bool(re.fullmatch(r"[a-z0-9]+", candidate[len(expected_doi):]))
+            )
+        ]
+    elif len(doi_candidates) == 1 and _is_expected_doi_artifact(
+        doi_candidates[0], expected_doi
+    ):
+        # Publisher PDF layout sometimes appends a logo token or an article
+        # identifier to the DOI URL path (for example ``...70067WILEYlogo``
+        # or ``.../5510554``).  Treat that as the expected DOI only when the
+        # complete candidate has the expected DOI as its prefix and there is
+        # no competing DOI candidate.
+        doi_candidates = [expected_doi]
     observed_doi = doi_candidates[0] if len(doi_candidates) == 1 else ""
 
     return {

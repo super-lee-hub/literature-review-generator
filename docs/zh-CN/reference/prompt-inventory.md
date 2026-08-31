@@ -9,7 +9,7 @@ SHA-256 的唯一真源。生产调用只能通过
 |---|---|---|---|---|---|---|---|
 | `stage1.analysis.system.v3` | `prompts/active/stage1/system_analysis_v3.txt` | `Stage1AnalysisService` -> reader system prompt | ACTIVE | 无 | `summary_v2_lite` JSON | v3 | Stage 1 Prompt authority、provider receipt、expected call graph、reuse binding |
 | `stage1.analysis.user.v3` | `prompts/active/stage1/user_analysis_v3.txt` | `Stage1AnalysisService` -> `Stage1InputBuilder` | ACTIVE | `PAPER_FULL_TEXT`、`VISUAL_COVERAGE_JSON`、`SUMMARY_SCHEMA_CONTRACT` | `summary_v2_lite` JSON | v3 | Stage 1 Prompt authority、provider receipt、expected call graph、reuse binding |
-| `stage1.visual_scan.system.v2` | `prompts/active/stage1/system_visual_scan_v2.txt` | `stage1_visual_scan.build_visual_scan_prompt` | ACTIVE | 无 | 带页到 child 归因的 `stage1_visual_observations/v2` JSON | v2 | visual scan call identity、候选元数据、observation artifact、receipt、expected-call graph 和 reuse schema binding |
+| `stage1.visual_scan.system.v3` | `prompts/active/stage1/system_visual_scan_v3.txt` | `stage1_visual_scan.build_visual_scan_prompt` | ACTIVE | `EVIDENCE_KINDS_JSON` | 带页到 child 归因的 `stage1_visual_observations/v2` JSON | v3 | visual scan call identity、候选元数据、observation artifact、receipt、expected-call graph 和 reuse schema binding |
 | `free_mode.chat.system.v1` | `prompts/active/free_mode/system_chat_v1.txt` | `free_mode.service.plan_free_mode_chat_turn` | ACTIVE | 无 | Free Mode planner JSON | v1 | Free Mode provider receipt metadata |
 | `free_mode.profile.system.v1` | `prompts/active/free_mode/system_profile_v1.txt` | `free_mode.service.generate_free_mode_profile` | ACTIVE | 无 | Free Mode profile JSON | v1 | Free Mode provider receipt metadata |
 | `outline.node.system.v3` | `prompts/active/outline/system_outline_node_v3.txt` | `OutlineV3Executor` provider node binding | ACTIVE | 无 | Outline v3 node JSON | v3 | Outline provider binding、receipt、replay key |
@@ -26,6 +26,10 @@ SHA-256 的唯一真源。生产调用只能通过
 旧的 `stage1.visual_scan.system.v1` 只保留在
 `prompts/legacy/stage1/system_visual_scan_v1.txt`，不再是 ACTIVE 生产路由；v1
 observation artifact 不能满足当前 v2 reuse qualification。
+
+`stage1.visual_scan.system.v2` 也已移入
+`prompts/legacy/stage1/system_visual_scan_v2.txt`。它的 observation 字段仍是 v2，
+但旧 prompt identity 不能满足当前 v3 prompt binding 的 exact reuse qualification。
 
 审计后没有当前生产调用者的旧 flat prompt 已删除，不复制到 `legacy/`。所有
 精确 hash 保存在 `prompts/registry.json`，测试会校验 ACTIVE 文件、占位符、owner、

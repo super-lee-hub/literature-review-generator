@@ -199,7 +199,9 @@ def test_parse_result_v1_joins_wrapped_standard_fields(tmp_path: Path) -> None:
                 "DOI\t10.1234/",
                 "wrapped",
                 "附件",
-                "  o KEY/paper.pdf",
+                "",
+                "  o KEY/long paper",
+                "    name.pdf",
             ]
         ),
         encoding="utf-8",
@@ -212,13 +214,16 @@ def test_parse_result_v1_joins_wrapped_standard_fields(tmp_path: Path) -> None:
     assert result.parser_route == "standard"
     assert result.report_hash
     assert result.parser_version == "zotero-parser-v1"
-    assert result.stats.wrapped_fields_joined == 3
+    assert result.stats.wrapped_fields_joined == 4
     assert result.papers[0]["title"] == "A Long Study of Consumer Fairness"
     assert result.papers[0]["abstract"] == "First abstract line continued abstract line"
     assert result.papers[0]["url"] == "https://example.com/article"
     assert result.papers[0]["doi"] == "10.1234/wrapped"
     assert result.papers[0]["journal"] == "Journal of Testing"
     assert result.papers[0]["authors"] == ["Smith, John", "Doe, Jane"]
+    assert result.papers[0]["attachments"] == ["KEY/long paper name.pdf"]
+    attachment_source = result.records[0].field_sources["attachments"][0]
+    assert attachment_source.line_end == attachment_source.line_start + 1
     abstract_source = result.records[0].field_sources["abstract"][0]
     assert abstract_source.line_end == abstract_source.line_start + 1
     serialized = result.to_dict()

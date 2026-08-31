@@ -190,7 +190,18 @@ def test_long_paper_scans_every_nonblank_page_and_publishes_observations(tmp_pat
     assert closure_record is not None
     closure_payload = json.loads(Path(closure_record.path).read_text(encoding="utf-8"))
     assert closure_payload["payload"]["complete"] is True
-    assert len([record for record in service.registry.list_records() if record.artifact_type == "stage1_visual_observations"]) == 4
+    observation_records = [
+        record
+        for record in service.registry.list_records()
+        if record.artifact_type == "stage1_visual_observations"
+    ]
+    assert len(observation_records) == 4
+    closure_dependency_paths = {
+        Path(dependency.path).resolve() for dependency in closure_record.depends_on
+    }
+    assert {
+        Path(record.path).resolve() for record in observation_records
+    }.issubset(closure_dependency_paths)
 
 
 def test_long_paper_visual_run_reuses_without_rescan_or_provider_transport(tmp_path: Path) -> None:

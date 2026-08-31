@@ -348,9 +348,23 @@ class JobRunner:
                 if not canonical_ready:
                     degradation.append("no_ready_summary_sources")
             else:
-                canonical_ready = bool(ready_pdfs and not errors) and not any(
-                    item in {"ambiguous", "mismatch"} for item in identity_verdicts
+                source_snapshot = (
+                    bundle.source_snapshot if bundle is not None else {}
                 )
+                # The canonical attachment selector may deliberately accept
+                # a fully rendered SCANNED_PRIMARY whose PDF text identity is
+                # ambiguous because the scan has no usable text layer.  The
+                # source bundle's explicit canonicalization decision is the
+                # authority in that case; retain the old verdict fallback for
+                # bundles produced by older callers without that field.
+                if "canonical_ready" in source_snapshot:
+                    canonical_ready = bool(
+                        ready_pdfs and not errors and source_snapshot.get("canonical_ready")
+                    )
+                else:
+                    canonical_ready = bool(ready_pdfs and not errors) and not any(
+                        item in {"ambiguous", "mismatch"} for item in identity_verdicts
+                    )
                 if not ready_pdfs:
                     degradation.append("no_ready_pdf_sources")
         elif summary_paths:

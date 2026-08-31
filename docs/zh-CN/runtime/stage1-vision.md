@@ -21,9 +21,23 @@ Stage 1 始终把 MinerU 或其他预处理器生成的 normalized full text 作
   以及不超过 `final_image_refs_max` 张高价值 crop。二阶段选 crop 只决定最终复核，
   不决定哪些页面曾经被视觉模型看见。
 
+Stage 1 的视觉扫描和 synthesis 使用独立的 `stage1_*_max_output_tokens` 配置，
+不会继承历史固定的 5000-token 上限。若 provider 返回明确的
+`finish_reason=length`，运行时会在同一个 primary route 上按有限预算序列重试；
+每次请求的预算、实际 usage、finish reason 和 retry 序号都会进入 receipt，达到
+ceiling 后才允许进入 backup。`stage1_request_timeout_seconds` 只控制请求等待时间，
+不代替 output-token budget。
+
+视觉扫描当前使用 `stage1.visual_scan.system.v3`，但 observation artifact 仍然是
+`stage1_visual_observations/v2`。`evidence_kinds` 的合法枚举由共享 schema contract
+生成并注入 prompt；`candidate_visual_id` 只能放在候选 ID 字段中，不能混入 evidence
+kind。HTTP 200/JSON parse 成功不等于 semantic success；v2 校验失败时最多按
+`stage1_semantic_retry_max_attempts` 在同一 primary route 重试，仍失败就保留 failed
+observation 和不完整 coverage。
+
 ## 页到 crop 的归因与 reuse 资格
 
-第一遍扫描严格以页面为单位：长文覆盖只发送并观察 `page_snapshot`。v2 Prompt
+第一遍扫描严格以页面为单位：长文覆盖只发送并观察 `page_snapshot`。v3 Prompt
 会接收同页 `figure_crop`、`table_crop`、`formula_crop` 的有界候选元数据，但
 元数据只是候选，不是已经确认的观察。每个页面 observation 必须声明
 `resolved`、`ambiguous` 或 `no_matching_candidate`。只有通过严格校验的

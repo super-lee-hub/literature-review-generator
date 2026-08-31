@@ -39,12 +39,23 @@ def test_provider_runtime_enforces_budget_and_emits_redacted_append_only_receipt
             "api_base": "https://provider.example/v1",
         },
         result={"status": "success", "content": {"answer": "ok"}},
-        metadata={"authorization": "Bearer super-secret", "safe": "value"},
+        metadata={
+            "authorization": "Bearer super-secret",
+            "safe": "value",
+            "request_budget": {
+                "max_output_tokens": 32000,
+                "api_token": "nested-secret",
+            },
+            "requested_output_tokens": 32000,
+        },
     )
 
     assert receipt.status == "success"
     assert receipt.prompt_hash != "private prompt"
     assert receipt.metadata["authorization"] == "[REDACTED_SECRET]"
+    assert receipt.metadata["request_budget"]["max_output_tokens"] == 32000
+    assert receipt.metadata["request_budget"]["api_token"] == "[REDACTED_SECRET]"
+    assert receipt.metadata["requested_output_tokens"] == 32000
     persisted = ledger.list_receipts()
     assert persisted == (receipt,)
     assert "super-secret" not in (tmp_path / "provider_receipts.jsonl").read_text(encoding="utf-8")

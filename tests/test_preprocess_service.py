@@ -94,6 +94,7 @@ def test_preprocess_manager_defaults_to_local_even_with_ambient_mineru_token(tmp
     cache_dir = tmp_path / "cache"
     _make_text_pdf(pdf_path)
     monkeypatch.setenv("MINERU_API_TOKEN", "token")
+    monkeypatch.setenv("ALLOW_LOCAL_PARSE_FALLBACK", "true")
 
     config = {
         "Paths": {"output_path": str(tmp_path)},
@@ -124,6 +125,7 @@ def test_preprocess_manager_records_hybrid_skip_reason_without_losing_token_stat
     cache_dir = tmp_path / "cache"
     _make_text_pdf(pdf_path)
     monkeypatch.setenv("MINERU_API_TOKEN", "token")
+    monkeypatch.setenv("ALLOW_LOCAL_PARSE_FALLBACK", "true")
 
     config = {
         "Paths": {"output_path": str(tmp_path)},
@@ -464,6 +466,33 @@ def test_mineru_binary_request_rejects_untrusted_hosts(monkeypatch) -> None:
         manager._request_binary("https://attacker.example/result.zip")
 
 
+def test_mineru_allowlist_accepts_exact_official_https_host_and_rejects_other_schemes(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "MINERU_ALLOWED_URL_HOSTS",
+        "mineru.oss-cn-shanghai.aliyuncs.com,cdn-mineru.openxlab.org.cn",
+    )
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_base_url = "https://mineru.example/api/v4"
+
+    accepted = "https://mineru.oss-cn-shanghai.aliyuncs.com/upload/object.pdf"
+    assert manager._validate_mineru_url(accepted, purpose="upload URL") == accepted
+    result_cdn = "https://cdn-mineru.openxlab.org.cn/result/object.zip"
+    assert manager._validate_mineru_url(result_cdn, purpose="binary artifact URL") == result_cdn
+
+    with pytest.raises(RuntimeError, match="host is not trusted"):
+        manager._validate_mineru_url(
+            "https://evil.example/upload/object.pdf",
+            purpose="upload URL",
+        )
+    with pytest.raises(RuntimeError, match="host is not trusted"):
+        manager._validate_mineru_url(
+            "http://mineru.oss-cn-shanghai.aliyuncs.com/upload/object.pdf",
+            purpose="upload URL",
+        )
+
+
 def test_mineru_upload_rejects_untrusted_presigned_url(monkeypatch, tmp_path: Path) -> None:
     manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
     manager.mineru_base_url = "https://mineru.example/api/v4"
@@ -658,6 +687,7 @@ def test_preprocess_manager_force_docling_strategy_bypasses_local_pipeline(monke
 
 def test_hybrid_skip_logs_baseline_quality_metrics(monkeypatch) -> None:
     logger = _ListLogger()
+    monkeypatch.setenv("ALLOW_LOCAL_PARSE_FALLBACK", "true")
     manager = PreprocessManager(
         config={
             "Preprocess": {

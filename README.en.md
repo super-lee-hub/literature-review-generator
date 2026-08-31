@@ -127,6 +127,14 @@ The current validation service is `ValidationExecutionService`. Its
 adjudication reuse authority is bound to the appropriate provider ledger,
 receipt, source closure, attempt identity, and Registry dependency closure.
 
+MinerU presigned upload/result URLs remain behind the SSRF guard. Set
+`MINERU_ALLOWED_URL_HOSTS` in `.env` to exact HTTPS hostnames only; the official
+Shanghai OSS host currently returned by MinerU is
+`mineru.oss-cn-shanghai.aliyuncs.com`; the real smoke in this environment also
+returned `cdn-mineru.openxlab.org.cn` for the result CDN, so both are listed as
+separate exact hosts. Do not use `*`, include a scheme/path, or disable TLS or
+host validation.
+
 ## Stage 1 and prompt authority
 
 Stage 1 is vision-first with the experimental

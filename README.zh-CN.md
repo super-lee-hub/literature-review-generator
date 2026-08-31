@@ -167,6 +167,12 @@ python -m reviewctl validation-status --job <job_id>
 绑定 provider ledger、receipt、source closure、attempt identity 和 Registry
 dependency closure。
 
+MinerU 的 presigned upload/result 链接仍经过 SSRF 防护。`.env` 中的
+`MINERU_ALLOWED_URL_HOSTS` 必须填写精确的 HTTPS 主机名；官方默认返回的
+上海 OSS host 是 `mineru.oss-cn-shanghai.aliyuncs.com`；本次真实 smoke 返回的
+结果 CDN host 是 `cdn-mineru.openxlab.org.cn`，二者都必须作为精确 host 单独列出。
+不要填写 `*`、协议、路径，也不要关闭 TLS 或 host 校验。
+
 ## Stage 1 与 Prompt authority
 
 Stage 1 默认采用实验性的 `deepseek-v4-flash-vision-exp`：MinerU 文本仍是主

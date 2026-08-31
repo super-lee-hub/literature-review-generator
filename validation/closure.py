@@ -1263,6 +1263,54 @@ def _adjudication_reuse_call_issues(
     return issues
 
 
+def _request_variant_matches_receipt(
+    expected_row: Mapping[str, Any],
+    receipt_row: Mapping[str, Any],
+) -> bool:
+    """Return whether a receipt uses one complete declared request variant."""
+
+    for raw_variant in expected_row.get("request_variants") or ():
+        if not isinstance(raw_variant, Mapping):
+            continue
+        input_hash = str(raw_variant.get("input_hash") or "")
+        config_hash = str(raw_variant.get("config_hash") or "")
+        if (
+            input_hash
+            and config_hash
+            and str(receipt_row.get("input_hash") or "") == input_hash
+            and str(receipt_row.get("config_hash") or "") == config_hash
+        ):
+            return True
+    return False
+
+
+def _receipt_matches_expected_binding(
+    expected_row: Mapping[str, Any],
+    receipt_row: Mapping[str, Any],
+) -> bool:
+    """Validate a receipt against its base identity or a declared variant."""
+
+    variant_match = _request_variant_matches_receipt(expected_row, receipt_row)
+    for field_name in (
+        "attempt_id",
+        "node_id",
+        "logical_attempt_identity",
+        "prompt_hash",
+        "input_hash",
+        "config_hash",
+        "schema_hash",
+    ):
+        if (
+            field_name in {"input_hash", "config_hash"}
+            and variant_match
+        ):
+            continue
+        expected_value = str(expected_row.get(field_name) or "")
+        if not expected_value or str(receipt_row.get(field_name) or "") != expected_value:
+            return False
+    return True
+
+
 def _provider_closure_entry(
     stage: str,
     record: ArtifactRecord | None,
@@ -2070,6 +2118,7 @@ def _provider_closure_entry(
         expected_row = expected_by_id.get(str(row.get("call_id") or ""))
         if expected_row is None:
             continue
+        variant_match = _request_variant_matches_receipt(expected_row, row)
         for field_name in (
             "attempt_id",
             "node_id",
@@ -2079,6 +2128,8 @@ def _provider_closure_entry(
             "config_hash",
             "schema_hash",
         ):
+            if field_name in {"input_hash", "config_hash"} and variant_match:
+                continue
             expected_value = str(expected_row.get(field_name) or "")
             if not expected_value or str(row.get(field_name) or "") != expected_value:
                 blocking.append(f"provider_closure_receipt_binding_mismatch:{stage}:{field_name}")

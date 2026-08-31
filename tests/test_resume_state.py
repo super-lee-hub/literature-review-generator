@@ -1,6 +1,7 @@
 import json
 
 from services.progress_state import Stage1ProgressSnapshot, determine_resume_state, write_stage1_progress_snapshot
+from runtime.lifecycle import _source_remediation_resume_allowed
 
 
 def test_resume_state_is_weak_for_summaries_only(tmp_path) -> None:
@@ -86,3 +87,47 @@ def test_resume_state_is_non_resumable_when_fingerprint_mismatches(tmp_path) -> 
     )
 
     assert report.state == "non_resumable"
+
+
+def test_source_remediation_resume_allows_only_source_hash_change_after_blocked_intake() -> None:
+    persisted = {
+        "state": "non_resumable",
+        "fingerprint_bundle": {
+            "config_hash": "config-a",
+            "source_hash": "source-old",
+            "request_hash": "request-a",
+        },
+    }
+    current = {
+        "config_hash": "config-a",
+        "source_hash": "source-new",
+        "request_hash": "request-a",
+    }
+    outcome = {
+        "job_status": "completed",
+        "job_disposition": "needs_review",
+        "canonical_ready": False,
+        "completed_stages": [],
+    }
+
+    assert _source_remediation_resume_allowed(
+        persisted,
+        current,
+        source_canonical_ready=True,
+        prior_outcome=outcome,
+        provider_receipt_count=0,
+    ) is True
+    assert _source_remediation_resume_allowed(
+        persisted,
+        {**current, "request_hash": "request-changed"},
+        source_canonical_ready=True,
+        prior_outcome=outcome,
+        provider_receipt_count=0,
+    ) is False
+    assert _source_remediation_resume_allowed(
+        persisted,
+        current,
+        source_canonical_ready=True,
+        prior_outcome={**outcome, "completed_stages": ["source_intake"]},
+        provider_receipt_count=0,
+    ) is False

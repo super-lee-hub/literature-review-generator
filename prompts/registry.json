@@ -53,13 +53,23 @@
     },
     {
       "prompt_id": "stage1.visual_scan.system.v2",
-      "path": "prompts/active/stage1/system_visual_scan_v2.txt",
+      "path": "prompts/legacy/stage1/system_visual_scan_v2.txt",
       "version": "v2",
-      "status": "ACTIVE",
+      "status": "LEGACY",
       "owner": "services.stage1_analysis_service.Stage1AnalysisService",
       "required_placeholders": [],
       "output_contract": "stage1_visual_observations/v2 JSON",
       "sha256": "0e71eea430506a8a79a22415b03e76c1ffcf4efdc6309ad29a0661fbeabfb992"
+    },
+    {
+      "prompt_id": "stage1.visual_scan.system.v3",
+      "path": "prompts/active/stage1/system_visual_scan_v3.txt",
+      "version": "v3",
+      "status": "ACTIVE",
+      "owner": "services.stage1_analysis_service.Stage1AnalysisService",
+      "required_placeholders": ["EVIDENCE_KINDS_JSON"],
+      "output_contract": "stage1_visual_observations/v2 JSON",
+      "sha256": "2c56d94bf8a1837a43ff01d26161ffda55fab1ffabf203b9fff32d62cd0b4f23"
     },
     {
       "prompt_id": "outline.node.system.v3",

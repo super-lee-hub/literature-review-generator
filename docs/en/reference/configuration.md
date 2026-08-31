@@ -28,7 +28,18 @@ validated by `services.settings`.
 - `send_original_pdf = never`
 - `image_transport = base64`
 - `single_call_max_pages = 12`
-- `visual_scan_batch_size = 10`
+- `visual_scan_batch_size = 1` (the safe implicit default when not explicitly
+  configured; it may be increased when the provider returns stable outputs)
+- `stage1_visual_scan_max_output_tokens = 16000`
+- `stage1_synthesis_max_output_tokens = 32000`
+- `stage1_length_retry_max_attempts = 2`; a `finish_reason=length` response
+  escalates only on the same primary route, and enters backup only after the
+  bounded sequence is exhausted
+- `stage1_length_retry_ceiling_tokens = 65536`
+- `stage1_request_timeout_seconds = 300`; this long Stage 1 timeout is
+  independent from the output-token budget
+- `stage1_semantic_retry_max_attempts = 1`; a JSON response that fails the v2
+  visual schema may retry on the same primary route only within this finite bound
 - `final_image_refs_max = 8`
 - `require_complete_visual_coverage = true`
 - `max_request_image_bytes = 36000000` raw image-byte budget, leaving headroom for

@@ -186,7 +186,10 @@ class Stage1InputBuilder:
         )
 
         single_call_max_pages = max(1, int(stage1_settings.get("single_call_max_pages", 12) or 12))
-        visual_scan_batch_size = max(1, int(stage1_settings.get("visual_scan_batch_size", 10) or 10))
+        # Keep the implicit default small enough for the configured 5k-token
+        # reader route to return one structured observation per page.  A
+        # caller-provided Stage1_Input value still has authority.
+        visual_scan_batch_size = max(1, int(stage1_settings.get("visual_scan_batch_size", 1) or 1))
         final_image_refs_max = max(0, int(stage1_settings.get("final_image_refs_max", 8) or 8))
         max_request_image_bytes, max_single_image_bytes = normalize_visual_byte_budgets(
             max_request_image_bytes=stage1_settings.get(

@@ -44,3 +44,36 @@ def test_stage1_multimodal_content_interleaves_labels_and_images(tmp_path: Path)
     assert image_index > 0
     assert built.user_message_content[image_index - 1]["type"] == "text"
     assert "visual_id=page-001" in str(built.user_message_content[image_index - 1]["text"])
+
+
+def test_stage1_default_long_paper_scan_batches_are_single_page() -> None:
+    registry = PromptRegistry()
+    page_refs = [
+        {
+            "visual_id": f"page-{index:03d}",
+            "page_no": index,
+            "bbox": [0, 0, 20, 20],
+            "artifact_type": "page_snapshot",
+            "image_path": f"C:/fixture/page-{index:03d}.jpg",
+            "image_bytes": 1,
+        }
+        for index in range(1, 14)
+    ]
+
+    built = Stage1InputBuilder().build(
+        prompt_template="{{PAPER_FULL_TEXT}}",
+        paper_text="paper",
+        reader_api_config={
+            "model": "deepseek-v4-flash-vision-exp",
+            "api_base": "https://api.deepseek.com",
+            "provider_family": "deepseek",
+        },
+        visual_bundle={
+            "selected_visual_refs": page_refs,
+            "coverage_report": {"nonblank_pages": 13},
+        },
+        stage1_input_settings={"send_selected_visuals": "true"},
+        prompt_identity=registry.identity("stage1.analysis.user.v3").to_dict(),
+    )
+
+    assert [len(batch) for batch in built.visual_scan_batches] == [1] * 13

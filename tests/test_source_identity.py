@@ -153,6 +153,26 @@ def test_pdf_inspection_uses_first_page_identity(tmp_path) -> None:
     assert result.evidence_hash
 
 
+def test_pdf_inspection_ignores_expected_doi_prefix_extension_artifact(tmp_path) -> None:
+    import fitz  # type: ignore
+
+    pdf_path = tmp_path / "concatenated-doi.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "Trust and Consumer Choice\nAlice Smith\nDOI 10.1234/trust.2024journalismcarlson",
+    )
+    document.set_metadata({"subject": "DOI 10.1234/trust.2024"})
+    document.save(pdf_path)
+    document.close()
+
+    result = inspect_pdf_identity(_paper(), str(pdf_path))
+
+    assert result.identity_verdict == "match"
+    assert result.canonical_ready is True
+
+
 def test_pdf_inspection_uses_first_page_author_and_year_without_doi_or_metadata(
     tmp_path,
 ) -> None:
@@ -174,3 +194,59 @@ def test_pdf_inspection_uses_first_page_author_and_year_without_doi_or_metadata(
     assert result.canonical_ready is True
     assert result.observed["authors"] == ["Alice Smith"]
     assert result.observed["year"] == "2024"
+
+
+def test_pdf_inspection_uses_date_and_normalizes_pdf_ligatures(tmp_path) -> None:
+    import fitz  # type: ignore
+
+    pdf_path = tmp_path / "date-and-ligature.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "Eﬀects of Explicit Sponsorship Disclosure on User Engagement\nZike Cao\n2024",
+    )
+    document.save(pdf_path)
+    document.close()
+
+    result = inspect_pdf_identity(
+        {
+            "title": "Effects of Explicit Sponsorship Disclosure on User Engagement",
+            "authors": ["Zike Cao"],
+            "date": "2024-00-00 2024",
+            "doi": "",
+        },
+        str(pdf_path),
+    )
+
+    assert result.identity_verdict == "match"
+    assert result.canonical_ready is True
+
+
+def test_pdf_inspection_accepts_fullwidth_doi_and_known_url_suffix_artifact(tmp_path) -> None:
+    import fitz  # type: ignore
+
+    pdf_path = tmp_path / "fullwidth-doi.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text(
+        (72, 72),
+        "Smiling Signals Intrinsic Motivation\nYimin Cheng\n"
+        "doi 10.1093/jcr/ucz023/5510554",
+    )
+    document.set_metadata({"subject": "10．1093／jcr／ucz023／5510554"})
+    document.save(pdf_path)
+    document.close()
+
+    result = inspect_pdf_identity(
+        {
+            "title": "Smiling Signals Intrinsic Motivation",
+            "authors": ["Yimin Cheng"],
+            "date": "2019",
+            "doi": "10.1093/jcr/ucz023",
+        },
+        str(pdf_path),
+    )
+
+    assert result.identity_verdict == "match"
+    assert result.observed["doi"] == "10.1093/jcr/ucz023"

@@ -52,6 +52,29 @@ _CALL_STATUSES = frozenset({"success", "failed", "blocked"})
 _SECRET_KEY_MARKERS = frozenset(
     {"api_key", "apikey", "authorization", "password", "secret", "token", "credential"}
 )
+_NON_SECRET_TOKEN_KEYS = frozenset(
+    {
+        "max_output_tokens",
+        "max_context_tokens",
+        "max_total_tokens",
+        "estimated_input_tokens",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_input_tokens",
+        "reasoning_tokens",
+        "requested_output_tokens",
+        "stage1_output_budget_tokens",
+        "stage1_requested_output_budgets",
+        "initial_output_tokens",
+        "ceiling_output_tokens",
+        "reasoning_reserve_tokens",
+        "reasoning_reserve",
+        "safety_margin_tokens",
+        "safety_margin",
+        "max_retries_per_call",
+    }
+)
 _REDACTION_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)((?:api[_-]?key|token|secret|password)\s*[:=]\s*)[^\s,;]+"),
@@ -298,7 +321,17 @@ def _redact_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     for raw_key, raw_value in value.items():
         key = str(raw_key)
         folded = key.casefold().replace("-", "_")
-        if any(marker in folded for marker in _SECRET_KEY_MARKERS):
+        if folded in _NON_SECRET_TOKEN_KEYS:
+            if isinstance(raw_value, Mapping):
+                result[key] = _redact_mapping(raw_value)
+            elif isinstance(raw_value, (list, tuple)):
+                result[key] = [
+                    _redact_mapping(item) if isinstance(item, Mapping) else item
+                    for item in raw_value
+                ]
+            else:
+                result[key] = raw_value
+        elif any(marker in folded for marker in _SECRET_KEY_MARKERS):
             result[key] = "[REDACTED_SECRET]"
         elif isinstance(raw_value, Mapping):
             result[key] = _redact_mapping(raw_value)

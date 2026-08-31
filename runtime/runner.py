@@ -69,6 +69,10 @@ class RuntimeExecutionResult:
     completion_status: str = ""
     completion_reasons: tuple[str, ...] = ()
     completion_evidence_hash: str = ""
+    summary_schema_ready: bool = False
+    visual_qualification_ready: bool = False
+    stage1_authority_ready: bool = False
+    stage1_reuse_eligible: bool = False
 
     @property
     def success(self) -> bool:
@@ -194,6 +198,134 @@ def _evaluate_runtime_completion(
             "evidence_sources": ("job_outcome_v1", "artifact_registry"),
         }
     )
+
+
+def _stage1_status_projection(registry: ArtifactRegistry) -> dict[str, bool]:
+    """Project Stage 1 evidence states without redefining job completion."""
+
+    from services.stage1_reuse import Stage1VisualEvidenceQualificationV1
+    from summary_schema import is_canonical_ai_summary
+
+    records = [record for record in registry.list_records() if record.status == "ready"]
+
+    def latest(artifact_type: str) -> ArtifactRecord | None:
+        candidates = [record for record in records if record.artifact_type == artifact_type]
+        return max(candidates, key=lambda record: (record.created_at, record.artifact_id), default=None)
+
+    def read_json(record: ArtifactRecord | None) -> Mapping[str, Any] | list[Any] | None:
+        if record is None:
+            return None
+        try:
+            payload = json.loads(Path(record.path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, (Mapping, list)) else None
+
+    summary_schema_ready = False
+    for record in (
+        latest("paper_artifact"),
+        latest("stage1_reusable_summary_manifest"),
+        latest("summary_file"),
+    ):
+        payload = read_json(record)
+        candidates: list[Any] = []
+        if isinstance(payload, Mapping):
+            candidates.extend(
+                (
+                    payload.get("summary_payload"),
+                    payload.get("ai_summary"),
+                    (payload.get("analysis") or {}).get("ai_summary")
+                    if isinstance(payload.get("analysis"), Mapping)
+                    else None,
+                )
+            )
+        elif isinstance(payload, list):
+            candidates.extend(
+                item.get("ai_summary")
+                for item in payload
+                if isinstance(item, Mapping)
+            )
+        for candidate in candidates:
+            if isinstance(candidate, Mapping) and is_canonical_ai_summary(candidate):
+                summary_schema_ready = True
+                break
+        if summary_schema_ready:
+            break
+
+    qualification: Mapping[str, Any] | None = None
+    for record in (
+        latest("stage1_reusable_summary_manifest"),
+        latest("paper_artifact"),
+    ):
+        payload = read_json(record)
+        if not isinstance(payload, Mapping):
+            continue
+        candidate = payload.get("visual_evidence_qualification")
+        if not isinstance(candidate, Mapping) and isinstance(payload.get("binding"), Mapping):
+            candidate = payload["binding"].get("visual_evidence_qualification")
+        if not isinstance(candidate, Mapping) and isinstance(payload.get("stage1_reuse"), Mapping):
+            binding = payload["stage1_reuse"].get("binding")
+            if isinstance(binding, Mapping):
+                candidate = binding.get("visual_evidence_qualification")
+        if isinstance(candidate, Mapping) and candidate:
+            qualification = candidate
+            break
+
+    visual_qualification_ready = False
+    if qualification is not None:
+        try:
+            visual_qualification_ready = (
+                Stage1VisualEvidenceQualificationV1.from_current_mapping_strict(
+                    qualification
+                ).complete_for_reuse()
+            )
+        except (TypeError, ValueError):
+            visual_qualification_ready = False
+    else:
+        has_visual_artifacts = any(
+            record.artifact_type in {
+                "page_snapshot",
+                "figure_crop",
+                "table_crop",
+                "formula_crop",
+                "stage1_visual_observations",
+                "stage1_visual_coverage",
+            }
+            for record in records
+        )
+        visual_qualification_ready = not has_visual_artifacts
+
+    closure_complete = False
+    closure_payload = read_json(latest("provider_receipt_closure"))
+    if isinstance(closure_payload, Mapping):
+        closure = closure_payload.get("payload")
+        closure_complete = isinstance(closure, Mapping) and closure.get("complete") is True
+
+    analyze_terminal_succeeded = False
+    for record in records:
+        if record.artifact_type != "runtime_stage_terminal":
+            continue
+        payload = read_json(record)
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("stage_name") == "analyze"
+            and payload.get("status") == "succeeded"
+        ):
+            analyze_terminal_succeeded = True
+            break
+
+    stage1_authority_ready = bool(
+        summary_schema_ready
+        and visual_qualification_ready
+        and closure_complete
+        and analyze_terminal_succeeded
+    )
+    return {
+        "summary_schema_ready": summary_schema_ready,
+        "visual_qualification_ready": visual_qualification_ready,
+        "stage1_authority_ready": stage1_authority_ready,
+        "stage1_reuse_eligible": stage1_authority_ready,
+    }
 
 
 class AgentRuntimeRunner:
@@ -1227,6 +1359,7 @@ class AgentRuntimeRunner:
                 f"canonical job outcome is invalid after finalization: {exc}"
             ) from exc
         evaluation = _evaluate_runtime_completion(outcome, session.context.registry)
+        stage1_projection = _stage1_status_projection(session.context.registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
             workspace_path=session.context.workspace.root_dir,
@@ -1243,6 +1376,7 @@ class AgentRuntimeRunner:
             completion_status=evaluation.status,
             completion_reasons=evaluation.reasons,
             completion_evidence_hash=evaluation.evidence_hash,
+            **stage1_projection,
         )
 
     @staticmethod
@@ -1319,6 +1453,7 @@ class AgentRuntimeRunner:
         if outcome.job_id != workspace.job_id:
             raise RuntimeRunnerError("job outcome belongs to another workspace")
         evaluation = _evaluate_runtime_completion(outcome, _registry)
+        stage1_projection = _stage1_status_projection(_registry)
         return RuntimeExecutionResult(
             job_id=outcome.job_id,
             workspace_path=workspace.root_dir,
@@ -1335,6 +1470,7 @@ class AgentRuntimeRunner:
             completion_status=evaluation.status,
             completion_reasons=evaluation.reasons,
             completion_evidence_hash=evaluation.evidence_hash,
+            **stage1_projection,
         )
 
     @classmethod

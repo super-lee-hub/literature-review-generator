@@ -27,10 +27,28 @@ crop references, batches, coverage status, and omissions.
   selection is a second-stage evidence decision; it does not decide whether a
   page was visible to the visual model.
 
+Stage 1 visual scans and synthesis use independent
+`stage1_*_max_output_tokens` settings and no longer inherit the historical fixed
+5000-token ceiling. When a provider returns an explicit
+`finish_reason=length`, the runtime escalates through a bounded budget sequence
+on the same primary route; each request's budget, reported usage, finish reason,
+and retry index are written to the receipt. Backup is eligible only after the
+configured ceiling is exhausted. `stage1_request_timeout_seconds` controls wait
+time separately from the output-token budget.
+
+The active visual prompt is `stage1.visual_scan.system.v3`, while the observation
+artifact remains `stage1_visual_observations/v2`. The valid `evidence_kinds` enum is
+generated from the shared schema contract and injected into the prompt;
+`candidate_visual_id` belongs only in the candidate-ID field and must never be used
+as an evidence kind. HTTP 200 and parseable JSON are transport success, not semantic
+success. A v2 schema failure may retry on the same primary route only within
+`stage1_semantic_retry_max_attempts`; repeated failure remains a failed observation
+and incomplete coverage.
+
 ## Page-to-crop attribution and reuse qualification
 
 The first pass is page-only: a `page_snapshot` is the unit that is sent and
-observed for long-paper coverage. The v2 prompt receives bounded metadata for
+observed for long-paper coverage. The v3 prompt receives bounded metadata for
 same-page `figure_crop`, `table_crop`, and `formula_crop` candidates, but those
 metadata entries are candidates rather than confirmed observations. Each page
 observation must declare `resolved`, `ambiguous`, or `no_matching_candidate`.

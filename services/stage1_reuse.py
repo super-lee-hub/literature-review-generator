@@ -17,6 +17,7 @@ from services.stage1_visual_contract import (
     validate_visual_coverage_semantics,
 )
 from services.stage1_visual_scan import VISUAL_OBSERVATIONS_VERSION, VISUAL_SCAN_PROMPT_ID
+from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
 from runtime.provider_runtime import hash_json
 
 
@@ -1013,6 +1014,7 @@ def _verify_visual_evidence_qualification(
                     "prompt_id": expected_scan_identity.prompt_id,
                     "prompt_version": expected_scan_identity.version,
                     "prompt_sha256": expected_scan_identity.sha256,
+                    "evidence_kinds": list(VISUAL_EVIDENCE_KINDS),
                 }
             )
         except (OSError, TypeError, ValueError, RuntimeError):

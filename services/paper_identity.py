@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any, Dict, List, Mapping
 
 
@@ -69,11 +70,17 @@ def rejected_doi_diagnostic(value: Any, field: str = "doi") -> Dict[str, str] | 
 
 
 def normalized_title_key(value: Any) -> str:
-    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().lower()
     if not text:
         return "unknown_title"
+    text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"[^\w\s]", "", text)
-    return re.sub(r"\s+", " ", text).strip() or "unknown_title"
+    text = re.sub(r"\s+", " ", text).strip()
+    # Zotero/PDF exports can insert line-wrap spaces inside Chinese titles.
+    # Remove only whitespace between CJK characters; preserve word boundaries
+    # for Latin-script titles.
+    text = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", text)
+    return text or "unknown_title"
 
 
 def normalized_author_surnames(authors: Any) -> List[str]:

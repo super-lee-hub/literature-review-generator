@@ -385,6 +385,40 @@ def _validate_pdf(_record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError(f"cannot read PDF artifact {path}: {exc}") from exc
 
 
+def _validate_visual_binary(_record: ArtifactRecord, path: Path) -> None:
+    """Validate a rendered Stage 1 page/crop as a decodable image."""
+
+    if path.suffix.casefold() not in {".jpg", ".jpeg", ".png"}:
+        raise ReconcileValidationError(
+            f"visual artifact has an unsupported image extension: {path}"
+        )
+    try:
+        if not path.read_bytes():
+            raise ReconcileValidationError(f"visual artifact is empty: {path}")
+    except OSError as exc:
+        raise ReconcileValidationError(f"cannot read visual artifact {path}: {exc}") from exc
+
+    try:
+        import pymupdf as fitz  # type: ignore
+    except ImportError:  # pragma: no cover - compatibility with older PyMuPDF releases.
+        try:
+            import fitz  # type: ignore
+        except ImportError as exc:  # pragma: no cover - dependency installation failure.
+            raise ReconcileValidationError(
+                "visual artifact decoder is unavailable"
+            ) from exc
+    try:
+        pixmap = fitz.Pixmap(str(path))
+        if int(pixmap.width) <= 0 or int(pixmap.height) <= 0:
+            raise ReconcileValidationError(
+                f"visual artifact has invalid dimensions: {path}"
+            )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ReconcileValidationError(
+            f"visual artifact is not a decodable image: {path}"
+        ) from exc
+
+
 def _validate_validation_run_result(record: ArtifactRecord, path: Path) -> None:
     from validation.input_dependencies import (
         ValidationInputDependencyError,
@@ -1586,6 +1620,10 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "summary_file": _validate_summary_file,
     "review_docx": _validate_docx,
     "source_pdf": _validate_pdf,
+    "page_snapshot": _validate_visual_binary,
+    "figure_crop": _validate_visual_binary,
+    "table_crop": _validate_visual_binary,
+    "formula_crop": _validate_visual_binary,
     "validation_run_result": _validate_validation_run_result,
     "validation_disposition": _validate_json_object,
     "runtime_job_spec": _validate_json_object,
@@ -1596,6 +1634,11 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "review_batch_manifest": _validate_review_batch_manifest,
     "paper_artifact": _validate_paper_artifact,
     "evidence_manifest": _validate_evidence_manifest,
+    "preprocess_manifest": _validate_json_object,
+    "preprocess_page_index": _validate_json_array,
+    "preprocess_structured_json": _validate_json_object,
+    "visual_manifest": _validate_json_object,
+    "stage1_visual_bundle": _validate_json_object,
     "normalized_text": _validate_nonempty_text,
     "chunks": _validate_json_array,
     "page_index": _validate_json_array,
@@ -1608,6 +1651,10 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "provider_expected_call_graph": _validate_json_object,
     "stage1_canonical_summaries": _validate_json_object,
     "audit_record": _validate_audit_record,
+    "source_inventory": _validate_json_object,
+    "resume_state_report": _validate_json_object,
+    "job_attempt": _validate_json_object,
+    "runtime_stage_trace": _validate_json_object,
     "validation_report_projection": _validate_nonempty_text,
     "manual_review_projection": _validate_json_object,
     "validation_completion_projection": _validate_json_object,
@@ -1652,7 +1699,29 @@ class RuntimeReconciler:
         self.external_registry_resolver = external_registry_resolver
         self.schema_validators = dict(DEFAULT_SCHEMA_VALIDATORS)
         self.schema_validators.update(dict(schema_validators or {}))
+        # A single ready artifact can be reachable through many dependency
+        # branches (for example, every rendered page shares the same PDF and
+        # preprocess inputs).  Cache only fully successful validations for
+        # this reconciler instance; the immutable identity fields keep a
+        # changed path/hash/version from being treated as the cached record.
+        self._validated_record_keys: set[tuple[str, ...]] = set()
         self.stage_store = StageTerminalStore(workspace, registry)
+
+    @staticmethod
+    def _validation_cache_key(
+        registry: ArtifactRegistry,
+        record: ArtifactRecord,
+    ) -> tuple[str, ...]:
+        return (
+            os.path.normcase(os.path.abspath(registry.registry_path)),
+            str(record.job_id),
+            str(record.artifact_id),
+            str(record.artifact_type),
+            str(record.artifact_version),
+            str(record.status),
+            os.path.normcase(os.path.abspath(os.fspath(record.path))),
+            str(record.content_hash),
+        )
 
     def _registry_for_ref(
         self,
@@ -1834,6 +1903,9 @@ class RuntimeReconciler:
         refreshed_registries: set[tuple[str, str]] | None = None,
     ) -> None:
         active_registry = registry or self.registry
+        validation_cache_key = self._validation_cache_key(active_registry, record)
+        if validation_cache_key in self._validated_record_keys:
+            return
         active_refreshed = refreshed_registries if refreshed_registries is not None else set()
         key = (record.job_id, record.artifact_id)
         active_visited = visited if visited is not None else set()
@@ -1873,6 +1945,7 @@ class RuntimeReconciler:
                     refreshed_registries=active_refreshed,
                     owner_record=record,
                 )
+            self._validated_record_keys.add(validation_cache_key)
         finally:
             active_visited.remove(key)
 

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace, atomic_write_json
-from validation.closure import ValidationClosureService
+from validation.closure import ValidationClosureService, _receipt_matches_expected_binding
 from validation.run_result import ValidationInputArtifactsV1, ValidationRunResultV1
 
 
@@ -149,3 +149,34 @@ def test_validation_closure_detects_draft_tampering_without_promoting_clean(tmp_
     result = ValidationClosureService(workspace, registry).inspect()
     assert result.status == "blocked"
     assert any("review_draft_hash_untrusted" in item for item in result.blocking_issues)
+
+
+def test_provider_closure_accepts_a_declared_output_budget_variant() -> None:
+    expected = {
+        "attempt_id": "attempt-1",
+        "node_id": "paper:visual:0",
+        "logical_attempt_identity": "attempt-1",
+        "prompt_hash": "p" * 64,
+        "input_hash": "i" * 64,
+        "config_hash": "c" * 64,
+        "schema_hash": "s" * 64,
+        "request_variants": [
+            {"input_hash": "i" * 64, "config_hash": "c" * 64},
+            {"input_hash": "j" * 64, "config_hash": "d" * 64},
+        ],
+    }
+    row = {
+        **{key: expected[key] for key in (
+            "attempt_id",
+            "node_id",
+            "logical_attempt_identity",
+            "prompt_hash",
+            "schema_hash",
+        )},
+        "input_hash": "j" * 64,
+        "config_hash": "d" * 64,
+    }
+
+    assert _receipt_matches_expected_binding(expected, row) is True
+    row["config_hash"] = "x" * 64
+    assert _receipt_matches_expected_binding(expected, row) is False
