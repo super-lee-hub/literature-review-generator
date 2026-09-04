@@ -63,4 +63,3 @@ DOCX citation renderer = 7 passed
 Hosted CI status is intentionally recorded after push against the resulting
 commit SHA; no live provider, Playwright, heavy-OCR, or paid API verification
 is implied by this local report.
-

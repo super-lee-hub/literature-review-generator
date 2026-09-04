@@ -44,4 +44,3 @@ The reported `summary_schema_ready=False`, `stage1_authority_ready=False`, and
 - The normal local preprocess and Stage1 artifact publication path remains
   active.
 - `tests/test_validation_entrypoint_parity_e2e.py`: `4 passed`
-
