@@ -14,14 +14,19 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from validation.source_binding import (
+    build_validation_source_authority_fingerprint,
     build_validation_source_binding,
     resolve_bound_paper_artifacts,
 )
+from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
+from services.job_workspace import JobWorkspace
+from validation.current_validation import _load_inputs
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -73,6 +78,7 @@ def upstream_workspace(tmp_path: Path) -> tuple[Path, dict[str, str]]:
             "artifact_version": "v1",
             "job_id": "up_job",
             "canonical_paper_key": paper_key,
+            "created_at": "2026-09-04T00:00:00Z",
             "artifacts": [
                 {"artifact_type": "normalized_text", "path": str(normalized_path), "content_hash": normalized_hash},
                 {"artifact_type": "chunks", "path": str(chunks_path), "content_hash": chunks_hash},
@@ -107,9 +113,24 @@ def upstream_workspace(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "job_id": "up_job",
         "producer": "test",
     }
+    manifest_record = {
+        "artifact_id": "evidence_manifest:upstream-paper",
+        "artifact_type": "evidence_manifest",
+        "artifact_version": "v1",
+        "status": "ready",
+        "path": str(manifest_path),
+        "content_hash": manifest_hash,
+        "job_id": "up_job",
+        "producer": "test",
+    }
     _write(
         ws / "artifact_registry.json",
-        {"artifact_registry_version": "1", "job_id": "up_job", "artifacts": [record]},
+        {
+            "artifact_registry_version": "v2",
+            "revision": 1,
+            "job_id": "up_job",
+            "artifacts": [record, manifest_record],
+        },
     )
     hashes = {
         "paper_key": paper_key,
@@ -356,6 +377,11 @@ def test_wrong_paper_manifest_semantic_identity_fails_closed(
     papers = {k: dict(v) for k, v in binding["papers"].items()}
     papers[hashes["paper_key"]]["evidence_manifest_hash"] = new_hash
     rewritten["papers"] = papers
+    registry_payload = json.loads((ws / "artifact_registry.json").read_text(encoding="utf-8"))
+    registry_payload["artifacts"][1]["content_hash"] = new_hash
+    (ws / "artifact_registry.json").write_text(
+        json.dumps(registry_payload, ensure_ascii=False), encoding="utf-8"
+    )
     artifacts, problems = resolve_bound_paper_artifacts(rewritten)
     assert artifacts == []
     assert any("manifest_paper_identity_mismatch" in item for item in problems)
@@ -376,3 +402,218 @@ def test_tampered_leaf_normalized_text_fails_closed(
     artifacts, problems = resolve_bound_paper_artifacts(binding)
     assert artifacts == []
     assert any("normalized_text_hash_mismatch" in item for item in problems)
+
+
+def test_source_authority_fingerprint_binds_canonical_leaf_hashes(
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    artifacts, problems = resolve_bound_paper_artifacts(binding)
+    assert problems == ()
+
+    fingerprint, authority_hash, diagnostics = build_validation_source_authority_fingerprint(
+        paper_artifacts=artifacts,
+        registry=None,
+        cited_paper_keys=[hashes["paper_key"]],
+    )
+    assert diagnostics == ()
+    assert len(authority_hash) == 64
+    entry = fingerprint["papers"][0]
+    assert entry["binding_contract_version"] == "v1"
+    assert entry["normalized_text_hash"] == hashes["normalized_hash"]
+    assert entry["chunks_hash"]
+    assert entry["page_index_hash"]
+
+
+def test_source_authority_fingerprint_changes_after_evidence_drift(
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    artifacts, problems = resolve_bound_paper_artifacts(binding)
+    assert problems == ()
+    _before, before_hash, before_diagnostics = build_validation_source_authority_fingerprint(
+        paper_artifacts=artifacts,
+        registry=None,
+        cited_paper_keys=[hashes["paper_key"]],
+    )
+    assert before_diagnostics == ()
+
+    normalized_path = Path(
+        binding["papers"][hashes["paper_key"]]["evidence"]["markdown_path"]["path"]
+    )
+    normalized_path.write_text(
+        normalized_path.read_text(encoding="utf-8") + "\n# drift\n",
+        encoding="utf-8",
+    )
+    _after, after_hash, after_diagnostics = build_validation_source_authority_fingerprint(
+        paper_artifacts=artifacts,
+        registry=None,
+        cited_paper_keys=[hashes["paper_key"]],
+    )
+    assert after_hash != before_hash
+    assert after_diagnostics
+
+
+def test_current_validation_loader_resolves_mixed_local_and_external_authority(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, upstream_hashes = upstream_workspace
+    upstream_summary = _summary_file(upstream_ws, upstream_hashes["paper_key"])
+    external_registry = ArtifactRegistry(
+        upstream_ws / "artifact_registry.json",
+        "up_job",
+    )
+
+    downstream_ws = JobWorkspace.create(str(tmp_path), "downstream", job_id="down_job")
+    downstream_registry = ArtifactRegistry(
+        downstream_ws.paths.registry_path,
+        downstream_ws.job_id,
+    )
+    local_key = "10.1234/local.paper.2026"
+    local_cache = Path(downstream_ws.artifact_path("local-evidence"))
+    local_cache.mkdir(parents=True, exist_ok=True)
+    local_paths = {
+        "markdown_path": local_cache / "normalized.md",
+        "chunks_path": local_cache / "chunks.json",
+        "page_index_path": local_cache / "page_index.json",
+    }
+    local_paths["markdown_path"].write_text("Local source evidence.", encoding="utf-8")
+    local_paths["chunks_path"].write_text("[]", encoding="utf-8")
+    local_paths["page_index_path"].write_text("[]", encoding="utf-8")
+    local_manifest_path = local_cache / "manifest.json"
+    local_manifest = {
+        "artifact_type": "evidence_manifest",
+        "artifact_version": "v1",
+        "job_id": downstream_ws.job_id,
+        "canonical_paper_key": local_key,
+        "created_at": "2026-09-04T00:00:00Z",
+        "artifacts": [
+            {
+                "artifact_type": artifact_type,
+                "path": str(path),
+                "content_hash": _sha256_bytes(path.read_bytes()),
+            }
+            for artifact_type, path in (
+                ("normalized_text", local_paths["markdown_path"]),
+                ("chunks", local_paths["chunks_path"]),
+                ("page_index", local_paths["page_index_path"]),
+            )
+        ],
+    }
+    local_manifest_path.write_text(json.dumps(local_manifest), encoding="utf-8")
+    local_manifest_record = downstream_registry.register_file(
+        artifact_id="evidence_manifest:local",
+        artifact_role="evidence_manifest",
+        artifact_type="evidence_manifest",
+        artifact_version="v1",
+        path=local_manifest_path,
+        producer="tests",
+    )
+    local_paper_path = Path(downstream_ws.artifact_path("local-paper.json"))
+    local_paper_path.write_text(
+        json.dumps(
+            {
+                "paper_identity": {"canonical_paper_key": local_key},
+                "paper_info": {"canonical_paper_key": local_key, "title": "Local"},
+                "source": {"source_pdf": "local.pdf"},
+                "analysis": {"ai_summary": {}},
+                "stage1_inputs": {
+                    "evidence_manifest_path": str(local_manifest_path),
+                    "evidence_manifest_hash": local_manifest_record.content_hash,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    local_paper_record = downstream_registry.register_file(
+        artifact_id="paper:local",
+        artifact_role="paper_artifact",
+        artifact_type="paper_artifact",
+        artifact_version="v1",
+        path=local_paper_path,
+        producer="tests",
+        depends_on=[ArtifactDependencyRefV2.from_record(local_manifest_record)],
+    )
+
+    binding = build_validation_source_binding(
+        summary_sources=[str(upstream_summary)],
+        local_registry=downstream_registry,
+        job_id=downstream_ws.job_id,
+    )
+    external_entry = binding["papers"][upstream_hashes["paper_key"]]
+    binding_path = Path(downstream_ws.artifact_path("validation-source-binding.json"))
+    binding_path.write_text(json.dumps(binding), encoding="utf-8")
+    external_dependencies = [
+        ArtifactDependencyRefV2(
+            dependency_kind="external_job",
+            job_id=external_entry["source_workspace_job_id"],
+            artifact_id=external_entry["stage1_paper_artifact_id"],
+            artifact_type="paper_artifact",
+            path=external_entry["stage1_paper_artifact_path"],
+            content_hash=external_entry["stage1_paper_artifact_hash"],
+        ),
+        ArtifactDependencyRefV2(
+            dependency_kind="external_job",
+            job_id=external_entry["evidence_manifest_job_id"],
+            artifact_id=external_entry["evidence_manifest_artifact_id"],
+            artifact_type="evidence_manifest",
+            path=external_entry["evidence_manifest_path"],
+            content_hash=external_entry["evidence_manifest_hash"],
+        ),
+    ]
+    downstream_registry.register_file(
+        artifact_id="validation_source_binding:mixed",
+        artifact_role="runtime_stage_evidence",
+        artifact_type="validation_source_binding",
+        artifact_version="v1",
+        path=binding_path,
+        producer="tests",
+        depends_on=external_dependencies,
+        external_registry_resolver=lambda job_id: (
+            external_registry if job_id == "up_job" else None
+        ),
+    )
+    review_path = Path(downstream_ws.artifact_path("review.json"))
+    citation_path = Path(downstream_ws.artifact_path("citation.json"))
+    review_path.write_text("{}", encoding="utf-8")
+    citation_path.write_text(
+        json.dumps(
+            {
+                "citation_sets": [
+                    {"paper_ids": [local_key]},
+                    {"paper_ids": [upstream_hashes["paper_key"]]},
+                ],
+                "occurrences": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = SimpleNamespace(
+        review_draft_path=str(review_path),
+        citation_manifest_path=str(citation_path),
+        artifact_registry=downstream_registry,
+        paper_artifact_records=(local_paper_record,),
+        summaries=[],
+        validation_external_registry_resolver=lambda job_id: (
+            external_registry if job_id == "up_job" else None
+        ),
+        get_paper_key=lambda paper: str(
+            paper.get("canonical_paper_key") or paper.get("source_paper_id") or ""
+        ),
+    )
+
+    _review, _citation, papers, _preprocess, _metadata = _load_inputs(service)
+    keys = {
+        str(item.get("paper_identity", {}).get("canonical_paper_key") or "")
+        for item in papers
+    }
+    assert keys == {local_key, upstream_hashes["paper_key"]}
+    assert not any(
+        item.startswith("validation_source_authority_ambiguous")
+        for item in service._validation_source_authority_diagnostics
+    )

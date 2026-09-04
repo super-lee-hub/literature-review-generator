@@ -98,6 +98,7 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "stage1_portable_provider_ledger",
         "free_mode_intent_input",
         "free_mode_review_intent_projection",
+        "validation_source_binding",
         "validation_adjudication_reuse_record",
         "stage1_visual_observations",
         "stage1_visual_coverage",
@@ -467,6 +468,78 @@ def _validate_validation_result(record: Any, _path: str | Path, root: Mapping[st
         ValidationRunResultV1.from_dict(root)
     except (TypeError, ValueError, KeyError) as exc:
         raise ArtifactSchemaError(f"{artifact_type} failed ValidationRunResultV1 validation: {exc}") from exc
+
+
+def _validate_validation_source_binding(
+    record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("validation_source_binding",),
+        expected_version="v1",
+    )
+    _require_fields(
+        root,
+        ("job_id", "upstream_workspaces", "papers", "diagnostics", "bound_paper_count"),
+        "validation_source_binding",
+    )
+    if not isinstance(root.get("upstream_workspaces"), (list, tuple)):
+        raise ArtifactSchemaError("validation_source_binding.upstream_workspaces must be an array")
+    papers = root.get("papers")
+    if not isinstance(papers, Mapping):
+        raise ArtifactSchemaError("validation_source_binding.papers must be an object")
+    if int(root.get("bound_paper_count") or 0) != len(papers):
+        raise ArtifactSchemaError("validation_source_binding.bound_paper_count is inconsistent")
+    for paper_key, entry in papers.items():
+        if not isinstance(entry, Mapping):
+            raise ArtifactSchemaError(
+                f"validation_source_binding paper entry is not an object: {paper_key}"
+            )
+        required = (
+            "canonical_paper_key",
+            "source_workspace_job_id",
+            "stage1_paper_artifact_id",
+            "stage1_paper_artifact_version",
+            "stage1_paper_artifact_path",
+            "stage1_paper_artifact_hash",
+            "evidence_manifest_artifact_id",
+            "evidence_manifest_artifact_type",
+            "evidence_manifest_artifact_version",
+            "evidence_manifest_job_id",
+            "evidence_manifest_path",
+            "evidence_manifest_hash",
+            "evidence",
+        )
+        _require_fields(entry, required, f"validation_source_binding.papers[{paper_key}]")
+        if str(entry.get("canonical_paper_key") or "") != str(paper_key):
+            raise ArtifactSchemaError("validation_source_binding paper key is inconsistent")
+        if str(entry.get("stage1_paper_artifact_version") or "") != "v1":
+            raise ArtifactSchemaError("validation_source_binding paper artifact version is invalid")
+        if (
+            str(entry.get("evidence_manifest_artifact_type") or "") != "evidence_manifest"
+            or str(entry.get("evidence_manifest_artifact_version") or "") != "v1"
+        ):
+            raise ArtifactSchemaError("validation_source_binding evidence manifest identity is invalid")
+        for label in ("stage1_paper_artifact_hash", "evidence_manifest_hash"):
+            digest = str(entry.get(label) or "")
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ArtifactSchemaError(f"validation_source_binding.{label} is not a SHA-256")
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, Mapping):
+            raise ArtifactSchemaError("validation_source_binding evidence must be an object")
+        for field in ("markdown_path", "chunks_path", "page_index_path"):
+            leaf = evidence.get(field)
+            if not isinstance(leaf, Mapping):
+                raise ArtifactSchemaError(
+                    f"validation_source_binding evidence is missing {field}"
+                )
+            if not str(leaf.get("path") or "") or not str(leaf.get("content_hash") or ""):
+                raise ArtifactSchemaError(
+                    f"validation_source_binding evidence {field} identity is incomplete"
+                )
 
 
 def _validate_receipt_closure(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
@@ -2109,6 +2182,7 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("review_docx_repaired", "v1"): _validate_docx,
         ("validation_run_result", "v1"): _validate_validation_result,
         ("validation_run_result_repaired", "v1"): _validate_validation_result,
+        ("validation_source_binding", "v1"): _validate_validation_source_binding,
         ("provider_receipt_closure", "v1"): _validate_receipt_closure,
         ("provider_expected_call_graph", "v1"): _validate_provider_expected_call_graph,
         ("stage1_summary_reuse_record", "v1"): _validate_stage1_summary_reuse_record,

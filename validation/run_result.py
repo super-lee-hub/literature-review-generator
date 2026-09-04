@@ -256,6 +256,10 @@ class ValidationInputArtifactsV1:
     citation_manifest_hash: str = ""
     evidence_manifest_ids: Tuple[str, ...] = ()
     evidence_manifest_hashes: Tuple[str, ...] = ()
+    validation_source_authority_hash: str = ""
+    validation_source_authority_fingerprint: Mapping[str, Any] = field(
+        default_factory=dict
+    )
 
     def validate(self) -> None:
         if bool(self.review_draft_id) != bool(self.review_draft_hash):
@@ -274,9 +278,20 @@ class ValidationInputArtifactsV1:
             raise ValidationRunResultError("evidence manifest artifact ids must be non-empty")
         if any(not item for item in self.evidence_manifest_hashes):
             raise ValidationRunResultError("evidence manifest artifact hashes must be non-empty")
+        if not isinstance(self.validation_source_authority_fingerprint, Mapping):
+            raise ValidationRunResultError(
+                "validation source authority fingerprint must be an object"
+            )
+        if bool(self.validation_source_authority_hash) != bool(
+            self.validation_source_authority_fingerprint
+        ):
+            raise ValidationRunResultError(
+                "validation source authority hash and fingerprint must be paired"
+            )
         hashes = (
             ("review draft", self.review_draft_hash),
             ("citation manifest", self.citation_manifest_hash),
+            ("validation source authority", self.validation_source_authority_hash),
             *(
                 (f"evidence manifest[{index}]", content_hash)
                 for index, content_hash in enumerate(self.evidence_manifest_hashes)
@@ -317,6 +332,12 @@ class ValidationInputArtifactsV1:
                 str(item).strip()
                 for item in (payload.get("evidence_manifest_hashes") or ())
             ),
+            validation_source_authority_hash=str(
+                payload.get("validation_source_authority_hash") or ""
+            ).strip(),
+            validation_source_authority_fingerprint=dict(
+                payload.get("validation_source_authority_fingerprint") or {}
+            ),
         )
         instance.validate()
         return instance
@@ -329,6 +350,10 @@ class ValidationInputArtifactsV1:
             "citation_manifest_hash": self.citation_manifest_hash,
             "evidence_manifest_ids": list(self.evidence_manifest_ids),
             "evidence_manifest_hashes": list(self.evidence_manifest_hashes),
+            "validation_source_authority_hash": self.validation_source_authority_hash,
+            "validation_source_authority_fingerprint": dict(
+                self.validation_source_authority_fingerprint
+            ),
         }
 
 

@@ -110,6 +110,12 @@ class ValidationExecutionService:
     )
     closure_epoch_id: str = field(default="", init=False)
     expected_call_graph_hash: str = field(default="", init=False)
+    validation_source_authority_hash: str = field(default="", init=False)
+    _validation_source_authority_fingerprint: dict[str, Any] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.job_id = str(self.job_id or self.workspace.job_id)
@@ -149,6 +155,36 @@ class ValidationExecutionService:
             logical_attempt_identity=self.attempt_id,
             expected_call_graph_hash=self.expected_call_graph_hash,
             current_input_artifact_hashes=input_hashes,
+            provider_config_hash=hash_json(_redact_mapping(dict(self.runtime_config or {}))),
+            schema_version="validation-v1",
+        )
+
+    def bind_validation_source_authority(
+        self,
+        fingerprint: Mapping[str, Any],
+        authority_hash: str,
+    ) -> None:
+        """Bind source authority to Validation identity before adjudication."""
+
+        normalized_hash = str(authority_hash or "").strip()
+        if len(normalized_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized_hash
+        ):
+            raise ValueError("validation source authority hash must be a lowercase SHA-256")
+        self.validation_source_authority_hash = normalized_hash
+        self._validation_source_authority_fingerprint = dict(fingerprint)
+        input_hashes = dict(self._input_dependency_hashes)
+        input_hashes["validation_source_authority"] = normalized_hash
+        self._input_dependency_hashes = {
+            str(key): str(value)
+            for key, value in sorted(input_hashes.items(), key=lambda item: str(item[0]))
+        }
+        self.closure_epoch_id = compute_closure_epoch_id(
+            job_id=self.job_id,
+            stage_name="stage4_validate",
+            logical_attempt_identity=self.attempt_id,
+            expected_call_graph_hash=self.expected_call_graph_hash,
+            current_input_artifact_hashes=self._input_dependency_hashes,
             provider_config_hash=hash_json(_redact_mapping(dict(self.runtime_config or {}))),
             schema_version="validation-v1",
         )

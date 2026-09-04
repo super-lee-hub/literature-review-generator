@@ -11,7 +11,7 @@ of this execution path.
 from __future__ import annotations
 
 from datetime import datetime
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 from pathlib import Path
@@ -125,18 +125,36 @@ def _load_inputs(
     if citation_manifest is None:
         _log(service, "error", f"Missing current citation manifest: {manifest_path}")
 
+    reload_registry = getattr(service.artifact_registry, "reload", None)
+    if callable(reload_registry):
+        reload_registry()
     paper_artifacts: list[dict[str, Any]] = [
         dict(item)
         for item in (paper_artifacts_override or ())
         if isinstance(item, Mapping)
     ]
     records = list(service.artifact_registry.list_records())
+    source_authority_diagnostics: list[str] = []
     if paper_artifacts_override is None:
         for record in records:
             if record.artifact_type != "paper_artifact" or record.status != "ready":
                 continue
             payload = _read_json(record.path)
             if payload is not None:
+                try:
+                    if file_sha256(record.path) != record.content_hash:
+                        source_authority_diagnostics.append(
+                            f"paper_artifact_hash_mismatch:{record.artifact_id}"
+                        )
+                        continue
+                except OSError:
+                    source_authority_diagnostics.append(
+                        f"paper_artifact_unreadable:{record.artifact_id}"
+                    )
+                    continue
+                payload["_registry_path"] = record.path
+                payload["_registry_artifact_id"] = record.artifact_id
+                payload["_registry_artifact_hash"] = record.content_hash
                 paper_artifacts.append(payload)
         loaded_paths = {
             _normal_path(item.get("_registry_path"))
@@ -148,42 +166,163 @@ def _load_inputs(
                 continue
             payload = _read_json(record.path)
             if payload is not None:
+                try:
+                    if file_sha256(record.path) != record.content_hash:
+                        source_authority_diagnostics.append(
+                            f"paper_artifact_hash_mismatch:{record.artifact_id}"
+                        )
+                        continue
+                except OSError:
+                    source_authority_diagnostics.append(
+                        f"paper_artifact_unreadable:{record.artifact_id}"
+                    )
+                    continue
+                payload["_registry_path"] = record.path
+                payload["_registry_artifact_id"] = record.artifact_id
+                payload["_registry_artifact_hash"] = record.content_hash
                 paper_artifacts.append(payload)
 
-    binding_records: list[Any] = []
-    if not paper_artifacts:
-        # Lane B: recover the authoritative upstream Stage 1 artifacts through
-        # the durable validation_source_binding/v1.  When a binding exists it
-        # is the only acceptable source of paper artifacts: any identity
-        # mismatch fails closed (VALIDATION_SOURCE_AUTHORITY_INVALID) instead
-        # of degrading to an ai_summary-only synthetic artifact.  The legacy
-        # summary fallback below is kept only for jobs with no binding at all.
-        binding_records = [
-            record
-            for record in records
-            if record.artifact_type == "validation_source_binding" and record.status == "ready"
-        ]
-        if binding_records:
-            binding_payload = _read_json(binding_records[-1].path)
+    binding_records: list[Any] = [
+        record
+        for record in records
+        if record.artifact_type == "validation_source_binding" and record.status == "ready"
+    ]
+    if paper_artifacts_override is None and binding_records:
+        # Lane B is resolved per cited canonical paper key.  A local artifact
+        # for one paper must not suppress an external authority for another.
+        from validation.source_binding import resolve_bound_paper_artifacts
+
+        cited_keys = _cited_paper_ids(citation_manifest or {})
+        if not cited_keys:
+            cited_keys = list(
+                dict.fromkeys(
+                    str(service.get_paper_key(summary.get("paper_info") or {})).strip()
+                    for summary in service.summaries
+                    if isinstance(summary.get("paper_info"), Mapping)
+                    and str(service.get_paper_key(summary.get("paper_info") or {})).strip()
+                )
+            )
+
+        def paper_key(artifact: Mapping[str, Any]) -> str:
+            identity = artifact.get("paper_identity")
+            if not isinstance(identity, Mapping):
+                return ""
+            return str(
+                identity.get("canonical_paper_key")
+                or identity.get("source_paper_id")
+                or ""
+            ).strip()
+
+        def authority_identity(artifact: Mapping[str, Any]) -> tuple[str, ...]:
+            binding = artifact.get("_validation_source_binding")
+            if isinstance(binding, Mapping):
+                return (
+                    str(binding.get("source_workspace_job_id") or ""),
+                    str(binding.get("stage1_paper_artifact_id") or ""),
+                    str(binding.get("stage1_paper_artifact_hash") or ""),
+                    str(binding.get("evidence_manifest_artifact_id") or ""),
+                    str(binding.get("evidence_manifest_hash") or ""),
+                )
+            stage1_inputs = artifact.get("stage1_inputs")
+            inputs = stage1_inputs if isinstance(stage1_inputs, Mapping) else {}
+            artifact_id = str(artifact.get("_registry_artifact_id") or "").strip()
+            paper_record = next(
+                (
+                    record
+                    for record in records
+                    if record.artifact_type == "paper_artifact"
+                    and (
+                        artifact_id
+                        and record.artifact_id == artifact_id
+                        or not artifact_id
+                        and _normal_path(record.path) == _normal_path(artifact.get("_registry_path"))
+                    )
+                ),
+                None,
+            )
+            manifest_path = _normal_path(inputs.get("evidence_manifest_path"))
+            manifest_hash = str(inputs.get("evidence_manifest_hash") or "")
+            manifest_record = next(
+                (
+                    record
+                    for record in records
+                    if record.artifact_type == "evidence_manifest"
+                    and _normal_path(record.path) == manifest_path
+                    and record.content_hash == manifest_hash
+                ),
+                None,
+            )
+            return (
+                str(getattr(paper_record, "job_id", "") or ""),
+                str(getattr(paper_record, "artifact_id", artifact_id) or artifact_id),
+                str(getattr(paper_record, "content_hash", "") or artifact.get("_registry_artifact_hash") or ""),
+                str(getattr(manifest_record, "job_id", "") or ""),
+                str(getattr(manifest_record, "artifact_id", "") or ""),
+                str(getattr(manifest_record, "content_hash", "") or manifest_hash),
+            )
+
+        local_by_key: dict[str, list[dict[str, Any]]] = {}
+        for artifact in paper_artifacts:
+            key = paper_key(artifact)
+            if key:
+                local_by_key.setdefault(key, []).append(artifact)
+        for key, candidates in local_by_key.items():
+            identities = {authority_identity(candidate) for candidate in candidates}
+            if len(identities) > 1:
+                source_authority_diagnostics.append(
+                    f"validation_source_authority_ambiguous:{key}"
+                )
+
+        bound_by_key: dict[str, list[dict[str, Any]]] = {}
+        for binding_record in sorted(
+            binding_records,
+            key=lambda record: str(getattr(record, "created_at", "")),
+        ):
+            binding_payload = _read_json(binding_record.path)
             if isinstance(binding_payload, Mapping) and isinstance(binding_payload.get("payload"), Mapping):
                 binding_payload = binding_payload["payload"]
-            if isinstance(binding_payload, Mapping):
-                from validation.source_binding import resolve_bound_paper_artifacts
+            if not isinstance(binding_payload, Mapping):
+                source_authority_diagnostics.append("validation_source_binding_unreadable")
+                continue
+            try:
+                binding_hash_matches = file_sha256(binding_record.path) == binding_record.content_hash
+                if not binding_hash_matches:
+                    source_authority_diagnostics.append("validation_source_binding_hash_mismatch")
+                    bound_artifacts = []
+                    binding_problems = ("validation_source_binding_hash_mismatch",)
+                else:
+                    bound_artifacts, binding_problems = resolve_bound_paper_artifacts(
+                        binding_payload,
+                        external_registry_resolver=getattr(
+                            service, "validation_external_registry_resolver", None
+                        ),
+                        present_paper_keys=cited_keys,
+                    )
+            except (OSError, TypeError, ValueError) as exc:
+                bound_artifacts = []
+                binding_problems = (f"validation_source_binding_invalid:{exc}",)
+            for problem in binding_problems:
+                source_authority_diagnostics.append(str(problem))
+                _log(service, "error", str(problem))
+            for bound in bound_artifacts:
+                key = paper_key(bound)
+                if not key:
+                    source_authority_diagnostics.append("validation_source_binding_paper_key_missing")
+                    continue
+                bound_by_key.setdefault(key, []).append(bound)
 
-                bound_artifacts, binding_problems = resolve_bound_paper_artifacts(
-                    binding_payload,
-                    external_registry_resolver=getattr(
-                        service, "validation_external_registry_resolver", None
-                    ),
-                    present_paper_keys=(
-                        str(service.get_paper_key(summary.get("paper_info") or {}))
-                        for summary in service.summaries
-                        if isinstance(summary.get("paper_info"), Mapping)
-                    ),
+        for key, bound_candidates in bound_by_key.items():
+            authorities = [*local_by_key.get(key, []), *bound_candidates]
+            identities = {authority_identity(candidate) for candidate in authorities}
+            if len(identities) > 1:
+                source_authority_diagnostics.append(
+                    f"validation_source_authority_ambiguous:{key}"
                 )
-                for problem in binding_problems:
-                    _log(service, "error", problem)
-                paper_artifacts.extend(bound_artifacts)
+                continue
+            if not local_by_key.get(key):
+                chosen = bound_candidates[0]
+                paper_artifacts.append(chosen)
+                local_by_key[key] = [chosen]
 
     if not paper_artifacts and not binding_records:
         # No binding and no local paper artifacts: legacy summary-only job.
@@ -206,11 +345,17 @@ def _load_inputs(
 
     preprocess_evidence: dict[str, Any] = {}
     paper_metadata: dict[str, Any] = {}
+    setattr(service, "_validation_source_authority_diagnostics", tuple(source_authority_diagnostics))
     for artifact in paper_artifacts:
         identity = artifact.get("paper_identity") or {}
         if not isinstance(identity, Mapping):
             continue
-        evidence = artifact.get("stage1_inputs", {}).get("preprocess_evidence", {})
+        stage1_inputs = artifact.get("stage1_inputs")
+        evidence = (
+            stage1_inputs.get("preprocess_evidence", {})
+            if isinstance(stage1_inputs, Mapping)
+            else {}
+        )
         for key in (
             identity.get("canonical_paper_key"),
             identity.get("source_paper_id"),
@@ -231,8 +376,15 @@ def _input_contract(
     review_draft_record_override: Any | None = None,
     citation_manifest_record_override: Any | None = None,
 ) -> tuple[ValidationInputArtifactsV1, int, bool, bool, tuple[str, ...]]:
+    reload_registry = getattr(service.artifact_registry, "reload", None)
+    if callable(reload_registry):
+        reload_registry()
     records = list(service.artifact_registry.list_records())
-    degradation: list[str] = []
+    degradation: list[str] = list(
+        str(item)
+        for item in getattr(service, "_validation_source_authority_diagnostics", ())
+        if str(item).strip()
+    )
 
     def registered_identity(
         path: str,
@@ -710,9 +862,34 @@ def _write_reports(
         resolved = registry.get(normalized_id)
         if resolved is not None:
             records_by_id[normalized_id] = resolved
-    for record in records_by_id.values():
-        if record is not None:
-            dependencies.append(ArtifactDependencyRefV2.from_record(record))
+    dependency_error = ""
+    declared_count = bool(
+        result.input_artifacts.review_draft_id
+        or result.input_artifacts.citation_manifest_id
+        or result.input_artifacts.evidence_manifest_ids
+    )
+    if declared_count:
+        from validation.input_dependencies import (
+            ValidationInputDependencyError,
+            resolve_validation_input_dependencies,
+        )
+
+        try:
+            dependencies = resolve_validation_input_dependencies(
+                registry,
+                result.input_artifacts,
+                external_registry_resolver=getattr(
+                    service, "validation_external_registry_resolver", None
+                ),
+            )
+        except ValidationInputDependencyError as exc:
+            dependency_error = str(exc)
+            dependencies = []
+    else:
+        for record in records_by_id.values():
+            if record is not None:
+                dependencies.append(ArtifactDependencyRefV2.from_record(record))
+    dependencies_verified = bool(not declared_count or (not dependency_error and dependencies))
     canonical_record = publish_json_artifact(
         publication_context,
         registry,
@@ -723,12 +900,20 @@ def _write_reports(
         artifact_version="v1",
         producer="validation.current_validation",
         artifact_id=result_artifact_id or result.validation_run_id,
-        status="ready" if result.contract_satisfied and not output_dir else "quarantined",
+        status=(
+            "ready"
+            if result.contract_satisfied and dependencies_verified and not output_dir
+            else "quarantined"
+        ),
         depends_on=dependencies,
+        external_registry_resolver=getattr(
+            service, "validation_external_registry_resolver", None
+        ),
         metadata={
             "execution_status": result.execution_status.value,
             "validation_disposition": result.validation_disposition.value,
             "contract_satisfied": result.contract_satisfied,
+            "dependency_error": dependency_error,
         },
     )
     result_path = canonical_record.path
@@ -956,6 +1141,47 @@ def run_current_validation(
             else None,
         )
 
+    (
+        input_artifacts,
+        expected_claim_count,
+        review_has_citations,
+        evidence_complete,
+        degradation_reasons,
+    ) = _input_contract(
+        service,
+        review_draft,
+        citation_manifest,
+        paper_artifacts,
+        review_draft_record_override=review_draft_record_override,
+        citation_manifest_record_override=citation_manifest_record_override,
+    )
+    from validation.source_binding import build_validation_source_authority_fingerprint
+
+    source_fingerprint, source_authority_hash, source_diagnostics = (
+        build_validation_source_authority_fingerprint(
+            paper_artifacts=paper_artifacts,
+            registry=service.artifact_registry,
+            cited_paper_keys=_cited_paper_ids(citation_manifest),
+        )
+    )
+    if source_diagnostics:
+        _log(
+            service,
+            "error",
+            "validation source authority fingerprint: " + "; ".join(source_diagnostics),
+        )
+        evidence_complete = False
+    if hasattr(service, "bind_validation_source_authority"):
+        service.bind_validation_source_authority(source_fingerprint, source_authority_hash)
+    input_artifacts = replace(
+        input_artifacts,
+        validation_source_authority_hash=source_authority_hash,
+        validation_source_authority_fingerprint=source_fingerprint,
+    )
+    degradation_reasons = tuple(
+        dict.fromkeys((*degradation_reasons, *source_diagnostics))
+    )
+
     checkpoint_root = getattr(service.workspace.paths, "checkpoints_dir", "")
     validator = ReviewValidator(
         review_draft,
@@ -972,20 +1198,6 @@ def run_current_validation(
         base_report = validator.validate()
     results = _adjudicate(service, base_report.citation_results)
     report = _build_report(results)
-    (
-        input_artifacts,
-        expected_claim_count,
-        review_has_citations,
-        evidence_complete,
-        degradation_reasons,
-    ) = _input_contract(
-        service,
-        review_draft,
-        citation_manifest,
-        paper_artifacts,
-        review_draft_record_override=review_draft_record_override,
-        citation_manifest_record_override=citation_manifest_record_override,
-    )
     result = ValidationRunResultV1.from_report(
         report,
         job_id=service.job_id,

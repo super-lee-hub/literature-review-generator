@@ -209,25 +209,9 @@ def generate_apa_references_from_manifest(
             text = str(entry.get("citation_text") or "").strip()
             if text:
                 references.append(text)
-    if not references:
-        for entry in citation_manifest.get("paper_entries", []):
-            if not isinstance(entry, Mapping):
-                continue
-            text = format_reference_entry(
-                CitationCatalogEntry(
-                    index=len(references) + 1,
-                    paper_id=str(entry.get("paper_id") or ""),
-                    paper_key=str(entry.get("paper_key") or entry.get("paper_id") or ""),
-                    title=str(entry.get("title") or ""),
-                    authors=[str(item) for item in entry.get("authors", [])],
-                    year=str(entry.get("year") or ""),
-                    journal=str(entry.get("journal") or ""),
-                    doi=str(entry.get("doi") or ""),
-                    aliases=[str(item) for item in entry.get("aliases", [])],
-                )
-            )
-            if text:
-                references.append(text)
+    # ``citation_manifest.bibliography`` is the sole bibliography authority.
+    # An empty cited bibliography must remain empty; reconstructing entries
+    # from ``paper_entries`` would emit uncited corpus papers.
     return list(dict.fromkeys(references))
 
 

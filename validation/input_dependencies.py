@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 import os
-from typing import Callable
+from typing import Callable, Mapping
 
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -140,15 +140,47 @@ def resolve_validation_input_dependencies(
             )
         dependencies.append(candidate)
 
-    try:
-        verified = registry.verify_ready_dependencies(
-            dependencies,
-            external_registry_resolver=external_registry_resolver,
-        )
-    except (OSError, RegistryError, TypeError, ValueError) as exc:
-        raise ValidationInputDependencyError(
-            f"Validation input dependencies are not durably verified: {exc}"
-        ) from exc
+    verified: list[ArtifactDependencyRefV2] = []
+    for dependency in dependencies:
+        try:
+            if dependency.dependency_kind == "local_job":
+                target_record = registry.verify_ready_artifact_closure(
+                    dependency,
+                    external_registry_resolver=external_registry_resolver,
+                )
+            else:
+                if external_registry_resolver is None:
+                    raise RegistryError(
+                        "external dependency cannot be verified without a resolver: "
+                        f"{dependency.job_id}/{dependency.artifact_id}"
+                    )
+                target_registry = external_registry_resolver(dependency.job_id)
+                if target_registry is None or target_registry.job_id != dependency.job_id:
+                    raise RegistryError(
+                        "external dependency Registry is unavailable or has the wrong owner: "
+                        f"{dependency.job_id}/{dependency.artifact_id}"
+                    )
+                target_record = target_registry.verify_ready_artifact_closure(
+                    ArtifactDependencyRefV2(
+                        dependency_kind="local_job",
+                        job_id=dependency.job_id,
+                        artifact_id=dependency.artifact_id,
+                        artifact_type=dependency.artifact_type,
+                        path=dependency.path,
+                        content_hash=dependency.content_hash,
+                    ),
+                    external_registry_resolver=external_registry_resolver,
+                )
+            verified.append(
+                ArtifactDependencyRefV2.from_record(
+                    target_record,
+                    dependency_kind=dependency.dependency_kind,
+                )
+            )
+        except (OSError, RegistryError, TypeError, ValueError) as exc:
+            raise ValidationInputDependencyError(
+                f"Validation input dependencies are not durably verified: {exc}"
+            ) from exc
     if len(verified) != len(identities):
         raise ValidationInputDependencyError(
             "Validation input dependency resolution returned an incomplete closure"
@@ -171,6 +203,33 @@ def validate_validation_dependency_contract(
         raise ValidationInputDependencyError(
             "Validation input dependencies do not exactly match the canonical payload"
         )
+    fingerprint = inputs.validation_source_authority_fingerprint
+    if fingerprint:
+        raw_entries = fingerprint.get("papers")
+        if not isinstance(raw_entries, (list, tuple)):
+            raise ValidationInputDependencyError(
+                "Validation source authority fingerprint papers are invalid"
+            )
+        fingerprint_evidence = Counter(
+            (
+                str(item.get("evidence_manifest_id") or ""),
+                str(item.get("evidence_manifest_hash") or ""),
+            )
+            for item in raw_entries
+            if isinstance(item, Mapping)
+            and str(item.get("evidence_manifest_id") or "")
+        )
+        declared_evidence = Counter(
+            (artifact_id, content_hash)
+            for artifact_id, content_hash in zip(
+                inputs.evidence_manifest_ids,
+                inputs.evidence_manifest_hashes,
+            )
+        )
+        if fingerprint_evidence != declared_evidence:
+            raise ValidationInputDependencyError(
+                "Validation source authority fingerprint does not match evidence dependencies"
+            )
     for dependency in record.depends_on:
         if not dependency.job_id or not dependency.path:
             raise ValidationInputDependencyError(
