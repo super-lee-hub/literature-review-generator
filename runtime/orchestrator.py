@@ -654,6 +654,102 @@ class InternalStageExecutorRegistry:
             summaries.extend(self._summary_payloads_from_file(path))
         return summaries
 
+    def _build_outline_evidence_pack(
+        self,
+        session: AgentRuntimeSession,
+        summaries: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Project loaded Stage1 summaries to the compact Outline evidence pack.
+
+        Durable projection (outline_evidence_pack/v1): the provider-facing
+        entries keep only the semantic fields Outline consumes (status,
+        source_mode, paper_info, ai_summary) plus a per-entry provenance hash,
+        so unrelated Stage1 blobs (preprocess / stage1_input / visual metadata)
+        never reach the Outline preflight estimator or provider payloads.
+        The pack artifact is registered with the source summary_file as its
+        dependency; authority stays traceable to the original Stage1 bytes.
+        """
+        from pathlib import Path
+
+        from outline.evidence_projection import build_pack, validate_pack
+
+        if not summaries:
+            return []
+        source_file: str | None = None
+        for value in (
+            session.request.summary_file,
+            *session.request.summary_sources,
+            *session.request.reuse_summary_files,
+        ):
+            if value is not None and str(value).strip():
+                source_file = str(value).strip()
+                break
+        source_ref = source_file or "same_session_stage1"
+        source_sha = ""
+        if source_file is not None:
+            try:
+                source_sha = file_sha256(source_file)
+            except (OSError, UnicodeError):
+                source_sha = ""
+        pack = build_pack(
+            summaries,
+            source_ref=source_ref,
+            source_ref_sha256=source_sha,
+            job_id=session.context.workspace.job_id,
+        )
+        validate_pack(pack)
+        payload_hash = str(pack.get("pack_payload_sha256") or "")
+        workspace = session.context.workspace
+        path = workspace.artifact_path(f"outline_evidence_pack_{payload_hash[:24]}.json")
+        dependencies: list[ArtifactDependencyRefV2] = []
+        summary_record = session.context.registry.get("summary_file")
+        if summary_record is not None and summary_record.status == "ready":
+            dependencies.append(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=summary_record.job_id,
+                    artifact_id=summary_record.artifact_id,
+                    artifact_type=summary_record.artifact_type,
+                    path=summary_record.path,
+                    content_hash=summary_record.content_hash,
+                )
+            )
+        payload_bytes = len(
+            json.dumps({"entries": pack.get("entries") or []}, ensure_ascii=False)
+        )
+        from services.queue_service import LocalPublicationContext
+
+        pack_publication = (
+            getattr(session.context.registry, "publication_context", None)
+            or LocalPublicationContext()
+        )
+        publish_json_artifact(
+            pack_publication,
+            session.context.registry,
+            path,
+            pack,
+            artifact_role="outline_evidence",
+            artifact_type="outline_evidence_pack",
+            artifact_version="v1",
+            producer="runtime.orchestrator._RuntimeStageHost",
+            artifact_id=f"outline_evidence_pack:{payload_hash[:24]}",
+            depends_on=dependencies,
+            metadata={
+                "immutable": True,
+                "entry_count": len(pack.get("entries") or []),
+                "pack_payload_bytes": payload_bytes,
+                "source_ref": source_ref,
+                "source_ref_sha256": source_sha,
+            },
+        )
+        session.stage_host.logger.info(
+            "outline evidence pack: %d entries, %d payload bytes (source=%s)",
+            len(pack.get("entries") or []),
+            payload_bytes,
+            source_ref,
+        )
+        return [dict(entry) for entry in (pack.get("entries") or [])]
+
     @staticmethod
     def _validate_summary_identity(
         summaries: Sequence[Mapping[str, Any]],
@@ -871,6 +967,7 @@ class InternalStageExecutorRegistry:
         summaries = self._load_summary_payloads(session, results)
         if not summaries:
             raise RuntimeError("Outline v3 requires a canonical Stage 1 summary source")
+        summaries = self._build_outline_evidence_pack(session, summaries)
 
         settings = session.context.settings
         route_name = str(settings.outline_model() or "").strip() or "Outline_API"
@@ -910,6 +1007,13 @@ class InternalStageExecutorRegistry:
         for diagnostic in provider_router.diagnostics:
             session.stage_host.logger.warning("outline routing: %s", diagnostic)
         stability = settings.outline_stability_settings()
+        outline_stability_config = dict(session.stage_host.config.get("OutlineStability") or {})
+        semantic_repair_enabled = str(
+            outline_stability_config.get("semantic_repair_enabled") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        opaque_alias_enabled = str(
+            outline_stability_config.get("opaque_alias_enabled") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
         free_mode_review_intent: Mapping[str, Any] | None = None
         if self.bridge.free_mode_envelope is not None:
             self.bridge.persist_free_mode_review_intent_projection(session)
@@ -928,6 +1032,8 @@ class InternalStageExecutorRegistry:
             cancellation_checker=session.stage_host.check_cancelled,
             publication_context=self.bridge.publication_context,
             stability_mode=stability.mode,
+            semantic_repair_enabled=semantic_repair_enabled,
+            opaque_alias_enabled=opaque_alias_enabled,
             max_provider_calls=stability.max_provider_calls,
             max_estimated_cost=stability.max_estimated_cost,
             max_estimated_total_tokens=stability.max_estimated_total_tokens,
@@ -994,6 +1100,7 @@ class InternalStageExecutorRegistry:
         summaries = self._load_summary_payloads(session, results)
         if not summaries:
             raise RuntimeError("stage3 requires canonical Stage 1 summaries")
+        summaries = self._build_outline_evidence_pack(session, summaries)
         final_record = session.context.registry.get("outline-v3:final_outline")
         if final_record is None or final_record.status != "ready":
             raise RuntimeError("stage3 requires a ready Outline v3 final outline")

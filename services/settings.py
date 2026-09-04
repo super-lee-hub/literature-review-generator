@@ -205,6 +205,8 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "cache_write_cost_per_1k_tokens",
             "max_smoke_overhead_ratio",
             "max_source_prompt_tokens",
+            "semantic_repair_enabled",
+            "opaque_alias_enabled",
         }
     ),
     "OutlineQualityGate": frozenset(
