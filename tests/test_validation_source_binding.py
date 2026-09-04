@@ -293,3 +293,86 @@ def test_bound_paper_key_filter_applies(
         binding, present_paper_keys=["10.9999/not.in.review"]
     )
     assert arts_skipped == []
+
+
+def _build(ws: Path, summary_path: Path) -> dict[str, Any]:
+    return build_validation_source_binding(
+        summary_sources=[str(summary_path)],
+        local_registry=None,
+        job_id="down_job",
+    )
+
+
+def test_registry_deletion_fails_closed(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    """A binding built while the registry existed must NOT silently skip
+    registry validation when the registry disappears afterwards."""
+
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    (ws / "artifact_registry.json").unlink()
+    artifacts, problems = resolve_bound_paper_artifacts(binding)
+    assert artifacts == []
+    assert any("registry_missing" in item for item in problems)
+
+
+def test_registry_record_identity_mismatch_fails_closed(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    """Same artifact_id + hash but wrong record identity must fail closed."""
+
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    reg_payload = json.loads((ws / "artifact_registry.json").read_text(encoding="utf-8"))
+    reg_payload["artifacts"][0]["artifact_type"] = "evidence_manifest"
+    (ws / "artifact_registry.json").write_text(json.dumps(reg_payload), encoding="utf-8")
+    artifacts, problems = resolve_bound_paper_artifacts(binding)
+    assert artifacts == []
+    assert any("registry_artifact_type_mismatch" in item for item in problems)
+
+
+def test_wrong_paper_manifest_semantic_identity_fails_closed(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    """A byte-identical manifest that semantically belongs to another paper
+    must fail closed via manifest semantic identity, not just file hash."""
+
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    manifest_path = Path(binding["papers"][hashes["paper_key"]]["evidence_manifest_path"])
+    # Rewrite the manifest as a *valid* manifest for a different paper, then
+    # sync the binding's manifest hash so the file-hash check would pass.
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["payload"]["canonical_paper_key"] = "10.9999/other.paper"
+    new_hash = _write(manifest_path, manifest)
+    rewritten = {**binding}
+    papers = {k: dict(v) for k, v in binding["papers"].items()}
+    papers[hashes["paper_key"]]["evidence_manifest_hash"] = new_hash
+    rewritten["papers"] = papers
+    artifacts, problems = resolve_bound_paper_artifacts(rewritten)
+    assert artifacts == []
+    assert any("manifest_paper_identity_mismatch" in item for item in problems)
+
+
+def test_tampered_leaf_normalized_text_fails_closed(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    """normalized.md byte drift after binding must fail closed: validation
+    adjudicates claims against these bytes and cannot read a stale file."""
+
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    leaf_path = Path(binding["papers"][hashes["paper_key"]]["evidence"]["markdown_path"]["path"])
+    leaf_path.write_text(leaf_path.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8")
+    artifacts, problems = resolve_bound_paper_artifacts(binding)
+    assert artifacts == []
+    assert any("normalized_text_hash_mismatch" in item for item in problems)

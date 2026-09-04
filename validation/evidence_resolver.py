@@ -286,11 +286,29 @@ class EvidenceResolver:
         if not candidates:
             candidates.append(self._create_negative_evidence_candidate(cited_span))
 
-        # Sort by confidence (descending) and window_rank (ascending)
-        candidates.sort(key=lambda x: (-x.confidence, x.window_rank))
-        if len(candidates) > max_windows:
-            candidates = candidates[:max_windows]
-        return candidates
+        # Sort by confidence (descending) and window_rank (ascending), but
+        # never let ai_summary hints starve source-grounded evidence: the
+        # adjudication support counts only recognize source-grounded tiers
+        # (locator_page_index / preprocess_chunks / normalized_text /
+        # plain_text_fallback / visual_refs), so a pile of high-confidence
+        # summary hints must not push the real paper windows out of the
+        # bounded packet.  Source-grounded candidates fill the window budget
+        # first; summary hints only take the remaining slots.
+        grounded = [c for c in candidates if c.resolver_tier != "ai_summary"]
+        hints = [c for c in candidates if c.resolver_tier == "ai_summary"]
+        grounded.sort(key=lambda x: (-x.confidence, x.window_rank))
+        hints.sort(key=lambda x: (-x.confidence, x.window_rank))
+        max_hints = max(1, min(2, max_windows))
+        if grounded:
+            chosen = grounded[: max_windows - max_hints] + hints[:max_hints]
+        else:
+            chosen = hints[:max_windows]
+        if not chosen:
+            chosen = [
+                c for c in candidates
+                if c.resolver_tier == "negative" or c.match_reason == "no_evidence"
+            ] or [self._create_negative_evidence_candidate(cited_span)]
+        return chosen[:max_windows]
 
     def _resolve_from_ai_summary(self, cited_span: str) -> List[EvidenceCandidate]:
         """Resolve evidence from AI summary in paper artifact."""

@@ -197,6 +197,7 @@ def build_validation_source_binding(
                 "source_workspace": str(workspace),
                 "stage1_paper_artifact_id": str(record.get("artifact_id") or ""),
                 "stage1_paper_artifact_path": str(record.get("path") or ""),
+                "stage1_paper_artifact_version": str(record.get("artifact_version") or "").strip(),
                 "stage1_paper_artifact_hash": str(record.get("content_hash") or ""),
                 "evidence_manifest_path": manifest_path,
                 "evidence_manifest_hash": str(stage1_inputs.get("evidence_manifest_hash") or "").strip(),
@@ -244,6 +245,71 @@ def _record_value(record: Any, name: str) -> str:
     if isinstance(record, Mapping):
         return str(record.get(name) or "").strip()
     return str(getattr(record, name, "") or "").strip()
+
+
+def _manifest_payload(manifest_path: str) -> tuple[Mapping[str, Any] | None, str]:
+    """Read an evidence manifest envelope and return (payload, failure_label)."""
+
+    payload = _read_json(manifest_path)
+    body = (
+        payload.get("payload")
+        if isinstance(payload, Mapping) and isinstance(payload.get("payload"), Mapping)
+        else payload
+    )
+    if not isinstance(body, Mapping):
+        return None, "evidence_manifest_unreadable"
+    return body, ""
+
+
+def verify_manifest_semantic_identity(
+    *,
+    manifest_path: str,
+    paper_key: str,
+    upstream_job_id: str,
+) -> tuple[bool, str]:
+    """A manifest hash match alone is not enough: the manifest must belong to
+    the bound paper and upstream job with the expected artifact identity."""
+
+    body, failure = _manifest_payload(manifest_path)
+    if body is None:
+        return False, failure
+    if str(body.get("artifact_type") or "") != "evidence_manifest":
+        return False, "manifest_type_mismatch"
+    if str(body.get("canonical_paper_key") or "") != str(paper_key):
+        return False, "manifest_paper_identity_mismatch"
+    if str(body.get("job_id") or "") != str(upstream_job_id):
+        return False, "manifest_job_mismatch"
+    return True, ""
+
+
+def verify_leaf_evidence_bytes(
+    *,
+    paper_key: str,
+    evidence: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Every leaf evidence file (normalized text / chunks / page index / ...)
+    must exist with the exact content hash recorded in the manifest.  Validation
+    adjudicates claims against these bytes, so they cannot be stale."""
+
+    for field, value in evidence.items():
+        if not isinstance(value, Mapping):
+            continue
+        leaf_path = str(value.get("path") or "").strip()
+        expected_hash = str(value.get("content_hash") or "").strip()
+        artifact_type = str(value.get("manifest_artifact_type") or field).strip()
+        if not leaf_path:
+            return False, f"{artifact_type}_path_missing"
+        if not Path(leaf_path).is_file():
+            return False, f"{artifact_type}_missing"
+        if not expected_hash:
+            return False, f"{artifact_type}_hash_missing"
+        try:
+            actual_hash = _sha256(leaf_path)
+        except OSError:
+            return False, f"{artifact_type}_unreadable"
+        if actual_hash != expected_hash:
+            return False, f"{artifact_type}_hash_mismatch"
+    return True, ""
 
 
 def resolve_bound_paper_artifacts(
@@ -305,73 +371,114 @@ def resolve_bound_paper_artifacts(
             continue
 
         registry = registry_for(entry)
-        if registry is not None and artifact_id:
-            record = _registry_get(registry, artifact_id)
-            if record is None:
-                problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_not_in_registry")
+        if registry is None:
+            # The binding declares an external Stage 1 authority; an
+            # unresolvable registry is a hard failure, never a silent skip.
+            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:registry_missing")
+            continue
+        if not artifact_id:
+            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:binding_incomplete")
+            continue
+        record = _registry_get(registry, artifact_id)
+        if record is None:
+            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_not_in_registry")
+            continue
+        # Full record identity binding: status, type, version, job, path and
+        # content hash must all match what the binding recorded at build time.
+        record_status = _record_value(record, "status")
+        if record_status != "ready":
+            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_not_ready")
+            continue
+        for name, expected, label in (
+            ("artifact_type", "paper_artifact", "artifact_type"),
+            ("artifact_version", str(entry.get("stage1_paper_artifact_version") or ""), "artifact_version"),
+            ("job_id", str(entry.get("source_workspace_job_id") or ""), "job_id"),
+            ("path", artifact_path, "path"),
+            ("content_hash", expected_hash, "artifact_hash"),
+        ):
+            if expected and _record_value(record, name) != expected:
+                problems.append(
+                    f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:registry_{label}_mismatch"
+                )
+                break
+        else:
+            try:
+                actual_hash = _sha256(artifact_path)
+            except OSError:
+                problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_unreadable")
                 continue
-            record_status = _record_value(record, "status")
-            record_hash = _record_value(record, "content_hash")
-            if record_status and record_status != "ready":
-                problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_not_ready")
-                continue
-            if record_hash and record_hash != expected_hash:
+            if actual_hash != expected_hash:
                 problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_hash_mismatch")
                 continue
-        try:
-            actual_hash = _sha256(artifact_path)
-        except OSError:
-            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_unreadable")
-            continue
-        if actual_hash != expected_hash:
-            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_hash_mismatch")
-            continue
 
-        payload = _read_json(artifact_path)
-        body = (
-            payload.get("payload")
-            if isinstance(payload, Mapping) and isinstance(payload.get("payload"), Mapping)
-            else payload
-        )
-        if not isinstance(body, Mapping):
-            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_payload_invalid")
-            continue
-        if _paper_key_of(body) != str(paper_key):
-            problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:paper_identity_mismatch")
-            continue
-
-        manifest_path = str(entry.get("evidence_manifest_path") or "").strip()
-        expected_manifest_hash = str(entry.get("evidence_manifest_hash") or "").strip()
-        if manifest_path:
-            if not Path(manifest_path).is_file():
-                problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:evidence_manifest_missing")
+            payload = _read_json(artifact_path)
+            body = (
+                payload.get("payload")
+                if isinstance(payload, Mapping) and isinstance(payload.get("payload"), Mapping)
+                else payload
+            )
+            if not isinstance(body, Mapping):
+                problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:artifact_payload_invalid")
                 continue
-            if expected_manifest_hash:
-                try:
-                    if _sha256(manifest_path) != expected_manifest_hash:
+            if _paper_key_of(body) != str(paper_key):
+                problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:paper_identity_mismatch")
+                continue
+
+            manifest_path = str(entry.get("evidence_manifest_path") or "").strip()
+            expected_manifest_hash = str(entry.get("evidence_manifest_hash") or "").strip()
+            evidence_paths = _as_mapping(entry.get("evidence"))
+            if manifest_path:
+                if not Path(manifest_path).is_file():
+                    problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:evidence_manifest_missing")
+                    continue
+                if expected_manifest_hash:
+                    try:
+                        if _sha256(manifest_path) != expected_manifest_hash:
+                            problems.append(
+                                f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:evidence_manifest_hash_mismatch"
+                            )
+                            continue
+                    except OSError:
                         problems.append(
-                            f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:evidence_manifest_hash_mismatch"
+                            f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:evidence_manifest_unreadable"
                         )
                         continue
-                except OSError:
-                    problems.append(f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:evidence_manifest_unreadable")
+                # Semantic identity: the manifest must belong to this paper/job.
+                manifest_ok, manifest_failure = verify_manifest_semantic_identity(
+                    manifest_path=manifest_path,
+                    paper_key=str(paper_key),
+                    upstream_job_id=str(entry.get("source_workspace_job_id") or ""),
+                )
+                if not manifest_ok:
+                    problems.append(
+                        f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:{manifest_failure}"
+                    )
+                    continue
+                # Leaf evidence bytes must match the manifest content hashes.
+                leaves_ok, leaf_failure = verify_leaf_evidence_bytes(
+                    paper_key=str(paper_key),
+                    evidence=evidence_paths,
+                )
+                if not leaves_ok:
+                    problems.append(
+                        f"VALIDATION_SOURCE_AUTHORITY_INVALID:{paper_key}:{leaf_failure}"
+                    )
                     continue
 
-        stage1_inputs = _as_mapping(body.get("stage1_inputs"))
-        merged_inputs = dict(stage1_inputs)
-        if manifest_path:
-            merged_inputs["evidence_manifest_path"] = manifest_path
-            if expected_manifest_hash:
-                merged_inputs["evidence_manifest_hash"] = expected_manifest_hash
-        evidence_paths = _as_mapping(entry.get("evidence"))
-        preprocess_evidence = {
-            str(field): str(value.get("path") or "")
-            for field, value in evidence_paths.items()
-            if isinstance(value, Mapping) and str(value.get("path") or "").strip()
-        }
-        if preprocess_evidence:
-            merged_inputs["preprocess_evidence"] = preprocess_evidence
-        artifacts.append(
+            stage1_inputs = _as_mapping(body.get("stage1_inputs"))
+            merged_inputs = dict(stage1_inputs)
+            if manifest_path:
+                merged_inputs["evidence_manifest_path"] = manifest_path
+                if expected_manifest_hash:
+                    merged_inputs["evidence_manifest_hash"] = expected_manifest_hash
+            preprocess_evidence = {
+                str(field): str(value.get("path") or "")
+                for field, value in evidence_paths.items()
+                if isinstance(value, Mapping) and str(value.get("path") or "").strip()
+            }
+            if preprocess_evidence:
+                merged_inputs["preprocess_evidence"] = preprocess_evidence
+            artifacts.append(
             {
                 **body,
                 "stage1_inputs": merged_inputs,
