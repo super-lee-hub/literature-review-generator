@@ -244,6 +244,264 @@ def test_evidence_manifest_status_change_invalidates_stale_reconciler_snapshot(
     assert reconciler.load_completed_stage_result("validate") is None
 
 
+@pytest.mark.parametrize("artifact_id", ("review:v2", "citation:v2"))
+def test_validation_complete_turns_false_when_primary_input_is_tampered(
+    tmp_path: Path,
+    artifact_id: str,
+) -> None:
+    reconciler, _validation_record, _evidence = _validation_graph(tmp_path)
+    assert reconciler.stage_is_complete("validate") is True
+    record = reconciler.registry.get(artifact_id)
+    assert record is not None
+    Path(record.path).write_text('{"tampered": true}', encoding="utf-8")
+
+    assert reconciler.stage_is_complete("validate") is False
+    assert any(
+        "validation_dependency_hash_mismatch" in item
+        for item in reconciler.last_completion_diagnostics
+    )
+
+
+def test_validation_complete_happy_path_remains_true(tmp_path: Path) -> None:
+    reconciler, _validation_record, _evidence = _validation_graph(tmp_path)
+    assert reconciler.stage_is_complete("validate") is True
+    assert reconciler.last_completion_diagnostics == ()
+
+
+def test_stage_is_complete_is_read_only(tmp_path: Path) -> None:
+    reconciler, _validation_record, _evidence = _validation_graph(tmp_path)
+    registry_path = Path(reconciler.registry.registry_path)
+    before_registry = registry_path.read_bytes()
+    before_revision = reconciler.registry.revision
+
+    assert reconciler.stage_is_complete("validate") is True
+
+    assert reconciler.registry.revision == before_revision
+    assert registry_path.read_bytes() == before_registry
+
+
+def _external_validation_graph(
+    tmp_path: Path,
+) -> tuple[RuntimeReconciler, ArtifactRegistry, ArtifactRecord]:
+    parent_workspace = JobWorkspace.create(str(tmp_path), "external-parent", job_id="job-external-parent")
+    parent_registry = ArtifactRegistry(parent_workspace.paths.registry_path, parent_workspace.job_id)
+    evidence_path = Path(parent_workspace.artifact_path("evidence.json"))
+    atomic_write_json(
+        str(evidence_path),
+        {
+            "artifact_type": "evidence_manifest",
+            "artifact_version": "v1",
+            "job_id": parent_workspace.job_id,
+        },
+    )
+    evidence = parent_registry.register_file(
+        artifact_id="evidence:external-paper",
+        artifact_role="paper_evidence",
+        artifact_type="evidence_manifest",
+        artifact_version="v1",
+        path=evidence_path,
+        producer="tests",
+    )
+
+    child_workspace = JobWorkspace.create(str(tmp_path), "external-child", job_id="job-external-child")
+    child_registry = ArtifactRegistry(child_workspace.paths.registry_path, child_workspace.job_id)
+    local_records: list[ArtifactRecord] = []
+    for artifact_id, artifact_type, version in (
+        ("review:v2", "review_draft", "v2"),
+        ("citation:v2", "citation_manifest", "v2"),
+    ):
+        path = Path(child_workspace.artifact_path(f"{artifact_id.replace(':', '-')}.json"))
+        atomic_write_json(str(path), {"artifact_type": artifact_type, "artifact_version": version})
+        local_records.append(
+            child_registry.register_file(
+                artifact_id=artifact_id,
+                artifact_role=artifact_type,
+                artifact_type=artifact_type,
+                artifact_version=version,
+                path=path,
+                producer="tests",
+            )
+        )
+    review, citation = local_records
+    external_ref = ArtifactDependencyRefV2(
+        dependency_kind="external_job",
+        job_id=evidence.job_id,
+        artifact_id=evidence.artifact_id,
+        artifact_type=evidence.artifact_type,
+        path=evidence.path,
+        content_hash=evidence.content_hash,
+    )
+    claim = ClaimValidationResultV1(
+        claim_result_id="claim:external",
+        claim_unit_ids=("claim-unit:external",),
+        citation_set_key="citation:external",
+        paper_ids=("external-paper",),
+        block_ids=("block:external",),
+        claim_text="The external evidence supports the bounded claim.",
+        claim_context="",
+        verdict=ClaimVerdict.SUPPORTED,
+        reasoning_summary="external dependency is authoritative",
+        repair_hint="",
+        root_causes=(),
+        span_start=0,
+        span_end=50,
+        alignment_status="supported",
+        alignment_confidence=1.0,
+        low_confidence=False,
+        details={"evidence_status": "supported"},
+        evidence_candidates=(),
+    )
+    validation = ValidationRunResultV1.create(
+        job_id=child_workspace.job_id,
+        attempt_id="attempt-external",
+        execution_status="succeeded",
+        report_id="validation:external",
+        input_artifacts=ValidationInputArtifactsV1(
+            review_draft_id=review.artifact_id,
+            review_draft_hash=review.content_hash,
+            citation_manifest_id=citation.artifact_id,
+            citation_manifest_hash=citation.content_hash,
+            evidence_manifest_ids=(evidence.artifact_id,),
+            evidence_manifest_hashes=(evidence.content_hash,),
+        ),
+        claim_results=(claim,),
+        expected_claim_count=1,
+        review_has_citations=True,
+        evidence_complete=True,
+    )
+    validation_path = Path(child_workspace.artifact_path("validation-result.json"))
+    atomic_write_json(str(validation_path), validation.to_dict())
+    validation_record = child_registry.register_file(
+        artifact_id=validation.validation_run_id,
+        artifact_role="validation",
+        artifact_type="validation_run_result",
+        artifact_version="v1",
+        path=validation_path,
+        producer="tests",
+        depends_on=[
+            ArtifactDependencyRefV2.from_record(review),
+            ArtifactDependencyRefV2.from_record(citation),
+            external_ref,
+        ],
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_workspace.job_id else None
+        ),
+    )
+    terminal = TerminalStageRecordV1.create(
+        job_id=child_workspace.job_id,
+        attempt_id=validation.attempt_id,
+        stage_name="validate",
+        status="succeeded",
+        producer="tests",
+        output_artifact_refs=[_dependency(validation_record)],
+    )
+    StageTerminalStore(child_workspace, child_registry).persist(terminal)
+    reconciler = RuntimeReconciler(
+        child_workspace,
+        child_registry,
+        schema_validators={
+            "review_draft": _json_schema,
+            "citation_manifest": _json_schema,
+            "evidence_manifest": _json_schema,
+        },
+        external_registry_resolver=lambda job_id: (
+            parent_registry if job_id == parent_workspace.job_id else None
+        ),
+    )
+    return reconciler, parent_registry, evidence
+
+
+def test_validation_complete_turns_false_when_external_evidence_deleted(tmp_path: Path) -> None:
+    reconciler, _parent_registry, evidence = _external_validation_graph(tmp_path)
+    assert reconciler.stage_is_complete("validate") is True
+    Path(evidence.path).unlink()
+
+    assert reconciler.stage_is_complete("validate") is False
+    assert any(
+        "validation_dependency_missing" in item
+        for item in reconciler.last_completion_diagnostics
+    )
+
+
+def test_validation_complete_turns_false_when_external_evidence_tampered(tmp_path: Path) -> None:
+    reconciler, _parent_registry, evidence = _external_validation_graph(tmp_path)
+    assert reconciler.stage_is_complete("validate") is True
+    Path(evidence.path).write_text('{"tampered": true}', encoding="utf-8")
+
+    assert reconciler.stage_is_complete("validate") is False
+    assert any(
+        "validation_dependency_hash_mismatch" in item
+        for item in reconciler.last_completion_diagnostics
+    )
+
+
+def test_validation_complete_turns_false_when_external_registry_unresolvable(tmp_path: Path) -> None:
+    reconciler, _parent_registry, _evidence = _external_validation_graph(tmp_path)
+    assert reconciler.stage_is_complete("validate") is True
+    blocked = RuntimeReconciler(
+        reconciler.workspace,
+        reconciler.registry,
+        schema_validators={
+            "review_draft": _json_schema,
+            "citation_manifest": _json_schema,
+            "evidence_manifest": _json_schema,
+        },
+        external_registry_resolver=lambda _job_id: None,
+    )
+
+    assert blocked.stage_is_complete("validate") is False
+    assert any(
+        "validation_external_registry_missing" in item
+        for item in blocked.last_completion_diagnostics
+    )
+
+
+def test_validation_complete_turns_false_when_external_record_quarantined(tmp_path: Path) -> None:
+    reconciler, parent_registry, evidence = _external_validation_graph(tmp_path)
+    assert reconciler.stage_is_complete("validate") is True
+    concurrent_registry = ArtifactRegistry(
+        parent_registry.registry_path,
+        parent_registry.job_id,
+    )
+    concurrent_registry.update_record(evidence.artifact_id, status="quarantined")
+
+    assert reconciler.stage_is_complete("validate") is False
+    assert any(
+        "validation_dependency_not_ready" in item
+        for item in reconciler.last_completion_diagnostics
+    )
+
+
+def test_child_registry_artifact_id_cannot_shadow_external_evidence(tmp_path: Path) -> None:
+    reconciler, _parent_registry, evidence = _external_validation_graph(tmp_path)
+    child_path = Path(reconciler.workspace.artifact_path("shadow-evidence.json"))
+    child_path.write_bytes(Path(evidence.path).read_bytes())
+    reconciler.registry.register_file(
+        artifact_id=evidence.artifact_id,
+        artifact_role="paper_evidence",
+        artifact_type="evidence_manifest",
+        artifact_version="v1",
+        path=child_path,
+        producer="tests.shadow",
+    )
+    validation_record = next(
+        record
+        for record in reconciler.registry.list_records()
+        if record.artifact_type == "validation_run_result"
+    )
+    from validation.run_result import ValidationRunResultV1
+
+    validation = ValidationRunResultV1.from_dict(
+        json.loads(Path(validation_record.path).read_text(encoding="utf-8"))
+    )
+    with pytest.raises(ValidationInputDependencyError, match="ambiguous"):
+        resolve_validation_input_dependencies(
+            reconciler.registry,
+            validation.input_artifacts,
+            external_registry_resolver=lambda _job_id: _parent_registry,
+        )
+
+
 def test_validation_dependency_resolution_preserves_external_evidence_identity(
     tmp_path: Path,
 ) -> None:

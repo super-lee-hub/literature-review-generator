@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
+from models import APIConfig
 from services.model_capabilities import resolve_model_capability
 
 
@@ -41,7 +42,7 @@ def provider_output_token_limit(
         value = _positive_int(config.get(key), 0)
         if value > 0:
             return value
-    capability = resolve_model_capability(config)
+    capability = resolve_model_capability(cast(APIConfig, config))
     return capability.max_output_tokens
 
 

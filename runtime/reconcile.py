@@ -435,10 +435,33 @@ def _validate_validation_run_result(record: ArtifactRecord, path: Path) -> None:
         raise ReconcileValidationError(
             "validation run result does not satisfy the canonical completion contract"
         )
+    if result.input_artifacts.validation_source_authority_fingerprint:
+        from validation.source_binding import validation_source_authority_hash
+
+        if (
+            validation_source_authority_hash(
+                result.input_artifacts.validation_source_authority_fingerprint
+            )
+            != result.input_artifacts.validation_source_authority_hash
+        ):
+            raise ReconcileValidationError(
+                "validation source authority fingerprint hash is inconsistent"
+            )
     try:
         validate_validation_dependency_contract(record, result.input_artifacts)
     except ValidationInputDependencyError as exc:
         raise ReconcileValidationError(str(exc)) from exc
+
+
+def _validate_validation_source_binding(record: ArtifactRecord, path: Path) -> None:
+    from runtime.artifact_validators import validate_registered_artifact
+
+    try:
+        validate_registered_artifact(record, path)
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        raise ReconcileValidationError(
+            f"validation source binding is invalid: {record.artifact_id}"
+        ) from exc
 
 
 def _require_contract_header(
@@ -1625,6 +1648,7 @@ DEFAULT_SCHEMA_VALIDATORS: dict[str, SchemaValidator] = {
     "table_crop": _validate_visual_binary,
     "formula_crop": _validate_visual_binary,
     "validation_run_result": _validate_validation_run_result,
+    "validation_source_binding": _validate_validation_source_binding,
     "validation_disposition": _validate_json_object,
     "runtime_job_spec": _validate_json_object,
     "stage1_progress_snapshot": _validate_json_object,
@@ -1706,6 +1730,41 @@ class RuntimeReconciler:
         # changed path/hash/version from being treated as the cached record.
         self._validated_record_keys: set[tuple[str, ...]] = set()
         self.stage_store = StageTerminalStore(workspace, registry)
+        self.last_completion_diagnostics: tuple[str, ...] = ()
+
+    def _begin_completion_query(self) -> bool:
+        """Refresh durable authority before answering a completion query."""
+
+        self.last_completion_diagnostics = ()
+        try:
+            self.registry.reload()
+        except (OSError, UnicodeError, ValueError, RegistryError) as exc:
+            self.last_completion_diagnostics = (f"registry_reload_failed:{exc}",)
+            return False
+        # A dependency can change in-place while retaining the same Registry
+        # identity fields.  Successful validation is therefore scoped to one
+        # fresh completion query, not to the lifetime of this reconciler.
+        self._validated_record_keys.clear()
+        return True
+
+    @staticmethod
+    def _completion_failure_code(stage_name: str, error: BaseException) -> str:
+        message = str(error).lower()
+        if stage_name != "validate":
+            return f"{stage_name}_completion_invalid"
+        if "external dependency registry is unavailable" in message:
+            return "validation_external_registry_missing"
+        if "external dependency" in message:
+            return "validation_external_dependency_unverified"
+        if "not ready" in message or "quarantined" in message:
+            return "validation_dependency_not_ready"
+        if "content hash" in message or "hash mismatch" in message:
+            return "validation_dependency_hash_mismatch"
+        if "file is missing" in message or "not registered" in message:
+            return "validation_dependency_missing"
+        if "primary input" in message or "validation input" in message:
+            return "validation_primary_input_drift"
+        return "validation_dependency_unverified"
 
     @staticmethod
     def _validation_cache_key(
@@ -1973,16 +2032,21 @@ class RuntimeReconciler:
             )
 
     def _completed_stage_record(self, stage_name: str) -> TerminalStageRecordV1 | None:
+        if not self._begin_completion_query():
+            return None
         candidates = [
             (record, path)
             for record, path in self.stage_store.load_records()
             if record.stage_name == stage_name and record.status == "succeeded"
         ]
+        diagnostics: list[str] = []
         for record, path in sorted(candidates, key=lambda item: item[0].finished_at, reverse=True):
             if record.job_id != self.registry.job_id:
+                diagnostics.append(f"{stage_name}_terminal_owner_mismatch:{record.record_id}")
                 continue
             registered = self.registry.get(record.record_id)
             if registered is None:
+                diagnostics.append(f"{stage_name}_terminal_missing_registry:{record.record_id}")
                 continue
             if (
                 registered.artifact_role != STAGE_TERMINAL_ROLE
@@ -1991,15 +2055,22 @@ class RuntimeReconciler:
                 or Path(registered.path).resolve() != path.resolve()
                 or tuple(registered.depends_on) != tuple(record.output_artifact_refs)
             ):
+                diagnostics.append(f"{stage_name}_terminal_identity_mismatch:{record.record_id}")
                 continue
             try:
                 self.validate_record(registered)
                 for output_ref in record.output_artifact_refs:
                     self.validate_dependency_ref(output_ref)
                 self._validate_stage_recovery_identity(record)
-            except ReconcileValidationError:
+            except (OSError, UnicodeError, ValueError, RegistryError, ReconcileValidationError) as exc:
+                code = self._completion_failure_code(stage_name, exc)
+                diagnostics.append(f"{code}:{exc}")
                 continue
+            self.last_completion_diagnostics = ()
             return record
+        if not candidates:
+            diagnostics.append(f"{stage_name}_terminal_missing")
+        self.last_completion_diagnostics = tuple(diagnostics)
         return None
 
     def stage_is_complete(self, stage_name: str) -> bool:
