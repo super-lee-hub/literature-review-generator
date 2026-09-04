@@ -64,6 +64,36 @@ def render_structured_citations(
     del generator_instance
     lookup = _entry_lookup(citation_manifest)
     unresolved: list[str] = []
+    raw = str(text or "")
+
+    # --- Group adjacent citation tokens into one multi-id group -----------
+    # Writer emission often produces consecutive single-ref tokens, e.g.
+    #   [[cite_ref:R006]][[cite_ref:R009]]
+    # which would otherwise render as "(A)(B)".  Merge a maximal run of
+    # adjacent tokens into a single token with comma-separated ref ids:
+    #   [[cite_ref:R006, R009]] -> "(A; B)"
+    def _group_adjacent(run_match: re.Match[str]) -> str:
+        run = run_match.group(0)
+        ids: list[str] = []
+        for token in re.findall(r"\[\[cite_ref:[^\]]+\]\]", run):
+            for ref_id in extract_ref_ids_from_token(token):
+                if ref_id not in ids:
+                    ids.append(ref_id)
+        if len(ids) <= 1:
+            return run
+        return f"[[cite_ref:{', '.join(ids)}]]"
+
+    rendered_text = re.sub(r"(?:\[\[cite_ref:[^\]]+\]\])+", _group_adjacent, raw)
+
+    # --- Normalize missing space before a citation group ------------------
+    # "text[[cite_ref:R008]]" -> "text [[cite_ref:R008]]"; the renderer never
+    # depends on the model emitting the space itself.
+    def _ensure_space_before(match: re.Match[str]) -> str:
+        return f"{match.group(1)} {match.group(2)}"
+
+    rendered_text = re.sub(
+        r"([^\s(,，.。])(\[\[cite_ref:)", _ensure_space_before, rendered_text
+    )
 
     def replace(match: re.Match[str]) -> str:
         token = match.group(0)
@@ -88,7 +118,7 @@ def render_structured_citations(
         unresolved.append(token)
         return token
 
-    rendered = re.sub(r"\[\[cite:(?!ref:)[^\]]+\]\]", record_legacy, str(text or ""))
+    rendered = re.sub(r"\[\[cite:(?!ref:)[^\]]+\]\]", record_legacy, rendered_text)
     rendered = re.sub(r"\[\[cite_ref:[^\]]+\]\]", replace, rendered)
     return rendered.replace("`", ""), unresolved
 

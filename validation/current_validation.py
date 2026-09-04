@@ -150,7 +150,43 @@ def _load_inputs(
             if payload is not None:
                 paper_artifacts.append(payload)
 
+    binding_records: list[Any] = []
     if not paper_artifacts:
+        # Lane B: recover the authoritative upstream Stage 1 artifacts through
+        # the durable validation_source_binding/v1.  When a binding exists it
+        # is the only acceptable source of paper artifacts: any identity
+        # mismatch fails closed (VALIDATION_SOURCE_AUTHORITY_INVALID) instead
+        # of degrading to an ai_summary-only synthetic artifact.  The legacy
+        # summary fallback below is kept only for jobs with no binding at all.
+        binding_records = [
+            record
+            for record in records
+            if record.artifact_type == "validation_source_binding" and record.status == "ready"
+        ]
+        if binding_records:
+            binding_payload = _read_json(binding_records[-1].path)
+            if isinstance(binding_payload, Mapping) and isinstance(binding_payload.get("payload"), Mapping):
+                binding_payload = binding_payload["payload"]
+            if isinstance(binding_payload, Mapping):
+                from validation.source_binding import resolve_bound_paper_artifacts
+
+                bound_artifacts, binding_problems = resolve_bound_paper_artifacts(
+                    binding_payload,
+                    external_registry_resolver=getattr(
+                        service, "validation_external_registry_resolver", None
+                    ),
+                    present_paper_keys=(
+                        str(service.get_paper_key(summary.get("paper_info") or {}))
+                        for summary in service.summaries
+                        if isinstance(summary.get("paper_info"), Mapping)
+                    ),
+                )
+                for problem in binding_problems:
+                    _log(service, "error", problem)
+                paper_artifacts.extend(bound_artifacts)
+
+    if not paper_artifacts and not binding_records:
+        # No binding and no local paper artifacts: legacy summary-only job.
         for summary in service.summaries:
             paper = summary.get("paper_info") or {}
             if not isinstance(paper, Mapping):

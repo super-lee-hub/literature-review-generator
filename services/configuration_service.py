@@ -356,8 +356,10 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "cache_write_cost_per_1k_tokens": "",
             "max_smoke_overhead_ratio": "2.0",
             "max_source_prompt_tokens": "0",
-            "semantic_repair_enabled": "false",
-            "opaque_alias_enabled": "false",
+            # Validated on live F1 (v19): bounded semantic repair + opaque
+            # structural aliases are the production defaults now.
+            "semantic_repair_enabled": "true",
+            "opaque_alias_enabled": "true",
         },
         "OutlineQualityGate": dict(OUTLINE_QUALITY_GATE_DEFAULTS),
     }

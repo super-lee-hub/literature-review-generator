@@ -224,7 +224,17 @@ class EvidenceResolver:
         locator: Optional[str] = None,
         selected_visual_refs: Optional[List[Dict[str, Any]]] = None,
         retrieval_queries: Optional[Sequence[str]] = None,
+        max_windows: int = 8,
     ) -> List[EvidenceCandidate]:
+        """Resolve bounded source-grounded evidence windows for one span.
+
+        ``max_windows`` caps the ranked windows returned per call so validation
+        adjudication sees a bounded window set (default 8) rather than
+        unbounded full-text excerpts.  Applied after de-duplication, before
+        the negative-evidence fallback.
+        """
+        if max_windows <= 0:
+            max_windows = 8
         candidates: List[EvidenceCandidate] = []
 
         # Explicit tier order as required
@@ -278,6 +288,8 @@ class EvidenceResolver:
 
         # Sort by confidence (descending) and window_rank (ascending)
         candidates.sort(key=lambda x: (-x.confidence, x.window_rank))
+        if len(candidates) > max_windows:
+            candidates = candidates[:max_windows]
         return candidates
 
     def _resolve_from_ai_summary(self, cited_span: str) -> List[EvidenceCandidate]:

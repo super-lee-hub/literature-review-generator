@@ -107,6 +107,7 @@ class _RuntimeStageHost:
         self.reuse_stage1 = bool(request.reuse_stage1)
         self.reuse_summary_files = list(request.reuse_summary_files)
         self.summaries: list[dict[str, Any]] = []
+        self.outline_evidence_pack: list[dict[str, Any]] = []
         self.summary_file = ""
         self.artifact_registry: Any = None
         self.job_workspace: JobWorkspace | None = None
@@ -1100,6 +1101,11 @@ class InternalStageExecutorRegistry:
         summaries = self._load_summary_payloads(session, results)
         if not summaries:
             raise RuntimeError("stage3 requires canonical Stage 1 summaries")
+        # Two-lane evidence: the compact pack is the *provider-facing* Review
+        # input only.  The runtime host keeps the canonical summaries so that
+        # downstream Validation can still resolve the authoritative Stage 1
+        # source artifacts instead of adjudicating against a lossy projection.
+        canonical_summaries = [dict(item) for item in summaries]
         summaries = self._build_outline_evidence_pack(session, summaries)
         final_record = session.context.registry.get("outline-v3:final_outline")
         if final_record is None or final_record.status != "ready":
@@ -1160,7 +1166,11 @@ class InternalStageExecutorRegistry:
             raise RuntimeError("stage3 section evidence packet payload is missing")
         from services.review_generation_service import ReviewGenerationService
 
-        session.stage_host.summaries = list(summaries)
+        # Lane A: compact provider-facing evidence for the Writer.
+        # Lane B: canonical Stage 1 summaries stay on the host as the
+        # downstream Validation authority (never the compact projection).
+        session.stage_host.outline_evidence_pack = list(summaries)
+        session.stage_host.summaries = canonical_summaries
         free_mode_context: Mapping[str, Any] | None = None
         if self.bridge.free_mode_envelope is not None:
             verify_free_mode_intent_input(
@@ -1623,6 +1633,11 @@ class AgentRuntimeBridge:
             for record in registry.list_records()
             if record.status == "ready" and record.artifact_type == "paper_artifact"
         )
+        if not paper_records:
+            # Downstream job: bind the authoritative upstream Stage 1
+            # artifacts durably so Validation can adjudicate claims against
+            # original normalized text instead of the compact review pack.
+            self._ensure_validation_source_binding(session, registry)
         visual_records = tuple(
             record
             for record in registry.list_records()
@@ -1646,6 +1661,79 @@ class AgentRuntimeBridge:
             runtime_config=session.stage_host.config,
             validation_external_registry_resolver=external_registry_resolver,
             publication_context=session.context.publication_context,
+        )
+
+    def _ensure_validation_source_binding(
+        self,
+        session: AgentRuntimeSession,
+        registry: Any,
+    ) -> None:
+        """Publish the durable upstream Stage 1 authority binding (Lane B).
+
+        Downstream review jobs carry no local paper artifacts; the binding
+        records each corpus paper's upstream Stage 1 paper artifact and its
+        evidence manifest with hashes, so Validation can resolve the original
+        normalized text / chunks / page index through the external registry
+        resolver and verify identity before use (fail-closed).
+        """
+
+        from validation.source_binding import build_validation_source_binding
+
+        if any(
+            record.artifact_type == "validation_source_binding" and record.status == "ready"
+            for record in registry.list_records()
+        ):
+            return
+        source_paths: list[str] = []
+        for value in (
+            session.request.summary_file,
+            *session.request.summary_sources,
+            *session.request.reuse_summary_files,
+        ):
+            if value is not None and str(value).strip():
+                source_paths.append(str(value).strip())
+        if not source_paths:
+            return
+        binding = build_validation_source_binding(
+            summary_sources=source_paths,
+            local_registry=registry,
+            job_id=session.context.workspace.job_id,
+        )
+        papers = binding.get("papers")
+        if not isinstance(papers, Mapping) or not papers:
+            return
+        from services.artifact_registry import ArtifactDependencyRefV2
+
+        payload_hash = hash_json({**dict(binding), "papers": dict(papers)})
+        path = session.context.workspace.artifact_path(
+            f"validation_source_binding_{payload_hash[:24]}.json"
+        )
+        dependencies: list[ArtifactDependencyRefV2] = []
+        summary_record = registry.get("summary_file")
+        if summary_record is not None and summary_record.status == "ready":
+            dependencies.append(
+                ArtifactDependencyRefV2(
+                    dependency_kind="local_job",
+                    job_id=summary_record.job_id,
+                    artifact_id=summary_record.artifact_id,
+                    artifact_type=summary_record.artifact_type,
+                    path=summary_record.path,
+                    content_hash=summary_record.content_hash,
+                )
+            )
+        from services.queue_service import LocalPublicationContext
+
+        publish_json_artifact(
+            getattr(registry, "publication_context", None) or LocalPublicationContext(),
+            registry,
+            path,
+            dict(binding),
+            artifact_role="runtime_stage_evidence",
+            artifact_type="validation_source_binding",
+            artifact_version="v1",
+            producer="runtime.orchestrator.InternalStageExecutorRegistry._ensure_validation_source_binding",
+            artifact_id=f"validation_source_binding:{payload_hash[:24]}",
+            depends_on=tuple(dependencies),
         )
 
     def persist_stage1_results(
@@ -1877,10 +1965,19 @@ class AgentRuntimeBridge:
     ) -> StageResult:
         host = session.stage_host
         review_word_path = word_file or host._get_review_word_file_path()
+        # Single bibliography authority: when callers pass no references, the
+        # canonical catalog (the same source that drives the DOCX References
+        # and the citation manifest bibliography) supplies them, so the JSON
+        # draft and the DOCX can never diverge.
+        resolved_references = list(references or ())
+        if not resolved_references and citation_ref_catalog:
+            from services.citation_catalog import references_from_catalog_payload
+
+            resolved_references = references_from_catalog_payload(citation_ref_catalog)
         if not host._persist_review_draft(
             outline_file=outline_file,
             review_sections=review_sections,
-            references=list(references or ()),
+            references=resolved_references,
             word_file=review_word_path,
             generation_mode=generation_mode,
             citation_ref_catalog=citation_ref_catalog,

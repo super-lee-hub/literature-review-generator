@@ -335,6 +335,40 @@ def format_in_text_citation(
     return f"({author_text}, {year}{locator_text})"
 
 
+def references_from_catalog_payload(catalog: Mapping[str, Any]) -> list[str]:
+    """Build the canonical bibliography reference strings from a catalog payload.
+
+    Single bibliography authority: the same ``format_reference_entry`` used by
+    the citation manifest bibliography drives ``review_draft.content.references``,
+    so the JSON draft and the DOCX References can never diverge again.
+    """
+
+    entries = catalog.get("entries")
+    if not isinstance(entries, list):
+        return []
+    references: list[str] = []
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("status") or "active") == "inactive":
+            continue
+        canonical = CitationCatalogEntry(
+            index=index,
+            paper_id=str(entry.get("paper_id") or entry.get("canonical_paper_key") or ""),
+            paper_key=str(entry.get("canonical_paper_key") or entry.get("paper_id") or ""),
+            title=str(entry.get("title") or ""),
+            authors=[str(item) for item in (entry.get("authors") or ()) if str(item)],
+            year=str(entry.get("year") or ""),
+            journal=str(entry.get("journal") or ""),
+            doi=str(entry.get("doi") or ""),
+            aliases=[str(item) for item in (entry.get("aliases") or ()) if str(item)],
+        )
+        text = format_reference_entry(canonical)
+        if text:
+            references.append(text)
+    return references
+
+
 def format_reference_entry(entry: CitationCatalogEntry) -> str:
     # Clean metadata fields
     def clean_field(value: Any) -> str:
