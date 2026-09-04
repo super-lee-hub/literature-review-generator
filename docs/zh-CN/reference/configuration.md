@@ -21,18 +21,20 @@
 
 `[Stage1_Input]` 关键默认值：
 
-- `mode = vision_first`
+- `mode = text_first`
+  （`vision_first` / `text_only` 仅作为兼容输入，统一归一化为 `text_first`）
 - `send_extracted_text = true`
 - `send_selected_visuals = true`
 - `send_original_pdf = never`
 - `image_transport = base64`
 - `single_call_max_pages = 12`
-- `visual_scan_batch_size = 1`（未显式配置时的安全默认值；可按 provider 输出稳定性上调）
+- `visual_scan_batch_size = 8`（只用于 selected-object extraction 或明确的
+  scan-heavy escalation；不会因为页数触发 normal page scan）
 - `stage1_visual_scan_max_output_tokens = 16000`
-- `stage1_synthesis_max_output_tokens = 32000`
-- `stage1_length_retry_max_attempts = 2`；收到 `finish_reason=length` 时只在同一
-  primary route 上按预算序列有限升级，仍不完整才进入 backup
-- `stage1_length_retry_ceiling_tokens = 65536`
+- `stage1_synthesis_max_output_tokens = 64000`
+- `stage1_length_retry_max_attempts = 1`；`finish_reason=length` 最多在同一
+  primary route 上做一次更大预算恢复，ceiling 后不再转 backup
+- `stage1_length_retry_ceiling_tokens = 128000`，并按 provider 上限 clamp
 - `stage1_request_timeout_seconds = 300`；这是长 Stage 1 请求的 timeout，和 output
   token budget 是两个独立控制项
 - `stage1_semantic_retry_max_attempts = 1`；视觉 JSON 已能解析但未通过 v2 schema 时，
@@ -45,28 +47,31 @@
   低于官方 base64/URL 单图 32 MiB 限制。
 
 当前 Stage 1 的布尔值和枚举值采用严格解析。布尔值允许
-`true/false`、`1/0`、`yes/no`、`on/off`；枚举值为 `mode=vision_first`、
+`true/false`、`1/0`、`yes/no`、`on/off`；枚举值为 `mode=text_first`（兼容读取 `vision_first` / `text_only`）、
 `image_transport=base64` 以及 `send_original_pdf=never|auto|always`。
 `crop_padding_ratio` 必须是 `0` 到 `0.25`（含边界）的有限数值。未知拼写、
 不支持的枚举、非有限浮点数和越界 padding 都会使配置校验失败，不会静默回退到默认值。
 
-运行时会按 base64 膨胀后的估算值同时执行单图和单请求预算。视觉扫描会分别记录
-planned、sent、omitted、observed visual ID；只有对每个实际发送图片恰好返回一个严格
-schema observation 的批次才算有效。长文先扫描全部可发送的非空页，再依据 observations
-选择最终 raw image；备用 reader 强制纯文本，并在 provider 证据中如实记录。
+运行时会按 base64 膨胀后的估算值同时执行单图和单请求预算。选择器和 extraction
+batch 会记录 required、optional、selected、inspected、unresolved visual unit ID；
+只有对每个实际发送图片恰好返回一个严格 schema observation 的 batch 才算有效。备用
+reader 强制纯文本，并在 provider 证据中如实记录。
 
 ## Stage 1 配置 ownership 与迁移键
 
-`Stage1_Input` 负责 provider-facing 的文本/PDF/图片传输、页面扫描 batch 与最终
-引用预算，以及 `require_complete_visual_coverage` reuse 策略。
-`mode=vision_first`、`image_transport=base64` 和
-`Stage1_Visual.render_all_nonblank_pages=true` 是 invariant。历史键
+`Stage1_Input` 负责 provider-facing 的文本/PDF/图片传输、selected-object batch 与
+最终引用预算，以及 `require_complete_visual_coverage` reuse 策略。
+`mode=text_first` 和 `image_transport=base64` 是当前 invariant；旧的 `vision_first` / `text_only`
+仅作为兼容输入归一化为 `text_first`。
+`Stage1_Visual.selection_mode=selective` 是生产默认；`adaptive_page_scan` 和
+`render_all_nonblank_pages=true` 只能用于明确的 exception。历史键
 `pdf_required_for_formal_precision`、`formal_precision_text_only_policy`、
 `pdf_verifier_api` 仅用于迁移归一化，进入 typed current settings 前会被移除。
 
-`Stage1_Visual` 负责渲染和 crop 形状：页面/crop 尺寸、像素和产物字节上限、格式、
-JPEG 质量、padding，以及 table/formula crop 开关。当前传输预算统一留在
-`Stage1_Input`。旧的 `max_visual_refs_per_paper`、`visual_artifact_dir` 和重复的
+`Stage1_Visual` 负责确定性选择和渲染：selection mode、visual soft/hard budget、
+页面/crop 尺寸、像素和产物字节上限、格式、JPEG 质量、padding，以及 table/formula
+crop 开关。当前传输 byte budget 统一留在 `Stage1_Input`。旧的
+`max_visual_refs_per_paper`、`visual_artifact_dir` 和重复的
 `Stage1_Visual.max_request_image_bytes` / `max_single_image_bytes` 已移除并拒绝，
 不会被静默当作当前控制项。
 
@@ -75,10 +80,11 @@ JPEG 质量、padding，以及 table/formula crop 开关。当前传输预算统
 
 ## Stage 1 视觉渲染
 
-`[Stage1_Visual]` 默认把每个非空页面渲染到约 2200 px 长边。全页图使用 JPEG
-质量 92；figure、table、formula crop 使用 PNG，bbox 默认外扩约 4%。发布前执行
-像素和字节安全上限。每个 visual manifest 记录宽高、scale、estimated DPI、格式、
-字节数和 SHA-256。
+`[Stage1_Visual]` 默认 `selection_mode=selective` 且
+`render_all_nonblank_pages=false`，soft budget 为 page 4、figure 6、table 6、
+formula 4、总计 10，hard total 为 16。页面目标长边约 2200 px，JPEG 质量 92；
+figure/table/formula crop 使用 PNG，bbox 默认外扩约 4%。发布前执行像素和字节安全
+上限；每个 visual manifest 记录宽高、scale、estimated DPI、格式、字节数和 SHA-256。
 
 ## Outline 角色化路由
 
@@ -161,14 +167,16 @@ python -m reviewctl config-migrate --config config.ini
 
 ## 迁移与证据
 
-model、capability、Prompt identity/hash、schema、预处理证据、visual manifest 或
-visual coverage 任一变化都会使 Stage 1 reuse 失效。页面渲染缺失或失败会写入
-`stage1_visual_coverage/v1`；当 `require_complete_visual_coverage=true` 时，摘要
-必须由 typed `visual_evidence_qualification` 验证为完整证据后才能 exact reuse。
+model、capability、Prompt identity/hash、schema、预处理证据、selection identity、
+visual manifest 或 visual coverage 任一变化都会使 Stage 1 reuse 失效。当前选择性
+coverage 是 `stage1_visual_coverage/v2`，按 required visual unit 而不是所有非空页面
+判定；selected-object observation 是 `stage1_visual_evidence/v3`。当
+`require_complete_visual_coverage=true` 时，摘要必须由 typed
+`visual_evidence_qualification` 验证所有 required unit 后才能 exact reuse。
 `quality_audit.needs_manual_review=true` 只记录降级或不完整证据，不能授权 reuse。
 显式设置 `require_complete_visual_coverage=false` 时，可以在验证 binding 完整性后复用
-降级结果，但必须保留该状态。该开关只放宽最终 raw reinspection 完整性，不放宽页面渲染、
-页面扫描、observation 完整性或 final transport omission 的 fail-closed 语义门槛。存在未解决
+降级结果，但必须保留该状态。该开关不放宽 required visual extraction、observation
+完整性或 final transport omission 的 fail-closed 语义门槛。存在未解决
 raw unit 时，authority 必须保留 degraded evidence，并将最终 raw recheck 保持为 partial
 或 fallback，不能改写为 complete。当前持久化的 qualification JSON 使用严格类型解析；
 布尔值、整数、数组或 omission 字段格式异常时，必须在任何宽松投影前阻断 reuse。Prompt

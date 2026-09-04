@@ -175,9 +175,12 @@ MinerU 的 presigned upload/result 链接仍经过 SSRF 防护。`.env` 中的
 
 ## Stage 1 与 Prompt authority
 
-Stage 1 默认采用实验性的 `deepseek-v4-flash-vision-exp`：MinerU 文本仍是主
-证据，所有非空 PDF 页面都会渲染并写入 visual coverage，长论文会先按批次做
-可恢复的视觉扫描，再进行最终综合。视觉模型失败时回退到
+Stage 1 默认是 full-text-first，可选使用实验性的
+`deepseek-v4-flash-vision-exp`：MinerU 文本是主证据，默认通过确定性的
+selective visual gate 只发送真正需要的 figure/table/formula/page object，正常每篇
+论文只做一次 paper-level synthesis；页数本身不会触发逐页扫描。只有选中的对象装不
+进 transport request 时才使用 selected-visual batches；scan-heavy/OCR-poor 论文才
+可升级到 adaptive page inspection。视觉失败会如实记录 modality 并回退到
 `deepseek-v4-flash`；validation 仍固定使用纯文本的 `deepseek-v4-flash`。
 生产 Prompt 统一通过带 hash 校验的 [Prompt 清单](./docs/zh-CN/reference/prompt-inventory.md)
 加载。

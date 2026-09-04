@@ -40,6 +40,7 @@ class ModelCapability:
     reasoning_param_style: ReasoningParamStyle = "none"
     highest_reasoning_effort: str = ""
     max_token_param: str = "max_tokens"
+    max_output_tokens: int | None = None
     supports_text_verbosity: bool = False
     disallowed_when_reasoning: Set[str] = field(default_factory=set)
     # Anthropic only. How this model wants its thinking configured:
@@ -414,6 +415,7 @@ def resolve_model_capability(api_config: APIConfig) -> ModelCapability:
             reasoning_param_style="deepseek_thinking",
             highest_reasoning_effort="max",
             max_token_param="max_tokens",
+            max_output_tokens=384_000,
             disallowed_when_reasoning={"temperature", "top_p", "presence_penalty", "frequency_penalty"},
         )
 

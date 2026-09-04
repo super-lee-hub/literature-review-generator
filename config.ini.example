@@ -244,19 +244,22 @@ enable_local_rag = false
 rag_backend = chroma
 
 [Stage1_Input]
-mode = vision_first
+# MinerU/full text is primary; selected visuals are bounded supplements.
+mode = text_first
 send_extracted_text = true
 send_selected_visuals = true
 send_original_pdf = never
 max_pdf_file_mb = 50
 force_pdf_file_input_for_provider = false
 image_transport = base64
+# Page count is not a normal-path visual trigger. This batch size applies only
+# to selected-object extraction or explicit scan-heavy escalation.
 single_call_max_pages = 12
-visual_scan_batch_size = 1
+visual_scan_batch_size = 8
 stage1_visual_scan_max_output_tokens = 16000
-stage1_synthesis_max_output_tokens = 32000
-stage1_length_retry_max_attempts = 2
-stage1_length_retry_ceiling_tokens = 65536
+stage1_synthesis_max_output_tokens = 64000
+stage1_length_retry_max_attempts = 1
+stage1_length_retry_ceiling_tokens = 128000
 stage1_request_timeout_seconds = 300
 stage1_semantic_retry_max_attempts = 1
 final_image_refs_max = 8
@@ -266,7 +269,16 @@ max_single_image_bytes = 24000000
 
 [Stage1_Visual]
 enabled = true
-render_all_nonblank_pages = true
+# Normal Stage 1 is deterministic selective visual evidence. Set
+# selection_mode=adaptive_page_scan only for scan-heavy/OCR-poor escalation.
+selection_mode = selective
+render_all_nonblank_pages = false
+page_snapshot_soft_max = 4
+figure_crop_soft_max = 6
+table_crop_soft_max = 6
+formula_crop_soft_max = 4
+selected_visual_soft_total = 10
+selected_visual_hard_total = 16
 page_long_edge_px = 2200
 crop_long_edge_px = 2400
 page_max_pixels = 16000000

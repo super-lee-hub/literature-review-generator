@@ -27,6 +27,9 @@ VISUAL_INPUT_IDENTITY_VERSION = "stage1_visual_input_identity/v1"
 VISUAL_OBSERVATIONS_ARTIFACT_TYPE = "stage1_visual_observations"
 VISUAL_OBSERVATIONS_VERSION = "v2"
 VISUAL_SCAN_PROMPT_ID = "stage1.visual_scan.system.v3"
+VISUAL_EVIDENCE_ARTIFACT_TYPE = "stage1_visual_evidence"
+VISUAL_EVIDENCE_VERSION = "v3"
+VISUAL_EXTRACT_PROMPT_ID = "stage1.visual_extract.system.v1"
 DEFAULT_MAX_REQUEST_IMAGE_BYTES = 36_000_000
 DEFAULT_MAX_SINGLE_IMAGE_BYTES = 24_000_000
 _BASE64_NUMERATOR = 4
@@ -90,6 +93,7 @@ class VisualScanBatch:
     batch_index: int
     visual_refs: tuple[dict[str, Any], ...]
     child_candidates: tuple[dict[str, Any], ...] = ()
+    extraction_mode: str = "page_scan"
 
     @property
     def visual_ids(self) -> tuple[str, ...]:
@@ -106,6 +110,7 @@ class VisualScanBatch:
     def to_dict(self) -> dict[str, Any]:
         return {
             "batch_index": self.batch_index,
+            "extraction_mode": self.extraction_mode,
             "visual_ids": list(self.visual_ids),
             "page_nos": [int(item.get("page_no") or 0) for item in self.visual_refs],
             "visual_refs": [dict(item) for item in self.visual_refs],
@@ -122,10 +127,14 @@ def plan_visual_scan_batches(
     batch_size: int = 10,
     max_request_image_bytes: int = DEFAULT_MAX_REQUEST_IMAGE_BYTES,
     max_single_image_bytes: int = DEFAULT_MAX_SINGLE_IMAGE_BYTES,
+    extraction_mode: str = "page_scan",
 ) -> tuple[VisualScanBatch, ...]:
-    """Partition every page snapshot by order, count, and encoded byte budget."""
+    """Partition selected visual units by order, count, and encoded byte budget."""
 
     size = max(1, int(batch_size))
+    normalized_mode = str(extraction_mode or "page_scan").strip().casefold()
+    if normalized_mode not in {"page_scan", "visual_extract"}:
+        raise ValueError("visual extraction mode must be page_scan or visual_extract")
     request_limit, single_limit = normalize_visual_byte_budgets(
         max_request_image_bytes=max_request_image_bytes,
         max_single_image_bytes=max_single_image_bytes,
@@ -157,6 +166,7 @@ def plan_visual_scan_batches(
                 for item in candidates
                 if int(item.get("page_no") or 0) in page_numbers
             ),
+            extraction_mode=normalized_mode,
         )
 
     batches: list[VisualScanBatch] = []
@@ -262,12 +272,17 @@ def build_visual_scan_user_content(
             if encoded_bytes + estimated > request_limit:
                 reason = "image_exceeds_request_byte_budget"
         if reason:
+            omission_scope = (
+                "selected_visual_extraction"
+                if batch.extraction_mode == "visual_extract"
+                else "page_coverage"
+            )
             omissions.append(
                 {
                     "visual_id": visual_id,
                     "page_no": int(visual.get("page_no") or 0),
                     "reason": reason,
-                    "scope": "page_coverage",
+                    "scope": omission_scope,
                     "authority_blocking": True,
                 }
             )
@@ -299,7 +314,11 @@ def build_visual_scan_user_content(
             "artifact_type": str(visual.get("artifact_type") or ""),
             "image_sha256": str(visual.get("image_sha256") or _file_sha256(path)),
             "image_bytes": raw_bytes,
-            "transport_omission_scope": "page_coverage",
+            "transport_omission_scope": (
+                "selected_visual_extraction"
+                if batch.extraction_mode == "visual_extract"
+                else "page_coverage"
+            ),
             "transport_omission_authority_blocking": True,
         })
     report = {
@@ -616,6 +635,77 @@ def validate_current_visual_observations_v2(
     )
 
 
+def validate_selected_visual_evidence_v3(
+    payload: Mapping[str, Any],
+    *,
+    allowed_visual_ids: Sequence[str],
+    expected_visual_refs: Sequence[Mapping[str, Any]] | None = None,
+    sent_visual_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Validate observations for selected object extraction batches.
+
+    The selected-object contract intentionally has no page-to-child
+    attribution fields: the deterministic selector already supplied the
+    object identity.  It still shares the canonical evidence-kind enum with
+    the legacy page-attribution prompt and validator.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("selected visual evidence payload must be an object")
+    if payload.get("artifact_type") != VISUAL_EVIDENCE_ARTIFACT_TYPE:
+        raise ValueError("selected visual evidence artifact_type is invalid")
+    if payload.get("artifact_version") != VISUAL_EVIDENCE_VERSION:
+        raise ValueError("selected visual evidence artifact_version is invalid")
+    raw_observations = payload.get("observations")
+    if not isinstance(raw_observations, list):
+        raise ValueError("selected visual evidence observations must be an array")
+    allowed_fields = _OBSERVATION_FIELDS | {"evidence_kinds"}
+    for observation in raw_observations:
+        if not isinstance(observation, Mapping):
+            raise ValueError("selected visual evidence entries must be objects")
+        unknown_fields = set(observation) - allowed_fields
+        if unknown_fields:
+            raise ValueError(
+                "selected visual evidence has unexpected fields: "
+                + str(sorted(map(str, unknown_fields)))
+            )
+
+    base_payload = {
+        "artifact_type": VISUAL_OBSERVATIONS_ARTIFACT_TYPE,
+        "artifact_version": "v1",
+        "observations": [
+            {key: value for key, value in observation.items() if key in _OBSERVATION_FIELDS}
+            for observation in raw_observations
+        ],
+    }
+    base = _validate_visual_observations_v1(
+        base_payload,
+        allowed_visual_ids=allowed_visual_ids,
+        expected_visual_refs=expected_visual_refs,
+        sent_visual_ids=sent_visual_ids,
+    )
+    normalized: list[dict[str, Any]] = []
+    for raw, validated in zip(raw_observations, base["observations"]):
+        kinds = raw.get("evidence_kinds")
+        if not isinstance(kinds, list) or not kinds:
+            raise ValueError(
+                "selected visual evidence evidence_kinds is invalid: "
+                + str(validated.get("visual_id") or "")
+            )
+        normalized_kinds = sorted({str(kind).strip() for kind in kinds if str(kind).strip()})
+        if not normalized_kinds or any(kind not in VISUAL_EVIDENCE_KINDS_SET for kind in normalized_kinds):
+            raise ValueError(
+                "selected visual evidence evidence_kinds is invalid: "
+                + str(validated.get("visual_id") or "")
+            )
+        normalized.append({**validated, "evidence_kinds": normalized_kinds})
+    return {
+        "artifact_type": VISUAL_EVIDENCE_ARTIFACT_TYPE,
+        "artifact_version": VISUAL_EVIDENCE_VERSION,
+        "observations": normalized,
+    }
+
+
 def validate_visual_observations(
     payload: Mapping[str, Any],
     *,
@@ -647,6 +737,48 @@ def validate_visual_observations(
             candidate_refs=candidate_refs,
         )
     raise ValueError("visual observation artifact_version is invalid")
+
+
+def build_visual_extract_prompt(
+    batch: VisualScanBatch,
+    *,
+    ocr_by_visual_id: Mapping[str, str] | None = None,
+) -> tuple[str, str]:
+    """Build the current selected-object extraction prompt from registry data."""
+
+    registry = PromptRegistry()
+    ocr = dict(ocr_by_visual_id or {})
+    labels = []
+    for visual in batch.visual_refs:
+        visual_id = str(visual.get("visual_id") or "")
+        labels.append(
+            {
+                "visual_id": visual_id,
+                "page_no": int(visual.get("page_no") or 0),
+                "bbox": list(visual.get("bbox") or []),
+                "artifact_type": str(visual.get("artifact_type") or ""),
+                "caption_excerpt": str(visual.get("caption_excerpt") or ""),
+                "nearby_text_excerpt": str(visual.get("nearby_text_excerpt") or ""),
+                "ocr_excerpt": str(ocr.get(visual_id) or ""),
+            }
+        )
+    user_text = (
+        "Selected visual extraction batch metadata:\n"
+        + json.dumps(
+            {
+                "batch_index": batch.batch_index,
+                "extraction_mode": batch.extraction_mode,
+                "objects": labels,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\nReturn exactly one object observation for every image actually sent."
+    )
+    return user_text, registry.render(
+        VISUAL_EXTRACT_PROMPT_ID,
+        {"EVIDENCE_KINDS_JSON": visual_evidence_kinds_json()},
+    )
 
 
 def select_final_visual_refs_after_scan(
@@ -1664,9 +1796,10 @@ def build_visual_scan_prompt(batch: VisualScanBatch, *, ocr_by_visual_id: Mappin
 __all__ = [
     "DEFAULT_MAX_REQUEST_IMAGE_BYTES", "DEFAULT_MAX_SINGLE_IMAGE_BYTES", "VISUAL_INPUT_IDENTITY_VERSION",
     "VISUAL_OBSERVATIONS_ARTIFACT_TYPE", "VISUAL_OBSERVATIONS_VERSION", "VISUAL_SCAN_PROMPT_ID",
-    "VisualScanBatch", "build_visual_scan_prompt", "build_visual_scan_user_content",
+    "VISUAL_EVIDENCE_ARTIFACT_TYPE", "VISUAL_EVIDENCE_VERSION", "VISUAL_EXTRACT_PROMPT_ID",
+    "VisualScanBatch", "build_visual_scan_prompt", "build_visual_extract_prompt", "build_visual_scan_user_content",
     "estimate_encoded_image_bytes", "normalize_visual_byte_budgets", "plan_visual_scan_batches", "select_final_visual_refs_after_scan",
-    "validate_current_visual_observations_v2", "validate_legacy_visual_observations_v1",
+    "validate_current_visual_observations_v2", "validate_selected_visual_evidence_v3", "validate_legacy_visual_observations_v1",
     "validate_visual_observations", "visual_label",
     "summarize_raw_reinspection_groups",
 ]

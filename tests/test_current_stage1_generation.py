@@ -932,7 +932,7 @@ def test_typed_manifest_visual_bbox_metadata_change_regenerates_without_image_ch
     original_materialize = Stage1VisualArtifactBuilder._materialize_visuals
 
     def materialize_with_bbox_only(self: Any, **kwargs: Any) -> list[Any]:
-        visuals = original_materialize(self, **kwargs)
+        visuals, failures = original_materialize(self, **kwargs)
         target_index = next(
             index
             for index, visual in enumerate(visuals)
@@ -940,10 +940,11 @@ def test_typed_manifest_visual_bbox_metadata_change_regenerates_without_image_ch
         )
         target = visuals[target_index]
         changed_bbox = [round(float(value) + 1.0, 2) for value in target.bbox]
-        return [
+        changed_visuals = [
             replace(visual, bbox=changed_bbox) if index == target_index else visual
             for index, visual in enumerate(visuals)
         ]
+        return changed_visuals, failures
 
     monkeypatch.setattr(
         Stage1VisualArtifactBuilder,

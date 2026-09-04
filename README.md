@@ -40,9 +40,13 @@ auto-generate 的设计就是围绕这些问题展开。
 
 Stage 1 不只读取抽取文本。
 
-当前 Vision-First pipeline 会保留全文文本，同时让视觉模型查看论文页面，并追踪图、表、公式、框架图等视觉证据。
+当前 full-text-first pipeline 会保留全文文本，并通过确定性的 selective visual gate
+只让视觉模型查看真正需要的图、表、公式、框架或页面对象；视觉 evidence 的 page/bbox
+和 hash 会被追踪。
 
-长论文可以分批扫描视觉页面，最终再结合全文文本进行综合；视觉模型失败时会明确记录 fallback，而不会把纯文本结果冒充成多模态成功。
+正常数字版论文以一次 paper-level synthesis 为主；只有 selected visuals 超过 transport
+限制时才分批提取对象。scan-heavy/OCR-poor 输入才允许 adaptive multi-page/full-page
+exception。视觉模型失败时会明确记录 fallback，而不会把纯文本结果冒充成多模态成功。
 
 ### 🧠 3. 多模型 Outline 交叉审校
 

@@ -137,12 +137,15 @@ host validation.
 
 ## Stage 1 and prompt authority
 
-Stage 1 is vision-first with the experimental
-`deepseek-v4-flash-vision-exp`. MinerU text remains primary evidence, every
-non-blank PDF page is rendered and tracked in visual coverage, and long papers
-use recoverable visual-scan batches before final synthesis. Vision failures
-fall back to `deepseek-v4-flash`. Validation remains text-only
-`deepseek-v4-flash`. Production prompts are loaded through the hash-verified
+Stage 1 is full-text-first with optional use of the experimental
+`deepseek-v4-flash-vision-exp`. MinerU text remains primary evidence. The
+default is a deterministic selective visual gate that sends only required
+figure/table/formula/page objects and normally makes one paper-level synthesis
+call; page count alone never creates page scans. Selected-object extraction
+batches are used only when transport limits require them. Scan-heavy/OCR-poor
+papers may explicitly escalate to adaptive page inspection. Vision failures
+fall back to `deepseek-v4-flash` with the modality recorded. Validation remains
+text-only `deepseek-v4-flash`. Production prompts are loaded through the hash-verified
 [Prompt inventory](./docs/en/reference/prompt-inventory.md).
 
 ## Queue and maintenance commands

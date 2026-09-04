@@ -72,6 +72,16 @@
       "sha256": "2c56d94bf8a1837a43ff01d26161ffda55fab1ffabf203b9fff32d62cd0b4f23"
     },
     {
+      "prompt_id": "stage1.visual_extract.system.v1",
+      "path": "prompts/active/stage1/system_visual_extract_v1.txt",
+      "version": "v1",
+      "status": "ACTIVE",
+      "owner": "services.stage1_analysis_service.Stage1AnalysisService",
+      "required_placeholders": ["EVIDENCE_KINDS_JSON"],
+      "output_contract": "stage1_visual_evidence/v3 JSON",
+      "sha256": "bc966700fb2ea7510b04e8816a49754ad85d4670bdbf876222afe873858ebb74"
+    },
+    {
       "prompt_id": "outline.node.system.v3",
       "path": "prompts/active/outline/system_outline_node_v3.txt",
       "version": "v3",

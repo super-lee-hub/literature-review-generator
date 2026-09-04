@@ -153,7 +153,11 @@ def normalize_stage1_config_sections(
             stage1_input["mode"] = parse_enum(
                 stage1_input["mode"],
                 field="Stage1_Input.mode",
-                allowed=("vision_first",),
+                allowed={
+                    "text_first": "text_first",
+                    "vision_first": "text_first",
+                    "text_only": "text_first",
+                },
             )
         if "image_transport" in stage1_input:
             stage1_input["image_transport"] = parse_enum(
@@ -177,6 +181,12 @@ def normalize_stage1_config_sections(
                 maximum=0.25,
             )
             stage1_visual["crop_padding_ratio"] = format(padding, ".15g")
+        if "selection_mode" in stage1_visual:
+            stage1_visual["selection_mode"] = parse_enum(
+                stage1_visual["selection_mode"],
+                field="Stage1_Visual.selection_mode",
+                allowed=("selective", "adaptive_page_scan"),
+            )
 
     return normalized
 

@@ -11,6 +11,7 @@ import zipfile
 from outline.v3_models import compute_v3_hash
 from services.stage1_visual_contract import (
     validate_current_visual_evidence_qualification_pair,
+    validate_selective_visual_semantics,
     validate_visual_coverage_semantics,
 )
 
@@ -100,6 +101,7 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "validation_adjudication_reuse_record",
         "stage1_visual_observations",
         "stage1_visual_coverage",
+        "stage1_visual_evidence",
     }
 )
 
@@ -1788,6 +1790,106 @@ def _validate_stage1_visual_observations_v2(record: Any, path: str | Path, root:
         raise ArtifactSchemaError(f"stage1_visual_observations v2 schema is invalid: {exc}") from exc
 
 
+def _validate_stage1_visual_evidence_v3(record: Any, path: str | Path, root: Mapping[str, Any]) -> None:
+    """Validate the current selected-object visual evidence artifact."""
+
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_evidence",),
+        expected_version="v3",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "batch_index",
+            "call_id",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "visual_ids",
+            "schema_hash",
+            "status",
+            "observations",
+            "error",
+        ),
+        "stage1_visual_evidence",
+    )
+    visual_ids = root.get("visual_ids")
+    observations = root.get("observations")
+    if not isinstance(visual_ids, list) or not isinstance(observations, list):
+        raise ArtifactSchemaError(
+            "stage1_visual_evidence visual_ids and observations must be arrays"
+        )
+    normalized_ids = [str(item).strip() for item in visual_ids]
+    if not normalized_ids or any(not item for item in normalized_ids) or len(set(normalized_ids)) != len(normalized_ids):
+        raise ArtifactSchemaError(
+            "stage1_visual_evidence visual_ids must be unique non-empty strings"
+        )
+    for field_name in ("prompt_id", "prompt_version", "call_id"):
+        if not str(root.get(field_name) or "").strip():
+            raise ArtifactSchemaError(f"stage1_visual_evidence.{field_name} is missing")
+    for field_name in ("prompt_sha256", "schema_hash"):
+        digest = str(root.get(field_name) or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest.lower()):
+            raise ArtifactSchemaError(
+                f"stage1_visual_evidence.{field_name} is not a SHA-256 hex digest"
+            )
+    metadata = getattr(record, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        raise ArtifactSchemaError("stage1_visual_evidence validation metadata is missing")
+    for field_name in (
+        "transport_status",
+        "semantic_validation_status",
+        "semantic_validation_error",
+        "semantic_retry_count",
+        "semantic_retry_index",
+    ):
+        if field_name not in metadata:
+            raise ArtifactSchemaError(
+                f"stage1_visual_evidence validation metadata is missing: {field_name}"
+            )
+    if metadata.get("transport_status") not in {"success", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_evidence transport_status is invalid")
+    if metadata.get("semantic_validation_status") not in {"passed", "failed", "not_evaluated"}:
+        raise ArtifactSchemaError(
+            "stage1_visual_evidence semantic_validation_status is invalid"
+        )
+    if not isinstance(metadata.get("semantic_validation_error"), str):
+        raise ArtifactSchemaError(
+            "stage1_visual_evidence semantic_validation_error must be a string"
+        )
+    for field_name in ("semantic_retry_count", "semantic_retry_index"):
+        value = metadata.get(field_name)
+        if type(value) is not int or value < 0:
+            raise ArtifactSchemaError(
+                f"stage1_visual_evidence {field_name} must be a non-negative integer"
+            )
+    status = str(root.get("status") or "")
+    if status not in {"success", "failed"}:
+        raise ArtifactSchemaError("stage1_visual_evidence.status is invalid")
+    if status == "failed":
+        if not str(root.get("error") or ""):
+            raise ArtifactSchemaError("failed stage1_visual_evidence must include an error")
+        if observations:
+            raise ArtifactSchemaError("failed stage1_visual_evidence must not include observations")
+        return
+    try:
+        from services.stage1_visual_scan import validate_selected_visual_evidence_v3
+
+        validate_selected_visual_evidence_v3(
+            root,
+            allowed_visual_ids=normalized_ids,
+            sent_visual_ids=normalized_ids,
+        )
+    except (ValueError, TypeError, ImportError) as exc:
+        raise ArtifactSchemaError(
+            f"stage1_visual_evidence v3 schema is invalid: {exc}"
+        ) from exc
+
+
 def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
     _validate_production_identity(
         record,
@@ -1888,6 +1990,111 @@ def _validate_stage1_visual_coverage(record: Any, _path: str | Path, root: Mappi
         )
 
 
+def _validate_stage1_visual_coverage_v2(record: Any, _path: str | Path, root: Mapping[str, Any]) -> None:
+    """Validate selective visual coverage and its required-unit reducer."""
+
+    _validate_production_identity(
+        record,
+        root,
+        expected_types=("stage1_visual_coverage",),
+        expected_version="v2",
+    )
+    _require_fields(
+        root,
+        (
+            "job_id",
+            "paper_key",
+            "total_pdf_pages",
+            "nonblank_pages",
+            "rendered_pages",
+            "visually_scanned_pages",
+            "page_status",
+            "scan_batches",
+            "coverage_status",
+            "scan_coverage_status",
+            "final_synthesis_modality",
+            "final_raw_visual_recheck_status",
+            "evidence_coverage_status",
+            "raw_reinspection_units",
+            "required_raw_reinspection_unit_count",
+            "closed_raw_reinspection_unit_count",
+            "unresolved_raw_reinspection_unit_ids",
+            "omissions",
+            "selection_mode",
+            "selection_contract_version",
+            "visual_selection_status",
+            "required_visual_unit_count",
+            "required_visual_unit_ids",
+            "optional_visual_unit_ids",
+            "selected_visual_unit_ids",
+            "inspected_visual_unit_ids",
+            "unresolved_visual_unit_ids",
+            "visual_extraction_strategy",
+        ),
+        "stage1_visual_coverage",
+    )
+    if str(root.get("coverage_status") or "") not in {
+        "complete", "partial", "failed", "not_required"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.coverage_status is invalid")
+    if str(root.get("scan_coverage_status") or "") not in {
+        "complete", "partial", "failed", "planned", "not_required"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.scan_coverage_status is invalid")
+    if str(root.get("final_synthesis_modality") or "") not in {
+        "multimodal", "text_only", "pdf_plus_text"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.final_synthesis_modality is invalid")
+    if str(root.get("final_raw_visual_recheck_status") or "") not in {
+        "complete", "partial", "not_run_fallback", "not_required"
+    }:
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage.final_raw_visual_recheck_status is invalid"
+        )
+    if str(root.get("evidence_coverage_status") or "") not in {
+        "complete", "degraded", "incomplete", "not_required"
+    }:
+        raise ArtifactSchemaError("stage1_visual_coverage.evidence_coverage_status is invalid")
+    raw_units = root.get("raw_reinspection_units")
+    unresolved_units = root.get("unresolved_raw_reinspection_unit_ids")
+    required_units = root.get("required_raw_reinspection_unit_count")
+    closed_units = root.get("closed_raw_reinspection_unit_count")
+    if (
+        not isinstance(raw_units, list)
+        or not isinstance(unresolved_units, list)
+        or type(required_units) is not int
+        or type(closed_units) is not int
+        or required_units < 0
+        or closed_units < 0
+        or closed_units > required_units
+        or len(raw_units) != required_units
+        or any(
+            not isinstance(item, Mapping)
+            or not str(item.get("unit_id") or "")
+            or not isinstance(item.get("closed"), bool)
+            for item in raw_units
+        )
+        or len({str(item.get("unit_id") or "") for item in raw_units}) != len(raw_units)
+        or sum(1 for item in raw_units if item.get("closed") is True) != closed_units
+        or [
+            str(item.get("unit_id") or "")
+            for item in raw_units
+            if item.get("closed") is not True
+        ]
+        != [str(item) for item in unresolved_units]
+    ):
+        raise ArtifactSchemaError("stage1_visual_coverage raw reinspection closure is invalid")
+    if not isinstance(root.get("page_status"), list) or not isinstance(root.get("scan_batches"), list):
+        raise ArtifactSchemaError("stage1_visual_coverage page_status and scan_batches must be arrays")
+    semantic_issues = validate_visual_coverage_semantics(root)
+    semantic_issues += validate_selective_visual_semantics(root)
+    if semantic_issues:
+        raise ArtifactSchemaError(
+            "stage1_visual_coverage semantic validation failed: "
+            + ", ".join(dict.fromkeys(semantic_issues))
+        )
+
+
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     version = str(getattr(record, "artifact_version", "") or "")
@@ -1932,10 +2139,12 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
         ("free_mode_intent_input", "v1"): _validate_free_mode_intent_input,
         ("free_mode_review_intent_projection", "v1"): _validate_free_mode_review_intent_projection,
         ("validation_adjudication_reuse_record", "v1"): _validate_validation_adjudication_reuse_record,
-        ("stage1_visual_observations", "v1"): _validate_stage1_visual_observations,
-        ("stage1_visual_observations", "v2"): _validate_stage1_visual_observations_v2,
-        ("stage1_visual_coverage", "v1"): _validate_stage1_visual_coverage,
-    }
+            ("stage1_visual_observations", "v1"): _validate_stage1_visual_observations,
+            ("stage1_visual_observations", "v2"): _validate_stage1_visual_observations_v2,
+            ("stage1_visual_coverage", "v1"): _validate_stage1_visual_coverage,
+            ("stage1_visual_coverage", "v2"): _validate_stage1_visual_coverage_v2,
+            ("stage1_visual_evidence", "v3"): _validate_stage1_visual_evidence_v3,
+        }
     validator = validators.get((artifact_type, version))
     if validator is None:
         raise ArtifactSchemaError(

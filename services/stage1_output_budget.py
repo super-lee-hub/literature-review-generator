@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from services.model_capabilities import resolve_model_capability
+
 
 DEFAULT_VISUAL_SCAN_MAX_OUTPUT_TOKENS = 16_000
-DEFAULT_SYNTHESIS_MAX_OUTPUT_TOKENS = 32_000
-DEFAULT_LENGTH_RETRY_MAX_ATTEMPTS = 2
-DEFAULT_LENGTH_RETRY_CEILING_TOKENS = 65_536
+DEFAULT_SYNTHESIS_MAX_OUTPUT_TOKENS = 64_000
+DEFAULT_LENGTH_RETRY_MAX_ATTEMPTS = 1
+DEFAULT_LENGTH_RETRY_CEILING_TOKENS = 128_000
 DEFAULT_STAGE1_REQUEST_TIMEOUT_SECONDS = 300
 DEFAULT_SEMANTIC_RETRY_MAX_ATTEMPTS = 1
 
@@ -29,9 +31,25 @@ def _nonnegative_int(value: Any, default: int) -> int:
     return parsed if parsed >= 0 else int(default)
 
 
+def provider_output_token_limit(
+    provider_config: Mapping[str, Any] | None = None,
+) -> int | None:
+    """Return an explicit or known provider output ceiling, if available."""
+
+    config = dict(provider_config or {})
+    for key in ("provider_max_output_tokens", "max_output_tokens_limit"):
+        value = _positive_int(config.get(key), 0)
+        if value > 0:
+            return value
+    capability = resolve_model_capability(config)
+    return capability.max_output_tokens
+
+
 def stage1_output_budget_sequence(
     stage: str,
     settings: Mapping[str, Any] | None = None,
+    *,
+    provider_config: Mapping[str, Any] | None = None,
 ) -> tuple[int, ...]:
     """Return the initial budget plus a finite same-provider escalation path.
 
@@ -52,7 +70,10 @@ def stage1_output_budget_sequence(
     else:
         raise ValueError(f"unsupported Stage 1 output-budget stage: {stage!r}")
 
+    provider_limit = provider_output_token_limit(provider_config)
     base = _positive_int(values.get(base_key), default_base)
+    if provider_limit is not None:
+        base = min(base, provider_limit)
     ceiling = _positive_int(
         values.get(
             "stage1_length_retry_ceiling_tokens",
@@ -60,6 +81,8 @@ def stage1_output_budget_sequence(
         ),
         DEFAULT_LENGTH_RETRY_CEILING_TOKENS,
     )
+    if provider_limit is not None:
+        ceiling = min(ceiling, provider_limit)
     if ceiling < base:
         raise ValueError(
             f"{base_key} cannot exceed stage1_length_retry_ceiling_tokens"
@@ -84,10 +107,16 @@ def stage1_output_budget_sequence(
 def stage1_output_budget_snapshot(
     stage: str,
     settings: Mapping[str, Any] | None = None,
+    *,
+    provider_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a non-secret provenance projection for one budget plan."""
 
-    budgets = stage1_output_budget_sequence(stage, settings)
+    budgets = stage1_output_budget_sequence(
+        stage,
+        settings,
+        provider_config=provider_config,
+    )
     return {
         "stage": str(stage),
         "requested_output_budgets": list(budgets),
@@ -129,4 +158,5 @@ __all__ = [
     "stage1_semantic_retry_max_attempts",
     "stage1_output_budget_sequence",
     "stage1_output_budget_snapshot",
+    "provider_output_token_limit",
 ]

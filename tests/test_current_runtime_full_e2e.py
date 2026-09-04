@@ -343,7 +343,7 @@ def test_current_three_pdf_runtime_chain_reaches_verified_export(
             }
         )
 
-    monkeypatch.setattr("ai_interface.get_summary_from_ai_with_fallback", configured_reader)
+    monkeypatch.setattr("ai_interface.get_summary_from_ai_detailed", configured_reader)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
     monkeypatch.setattr("ai_interface._call_ai_api", adjudicator)
@@ -497,7 +497,7 @@ def test_current_runtime_optional_validation_policy_and_export(
             {"blocks": [{"text": f"The evidence supports the bounded synthesis [[cite_ref:{ref_id}]]."}]}
         )
 
-    monkeypatch.setattr("ai_interface.get_summary_from_ai_with_fallback", configured_reader)
+    monkeypatch.setattr("ai_interface.get_summary_from_ai_detailed", configured_reader)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
 

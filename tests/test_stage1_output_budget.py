@@ -43,6 +43,30 @@ def test_stage1_budget_sequence_rejects_ceiling_below_initial_budget() -> None:
         )
 
 
+def test_stage1_budget_sequence_clamps_to_declared_provider_capability() -> None:
+    settings = {
+        "stage1_synthesis_max_output_tokens": "32000",
+        "stage1_length_retry_max_attempts": "2",
+        "stage1_length_retry_ceiling_tokens": "65536",
+    }
+    config = {
+        "model": "deepseek-v4-flash-vision-exp",
+        "api_base": "https://api.deepseek.com",
+        "provider_family": "deepseek",
+    }
+
+    assert stage1_output_budget_sequence(
+        "synthesis",
+        settings,
+        provider_config=config,
+    ) == (32000, 64000, 65536)
+    assert stage1_output_budget_snapshot(
+        "synthesis",
+        {**settings, "stage1_length_retry_ceiling_tokens": "500000"},
+        provider_config=config,
+    )["ceiling_output_tokens"] == 384000
+
+
 def test_stage1_timeout_is_independent_from_output_budget() -> None:
     assert stage1_request_timeout_seconds({"stage1_request_timeout_seconds": "240"}) == 240
 

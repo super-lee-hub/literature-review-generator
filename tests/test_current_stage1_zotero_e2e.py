@@ -56,6 +56,7 @@ def test_current_zotero_stage1_runs_through_runtime_and_persists_identity(
         primary_config: Mapping[str, Any],
         backup_config: Mapping[str, Any],
         runtime: Any,
+        **_kwargs: Any,
     ) -> Mapping[str, Any]:
         del built_input, primary_config, backup_config, runtime
         paper_info = dict(item.paper_info)

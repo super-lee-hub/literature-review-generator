@@ -10,13 +10,19 @@ from typing import Any, Callable, Mapping
 from services.artifact_registry import ArtifactRegistry, file_sha256
 from services.prompt_registry import PromptRegistry
 from services.stage1_visual_contract import (
+    SELECTIVE_VISUAL_CONTRACT_VERSION,
     VISUAL_OMISSION_SCOPES,
     current_visual_contract_markers,
     validate_current_visual_evidence_qualification,
     validate_current_visual_evidence_qualification_pair,
     validate_visual_coverage_semantics,
 )
-from services.stage1_visual_scan import VISUAL_OBSERVATIONS_VERSION, VISUAL_SCAN_PROMPT_ID
+from services.stage1_visual_scan import (
+    VISUAL_EVIDENCE_VERSION,
+    VISUAL_EXTRACT_PROMPT_ID,
+    VISUAL_OBSERVATIONS_VERSION,
+    VISUAL_SCAN_PROMPT_ID,
+)
 from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
 from runtime.provider_runtime import hash_json
 
@@ -184,6 +190,17 @@ class Stage1VisualEvidenceQualificationV1:
     visual_scan_prompt_version: str = ""
     visual_scan_prompt_sha256: str = ""
     visual_scan_schema_hash: str = ""
+    selection_mode: str = "selective"
+    selection_contract_version: str = "stage1_visual_selection/v1"
+    visual_selection_status: str = "not_required"
+    required_visual_unit_count: int = 0
+    required_visual_unit_ids: tuple[str, ...] = ()
+    optional_visual_unit_ids: tuple[str, ...] = ()
+    selected_visual_unit_ids: tuple[str, ...] = ()
+    inspected_visual_unit_ids: tuple[str, ...] = ()
+    unresolved_visual_unit_ids: tuple[str, ...] = ()
+    materialization_failed_unit_ids: tuple[str, ...] = ()
+    visual_extraction_strategy: str = "none"
 
     @staticmethod
     def _strings(value: Any) -> tuple[str, ...]:
@@ -248,6 +265,23 @@ class Stage1VisualEvidenceQualificationV1:
             visual_scan_prompt_version=_text(raw.get("visual_scan_prompt_version")),
             visual_scan_prompt_sha256=_text(raw.get("visual_scan_prompt_sha256")),
             visual_scan_schema_hash=_text(raw.get("visual_scan_schema_hash")),
+            selection_mode=_text(raw.get("selection_mode")) or "selective",
+            selection_contract_version=(
+                _text(raw.get("selection_contract_version")) or "stage1_visual_selection/v1"
+            ),
+            visual_selection_status=_text(raw.get("visual_selection_status")) or "not_required",
+            required_visual_unit_count=(
+                _as_int_or_none(raw.get("required_visual_unit_count")) or 0
+            ),
+            required_visual_unit_ids=cls._strings(raw.get("required_visual_unit_ids")),
+            optional_visual_unit_ids=cls._strings(raw.get("optional_visual_unit_ids")),
+            selected_visual_unit_ids=cls._strings(raw.get("selected_visual_unit_ids")),
+            inspected_visual_unit_ids=cls._strings(raw.get("inspected_visual_unit_ids")),
+            unresolved_visual_unit_ids=cls._strings(raw.get("unresolved_visual_unit_ids")),
+            materialization_failed_unit_ids=cls._strings(
+                raw.get("materialization_failed_unit_ids")
+            ),
+            visual_extraction_strategy=_text(raw.get("visual_extraction_strategy")) or "none",
         )
 
     @classmethod
@@ -274,6 +308,9 @@ class Stage1VisualEvidenceQualificationV1:
             "observation_artifact_paths", "required_page_ids", "sent_page_ids",
             "observed_page_ids", "render_failed_page_ids", "scan_failed_page_ids",
             "unresolved_raw_reinspection_unit_ids",
+            "required_visual_unit_ids", "optional_visual_unit_ids",
+            "selected_visual_unit_ids", "inspected_visual_unit_ids",
+            "unresolved_visual_unit_ids", "materialization_failed_unit_ids",
         ):
             payload[field_name] = list(payload[field_name])
         payload["transport_omissions"] = [dict(item) for item in self.transport_omissions]
@@ -284,13 +321,21 @@ class Stage1VisualEvidenceQualificationV1:
 
     def qualification_issues(self) -> tuple[str, ...]:
         issues: list[str] = []
-        if self.artifact_type != "stage1_visual_evidence_qualification" or self.artifact_version != "v1":
+        if self.artifact_type != "stage1_visual_evidence_qualification" or self.artifact_version not in {
+            "v1", SELECTIVE_VISUAL_CONTRACT_VERSION
+        }:
             issues.append("qualification_type_invalid")
         issues.extend(validate_visual_coverage_semantics(self.to_dict()))
-        if self.required_nonblank_page_count != len(self.required_page_ids):
+        if self.artifact_version == "v1" and self.required_nonblank_page_count != len(self.required_page_ids):
             issues.append("required_page_ids_incomplete")
+        if self.artifact_version == SELECTIVE_VISUAL_CONTRACT_VERSION:
+            from services.stage1_visual_contract import validate_selective_visual_semantics
+
+            issues.extend(validate_selective_visual_semantics(self.to_dict()))
+            if self.selection_contract_version != "stage1_visual_selection/v1":
+                issues.append("selection_contract_version_invalid")
         required = set(self.required_page_ids)
-        if self.scan_coverage_status in {"complete", "partial", "failed"}:
+        if self.artifact_version == "v1" and self.scan_coverage_status in {"complete", "partial", "failed"}:
             if self.visual_observation_artifact_version != VISUAL_OBSERVATIONS_VERSION:
                 issues.append("visual_observation_schema_invalid")
             if self.visual_scan_prompt_id != VISUAL_SCAN_PROMPT_ID:
@@ -303,9 +348,9 @@ class Stage1VisualEvidenceQualificationV1:
                 issues.append("required_page_inputs_not_sent")
             if required - set(self.observed_page_ids):
                 issues.append("required_page_observations_missing")
-        if self.render_failed_page_ids:
+        if self.artifact_version == "v1" and self.render_failed_page_ids:
             issues.append("required_page_render_failed")
-        if self.scan_failed_page_ids:
+        if self.artifact_version == "v1" and self.scan_failed_page_ids:
             issues.append("required_page_scan_failed")
         invalid_omissions = [
             item
@@ -378,7 +423,7 @@ class Stage1VisualEvidenceQualificationV1:
                 )
             ):
                 issues.append("raw_reinspection_relaxed_authority_invalid")
-        if self.scan_coverage_status not in {"complete", "partial", "failed", "not_required"}:
+        if self.scan_coverage_status not in {"complete", "partial", "failed", "planned", "not_required"}:
             issues.append("scan_coverage_status_invalid")
         if self.final_synthesis_modality not in {"multimodal", "text_only", "pdf_plus_text"}:
             issues.append("final_synthesis_modality_invalid")
@@ -386,7 +431,7 @@ class Stage1VisualEvidenceQualificationV1:
             "complete", "partial", "not_run_fallback", "not_required",
         }:
             issues.append("final_raw_visual_recheck_status_invalid")
-        if self.evidence_coverage_status not in {"complete", "degraded", "incomplete"}:
+        if self.evidence_coverage_status not in {"complete", "degraded", "incomplete", "not_required"}:
             issues.append("evidence_coverage_status_invalid")
         unit_ids = [
             str(item.get("unit_id") or "")
@@ -428,7 +473,9 @@ class Stage1VisualEvidenceQualificationV1:
             and self.require_complete_visual_coverage
         ):
             issues.append("raw_reinspection_units_unresolved")
-        if self.require_complete_visual_coverage and self.evidence_coverage_status != "complete":
+        if self.require_complete_visual_coverage and self.evidence_coverage_status not in {
+            "complete", "not_required"
+        }:
             issues.append("evidence_not_complete_for_reuse")
         return tuple(dict.fromkeys(issues))
 
@@ -995,8 +1042,11 @@ def _verify_visual_evidence_qualification(
             return False, "prior_visual_observation_contract_invalid"
         return False, "prior_visual_coverage_artifact_invalid"
 
+    selective_contract = qualification.artifact_version == SELECTIVE_VISUAL_CONTRACT_VERSION
     required_visual_evidence = bool(
-        qualification.required_page_ids
+        selective_contract
+        or qualification.required_visual_unit_ids
+        or qualification.required_page_ids
         or qualification.required_nonblank_page_count
         or qualification.scan_coverage_status != "not_required"
         or qualification.observation_artifact_ids
@@ -1004,13 +1054,22 @@ def _verify_visual_evidence_qualification(
     )
     expected_scan_identity = None
     expected_scan_schema_hash = ""
-    if required_visual_evidence:
+    if qualification.observation_artifact_ids:
         try:
-            expected_scan_identity = PromptRegistry().identity(VISUAL_SCAN_PROMPT_ID)
+            prompt_id = (
+                VISUAL_EXTRACT_PROMPT_ID
+                if qualification.visual_observation_artifact_version == VISUAL_EVIDENCE_VERSION
+                else VISUAL_SCAN_PROMPT_ID
+            )
+            expected_scan_identity = PromptRegistry().identity(prompt_id)
             expected_scan_schema_hash = hash_json(
                 {
-                    "artifact_type": "stage1_visual_observations",
-                    "artifact_version": VISUAL_OBSERVATIONS_VERSION,
+                    "artifact_type": (
+                        "stage1_visual_evidence"
+                        if qualification.visual_observation_artifact_version == VISUAL_EVIDENCE_VERSION
+                        else "stage1_visual_observations"
+                    ),
+                    "artifact_version": qualification.visual_observation_artifact_version,
                     "prompt_id": expected_scan_identity.prompt_id,
                     "prompt_version": expected_scan_identity.version,
                     "prompt_sha256": expected_scan_identity.sha256,
@@ -1020,7 +1079,8 @@ def _verify_visual_evidence_qualification(
         except (OSError, TypeError, ValueError, RuntimeError):
             return False, "prior_visual_observation_contract_invalid"
         if (
-            qualification.visual_observation_artifact_version != VISUAL_OBSERVATIONS_VERSION
+            qualification.visual_observation_artifact_version
+            not in {VISUAL_OBSERVATIONS_VERSION, VISUAL_EVIDENCE_VERSION}
             or qualification.visual_scan_prompt_id != expected_scan_identity.prompt_id
             or qualification.visual_scan_prompt_version != expected_scan_identity.version
             or qualification.visual_scan_prompt_sha256 != expected_scan_identity.sha256
@@ -1091,7 +1151,7 @@ def _verify_visual_evidence_qualification(
             expected_hash=qualification.coverage_artifact_hash,
             declared_path=qualification.coverage_artifact_path,
             artifact_type="stage1_visual_coverage",
-            expected_artifact_version="v1",
+            expected_artifact_version="v2" if selective_contract else "v1",
             invalid_reason="prior_visual_coverage_artifact_invalid",
         )
         if not coverage_ok:
@@ -1165,6 +1225,23 @@ def _verify_visual_evidence_qualification(
                         return False, "prior_visual_coverage_artifact_invalid"
                 elif sorted(str(item) for item in (actual or [])) != sorted(str(item) for item in (declared or [])):
                     return False, "prior_visual_coverage_artifact_invalid"
+        if selective_contract:
+            for field_name in (
+                "selection_mode",
+                "selection_contract_version",
+                "visual_selection_status",
+                "required_visual_unit_count",
+                "required_visual_unit_ids",
+                "optional_visual_unit_ids",
+                "selected_visual_unit_ids",
+                "inspected_visual_unit_ids",
+                "unresolved_visual_unit_ids",
+                "visual_extraction_strategy",
+            ):
+                declared = getattr(qualification, field_name)
+                actual = coverage_payload.get(field_name)
+                if hash_json(actual) != hash_json(declared):
+                    return False, "prior_visual_coverage_artifact_invalid"
 
     if len(qualification.observation_artifact_ids) != len(qualification.observation_artifact_hashes):
         return False, "prior_visual_observation_artifact_invalid"
@@ -1178,12 +1255,17 @@ def _verify_visual_evidence_qualification(
             if index < len(qualification.observation_artifact_paths)
             else ""
         )
+        observation_type = (
+            "stage1_visual_evidence"
+            if qualification.visual_observation_artifact_version == VISUAL_EVIDENCE_VERSION
+            else "stage1_visual_observations"
+        )
         ok, observation_path, reason = verify_artifact(
             artifact_id=artifact_id,
             expected_hash=artifact_hash,
             declared_path=declared_path,
-            artifact_type="stage1_visual_observations",
-            expected_artifact_version=VISUAL_OBSERVATIONS_VERSION,
+            artifact_type=observation_type,
+            expected_artifact_version=qualification.visual_observation_artifact_version,
             invalid_reason="prior_visual_observation_artifact_invalid",
         )
         if not ok:

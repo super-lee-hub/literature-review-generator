@@ -405,7 +405,10 @@ class ProviderReceiptClosure:
                                 payload = envelope.get("analysis")
                             if (
                                 payload is None
-                                and envelope.get("artifact_type") == "stage1_visual_observations"
+                                and envelope.get("artifact_type") in {
+                                    "stage1_visual_observations",
+                                    "stage1_visual_evidence",
+                                }
                             ):
                                 payload = {
                                     "artifact_type": envelope.get("artifact_type"),

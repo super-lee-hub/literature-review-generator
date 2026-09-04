@@ -8,7 +8,7 @@ facts needed to audit that decision.  Secrets and raw prompts never belong in
 a receipt.
 """
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import os
@@ -777,6 +777,56 @@ class ProviderRuntimeLedger:
     def list_receipts(self) -> tuple[ProviderCallReceiptV1, ...]:
         with self._lock:
             return tuple(self._read_unlocked())
+
+    def retag_epoch(self, previous: str, current: str) -> int:
+        """Rebind receipts written under ``previous`` to ``current``.
+
+        One logical Stage 1 attempt finalizes its expected call graph after
+        visual scans have already produced receipts (the synthesis request
+        identity is only known post-scan).  When the closure epoch moves to
+        that final graph, the receipts already appended for the same attempt
+        must follow the attempt, otherwise the epoch filter silently drops
+        them.  The ledger is a staging file owned by one attempt at this
+        point, so the rewrite is lossless and each migrated receipt records
+        the rebind in its metadata.
+        """
+        if not str(previous) or not str(current) or str(previous) == str(current):
+            return 0
+        with self._lock:
+            receipts = self._read_unlocked()
+            changed = []
+            for receipt in receipts:
+                if str(receipt.closure_epoch_id or "") != str(previous):
+                    changed.append(receipt)
+                    continue
+                metadata = dict(receipt.metadata)
+                metadata["closure_epoch_retagged_from"] = str(previous)
+                changed.append(
+                    replace(
+                        receipt,
+                        closure_epoch_id=str(current),
+                        metadata=metadata,
+                    )
+                )
+            migrated_count = sum(
+                1
+                for receipt in changed
+                if str(receipt.closure_epoch_id or "") == str(current)
+                and str(receipt.metadata.get("closure_epoch_retagged_from") or "") == str(previous)
+            )
+            if not migrated_count:
+                return 0
+            encoded_lines = [
+                _canonical_json(receipt.to_dict()) + "\n" for receipt in changed
+            ]
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.path.with_suffix(self.path.suffix + f".retag-{uuid.uuid4().hex}.tmp")
+            with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.writelines(encoded_lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+            return migrated_count
 
 
 class ProviderRuntime:

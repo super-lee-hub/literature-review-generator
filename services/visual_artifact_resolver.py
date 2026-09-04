@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from services.artifact_registry import ArtifactRegistry
+
+
+_CURRENT_SELECTION_CONTRACT_VERSION = "stage1_visual_selection/v1"
+_CURRENT_SELECTION_MODES = frozenset({"selective", "adaptive_page_scan"})
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
 
 
 def normalize_visual_artifact(visual: Dict[str, Any]) -> Dict[str, Any]:
@@ -137,6 +145,107 @@ class VisualArtifactResolver:
                     candidates.append(value)
         return candidates
 
+    @staticmethod
+    def _requested_selection_contract(paper_artifact: Mapping[str, Any]) -> tuple[str, str]:
+        """Read the selection contract requested by the paper artifact.
+
+        Legacy paper artifacts do not carry a selection contract. They remain
+        readable, but must not authorize an unbound registry fallback.
+        """
+        stage1_inputs = paper_artifact.get("stage1_inputs")
+        if not isinstance(stage1_inputs, Mapping):
+            return "", ""
+        policy = stage1_inputs.get("visual_selection_policy_snapshot")
+        coverage = stage1_inputs.get("visual_coverage")
+        policy = policy if isinstance(policy, Mapping) else {}
+        coverage = coverage if isinstance(coverage, Mapping) else {}
+        mode = _text(coverage.get("selection_mode") or policy.get("selection_mode"))
+        version = _text(
+            coverage.get("selection_contract_version")
+            or policy.get("selection_contract_version")
+        )
+        return mode.casefold(), version
+
+    @staticmethod
+    def _manifest_has_authority_proof(
+        manifest: Mapping[str, Any],
+        record: Any,
+        *,
+        requested_mode: str,
+        requested_contract: str,
+        requested_job_id: str,
+    ) -> bool:
+        """Return whether a manifest is explicitly current/authoritative.
+
+        A paper-key match is intentionally insufficient. The proof may be
+        persisted either in manifest fields or Registry metadata so existing
+        read/audit records remain compatible without being promoted implicitly.
+        """
+        metadata = getattr(record, "metadata", {})
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        raw_selection_policy = manifest.get("selection_policy")
+        selection_policy = (
+            raw_selection_policy if isinstance(raw_selection_policy, Mapping) else {}
+        )
+        raw_budget_decisions = manifest.get("budget_decisions")
+        budget_decisions = (
+            raw_budget_decisions if isinstance(raw_budget_decisions, Mapping) else {}
+        )
+        raw_coverage_report = manifest.get("coverage_report")
+        coverage_report = (
+            raw_coverage_report if isinstance(raw_coverage_report, Mapping) else {}
+        )
+        mode = _text(
+            manifest.get("selection_mode")
+            or selection_policy.get("selection_mode")
+            or budget_decisions.get("selection_mode")
+            or coverage_report.get("selection_mode")
+        ).casefold()
+        contract = _text(
+            manifest.get("selection_contract_version")
+            or selection_policy.get("selection_contract_version")
+            or budget_decisions.get("selection_contract_version")
+            or coverage_report.get("selection_contract_version")
+        )
+        if mode not in _CURRENT_SELECTION_MODES or contract != _CURRENT_SELECTION_CONTRACT_VERSION:
+            return False
+        if requested_mode and mode != requested_mode:
+            return False
+        if requested_contract and contract != requested_contract:
+            return False
+        manifest_job_id = _text(
+            manifest.get("created_from_job_id")
+            or manifest.get("job_id")
+            or coverage_report.get("job_id")
+        )
+        record_job_id = _text(getattr(record, "job_id", ""))
+        if not requested_job_id or manifest_job_id != requested_job_id or record_job_id != requested_job_id:
+            return False
+
+        proof_values = (
+            manifest.get("selection_authority"),
+            manifest.get("authority"),
+            manifest.get("authority_kind"),
+            manifest.get("current_pointer"),
+            manifest.get("is_current"),
+            metadata.get("selection_authority"),
+            metadata.get("authority"),
+            metadata.get("authority_kind"),
+            metadata.get("current_pointer"),
+            metadata.get("is_current"),
+        )
+        for proof in proof_values:
+            if isinstance(proof, Mapping):
+                if proof.get("current") is True or proof.get("is_current") is True:
+                    return True
+                if _text(proof.get("role")).casefold() in {"current", "authority"}:
+                    return True
+            elif proof is True:
+                return True
+            elif _text(proof).casefold() in {"current", "authority", "authoritative"}:
+                return True
+        return False
+
     def resolve_visual_manifest_path(self, paper_artifact_path: str) -> str:
         paper_artifact = self._load_paper_artifact(paper_artifact_path)
         if not paper_artifact:
@@ -149,6 +258,13 @@ class VisualArtifactResolver:
         if manifest_path and os.path.isfile(manifest_path):
             return os.path.abspath(manifest_path)
 
+        # Registry fallback is bound by the current selection contract. A
+        # legacy all-page manifest - or any manifest without an explicit
+        # current/authority proof and a matching mode/contract/job identity -
+        # must never become the selective authority. Paper-key matching alone
+        # is intentionally insufficient.
+        requested_mode, requested_contract = self._requested_selection_contract(paper_artifact)
+        requested_job_id = _text(paper_artifact.get("created_from_job_id"))
         paper_keys = set(self._paper_key_candidates(paper_artifact))
         for record in self.artifact_registry.list_records():
             if record.artifact_type != "visual_manifest" or record.status != "ready":
@@ -158,6 +274,14 @@ class VisualArtifactResolver:
                 continue
             manifest_paper_key = str(manifest.get("paper_key") or "").strip()
             if paper_keys and manifest_paper_key not in paper_keys:
+                continue
+            if not self._manifest_has_authority_proof(
+                manifest,
+                record,
+                requested_mode=requested_mode,
+                requested_contract=requested_contract,
+                requested_job_id=requested_job_id,
+            ):
                 continue
             return os.path.abspath(record.path)
         return ""

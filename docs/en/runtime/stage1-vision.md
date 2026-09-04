@@ -1,177 +1,175 @@
-# Stage 1 Vision-First Pipeline
+# Stage 1 Selective Visual Evidence Pipeline
 
-Stage 1 keeps MinerU or other normalized full text as a primary evidence
-source and adds page-level visual evidence. The pipeline does not guess which
-figure is important before the model has seen the page.
+Stage 1 is a full-text-first academic paper reader. MinerU normalized text,
+structured page metadata, captions, blocks, page index, and OCR are the primary
+evidence. Vision is a deterministic, bounded supplement for evidence whose
+meaning depends on layout, object boundaries, or visual notation.
 
-## Coverage
+The normal path is:
 
-Every nonblank PDF page is rendered as a traceable `page_snapshot`. Blank pages
-may be skipped only with `skipped_blank`; render failures remain explicit
-`render_failed`. The durable `stage1_visual_coverage/v1` report records total
-pages, nonblank pages, rendered/scanned/skipped/failed counts, page status,
-crop references, batches, coverage status, and omissions.
-
-## Request paths
-
-- Short papers (at most `single_call_max_pages`) use one synthesis request with
-  MinerU full text, page metadata, page-specific labels/OCR, page images, and
-  bounded figure/table/formula crops.
-- Longer papers first use deterministic visual scan batches of at most
-  `visual_scan_batch_size` page objects. Each image is immediately preceded by
-  a text label containing `visual_id`, page, bbox, artifact type, caption, and
-  nearby OCR/text. The scan output is a durable
-  `stage1_visual_observations/v2` artifact.
-- Final synthesis receives the full normalized text, all scan observations,
-  coverage report, and at most `final_image_refs_max` high-value crops. Crop
-  selection is a second-stage evidence decision; it does not decide whether a
-  page was visible to the visual model.
-
-Stage 1 visual scans and synthesis use independent
-`stage1_*_max_output_tokens` settings and no longer inherit the historical fixed
-5000-token ceiling. When a provider returns an explicit
-`finish_reason=length`, the runtime escalates through a bounded budget sequence
-on the same primary route; each request's budget, reported usage, finish reason,
-and retry index are written to the receipt. Backup is eligible only after the
-configured ceiling is exhausted. `stage1_request_timeout_seconds` controls wait
-time separately from the output-token budget.
-
-The active visual prompt is `stage1.visual_scan.system.v3`, while the observation
-artifact remains `stage1_visual_observations/v2`. The valid `evidence_kinds` enum is
-generated from the shared schema contract and injected into the prompt;
-`candidate_visual_id` belongs only in the candidate-ID field and must never be used
-as an evidence kind. HTTP 200 and parseable JSON are transport success, not semantic
-success. A v2 schema failure may retry on the same primary route only within
-`stage1_semantic_retry_max_attempts`; repeated failure remains a failed observation
-and incomplete coverage.
-
-## Page-to-crop attribution and reuse qualification
-
-The first pass is page-only: a `page_snapshot` is the unit that is sent and
-observed for long-paper coverage. The v3 prompt receives bounded metadata for
-same-page `figure_crop`, `table_crop`, and `formula_crop` candidates, but those
-metadata entries are candidates rather than confirmed observations. Each page
-observation must declare `resolved`, `ambiguous`, or `no_matching_candidate`.
-Only an explicit, validated `raw_reinspection_candidates` association can
-select a child; a child does not inherit quantitative or relationship evidence
-merely because it shares a page. The selected child carries
-`source_page_visual_id`, `source_observation_visual_id`, `object_attribution_*`,
-`post_scan_score`, and score components. If an ambiguous set does not fit the
-raw-image budget, the reducer retains the page snapshot as the safe fallback.
-Ambiguous attribution is atomic: the reducer schedules the complete candidate
-set as one raw-reinspection unit, or one page snapshot as its reserved fallback;
-it never admits a partial child set. The unit is considered before ordinary
-visual competition, so a global count/byte budget cannot silently consume its
-slot and erase the unit. If neither the children nor the fallback can be
-represented, the unit remains explicitly `not_represented` and unresolved in
-the coverage artifact. This atomic decision covers reference count, encoded
-request bytes, per-image bytes, missing/unreadable children, overlap, dedupe
-groups, and transport constraints. The final coverage and provider transport
-metadata retain the group id, candidate ids, resolution, selected ids, fallback
-reason, transport status, and child-completion flag.
-
-Attribution and raw necessity are separate decisions. An explicit
-`requires_raw_reinspection=false` is respected for an otherwise resolved child;
-manual-review or OCR-conflict safety policy may upgrade it, while an ambiguous
-page upgrades the whole candidate unit. A high attribution score alone is not
-permission to spend raw-image budget.
-
-Immediately before a synthesis HTTP request, local image bytes are snapshotted
-and frozen once. An `all_children` unit is admitted transactionally from that
-snapshot; if a child has disappeared or the actual request budget no longer
-fits, the frozen request contains the declared page fallback or no member of
-the unit. The provider request hash and receipt are computed from this frozen
-wire membership, not from a mutable path that may later change.
-
-The achieved reducer is recorded in the typed
-`visual_evidence_qualification` binding and distinguishes four independent
-facts:
-
-- `scan_coverage_status`: `complete`, `partial`, `failed`, or `not_required`;
-- `final_synthesis_modality`: `multimodal`, `text_only`, or `pdf_plus_text`;
-- `final_raw_visual_recheck_status`: `complete`, `partial`,
-  `not_run_fallback`, or `not_required`;
-- `evidence_coverage_status`: `complete`, `degraded`, or `incomplete`.
-
-These fields replace the old overloaded interpretation of `coverage_status`
-(which remains only as a Registry v1 scan-domain alias with
-`complete|partial|failed`; `not_required` is reduced to `complete` for the
-alias). A backup response after a
-complete page scan keeps `scan_coverage_status=complete`, but records
-`final_synthesis_modality=text_only`,
-`final_raw_visual_recheck_status=not_run_fallback`, and
-`evidence_coverage_status=degraded`; it is marked for manual review. Final
-`evidence_coverage_status=complete` requires every required raw-reinspection
-unit to be closed at wire time; sending any image is not sufficient. The final
-coverage artifact is published only after its JSON readback matches these
-reducer facts.
-
-With `require_complete_visual_coverage=true`, exact reuse verifies the Registry
-records, content hashes, JSON type/version, the v2 observation prompt/schema
-identity, and observation/coverage bytes. A prior v1 observation contract is
-therefore invalidated rather than silently reinterpreted. The
-`validate_legacy_visual_observations_v1` API is a legacy reader only; current
-Stage 1 and Registry paths call `validate_current_visual_observations_v2` and
-reject v1 provider responses.
-Partial or failed scans, omitted required pages, and missing, deleted, or
-tampered coverage/observation artifacts block reuse and require new provider
-work. Setting the option to `false` is an explicit degraded-reuse policy: it
-does not erase the status or manual-review flag, and the referenced artifacts
-must still verify.
-
-## Provider and fallback
-
-DeepSeek Vision uses the official OpenAI-compatible Chat Completions format:
-`text` blocks and `image_url` blocks containing base64 data URLs. Responses
-uses `input_text` and `input_image`. The experimental model is explicitly
-capability-gated; ordinary `deepseek-v4-flash` is text-only. The configured
-`deepseek-v4-flash-vision-exp` model is publicly documented/reported as live;
-generic model-list endpoints may lag that availability. Therefore a missing
-key means that live availability was not independently verified, not that the
-model was declared unavailable.
-
-If the vision call fails, the reader falls back to ordinary Flash with MinerU
-full text and any successful visual observations rendered as text. A fallback
-is recorded as fallback evidence and is never labeled multimodal success.
-
-Validation stays on ordinary `deepseek-v4-flash` and receives source chunks,
-OCR, captions, and observation text only. Original PDFs are not sent as file
-attachments by default.
-
-## Strict configuration values
-
-Current Stage 1 booleans, enums, and `crop_padding_ratio` are parsed by one
-shared strict parser during validation, settings normalization, and runtime
-input construction. Unknown boolean spellings, unsupported enum values, and
-non-finite or out-of-range padding values fail closed; they do not silently
-become a default. Accepted boolean spellings are `true/false`, `1/0`,
-`yes/no`, and `on/off`. The current enums are `mode=vision_first`,
-`image_transport=base64`, and `send_original_pdf=never|auto|always`.
-
-## Official limits
-
-The implementation follows the [DeepSeek Vision guide](https://api-docs.deepseek.com/zh-cn/guides/vision): 48 MiB inline request body, 32 MiB per base64/URL image, 384 image-token upper bound, and 4096 px single-edge limit when a request contains 15 or more images.
-
-## Explicit live smoke
-
-The opt-in smoke test creates a private synthetic one-page PDF containing a
-small table and a framework diagram, then checks the exact experimental model
-ID, image payload, JSON response, usage, and provider receipt. Run it only when
-the external credential and network call are authorized:
-
-```powershell
-$env:AUTO_GENERATE_RUN_LIVE_API = "1"
-python -m pytest -q tests/live/test_deepseek_vision_smoke.py -m live_api
+```text
+PDF / Zotero attachment
+  -> canonical attachment resolution
+  -> MinerU / preprocess
+  -> normalized full text + structured page metadata + OCR/captions/blocks
+  -> deterministic selective visual gate
+  -> selected figure/table/formula/page units (only when required)
+  -> one paper-level Stage 1 synthesis
+  -> summary_v2_lite
 ```
 
-The smoke test accepts only `DEEPSEEK_API_KEY` or
-`AUTO_GENERATE_DEEPSEEK_API_KEY`; a generic live key or `OPENAI_API_KEY` is
-never sent to the DeepSeek endpoint. Without explicit opt-in, the result is
-`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_LIVE_API_NOT_ENABLED`; without a
-DeepSeek-specific key, it is
-`LIVE_DEEPSEEK_VISION_SMOKE=NOT_RUN_NO_DEEPSEEK_KEY`. Offline and mocked tests
-do not substitute for live evidence. The pytest offline guard remains enabled
-for ordinary tests even when a generic live key and opt-in flag exist; a live
-DeepSeek test receives a temporary provider-scoped exception only for
-`api.deepseek.com` and its currently resolved addresses. The smoke test never
-writes the key, response body, or synthetic PDF into the repository.
+## Normal, escalation, and exceptional paths
+
+For a modern digital PDF with reliable text, Stage 1 makes one synthesis
+provider call. It may include no images, or a small set of deterministic visual
+objects. A 30-page paper does not create 30 visual calls merely because it has
+30 pages.
+
+The selector runs before any visual provider call. It uses persisted preprocess
+evidence such as `image_count`, figure/table/formula captions, framework/model/
+mechanism/workflow terms, nearby text, block geometry, OCR use/conflicts, text
+layer quality, and scanned-page indicators. It never calls Vision to decide
+which page should be sent to Vision.
+
+If selected objects exceed the request image budget, the runtime creates
+`stage1_visual_extract:<paper>:<batch>` calls and then exactly one synthesis.
+These are selected-visual batches, not page-coverage batches.
+
+Only scan-heavy or OCR-poor inputs may use the exceptional adaptive page path.
+Typical deterministic reasons are `scanned_pdf`, `scanned_page_ratio`,
+`low_text_coverage`, `low_text_layer_coverage`, or materially degraded OCR.
+Set `Stage1_Visual.selection_mode=adaptive_page_scan` for an explicit test or
+operator escalation. `render_all_nonblank_pages=true` remains a readable
+compatibility switch for that exception; it is not the production default.
+Adaptive page calls use the retained page-attribution contract and record the
+reason for escalation in the coverage and receipt artifacts.
+
+## Selective visual gate and budgets
+
+The shipped defaults are:
+
+```ini
+[Stage1_Visual]
+selection_mode = selective
+render_all_nonblank_pages = false
+page_snapshot_soft_max = 4
+figure_crop_soft_max = 6
+table_crop_soft_max = 6
+formula_crop_soft_max = 4
+selected_visual_soft_total = 10
+selected_visual_hard_total = 16
+```
+
+Page snapshots, figure crops, table crops, and formula crops are separate
+evidence units. A page snapshot and a crop for the same object are not both
+sent by default; the selector prefers the crop unless page-level layout,
+scanning quality, attribution uncertainty, or crop failure makes the full page
+the safer representation.
+
+Soft budgets guide optional selection. Required units are never silently
+dropped when a soft budget is reached. If required units do not fit in one
+request, selected-object extraction batches are used. Image byte budgets,
+base64 expansion estimates, single-image limits, request limits, frozen local
+bytes, atomic groups, and Registry hashes remain enforced at transport time.
+
+## Completeness and provenance
+
+The current selective coverage artifact is `stage1_visual_coverage/v2`. Its
+authority is based on required visual units, not all nonblank pages:
+
+- `visual_selection_status`
+- `required_visual_unit_count`
+- `required_visual_unit_ids`
+- `optional_visual_unit_ids`
+- `selected_visual_unit_ids`
+- `inspected_visual_unit_ids`
+- `unresolved_visual_unit_ids`
+- `visual_extraction_strategy`
+- `evidence_coverage_status`
+
+Normal text-only papers have no required visual units and use
+`evidence_coverage_status=not_required`. A selected unit is complete only when
+it is directly sent in the synthesis or successfully represented by a selected
+visual extraction observation. A missing required unit is `incomplete`; it is
+never silently reduced to complete.
+
+Selected-object observations use `stage1_visual_evidence/v3` and the active
+`stage1.visual_extract.system.v1` prompt. The legacy page-attribution reader
+`stage1_visual_observations/v2` and its prompt remain available for the
+adaptive page exception and for auditing older runs. Legacy all-page artifacts
+cannot masquerade as a selective authority.
+
+Every provider-generated summary still binds source PDF bytes, preprocess
+artifacts, prompt/schema identities, selected visual IDs with page/bbox and
+image hashes, Registry dependencies, expected-call graph, provider receipts,
+receipt closure, and typed Stage 1 reuse authority. Changing the selection
+identity invalidates exact summary reuse. Source PDFs, MinerU output, OCR,
+page index, structured JSON, and preprocess artifacts may be reused only after
+their hashes and Registry dependency closure verify.
+
+## Output budgets and retry taxonomy
+
+Visual extraction and paper synthesis have independent Stage 1 output budgets:
+`stage1_visual_scan_max_output_tokens` and
+`stage1_synthesis_max_output_tokens`. The synthesis default has enough
+headroom for `summary_v2_lite`; the effective sequence is clamped to the
+configured or known provider maximum and is shown by `reviewctl doctor`.
+
+Retries are classified, not shared:
+
+- transient network/429/502/503/504 failures use bounded transport retry;
+- `finish_reason=length` advances once through a larger same-route budget and
+  then fails closed as `STAGE1_SYNTHESIS_OUTPUT_BUDGET_EXHAUSTED` (no same-budget
+  retry and no backup burn after exhaustion);
+- simple JSON envelope defects may be recovered locally;
+- schema-semantic failures have at most a bounded schema-aware recovery;
+- prompt/schema drift, invalid enums, deterministic parameter/authentication
+  errors, and other non-retryable 4xx failures stop deterministically.
+
+The `evidence_kinds` enum is defined once in
+`services/stage1_visual_schema.py`. Both the page prompt/validator and the
+selected-object prompt/validator consume that authority, so visual IDs cannot
+be misused as evidence kinds.
+
+## MinerU result URL safety
+
+MinerU result downloads require HTTPS and an exact hostname. The safe defaults
+include the currently observed official hosts
+`mineru.oss-cn-shanghai.aliyuncs.com` and `cdn-mineru.openxlab.org.cn`.
+`MINERU_ALLOWED_URL_HOSTS` can add exact hosts; schemes, paths, arbitrary URLs,
+and wildcards are rejected. `reviewctl doctor` reports the effective allowlist
+and warns about invalid entries without making a network call.
+
+## Transport and validation boundaries
+
+Vision requests use provider-specific multimodal capability checks and the
+existing base64/image byte hardening. Raw image paths are frozen before a
+synthesis transport; receipts record the request hash and actual image
+membership. Validation remains text/evidence-only and consumes structured
+visual observations and provenance, not fresh Vision calls.
+
+The optional live DeepSeek smoke is not implied by offline or mocked tests. It
+is `NOT_RUN` unless the explicit live flag and a DeepSeek-scoped credential are
+provided.
+
+## Architecture comparison
+
+Historical default:
+
+```text
+all nonblank pages -> page visual scan -> page observations
+                   -> selected raw reinspection -> paper synthesis
+```
+
+Current default:
+
+```text
+MinerU full text -> deterministic selective visual gate
+                 -> optional selected-visual extraction batches
+                 -> one paper synthesis
+```
+
+All-page inspection remains an evidence-based exceptional fallback. This
+restores the original product meaning—an academic reader whose main input is
+the normalized paper—while retaining provenance, Registry, receipts,
+fail-closed validation, transport safety, and resumable reuse.

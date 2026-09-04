@@ -59,6 +59,7 @@ def _run_stage1(
         primary_config: Mapping[str, Any],
         backup_config: Mapping[str, Any],
         runtime: Any,
+        **_kwargs: Any,
     ) -> Mapping[str, Any]:
         del built_input, primary_config, backup_config, runtime
         key = str(item.canonical_paper_key)

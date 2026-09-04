@@ -153,7 +153,7 @@ def test_stage1_migration_only_pdf_keys_are_readable_but_not_retained() -> None:
             "pdf_required_for_formal_precision": "true",
             "formal_precision_text_only_policy": "block",
             "pdf_verifier_api": "Validator_API",
-            "mode": "vision_first",
+            "mode": "text_first",
             "image_transport": "base64",
         }
     }

@@ -27,6 +27,13 @@ from services.stage1_input_selector import Stage1InputSelection, select_stage1_i
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
 
+DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
+    {
+        "mineru.oss-cn-shanghai.aliyuncs.com",
+        "cdn-mineru.openxlab.org.cn",
+    }
+)
+
 
 def _as_bool(value: Any, default: bool = False) -> bool:
     if value is None:
@@ -156,11 +163,22 @@ class PreprocessManager:
         self.mineru_poll_timeout_seconds = _as_float(os.getenv("MINERU_POLL_TIMEOUT_SECONDS", "900"), 900.0)
         self.mineru_request_max_retries = _as_int(os.getenv("MINERU_REQUEST_MAX_RETRIES", "2"), 2)
         self.mineru_retry_backoff_seconds = _as_float(os.getenv("MINERU_RETRY_BACKOFF_SECONDS", "1.5"), 1.5)
-        self.mineru_allowed_url_hosts = {
+        configured_allowed_hosts = {
             item.strip().lower()
             for item in str(os.getenv("MINERU_ALLOWED_URL_HOSTS", "")).split(",")
             if item.strip()
         }
+        self.mineru_invalid_allowed_url_hosts = {
+            item
+            for item in configured_allowed_hosts
+            if not self._is_safe_exact_mineru_host(item)
+        }
+        self.mineru_allowed_url_hosts = set(DEFAULT_MINERU_ALLOWED_URL_HOSTS)
+        self.mineru_allowed_url_hosts.update(
+            item
+            for item in configured_allowed_hosts
+            if item not in self.mineru_invalid_allowed_url_hosts
+        )
         self.allow_local_parse_fallback = _as_bool(os.getenv("ALLOW_LOCAL_PARSE_FALLBACK", "true"), default=True)
         self.docling_timeout_seconds = _as_float(
             preprocess_section.get("docling_timeout_seconds", os.getenv("DOCLING_TIMEOUT_SECONDS", "300")),
@@ -1341,6 +1359,18 @@ class PreprocessManager:
         parsed = urlparse(value)
         hostname = (parsed.hostname or "").lower()
         return bool(parsed.scheme == "https" and hostname and hostname in self.mineru_allowed_url_hosts)
+
+    @staticmethod
+    def _is_safe_exact_mineru_host(value: str) -> bool:
+        host = str(value or "").strip().lower()
+        if not host or "*" in host or "/" in host or ":" in host or "@" in host:
+            return False
+        if host.startswith(".") or host.endswith(".") or ".." in host:
+            return False
+        return all(
+            part and all(char.isalnum() or char == "-" for char in part)
+            for part in host.split(".")
+        )
 
     def _mineru_headers(self) -> Dict[str, str]:
         return {

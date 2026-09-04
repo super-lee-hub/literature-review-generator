@@ -22,20 +22,21 @@ validated by `services.settings`.
 
 `[Stage1_Input]` controls the evidence path:
 
-- `mode = vision_first`
+- `mode = text_first`
+  (`vision_first` / `text_only` are compatibility inputs normalized to `text_first`)
 - `send_extracted_text = true`
 - `send_selected_visuals = true`
 - `send_original_pdf = never`
 - `image_transport = base64`
 - `single_call_max_pages = 12`
-- `visual_scan_batch_size = 1` (the safe implicit default when not explicitly
-  configured; it may be increased when the provider returns stable outputs)
+- `visual_scan_batch_size = 8`; this applies only to selected-object extraction
+  or explicit scan-heavy escalation, never to normal page count
 - `stage1_visual_scan_max_output_tokens = 16000`
-- `stage1_synthesis_max_output_tokens = 32000`
-- `stage1_length_retry_max_attempts = 2`; a `finish_reason=length` response
-  escalates only on the same primary route, and enters backup only after the
-  bounded sequence is exhausted
-- `stage1_length_retry_ceiling_tokens = 65536`
+- `stage1_synthesis_max_output_tokens = 64000`
+- `stage1_length_retry_max_attempts = 1`; `finish_reason=length` gets at most
+  one larger same-route recovery and does not fall through to backup after
+  budget exhaustion
+- `stage1_length_retry_ceiling_tokens = 128000`, clamped to the provider cap
 - `stage1_request_timeout_seconds = 300`; this long Stage 1 timeout is
   independent from the output-token budget
 - `stage1_semantic_retry_max_attempts = 1`; a JSON response that fails the v2
@@ -48,33 +49,36 @@ validated by `services.settings`.
   the official 32 MiB single base64/URL image limit.
 
 Current Stage 1 boolean and enum values are strict. Accepted boolean spellings
-are `true/false`, `1/0`, `yes/no`, and `on/off`; current enum values are
-`mode=vision_first`, `image_transport=base64`, and
+are `true/false`, `1/0`, `yes/no`, and `on/off`; the current canonical mode is
+`mode=text_first` (compatibility inputs `vision_first` / `text_only` are normalized),
+with `image_transport=base64` and
 `send_original_pdf=never|auto|always`. `crop_padding_ratio` is a finite value
 from `0` through `0.25` inclusive. Unknown spellings, unsupported enum values,
 non-finite floats, and out-of-range padding fail configuration validation and
 are not silently replaced with defaults.
 
 The runtime estimates base64-expanded bytes for both per-image and per-request
-budgets. A visual scan records planned, sent, omitted, and observed visual IDs;
-an observation batch is valid only when it contains exactly one strict-schema
-observation for every image actually sent. Long papers scan all sendable
-nonblank pages first, then select the final raw image references from those
-observations. Backup reader transport is text-only and is recorded as such.
+budgets. The selective gate records required, optional, selected, inspected, and
+unresolved visual unit IDs. A visual extraction batch is valid only when it
+contains exactly one strict-schema observation for every image actually sent.
+Backup reader transport is text-only and is recorded as such.
 
 ## Stage 1 ownership and migration keys
 
-`Stage1_Input` owns provider-facing text/PDF/image transport, page-scan batch
-and final-reference budgets, and the `require_complete_visual_coverage` reuse
-policy. `mode=vision_first`, `image_transport=base64`, and
-`Stage1_Visual.render_all_nonblank_pages=true` are invariants. The historical
+`Stage1_Input` owns provider-facing text/PDF/image transport, selected-object
+batch and final-reference budgets, and the `require_complete_visual_coverage`
+reuse policy. `mode=text_first` and `image_transport=base64` are current invariants;
+legacy inputs `vision_first` / `text_only` normalize to `text_first`. `Stage1_Visual.selection_mode=selective` is the production default;
+`adaptive_page_scan` and `render_all_nonblank_pages=true` are explicit
+exception controls. The historical
 `pdf_required_for_formal_precision`, `formal_precision_text_only_policy`, and
 `pdf_verifier_api` keys are accepted only for migration normalization and are
 removed from the typed current settings.
 
-`Stage1_Visual` owns rendering and crop shape: page/crop dimensions, pixel and
-artifact-byte limits, formats, JPEG quality, padding, and table/formula crop
-switches. The current transport budgets remain in `Stage1_Input`. The old
+`Stage1_Visual` owns deterministic selection and rendering: selection mode,
+soft/hard visual budgets, page/crop dimensions, pixel and artifact-byte limits,
+formats, JPEG quality, padding, and table/formula crop switches. The current
+transport byte budgets remain in `Stage1_Input`. The old
 `max_visual_refs_per_paper`, `visual_artifact_dir`, and the duplicate
 `Stage1_Visual.max_request_image_bytes` / `max_single_image_bytes` keys are
 removed and rejected; they are not silently accepted as current controls.
@@ -85,11 +89,13 @@ the example file, and the runtime owner map cannot drift independently.
 
 ## Stage 1 Visual Rendering
 
-`[Stage1_Visual]` defaults render every nonblank page at a target long edge
-of 2200 px. Page snapshots use JPEG quality 92; figure, table, and formula
-crops use PNG with about 4% padding. Pixel and byte limits are enforced before
-publication. Each visual manifest records dimensions, scale, estimated DPI,
-format, byte count, and SHA-256.
+`[Stage1_Visual]` defaults to `selection_mode=selective` and
+`render_all_nonblank_pages=false`. It uses soft caps of 4 page snapshots, 6
+figure crops, 6 table crops, 4 formula crops, 10 selected visuals total, and a
+16-unit hard total. Page snapshots use a 2200 px target long edge and JPEG
+quality 92; figure, table, and formula crops use PNG with about 4% padding.
+Pixel and byte limits are enforced before publication. Each visual manifest
+records dimensions, scale, estimated DPI, format, byte count, and SHA-256.
 
 ## Outline Role Routing
 
@@ -186,16 +192,18 @@ the explicit opt-in to discard them.
 ## Migration and Evidence
 
 Changing the model, capability, prompt identity/hash, schema, preprocess
-evidence, visual manifest, or visual coverage invalidates Stage 1 reuse. Missing
-or failed page rendering is recorded in `stage1_visual_coverage/v1`; with
-`require_complete_visual_coverage=true`, the typed
-`visual_evidence_qualification` must verify complete evidence before exact
-reuse. `quality_audit.needs_manual_review=true` records degraded or incomplete
+evidence, selection identity, visual manifest, or visual coverage invalidates
+Stage 1 reuse. The current coverage artifact is
+`stage1_visual_coverage/v2`; it binds required visual unit IDs rather than all
+nonblank pages. Selected-object evidence is `stage1_visual_evidence/v3`.
+`require_complete_visual_coverage=true` requires the typed
+`visual_evidence_qualification` to verify all required units before exact reuse.
+`quality_audit.needs_manual_review=true` records degraded or incomplete
 evidence; it does not authorize reuse. An explicit
 `require_complete_visual_coverage=false` policy may reuse a verified degraded
-binding with that status preserved. This switch relaxes only the final raw
-reinspection completeness gate: rendering, page scanning, observation
-integrity, and final-transport omissions remain fail-closed semantic gates.
+binding with that status preserved. Rendering, page scanning, selected-object
+extraction integrity, and final-transport omissions remain fail-closed semantic
+gates.
 An unresolved raw unit must remain represented as degraded evidence with a
 partial or fallback final raw-recheck status; it is never rewritten as
 complete. Persisted current qualification JSON is parsed with exact types, so

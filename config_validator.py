@@ -272,8 +272,8 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
     stage1_input = normalized_stage1.get("Stage1_Input", {})
     if isinstance(stage1_input, dict):
         mode = _normalize_config_text(stage1_input.get("mode"))
-        if mode and mode.casefold() != "vision_first":
-            return False, ["[Stage1_Input] mode must be vision_first"]
+        if mode and mode.casefold() not in {"text_first", "vision_first", "text_only"}:
+            return False, ["[Stage1_Input] mode must be text_first"]
         image_transport = _normalize_config_text(stage1_input.get("image_transport"))
         if image_transport and image_transport.casefold() != "base64":
             return False, ["[Stage1_Input] image_transport must be base64"]
@@ -320,9 +320,12 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
 
     stage1_visual = normalized_stage1.get("Stage1_Visual", {})
     if isinstance(stage1_visual, dict):
+        selection_mode = _normalize_config_text(stage1_visual.get("selection_mode"))
+        if selection_mode and selection_mode.casefold() not in {"selective", "adaptive_page_scan"}:
+            return False, [
+                "[Stage1_Visual] selection_mode must be selective or adaptive_page_scan"
+            ]
         render_all = _normalize_config_text(stage1_visual.get("render_all_nonblank_pages"))
-        if render_all and render_all.casefold() != "true":
-            return False, ["[Stage1_Visual] render_all_nonblank_pages is an invariant and must be true"]
         for key in ("page_format", "crop_format"):
             if key in stage1_visual:
                 image_format = _normalize_config_text(stage1_visual[key]).casefold()
@@ -340,6 +343,23 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 valid, error = validate_numeric_range(str(stage1_visual[key]), 1, 2000000000)
                 if not valid:
                     return False, [f"[Stage1_Visual] {key} {error}"]
+        for key in (
+            "page_snapshot_soft_max", "figure_crop_soft_max", "table_crop_soft_max",
+            "formula_crop_soft_max", "selected_visual_soft_total", "selected_visual_hard_total",
+        ):
+            if key in stage1_visual:
+                valid, error = validate_numeric_range(str(stage1_visual[key]), 0, 1000000)
+                if not valid:
+                    return False, [f"[Stage1_Visual] {key} {error}"]
+        try:
+            soft_total = int(str(stage1_visual.get("selected_visual_soft_total", "10")).strip())
+            hard_total = int(str(stage1_visual.get("selected_visual_hard_total", "16")).strip())
+        except (TypeError, ValueError):
+            soft_total = hard_total = 0
+        if soft_total > hard_total:
+            return False, [
+                "[Stage1_Visual] selected_visual_soft_total cannot exceed selected_visual_hard_total"
+            ]
 
     try:
         settings = ApplicationSettings.from_config(config_dict)

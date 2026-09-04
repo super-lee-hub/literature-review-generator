@@ -38,6 +38,9 @@ from services.artifact_registry import (
     file_sha256,
 )
 from services.model_capabilities import resolve_model_capability
+from services.settings import ApplicationSettings
+from services.stage1_output_budget import stage1_output_budget_sequence, provider_output_token_limit
+from preprocess.service import DEFAULT_MINERU_ALLOWED_URL_HOSTS, PreprocessManager
 from services.job_workspace import JobWorkspace
 from runtime.cancellation import CancellationRequestStore
 from runtime.export_bundle import ExportBundleService, ExportBundleSpecV1, ForensicAttestationService
@@ -1167,6 +1170,7 @@ class ReviewControlPlane:
                             "supports_reasoning": capability.supports_reasoning,
                             "supports_pdf_file_input": capability.supports_pdf_file_input,
                             "max_token_param": capability.max_token_param,
+                            "max_output_tokens": capability.max_output_tokens,
                         }
                         if capability is not None
                         else None
@@ -1178,6 +1182,60 @@ class ReviewControlPlane:
             "warn" if missing_keys else "pass",
             {"providers": provider_details, "missing_required_api_keys": missing_keys, "network_probe": False},
         )
+
+        try:
+            stage1_settings = ApplicationSettings.from_config(normalized_config)
+            primary_reader = dict(normalized_config.get("Primary_Reader_API") or {})
+            input_settings = dict(stage1_settings.section("Stage1_Input"))
+            stage1_budget_details = {
+                "visual_extract_or_scan": list(
+                    stage1_output_budget_sequence(
+                        "visual_scan",
+                        input_settings,
+                        provider_config=primary_reader,
+                    )
+                ),
+                "paper_synthesis": list(
+                    stage1_output_budget_sequence(
+                        "synthesis",
+                        input_settings,
+                        provider_config=primary_reader,
+                    )
+                ),
+                "provider_max_output_tokens": provider_output_token_limit(primary_reader),
+                "selection_mode": str(
+                    stage1_settings.section("Stage1_Visual").get("selection_mode")
+                    or "selective"
+                ),
+            }
+            add("stage1_budget", "pass", stage1_budget_details)
+        except Exception as exc:
+            add("stage1_budget", "fail", {"error": str(exc)})
+
+        try:
+            mineru = PreprocessManager(dict(normalized_config))
+            invalid_hosts = sorted(
+                str(item) for item in getattr(mineru, "mineru_invalid_allowed_url_hosts", set())
+            )
+            missing_defaults = sorted(
+                DEFAULT_MINERU_ALLOWED_URL_HOSTS
+                - set(getattr(mineru, "mineru_allowed_url_hosts", set()))
+            )
+            allowlist_status = "pass" if not invalid_hosts and not missing_defaults else "warn"
+            add(
+                "mineru_result_allowlist",
+                allowlist_status,
+                {
+                    "default_exact_hosts": sorted(DEFAULT_MINERU_ALLOWED_URL_HOSTS),
+                    "effective_exact_hosts": sorted(mineru.mineru_allowed_url_hosts),
+                    "invalid_configured_entries": invalid_hosts,
+                    "missing_default_hosts": missing_defaults,
+                    "wildcards_allowed": False,
+                    "network_probe": False,
+                },
+            )
+        except Exception as exc:
+            add("mineru_result_allowlist", "fail", {"error": str(exc)})
 
         add(
             "current_settings",

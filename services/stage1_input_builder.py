@@ -97,16 +97,6 @@ class Stage1InputBuilder:
         visual_bundle_dict = dict(visual_bundle or {})
         stage1_settings = dict(stage1_input_settings or {})
         preprocess_metadata_dict = dict(preprocess_metadata or {})
-        all_visual_refs = [
-            normalize_visual_artifact(dict(item))
-            for item in (
-                visual_bundle_dict.get("all_visual_refs")
-                or visual_bundle_dict.get("selected_visual_refs")
-                or []
-            )
-            if isinstance(item, Mapping)
-        ]
-        selected_visual_refs = list(all_visual_refs)
         visual_manifest_path = str(visual_bundle_dict.get("visual_manifest_path") or "")
         visual_bundle_path = str(visual_bundle_dict.get("bundle_path") or "")
         selection_policy_snapshot = dict(visual_bundle_dict.get("selection_policy_snapshot") or {})
@@ -116,6 +106,30 @@ class Stage1InputBuilder:
             or visual_bundle_dict.get("visual_coverage")
             or {}
         )
+        # Authority: only the explicit ``selected_visual_refs`` field may
+        # define the visual units under the current selective contract.  A
+        # bundle that carries visual refs but no explicit selection field is
+        # a legacy all-page-like artifact; it must fail closed instead of
+        # silently becoming the selective evidence authority.
+        explicit_selected_refs = [
+            normalize_visual_artifact(dict(item))
+            for item in (visual_bundle_dict.get("selected_visual_refs") or [])
+            if isinstance(item, Mapping)
+        ]
+        legacy_all_refs = [
+            normalize_visual_artifact(dict(item))
+            for item in (visual_bundle_dict.get("all_visual_refs") or [])
+            if isinstance(item, Mapping)
+        ]
+        if not explicit_selected_refs and legacy_all_refs:
+            raise ValueError(
+                "visual bundle carries only legacy all_visual_refs without an explicit "
+                "selection field; legacy bundles are not authorized as the current "
+                "selective visual authority"
+            )
+        # Downstream code treats this collection as the complete set of
+        # preprocess-selected visual units for the paper.
+        all_visual_refs = list(explicit_selected_refs)
         post_scan_refs = [
             normalize_visual_artifact(dict(item))
             for item in (post_scan_visual_refs or [])
@@ -157,8 +171,12 @@ class Stage1InputBuilder:
         mode = parse_enum(
             stage1_settings.get("mode"),
             field="Stage1_Input.mode",
-            allowed=("vision_first",),
-            default="vision_first",
+            allowed={
+                "text_first": "text_first",
+                "vision_first": "text_first",
+                "text_only": "text_first",
+            },
+            default="text_first",
         )
         image_transport = parse_enum(
             stage1_settings.get("image_transport"),
@@ -185,11 +203,11 @@ class Stage1InputBuilder:
             default=False,
         )
 
+        # ``single_call_max_pages`` is retained as a compatibility setting for
+        # old callers, but page count is no longer a reason to launch visual
+        # provider calls in the current selective contract.
         single_call_max_pages = max(1, int(stage1_settings.get("single_call_max_pages", 12) or 12))
-        # Keep the implicit default small enough for the configured 5k-token
-        # reader route to return one structured observation per page.  A
-        # caller-provided Stage1_Input value still has authority.
-        visual_scan_batch_size = max(1, int(stage1_settings.get("visual_scan_batch_size", 1) or 1))
+        visual_scan_batch_size = max(1, int(stage1_settings.get("visual_scan_batch_size", 8) or 8))
         final_image_refs_max = max(0, int(stage1_settings.get("final_image_refs_max", 8) or 8))
         max_request_image_bytes, max_single_image_bytes = normalize_visual_byte_budgets(
             max_request_image_bytes=stage1_settings.get(
@@ -201,6 +219,24 @@ class Stage1InputBuilder:
         )
         visual_coverage["max_request_image_bytes"] = max_request_image_bytes
         visual_coverage["max_single_image_bytes"] = max_single_image_bytes
+        selection_mode = str(
+            visual_coverage.get("selection_mode")
+            or selection_policy_snapshot.get("selection_mode")
+            or "selective"
+        ).strip().casefold()
+        if selection_mode not in {"selective", "adaptive_page_scan"}:
+            raise ValueError(
+                "Stage1 visual selection_mode must be selective or adaptive_page_scan"
+            )
+        extraction_strategy = str(
+            visual_coverage.get("visual_extraction_strategy") or ""
+        ).strip().casefold()
+        visual_coverage["selection_mode"] = selection_mode
+        visual_coverage["selection_contract_version"] = str(
+            visual_coverage.get("selection_contract_version")
+            or selection_policy_snapshot.get("selection_contract_version")
+            or "stage1_visual_selection/v1"
+        )
         page_refs = sorted(
             [item for item in all_visual_refs if str(item.get("artifact_type") or "") == "page_snapshot"],
             key=lambda item: int(item.get("page_no") or 0),
@@ -209,53 +245,149 @@ class Stage1InputBuilder:
             [item for item in all_visual_refs if str(item.get("artifact_type") or "") != "page_snapshot"],
             key=lambda item: (-float(item.get("selection_score") or 0.0), int(item.get("page_no") or 0)),
         )
-        nonblank_page_count = int(visual_coverage.get("nonblank_pages") or len(page_refs))
-        visual_coverage["required_nonblank_page_count"] = nonblank_page_count
-        visual_coverage["required_page_ids"] = [
+        selected_ids = [
             str(item.get("visual_id") or "")
-            for item in page_refs
+            for item in all_visual_refs
             if str(item.get("visual_id") or "")
         ]
-        page_total_bytes = sum(
-            estimate_encoded_image_bytes(int(item.get("image_bytes") or 0))
-            for item in page_refs
-        )
-        page_sizes_safe = all(
-            int(item.get("image_bytes") or 0) <= max_single_image_bytes
-            for item in page_refs
-        )
-        short_path = (
-            nonblank_page_count <= single_call_max_pages
-            and page_total_bytes <= max_request_image_bytes
-            and page_sizes_safe
-        )
-        if short_path:
-            selected_visual_refs = self._fit_visual_budget(
-                [*page_refs, *crop_refs[:final_image_refs_max]],
-                max_bytes=max_request_image_bytes,
-                max_single_bytes=max_single_image_bytes,
-                required=page_refs,
+        # A coverage report produced by the current preprocess is the
+        # authority for the unit sets: it may legitimately declare required
+        # units whose local rendering failed (they stay required/unresolved
+        # instead of silently disappearing).  Only fall back to deriving the
+        # sets from the refs when no such declared coverage exists.
+        declared_required = visual_coverage.get("required_visual_unit_ids")
+        coverage_is_authoritative = (
+            str(
+                visual_coverage.get("selection_contract_version") or ""
+            ).strip()
+            == "stage1_visual_selection/v1"
+            and isinstance(declared_required, list)
+            and (
+                "selected_visual_unit_ids" in visual_coverage
+                or "optional_visual_unit_ids" in visual_coverage
             )
+        )
+        if coverage_is_authoritative and isinstance(declared_required, list):
+            required_visual_ids = [str(value) for value in declared_required if str(value)]
+            declared_optional = visual_coverage.get("optional_visual_unit_ids")
+            optional_visual_ids = (
+                [str(value) for value in declared_optional if str(value)]
+                if isinstance(declared_optional, list)
+                else []
+            )
+            declared_selected = visual_coverage.get("selected_visual_unit_ids")
+            if isinstance(declared_selected, list):
+                declared_selected_ids = [
+                    str(value) for value in declared_selected if str(value)
+                ]
+            else:
+                declared_selected_ids = []
+            # Runtime refs may legitimately extend the preprocess selection
+            # (e.g. raw-reinspection children).  The transport set is the
+            # union of declared and ref-backed units so inspected units
+            # always stay within the selected scope.
+            selected_ids = list(
+                dict.fromkeys([*declared_selected_ids, *selected_ids])
+            )
+            visual_coverage["selected_visual_unit_ids"] = selected_ids
+        elif selection_mode == "adaptive_page_scan":
+            required_visual_ids = [
+                str(item.get("visual_id") or "")
+                for item in page_refs
+                if str(item.get("visual_id") or "")
+            ]
+            optional_visual_ids = [
+                str(item.get("visual_id") or "")
+                for item in all_visual_refs
+                if str(item.get("visual_id") or "") not in set(required_visual_ids)
+            ]
         else:
+            required_visual_ids = [
+                str(item.get("visual_id") or "")
+                for item in all_visual_refs
+                if bool(item.get("selection_required", True))
+                and str(item.get("visual_id") or "")
+            ]
+            optional_visual_ids = [
+                str(item.get("visual_id") or "")
+                for item in all_visual_refs
+                if not bool(item.get("selection_required", True))
+                and str(item.get("visual_id") or "")
+            ]
+        if not coverage_is_authoritative:
+            visual_coverage["required_visual_unit_count"] = len(required_visual_ids)
+            visual_coverage["required_visual_unit_ids"] = required_visual_ids
+            visual_coverage["optional_visual_unit_ids"] = optional_visual_ids
+            visual_coverage["selected_visual_unit_ids"] = selected_ids
+            if selection_mode == "adaptive_page_scan":
+                visual_coverage["required_nonblank_page_count"] = int(
+                    visual_coverage.get("nonblank_pages") or len(page_refs)
+                )
+                visual_coverage["required_page_ids"] = [
+                    str(item.get("visual_id") or "")
+                    for item in page_refs
+                    if str(item.get("visual_id") or "")
+                ]
+            else:
+                visual_coverage["required_nonblank_page_count"] = 0
+                visual_coverage["required_page_ids"] = []
+
+        selected_visual_refs: List[Dict[str, Any]] = []
+        planned_batches = ()
+        if post_scan_refs:
             selected_visual_refs = self._fit_visual_budget(
-                post_scan_refs or [],
+                post_scan_refs,
                 max_bytes=max_request_image_bytes,
                 max_single_bytes=max_single_image_bytes,
                 required=[],
             )
+            extraction_strategy = "adaptive_raw_reinspection"
+        elif extraction_strategy == "selected_visual_batches" and visual_observations:
+            # The selected units have already been extracted into structured
+            # observations. Keep the synthesis text/evidence request free of a
+            # second image pass and preserve the completed batch identity.
+            selected_visual_refs = []
+        elif selection_mode == "adaptive_page_scan":
+            planned_batches = plan_visual_scan_batches(
+                page_refs,
+                candidate_refs=all_visual_refs,
+                batch_size=visual_scan_batch_size,
+                max_request_image_bytes=max_request_image_bytes,
+                max_single_image_bytes=max_single_image_bytes,
+                extraction_mode="page_scan",
+            )
+            extraction_strategy = "adaptive_page_scan"
+        elif all_visual_refs and self._visual_refs_fit_budget(
+            all_visual_refs,
+            max_bytes=max_request_image_bytes,
+            max_single_bytes=max_single_image_bytes,
+        ):
+            selected_visual_refs = [dict(item) for item in all_visual_refs]
+            extraction_strategy = "direct_synthesis_visuals"
+        elif all_visual_refs:
+            planned_batches = plan_visual_scan_batches(
+                all_visual_refs,
+                candidate_refs=(),
+                batch_size=visual_scan_batch_size,
+                max_request_image_bytes=max_request_image_bytes,
+                max_single_image_bytes=max_single_image_bytes,
+                extraction_mode="visual_extract",
+            )
+            extraction_strategy = "selected_visual_batches"
+        else:
+            extraction_strategy = "none"
+        visual_coverage["visual_extraction_strategy"] = extraction_strategy
+        visual_coverage["planned_visual_ids"] = (
+            [str(item.get("visual_id") or "") for item in page_refs if str(item.get("visual_id") or "")]
+            if extraction_strategy == "adaptive_page_scan"
+            else selected_ids
+        )
         visual_coverage.update(
             summarize_raw_reinspection_groups(
                 selected_visual_refs,
                 planned_units=visual_coverage.get("raw_reinspection_units"),
             )
         )
-        planned_batches = plan_visual_scan_batches(
-            page_refs,
-            candidate_refs=all_visual_refs,
-            batch_size=visual_scan_batch_size,
-            max_request_image_bytes=max_request_image_bytes,
-            max_single_image_bytes=max_single_image_bytes,
-        ) if not short_path else ()
         visual_scan_batches = [list(batch.visual_refs) for batch in planned_batches]
         visual_scan_candidate_refs = [
             [dict(item) for item in batch.child_candidates]
@@ -264,6 +396,7 @@ class Stage1InputBuilder:
         planned_scan_batches = [
             {
                 "batch_index": index,
+                "extraction_mode": planned_batches[index].extraction_mode,
                 "visual_ids": [str(item.get("visual_id") or "") for item in batch],
                 "page_nos": [int(item.get("page_no") or 0) for item in batch],
                 "child_candidate_ids": [
@@ -279,11 +412,10 @@ class Stage1InputBuilder:
         # second build must not overwrite the durable batch outcomes.
         visual_coverage["planned_scan_batches"] = planned_scan_batches
         visual_coverage.setdefault("scan_batches", [])
-        visual_coverage.setdefault("planned_visual_ids", [str(item.get("visual_id") or "") for item in page_refs])
-        visual_coverage.setdefault("coverage_status", "planned" if page_refs else "complete")
+        visual_coverage.setdefault("coverage_status", "complete" if not selected_ids else "partial")
         visual_coverage.setdefault(
             "scan_coverage_status",
-            "planned" if page_refs and not short_path else "not_required",
+            "planned" if planned_batches else "not_required",
         )
 
         if not send_selected_visuals:
@@ -498,6 +630,34 @@ class Stage1InputBuilder:
             visual_scan_batches=visual_scan_batches,
             visual_scan_candidate_refs=visual_scan_candidate_refs,
         )
+
+    @staticmethod
+    def _visual_refs_fit_budget(
+        refs: Sequence[Mapping[str, Any]],
+        *,
+        max_bytes: int,
+        max_single_bytes: int,
+    ) -> bool:
+        total = 0
+        seen_ids: set[str] = set()
+        for item in refs:
+            if not isinstance(item, Mapping):
+                return False
+            visual_id = str(item.get("visual_id") or "")
+            image_path = str(item.get("image_path") or "").strip()
+            if not visual_id or visual_id in seen_ids or not image_path or not os.path.isfile(image_path):
+                return False
+            try:
+                raw_bytes = int(os.path.getsize(image_path))
+            except OSError:
+                return False
+            if raw_bytes <= 0 or raw_bytes > max_single_bytes:
+                return False
+            total += estimate_encoded_image_bytes(raw_bytes)
+            if total > max_bytes:
+                return False
+            seen_ids.add(visual_id)
+        return True
 
     @staticmethod
     def _fit_visual_budget(

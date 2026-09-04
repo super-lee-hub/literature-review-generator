@@ -273,7 +273,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "retry_attempts": "1",
         },
         "Stage1_Input": {
-            "mode": "vision_first",
+            "mode": "text_first",
             "send_extracted_text": "true",
             "send_selected_visuals": "true",
             "send_original_pdf": "never",
@@ -281,11 +281,11 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "force_pdf_file_input_for_provider": "false",
             "image_transport": "base64",
             "single_call_max_pages": "12",
-            "visual_scan_batch_size": "1",
+            "visual_scan_batch_size": "8",
             "stage1_visual_scan_max_output_tokens": "16000",
-            "stage1_synthesis_max_output_tokens": "32000",
-            "stage1_length_retry_max_attempts": "2",
-            "stage1_length_retry_ceiling_tokens": "65536",
+            "stage1_synthesis_max_output_tokens": "64000",
+            "stage1_length_retry_max_attempts": "1",
+            "stage1_length_retry_ceiling_tokens": "128000",
             "stage1_request_timeout_seconds": "300",
             "stage1_semantic_retry_max_attempts": "1",
             "final_image_refs_max": "8",
@@ -295,7 +295,14 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
         },
         "Stage1_Visual": {
             "enabled": "true",
-            "render_all_nonblank_pages": "true",
+            "selection_mode": "selective",
+            "render_all_nonblank_pages": "false",
+            "page_snapshot_soft_max": "4",
+            "figure_crop_soft_max": "6",
+            "table_crop_soft_max": "6",
+            "formula_crop_soft_max": "4",
+            "selected_visual_soft_total": "10",
+            "selected_visual_hard_total": "16",
             "page_long_edge_px": "2200",
             "crop_long_edge_px": "2400",
             "page_max_pixels": "16000000",
@@ -400,13 +407,13 @@ def ensure_config_sections(
         merged[section].update({key: str(value) for key, value in values.items()})
 
     # Migrate only the former shipped defaults.  A user-selected model is
-    # preserved; vision-first is an explicit Stage 1 mode, not permission to
+    # preserved; text-first is the current Stage 1 mode, not permission to
     # overwrite arbitrary provider configuration.
     stage1_input = merged.setdefault("Stage1_Input", {})
-    stage1_input.setdefault("mode", "vision_first")
+    stage1_input.setdefault("mode", "text_first")
     legacy_primary_defaults = {"deepseek-v4-pro"}
     if (
-        str(stage1_input.get("mode") or "").strip().lower() == "vision_first"
+        str(stage1_input.get("mode") or "").strip().lower() in {"vision_first", "text_first", "text_only"}
         and str(merged["Primary_Reader_API"].get("model") or "").strip().lower() in legacy_primary_defaults
     ):
         merged["Primary_Reader_API"]["model"] = "deepseek-v4-flash-vision-exp"

@@ -2993,6 +2993,22 @@ class OutlineV3Executor:
                     "must_return_confirmed_relation_ids": True,
                     "must_reject_without_recorded_evidence": True,
                     "allowed_relation_ids": [item["relation_id"] for item in relation_candidates],
+                    # Explicit output envelope: the JSON response must include
+                    # BOTH keys even when one of the lists is empty.  Providers
+                    # that omit an empty rejected_relations array otherwise
+                    # fail the registered-artifact schema gate.
+                    "output_fields": {
+                        "confirmed_relation_ids": (
+                            "array of relation_id strings; may be empty only when "
+                            "every candidate is rejected"
+                        ),
+                        "rejected_relations": (
+                            "array of objects, each with relation_id and a "
+                            "recorded evidence reason; may be empty only when "
+                            "every candidate is confirmed"
+                        ),
+                    },
+                    "reject_every_unconfirmed_candidate": True,
                 },
             }
             relation_deps = {"relation_candidates": _hash_payload(candidate_map), "outline_evidence_views": _hash_payload(evidence)}
@@ -3087,6 +3103,34 @@ class OutlineV3Executor:
                     "source_summary_hashes": sorted(evidence_model.source_summary_hashes),
                     "shared_hashes": plan.shared_artifact_hashes,
                     "output_contract": {
+                        "output_fields": {
+                            "candidate_id": (
+                                "string; echo the candidate_id from this request verbatim"
+                            ),
+                            "sections": (
+                                "non-empty array of outline sections; each section is an "
+                                "object with section_id, title, paper_keys (subset of the "
+                                "provided evidence paper_keys), relation_ids (subset of "
+                                "provided relation_ids), claims (non-empty array of "
+                                "planned claim strings) and rationale"
+                            ),
+                        },
+                        "paper_keys_are_the_only_allowed_keys": (
+                            "Every entry in every section's paper_keys must come "
+                            "verbatim from the paper_keys array in this request. "
+                            "Never add, invent, or abbreviate a paper key. Works "
+                            "cited inside the reviewed literature are NOT part of "
+                            "the evidence set; if a claim needs one, describe it in "
+                            "the claim text and leave it out of paper_keys."
+                        ),
+                        "relation_ids_are_the_only_allowed_relation_ids": (
+                            "Every entry in every section's relation_ids must come "
+                            "verbatim from the relation_ids array in this request. "
+                            "Never invent, rename, merge, or re-derive a relation "
+                            "id; if a section needs a connection that is not in the "
+                            "provided list, describe it in the claim text and leave "
+                            "relation_ids out of it."
+                        ),
                         "sections": "non_empty",
                         "section_paper_keys_must_be_subset_of_evidence": True,
                         "section_relation_ids_must_be_subset_of_relation_ids": True,

@@ -290,7 +290,6 @@ def test_validate_all_config_warns_for_reasoning_fields_on_generic_provider():
         ("Stage1_Visual", "page_format", "webp"),
         ("Stage1_Visual", "crop_format", "tiff"),
         ("Stage1_Visual", "page_jpeg_quality", "101"),
-        ("Stage1_Visual", "render_all_nonblank_pages", "false"),
         ("Stage1_Input", "image_transport", "url"),
     ],
 )
@@ -356,7 +355,7 @@ def test_application_settings_normalizes_explicit_stage1_values() -> None:
 
     assert settings.section("Stage1_Input")["send_selected_visuals"] == "true"
     assert settings.section("Stage1_Input")["send_original_pdf"] == "auto"
-    assert settings.section("Stage1_Input")["mode"] == "vision_first"
+    assert settings.section("Stage1_Input")["mode"] == "text_first"
     assert settings.section("Stage1_Input")["image_transport"] == "base64"
     assert settings.section("Stage1_Visual")["enabled"] == "false"
     assert settings.section("Stage1_Visual")["crop_padding_ratio"] == "0.125"

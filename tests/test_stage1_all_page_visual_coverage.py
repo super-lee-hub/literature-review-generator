@@ -25,7 +25,11 @@ def _write_long_text_pdf(path: Path, *, page_count: int = 13) -> None:
 
 def _long_visual_config(*, require_complete: bool = True) -> dict[str, dict[str, str]]:
     return {
-        "Stage1_Visual": {"enabled": "true"},
+        "Stage1_Visual": {
+            "enabled": "true",
+            "selection_mode": "adaptive_page_scan",
+            "render_all_nonblank_pages": "true",
+        },
         "Stage1_Input": {
             "send_selected_visuals": "true",
             "single_call_max_pages": "12",
@@ -158,7 +162,11 @@ def test_long_paper_scans_every_nonblank_page_and_publishes_observations(tmp_pat
         pdf_path,
         reader,
         config_overrides={
-            "Stage1_Visual": {"enabled": "true"},
+            "Stage1_Visual": {
+                "enabled": "true",
+                "selection_mode": "adaptive_page_scan",
+                "render_all_nonblank_pages": "true",
+            },
             "Stage1_Input": {
                 "send_selected_visuals": "true",
                 "single_call_max_pages": "12",
@@ -254,7 +262,11 @@ def test_long_paper_visual_run_reuses_without_rescan_or_provider_transport(tmp_p
         pdf_path,
         reader,
         config_overrides={
-            "Stage1_Visual": {"enabled": "true"},
+            "Stage1_Visual": {
+                "enabled": "true",
+                "selection_mode": "adaptive_page_scan",
+                "render_all_nonblank_pages": "true",
+            },
             "Stage1_Input": {
                 "send_selected_visuals": "true",
                 "single_call_max_pages": "12",
@@ -364,7 +376,11 @@ def test_long_paper_final_synthesis_receives_attributed_child_crop(tmp_path: Pat
         pdf_path,
         reader,
         config_overrides={
-            "Stage1_Visual": {"enabled": "true"},
+            "Stage1_Visual": {
+                "enabled": "true",
+                "selection_mode": "adaptive_page_scan",
+                "render_all_nonblank_pages": "true",
+            },
             "Stage1_Input": {
                 "send_selected_visuals": "true",
                 "single_call_max_pages": "12",

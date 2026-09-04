@@ -202,7 +202,7 @@ def _legacy_primary_default_is_unambiguous(
         return False
     stage1_index = sections.get("Stage1_Input")
     stage1 = _section_values(lines, stage1_index) if stage1_index is not None else {}
-    return stage1.get("mode", "").casefold() in {"", "vision_first"}
+    return stage1.get("mode", "").casefold() in {"", "vision_first", "text_first", "text_only"}
 
 
 def migrate_config_text(

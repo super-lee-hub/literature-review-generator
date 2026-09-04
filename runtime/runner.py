@@ -289,6 +289,7 @@ def _stage1_status_projection(registry: ArtifactRegistry) -> dict[str, bool]:
                 "table_crop",
                 "formula_crop",
                 "stage1_visual_observations",
+                "stage1_visual_evidence",
                 "stage1_visual_coverage",
             }
             for record in records

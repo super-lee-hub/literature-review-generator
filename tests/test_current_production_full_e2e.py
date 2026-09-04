@@ -73,7 +73,7 @@ def test_current_production_full_chain_uses_runner_validation_export_and_attesta
             }
         )
 
-    monkeypatch.setattr("ai_interface.get_summary_from_ai_with_fallback", configured_reader)
+    monkeypatch.setattr("ai_interface.get_summary_from_ai_detailed", configured_reader)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed_uninstrumented", configured_outline)
     monkeypatch.setattr("ai_interface._call_ai_api_detailed", configured_writer)
     monkeypatch.setattr("ai_interface._call_ai_api", _adjudicator_response)

@@ -6,8 +6,14 @@ from typing import Any, Mapping, TypeGuard
 
 
 VISUAL_OMISSION_SCOPES = frozenset(
-    {"page_coverage", "raw_reinspection", "final_transport"}
+    {
+        "page_coverage",
+        "selected_visual_extraction",
+        "raw_reinspection",
+        "final_transport",
+    }
 )
+SELECTIVE_VISUAL_CONTRACT_VERSION = "v2"
 
 
 def _is_exact_nonnegative_int(value: Any) -> TypeGuard[int]:
@@ -149,6 +155,103 @@ def validate_visual_coverage_semantics(
     return tuple(dict.fromkeys(issues))
 
 
+def validate_selective_visual_semantics(
+    payload: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Validate the required-unit reducer used by the selective contract."""
+
+    issues: list[str] = []
+    mode = payload.get("selection_mode")
+    if mode not in {"selective", "adaptive_page_scan"}:
+        issues.append("selection_mode_invalid")
+    strategy = payload.get("visual_extraction_strategy")
+    if strategy not in {
+        "none",
+        "direct_synthesis_visuals",
+        "selected_visual_batches",
+        "adaptive_page_scan",
+        "adaptive_raw_reinspection",
+    }:
+        issues.append("visual_extraction_strategy_invalid")
+    selection_status = payload.get("visual_selection_status")
+    if selection_status not in {"complete", "degraded", "incomplete", "not_required"}:
+        issues.append("visual_selection_status_invalid")
+
+    arrays: dict[str, list[str]] = {}
+    for field_name in (
+        "required_visual_unit_ids",
+        "optional_visual_unit_ids",
+        "selected_visual_unit_ids",
+        "inspected_visual_unit_ids",
+        "unresolved_visual_unit_ids",
+    ):
+        values = _string_array(payload.get(field_name))
+        if values is None or len(set(values)) != len(values):
+            issues.append(f"{field_name}_invalid")
+            arrays[field_name] = []
+        else:
+            arrays[field_name] = values
+    # Materialization failures are an optional declared set: coverage reports
+    # produced by the current preprocess carry it, while qualification
+    # projections without the field simply have no failed units.
+    raw_materialization_failed = payload.get("materialization_failed_unit_ids")
+    if raw_materialization_failed is None:
+        arrays["materialization_failed_unit_ids"] = []
+    else:
+        failed_values = _string_array(raw_materialization_failed)
+        if failed_values is None or len(set(failed_values)) != len(failed_values):
+            issues.append("materialization_failed_unit_ids_invalid")
+            arrays["materialization_failed_unit_ids"] = []
+        else:
+            arrays["materialization_failed_unit_ids"] = failed_values
+    try:
+        required_count = payload.get("required_visual_unit_count")
+        if not _is_exact_nonnegative_int(required_count):
+            raise ValueError
+        if required_count != len(arrays["required_visual_unit_ids"]):
+            issues.append("required_visual_unit_count_invalid")
+    except (TypeError, ValueError):
+        issues.append("required_visual_unit_count_invalid")
+
+    required = set(arrays["required_visual_unit_ids"])
+    selected = set(arrays["selected_visual_unit_ids"])
+    inspected = set(arrays["inspected_visual_unit_ids"])
+    unresolved = set(arrays["unresolved_visual_unit_ids"])
+    optional = set(arrays["optional_visual_unit_ids"])
+    materialization_failed = set(arrays["materialization_failed_unit_ids"])
+    # A required unit whose local rendering failed was never selected for
+    # transport.  It remains required and unresolved, and must be declared in
+    # the materialization-failed set instead of silently disappearing.
+    if not required.issubset(selected | materialization_failed):
+        issues.append("required_visual_units_not_selected")
+    if materialization_failed & selected or materialization_failed & inspected:
+        issues.append("materialization_failed_unit_state_invalid")
+    if not materialization_failed.issubset(required | optional):
+        issues.append("materialization_failed_unit_state_invalid")
+    if required & optional:
+        issues.append("required_optional_visual_unit_overlap")
+    if not inspected.issubset(selected) or not unresolved.issubset(required):
+        issues.append("visual_unit_state_out_of_scope")
+    if inspected & unresolved:
+        issues.append("inspected_unresolved_visual_unit_overlap")
+    # Failed required units must stay visible in unresolved, otherwise the
+    # incomplete-state rule below reports false coverage.
+    if not materialization_failed.issubset(unresolved):
+        issues.append("materialization_failed_unit_not_unresolved")
+    if payload.get("evidence_coverage_status") == "not_required":
+        if required or unresolved:
+            issues.append("not_required_visual_state_invalid")
+    elif payload.get("evidence_coverage_status") == "complete":
+        if not required.issubset(inspected) or unresolved:
+            issues.append("complete_visual_state_invalid")
+    elif payload.get("evidence_coverage_status") in {"incomplete", "degraded"}:
+        if required and not (required - inspected).issubset(unresolved):
+            issues.append("unresolved_visual_state_invalid")
+    else:
+        issues.append("evidence_coverage_status_invalid")
+    return tuple(dict.fromkeys(issues))
+
+
 _CURRENT_REQUIRED_FIELDS = (
     "artifact_type",
     "artifact_version",
@@ -181,6 +284,37 @@ _CURRENT_REQUIRED_FIELDS = (
     "visual_scan_schema_hash",
 )
 
+_SELECTIVE_REQUIRED_FIELDS = (
+    "artifact_type",
+    "artifact_version",
+    "coverage_artifact_id",
+    "coverage_artifact_hash",
+    "coverage_artifact_path",
+    "observation_artifact_ids",
+    "observation_artifact_hashes",
+    "observation_artifact_paths",
+    "transport_omissions",
+    "scan_coverage_status",
+    "final_synthesis_modality",
+    "final_raw_visual_recheck_status",
+    "evidence_coverage_status",
+    "required_raw_reinspection_unit_count",
+    "closed_raw_reinspection_unit_count",
+    "unresolved_raw_reinspection_unit_ids",
+    "raw_reinspection_units",
+    "require_complete_visual_coverage",
+    "selection_mode",
+    "selection_contract_version",
+    "visual_selection_status",
+    "required_visual_unit_count",
+    "required_visual_unit_ids",
+    "optional_visual_unit_ids",
+    "selected_visual_unit_ids",
+    "inspected_visual_unit_ids",
+    "unresolved_visual_unit_ids",
+    "visual_extraction_strategy",
+)
+
 _CURRENT_STRING_FIELDS = (
     "artifact_type",
     "artifact_version",
@@ -208,11 +342,20 @@ _CURRENT_STRING_ARRAY_FIELDS = (
     "scan_failed_page_ids",
     "unresolved_raw_reinspection_unit_ids",
 )
+_SELECTIVE_STRING_ARRAY_FIELDS = _CURRENT_STRING_ARRAY_FIELDS + (
+    "required_visual_unit_ids",
+    "optional_visual_unit_ids",
+    "selected_visual_unit_ids",
+    "inspected_visual_unit_ids",
+    "unresolved_visual_unit_ids",
+    "materialization_failed_unit_ids",
+)
 _CURRENT_INT_FIELDS = (
     "required_nonblank_page_count",
     "required_raw_reinspection_unit_count",
     "closed_raw_reinspection_unit_count",
 )
+_SELECTIVE_INT_FIELDS = _CURRENT_INT_FIELDS + ("required_visual_unit_count",)
 
 _CURRENT_VISUAL_MARKER_FIELDS = (
     "prompt_id",
@@ -302,21 +445,42 @@ def validate_current_visual_evidence_qualification_pair(
 def validate_current_visual_evidence_qualification(
     value: Any,
 ) -> tuple[str, ...]:
-    """Validate the serialized JSON shape and semantics of current v1 data."""
+    """Validate the serialized JSON shape for current v1/v2 visual data."""
 
     if not isinstance(value, Mapping):
         return ("qualification_mapping_invalid",)
     issues: list[str] = []
-    missing = [field for field in _CURRENT_REQUIRED_FIELDS if field not in value]
+    version = value.get("artifact_version")
+    if version == SELECTIVE_VISUAL_CONTRACT_VERSION:
+        required_fields = _SELECTIVE_REQUIRED_FIELDS
+        string_fields = _CURRENT_STRING_FIELDS + (
+            "selection_mode",
+            "selection_contract_version",
+            "visual_selection_status",
+            "visual_extraction_strategy",
+        )
+        string_array_fields = _SELECTIVE_STRING_ARRAY_FIELDS
+        int_fields = _SELECTIVE_INT_FIELDS
+    elif version == "v1":
+        required_fields = _CURRENT_REQUIRED_FIELDS
+        string_fields = _CURRENT_STRING_FIELDS
+        string_array_fields = _CURRENT_STRING_ARRAY_FIELDS
+        int_fields = _CURRENT_INT_FIELDS
+    else:
+        required_fields = _CURRENT_REQUIRED_FIELDS
+        string_fields = _CURRENT_STRING_FIELDS
+        string_array_fields = _CURRENT_STRING_ARRAY_FIELDS
+        int_fields = _CURRENT_INT_FIELDS
+    missing = [field for field in required_fields if field not in value]
     if missing:
         issues.append("qualification_fields_missing")
-    for field_name in _CURRENT_STRING_FIELDS:
+    for field_name in string_fields:
         if field_name in value and type(value[field_name]) is not str:
             issues.append("qualification_string_type_invalid")
-    for field_name in _CURRENT_STRING_ARRAY_FIELDS:
+    for field_name in string_array_fields:
         if field_name in value and _json_string_array(value[field_name]) is None:
             issues.append("qualification_array_type_invalid")
-    for field_name in _CURRENT_INT_FIELDS:
+    for field_name in int_fields:
         if field_name in value and not _is_exact_nonnegative_int(value[field_name]):
             issues.append("qualification_integer_type_invalid")
     if "require_complete_visual_coverage" in value and type(
@@ -336,18 +500,22 @@ def validate_current_visual_evidence_qualification(
         issues.append("qualification_object_array_type_invalid")
     if value.get("artifact_type") != "stage1_visual_evidence_qualification":
         issues.append("qualification_type_invalid")
-    if value.get("artifact_version") != "v1":
+    if value.get("artifact_version") not in {"v1", SELECTIVE_VISUAL_CONTRACT_VERSION}:
         issues.append("qualification_version_invalid")
 
     if not issues:
         issues.extend(validate_visual_coverage_semantics(value))
+        if version == SELECTIVE_VISUAL_CONTRACT_VERSION:
+            issues.extend(validate_selective_visual_semantics(value))
     return tuple(dict.fromkeys(issues))
 
 
 __all__ = [
+    "SELECTIVE_VISUAL_CONTRACT_VERSION",
     "VISUAL_OMISSION_SCOPES",
     "current_visual_contract_markers",
     "validate_current_visual_evidence_qualification",
     "validate_current_visual_evidence_qualification_pair",
     "validate_visual_coverage_semantics",
+    "validate_selective_visual_semantics",
 ]

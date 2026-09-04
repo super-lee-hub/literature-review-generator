@@ -109,7 +109,25 @@ def test_page_and_crop_pixel_budgets_are_applied_independently(
 
 def test_configured_png_pages_and_jpeg_crops_report_render_truth(tmp_path: Path) -> None:
     pdf_path = tmp_path / "format-truth.pdf"
-    _write_visual_pdf(pdf_path)
+    document = fitz.open()
+    framework_page = document.new_page()
+    framework_page.insert_text(
+        (72, 72),
+        "Research framework and conceptual framework. The page-level layout is "
+        "itself the evidence unit for the proposed mechanism and workflow. "
+        "The surrounding paragraph defines the constructs and study design.",
+    )
+    figure_page = document.new_page()
+    figure_page.insert_text(
+        (72, 72),
+        "Figure 1. Research framework and treatment-to-outcome pathway. "
+        "The surrounding paragraph explains the construct definitions and results.",
+    )
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 320, 180), False)
+    pixmap.clear_with(150)
+    figure_page.insert_image(fitz.Rect(72, 110, 392, 290), pixmap=pixmap)
+    document.save(pdf_path)
+    document.close()
 
     def reader(**kwargs):
         return {"status": "success", "content": _canonical_summary()}

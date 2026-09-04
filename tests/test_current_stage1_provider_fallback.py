@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import json
 
 import fitz  # type: ignore
+import pytest
 
 import ai_interface
 from runtime.provider_runtime import ProviderRuntimeLedger
@@ -107,6 +108,50 @@ def test_stage1_length_retry_escalates_same_primary_budget_before_backup(
     assert all(receipt.route == "Primary_Reader_API" for receipt in receipts)
 
 
+def test_stage1_length_budget_exhaustion_does_not_fallback_to_backup(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    pdf_path = tmp_path / "length-exhausted-paper.pdf"
+    _write_pdf(pdf_path)
+    engines: list[str] = []
+
+    def always_length(
+        prompt_text: str,
+        primary_api_config: Mapping[str, Any],
+        backup_api_config: Mapping[str, Any],
+        *,
+        engine_type: str = "primary",
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        engines.append(engine_type)
+        return {
+            "status": "failed",
+            "error_kind": "invalid_response",
+            "finish_reason": "length",
+            "message": "provider output reached max_tokens",
+        }
+
+    monkeypatch.setattr("ai_interface.get_summary_from_ai_detailed", always_length)
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader=None,
+        config_overrides={
+            "Stage1_Input": {
+                "stage1_synthesis_max_output_tokens": "12000",
+                "stage1_length_retry_max_attempts": "1",
+                "stage1_length_retry_ceiling_tokens": "24000",
+            }
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        service.run(bundle)
+
+    assert engines == ["primary", "primary"]
+
+
 def test_stage1_visual_length_retry_is_recorded_before_scan_can_close(
     tmp_path: Path,
 ) -> None:
@@ -171,6 +216,11 @@ def test_stage1_visual_length_retry_is_recorded_before_scan_can_close(
         reader,
         config_overrides={
             **_visual_config_overrides(),
+            "Stage1_Visual": {
+                **_visual_config_overrides()["Stage1_Visual"],
+                "selection_mode": "adaptive_page_scan",
+                "render_all_nonblank_pages": "true",
+            },
             "Stage1_Input": {
                 **_visual_config_overrides()["Stage1_Input"],
                 "single_call_max_pages": "12",
@@ -206,9 +256,9 @@ def _semantic_retry_visual_content(
             raw_candidates = [
                 {
                     "candidate_visual_id": candidate_id,
-                    "evidence_kinds": [candidate_id],
+                    "evidence_kinds": ["relationships"],
                     "reason": "The page metadata identifies the candidate.",
-                    "confidence": "high",
+                    "confidence": "certain" if invalid else "high",
                     "requires_raw_reinspection": True,
                 }
             ]
@@ -288,6 +338,11 @@ def test_stage1_semantic_retry_accepts_only_schema_valid_visual_observation(
         reader,
         config_overrides={
             **_visual_config_overrides(),
+            "Stage1_Visual": {
+                **_visual_config_overrides()["Stage1_Visual"],
+                "selection_mode": "adaptive_page_scan",
+                "render_all_nonblank_pages": "true",
+            },
             "Stage1_Input": {
                 **_visual_config_overrides()["Stage1_Input"],
                 "single_call_max_pages": "12",
@@ -334,6 +389,11 @@ def test_repeated_invalid_visual_observation_stays_incomplete_and_not_reusable(
         reader,
         config_overrides={
             **_visual_config_overrides(),
+            "Stage1_Visual": {
+                **_visual_config_overrides()["Stage1_Visual"],
+                "selection_mode": "adaptive_page_scan",
+                "render_all_nonblank_pages": "true",
+            },
             "Stage1_Input": {
                 **_visual_config_overrides()["Stage1_Input"],
                 "single_call_max_pages": "12",
@@ -402,7 +462,14 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
         tmp_path,
         pdf_path,
         reader,
-        config_overrides=_visual_config_overrides(),
+        config_overrides={
+            **_visual_config_overrides(),
+            "Stage1_Visual": {
+                **_visual_config_overrides()["Stage1_Visual"],
+                "selection_mode": "adaptive_page_scan",
+                "render_all_nonblank_pages": "true",
+            },
+        },
     )
     result = service.run(bundle)
     summary = result.summaries[0]
@@ -412,7 +479,7 @@ def test_stage1_backup_success_is_recorded_as_text_only_after_visual_scan(
     assert summary["provider"]["successful_engine"] == "backup"
     assert summary["provider"]["successful_input_mode"] == "text_only"
     assert summary["provider"]["images_actually_sent_count"] == 0
-    assert summary["provider"]["scan_coverage_status"] == "not_required"
+    assert summary["provider"]["scan_coverage_status"] == "complete"
     assert summary["provider"]["final_synthesis_modality"] == "text_only"
     assert summary["provider"]["final_raw_visual_recheck_status"] == "not_run_fallback"
     assert summary["provider"]["evidence_coverage_status"] == "degraded"
