@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,6 +24,8 @@ from validation.source_binding import (
     build_validation_source_authority_fingerprint,
     build_validation_source_binding,
     resolve_bound_paper_artifacts,
+    validation_source_binding_semantic_hash,
+    validation_source_binding_payload_hash,
 )
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace
@@ -460,6 +463,135 @@ def test_source_authority_fingerprint_changes_after_evidence_drift(
     )
     assert after_hash != before_hash
     assert after_diagnostics
+
+
+def test_binding_semantic_hash_is_independent_of_workspace_locators(
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    relocated = json.loads(json.dumps(binding, ensure_ascii=False))
+    relocated["job_id"] = "relocated-downstream-job"
+    relocated["upstream_workspaces"] = [r"D:\\durable\\f1-stage1"]
+    relocated["diagnostics"] = ["historical_locator_warning"]
+    entry = relocated["papers"][hashes["paper_key"]]
+    entry["source_workspace"] = r"D:\\durable\\f1-stage1"
+    entry["stage1_paper_artifact_path"] = r"D:\\durable\\f1-stage1\\paper.json"
+    entry["evidence_manifest_path"] = r"D:\\durable\\f1-stage1\\manifest.json"
+    for leaf in entry["evidence"].values():
+        leaf["path"] = r"D:\\durable\\f1-stage1\\evidence\\relocated.bin"
+
+    assert validation_source_binding_payload_hash(relocated) == (
+        validation_source_binding_payload_hash(binding)
+    )
+
+
+def test_source_authority_hash_ignores_physical_binding_file_hash(
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    ws, hashes = upstream_workspace
+    summary_path = _summary_file(ws, hashes["paper_key"])
+    binding = _build(ws, summary_path)
+    artifacts, problems = resolve_bound_paper_artifacts(binding)
+    assert problems == ()
+
+    _before, before_hash, before_diagnostics = build_validation_source_authority_fingerprint(
+        paper_artifacts=artifacts,
+        registry=None,
+        cited_paper_keys=[hashes["paper_key"]],
+        current_binding_artifact_id="validation_source_binding:semantic-id",
+        current_binding_content_hash="a" * 64,
+        current_binding_semantic_hash="s" * 64,
+    )
+    _after, after_hash, after_diagnostics = build_validation_source_authority_fingerprint(
+        paper_artifacts=artifacts,
+        registry=None,
+        cited_paper_keys=[hashes["paper_key"]],
+        current_binding_artifact_id="validation_source_binding:semantic-id",
+        current_binding_content_hash="b" * 64,
+        current_binding_semantic_hash="s" * 64,
+    )
+
+    assert before_diagnostics == ()
+    assert after_diagnostics == ()
+    assert after_hash == before_hash
+
+
+def test_semantic_binding_hash_changes_for_authority_mutations(
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    ws, hashes = upstream_workspace
+    binding = _build(ws, _summary_file(ws, hashes["paper_key"]))
+    baseline = validation_source_binding_semantic_hash(binding)
+
+    paper_hash_changed = json.loads(json.dumps(binding, ensure_ascii=False))
+    paper_hash_changed["papers"][hashes["paper_key"]][
+        "stage1_paper_artifact_hash"
+    ] = "a" * 64
+    manifest_hash_changed = json.loads(json.dumps(binding, ensure_ascii=False))
+    manifest_hash_changed["papers"][hashes["paper_key"]][
+        "evidence_manifest_hash"
+    ] = "b" * 64
+    leaf_hash_changed = json.loads(json.dumps(binding, ensure_ascii=False))
+    leaf_hash_changed["papers"][hashes["paper_key"]]["evidence"]["markdown_path"][
+        "content_hash"
+    ] = "c" * 64
+    contract_changed = json.loads(json.dumps(binding, ensure_ascii=False))
+    contract_changed["binding_contract_version"] = "v2"
+
+    assert validation_source_binding_semantic_hash(paper_hash_changed) != baseline
+    assert validation_source_binding_semantic_hash(manifest_hash_changed) != baseline
+    assert validation_source_binding_semantic_hash(leaf_hash_changed) != baseline
+    assert validation_source_binding_semantic_hash(contract_changed) != baseline
+
+
+def test_source_authority_fingerprint_ignores_binding_locator_paths(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    ws, hashes = upstream_workspace
+    binding = _build(ws, _summary_file(ws, hashes["paper_key"]))
+    artifacts, problems = resolve_bound_paper_artifacts(binding)
+    assert problems == ()
+    _before, before_hash, before_diagnostics = build_validation_source_authority_fingerprint(
+        paper_artifacts=artifacts,
+        registry=None,
+        cited_paper_keys=[hashes["paper_key"]],
+    )
+
+    relocated_artifacts = json.loads(json.dumps(artifacts, ensure_ascii=False))
+    relocated_binding = relocated_artifacts[0]["_validation_source_binding"]
+    relocated_dir = tmp_path / "relocated-authority"
+    relocated_dir.mkdir()
+    original_paper_path = Path(relocated_binding["stage1_paper_artifact_path"])
+    original_manifest_path = Path(relocated_binding["evidence_manifest_path"])
+    relocated_paper_path = relocated_dir / "paper.json"
+    relocated_manifest_path = relocated_dir / "manifest.json"
+    shutil.copy2(original_paper_path, relocated_paper_path)
+    shutil.copy2(original_manifest_path, relocated_manifest_path)
+    relocated_binding["stage1_paper_artifact_path"] = str(relocated_paper_path)
+    relocated_binding["evidence_manifest_path"] = str(relocated_manifest_path)
+    for field, leaf in relocated_binding["evidence"].items():
+        relocated_leaf_path = relocated_dir / f"{field}.bin"
+        shutil.copy2(Path(leaf["path"]), relocated_leaf_path)
+        leaf["path"] = str(relocated_leaf_path)
+    relocated_artifacts[0]["stage1_inputs"]["evidence_manifest_path"] = str(
+        relocated_manifest_path
+    )
+    relocated_artifacts[0]["stage1_inputs"]["preprocess_evidence"] = {
+        field: relocated_binding["evidence"][field]["path"]
+        for field in ("markdown_path", "chunks_path", "page_index_path")
+    }
+    _after, after_hash, after_diagnostics = build_validation_source_authority_fingerprint(
+        paper_artifacts=relocated_artifacts,
+        registry=None,
+        cited_paper_keys=[hashes["paper_key"]],
+    )
+
+    assert before_diagnostics == ()
+    assert after_diagnostics == ()
+    assert after_hash == before_hash
 
 
 def test_current_validation_loader_resolves_mixed_local_and_external_authority(

@@ -483,9 +483,32 @@ def _validate_validation_source_binding(
     )
     _require_fields(
         root,
-        ("job_id", "upstream_workspaces", "papers", "diagnostics", "bound_paper_count"),
+        (
+            "job_id",
+            "binding_contract_version",
+            "upstream_workspaces",
+            "papers",
+            "diagnostics",
+            "bound_paper_count",
+        ),
         "validation_source_binding",
     )
+    from validation.source_binding import BINDING_CONTRACT_VERSION
+
+    if str(root.get("binding_contract_version") or "") != BINDING_CONTRACT_VERSION:
+        raise ArtifactSchemaError(
+            "validation_source_binding binding contract version is invalid"
+        )
+    metadata_semantic_hash = str(
+        getattr(record, "metadata", {}).get("semantic_payload_hash") or ""
+    ).strip()
+    if metadata_semantic_hash:
+        from validation.source_binding import validation_source_binding_semantic_hash
+
+        if metadata_semantic_hash != validation_source_binding_semantic_hash(root):
+            raise ArtifactSchemaError(
+                "validation_source_binding semantic payload hash is inconsistent"
+            )
     if not isinstance(root.get("upstream_workspaces"), (list, tuple)):
         raise ArtifactSchemaError("validation_source_binding.upstream_workspaces must be an array")
     papers = root.get("papers")

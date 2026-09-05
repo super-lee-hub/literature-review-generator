@@ -116,6 +116,7 @@ class _RuntimeStageHost:
         self.workspace: JobWorkspace | None = None
         self.current_validation_source_binding_id = ""
         self.current_validation_source_binding_hash = ""
+        self.current_validation_source_binding_content_hash = ""
         self._checkpoint_processed_papers: set[str] = set()
         self._checkpoint_failed_papers: set[str] = set()
 
@@ -1784,7 +1785,8 @@ class AgentRuntimeBridge:
                 ),
             )[0]
             session.stage_host.current_validation_source_binding_id = selected.artifact_id
-            session.stage_host.current_validation_source_binding_hash = selected.content_hash
+            session.stage_host.current_validation_source_binding_hash = expected_payload_hash
+            session.stage_host.current_validation_source_binding_content_hash = selected.content_hash
             return selected
 
         from services.artifact_registry import ArtifactDependencyRefV2
@@ -1943,7 +1945,8 @@ class AgentRuntimeBridge:
             },
         )
         session.stage_host.current_validation_source_binding_id = record.artifact_id
-        session.stage_host.current_validation_source_binding_hash = record.content_hash
+        session.stage_host.current_validation_source_binding_hash = expected_payload_hash
+        session.stage_host.current_validation_source_binding_content_hash = record.content_hash
         return record
 
     def persist_stage1_results(

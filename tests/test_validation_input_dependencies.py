@@ -21,6 +21,7 @@ from services.artifact_registry import (
 from services.job_workspace import JobWorkspace, atomic_write_json
 from validation.input_dependencies import (
     ValidationInputDependencyError,
+    declared_validation_input_identities,
     resolve_validation_input_dependencies,
 )
 from validation.run_result import (
@@ -29,6 +30,29 @@ from validation.run_result import (
     ValidationInputArtifactsV1,
     ValidationRunResultV1,
 )
+
+
+def test_validation_input_binding_keeps_semantic_and_physical_hashes_separate() -> None:
+    semantic_hash = "a" * 64
+    physical_hash = "b" * 64
+    inputs = ValidationInputArtifactsV1(
+        validation_source_binding_id="validation_source_binding:semantic",
+        validation_source_binding_hash=semantic_hash,
+        validation_source_binding_semantic_hash=semantic_hash,
+        validation_source_binding_content_hash=physical_hash,
+    )
+
+    assert declared_validation_input_identities(inputs) == (
+        (
+            "validation_source_binding",
+            "validation_source_binding:semantic",
+            physical_hash,
+        ),
+    )
+    restored = ValidationInputArtifactsV1.from_value(inputs.to_dict())
+    assert restored.validation_source_binding_hash == semantic_hash
+    assert restored.validation_source_binding_semantic_hash == semantic_hash
+    assert restored.validation_source_binding_content_hash == physical_hash
 
 
 def _dependency(record: ArtifactRecord, *, dependency_kind: str = "local_job") -> ArtifactDependencyRefV2:

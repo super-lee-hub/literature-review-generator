@@ -194,12 +194,21 @@ def _load_inputs(
         # for one paper must not suppress an external authority for another.
         from validation.source_binding import resolve_bound_paper_artifacts
         from validation.source_binding import validation_source_binding_payload_hash
+        from validation.source_binding import validation_source_binding_semantic_hash
 
         current_binding_id = str(
             getattr(service, "current_validation_source_binding_id", "") or ""
         ).strip()
         current_binding_hash = str(
             getattr(service, "current_validation_source_binding_hash", "") or ""
+        ).strip()
+        current_binding_semantic_hash = str(
+            getattr(service, "current_validation_source_binding_semantic_hash", "")
+            or ""
+        ).strip()
+        current_binding_content_hash = str(
+            getattr(service, "current_validation_source_binding_content_hash", "")
+            or ""
         ).strip()
         current_binding_record = getattr(service, "validation_source_binding_record", None)
         has_explicit_selector = any(
@@ -208,15 +217,38 @@ def _load_inputs(
                 "validation_source_binding_record",
                 "current_validation_source_binding_id",
                 "current_validation_source_binding_hash",
+                "current_validation_source_binding_semantic_hash",
+                "current_validation_source_binding_content_hash",
             )
         )
         if current_binding_record is not None:
             current_binding_id = str(
                 getattr(current_binding_record, "artifact_id", "") or current_binding_id
             ).strip()
-            current_binding_hash = str(
-                getattr(current_binding_record, "content_hash", "") or current_binding_hash
+            current_binding_content_hash = str(
+                getattr(current_binding_record, "content_hash", "")
+                or current_binding_content_hash
             ).strip()
+            metadata = getattr(current_binding_record, "metadata", {})
+            current_binding_semantic_hash = str(
+                metadata.get("semantic_payload_hash")
+                if isinstance(metadata, Mapping)
+                else ""
+            ).strip()
+            if not current_binding_semantic_hash:
+                raw_current_payload = _read_json(current_binding_record.path)
+                if isinstance(raw_current_payload, Mapping) and isinstance(
+                    raw_current_payload.get("payload"), Mapping
+                ):
+                    raw_current_payload = raw_current_payload["payload"]
+                if isinstance(raw_current_payload, Mapping):
+                    current_binding_semantic_hash = validation_source_binding_semantic_hash(
+                        raw_current_payload
+                    )
+        elif not current_binding_content_hash and not current_binding_semantic_hash:
+            # Compatibility for pre-semantic callers: their one hash field was
+            # the physical Registry content hash.
+            current_binding_content_hash = current_binding_hash
 
         if current_binding_id:
             matches = [
@@ -224,13 +256,16 @@ def _load_inputs(
                 for record in all_binding_records
                 if record.artifact_id == current_binding_id
                 and (
-                    not current_binding_hash
-                    or record.content_hash == current_binding_hash
+                    not current_binding_content_hash
+                    or record.content_hash == current_binding_content_hash
                 )
             ]
-            if len(matches) == 1 and current_binding_hash:
+            if len(matches) == 1:
                 selected = matches[0]
-                if selected.content_hash != current_binding_hash:
+                if (
+                    current_binding_content_hash
+                    and selected.content_hash != current_binding_content_hash
+                ):
                     source_authority_diagnostics.append(
                         "validation_source_binding_hash_mismatch"
                     )
@@ -242,7 +277,27 @@ def _load_inputs(
                             "validation_source_binding_version_mismatch"
                         )
                     else:
-                        binding_records = [selected]
+                        raw_selected_payload = _read_json(selected.path)
+                        if isinstance(raw_selected_payload, Mapping) and isinstance(
+                            raw_selected_payload.get("payload"), Mapping
+                        ):
+                            raw_selected_payload = raw_selected_payload["payload"]
+                        selected_semantic_hash = (
+                            validation_source_binding_semantic_hash(
+                                raw_selected_payload
+                            )
+                            if isinstance(raw_selected_payload, Mapping)
+                            else ""
+                        )
+                        if (
+                            current_binding_semantic_hash
+                            and selected_semantic_hash != current_binding_semantic_hash
+                        ):
+                            source_authority_diagnostics.append(
+                                "validation_source_binding_semantic_hash_mismatch"
+                            )
+                        else:
+                            binding_records = [selected]
             else:
                 source_authority_diagnostics.append(
                     "validation_source_binding_current_identity_unresolved"
@@ -613,6 +668,24 @@ def _input_contract(
             evidence_identities.append((evidence_id, actual))
 
     unique_evidence = list(dict.fromkeys(evidence_identities))
+    binding_semantic_hash = str(
+        getattr(service, "current_validation_source_binding_semantic_hash", "")
+        or ""
+    ).strip()
+    legacy_binding_hash = str(
+        getattr(service, "current_validation_source_binding_hash", "") or ""
+    ).strip()
+    binding_content_hash = str(
+        getattr(service, "current_validation_source_binding_content_hash", "")
+        or ""
+    ).strip()
+    if not binding_semantic_hash:
+        binding_semantic_hash = legacy_binding_hash
+    if not binding_content_hash and not hasattr(
+        service, "current_validation_source_binding_semantic_hash"
+    ):
+        # Compatibility for callers that predate the semantic/content split.
+        binding_content_hash = legacy_binding_hash
     input_artifacts = ValidationInputArtifactsV1(
         review_draft_id=review_id,
         review_draft_hash=review_hash,
@@ -623,9 +696,9 @@ def _input_contract(
         validation_source_binding_id=str(
             getattr(service, "current_validation_source_binding_id", "") or ""
         ).strip(),
-        validation_source_binding_hash=str(
-            getattr(service, "current_validation_source_binding_hash", "") or ""
-        ).strip(),
+        validation_source_binding_hash=binding_semantic_hash,
+        validation_source_binding_semantic_hash=binding_semantic_hash,
+        validation_source_binding_content_hash=binding_content_hash,
     )
     evidence_complete = not degradation and (
         not review_has_citations or bool(unique_evidence)
@@ -1270,7 +1343,21 @@ def run_current_validation(
                 getattr(service, "current_validation_source_binding_id", "") or ""
             ).strip(),
             current_binding_content_hash=str(
-                getattr(service, "current_validation_source_binding_hash", "") or ""
+                getattr(
+                    service,
+                    "current_validation_source_binding_content_hash",
+                    "",
+                )
+                or ""
+            ).strip(),
+            current_binding_semantic_hash=str(
+                getattr(
+                    service,
+                    "current_validation_source_binding_semantic_hash",
+                    "",
+                )
+                or getattr(service, "current_validation_source_binding_hash", "")
+                or ""
             ).strip(),
             binding_contract_version=binding_contract_version,
         )
@@ -1301,6 +1388,7 @@ def run_current_validation(
         preprocess,
         metadata,
         edge_checkpoint_store=ValidationEdgeCheckpointStore(checkpoint_root),
+        validation_source_authority_hash=source_authority_hash,
     )
     worker_count = max(1, int(getattr(service.settings.runtime, "max_workers", 1) or 1))
     try:

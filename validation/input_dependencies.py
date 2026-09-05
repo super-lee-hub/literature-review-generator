@@ -39,11 +39,18 @@ def declared_validation_input_identities(
             )
         )
     if inputs.validation_source_binding_id:
+        # Registry closure is verified against the physical file hash.  New
+        # Validation inputs also carry the path-independent semantic hash, but
+        # it is not the hash of this dependency edge.
+        binding_content_hash = (
+            inputs.validation_source_binding_content_hash
+            or inputs.validation_source_binding_hash
+        )
         identities.append(
             (
                 "validation_source_binding",
                 inputs.validation_source_binding_id,
-                inputs.validation_source_binding_hash,
+                binding_content_hash,
             )
         )
     identities.extend(
@@ -221,10 +228,41 @@ def validate_validation_dependency_contract(
         )
         if inputs.validation_source_binding_id and (
             fingerprint_binding_id != inputs.validation_source_binding_id
-            or fingerprint_binding_hash != inputs.validation_source_binding_hash
+            or fingerprint_binding_hash
+            != (
+                inputs.validation_source_binding_content_hash
+                or (
+                    inputs.validation_source_binding_hash
+                    if not inputs.validation_source_binding_semantic_hash
+                    else ""
+                )
+            )
         ):
+            # A new fingerprint exposes the physical binding hash only as
+            # audit metadata.  Compare it when the input carries one, while
+            # retaining compatibility with old payloads that used the legacy
+            # hash field for the physical identity.
+            if inputs.validation_source_binding_content_hash or (
+                not inputs.validation_source_binding_semantic_hash
+                and inputs.validation_source_binding_hash
+            ):
+                raise ValidationInputDependencyError(
+                    "Validation source authority fingerprint does not match the current binding"
+                )
+        fingerprint_semantic_hash = str(
+            fingerprint.get("current_binding_semantic_hash") or ""
+        )
+        expected_semantic_hash = (
+            inputs.validation_source_binding_semantic_hash
+            or (
+                inputs.validation_source_binding_hash
+                if not inputs.validation_source_binding_content_hash
+                else ""
+            )
+        )
+        if expected_semantic_hash and fingerprint_semantic_hash != expected_semantic_hash:
             raise ValidationInputDependencyError(
-                "Validation source authority fingerprint does not match the current binding"
+                "Validation source authority fingerprint does not match the semantic current binding"
             )
         raw_entries = fingerprint.get("papers")
         if not isinstance(raw_entries, (list, tuple)):

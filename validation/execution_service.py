@@ -176,15 +176,31 @@ class ValidationExecutionService:
         self._validation_source_authority_fingerprint = dict(fingerprint)
         if self.validation_source_binding_record is not None:
             expected_binding_id = self.validation_source_binding_record.artifact_id
-            expected_binding_hash = self.validation_source_binding_record.content_hash
+            expected_binding_semantic_hash = self.current_validation_source_binding_semantic_hash
+            expected_binding_content_hash = (
+                self.validation_source_binding_record.content_hash
+            )
             if str(fingerprint.get("current_binding_artifact_id") or "") != expected_binding_id:
                 raise ValueError("validation source fingerprint does not identify the current binding")
-            if str(fingerprint.get("current_binding_content_hash") or "") != expected_binding_hash:
-                raise ValueError("validation source fingerprint does not match the current binding")
+            if expected_binding_semantic_hash and str(
+                fingerprint.get("current_binding_semantic_hash") or ""
+            ) != expected_binding_semantic_hash:
+                raise ValueError(
+                    "validation source fingerprint does not match the semantic current binding"
+                )
+            if str(fingerprint.get("current_binding_content_hash") or "") != expected_binding_content_hash:
+                raise ValueError(
+                    "validation source fingerprint does not match the physical current binding"
+                )
         input_hashes = dict(self._input_dependency_hashes)
         input_hashes["validation_source_authority"] = normalized_hash
         if self.validation_source_binding_record is not None:
-            input_hashes["validation_source_binding"] = self.validation_source_binding_record.content_hash
+            # The closure epoch and adjudication reuse key follow semantic
+            # authority.  The physical binding file remains a Registry input
+            # for audit/dependency verification, not a replay identity.
+            input_hashes["validation_source_binding"] = (
+                self.current_validation_source_binding_semantic_hash
+            )
         self._input_dependency_hashes = {
             str(key): str(value)
             for key, value in sorted(input_hashes.items(), key=lambda item: str(item[0]))
@@ -213,6 +229,32 @@ class ValidationExecutionService:
 
     @property
     def current_validation_source_binding_hash(self) -> str:
+        """Compatibility alias for the semantic binding hash."""
+
+        return self.current_validation_source_binding_semantic_hash
+
+    @property
+    def current_validation_source_binding_semantic_hash(self) -> str:
+        record = self.validation_source_binding_record
+        if record is None:
+            return ""
+        metadata = getattr(record, "metadata", {})
+        metadata_hash = ""
+        if isinstance(metadata, Mapping):
+            metadata_hash = str(metadata.get("semantic_payload_hash") or "").strip()
+        try:
+            from validation.source_binding import validation_source_binding_semantic_hash
+
+            payload = self._load_json(record.path)
+            if isinstance(payload.get("payload"), Mapping):
+                payload = dict(payload["payload"])
+            computed_hash = validation_source_binding_semantic_hash(payload)
+            return computed_hash or metadata_hash
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return metadata_hash
+
+    @property
+    def current_validation_source_binding_content_hash(self) -> str:
         return str(
             self.validation_source_binding_record.content_hash
             if self.validation_source_binding_record is not None

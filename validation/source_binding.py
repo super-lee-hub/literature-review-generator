@@ -788,17 +788,133 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def validation_source_binding_payload_hash(binding: Mapping[str, Any]) -> str:
-    """Return the canonical semantic identity of a binding payload.
+def _mapping_from_pairs(value: Any) -> Mapping[str, Any]:
+    """Normalize the tuple-of-pairs representation used by JSON boundaries."""
 
-    This keeps the content-addressed binding ID aligned with the runtime's
-    existing JSON identity domain while treating JSON-equivalent tuples/lists
-    and mapping order as the same payload.
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, (list, tuple)):
+        return {
+            str(item[0]): item[1]
+            for item in value
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        }
+    return {}
+
+
+def _semantic_source_identity(value: Any) -> dict[str, str]:
+    identity = _mapping_from_pairs(value)
+    return {
+        field: str(identity.get(field) or "").strip()
+        for field in (
+            "source_job_id",
+            "source_artifact_id",
+            "source_artifact_version",
+            "source_artifact_hash",
+        )
+    }
+
+
+def _semantic_evidence_identity(field: str, value: Any) -> dict[str, str]:
+    evidence = _mapping_from_pairs(value)
+    return {
+        "manifest_artifact_type": str(
+            evidence.get("manifest_artifact_type") or field
+        ).strip(),
+        "content_hash": str(evidence.get("content_hash") or "").strip(),
+    }
+
+
+def _validation_source_binding_semantic_payload(
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project a binding onto source-authority semantics only.
+
+    A binding payload also carries physical locators so the validator can find
+    files and Registry records.  Those locators, the downstream owner, and
+    diagnostics are operational metadata; including them in the identity
+    would make a workspace relocation look like source drift.  The projection
+    below deliberately names the complete semantic contract instead of
+    recursively filtering arbitrary keys, so a future locator cannot silently
+    become an identity input.
     """
 
-    from runtime.provider_runtime import hash_json
+    envelope_payload = binding.get("payload")
+    if isinstance(envelope_payload, Mapping):
+        binding = envelope_payload
 
-    return hash_json(dict(binding))
+    source_identities = [
+        _semantic_source_identity(item)
+        for item in (binding.get("summary_source_identities") or ())
+    ]
+    source_identities.sort(
+        key=lambda item: tuple(item.get(field) or "" for field in item)
+    )
+
+    paper_payloads: list[dict[str, Any]] = []
+    raw_papers = binding.get("papers")
+    if isinstance(raw_papers, Mapping):
+        paper_items = raw_papers.items()
+    else:
+        paper_items = ()
+    paper_fields = (
+        "canonical_paper_key",
+        "source_workspace_job_id",
+        "stage1_paper_artifact_id",
+        "stage1_paper_artifact_version",
+        "stage1_paper_artifact_hash",
+        "evidence_manifest_artifact_id",
+        "evidence_manifest_artifact_type",
+        "evidence_manifest_artifact_version",
+        "evidence_manifest_job_id",
+        "evidence_manifest_hash",
+    )
+    for paper_key, raw_entry in paper_items:
+        entry = _mapping_from_pairs(raw_entry)
+        semantic_entry: dict[str, Any] = {
+            field: str(entry.get(field) or "").strip()
+            for field in paper_fields
+        }
+        semantic_entry["canonical_paper_key"] = str(
+            semantic_entry.get("canonical_paper_key") or paper_key
+        ).strip()
+        raw_evidence = entry.get("evidence")
+        evidence_items = (
+            raw_evidence.items() if isinstance(raw_evidence, Mapping) else ()
+        )
+        semantic_entry["evidence"] = {
+            str(field): _semantic_evidence_identity(str(field), value)
+            for field, value in sorted(evidence_items, key=lambda item: str(item[0]))
+        }
+        paper_payloads.append(semantic_entry)
+    paper_payloads.sort(key=lambda item: item.get("canonical_paper_key") or "")
+
+    return {
+        "artifact_type": str(binding.get("artifact_type") or "").strip(),
+        "artifact_version": str(binding.get("artifact_version") or "").strip(),
+        "binding_contract_version": str(
+            binding.get("binding_contract_version") or ""
+        ).strip(),
+        "summary_source_identities": source_identities,
+        "papers": paper_payloads,
+    }
+
+
+def validation_source_binding_semantic_hash(binding: Mapping[str, Any]) -> str:
+    """Return the path-independent semantic identity of a binding."""
+
+    return _stable_hash(_validation_source_binding_semantic_payload(binding))
+
+
+def validation_source_binding_payload_hash(binding: Mapping[str, Any]) -> str:
+    """Backward-compatible name for the semantic binding identity.
+
+    Older callers used ``payload_hash`` for the content-addressed binding ID.
+    The ID now hashes the explicit semantic projection, while the Registry's
+    ``ArtifactRecord.content_hash`` remains the physical JSON-file hash.
+    """
+
+    return validation_source_binding_semantic_hash(binding)
 
 
 def _registry_records_for_fingerprint(registry: Any) -> list[Any]:
@@ -827,6 +943,7 @@ def build_validation_source_authority_fingerprint(
     cited_paper_keys: Iterable[str],
     current_binding_artifact_id: str = "",
     current_binding_content_hash: str = "",
+    current_binding_semantic_hash: str = "",
     binding_contract_version: str = BINDING_CONTRACT_VERSION,
 ) -> tuple[dict[str, Any], str, tuple[str, ...]]:
     """Build one path-independent fingerprint for all cited source authorities.
@@ -914,6 +1031,14 @@ def build_validation_source_authority_fingerprint(
             if paper_record is not None
             else binding.get("stage1_paper_artifact_hash") or ""
         ).strip()
+        if artifact_path:
+            try:
+                actual_paper_hash = _sha256(artifact_path)
+                if paper_artifact_hash and actual_paper_hash != paper_artifact_hash:
+                    diagnostics.append(f"source_authority_paper_hash_mismatch:{paper_key}")
+                    paper_artifact_hash = actual_paper_hash
+            except OSError:
+                diagnostics.append(f"source_authority_paper_unreadable:{paper_key}")
         source_job_id = str(
             binding.get("source_workspace_job_id")
             or _fingerprint_record_value(paper_record, "job_id")
@@ -952,18 +1077,67 @@ def build_validation_source_authority_fingerprint(
             manifest_version = manifest_version or _fingerprint_record_value(manifest_record, "artifact_version")
             manifest_job_id = manifest_job_id or _fingerprint_record_value(manifest_record, "job_id")
             manifest_hash = manifest_hash or _fingerprint_record_value(manifest_record, "content_hash")
+        # The binding already carries the canonical leaf hashes.  Use those
+        # semantic identities first so a moved locator cannot change the
+        # fingerprint.  When the manifest is physically available, re-read it
+        # as an additional consistency check and refresh the same hash map.
         leaf_hashes: dict[str, str] = {}
-        try:
-            manifest, _verified = _canonical_manifest(manifest_path)
-            if manifest.canonical_paper_key != paper_key:
-                raise ValueError("manifest paper identity mismatch")
-            if manifest.job_id != source_job_id:
-                raise ValueError("manifest job identity mismatch")
-            leaf_hashes = {
-                item.artifact_type: item.content_hash for item in manifest.artifacts
-            }
-        except (OSError, TypeError, ValueError, KeyError) as exc:
-            diagnostics.append(f"source_authority_manifest_invalid:{paper_key}:{exc}")
+        bound_evidence = binding.get("evidence")
+        if isinstance(bound_evidence, Mapping):
+            for field, value in bound_evidence.items():
+                if isinstance(value, Mapping):
+                    artifact_type = str(
+                        value.get("manifest_artifact_type") or field
+                    ).strip()
+                    content_hash = str(value.get("content_hash") or "").strip()
+                    if artifact_type and content_hash:
+                        leaf_hashes[artifact_type] = content_hash
+        if manifest_path and Path(manifest_path).is_file():
+            try:
+                actual_manifest_hash = _sha256(manifest_path)
+                if manifest_hash and actual_manifest_hash != manifest_hash:
+                    diagnostics.append(
+                        f"source_authority_manifest_hash_mismatch:{paper_key}"
+                    )
+                    manifest_hash = actual_manifest_hash
+                manifest, _verified = _canonical_manifest(manifest_path)
+                if manifest.canonical_paper_key != paper_key:
+                    raise ValueError("manifest paper identity mismatch")
+                if manifest.job_id != source_job_id:
+                    raise ValueError("manifest job identity mismatch")
+                leaf_hashes = {
+                    item.artifact_type: item.content_hash
+                    for item in manifest.artifacts
+                }
+            except (OSError, TypeError, ValueError, KeyError) as exc:
+                diagnostics.append(f"source_authority_manifest_invalid:{paper_key}:{exc}")
+
+        if isinstance(bound_evidence, Mapping):
+            for field, value in bound_evidence.items():
+                if not isinstance(value, Mapping):
+                    continue
+                artifact_type = str(
+                    value.get("manifest_artifact_type") or field
+                ).strip()
+                leaf_path = str(value.get("path") or "").strip()
+                expected_leaf_hash = str(value.get("content_hash") or "").strip()
+                if not leaf_path or not Path(leaf_path).is_file():
+                    diagnostics.append(
+                        f"source_authority_leaf_unreadable:{paper_key}:{artifact_type}"
+                    )
+                    continue
+                try:
+                    actual_leaf_hash = _sha256(leaf_path)
+                except OSError:
+                    diagnostics.append(
+                        f"source_authority_leaf_unreadable:{paper_key}:{artifact_type}"
+                    )
+                    continue
+                if expected_leaf_hash and actual_leaf_hash != expected_leaf_hash:
+                    diagnostics.append(
+                        f"source_authority_leaf_hash_mismatch:{paper_key}:{artifact_type}"
+                    )
+                    leaf_hashes[artifact_type] = actual_leaf_hash
 
         if (
             not paper_artifact_id
@@ -1005,16 +1179,30 @@ def build_validation_source_authority_fingerprint(
             binding_contract_version or BINDING_CONTRACT_VERSION
         ),
         "current_binding_artifact_id": str(current_binding_artifact_id or ""),
+        "current_binding_semantic_hash": str(current_binding_semantic_hash or ""),
+        # This is retained as audit metadata, but is intentionally excluded
+        # by validation_source_authority_hash from the semantic checkpoint
+        # identity because it hashes a path-bearing binding JSON file.
         "current_binding_content_hash": str(current_binding_content_hash or ""),
         "papers": fingerprint_entries,
     }
-    return fingerprint, _stable_hash(fingerprint), tuple(dict.fromkeys(diagnostics))
+    return fingerprint, validation_source_authority_hash(fingerprint), tuple(
+        dict.fromkeys(diagnostics)
+    )
 
 
 def validation_source_authority_hash(fingerprint: Mapping[str, Any]) -> str:
     """Return the canonical digest for a persisted authority fingerprint."""
 
-    return _stable_hash(dict(fingerprint))
+    semantic = dict(fingerprint)
+    # Registry content hashes and file paths are physical audit evidence.  The
+    # source-authority checkpoint identity must remain stable when only the
+    # binding file/locator moves.  Paper, manifest, and leaf hashes remain in
+    # the fingerprint entries and therefore continue to invalidate on source
+    # byte drift.
+    semantic.pop("current_binding_content_hash", None)
+    semantic.pop("current_binding_physical_hash", None)
+    return _stable_hash(semantic)
 
 
 __all__ = [
@@ -1028,5 +1216,6 @@ __all__ = [
     "verify_leaf_evidence_bytes",
     "verify_manifest_semantic_identity",
     "validation_source_authority_hash",
+    "validation_source_binding_semantic_hash",
     "validation_source_binding_payload_hash",
 ]
