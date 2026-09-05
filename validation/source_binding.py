@@ -1031,14 +1031,6 @@ def build_validation_source_authority_fingerprint(
             if paper_record is not None
             else binding.get("stage1_paper_artifact_hash") or ""
         ).strip()
-        if artifact_path:
-            try:
-                actual_paper_hash = _sha256(artifact_path)
-                if paper_artifact_hash and actual_paper_hash != paper_artifact_hash:
-                    diagnostics.append(f"source_authority_paper_hash_mismatch:{paper_key}")
-                    paper_artifact_hash = actual_paper_hash
-            except OSError:
-                diagnostics.append(f"source_authority_paper_unreadable:{paper_key}")
         source_job_id = str(
             binding.get("source_workspace_job_id")
             or _fingerprint_record_value(paper_record, "job_id")
