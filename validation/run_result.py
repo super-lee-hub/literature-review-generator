@@ -256,6 +256,8 @@ class ValidationInputArtifactsV1:
     citation_manifest_hash: str = ""
     evidence_manifest_ids: Tuple[str, ...] = ()
     evidence_manifest_hashes: Tuple[str, ...] = ()
+    validation_source_binding_id: str = ""
+    validation_source_binding_hash: str = ""
     validation_source_authority_hash: str = ""
     validation_source_authority_fingerprint: Mapping[str, Any] = field(
         default_factory=dict
@@ -278,6 +280,10 @@ class ValidationInputArtifactsV1:
             raise ValidationRunResultError("evidence manifest artifact ids must be non-empty")
         if any(not item for item in self.evidence_manifest_hashes):
             raise ValidationRunResultError("evidence manifest artifact hashes must be non-empty")
+        if bool(self.validation_source_binding_id) != bool(self.validation_source_binding_hash):
+            raise ValidationRunResultError(
+                "validation source binding identity requires both id and hash"
+            )
         if not isinstance(self.validation_source_authority_fingerprint, Mapping):
             raise ValidationRunResultError(
                 "validation source authority fingerprint must be an object"
@@ -291,6 +297,7 @@ class ValidationInputArtifactsV1:
         hashes = (
             ("review draft", self.review_draft_hash),
             ("citation manifest", self.citation_manifest_hash),
+            ("validation source binding", self.validation_source_binding_hash),
             ("validation source authority", self.validation_source_authority_hash),
             *(
                 (f"evidence manifest[{index}]", content_hash)
@@ -332,6 +339,12 @@ class ValidationInputArtifactsV1:
                 str(item).strip()
                 for item in (payload.get("evidence_manifest_hashes") or ())
             ),
+            validation_source_binding_id=str(
+                payload.get("validation_source_binding_id") or ""
+            ).strip(),
+            validation_source_binding_hash=str(
+                payload.get("validation_source_binding_hash") or ""
+            ).strip(),
             validation_source_authority_hash=str(
                 payload.get("validation_source_authority_hash") or ""
             ).strip(),
@@ -350,6 +363,8 @@ class ValidationInputArtifactsV1:
             "citation_manifest_hash": self.citation_manifest_hash,
             "evidence_manifest_ids": list(self.evidence_manifest_ids),
             "evidence_manifest_hashes": list(self.evidence_manifest_hashes),
+            "validation_source_binding_id": self.validation_source_binding_id,
+            "validation_source_binding_hash": self.validation_source_binding_hash,
             "validation_source_authority_hash": self.validation_source_authority_hash,
             "validation_source_authority_fingerprint": dict(
                 self.validation_source_authority_fingerprint

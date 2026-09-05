@@ -68,6 +68,7 @@ class ValidationExecutionService:
     runtime_config: Mapping[str, Any] = field(default_factory=dict)
     validation_external_registry_resolver: Callable[[str], Any | None] | None = None
     publication_context: Any | None = None
+    validation_source_binding_record: ArtifactRecord | None = None
     _provider_receipt_ledger: ProviderRuntimeLedger | None = field(
         default=None,
         init=False,
@@ -173,8 +174,17 @@ class ValidationExecutionService:
             raise ValueError("validation source authority hash must be a lowercase SHA-256")
         self.validation_source_authority_hash = normalized_hash
         self._validation_source_authority_fingerprint = dict(fingerprint)
+        if self.validation_source_binding_record is not None:
+            expected_binding_id = self.validation_source_binding_record.artifact_id
+            expected_binding_hash = self.validation_source_binding_record.content_hash
+            if str(fingerprint.get("current_binding_artifact_id") or "") != expected_binding_id:
+                raise ValueError("validation source fingerprint does not identify the current binding")
+            if str(fingerprint.get("current_binding_content_hash") or "") != expected_binding_hash:
+                raise ValueError("validation source fingerprint does not match the current binding")
         input_hashes = dict(self._input_dependency_hashes)
         input_hashes["validation_source_authority"] = normalized_hash
+        if self.validation_source_binding_record is not None:
+            input_hashes["validation_source_binding"] = self.validation_source_binding_record.content_hash
         self._input_dependency_hashes = {
             str(key): str(value)
             for key, value in sorted(input_hashes.items(), key=lambda item: str(item[0]))
@@ -192,6 +202,22 @@ class ValidationExecutionService:
     @property
     def project_name(self) -> str:
         return str(self.workspace.project_name)
+
+    @property
+    def current_validation_source_binding_id(self) -> str:
+        return str(
+            self.validation_source_binding_record.artifact_id
+            if self.validation_source_binding_record is not None
+            else ""
+        )
+
+    @property
+    def current_validation_source_binding_hash(self) -> str:
+        return str(
+            self.validation_source_binding_record.content_hash
+            if self.validation_source_binding_record is not None
+            else ""
+        )
 
     @property
     def review_draft_path(self) -> str:

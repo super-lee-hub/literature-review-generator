@@ -38,6 +38,14 @@ def declared_validation_input_identities(
                 inputs.citation_manifest_hash,
             )
         )
+    if inputs.validation_source_binding_id:
+        identities.append(
+            (
+                "validation_source_binding",
+                inputs.validation_source_binding_id,
+                inputs.validation_source_binding_hash,
+            )
+        )
     identities.extend(
         ("evidence_manifest", artifact_id, content_hash)
         for artifact_id, content_hash in zip(
@@ -205,6 +213,19 @@ def validate_validation_dependency_contract(
         )
     fingerprint = inputs.validation_source_authority_fingerprint
     if fingerprint:
+        fingerprint_binding_id = str(
+            fingerprint.get("current_binding_artifact_id") or ""
+        )
+        fingerprint_binding_hash = str(
+            fingerprint.get("current_binding_content_hash") or ""
+        )
+        if inputs.validation_source_binding_id and (
+            fingerprint_binding_id != inputs.validation_source_binding_id
+            or fingerprint_binding_hash != inputs.validation_source_binding_hash
+        ):
+            raise ValidationInputDependencyError(
+                "Validation source authority fingerprint does not match the current binding"
+            )
         raw_entries = fingerprint.get("papers")
         if not isinstance(raw_entries, (list, tuple)):
             raise ValidationInputDependencyError(

@@ -31,6 +31,11 @@ from services.evidence_manifest import EvidenceManifestV1, verified_evidence_pat
 
 BINDING_ARTIFACT_TYPE = "validation_source_binding"
 BINDING_ARTIFACT_VERSION = "v1"
+# The Registry schema version and the semantic binding contract version are
+# separate.  A contract revision must produce a new binding identity without
+# pretending that the Registry artifact schema itself is supported at a new
+# version before its validator exists.
+BINDING_CONTRACT_VERSION = "v1"
 REGISTRY_FILENAME = "artifact_registry.json"
 
 # manifest artifact_type -> ReviewValidator preprocess_evidence field
@@ -190,6 +195,7 @@ def build_validation_source_binding(
     papers: dict[str, dict[str, Any]] = {}
     diagnostics: list[str] = []
     workspaces: list[str] = []
+    source_identities: list[dict[str, str]] = []
 
     if local_registry is not None:
         try:
@@ -207,13 +213,20 @@ def build_validation_source_binding(
         if workspace is None:
             diagnostics.append(f"upstream_workspace_unresolved:{Path(text).name}")
             continue
-        if str(workspace) in workspaces:
-            continue
-        workspaces.append(str(workspace))
         records, upstream_job_id = _registry_records(workspace)
         if not records:
             diagnostics.append(f"upstream_registry_unreadable:{Path(text).name}")
             continue
+        source_identity = _summary_source_identity(
+            text,
+            records=records,
+            upstream_job_id=upstream_job_id,
+        )
+        if source_identity:
+            source_identities.append(source_identity)
+        if str(workspace) in workspaces:
+            continue
+        workspaces.append(str(workspace))
         for record in records:
             if str(record.get("artifact_type") or "") != "paper_artifact":
                 continue
@@ -308,13 +321,99 @@ def build_validation_source_binding(
     binding = {
         "artifact_type": BINDING_ARTIFACT_TYPE,
         "artifact_version": BINDING_ARTIFACT_VERSION,
+        "binding_contract_version": BINDING_CONTRACT_VERSION,
         "job_id": str(job_id or ""),
-        "upstream_workspaces": tuple(workspaces),
+        "upstream_workspaces": tuple(sorted(set(workspaces))),
+        # A source path is intentionally not part of this identity.  Summary
+        # sources are represented by their owning Registry job, artifact ID,
+        # and content hash so a workspace move cannot silently change the
+        # semantic binding while a changed source set does.
+        "summary_source_identities": tuple(
+            sorted(
+                (dict(identity) for identity in source_identities),
+                key=lambda identity: tuple(
+                    str(identity.get(field) or "")
+                    for field in (
+                        "source_job_id",
+                        "source_artifact_id",
+                        "source_artifact_version",
+                        "source_artifact_hash",
+                    )
+                ),
+            )
+        ),
         "papers": papers,
         "diagnostics": tuple(diagnostics),
         "bound_paper_count": len(papers),
     }
     return binding
+
+
+def _summary_source_identity(
+    source_path: str,
+    *,
+    records: Sequence[Mapping[str, Any]],
+    upstream_job_id: str,
+) -> dict[str, str]:
+    """Return a path-independent identity for one summary source.
+
+    A summary file is normally a durable ``summary_file`` Registry artifact.
+    Portable or older workspaces may not have that record, so the exact file
+    bytes remain a useful fallback identity.  The path is deliberately omitted
+    from both forms.
+    """
+
+    normalized_path = _canonical_path(source_path)
+    matches = [
+        record
+        for record in records
+        if str(record.get("status") or "") == "ready"
+        and str(record.get("artifact_type") or "") == "summary_file"
+        and _canonical_path(record.get("path")) == normalized_path
+    ]
+    identities = {
+        (
+            str(record.get("job_id") or upstream_job_id),
+            str(record.get("artifact_id") or ""),
+            str(record.get("artifact_version") or ""),
+            str(record.get("content_hash") or ""),
+        )
+        for record in matches
+    }
+    if len(identities) > 1:
+        # Keep the ambiguity visible in the binding payload.  The orchestrator
+        # will fail closed when it cannot select a unique current identity.
+        return {
+            "source_job_id": str(upstream_job_id or ""),
+            "source_artifact_id": "",
+            "source_artifact_version": "ambiguous",
+            "source_artifact_hash": "",
+        }
+    if identities:
+        job_id, artifact_id, artifact_version, content_hash = next(iter(identities))
+        return {
+            "source_job_id": job_id,
+            "source_artifact_id": artifact_id,
+            "source_artifact_version": artifact_version,
+            "source_artifact_hash": content_hash,
+        }
+    if normalized_path and Path(normalized_path).is_file():
+        try:
+            content_hash = _sha256(normalized_path)
+        except OSError:
+            content_hash = ""
+        return {
+            "source_job_id": str(upstream_job_id or ""),
+            "source_artifact_id": "",
+            "source_artifact_version": "unregistered",
+            "source_artifact_hash": content_hash,
+        }
+    return {
+        "source_job_id": str(upstream_job_id or ""),
+        "source_artifact_id": "",
+        "source_artifact_version": "unresolved",
+        "source_artifact_hash": "",
+    }
 
 
 def _registry_get(registry: Any, artifact_id: str) -> Any | None:
@@ -689,6 +788,19 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def validation_source_binding_payload_hash(binding: Mapping[str, Any]) -> str:
+    """Return the canonical semantic identity of a binding payload.
+
+    This keeps the content-addressed binding ID aligned with the runtime's
+    existing JSON identity domain while treating JSON-equivalent tuples/lists
+    and mapping order as the same payload.
+    """
+
+    from runtime.provider_runtime import hash_json
+
+    return hash_json(dict(binding))
+
+
 def _registry_records_for_fingerprint(registry: Any) -> list[Any]:
     if registry is None:
         return []
@@ -713,6 +825,9 @@ def build_validation_source_authority_fingerprint(
     paper_artifacts: Sequence[Mapping[str, Any]],
     registry: Any,
     cited_paper_keys: Iterable[str],
+    current_binding_artifact_id: str = "",
+    current_binding_content_hash: str = "",
+    binding_contract_version: str = BINDING_CONTRACT_VERSION,
 ) -> tuple[dict[str, Any], str, tuple[str, ...]]:
     """Build one path-independent fingerprint for all cited source authorities.
 
@@ -865,7 +980,9 @@ def build_validation_source_authority_fingerprint(
 
         fingerprint_entries.append(
             {
-                "binding_contract_version": BINDING_ARTIFACT_VERSION,
+                "binding_contract_version": str(
+                    binding_contract_version or BINDING_CONTRACT_VERSION
+                ),
                 "canonical_paper_key": paper_key,
                 "source_job_id": source_job_id,
                 "paper_artifact_id": paper_artifact_id,
@@ -883,7 +1000,12 @@ def build_validation_source_authority_fingerprint(
 
     fingerprint = {
         "artifact_type": "validation_source_authority_fingerprint",
-        "artifact_version": BINDING_ARTIFACT_VERSION,
+        "artifact_version": str(binding_contract_version or BINDING_ARTIFACT_VERSION),
+        "binding_contract_version": str(
+            binding_contract_version or BINDING_CONTRACT_VERSION
+        ),
+        "current_binding_artifact_id": str(current_binding_artifact_id or ""),
+        "current_binding_content_hash": str(current_binding_content_hash or ""),
         "papers": fingerprint_entries,
     }
     return fingerprint, _stable_hash(fingerprint), tuple(dict.fromkeys(diagnostics))
@@ -898,6 +1020,7 @@ def validation_source_authority_hash(fingerprint: Mapping[str, Any]) -> str:
 __all__ = [
     "BINDING_ARTIFACT_TYPE",
     "BINDING_ARTIFACT_VERSION",
+    "BINDING_CONTRACT_VERSION",
     "build_validation_source_authority_fingerprint",
     "build_validation_source_binding",
     "discover_upstream_workspace",
@@ -905,4 +1028,5 @@ __all__ = [
     "verify_leaf_evidence_bytes",
     "verify_manifest_semantic_identity",
     "validation_source_authority_hash",
+    "validation_source_binding_payload_hash",
 ]

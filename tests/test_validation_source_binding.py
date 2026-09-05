@@ -26,6 +26,10 @@ from validation.source_binding import (
 )
 from services.artifact_registry import ArtifactDependencyRefV2, ArtifactRegistry
 from services.job_workspace import JobWorkspace
+from services.queue_service import LocalPublicationContext
+from runtime.orchestrator import AgentRuntimeBridge
+from runtime.provider_runtime import hash_json
+from services.job_workspace import publish_json_artifact
 from validation.current_validation import _load_inputs
 
 
@@ -617,3 +621,493 @@ def test_current_validation_loader_resolves_mixed_local_and_external_authority(
         item.startswith("validation_source_authority_ambiguous")
         for item in service._validation_source_authority_diagnostics
     )
+
+
+def _binding_context(
+    tmp_path: Path,
+    summary_sources: list[Path],
+    upstream_ws: Path,
+) -> tuple[Any, Any, ArtifactRegistry, ArtifactRegistry]:
+    downstream_ws = JobWorkspace.create(str(tmp_path), "downstream", job_id="down_job")
+    downstream_registry = ArtifactRegistry(
+        downstream_ws.paths.registry_path,
+        downstream_ws.job_id,
+    )
+    upstream_registry = ArtifactRegistry(upstream_ws / "artifact_registry.json", "up_job")
+    bridge = AgentRuntimeBridge.__new__(AgentRuntimeBridge)
+    session = SimpleNamespace(
+        request=SimpleNamespace(
+            summary_file=None,
+            summary_sources=tuple(str(path) for path in summary_sources),
+            reuse_summary_files=(),
+        ),
+        context=SimpleNamespace(
+            workspace=downstream_ws,
+            registry=downstream_registry,
+            publication_context=LocalPublicationContext(),
+        ),
+        stage_host=SimpleNamespace(),
+    )
+    return bridge, session, downstream_registry, upstream_registry
+
+
+def _upstream_resolver(registry: ArtifactRegistry):
+    return lambda job_id: registry if job_id == registry.job_id else None
+
+
+def _binding_records(registry: ArtifactRegistry) -> list[Any]:
+    return sorted(
+        (
+            record
+            for record in registry.list_records()
+            if record.artifact_type == "validation_source_binding"
+            and record.status == "ready"
+        ),
+        key=lambda record: record.artifact_id,
+    )
+
+
+def _rewrite_upstream_paper(
+    upstream_ws: Path,
+    *,
+    mutate: Any,
+) -> None:
+    registry_payload = json.loads(
+        (upstream_ws / "artifact_registry.json").read_text(encoding="utf-8")
+    )
+    paper_record = next(
+        record
+        for record in registry_payload["artifacts"]
+        if record.get("artifact_type") == "paper_artifact"
+    )
+    paper_path = Path(paper_record["path"])
+    paper_payload = json.loads(paper_path.read_text(encoding="utf-8"))
+    mutate(paper_payload)
+    paper_hash = _write(paper_path, paper_payload)
+    paper_record["content_hash"] = paper_hash
+    _write(upstream_ws / "artifact_registry.json", registry_payload)
+
+
+def _write_loader_inputs(workspace: JobWorkspace, paper_key: str) -> tuple[Path, Path]:
+    review_path = Path(workspace.artifact_path("review.json"))
+    citation_path = Path(workspace.artifact_path("citation.json"))
+    _write(review_path, {})
+    _write(
+        citation_path,
+        {
+            "citation_sets": [{"paper_ids": [paper_key]}],
+            "occurrences": [],
+        },
+    )
+    return review_path, citation_path
+
+
+def _loader_service(
+    workspace: JobWorkspace,
+    registry: ArtifactRegistry,
+    upstream_registry: ArtifactRegistry,
+    paper_key: str,
+    current_record: Any,
+) -> Any:
+    review_path, citation_path = _write_loader_inputs(workspace, paper_key)
+    return SimpleNamespace(
+        review_draft_path=str(review_path),
+        citation_manifest_path=str(citation_path),
+        artifact_registry=registry,
+        paper_artifact_records=(),
+        summaries=[],
+        validation_external_registry_resolver=_upstream_resolver(upstream_registry),
+        current_validation_source_binding_id=current_record.artifact_id,
+        current_validation_source_binding_hash=current_record.content_hash,
+        get_paper_key=lambda paper: str(
+            paper.get("canonical_paper_key") or paper.get("source_paper_id") or ""
+        ),
+    )
+
+
+def _publish_manual_binding(
+    session: Any,
+    registry: ArtifactRegistry,
+    binding: dict[str, Any],
+    upstream_registry: ArtifactRegistry,
+    *,
+    artifact_id: str | None = None,
+) -> Any:
+    payload_hash = hash_json(binding)
+    path = session.context.workspace.artifact_path(
+        f"validation_source_binding_{payload_hash[:24]}.json"
+    )
+    dependencies: list[ArtifactDependencyRefV2] = []
+    for entry in (binding.get("papers") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        dependencies.extend(
+            [
+                ArtifactDependencyRefV2(
+                    dependency_kind="external_job",
+                    job_id=str(entry["source_workspace_job_id"]),
+                    artifact_id=str(entry["stage1_paper_artifact_id"]),
+                    artifact_type="paper_artifact",
+                    path=str(entry["stage1_paper_artifact_path"]),
+                    content_hash=str(entry["stage1_paper_artifact_hash"]),
+                ),
+                ArtifactDependencyRefV2(
+                    dependency_kind="external_job",
+                    job_id=str(entry["evidence_manifest_job_id"]),
+                    artifact_id=str(entry["evidence_manifest_artifact_id"]),
+                    artifact_type="evidence_manifest",
+                    path=str(entry["evidence_manifest_path"]),
+                    content_hash=str(entry["evidence_manifest_hash"]),
+                ),
+            ]
+        )
+    return publish_json_artifact(
+        session.context.publication_context,
+        registry,
+        path,
+        binding,
+        artifact_role="runtime_stage_evidence",
+        artifact_type="validation_source_binding",
+        artifact_version=str(binding["artifact_version"]),
+        producer="tests.lifecycle",
+        artifact_id=artifact_id or f"validation_source_binding:{payload_hash[:24]}",
+        depends_on=dependencies,
+        external_registry_resolver=_upstream_resolver(upstream_registry),
+    )
+
+
+def test_old_ready_source_binding_does_not_block_new_current_binding(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    old_record = bridge._ensure_validation_source_binding(
+        session,
+        registry,
+        external_registry_resolver=_upstream_resolver(upstream_registry),
+    )
+    assert old_record is not None
+
+    _rewrite_upstream_paper(
+        upstream_ws,
+        mutate=lambda payload: payload["payload"]["analysis"]["ai_summary"]["main_findings"].append(
+            "authority drift"
+        ),
+    )
+    upstream_registry.reload()
+    new_record = bridge._ensure_validation_source_binding(
+        session,
+        registry,
+        external_registry_resolver=_upstream_resolver(upstream_registry),
+    )
+
+    assert new_record is not None
+    assert new_record.artifact_id != old_record.artifact_id
+    assert len(_binding_records(registry)) == 2
+
+
+def test_binding_rebuilds_when_summary_source_set_changes(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    alternate_summary = summary_path.with_name("stage1_summaries_alternate.json")
+    alternate_summary.write_text(
+        json.dumps(
+            [{"paper_info": {"canonical_paper_key": hashes["paper_key"]}, "revision": 2}],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    first = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    session.request.summary_sources = (str(summary_path), str(alternate_summary))
+    second = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+
+    assert first is not None and second is not None
+    assert second.artifact_id != first.artifact_id
+
+
+def test_binding_rebuilds_when_upstream_paper_artifact_hash_changes(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    first = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    _rewrite_upstream_paper(
+        upstream_ws,
+        mutate=lambda payload: payload["payload"].setdefault("metadata", {}).update({"revision": 2}),
+    )
+    upstream_registry.reload()
+    second = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+
+    assert first is not None and second is not None
+    assert second.artifact_id != first.artifact_id
+
+
+def test_binding_rebuilds_when_evidence_manifest_hash_changes(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    first = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    manifest_path = next(
+        Path(record["path"])
+        for record in json.loads((upstream_ws / "artifact_registry.json").read_text(encoding="utf-8"))["artifacts"]
+        if record.get("artifact_type") == "evidence_manifest"
+    )
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_payload["payload"]["created_at"] = "2026-09-05T00:00:00Z"
+    manifest_hash = _write(manifest_path, manifest_payload)
+    _rewrite_upstream_paper(
+        upstream_ws,
+        mutate=lambda payload: payload["payload"]["stage1_inputs"].update(
+            {"evidence_manifest_hash": manifest_hash}
+        ),
+    )
+    registry_payload = json.loads(
+        (upstream_ws / "artifact_registry.json").read_text(encoding="utf-8")
+    )
+    for record in registry_payload["artifacts"]:
+        if record.get("artifact_type") == "evidence_manifest":
+            record["content_hash"] = manifest_hash
+    _write(upstream_ws / "artifact_registry.json", registry_payload)
+    upstream_registry.reload()
+    second = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+
+    assert first is not None and second is not None
+    assert second.artifact_id != first.artifact_id
+
+
+def test_binding_rebuilds_when_binding_contract_version_changes(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import validation.source_binding as source_binding
+
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    first = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    monkeypatch.setattr(source_binding, "BINDING_CONTRACT_VERSION", "v2")
+    second = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+
+    assert first is not None and second is not None
+    assert second.artifact_id != first.artifact_id
+    assert second.artifact_version == "v1"
+    assert second.metadata["binding_contract_version"] == "v2"
+
+
+def test_exact_current_binding_is_reused_without_duplicate_publication(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    first = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    revision = registry.revision
+    second = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+
+    assert first is not None and second is not None
+    assert second.artifact_id == first.artifact_id
+    assert second.content_hash == first.content_hash
+    assert registry.revision == revision
+    assert len(_binding_records(registry)) == 1
+
+
+def test_stale_historical_binding_does_not_poison_current_validation(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    _old = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    _rewrite_upstream_paper(
+        upstream_ws,
+        mutate=lambda payload: payload["payload"].setdefault("metadata", {}).update({"revision": 3}),
+    )
+    upstream_registry.reload()
+    current = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    assert current is not None
+    service = _loader_service(
+        session.context.workspace,
+        registry,
+        upstream_registry,
+        hashes["paper_key"],
+        current,
+    )
+
+    _review, _citation, papers, _preprocess, _metadata = _load_inputs(service)
+
+    assert len(papers) == 1
+    assert not any(
+        item.startswith("VALIDATION_SOURCE_AUTHORITY_INVALID")
+        or item.startswith("validation_source_binding_hash_mismatch")
+        for item in service._validation_source_authority_diagnostics
+    )
+
+
+def test_multiple_historical_ready_bindings_do_not_create_false_authority_ambiguity(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    current = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    assert current is not None
+    first_binding = json.loads(Path(current.path).read_text(encoding="utf-8"))
+    first_entry = dict(first_binding["papers"][hashes["paper_key"]])
+
+    upstream_payload = json.loads(
+        Path(first_entry["stage1_paper_artifact_path"]).read_text(encoding="utf-8")
+    )
+    alternate_path = upstream_ws / "papers" / "paper-alternate.json"
+    alternate_payload = dict(upstream_payload)
+    alternate_payload["payload"] = dict(upstream_payload["payload"])
+    alternate_payload["payload"]["metadata"] = {"historical": True}
+    alternate_hash = _write(alternate_path, alternate_payload)
+    manifest_record = upstream_registry.get(first_entry["evidence_manifest_artifact_id"])
+    assert manifest_record is not None
+    alternate_record = upstream_registry.register_file(
+        artifact_role="paper_summary",
+        artifact_type="paper_artifact",
+        artifact_version="v1",
+        path=alternate_path,
+        producer="tests.lifecycle",
+        artifact_id="paper:alternate",
+        depends_on=[ArtifactDependencyRefV2.from_record(manifest_record)],
+    )
+    assert alternate_record.content_hash == alternate_hash
+    second_binding = dict(first_binding)
+    second_binding["papers"] = {
+        hashes["paper_key"]: {
+            **first_entry,
+            "stage1_paper_artifact_id": alternate_record.artifact_id,
+            "stage1_paper_artifact_path": alternate_record.path,
+            "stage1_paper_artifact_hash": alternate_record.content_hash,
+        }
+    }
+    second = _publish_manual_binding(session, registry, second_binding, upstream_registry)
+    service = _loader_service(
+        session.context.workspace,
+        registry,
+        upstream_registry,
+        hashes["paper_key"],
+        second,
+    )
+
+    _review, _citation, papers, _preprocess, _metadata = _load_inputs(service)
+
+    assert len(papers) == 1
+    assert not any(
+        item.startswith("validation_source_authority_ambiguous")
+        for item in service._validation_source_authority_diagnostics
+    )
+
+
+def test_resume_selects_same_exact_current_binding(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    initial = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    resumed = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+
+    assert initial is not None and resumed is not None
+    assert (resumed.artifact_id, resumed.content_hash) == (
+        initial.artifact_id,
+        initial.content_hash,
+    )
+    assert len(_binding_records(registry)) == 1
+
+
+def test_current_binding_selection_is_deterministic(
+    tmp_path: Path,
+    upstream_workspace: tuple[Path, dict[str, str]],
+) -> None:
+    upstream_ws, hashes = upstream_workspace
+    summary_path = _summary_file(upstream_ws, hashes["paper_key"])
+    bridge, session, registry, upstream_registry = _binding_context(
+        tmp_path, [summary_path], upstream_ws
+    )
+    canonical = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+    assert canonical is not None
+    payload = json.loads(Path(canonical.path).read_text(encoding="utf-8"))
+    duplicate = _publish_manual_binding(
+        session,
+        registry,
+        payload,
+        upstream_registry,
+        artifact_id="validation_source_binding:legacy",
+    )
+    assert duplicate.artifact_id != canonical.artifact_id
+
+    selected = bridge._ensure_validation_source_binding(
+        session, registry, external_registry_resolver=_upstream_resolver(upstream_registry)
+    )
+
+    assert selected is not None
+    assert selected.artifact_id == canonical.artifact_id

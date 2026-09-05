@@ -182,16 +182,106 @@ def _load_inputs(
                 payload["_registry_artifact_hash"] = record.content_hash
                 paper_artifacts.append(payload)
 
-    binding_records: list[Any] = [
+    all_binding_records: list[Any] = [
         record
         for record in records
         if record.artifact_type == "validation_source_binding" and record.status == "ready"
     ]
-    if paper_artifacts_override is None and binding_records:
+    binding_records: list[Any] = []
+    binding_history_present = bool(all_binding_records)
+    if paper_artifacts_override is None and all_binding_records:
         # Lane B is resolved per cited canonical paper key.  A local artifact
         # for one paper must not suppress an external authority for another.
         from validation.source_binding import resolve_bound_paper_artifacts
+        from validation.source_binding import validation_source_binding_payload_hash
 
+        current_binding_id = str(
+            getattr(service, "current_validation_source_binding_id", "") or ""
+        ).strip()
+        current_binding_hash = str(
+            getattr(service, "current_validation_source_binding_hash", "") or ""
+        ).strip()
+        current_binding_record = getattr(service, "validation_source_binding_record", None)
+        has_explicit_selector = any(
+            hasattr(service, attribute)
+            for attribute in (
+                "validation_source_binding_record",
+                "current_validation_source_binding_id",
+                "current_validation_source_binding_hash",
+            )
+        )
+        if current_binding_record is not None:
+            current_binding_id = str(
+                getattr(current_binding_record, "artifact_id", "") or current_binding_id
+            ).strip()
+            current_binding_hash = str(
+                getattr(current_binding_record, "content_hash", "") or current_binding_hash
+            ).strip()
+
+        if current_binding_id:
+            matches = [
+                record
+                for record in all_binding_records
+                if record.artifact_id == current_binding_id
+                and (
+                    not current_binding_hash
+                    or record.content_hash == current_binding_hash
+                )
+            ]
+            if len(matches) == 1 and current_binding_hash:
+                selected = matches[0]
+                if selected.content_hash != current_binding_hash:
+                    source_authority_diagnostics.append(
+                        "validation_source_binding_hash_mismatch"
+                    )
+                else:
+                    from validation.source_binding import BINDING_ARTIFACT_VERSION
+
+                    if selected.artifact_version != BINDING_ARTIFACT_VERSION:
+                        source_authority_diagnostics.append(
+                            "validation_source_binding_version_mismatch"
+                        )
+                    else:
+                        binding_records = [selected]
+            else:
+                source_authority_diagnostics.append(
+                    "validation_source_binding_current_identity_unresolved"
+                )
+        elif not has_explicit_selector:
+            if len(all_binding_records) == 1:
+                # Compatibility for direct loader callers from before the runtime
+                # carried an explicit selected binding identity.
+                binding_records = list(all_binding_records)
+            elif len(all_binding_records) > 1:
+                # Never aggregate an unbounded history.  If an older caller did
+                # not provide the selected identity, the only safe fallback is a
+                # single semantic payload shared by all ready records; otherwise
+                # fail closed instead of manufacturing an authority ambiguity.
+                candidates_by_identity: dict[str, list[Any]] = {}
+                for record in all_binding_records:
+                    raw_payload = _read_json(record.path)
+                    if isinstance(raw_payload, Mapping) and isinstance(
+                        raw_payload.get("payload"), Mapping
+                    ):
+                        raw_payload = raw_payload["payload"]
+                    if not isinstance(raw_payload, Mapping):
+                        continue
+                    try:
+                        identity = validation_source_binding_payload_hash(raw_payload)
+                    except (TypeError, ValueError):
+                        continue
+                    candidates_by_identity.setdefault(identity, []).append(record)
+                if len(candidates_by_identity) == 1:
+                    binding_records = [
+                        sorted(
+                            next(iter(candidates_by_identity.values())),
+                            key=lambda record: record.artifact_id,
+                        )[0]
+                    ]
+                else:
+                    source_authority_diagnostics.append(
+                        "validation_source_binding_current_identity_ambiguous"
+                    )
         cited_keys = _cited_paper_ids(citation_manifest or {})
         if not cited_keys:
             cited_keys = list(
@@ -274,10 +364,7 @@ def _load_inputs(
                 )
 
         bound_by_key: dict[str, list[dict[str, Any]]] = {}
-        for binding_record in sorted(
-            binding_records,
-            key=lambda record: str(getattr(record, "created_at", "")),
-        ):
+        for binding_record in binding_records:
             binding_payload = _read_json(binding_record.path)
             if isinstance(binding_payload, Mapping) and isinstance(binding_payload.get("payload"), Mapping):
                 binding_payload = binding_payload["payload"]
@@ -324,7 +411,7 @@ def _load_inputs(
                 paper_artifacts.append(chosen)
                 local_by_key[key] = [chosen]
 
-    if not paper_artifacts and not binding_records:
+    if not paper_artifacts and not binding_history_present:
         # No binding and no local paper artifacts: legacy summary-only job.
         for summary in service.summaries:
             paper = summary.get("paper_info") or {}
@@ -533,6 +620,12 @@ def _input_contract(
         citation_manifest_hash=manifest_hash,
         evidence_manifest_ids=tuple(item[0] for item in unique_evidence),
         evidence_manifest_hashes=tuple(item[1] for item in unique_evidence),
+        validation_source_binding_id=str(
+            getattr(service, "current_validation_source_binding_id", "") or ""
+        ).strip(),
+        validation_source_binding_hash=str(
+            getattr(service, "current_validation_source_binding_hash", "") or ""
+        ).strip(),
     )
     evidence_complete = not degradation and (
         not review_has_citations or bool(unique_evidence)
@@ -1155,13 +1248,31 @@ def run_current_validation(
         review_draft_record_override=review_draft_record_override,
         citation_manifest_record_override=citation_manifest_record_override,
     )
-    from validation.source_binding import build_validation_source_authority_fingerprint
+    from validation.source_binding import (
+        BINDING_CONTRACT_VERSION,
+        build_validation_source_authority_fingerprint,
+    )
+
+    binding_record = getattr(service, "validation_source_binding_record", None)
+    binding_metadata = getattr(binding_record, "metadata", {})
+    binding_contract_version = str(
+        binding_metadata.get("binding_contract_version")
+        if isinstance(binding_metadata, Mapping)
+        else ""
+    ).strip() or BINDING_CONTRACT_VERSION
 
     source_fingerprint, source_authority_hash, source_diagnostics = (
         build_validation_source_authority_fingerprint(
             paper_artifacts=paper_artifacts,
             registry=service.artifact_registry,
             cited_paper_keys=_cited_paper_ids(citation_manifest),
+            current_binding_artifact_id=str(
+                getattr(service, "current_validation_source_binding_id", "") or ""
+            ).strip(),
+            current_binding_content_hash=str(
+                getattr(service, "current_validation_source_binding_hash", "") or ""
+            ).strip(),
+            binding_contract_version=binding_contract_version,
         )
     )
     if source_diagnostics:
