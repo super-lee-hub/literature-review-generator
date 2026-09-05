@@ -2643,6 +2643,9 @@ class Stage1AnalysisService:
                 "length_retries": int(
                     provider_result.get("stage1_length_retries") or 0
                 ),
+                "schema_retries": int(
+                    provider_result.get("stage1_schema_retries") or 0
+                ),
                 "semantic_retries": int(
                     coverage.get("semantic_retries") or 0
                 ),
@@ -5086,6 +5089,8 @@ class Stage1AnalysisService:
             "message": "primary Stage 1 reader did not run",
         }
         attempted_budgets: list[int] = []
+        length_retry_count = 0
+        schema_retry_count = 0
         for retry_index, output_budget in enumerate(synthesis_budgets):
             staged_primary_config = self._stage1_provider_config(
                 primary_config,
@@ -5112,16 +5117,38 @@ class Stage1AnalysisService:
             )
             attempted_budgets.append(output_budget)
             if str(primary_result.get("status") or "").strip().casefold() == "success":
-                return {
-                    **dict(primary_result),
-                    "stage1_output_stage": "synthesis",
-                    "stage1_requested_output_budgets": attempted_budgets,
-                    "stage1_length_retries": max(0, len(attempted_budgets) - 1),
-                    "stage1_terminal_output_tokens": output_budget,
-                    "stage1_request_timeout_seconds": request_timeout_seconds,
-                }
+                try:
+                    self._canonical_substantive_summary(primary_result)
+                except RuntimeError as exc:
+                    primary_result = {
+                        **dict(primary_result),
+                        "status": "failed",
+                        "error_kind": "invalid_response",
+                        "message": str(exc),
+                        "engine_type": "primary",
+                    }
+                    if retry_index < len(synthesis_budgets) - 1:
+                        schema_retry_count += 1
+                        if self.logger:
+                            self.logger.warning(
+                                "Stage 1 synthesis response failed canonical validation; "
+                                "escalating the existing primary output budget "
+                                f"from {output_budget} to {synthesis_budgets[retry_index + 1]} tokens."
+                            )
+                        continue
+                else:
+                    return {
+                        **dict(primary_result),
+                        "stage1_output_stage": "synthesis",
+                        "stage1_requested_output_budgets": attempted_budgets,
+                        "stage1_length_retries": length_retry_count,
+                        "stage1_schema_retries": schema_retry_count,
+                        "stage1_terminal_output_tokens": output_budget,
+                        "stage1_request_timeout_seconds": request_timeout_seconds,
+                    }
             if not self._is_length_result(primary_result) or retry_index >= len(synthesis_budgets) - 1:
                 break
+            length_retry_count += 1
             if self.logger:
                 self.logger.warning(
                     "Stage 1 synthesis response was truncated; escalating output budget "
@@ -5137,7 +5164,8 @@ class Stage1AnalysisService:
                 "engine_type": "primary",
                 "stage1_output_stage": "synthesis",
                 "stage1_requested_output_budgets": attempted_budgets,
-                "stage1_length_retries": max(0, len(attempted_budgets) - 1),
+                "stage1_length_retries": length_retry_count,
+                "stage1_schema_retries": schema_retry_count,
                 "stage1_terminal_output_tokens": (
                     attempted_budgets[-1] if attempted_budgets else 0
                 ),
@@ -5176,7 +5204,8 @@ class Stage1AnalysisService:
             )[:240],
             "stage1_output_stage": "synthesis",
             "stage1_requested_output_budgets": attempted_budgets,
-            "stage1_length_retries": max(0, len(attempted_budgets) - 1),
+            "stage1_length_retries": length_retry_count,
+            "stage1_schema_retries": schema_retry_count,
             "stage1_terminal_output_tokens": synthesis_budgets[0],
             "stage1_request_timeout_seconds": request_timeout_seconds,
         }

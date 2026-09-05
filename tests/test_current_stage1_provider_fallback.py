@@ -108,6 +108,44 @@ def test_stage1_length_retry_escalates_same_primary_budget_before_backup(
     assert all(receipt.route == "Primary_Reader_API" for receipt in receipts)
 
 
+def test_stage1_schema_retry_escalates_existing_primary_budget_before_backup(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    pdf_path = tmp_path / "schema-retry-paper.pdf"
+    _write_pdf(pdf_path)
+    calls: list[tuple[str, int]] = []
+
+    def fake_detailed(
+        prompt_text: str,
+        primary_api_config: Mapping[str, Any],
+        backup_api_config: Mapping[str, Any],
+        *,
+        engine_type: str = "primary",
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        del prompt_text, backup_api_config, kwargs
+        calls.append((engine_type, int(primary_api_config.get("max_output_tokens") or 0)))
+        if len(calls) == 1:
+            return {
+                "status": "success",
+                "content": {"core_analysis": {"summary": "partial"}},
+            }
+        return {"status": "success", "content": _canonical_summary()}
+
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+    service, bundle = _service(tmp_path, pdf_path, reader=None)
+
+    result = service.run(bundle)
+
+    assert result.generated_count == 1
+    assert calls == [("primary", 64000), ("primary", 128000)]
+    provider = result.summaries[0]["provider"]
+    assert provider["requested_output_budgets"] == [64000, 128000]
+    assert provider["length_retries"] == 0
+    assert provider["schema_retries"] == 1
+
+
 def test_stage1_length_budget_exhaustion_does_not_fallback_to_backup(
     tmp_path: Path,
     monkeypatch: Any,
