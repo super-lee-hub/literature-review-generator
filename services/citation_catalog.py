@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from services.citation_metadata import normalize_summary_paper_metadata
 from services.paper_identity import (
@@ -335,7 +335,11 @@ def format_in_text_citation(
     return f"({author_text}, {year}{locator_text})"
 
 
-def references_from_catalog_payload(catalog: Mapping[str, Any]) -> list[str]:
+def references_from_catalog_payload(
+    catalog: Mapping[str, Any],
+    *,
+    cited_paper_keys: Iterable[str] | None = None,
+) -> list[str]:
     """Build the canonical bibliography reference strings from a catalog payload.
 
     Single bibliography authority: the same ``format_reference_entry`` used by
@@ -346,12 +350,30 @@ def references_from_catalog_payload(catalog: Mapping[str, Any]) -> list[str]:
     entries = catalog.get("entries")
     if not isinstance(entries, list):
         return []
+    wanted = (
+        {str(item).strip() for item in cited_paper_keys if str(item).strip()}
+        if cited_paper_keys is not None
+        else None
+    )
     references: list[str] = []
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, Mapping):
             continue
         if str(entry.get("status") or "active") == "inactive":
             continue
+        if wanted is not None:
+            aliases = {
+                str(entry.get(key) or "").strip()
+                for key in ("paper_id", "canonical_paper_key", "paper_key")
+                if str(entry.get(key) or "").strip()
+            }
+            aliases.update(
+                str(item).strip()
+                for item in (entry.get("aliases") or ())
+                if str(item).strip()
+            )
+            if not aliases.intersection(wanted):
+                continue
         canonical = CitationCatalogEntry(
             index=index,
             paper_id=str(entry.get("paper_id") or entry.get("canonical_paper_key") or ""),

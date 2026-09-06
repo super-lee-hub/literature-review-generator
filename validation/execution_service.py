@@ -68,6 +68,7 @@ class ValidationExecutionService:
     runtime_config: Mapping[str, Any] = field(default_factory=dict)
     validation_external_registry_resolver: Callable[[str], Any | None] | None = None
     publication_context: Any | None = None
+    validation_source_binding_record: ArtifactRecord | None = None
     _provider_receipt_ledger: ProviderRuntimeLedger | None = field(
         default=None,
         init=False,
@@ -110,6 +111,12 @@ class ValidationExecutionService:
     )
     closure_epoch_id: str = field(default="", init=False)
     expected_call_graph_hash: str = field(default="", init=False)
+    validation_source_authority_hash: str = field(default="", init=False)
+    _validation_source_authority_fingerprint: dict[str, Any] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.job_id = str(self.job_id or self.workspace.job_id)
@@ -153,9 +160,106 @@ class ValidationExecutionService:
             schema_version="validation-v1",
         )
 
+    def bind_validation_source_authority(
+        self,
+        fingerprint: Mapping[str, Any],
+        authority_hash: str,
+    ) -> None:
+        """Bind source authority to Validation identity before adjudication."""
+
+        normalized_hash = str(authority_hash or "").strip()
+        if len(normalized_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized_hash
+        ):
+            raise ValueError("validation source authority hash must be a lowercase SHA-256")
+        self.validation_source_authority_hash = normalized_hash
+        self._validation_source_authority_fingerprint = dict(fingerprint)
+        if self.validation_source_binding_record is not None:
+            expected_binding_id = self.validation_source_binding_record.artifact_id
+            expected_binding_semantic_hash = self.current_validation_source_binding_semantic_hash
+            expected_binding_content_hash = (
+                self.validation_source_binding_record.content_hash
+            )
+            if str(fingerprint.get("current_binding_artifact_id") or "") != expected_binding_id:
+                raise ValueError("validation source fingerprint does not identify the current binding")
+            if expected_binding_semantic_hash and str(
+                fingerprint.get("current_binding_semantic_hash") or ""
+            ) != expected_binding_semantic_hash:
+                raise ValueError(
+                    "validation source fingerprint does not match the semantic current binding"
+                )
+            if str(fingerprint.get("current_binding_content_hash") or "") != expected_binding_content_hash:
+                raise ValueError(
+                    "validation source fingerprint does not match the physical current binding"
+                )
+        input_hashes = dict(self._input_dependency_hashes)
+        input_hashes["validation_source_authority"] = normalized_hash
+        if self.validation_source_binding_record is not None:
+            # The closure epoch and adjudication reuse key follow semantic
+            # authority.  The physical binding file remains a Registry input
+            # for audit/dependency verification, not a replay identity.
+            input_hashes["validation_source_binding"] = (
+                self.current_validation_source_binding_semantic_hash
+            )
+        self._input_dependency_hashes = {
+            str(key): str(value)
+            for key, value in sorted(input_hashes.items(), key=lambda item: str(item[0]))
+        }
+        self.closure_epoch_id = compute_closure_epoch_id(
+            job_id=self.job_id,
+            stage_name="stage4_validate",
+            logical_attempt_identity=self.attempt_id,
+            expected_call_graph_hash=self.expected_call_graph_hash,
+            current_input_artifact_hashes=self._input_dependency_hashes,
+            provider_config_hash=hash_json(_redact_mapping(dict(self.runtime_config or {}))),
+            schema_version="validation-v1",
+        )
+
     @property
     def project_name(self) -> str:
         return str(self.workspace.project_name)
+
+    @property
+    def current_validation_source_binding_id(self) -> str:
+        return str(
+            self.validation_source_binding_record.artifact_id
+            if self.validation_source_binding_record is not None
+            else ""
+        )
+
+    @property
+    def current_validation_source_binding_hash(self) -> str:
+        """Compatibility alias for the semantic binding hash."""
+
+        return self.current_validation_source_binding_semantic_hash
+
+    @property
+    def current_validation_source_binding_semantic_hash(self) -> str:
+        record = self.validation_source_binding_record
+        if record is None:
+            return ""
+        metadata = getattr(record, "metadata", {})
+        metadata_hash = ""
+        if isinstance(metadata, Mapping):
+            metadata_hash = str(metadata.get("semantic_payload_hash") or "").strip()
+        try:
+            from validation.source_binding import validation_source_binding_semantic_hash
+
+            payload = self._load_json(record.path)
+            if isinstance(payload.get("payload"), Mapping):
+                payload = dict(payload["payload"])
+            computed_hash = validation_source_binding_semantic_hash(payload)
+            return computed_hash or metadata_hash
+        except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return metadata_hash
+
+    @property
+    def current_validation_source_binding_content_hash(self) -> str:
+        return str(
+            self.validation_source_binding_record.content_hash
+            if self.validation_source_binding_record is not None
+            else ""
+        )
 
     @property
     def review_draft_path(self) -> str:

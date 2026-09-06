@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, replace
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, cast
 
 from config_loader import load_config
@@ -41,6 +42,7 @@ from services.settings import ApplicationSettings
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
     ArtifactRecord,
+    RegistryError,
     file_sha256,
 )
 from services.job_runner import JobRunRequest, JobRunner, validate_job_request_options
@@ -112,6 +114,9 @@ class _RuntimeStageHost:
         self.artifact_registry: Any = None
         self.job_workspace: JobWorkspace | None = None
         self.workspace: JobWorkspace | None = None
+        self.current_validation_source_binding_id = ""
+        self.current_validation_source_binding_hash = ""
+        self.current_validation_source_binding_content_hash = ""
         self._checkpoint_processed_papers: set[str] = set()
         self._checkpoint_failed_papers: set[str] = set()
 
@@ -1241,7 +1246,11 @@ class InternalStageExecutorRegistry:
                 attempt_id=attempt_id,
             ),
             "validate": lambda: (
-                self.bridge.run_validation(session, attempt_id=attempt_id),
+                self.bridge.run_validation(
+                    session,
+                    attempt_id=attempt_id,
+                    external_registry_resolver=external_registry_resolver,
+                ),
                 0,
             ),
         }
@@ -1628,16 +1637,22 @@ class AgentRuntimeBridge:
         external_registry_resolver: Any | None = None,
     ) -> ValidationExecutionService:
         registry = session.context.registry
+        reload_registry = getattr(registry, "reload", None)
+        if callable(reload_registry):
+            reload_registry()
         paper_records = tuple(
             record
             for record in registry.list_records()
             if record.status == "ready" and record.artifact_type == "paper_artifact"
         )
-        if not paper_records:
-            # Downstream job: bind the authoritative upstream Stage 1
-            # artifacts durably so Validation can adjudicate claims against
-            # original normalized text instead of the compact review pack.
-            self._ensure_validation_source_binding(session, registry)
+        # Bind any cited papers that are not already represented locally.  The
+        # binding is also needed when the current job has only a partial local
+        # paper set: Validation resolves authority per canonical paper key.
+        binding_record = self._ensure_validation_source_binding(
+            session,
+            registry,
+            external_registry_resolver=external_registry_resolver,
+        )
         visual_records = tuple(
             record
             for record in registry.list_records()
@@ -1661,13 +1676,16 @@ class AgentRuntimeBridge:
             runtime_config=session.stage_host.config,
             validation_external_registry_resolver=external_registry_resolver,
             publication_context=session.context.publication_context,
+            validation_source_binding_record=binding_record,
         )
 
     def _ensure_validation_source_binding(
         self,
         session: AgentRuntimeSession,
         registry: Any,
-    ) -> None:
+        *,
+        external_registry_resolver: Any | None = None,
+    ) -> ArtifactRecord | None:
         """Publish the durable upstream Stage 1 authority binding (Lane B).
 
         Downstream review jobs carry no local paper artifacts; the binding
@@ -1677,13 +1695,17 @@ class AgentRuntimeBridge:
         resolver and verify identity before use (fail-closed).
         """
 
-        from validation.source_binding import build_validation_source_binding
+        from validation.source_binding import (
+            BINDING_ARTIFACT_TYPE,
+            BINDING_ARTIFACT_VERSION,
+            BINDING_CONTRACT_VERSION,
+            build_validation_source_binding,
+            validation_source_binding_payload_hash,
+        )
 
-        if any(
-            record.artifact_type == "validation_source_binding" and record.status == "ready"
-            for record in registry.list_records()
-        ):
-            return
+        reload_registry = getattr(registry, "reload", None)
+        if callable(reload_registry):
+            reload_registry()
         source_paths: list[str] = []
         for value in (
             session.request.summary_file,
@@ -1691,9 +1713,11 @@ class AgentRuntimeBridge:
             *session.request.reuse_summary_files,
         ):
             if value is not None and str(value).strip():
-                source_paths.append(str(value).strip())
+                normalized = str(value).strip()
+                if normalized not in source_paths:
+                    source_paths.append(normalized)
         if not source_paths:
-            return
+            return None
         binding = build_validation_source_binding(
             summary_sources=source_paths,
             local_registry=registry,
@@ -1701,40 +1725,229 @@ class AgentRuntimeBridge:
         )
         papers = binding.get("papers")
         if not isinstance(papers, Mapping) or not papers:
-            return
+            return None
+        expected_payload_hash = validation_source_binding_payload_hash(binding)
+        expected_artifact_id = f"{BINDING_ARTIFACT_TYPE}:{expected_payload_hash[:24]}"
+
+        def binding_payload(record: ArtifactRecord) -> Mapping[str, Any] | None:
+            try:
+                raw = json.loads(Path(record.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return None
+            if isinstance(raw, Mapping) and isinstance(raw.get("payload"), Mapping):
+                raw = raw["payload"]
+            return raw if isinstance(raw, Mapping) else None
+
+        def closure_is_current(record: ArtifactRecord) -> bool:
+            try:
+                if record.job_id != registry.job_id or record.status != "ready":
+                    return False
+                if file_sha256(record.path) != record.content_hash:
+                    return False
+                verify_closure = getattr(registry, "verify_ready_artifact_closure", None)
+                if callable(verify_closure):
+                    verify_closure(
+                        record,
+                        external_registry_resolver=external_registry_resolver,
+                    )
+            except (OSError, RegistryError, TypeError, ValueError):
+                return False
+            return True
+
+        exact_candidates: list[ArtifactRecord] = []
+        for record in registry.list_records():
+            if (
+                record.artifact_type != BINDING_ARTIFACT_TYPE
+                or record.artifact_version != BINDING_ARTIFACT_VERSION
+                or record.status != "ready"
+            ):
+                continue
+            payload = binding_payload(record)
+            if payload is None:
+                continue
+            if (
+                str(payload.get("artifact_type") or "") != BINDING_ARTIFACT_TYPE
+                or str(payload.get("artifact_version") or "") != BINDING_ARTIFACT_VERSION
+                or str(payload.get("binding_contract_version") or "")
+                != BINDING_CONTRACT_VERSION
+                or str(payload.get("job_id") or "") != str(registry.job_id)
+                or validation_source_binding_payload_hash(payload) != expected_payload_hash
+            ):
+                continue
+            if closure_is_current(record):
+                exact_candidates.append(record)
+        if exact_candidates:
+            selected = sorted(
+                exact_candidates,
+                key=lambda record: (
+                    0 if record.artifact_id == expected_artifact_id else 1,
+                    record.artifact_id,
+                ),
+            )[0]
+            session.stage_host.current_validation_source_binding_id = selected.artifact_id
+            session.stage_host.current_validation_source_binding_hash = expected_payload_hash
+            session.stage_host.current_validation_source_binding_content_hash = selected.content_hash
+            return selected
+
         from services.artifact_registry import ArtifactDependencyRefV2
 
-        payload_hash = hash_json({**dict(binding), "papers": dict(papers)})
-        path = session.context.workspace.artifact_path(
-            f"validation_source_binding_{payload_hash[:24]}.json"
+        target_path = session.context.workspace.artifact_path(
+            f"validation_source_binding_{expected_payload_hash[:24]}.json"
         )
         dependencies: list[ArtifactDependencyRefV2] = []
-        summary_record = registry.get("summary_file")
-        if summary_record is not None and summary_record.status == "ready":
+        dependency_keys = {
+            (item.dependency_kind, item.job_id, item.artifact_id)
+            for item in dependencies
+        }
+
+        def add_dependency(
+            *,
+            job_id: str,
+            artifact_id: str,
+            artifact_type: str,
+            path: str,
+            content_hash: str,
+        ) -> None:
+            resolved_job_id = str(job_id or "").strip()
+            resolved_artifact_id = str(artifact_id or "").strip()
+            resolved_path = str(path or "").strip()
+            resolved_hash = str(content_hash or "").strip()
+            if not resolved_job_id or not resolved_artifact_id or not resolved_path or not resolved_hash:
+                return
+            dependency_kind = (
+                "local_job" if resolved_job_id == str(registry.job_id) else "external_job"
+            )
+            key = (dependency_kind, resolved_job_id, resolved_artifact_id)
+            if key in dependency_keys:
+                return
             dependencies.append(
                 ArtifactDependencyRefV2(
-                    dependency_kind="local_job",
-                    job_id=summary_record.job_id,
-                    artifact_id=summary_record.artifact_id,
-                    artifact_type=summary_record.artifact_type,
-                    path=summary_record.path,
-                    content_hash=summary_record.content_hash,
+                    dependency_kind=dependency_kind,
+                    job_id=resolved_job_id,
+                    artifact_id=resolved_artifact_id,
+                    artifact_type=artifact_type,
+                    path=resolved_path,
+                    content_hash=resolved_hash,
                 )
             )
+            dependency_keys.add(key)
+
+        # Summary source identity is part of the expected payload.  When it is
+        # also a Registry artifact, include it in the closure so a source-set
+        # change cannot be hidden behind an otherwise identical paper set.
+        for raw_identity in binding.get("summary_source_identities") or ():
+            if isinstance(raw_identity, Mapping):
+                identity = raw_identity
+            elif isinstance(raw_identity, (list, tuple)):
+                identity = {
+                    str(item[0]): item[1]
+                    for item in raw_identity
+                    if isinstance(item, (list, tuple)) and len(item) == 2
+                }
+            else:
+                identity = {}
+            source_job_id = str(identity.get("source_job_id") or "").strip()
+            source_artifact_id = str(identity.get("source_artifact_id") or "").strip()
+            source_artifact_hash = str(identity.get("source_artifact_hash") or "").strip()
+            if not source_job_id or not source_artifact_id or not source_artifact_hash:
+                continue
+            source_registry: Any | None = registry
+            if source_job_id != str(registry.job_id):
+                if not callable(external_registry_resolver):
+                    continue
+                try:
+                    source_registry = external_registry_resolver(source_job_id)
+                except (OSError, TypeError, ValueError, KeyError):
+                    source_registry = None
+            if source_registry is None:
+                continue
+            source_record: Any = None
+            try:
+                reload_source_registry = getattr(source_registry, "reload", None)
+                if callable(reload_source_registry):
+                    reload_source_registry()
+                get_source_record = getattr(source_registry, "get", None)
+                source_record = (
+                    get_source_record(source_artifact_id)
+                    if callable(get_source_record)
+                    else None
+                )
+            except (OSError, RegistryError, TypeError, ValueError):
+                source_record = None
+            if source_record is None or source_record.status != "ready":
+                continue
+            if source_record.content_hash != source_artifact_hash:
+                continue
+            add_dependency(
+                job_id=source_record.job_id,
+                artifact_id=source_record.artifact_id,
+                artifact_type=source_record.artifact_type,
+                path=source_record.path,
+                content_hash=source_record.content_hash,
+            )
+
+        for entry in sorted(papers.values(), key=lambda item: str(item.get("canonical_paper_key") or "")):
+            if not isinstance(entry, Mapping):
+                continue
+            for prefix, artifact_type in (
+                ("stage1_paper_artifact", "paper_artifact"),
+                ("evidence_manifest_artifact", "evidence_manifest"),
+            ):
+                artifact_id = str(entry.get(f"{prefix}_id") or "").strip()
+                job_id = str(
+                    entry.get(
+                        "source_workspace_job_id"
+                        if prefix == "stage1_paper_artifact"
+                        else "evidence_manifest_job_id"
+                    )
+                    or ""
+                ).strip()
+                path = str(
+                    entry.get(
+                        "stage1_paper_artifact_path"
+                        if prefix == "stage1_paper_artifact"
+                        else "evidence_manifest_path"
+                    )
+                    or ""
+                ).strip()
+                content_hash = str(
+                    entry.get(
+                        "stage1_paper_artifact_hash"
+                        if prefix == "stage1_paper_artifact"
+                        else "evidence_manifest_hash"
+                    )
+                    or ""
+                ).strip()
+                add_dependency(
+                    job_id=job_id,
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    path=path,
+                    content_hash=content_hash,
+                )
         from services.queue_service import LocalPublicationContext
 
-        publish_json_artifact(
+        record = publish_json_artifact(
             getattr(registry, "publication_context", None) or LocalPublicationContext(),
             registry,
-            path,
+            target_path,
             dict(binding),
             artifact_role="runtime_stage_evidence",
-            artifact_type="validation_source_binding",
-            artifact_version="v1",
+            artifact_type=BINDING_ARTIFACT_TYPE,
+            artifact_version=BINDING_ARTIFACT_VERSION,
             producer="runtime.orchestrator.InternalStageExecutorRegistry._ensure_validation_source_binding",
-            artifact_id=f"validation_source_binding:{payload_hash[:24]}",
+            artifact_id=expected_artifact_id,
             depends_on=tuple(dependencies),
+            external_registry_resolver=external_registry_resolver,
+            metadata={
+                "semantic_payload_hash": expected_payload_hash,
+                "binding_contract_version": BINDING_CONTRACT_VERSION,
+            },
         )
+        session.stage_host.current_validation_source_binding_id = record.artifact_id
+        session.stage_host.current_validation_source_binding_hash = expected_payload_hash
+        session.stage_host.current_validation_source_binding_content_hash = record.content_hash
+        return record
 
     def persist_stage1_results(
         self,
@@ -1964,16 +2177,52 @@ class AgentRuntimeBridge:
         citation_ref_catalog_hash: str = "",
     ) -> StageResult:
         host = session.stage_host
+        registry = session.context.registry
         review_word_path = word_file or host._get_review_word_file_path()
         # Single bibliography authority: when callers pass no references, the
         # canonical catalog (the same source that drives the DOCX References
         # and the citation manifest bibliography) supplies them, so the JSON
         # draft and the DOCX can never diverge.
         resolved_references = list(references or ())
-        if not resolved_references and citation_ref_catalog:
+        if citation_ref_catalog:
             from services.citation_catalog import references_from_catalog_payload
+            from services.citation_ref_catalog import extract_ref_ids_from_token, resolve_ref_id
 
-            resolved_references = references_from_catalog_payload(citation_ref_catalog)
+            cited_paper_keys: set[str] = set()
+            for raw_section in review_sections:
+                if not isinstance(raw_section, Mapping):
+                    continue
+                for raw_block in raw_section.get("blocks", []) or ():
+                    if not isinstance(raw_block, Mapping):
+                        continue
+                    tokens: list[str] = []
+                    for token in re.findall(
+                        r"\[\[cite_ref:[^\]]+\]\]",
+                        str(raw_block.get("text") or ""),
+                    ):
+                        tokens.extend(extract_ref_ids_from_token(token))
+                    for citation in raw_block.get("citations", []) or ():
+                        if not isinstance(citation, Mapping):
+                            continue
+                        tokens.extend(
+                            extract_ref_ids_from_token(
+                                citation.get("citation_token") or citation.get("raw_text") or ""
+                            )
+                        )
+                        if str(citation.get("ref_id") or "").strip():
+                            tokens.append(str(citation["ref_id"]).strip())
+                    for ref_id in dict.fromkeys(tokens):
+                        entry = resolve_ref_id(citation_ref_catalog, ref_id)
+                        if not isinstance(entry, Mapping):
+                            continue
+                        for field in ("paper_id", "canonical_paper_key", "paper_key"):
+                            value = str(entry.get(field) or "").strip()
+                            if value:
+                                cited_paper_keys.add(value)
+            resolved_references = references_from_catalog_payload(
+                citation_ref_catalog,
+                cited_paper_keys=cited_paper_keys,
+            )
         if not host._persist_review_draft(
             outline_file=outline_file,
             review_sections=review_sections,
@@ -2007,6 +2256,52 @@ class AgentRuntimeBridge:
         manifest = dict(manifest_payload) if isinstance(manifest_payload, Mapping) else {}
         if not manifest:
             raise RuntimeError("current citation manifest is unavailable")
+        from docx_writer import generate_apa_references_from_manifest
+
+        canonical_references = generate_apa_references_from_manifest(manifest, host)
+        draft_payload = json.loads(Path(draft_record.path).read_text(encoding="utf-8"))
+        draft_content = draft_payload.get("content")
+        draft_references = (
+            list(draft_content.get("references") or [])
+            if isinstance(draft_content, Mapping)
+            else []
+        )
+        if draft_references != canonical_references:
+            # The manifest is built from the persisted structured draft, so a
+            # final synchronization pass is safe: references do not affect
+            # citation occurrence extraction, but they must be the same bytes
+            # that the DOCX renderer emits.
+            if not host._persist_review_draft(
+                outline_file=outline_file,
+                review_sections=review_sections,
+                references=canonical_references,
+                word_file=review_word_path,
+                generation_mode=generation_mode,
+                citation_ref_catalog=citation_ref_catalog,
+                citation_ref_catalog_path=citation_ref_catalog_path,
+                citation_ref_catalog_hash=citation_ref_catalog_hash,
+            ):
+                raise RuntimeError("canonical bibliography synchronization failed")
+            draft_record = registry.get("review_draft")
+            if draft_record is None or draft_record.status != "ready":
+                raise RuntimeError("review draft record is unavailable after bibliography synchronization")
+            if not host._persist_citation_manifest(
+                review_draft_path=draft_record.path,
+                review_word_path=review_word_path,
+                citation_ref_catalog=citation_ref_catalog,
+                citation_ref_catalog_path=citation_ref_catalog_path,
+                citation_ref_catalog_hash=citation_ref_catalog_hash,
+            ):
+                raise RuntimeError("citation manifest synchronization failed")
+            manifest_record = registry.get(host.CITATION_MANIFEST_ARTIFACT_ID)
+            if manifest_record is None or manifest_record.status != "ready":
+                raise RuntimeError("citation manifest record is unavailable after bibliography synchronization")
+            try:
+                manifest_payload = json.loads(Path(manifest_record.path).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("current citation manifest is unreadable after synchronization") from exc
+            manifest = dict(manifest_payload) if isinstance(manifest_payload, Mapping) else {}
+            canonical_references = generate_apa_references_from_manifest(manifest, host)
         docx_source_path = Path(review_word_path)
         if rebuild_docx:
             from docx_writer import rebuild_review_docx_from_structured_artifacts
@@ -2023,7 +2318,6 @@ class AgentRuntimeBridge:
                 manifest,
                 str(docx_source_path),
             )
-        registry = session.context.registry
         catalog_record = registry.get("citation_ref_catalog")
         if not docx_source_path.is_file():
             raise RuntimeError(f"review DOCX bytes are unavailable before publication: {docx_source_path}")

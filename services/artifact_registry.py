@@ -598,7 +598,10 @@ class ArtifactRegistry:
                 f"artifact_id {candidate.artifact_id!r} conflicts on "
                 f"{', '.join(conflicting_fields)}"
             )
-        if existing.artifact_type == "repair_promotion_transaction" and existing.status == "ready":
+        if existing.artifact_type in {
+            "repair_promotion_transaction",
+            "validation_source_binding",
+        } and existing.status == "ready":
             immutable_fields = (
                 "artifact_role",
                 "artifact_type",
@@ -618,7 +621,7 @@ class ArtifactRegistry:
             ]
             if changed:
                 raise ArtifactConflict(
-                    f"READY promotion transaction is immutable: {candidate.artifact_id!r}; "
+                    f"READY {existing.artifact_type} is immutable: {candidate.artifact_id!r}; "
                     f"changed fields: {', '.join(changed)}"
                 )
 

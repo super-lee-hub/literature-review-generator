@@ -495,6 +495,7 @@ class ReviewValidator:
         model_route: str = "Validator_API",
         prompt_version: str = "validation_edge_prompt_v1",
         adjudication_schema_version: str = DEFAULT_ADJUDICATION_SCHEMA_VERSION,
+        validation_source_authority_hash: str = "",
         edge_checkpoint_callback: Optional[Callable[[ValidationEdgeKeyV1, str], None]] = None,
     ):
         self.review_draft = review_draft or {}
@@ -514,6 +515,9 @@ class ReviewValidator:
         self.model_route = model_route
         self.prompt_version = prompt_version
         self.adjudication_schema_version = adjudication_schema_version
+        self.validation_source_authority_hash = str(
+            validation_source_authority_hash or ""
+        ).strip()
         self.edge_checkpoint_callback = edge_checkpoint_callback
         self.evidence_loader = PreprocessEvidenceLoader()
         self._resolver_context_cache: Dict[str, EvidenceResolverContext] = {}
@@ -571,6 +575,7 @@ class ReviewValidator:
             model_route=self.model_route,
             prompt_version=self.prompt_version,
             adjudication_schema_version=self.adjudication_schema_version,
+            validation_source_authority_hash=self.validation_source_authority_hash,
         )
 
     def _resolve_validation_edge(

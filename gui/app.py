@@ -1499,13 +1499,14 @@ class WorkspaceController:
         )
 
     def _ensure_queue_runner(self) -> Optional[Any]:
+        if self._queue_runner is not None:
+            return self._queue_runner
         if not self._queue_service:
             return None
-        if self._queue_runner is None:
-            from services.job_runner import JobRunner
-            from services.queue_service import QueueRunner
+        from services.job_runner import JobRunner
+        from services.queue_service import QueueRunner
 
-            self._queue_runner = QueueRunner(self._queue_service, JobRunner())
+        self._queue_runner = QueueRunner(self._queue_service, JobRunner())
         return self._queue_runner
 
     def add_job_to_queue(
