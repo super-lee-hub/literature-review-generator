@@ -5172,6 +5172,26 @@ class Stage1AnalysisService:
                 "stage1_request_timeout_seconds": request_timeout_seconds,
             }
 
+        primary_reader_only = parse_strict_bool(
+            stage1_input_settings.get("primary_reader_only"),
+            field="Stage1_Input.primary_reader_only",
+            default=False,
+        )
+        if primary_reader_only:
+            return {
+                **dict(primary_result),
+                "engine_type": "primary",
+                "backup_fallback_disabled": True,
+                "stage1_output_stage": "synthesis",
+                "stage1_requested_output_budgets": attempted_budgets,
+                "stage1_length_retries": length_retry_count,
+                "stage1_schema_retries": schema_retry_count,
+                "stage1_terminal_output_tokens": (
+                    attempted_budgets[-1] if attempted_budgets else 0
+                ),
+                "stage1_request_timeout_seconds": request_timeout_seconds,
+            }
+
         backup_config_for_stage = self._stage1_provider_config(
             backup_config,
             stage="synthesis",

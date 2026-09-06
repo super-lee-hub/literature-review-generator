@@ -251,6 +251,7 @@ rag_backend = chroma
 
 [Stage1_Input]
 # MinerU/full text is primary; selected visuals are bounded supplements.
+primary_reader_only = false
 mode = text_first
 send_extracted_text = true
 send_selected_visuals = true

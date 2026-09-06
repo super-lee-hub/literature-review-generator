@@ -47,6 +47,41 @@ def test_current_stage1_default_reader_falls_back_from_primary_to_backup(
     assert engines[:2] == ["primary", "backup"]
 
 
+def test_current_stage1_primary_reader_only_blocks_backup_fallback(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    pdf_path = tmp_path / "primary-only-paper.pdf"
+    _write_pdf(pdf_path)
+    engines: list[str] = []
+
+    def fake_detailed(
+        prompt_text: str,
+        primary_api_config: Mapping[str, Any],
+        backup_api_config: Mapping[str, Any],
+        *,
+        engine_type: str = "primary",
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        del prompt_text, primary_api_config, backup_api_config, kwargs
+        engines.append(engine_type)
+        if engine_type == "primary":
+            return {"status": "failed", "error_kind": "quota_exhausted", "message": "test quota"}
+        return {"status": "success", "content": _canonical_summary()}
+
+    monkeypatch.setattr(ai_interface, "get_summary_from_ai_detailed", fake_detailed)
+    service, bundle = _service(
+        tmp_path,
+        pdf_path,
+        reader=None,
+        config_overrides={"Stage1_Input": {"primary_reader_only": "true"}},
+    )
+
+    with pytest.raises(RuntimeError):
+        service.run(bundle)
+
+    assert engines == ["primary"]
+
+
 def test_stage1_length_retry_escalates_same_primary_budget_before_backup(
     tmp_path: Path,
     monkeypatch: Any,

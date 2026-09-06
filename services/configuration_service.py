@@ -273,6 +273,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "retry_attempts": "1",
         },
         "Stage1_Input": {
+            "primary_reader_only": "false",
             "mode": "text_first",
             "send_extracted_text": "true",
             "send_selected_visuals": "true",

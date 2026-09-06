@@ -33,6 +33,7 @@ _MIGRATION_ONLY_STAGE1_KEYS = frozenset(
 # keys are rejected instead of being silently ignored.
 STAGE1_CONFIG_OWNERSHIP: Dict[str, Dict[str, str]] = {
     "Stage1_Input": {
+        "primary_reader_only": "ACTIVE",
         "mode": "INVARIANT",
         "send_extracted_text": "ACTIVE",
         "send_selected_visuals": "ACTIVE",
@@ -245,6 +246,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
     "GUI": frozenset({"language"}),
     "Stage1_Input": frozenset(
         {
+            "primary_reader_only",
             "mode",
             "send_extracted_text",
             "send_selected_visuals",
