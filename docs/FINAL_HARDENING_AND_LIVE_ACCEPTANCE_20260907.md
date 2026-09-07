@@ -8,9 +8,9 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-FINAL_EXECUTABLE_SHA = 17d63f5e0f3d898fff95e8dbedeeb5b1d4333f55
+FINAL_EXECUTABLE_SHA = 119c677405fc61ef2c0ba78ef4b8a2b326d6dfb8
 REMOTE_HEAD_AT_CODE_ACCEPTANCE = 556e4f197b154017b52a61f8d45874d72d816f47
-HOSTED_CI_RUN = NOT_RUN_FOR_91BE02E4
+HOSTED_CI_RUN = NOT_RUN_FOR_119C6774
 HOSTED_CI_CONCLUSION = NOT_RUN
 ```
 
@@ -222,7 +222,7 @@ zero.
 
 ### Local exact-SHA checks
 
-The current executable commit is 17d63f5e0f3d898fff95e8dbedeeb5b1d4333f55.
+The current executable commit is 119c677405fc61ef2c0ba78ef4b8a2b326d6dfb8.
 The report-only update will be a child commit and does not change that
 executable SHA.
 
@@ -250,7 +250,7 @@ a local PASS.
 
 ### Hosted exact-SHA checks
 
-No Hosted run has yet been read back for 17d63f5e0f3d898fff95e8dbedeeb5b1d4333f55.
+No Hosted run has yet been read back for 119c677405fc61ef2c0ba78ef4b8a2b326d6dfb8.
 The earlier successful run belongs to the preceding executable SHA and is not
 evidence for this code revision.
 
@@ -347,7 +347,7 @@ docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 ## Remaining owner actions
 
-0. Push the local report/code chain (17d63f5e executable with report-only
+0. Push the local report/code chain (119c6774 executable with report-only
    descendants) to the existing PR branch. The remote head is still
    556e4f197b154017b52a61f8d45874d72d816f47; SSH was reset and the
    authenticated GitHub ref update was not authorized by the external-write
