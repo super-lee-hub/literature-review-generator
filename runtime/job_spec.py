@@ -366,7 +366,9 @@ class RuntimeJobSpec:
         if "source" in payload:
             # Structured callers must use the same strict parser as the JSON
             # file boundary; this method is not a permissive dict sink.
-            return cls.from_dict(payload)
+            result = cls.from_dict(payload)
+            result.validate()
+            return result
         allowed = frozenset(
             {
                 "project_name",
@@ -436,7 +438,9 @@ class RuntimeJobSpec:
             "workspace_path": optional_text("workspace_path"),
             "metadata": dict(metadata),
         }
-        return cls.from_dict(normalized)
+        result = cls.from_dict(normalized)
+        result.validate()
+        return result
 
 
 def load_runtime_job_spec(path: str | Path) -> RuntimeJobSpec:
