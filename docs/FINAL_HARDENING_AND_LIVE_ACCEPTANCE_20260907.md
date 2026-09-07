@@ -347,8 +347,8 @@ docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 ## Remaining owner actions
 
-0. Push the local report/code chain (91be02e4 executable with a report-only
-   child to be created) to the existing PR branch. The remote head is still
+0. Push the local report/code chain (91be02e4 executable with report-only
+   descendant e14e838) to the existing PR branch. The remote head is still
    556e4f197b154017b52a61f8d45874d72d816f47; SSH was reset and the
    authenticated GitHub ref update was not authorized by the external-write
    policy.
