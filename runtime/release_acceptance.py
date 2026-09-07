@@ -624,7 +624,11 @@ class GateEvidenceProducer:
         }
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        with temp.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
         atomic_replace_with_retry(temp, target, timeout_seconds=5.0)
         return target
 
@@ -736,9 +740,19 @@ class GateEvidenceVerifier:
                         providers.add(provider)
                 if ref.role in {"closure", "stage_terminal", "outline_terminal"}:
                     status = str(row.get("status") or row.get("closure_status") or "").casefold()
+                    closure_payload = row.get("payload")
+                    if isinstance(closure_payload, Mapping):
+                        status = str(
+                            closure_payload.get("status")
+                            or closure_payload.get("closure_status")
+                            or status
+                        ).casefold()
                     facts["closure_complete"] = facts["closure_complete"] or status in {
                         "complete", "completed", "trusted", "verified", "succeeded"
-                    }
+                    } or (
+                        isinstance(closure_payload, Mapping)
+                        and closure_payload.get("complete") is True
+                    ) or row.get("complete") is True
                 if ref.role == "outline_provider_call_plan":
                     route_plan = row.get("reachable_provider_route_plan")
                     if isinstance(route_plan, Mapping) and isinstance(route_plan.get("routes"), list):
