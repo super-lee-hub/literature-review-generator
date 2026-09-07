@@ -4,7 +4,10 @@
 
 `NOT_READY_TO_MERGE`
 
-This report is evidence-bound. The hardening code was committed locally at
+This report is evidence-bound. The current local detached worktree HEAD at
+the previous evidence capture was
+`f77ea1db06d041b02169ac5ded571e930dd3406a` (this report publication commit).
+The hardening code was committed locally at
 `d3ca43a5330cf5ebb0cb4fb91866c8590b956f53`. It has not reached GitHub because
 the authenticated OAuth credential rejected the workflow-file update for
 missing `workflow` scope. No merge was attempted.
@@ -24,6 +27,10 @@ required GitHub scope is supplied.
 | Active PR remote head | `2e6bdb32aca84c8d948adc846e3db76cd15b46b5` |
 | PR #24 Hosted run | `34017515111`, `SUCCESS`, but on the old remote head |
 | PR #23 | `MERGED` at `4fa4e57aedc770dc18824ac15265fc36836ec791`; old head `50c0917c...` |
+
+GitHub governance readback: `main` is currently unprotected (`GET
+/branches/main/protection` returned 404). Required PR/status-check protection is
+therefore an owner action, not a code-level PASS.
 
 The SSH push was reset by the remote. HTTPS reached GitHub but was rejected:
 the OAuth App is not permitted to update `.github/workflows/windows-tests.yml`
@@ -162,8 +169,8 @@ with `network_calls=0`; a separate synthetic-key preflight exercised all
 | 10 Heavy OCR | NOT_VERIFIED | No live OCR acceptance sample/run |
 | Q Full F1 15-paper chain | BLOCKED_INPUT | `paper_artifact = 0/15` live evidence; no Outline/Review/Citation/DOCX/Validator closure |
 | R Negative live behavior | NOT_VERIFIED | Offline provider taxonomy tests exist; no live/mock acceptance gate run separately |
-| S Secret/privacy scan | NOT_VERIFIED | Report/receipt redaction and `.env` guard code tested; full release scan not run |
-| T Governance | NOT_VERIFIED | PR state read; branch-protection configuration remains owner action |
+| S Secret/privacy scan | NOT_VERIFIED | Scoped tracked-file scan found `.env` untracked/ignored, zero private-key/API-key candidates, and no non-test Authorization/Bearer hits; full history scan not run |
+| T Governance | BLOCKED | GitHub readback confirms `main` is unprotected; owner must configure required PR/Windows checks |
 
 Actual live Provider transport count is **0**. Actual F1 15-paper artifact
 count is **0/15**. Outline, Review, Citation, DOCX, Validator, repair, GUI,
