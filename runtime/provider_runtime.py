@@ -11,15 +11,16 @@ a receipt.
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 import uuid
 
-from services.durable_io import atomic_replace_with_retry
+from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
 from services.job_workspace import atomic_write_json, utc_now_iso
 
 
@@ -121,7 +122,11 @@ class ProviderAggregateBudgetV1:
             if isinstance(value, bool) or int(value) < 0:
                 raise ProviderRuntimeContractError(f"{name} must be a non-negative integer")
             object.__setattr__(self, name, int(value))
-        if isinstance(self.max_wall_seconds, bool) or float(self.max_wall_seconds) < 0:
+        if (
+            isinstance(self.max_wall_seconds, bool)
+            or not math.isfinite(float(self.max_wall_seconds))
+            or float(self.max_wall_seconds) < 0
+        ):
             raise ProviderRuntimeContractError("max_wall_seconds must be non-negative")
         object.__setattr__(self, "max_wall_seconds", float(self.max_wall_seconds))
 
@@ -171,11 +176,15 @@ class ProviderAggregateBudgetV1:
 
 @dataclass(frozen=True)
 class ProviderAggregateReservationV1:
-    reservation_id: int
+    reservation_id: str
     provider_calls: int
     output_tokens: int
     retry_attempts: int
     admitted_at: str
+    owner_id: str = ""
+    owner_pid: int = 0
+    transport_started: bool = False
+    context: Mapping[str, Any] = field(default_factory=dict)
 
 
 class ProviderBudgetController:
@@ -190,9 +199,15 @@ class ProviderBudgetController:
         self.budget = budget
         self._monotonic = monotonic
         self._started_monotonic = float(monotonic())
+        self._first_started_epoch = float(time.time())
+        self._absolute_deadline_epoch = (
+            self._first_started_epoch + float(budget.max_wall_seconds)
+            if budget.max_wall_seconds
+            else 0.0
+        )
+        self._owner_id = uuid.uuid4().hex
         self._lock = threading.RLock()
-        self._next_reservation_id = 0
-        self._reservations: dict[int, ProviderAggregateReservationV1] = {}
+        self._reservations: dict[str, ProviderAggregateReservationV1] = {}
         self._calls_used = 0
         self._output_tokens_used = 0
         self._retry_attempts_used = 0
@@ -200,6 +215,7 @@ class ProviderBudgetController:
         self._output_tokens_reserved = 0
         self._retry_attempts_reserved = 0
         self._state_path: Path | None = None
+        self._ambiguous_reservation_ids: set[str] = set()
 
     def bind_state_path(self, path: str | Path) -> None:
         """Bind aggregate usage to a job-owned durable state file."""
@@ -211,30 +227,110 @@ class ProviderBudgetController:
                     "provider aggregate budget cannot be rebound to a different state path"
                 )
             self._state_path = target
-            if not target.is_file():
+            with interprocess_file_lock(target):
+                if not target.is_file():
+                    self._persist_state_unlocked()
+                    return
+                self._load_state_unlocked()
+                self._reconcile_dead_reservations_unlocked()
                 self._persist_state_unlocked()
-                return
-            try:
-                payload = json.loads(target.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _load_state_unlocked(self) -> None:
+        if self._state_path is None or not self._state_path.is_file():
+            return
+        try:
+            payload = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget state is unreadable"
+            ) from exc
+        state_schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
+        if not isinstance(payload, Mapping) or state_schema not in {
+            "provider-aggregate-budget-v1",
+            "provider-aggregate-budget-v2",
+        }:
+            raise ProviderRuntimeContractError("provider aggregate budget state schema is invalid")
+        if (
+            state_schema == "provider-aggregate-budget-v1"
+            and self.budget.max_wall_seconds
+            and payload.get("absolute_deadline_epoch") is None
+        ):
+            raise ProviderRuntimeContractError(
+                "legacy provider aggregate budget state has no durable wall-clock deadline"
+            )
+        if payload.get("budget") != self.budget.to_dict():
+            raise ProviderRuntimeContractError("provider aggregate budget state limits changed")
+        for field_name, attribute in (
+            ("calls_used", "_calls_used"),
+            ("output_tokens_used", "_output_tokens_used"),
+            ("retry_attempts_used", "_retry_attempts_used"),
+        ):
+            raw = payload.get(field_name, 0)
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
                 raise ProviderRuntimeContractError(
-                    "provider aggregate budget state is unreadable"
+                    f"provider aggregate budget state field is invalid: {field_name}"
+                )
+            setattr(self, attribute, raw)
+        raw_started = payload.get("first_started_epoch")
+        raw_deadline = payload.get("absolute_deadline_epoch")
+        if raw_started is not None:
+            try:
+                self._first_started_epoch = float(raw_started)
+            except (TypeError, ValueError) as exc:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget first_started_epoch is invalid"
                 ) from exc
-            if not isinstance(payload, Mapping) or payload.get("schema_version") != "provider-aggregate-budget-v1":
-                raise ProviderRuntimeContractError("provider aggregate budget state schema is invalid")
-            if payload.get("budget") != self.budget.to_dict():
-                raise ProviderRuntimeContractError("provider aggregate budget state limits changed")
-            for field_name, attribute in (
-                ("calls_used", "_calls_used"),
-                ("output_tokens_used", "_output_tokens_used"),
-                ("retry_attempts_used", "_retry_attempts_used"),
-            ):
-                raw = payload.get(field_name, 0)
-                if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
-                    raise ProviderRuntimeContractError(
-                        f"provider aggregate budget state field is invalid: {field_name}"
+        if raw_deadline is not None:
+            try:
+                self._absolute_deadline_epoch = float(raw_deadline)
+            except (TypeError, ValueError) as exc:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget absolute_deadline_epoch is invalid"
+                ) from exc
+        reservations: dict[str, ProviderAggregateReservationV1] = {}
+        raw_reservations = payload.get("reservations")
+        if isinstance(raw_reservations, list):
+            for raw in raw_reservations:
+                if not isinstance(raw, Mapping):
+                    raise ProviderRuntimeContractError("provider aggregate reservation is invalid")
+                reservation_id = str(raw.get("reservation_id") or "").strip()
+                if not reservation_id:
+                    raise ProviderRuntimeContractError("provider aggregate reservation ID is missing")
+                try:
+                    reservation = ProviderAggregateReservationV1(
+                        reservation_id=reservation_id,
+                        provider_calls=int(raw.get("provider_calls") or 0),
+                        output_tokens=int(raw.get("output_tokens") or 0),
+                        retry_attempts=int(raw.get("retry_attempts") or 0),
+                        admitted_at=str(raw.get("admitted_at") or ""),
+                        owner_id=str(raw.get("owner_id") or ""),
+                        owner_pid=int(raw.get("owner_pid") or 0),
+                        transport_started=bool(raw.get("transport_started", False)),
+                        context=dict(raw.get("context") or {}),
                     )
-                setattr(self, attribute, raw)
+                except (TypeError, ValueError) as exc:
+                    raise ProviderRuntimeContractError(
+                        "provider aggregate reservation fields are invalid"
+                    ) from exc
+                if (
+                    reservation.provider_calls < 0
+                    or reservation.output_tokens < 0
+                    or reservation.retry_attempts < 0
+                    or not reservation.admitted_at
+                ):
+                    raise ProviderRuntimeContractError("provider aggregate reservation values are invalid")
+                reservations[reservation.reservation_id] = reservation
+        else:
             reserved = {
                 name: payload.get(name, 0)
                 for name in (
@@ -243,12 +339,75 @@ class ProviderBudgetController:
                     "retry_attempts_reserved",
                 )
             }
-            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in reserved.values()):
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in reserved.values()
+            ):
                 raise ProviderRuntimeContractError("provider aggregate budget reserved state is invalid")
             if any(reserved.values()):
                 raise ProviderBudgetExceeded(
-                    "provider aggregate budget has unreleased reservations from a prior process"
+                    "provider aggregate budget has legacy unreconciled reservations"
                 )
+        self._reservations = reservations
+        self._ambiguous_reservation_ids = set()
+        self._recompute_reserved_unlocked()
+        stored_reserved = (
+            payload.get("calls_reserved", self._calls_reserved),
+            payload.get("output_tokens_reserved", self._output_tokens_reserved),
+            payload.get("retry_attempts_reserved", self._retry_attempts_reserved),
+        )
+        if stored_reserved != (
+            self._calls_reserved,
+            self._output_tokens_reserved,
+            self._retry_attempts_reserved,
+        ):
+            raise ProviderRuntimeContractError(
+                "provider aggregate budget reserved totals do not match reservation records"
+            )
+        for limit, used, reserved, label in (
+            (
+                self.budget.max_provider_calls_total,
+                self._calls_used,
+                self._calls_reserved,
+                "provider calls",
+            ),
+            (
+                self.budget.max_output_tokens_total,
+                self._output_tokens_used,
+                self._output_tokens_reserved,
+                "provider output tokens",
+            ),
+            (
+                self.budget.max_retry_attempts_total,
+                self._retry_attempts_used,
+                self._retry_attempts_reserved,
+                "provider retries",
+            ),
+        ):
+            if limit and used + reserved > limit:
+                raise ProviderRuntimeContractError(
+                    f"provider aggregate budget state exceeds its {label} limit"
+                )
+
+    def _recompute_reserved_unlocked(self) -> None:
+        self._calls_reserved = sum(item.provider_calls for item in self._reservations.values())
+        self._output_tokens_reserved = sum(item.output_tokens for item in self._reservations.values())
+        self._retry_attempts_reserved = sum(item.retry_attempts for item in self._reservations.values())
+
+    def _reconcile_dead_reservations_unlocked(self) -> None:
+        """Release only reservations proven to have died before transport."""
+
+        stale: list[str] = []
+        for reservation_id, reservation in self._reservations.items():
+            if self._pid_alive(reservation.owner_pid):
+                continue
+            if reservation.transport_started:
+                self._ambiguous_reservation_ids.add(reservation_id)
+                continue
+            stale.append(reservation_id)
+        for reservation_id in stale:
+            self._reservations.pop(reservation_id, None)
+        self._recompute_reserved_unlocked()
 
     def _persist_state_unlocked(self) -> None:
         if self._state_path is None:
@@ -256,7 +415,7 @@ class ProviderBudgetController:
         atomic_write_json(
             str(self._state_path),
             {
-                "schema_version": "provider-aggregate-budget-v1",
+                "schema_version": "provider-aggregate-budget-v2",
                 "budget": self.budget.to_dict(),
                 "calls_used": self._calls_used,
                 "output_tokens_used": self._output_tokens_used,
@@ -264,11 +423,31 @@ class ProviderBudgetController:
                 "calls_reserved": self._calls_reserved,
                 "output_tokens_reserved": self._output_tokens_reserved,
                 "retry_attempts_reserved": self._retry_attempts_reserved,
+                "first_started_epoch": self._first_started_epoch,
+                "absolute_deadline_epoch": self._absolute_deadline_epoch,
+                "owner_id": self._owner_id,
+                "reservations": [
+                    {
+                        "reservation_id": reservation.reservation_id,
+                        "provider_calls": reservation.provider_calls,
+                        "output_tokens": reservation.output_tokens,
+                        "retry_attempts": reservation.retry_attempts,
+                        "admitted_at": reservation.admitted_at,
+                        "owner_id": reservation.owner_id,
+                        "owner_pid": reservation.owner_pid,
+                        "transport_started": reservation.transport_started,
+                        "context": dict(reservation.context),
+                    }
+                    for reservation in self._reservations.values()
+                ],
             },
         )
 
     def _check_wall(self) -> None:
-        if self.budget.max_wall_seconds and (
+        if self.budget.max_wall_seconds and self._absolute_deadline_epoch:
+            if float(time.time()) >= self._absolute_deadline_epoch:
+                raise ProviderBudgetExceeded("aggregate provider wall-clock budget exhausted")
+        elif self.budget.max_wall_seconds and (
             float(self._monotonic()) - self._started_monotonic
         ) >= self.budget.max_wall_seconds:
             raise ProviderBudgetExceeded("aggregate provider wall-clock budget exhausted")
@@ -278,51 +457,189 @@ class ProviderBudgetController:
         *,
         requested_output_tokens: int = 0,
         requested_retry_attempts: int = 0,
+        context: Mapping[str, Any] | None = None,
     ) -> ProviderAggregateReservationV1:
         output_tokens = max(0, int(requested_output_tokens))
         retry_attempts = max(0, int(requested_retry_attempts))
         provider_calls = 1 + retry_attempts
         with self._lock:
-            self._check_wall()
-            if (
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return self._admit_unlocked(
+                    provider_calls=provider_calls,
+                    output_tokens=output_tokens,
+                    retry_attempts=retry_attempts,
+                    context=context,
+                )
+            with lock:
+                self._load_state_unlocked()
+                self._reconcile_dead_reservations_unlocked()
+                return self._admit_unlocked(
+                    provider_calls=provider_calls,
+                    output_tokens=output_tokens,
+                    retry_attempts=retry_attempts,
+                    context=context,
+                )
+
+    def _admit_unlocked(
+        self,
+        *,
+        provider_calls: int,
+        output_tokens: int,
+        retry_attempts: int,
+        context: Mapping[str, Any] | None,
+    ) -> ProviderAggregateReservationV1:
+        self._check_wall()
+        if self._ambiguous_reservation_ids:
+            raise ProviderBudgetExceeded(
+                "provider aggregate budget has ambiguous reservations requiring durable receipt reconciliation"
+            )
+        if (
                 self.budget.max_provider_calls_total
                 and self._calls_used + self._calls_reserved + provider_calls
                 > self.budget.max_provider_calls_total
-            ):
-                raise ProviderBudgetExceeded("aggregate provider call budget exhausted")
-            if (
+        ):
+            raise ProviderBudgetExceeded("aggregate provider call budget exhausted")
+        if (
                 self.budget.max_output_tokens_total
                 and self._output_tokens_used + self._output_tokens_reserved + output_tokens
                 > self.budget.max_output_tokens_total
-            ):
-                raise ProviderBudgetExceeded("aggregate provider output-token budget exhausted")
-            if (
+        ):
+            raise ProviderBudgetExceeded("aggregate provider output-token budget exhausted")
+        if (
                 self.budget.max_retry_attempts_total
                 and self._retry_attempts_used + self._retry_attempts_reserved + retry_attempts
                 > self.budget.max_retry_attempts_total
-            ):
-                raise ProviderBudgetExceeded("aggregate provider retry budget exhausted")
-            self._next_reservation_id += 1
-            reservation = ProviderAggregateReservationV1(
-                reservation_id=self._next_reservation_id,
+        ):
+            raise ProviderBudgetExceeded("aggregate provider retry budget exhausted")
+        reservation = ProviderAggregateReservationV1(
+                reservation_id=f"{os.getpid()}-{uuid.uuid4().hex}",
                 provider_calls=provider_calls,
                 output_tokens=output_tokens,
                 retry_attempts=retry_attempts,
                 admitted_at=utc_now_iso(),
+                owner_id=self._owner_id,
+                owner_pid=os.getpid(),
+                context=dict(context or {}),
+        )
+        self._reservations[reservation.reservation_id] = reservation
+        self._calls_reserved += provider_calls
+        self._output_tokens_reserved += output_tokens
+        self._retry_attempts_reserved += retry_attempts
+        try:
+            self._persist_state_unlocked()
+        except BaseException:
+            del self._reservations[reservation.reservation_id]
+            self._calls_reserved -= provider_calls
+            self._output_tokens_reserved -= output_tokens
+            self._retry_attempts_reserved -= retry_attempts
+            raise
+        return reservation
+
+    def mark_transport_started(self, reservation: ProviderAggregateReservationV1) -> None:
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                self._mark_transport_started_unlocked(reservation)
+                return
+            with lock:
+                self._load_state_unlocked()
+                self._mark_transport_started_unlocked(reservation)
+
+    def _mark_transport_started_unlocked(self, reservation: ProviderAggregateReservationV1) -> None:
+        current = self._reservations.get(reservation.reservation_id)
+        if current is None:
+            raise ProviderRuntimeContractError(
+                f"unknown provider reservation: {reservation.reservation_id}"
             )
-            self._reservations[reservation.reservation_id] = reservation
-            self._calls_reserved += provider_calls
-            self._output_tokens_reserved += output_tokens
-            self._retry_attempts_reserved += retry_attempts
+        self._reservations[reservation.reservation_id] = replace(
+            current,
+            transport_started=True,
+        )
+        self._persist_state_unlocked()
+
+    def reconcile_orphaned_reservations(
+        self,
+        *,
+        receipt_ledgers: Iterable[str | Path] = (),
+    ) -> dict[str, Any]:
+        """Reconcile dead reservations from durable provider receipts.
+
+        A reservation with no transport-start marker is released after its
+        owner process is gone. A marked reservation is released only when a
+        receipt carrying that reservation ID is found; otherwise the state
+        remains blocked and the caller receives an explicit ambiguity error.
+        """
+
+        with self._lock:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return self._reconcile_orphaned_unlocked(receipt_ledgers)
+            with lock:
+                self._load_state_unlocked()
+                return self._reconcile_orphaned_unlocked(receipt_ledgers)
+
+    def _reconcile_orphaned_unlocked(
+        self,
+        receipt_ledgers: Iterable[str | Path],
+    ) -> dict[str, Any]:
+        receipt_by_reservation: dict[str, Mapping[str, Any]] = {}
+        for ledger_path in receipt_ledgers:
             try:
-                self._persist_state_unlocked()
-            except BaseException:
-                del self._reservations[reservation.reservation_id]
-                self._calls_reserved -= provider_calls
-                self._output_tokens_reserved -= output_tokens
-                self._retry_attempts_reserved -= retry_attempts
-                raise
-            return reservation
+                receipts = ProviderRuntimeLedger(ledger_path).list_receipts()
+            except (OSError, ValueError, ProviderRuntimeContractError):
+                continue
+            for receipt in receipts:
+                metadata = receipt.metadata if isinstance(receipt.metadata, Mapping) else {}
+                reservation_id = str(metadata.get("aggregate_reservation_id") or "")
+                if reservation_id:
+                    receipt_by_reservation[reservation_id] = receipt.to_dict()
+        released: list[str] = []
+        recovered: list[str] = []
+        ambiguous: list[str] = []
+        for reservation_id, reservation in list(self._reservations.items()):
+            if self._pid_alive(reservation.owner_pid):
+                continue
+            receipt = receipt_by_reservation.get(reservation_id)
+            if receipt is not None:
+                try:
+                    attempts = max(1, int(receipt.get("attempts") or 1))
+                except (TypeError, ValueError):
+                    attempts = reservation.provider_calls
+                output = receipt.get("output_tokens")
+                try:
+                    actual_output = (
+                        reservation.output_tokens
+                        if output in (None, "")
+                        else int(output)
+                    )
+                except (TypeError, ValueError):
+                    actual_output = reservation.output_tokens
+                if attempts > reservation.provider_calls or actual_output > reservation.output_tokens:
+                    raise ProviderRuntimeContractError(
+                        "durable receipt exceeds its orphaned aggregate reservation"
+                    )
+                self._reservations.pop(reservation_id, None)
+                self._calls_used += attempts
+                self._output_tokens_used += actual_output
+                self._retry_attempts_used += max(0, attempts - 1)
+                self._ambiguous_reservation_ids.discard(reservation_id)
+                recovered.append(reservation_id)
+            elif reservation.transport_started:
+                self._ambiguous_reservation_ids.add(reservation_id)
+                ambiguous.append(reservation_id)
+            else:
+                self._reservations.pop(reservation_id, None)
+                self._ambiguous_reservation_ids.discard(reservation_id)
+                released.append(reservation_id)
+        self._recompute_reserved_unlocked()
+        self._persist_state_unlocked()
+        if ambiguous:
+            raise ProviderBudgetExceeded(
+                "provider aggregate budget has ambiguous orphaned reservations: "
+                + ", ".join(sorted(ambiguous))
+            )
+        return {"released": released, "recovered": recovered, "ambiguous": ambiguous}
 
     def complete(
         self,
@@ -330,50 +647,84 @@ class ProviderBudgetController:
         result: Mapping[str, Any],
     ) -> dict[str, Any]:
         with self._lock:
-            current = self._reservations.pop(reservation.reservation_id, None)
-            if current is None:
+            lock = interprocess_file_lock(self._state_path) if self._state_path is not None else None
+            if lock is None:
+                return self._complete_unlocked(
+                    reservation=reservation,
+                    result=result,
+                )
+            with lock:
+                self._load_state_unlocked()
+                return self._complete_unlocked(
+                    reservation=reservation,
+                    result=result,
+                )
+
+    def _complete_unlocked(
+        self,
+        *,
+        reservation: ProviderAggregateReservationV1,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        current = self._reservations.get(reservation.reservation_id)
+        if current is None:
                 raise ProviderRuntimeContractError(
                     f"unknown or already completed provider reservation: {reservation.reservation_id}"
                 )
-            try:
-                attempts = max(1, int(result.get("attempts") or 1))
-            except (TypeError, ValueError):
-                attempts = current.provider_calls
-            if attempts > current.provider_calls:
+        try:
+            attempts = max(1, int(result.get("attempts") or 1))
+        except (TypeError, ValueError):
+            attempts = current.provider_calls
+        if attempts > current.provider_calls:
                 raise ProviderRuntimeContractError(
                     "provider transport attempts exceeded the pre-admitted aggregate reservation"
                 )
-            actual_retries = max(0, attempts - 1)
-            raw_output = result.get("output_tokens")
-            try:
-                actual_output = int(raw_output) if raw_output is not None else current.output_tokens
-            except (TypeError, ValueError):
-                actual_output = current.output_tokens
-            if actual_output < 0 or actual_output > current.output_tokens:
+        actual_retries = max(0, attempts - 1)
+        raw_output = result.get("output_tokens")
+        try:
+            actual_output = int(raw_output) if raw_output is not None else current.output_tokens
+        except (TypeError, ValueError):
+            actual_output = current.output_tokens
+        if actual_output < 0 or actual_output > current.output_tokens:
                 raise ProviderRuntimeContractError(
                     "provider output tokens exceeded the pre-admitted aggregate reservation"
                 )
-            self._calls_reserved -= current.provider_calls
-            self._output_tokens_reserved -= current.output_tokens
-            self._retry_attempts_reserved -= current.retry_attempts
-            self._calls_used += attempts
-            self._output_tokens_used += actual_output
-            self._retry_attempts_used += actual_retries
-            self._persist_state_unlocked()
-            return self.snapshot()
+        self._reservations.pop(reservation.reservation_id, None)
+        self._calls_reserved -= current.provider_calls
+        self._output_tokens_reserved -= current.output_tokens
+        self._retry_attempts_reserved -= current.retry_attempts
+        self._calls_used += attempts
+        self._output_tokens_used += actual_output
+        self._retry_attempts_used += actual_retries
+        self._persist_state_unlocked()
+        return self._snapshot_unlocked()
+
+    def _snapshot_unlocked(self) -> dict[str, Any]:
+        return {
+            "budget": self.budget.to_dict(),
+            "calls_used": self._calls_used,
+            "output_tokens_used": self._output_tokens_used,
+            "retry_attempts_used": self._retry_attempts_used,
+            "calls_reserved": self._calls_reserved,
+            "output_tokens_reserved": self._output_tokens_reserved,
+            "retry_attempts_reserved": self._retry_attempts_reserved,
+            "elapsed_seconds": max(
+                0.0,
+                (
+                    float(time.time()) - self._first_started_epoch
+                    if self._absolute_deadline_epoch
+                    else float(self._monotonic()) - self._started_monotonic
+                ),
+            ),
+            "absolute_deadline_epoch": self._absolute_deadline_epoch,
+        }
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return {
-                "budget": self.budget.to_dict(),
-                "calls_used": self._calls_used,
-                "output_tokens_used": self._output_tokens_used,
-                "retry_attempts_used": self._retry_attempts_used,
-                "calls_reserved": self._calls_reserved,
-                "output_tokens_reserved": self._output_tokens_reserved,
-                "retry_attempts_reserved": self._retry_attempts_reserved,
-                "elapsed_seconds": max(0.0, float(self._monotonic()) - self._started_monotonic),
-            }
+            if self._state_path is not None:
+                with interprocess_file_lock(self._state_path):
+                    self._load_state_unlocked()
+            return self._snapshot_unlocked()
 
 
 _ENV_BUDGET_LOCK = threading.Lock()
@@ -724,7 +1075,7 @@ class ProviderCallAdmissionV1:
     estimated_output_tokens: int = 0
     reserved_call_attempts: int = 1
     reserved_retry_attempts: int = 0
-    aggregate_reservation_id: int | None = None
+    aggregate_reservation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1085,23 +1436,25 @@ class ProviderRuntimeLedger:
         payload = receipt.to_dict()
         encoded = _canonical_json(payload)
         with self._lock:
-            existing = self._read_unlocked()
-            for candidate in existing:
-                if candidate.receipt_id != receipt.receipt_id:
-                    continue
-                if _canonical_json(candidate.to_dict()) != encoded:
-                    raise ProviderReceiptConflict(f"receipt ID reused with different content: {receipt.receipt_id}")
-                return candidate
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(encoded + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            with interprocess_file_lock(self.path):
+                existing = self._read_unlocked()
+                for candidate in existing:
+                    if candidate.receipt_id != receipt.receipt_id:
+                        continue
+                    if _canonical_json(candidate.to_dict()) != encoded:
+                        raise ProviderReceiptConflict(f"receipt ID reused with different content: {receipt.receipt_id}")
+                    return candidate
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+                    handle.write(encoded + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
         return receipt
 
     def list_receipts(self) -> tuple[ProviderCallReceiptV1, ...]:
         with self._lock:
-            return tuple(self._read_unlocked())
+            with interprocess_file_lock(self.path):
+                return tuple(self._read_unlocked())
 
     def usage_summary(self) -> dict[str, Any]:
         """Recompute physical call usage from durable receipts."""
@@ -1166,46 +1519,47 @@ class ProviderRuntimeLedger:
         if not str(previous) or not str(current) or str(previous) == str(current):
             return 0
         with self._lock:
-            receipts = self._read_unlocked()
-            changed = []
-            for receipt in receipts:
-                if str(receipt.closure_epoch_id or "") != str(previous):
-                    changed.append(receipt)
-                    continue
-                metadata = dict(receipt.metadata)
-                metadata["closure_epoch_retagged_from"] = str(previous)
-                changed.append(
-                    replace(
-                        receipt,
-                        closure_epoch_id=str(current),
-                        metadata=metadata,
+            with interprocess_file_lock(self.path):
+                receipts = self._read_unlocked()
+                changed = []
+                for receipt in receipts:
+                    if str(receipt.closure_epoch_id or "") != str(previous):
+                        changed.append(receipt)
+                        continue
+                    metadata = dict(receipt.metadata)
+                    metadata["closure_epoch_retagged_from"] = str(previous)
+                    changed.append(
+                        replace(
+                            receipt,
+                            closure_epoch_id=str(current),
+                            metadata=metadata,
+                        )
                     )
+                migrated_count = sum(
+                    1
+                    for receipt in changed
+                    if str(receipt.closure_epoch_id or "") == str(current)
+                    and str(receipt.metadata.get("closure_epoch_retagged_from") or "") == str(previous)
                 )
-            migrated_count = sum(
-                1
-                for receipt in changed
-                if str(receipt.closure_epoch_id or "") == str(current)
-                and str(receipt.metadata.get("closure_epoch_retagged_from") or "") == str(previous)
-            )
-            if not migrated_count:
-                return 0
-            encoded_lines = [
-                _canonical_json(receipt.to_dict()) + "\n" for receipt in changed
-            ]
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = self.path.with_suffix(self.path.suffix + f".retag-{uuid.uuid4().hex}.tmp")
-            try:
-                with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
-                    handle.writelines(encoded_lines)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                atomic_replace_with_retry(temp_path, self.path, timeout_seconds=5.0)
-            finally:
+                if not migrated_count:
+                    return 0
+                encoded_lines = [
+                    _canonical_json(receipt.to_dict()) + "\n" for receipt in changed
+                ]
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = self.path.with_suffix(self.path.suffix + f".retag-{uuid.uuid4().hex}.tmp")
                 try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            return migrated_count
+                    with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                        handle.writelines(encoded_lines)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    atomic_replace_with_retry(temp_path, self.path, timeout_seconds=5.0)
+                finally:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return migrated_count
 
 
 class ProviderRuntime:
@@ -1334,6 +1688,14 @@ class ProviderRuntime:
                 aggregate_reservation = self.aggregate_budget.admit(
                     requested_output_tokens=output,
                     requested_retry_attempts=retries,
+                    context={
+                        "job_id": self.job_id,
+                        "attempt_id": self.attempt_id,
+                        "stage_name": self.stage_name,
+                        "node_id": self.node_id,
+                        "call_id": self.call_id,
+                        "ledger_path": str(self.ledger.path) if self.ledger is not None else "",
+                    },
                 )
             self._calls += 1
             self._reserved_tokens += estimated + output
@@ -1378,6 +1740,8 @@ class ProviderRuntime:
         receipt_metadata = dict(metadata or {})
         if aggregate_snapshot is not None:
             receipt_metadata["aggregate_budget"] = aggregate_snapshot
+        if aggregate_reservation is not None:
+            receipt_metadata["aggregate_reservation_id"] = aggregate_reservation.reservation_id
         receipt = ProviderCallReceiptV1.from_result(
             admission=admission,
             job_id=self.job_id,
@@ -1416,6 +1780,19 @@ class ProviderRuntime:
                 self.ledger.append(receipt)
             self._receipts.append(receipt)
         return receipt
+
+    def mark_transport_started(self, admission: ProviderCallAdmissionV1) -> None:
+        """Durably mark the boundary immediately before a transport call."""
+
+        if self.aggregate_budget is None or admission.aggregate_reservation_id is None:
+            return
+        with self._lock:
+            reservation = self._aggregate_reservations.get(admission.sequence)
+        if reservation is None:
+            raise ProviderRuntimeContractError(
+                f"aggregate reservation is missing for admission sequence {admission.sequence}"
+            )
+        self.aggregate_budget.mark_transport_started(reservation)
 
     def blocked_receipt(
         self,

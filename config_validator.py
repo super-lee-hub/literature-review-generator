@@ -407,12 +407,33 @@ def validate_all_config(
     except (TypeError, ValueError) as exc:
         return False, [str(exc)]
     if reachable_stages is None or "outline" in reachable_stages:
-        outline_errors = settings.validate_outline_config()
+        from runtime.provider_routes import OUTLINE_ROLE_TO_SETTING, build_reachable_provider_route_plan
+
+        try:
+            outline_route_plan = build_reachable_provider_route_plan(
+                config_dict,
+                action="generate_outline",
+                requested_stages=("outline",),
+            )
+        except (TypeError, ValueError) as exc:
+            return False, [f"unable to build reachable provider route plan: {exc}"]
+        enabled_outline_roles = {
+            OUTLINE_ROLE_TO_SETTING[role]
+            for role in outline_route_plan.semantic_roles
+            if role in OUTLINE_ROLE_TO_SETTING
+        }
+        outline_errors = settings.validate_outline_config(
+            enabled_role_keys=enabled_outline_roles
+        )
         if outline_errors:
             return False, outline_errors
         # A critique that shares the generator's identity is legal but must never be
         # invisible, so it is surfaced as a warning rather than silently accepted.
-        messages.extend(settings.outline_routing_diagnostics())
+        messages.extend(
+            settings.outline_routing_diagnostics(
+                enabled_role_keys=enabled_outline_roles
+            )
+        )
     preprocess = config_dict.get("Preprocess", {})
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]

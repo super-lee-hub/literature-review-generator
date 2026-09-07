@@ -37,6 +37,7 @@ from validation.repair_transaction import RepairPromotionTransaction, current_ar
 from outline.v3_executor import OutlineV3Executor
 from outline.adoption_transaction import current_adoption_record
 from outline.provider_router import OutlineRoleRoute, build_outline_provider_router
+from runtime.provider_routes import build_reachable_provider_route_plan
 from services.model_capabilities import resolve_model_capability
 from services.model_selection import get_api_config_for_section
 from services.settings import ApplicationSettings
@@ -986,6 +987,21 @@ class InternalStageExecutorRegistry:
         summaries = self._build_outline_evidence_pack(session, summaries)
 
         settings = session.context.settings
+        reachable_route_plan = build_reachable_provider_route_plan(
+            session.stage_host.config,
+            action="generate_outline",
+            requested_stages=("outline",),
+            free_mode_enabled=self.bridge.free_mode_envelope is not None,
+        )
+        unresolved_routes = reachable_route_plan.unresolved_required_routes
+        if unresolved_routes:
+            missing = ", ".join(
+                f"{route.semantic_role}->[{route.section_name}]"
+                for route in unresolved_routes
+            )
+            raise RuntimeError(
+                "Outline v3 reachable provider route plan is incomplete: " + missing
+            )
         route_name = str(settings.outline_model() or "").strip() or "Outline_API"
         # Resolve the section the generator role actually names. The stage-level
         # provider used to come from get_outline_api_config(), which silently
@@ -1016,6 +1032,7 @@ class InternalStageExecutorRegistry:
         provider_router = build_outline_provider_router(
             settings=settings,
             config=dict(session.stage_host.config),
+            enabled_roles=reachable_route_plan.semantic_roles,
             route_resolver=lambda role, section: self._outline_route_for_section(
                 session=session, role=role, section_name=section
             ),
@@ -1042,6 +1059,8 @@ class InternalStageExecutorRegistry:
             provider=provider,
             provider_profile=profile,
             provider_router=provider_router,
+            enabled_semantic_roles=reachable_route_plan.semantic_roles,
+            reachable_provider_route_plan=reachable_route_plan.to_dict(),
             candidate_count=settings.outline_candidate_count(),
             quality_gate=settings.outline_quality_gate(),
             review_intent=free_mode_review_intent,

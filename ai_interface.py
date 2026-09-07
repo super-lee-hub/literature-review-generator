@@ -2177,6 +2177,11 @@ def _call_ai_api_detailed(
         }
         return blocked
 
+    # The durable budget distinguishes a process that died before transport
+    # from one that may have sent a request but failed before writing a receipt.
+    # Mark this boundary immediately before entering the uninstrumented
+    # transport so resume can release only the former case.
+    provider_runtime.mark_transport_started(admission)
     result = _call_ai_api_detailed_uninstrumented(
         prompt,
         api_config,

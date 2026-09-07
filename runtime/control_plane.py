@@ -19,10 +19,10 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import uuid
 from typing import Any, Mapping, Sequence, cast
 
 from config_loader import load_config
-from config_loader import provider_sections_for_stage_plan
 from config_validator import validate_all_config
 from ai_interface import build_provider_transport_preflight, classify_provider_endpoint
 from services.credential_provenance import is_template_credential, provenance_payload
@@ -33,6 +33,7 @@ from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
 from runtime.provider_runtime import ProviderRuntime, ProviderRuntimeLedger
+from runtime.provider_routes import build_reachable_provider_route_plan
 from runtime.stage_terminal import StageTerminalStore
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -45,7 +46,8 @@ from services.model_capabilities import resolve_model_capability
 from services.settings import ApplicationSettings
 from services.stage1_output_budget import stage1_output_budget_sequence, provider_output_token_limit
 from preprocess.service import DEFAULT_MINERU_ALLOWED_URL_HOSTS, PreprocessManager
-from services.job_workspace import JobWorkspace
+from services.job_workspace import JobWorkspace, atomic_write_json
+from services.durable_io import interprocess_file_lock
 from runtime.cancellation import CancellationRequestStore
 from runtime.export_bundle import ExportBundleService, ExportBundleSpecV1, ForensicAttestationService
 from outline.adoption_transaction import OutlineAdoptionTransaction
@@ -529,6 +531,419 @@ class ReviewControlPlane:
             )
         return payload
 
+    def acceptance_run(
+        self,
+        acceptance_spec_path: str | Path,
+    ) -> dict[str, Any]:
+        """Execute or resume an owner-authorized acceptance run.
+
+        The acceptance specification is an input contract, not a bag of
+        pass/fail claims. Runtime execution is allowed only when the owner
+        explicitly enables it; every resulting gate is then verified from
+        hashed durable references before it can become PASS.
+        """
+
+        from runtime.release_acceptance import (
+            AcceptanceRunStateV1,
+            GateEvidenceProducer,
+            GateEvidenceVerifier,
+            ReleaseAcceptanceSpec,
+            ReleaseAcceptanceSpecError,
+            gate_contract,
+        )
+
+        spec_path = Path(acceptance_spec_path).expanduser().resolve()
+        try:
+            raw = json.loads(spec_path.read_text(encoding="utf-8"))
+            acceptance_spec = ReleaseAcceptanceSpec.from_mapping(
+                raw,
+                origin_dir=spec_path.parent,
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ControlPlaneError(
+                f"acceptance specification is invalid: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        current_sha = ""
+        try:
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(self.repo_root),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if completed.returncode == 0:
+                current_sha = str(completed.stdout or "").strip().splitlines()[-1]
+        except (OSError, subprocess.SubprocessError):
+            current_sha = ""
+        if not current_sha:
+            raise ControlPlaneError("acceptance run cannot bind to the current checkout SHA")
+
+        state_path = Path(
+            acceptance_spec.state_path
+            or (
+                Path(acceptance_spec.evidence_manifest).parent
+                if acceptance_spec.evidence_manifest
+                else self.repo_root / "output" / "_acceptance"
+            )
+        ).expanduser().resolve()
+        if state_path.suffix.casefold() != ".json":
+            state_path = state_path / "acceptance_run_state_v1.json"
+        evidence_path = Path(
+            acceptance_spec.evidence_manifest
+            or state_path.with_name("acceptance_evidence_index_v1.json")
+        ).expanduser().resolve()
+        gates = acceptance_spec.gates or (
+            "C",
+            "D",
+            "E",
+            "F",
+            "G",
+            "H",
+            "I",
+            "J",
+            "K",
+            "Q",
+        )
+        for gate in gates:
+            gate_contract(gate)
+
+        state: AcceptanceRunStateV1 | None = None
+        with interprocess_file_lock(state_path):
+            if state_path.is_file():
+                try:
+                    state = AcceptanceRunStateV1.from_mapping(
+                        json.loads(state_path.read_text(encoding="utf-8"))
+                    )
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                    state = None
+            if state is None or state.final_sha != current_sha:
+                state = AcceptanceRunStateV1(
+                    run_id=f"acceptance-{uuid.uuid4().hex}",
+                    final_sha=current_sha,
+                    acceptance_spec_path=str(spec_path),
+                    runtime_spec_path=acceptance_spec.runtime_spec,
+                    status="planned",
+                    gates={
+                        str(gate): {
+                            "gate": str(gate),
+                            "status": "NOT_RUN",
+                            "contract": gate_contract(gate),
+                        }
+                        for gate in gates
+                    },
+                    updated_at=self._utc_now(),
+                )
+            atomic_write_json(str(state_path), state.to_dict())
+
+        route_plan: dict[str, Any] | None = None
+        runtime_result: dict[str, Any] | None = None
+        runtime_spec = (
+            Path(acceptance_spec.runtime_spec).expanduser().resolve()
+            if acceptance_spec.runtime_spec
+            else None
+        )
+        runtime_job_spec: RuntimeJobSpec | None = None
+        if runtime_spec is not None and runtime_spec.is_file():
+            try:
+                runtime_job_spec = load_runtime_job_spec(runtime_spec)
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                runtime_job_spec = None
+        if runtime_spec is None:
+            runtime_result = {
+                "status": "BLOCKED_INPUT",
+                "reason": "acceptance spec must provide runtime_spec to execute or resume C-K/Q",
+            }
+        elif os.getenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "0") != "1":
+            runtime_result = {
+                "status": "BLOCKED_AUTHORIZATION",
+                "reason": "set AUTO_GENERATE_RUN_LIVE_ACCEPTANCE=1 for owner-authorized acceptance execution",
+            }
+        else:
+            try:
+                runtime_payload = json.loads(runtime_spec.read_text(encoding="utf-8"))
+                runtime_job_spec = RuntimeJobSpec.from_dict(runtime_payload).resolved_from(
+                    runtime_spec.parent
+                )
+                config_path = Path(runtime_job_spec.config).expanduser().resolve()
+                route_plan = self.provider_preflight(
+                    config_path=config_path,
+                    action=runtime_job_spec.action,
+                    requested_stages=runtime_job_spec.metadata.get("requested_stages"),
+                    free_mode_enabled=bool(
+                        runtime_job_spec.free_mode_profile
+                        or runtime_job_spec.free_mode_idea
+                        or runtime_job_spec.metadata.get("free_mode_input")
+                    ),
+                ).get("route_plan")
+                prior_workspace = state.workspace_path if state else ""
+                if prior_workspace and Path(prior_workspace).is_dir():
+                    runtime_result = self.resume(
+                        workspace=prior_workspace,
+                        job_id=state.job_id if state else "",
+                    )
+                else:
+                    runtime_result = self.run(runtime_spec)
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, ControlPlaneError) as exc:
+                runtime_result = {
+                    "status": "BLOCKED_INPUT",
+                    "reason": f"acceptance runtime input is invalid or blocked: {type(exc).__name__}: {exc}",
+                }
+
+        workspace_path = str(
+            (runtime_result or {}).get("workspace_path")
+            or (state.workspace_path if state else "")
+        )
+        job_id = str(
+            (runtime_result or {}).get("job_id")
+            or (state.job_id if state else "")
+            or acceptance_spec.job_id
+        )
+
+        refs: list[dict[str, Any]] = []
+        if runtime_spec is not None and runtime_spec.is_file():
+            refs.append(
+                GateEvidenceProducer(
+                    final_sha=current_sha,
+                    origin_dir=spec_path.parent,
+                ).reference(
+                    runtime_spec,
+                    role="runtime_spec",
+                    artifact_type="runtime_job_spec",
+                    artifact_version="v1",
+                    job_id=job_id,
+                )
+            )
+        if workspace_path and Path(workspace_path).is_dir():
+            refs.extend(
+                self._acceptance_workspace_references(
+                    workspace_path,
+                    final_sha=current_sha,
+                    job_id=job_id,
+                )
+            )
+        if runtime_job_spec is not None:
+            refs.extend(
+                self._acceptance_source_references(
+                    runtime_job_spec,
+                    final_sha=current_sha,
+                    job_id=job_id,
+                )
+            )
+        if (
+            refs
+            and not evidence_path.is_file()
+            and runtime_result is not None
+            and not str(runtime_result.get("status") or "").startswith("BLOCKED")
+        ):
+            producer = GateEvidenceProducer(final_sha=current_sha)
+            producer.write_manifest(
+                evidence_path,
+                {str(gate): refs for gate in gates},
+            )
+
+        verifier = GateEvidenceVerifier()
+        verified_gates: dict[str, Any] = {}
+        evidence_payload: Mapping[str, Any] | None = None
+        if evidence_path.is_file():
+            try:
+                loaded_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_evidence, Mapping):
+                    evidence_payload = loaded_evidence
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                evidence_payload = None
+        for gate in gates:
+            gate_evidence = (
+                evidence_payload.get("gates", {}).get(gate)
+                if isinstance(evidence_payload, Mapping)
+                and isinstance(evidence_payload.get("gates"), Mapping)
+                else None
+            )
+            verified_gates[str(gate)] = verifier.verify(
+                str(gate),
+                gate_evidence if isinstance(gate_evidence, Mapping) else None,
+                expected_final_sha=current_sha,
+                origin_dir=evidence_path.parent,
+                expected_job_id=job_id,
+            )
+            if verified_gates[str(gate)].get("status") == "PASS":
+                continue
+            if runtime_result and str(runtime_result.get("status") or "").startswith("BLOCKED"):
+                verified_gates[str(gate)] = {
+                    **verified_gates[str(gate)],
+                    "execution": runtime_result,
+                }
+
+        final_status = (
+            "complete"
+            if verified_gates and all(item.get("status") == "PASS" for item in verified_gates.values())
+            else "blocked"
+        )
+        state = AcceptanceRunStateV1(
+            run_id=state.run_id if state else f"acceptance-{uuid.uuid4().hex}",
+            final_sha=current_sha,
+            acceptance_spec_path=str(spec_path),
+            runtime_spec_path=str(runtime_spec or ""),
+            status=final_status,
+            gates=verified_gates,
+            workspace_path=workspace_path,
+            job_id=job_id,
+            updated_at=self._utc_now(),
+        )
+        with interprocess_file_lock(state_path):
+            atomic_write_json(str(state_path), state.to_dict())
+        return {
+            "control_plane_version": CONTROL_PLANE_VERSION,
+            "status": final_status,
+            "ok": final_status == "complete",
+            "run_id": state.run_id,
+            "final_sha": current_sha,
+            "acceptance_spec_path": str(spec_path),
+            "state_path": str(state_path),
+            "evidence_manifest": str(evidence_path) if evidence_path.is_file() else "",
+            "runtime_result": runtime_result,
+            "route_plan": route_plan,
+            "gates": verified_gates,
+            "read_only": False,
+        }
+
+    @staticmethod
+    def _utc_now() -> str:
+        from services.job_workspace import utc_now_iso
+
+        return utc_now_iso()
+
+    def _acceptance_workspace_references(
+        self,
+        workspace_path: str,
+        *,
+        final_sha: str,
+        job_id: str,
+    ) -> list[dict[str, Any]]:
+        """Inventory only durable workspace artifacts for acceptance evidence."""
+
+        from runtime.release_acceptance import GateEvidenceProducer
+
+        workspace = Path(workspace_path).expanduser().resolve()
+        producer = GateEvidenceProducer(final_sha=final_sha)
+        references: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(path: Path, *, role: str, artifact_type: str = "", artifact_version: str = "") -> None:
+            resolved = path.expanduser().resolve()
+            key = str(resolved).casefold()
+            if key in seen or not resolved.is_file() or resolved.is_symlink():
+                return
+            try:
+                ref = producer.reference(
+                    resolved,
+                    role=role,
+                    artifact_type=artifact_type,
+                    artifact_version=artifact_version,
+                    job_id=job_id,
+                )
+            except (OSError, ValueError):
+                return
+            seen.add(key)
+            references.append(ref)
+
+        registry_path = workspace / "artifact_registry.json"
+        add(registry_path, role="registry")
+        registry_payload: Mapping[str, Any] = {}
+        try:
+            raw_registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            if isinstance(raw_registry, Mapping):
+                registry_payload = raw_registry
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+        for item in registry_payload.get("artifacts", ()) if isinstance(registry_payload, Mapping) else ():
+            if not isinstance(item, Mapping):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            artifact_type = str(item.get("artifact_type") or "")
+            raw_metadata = item.get("metadata")
+            metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+            role = {
+                "job_outcome": "job_outcome",
+                "job_attempt": "attempt",
+                "runtime_stage_terminal": (
+                    "outline_terminal"
+                    if str(metadata.get("stage_name") or "") == "outline"
+                    else "stage_terminal"
+                ),
+                "provider_call_receipt": "provider_receipt_ledger",
+                "provider_receipt_ledger": "provider_receipt_ledger",
+                "stage1_canonical_summaries": "canonical_stage1",
+                "outline_provider_call_plan": "outline_provider_call_plan",
+                "review_docx": "review_docx",
+                "validation_run_result": "validation_artifact",
+                "validation_run_result_repaired": "repair_artifact",
+                "validation_report_projection": "defect_artifact",
+                "validation_receipt_closure": "closure",
+                "provider_receipt_closure": "closure",
+            }.get(artifact_type, "")
+            if role:
+                add(
+                    Path(raw_path),
+                    role=role,
+                    artifact_type=artifact_type,
+                    artifact_version=str(item.get("artifact_version") or ""),
+                )
+
+        for path in workspace.glob("**/*provider*receipt*.jsonl"):
+            add(
+                path,
+                role="provider_receipt_ledger",
+                artifact_type="provider_receipt_ledger",
+                artifact_version="v1",
+            )
+        for path in workspace.glob("**/*process*event*.jsonl"):
+            add(path, role="process_events")
+        for path in workspace.glob("**/*interruption*.*"):
+            add(path, role="interruption_event")
+        for path in workspace.glob("**/*resume*.*"):
+            add(path, role="resume_event")
+        for path in workspace.glob("**/*ocr*.*"):
+            add(path, role="ocr_diagnostics")
+        return references
+
+    @staticmethod
+    def _acceptance_source_references(
+        spec: RuntimeJobSpec,
+        *,
+        final_sha: str,
+        job_id: str,
+    ) -> list[dict[str, Any]]:
+        from runtime.release_acceptance import GateEvidenceProducer
+
+        if spec.source.mode != "direct":
+            return []
+        folder = Path(spec.source.pdf_folder).expanduser().resolve()
+        if not folder.is_dir():
+            return []
+        producer = GateEvidenceProducer(final_sha=final_sha)
+        refs: list[dict[str, Any]] = []
+        for path in sorted(folder.glob("*.pdf")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            try:
+                refs.append(
+                    producer.reference(
+                        path,
+                        role="source_pdf",
+                        artifact_type="source_pdf",
+                        job_id=job_id,
+                        modality="pdf",
+                    )
+                )
+            except (OSError, ValueError):
+                continue
+        return refs
+
     @staticmethod
     def _formal_runner_transport_diff(
         spec: RuntimeJobSpec,
@@ -541,6 +956,11 @@ class ReviewControlPlane:
                 config_path=spec.config,
                 action=spec.action,
                 requested_stages=spec.metadata.get("requested_stages"),
+                free_mode_enabled=bool(
+                    spec.free_mode_profile
+                    or spec.free_mode_idea
+                    or spec.metadata.get("free_mode_input")
+                ),
             )
             expected = {
                 (
@@ -1326,6 +1746,27 @@ class ReviewControlPlane:
             add("stage1_budget", "fail", {"error": str(exc)})
 
         try:
+            route_plan = build_reachable_provider_route_plan(
+                normalized_config,
+                action="run_all",
+                requested_stages=None,
+            )
+            add(
+                "reachable_provider_routes",
+                "fail" if route_plan.unresolved_required_routes else "pass",
+                {
+                    "route_plan": route_plan.to_dict(),
+                    "required_provider_sections": list(
+                        route_plan.required_provider_sections
+                    ),
+                    "semantic_roles": list(route_plan.semantic_roles),
+                    "physical_route_count": len(route_plan.physical_routes),
+                },
+            )
+        except Exception as exc:
+            add("reachable_provider_routes", "fail", {"error": str(exc)})
+
+        try:
             mineru = PreprocessManager(dict(normalized_config))
             invalid_hosts = sorted(
                 str(item) for item in getattr(mineru, "mineru_invalid_allowed_url_hosts", set())
@@ -1399,6 +1840,7 @@ class ReviewControlPlane:
         action: str = "analyze",
         requested_stages: Sequence[str] | None = None,
         section: str | None = None,
+        free_mode_enabled: bool = False,
     ) -> dict[str, Any]:
         """Exercise the formal config/route/payload construction without HTTP."""
 
@@ -1408,28 +1850,35 @@ class ReviewControlPlane:
                 str(target_config),
                 action=action,
                 requested_stages=requested_stages,
+                free_mode_enabled=free_mode_enabled,
                 allow_template_credentials=False,
             )
-            settings = ApplicationSettings.from_config(normalized)
-            roles = provider_sections_for_stage_plan(
+            route_plan = build_reachable_provider_route_plan(
                 normalized,
-                requested_stages=requested_stages,
                 action=action,
+                requested_stages=requested_stages,
+                free_mode_enabled=free_mode_enabled,
             )
-            if section and section not in roles:
+            roles = route_plan.required_provider_sections
+            selected_section = section
+            if section and section in route_plan.semantic_roles:
+                selected_section = route_plan.route_for_role(section).section_name
+            if section and selected_section not in roles:
                 return {
                     "control_plane_version": CONTROL_PLANE_VERSION,
                     "status": "blocked",
                     "ok": False,
                     "action": action,
                     "requested_stages": list(requested_stages or ()),
+                    "free_mode_enabled": bool(free_mode_enabled),
                     "provider_roles": list(roles),
+                    "route_plan": route_plan.to_dict(),
                     "error_type": "UnreachableProviderRoute",
                     "error": f"[{section}] is not reachable from the current StagePlan",
                     "network_calls": 0,
                     "read_only": True,
                 }
-            selected_roles = (section,) if section else roles
+            selected_roles = (selected_section,) if selected_section else roles
             provenance = {
                 item.section: item.selected_source
                 for item in getattr(normalized, "credential_provenance", ())
@@ -1451,7 +1900,9 @@ class ReviewControlPlane:
                 "ok": True,
                 "action": action,
                 "requested_stages": list(requested_stages or ()),
+                "free_mode_enabled": bool(free_mode_enabled),
                 "provider_roles": list(selected_roles),
+                "route_plan": route_plan.to_dict(),
                 "providers": providers,
                 "credential_provenance": provenance_payload(
                     list(getattr(normalized, "credential_provenance", ()))
@@ -1481,6 +1932,7 @@ class ReviewControlPlane:
         section: str | None = None,
         third_party_acknowledged: bool = False,
         third_party_hosts: Sequence[str] | None = None,
+        free_mode_enabled: bool = False,
     ) -> dict[str, Any]:
         """Make a minimal real request through the production transport path.
 
@@ -1496,20 +1948,27 @@ class ReviewControlPlane:
                 str(target_config),
                 action=action,
                 requested_stages=requested_stages,
+                free_mode_enabled=free_mode_enabled,
                 allow_template_credentials=False,
             )
-            roles = provider_sections_for_stage_plan(
+            route_plan = build_reachable_provider_route_plan(
                 normalized,
-                requested_stages=requested_stages,
                 action=action,
+                requested_stages=requested_stages,
+                free_mode_enabled=free_mode_enabled,
             )
-            selected_roles = (section,) if section else roles
-            if section and section not in roles:
+            roles = route_plan.required_provider_sections
+            selected_section = section
+            if section and section in route_plan.semantic_roles:
+                selected_section = route_plan.route_for_role(section).section_name
+            selected_roles = (selected_section,) if selected_section else roles
+            if section and selected_section not in roles:
                 return {
                     "control_plane_version": CONTROL_PLANE_VERSION,
                     "status": "BLOCKED_UNREACHABLE_ROUTE",
                     "ok": False,
                     "provider_roles": list(roles),
+                    "route_plan": route_plan.to_dict(),
                     "network_calls": 0,
                     "read_only": False,
                 }
@@ -1546,6 +2005,7 @@ class ReviewControlPlane:
                         "status": "BLOCKED_TRUST_POLICY",
                         "ok": False,
                         "provider_roles": list(selected_roles),
+                        "route_plan": route_plan.to_dict(),
                         "blocked_host": host,
                         "network_calls": 0,
                         "read_only": False,
@@ -1592,6 +2052,11 @@ class ReviewControlPlane:
                 total_calls += sum(int(receipt.attempts) for receipt in receipts)
                 results.append(
                     {
+                        "semantic_roles": [
+                            route.semantic_role
+                            for route in route_plan.routes
+                            if route.section_name == role and route.enabled
+                        ],
                         "semantic_role": role,
                         "provider_family": capability.provider_family,
                         "model": str(provider.get("model") or ""),
@@ -1613,6 +2078,8 @@ class ReviewControlPlane:
                 "status": "pass" if ok else "fail",
                 "ok": ok,
                 "provider_roles": list(selected_roles),
+                "free_mode_enabled": bool(free_mode_enabled),
+                "route_plan": route_plan.to_dict(),
                 "providers": results,
                 "network_calls": total_calls,
                 "usage": usage,

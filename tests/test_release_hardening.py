@@ -3,6 +3,8 @@ from __future__ import annotations
 import configparser
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,8 +19,16 @@ from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderBudgetController,
     ProviderRuntime,
+    ProviderRuntimeLedger,
 )
-from runtime.release_acceptance import ReleaseAcceptanceSpec, ReleaseAcceptanceSpecError
+from runtime.release_acceptance import (
+    GateEvidenceProducer,
+    GateEvidenceVerifier,
+    ReleaseAcceptanceSpec,
+    ReleaseAcceptanceSpecError,
+    validate_gate_evidence,
+)
+from runtime.provider_routes import build_reachable_provider_route_plan
 from runtime.zotero_attachment_resolver import (
     ZoteroAttachmentIndex,
     ZoteroAttachmentResolutionError,
@@ -62,6 +72,18 @@ def test_runtime_job_spec_rejects_unknown_top_level_and_nested_keys() -> None:
         )
 
 
+def test_runtime_job_spec_flat_mapping_rejects_unknown_fields() -> None:
+    with pytest.raises(ValueError, match="unexpected"):
+        RuntimeJobSpec.from_mapping(
+            {
+                "project_name": "demo",
+                "source_mode": "direct",
+                "pdf_folder": "papers",
+                "unexpected": "value",
+            }
+        )
+
+
 def test_stage_plan_config_admission_does_not_require_unreachable_sections(tmp_path: Path) -> None:
     config_path = tmp_path / "minimal.ini"
     _write_config(
@@ -90,6 +112,91 @@ def test_stage_plan_config_admission_does_not_require_unreachable_sections(tmp_p
     assert "Writer_API" not in loaded
     assert "Outline_API" not in loaded
     assert "OutlineModels" not in loaded
+
+
+def test_reachable_provider_route_plan_expands_enabled_outline_semantic_routes() -> None:
+    config = {
+        "Application": {"config_schema": "4"},
+        "Paths": {"output_path": "output"},
+        "Primary_Reader_API": {
+            "api_key": "sk-primary-reader",
+            "model": "deepseek-v4-pro",
+            "api_base": "https://api.deepseek.com",
+            "endpoint_type": "chat_completions",
+            "provider_family": "deepseek",
+        },
+        "Backup_Reader_API": {
+            "api_key": "sk-backup-reader",
+            "model": "deepseek-v4-flash",
+            "api_base": "https://api.deepseek.com",
+            "endpoint_type": "chat_completions",
+            "provider_family": "deepseek",
+        },
+        "Writer_API": {
+            "api_key": "sk-writer-api",
+            "model": "gpt-5.6-sol",
+            "api_base": "https://writer.example.test/v1",
+            "endpoint_type": "responses",
+            "provider_family": "openai_responses",
+        },
+        "Outline_API": {
+            "api_key": "sk-outline-api",
+            "model": "claude-opus-5",
+            "api_base": "https://outline.example.test",
+            "endpoint_type": "anthropic",
+            "provider_family": "anthropic",
+        },
+        "Free_Mode_API": {
+            "api_key": "sk-free-mode-api",
+            "model": "deepseek-v4-pro",
+            "api_base": "https://api.deepseek.com",
+            "endpoint_type": "chat_completions",
+            "provider_family": "deepseek",
+        },
+        "Validator_API": {
+            "api_key": "sk-validator-api",
+            "model": "deepseek-v4-flash",
+            "api_base": "https://api.deepseek.com",
+            "endpoint_type": "chat_completions",
+            "provider_family": "deepseek",
+        },
+        "Outline": {
+            "relation_adjudication_enabled": "true",
+            "structure_critique_enabled": "true",
+            "coverage_critique_enabled": "false",
+            "evidence_critique_enabled": "true",
+        },
+        "OutlineModels": {
+            "outline_model": "Outline_API",
+            "relation_adjudicator_model": "Free_Mode_API",
+            "structure_critic_model": "Writer_API",
+            "coverage_critic_model": "Free_Mode_API",
+            "evidence_critic_model": "Writer_API",
+            "arbitrator_model": "Outline_API",
+        },
+        "Validation": {"review_enabled": "false"},
+    }
+
+    plan = build_reachable_provider_route_plan(
+        config,
+        action="generate_outline",
+        requested_stages=None,
+    )
+
+    assert plan.required_provider_sections == (
+        "Outline_API",
+        "Free_Mode_API",
+        "Writer_API",
+    )
+    assert {route.semantic_role for route in plan.routes} == {
+        "candidate_provider_generation",
+        "relation_adjudication",
+        "structure_critique",
+        "evidence_critique",
+        "arbitration",
+    }
+    assert "coverage_critique" not in plan.semantic_roles
+    assert len(plan.physical_routes) == 3
 
 
 def test_stage_plan_config_admission_requires_reachable_backup(tmp_path: Path) -> None:
@@ -146,6 +253,60 @@ def test_specialized_gate_never_passes_from_completed_job_alone(tmp_path: Path, 
 
     assert result["status"] != "PASS"
     assert "evidence" in str(result.get("reason", "")).lower() or result["status"] == "NOT_VERIFIED"
+
+
+def test_acceptance_does_not_trust_handwritten_gate_facts() -> None:
+    result = validate_gate_evidence(
+        "C",
+        {
+            "final_sha": "a" * 40,
+            "source_count": 1,
+            "canonical_stage1_count": 1,
+            "actual_transport_calls": 1,
+            "closure_complete": True,
+        },
+        expected_final_sha="a" * 40,
+    )
+    assert result["status"] == "NOT_VERIFIED"
+    assert "durable" in str(result["reason"]).lower()
+
+
+def test_gate_evidence_verifier_reopens_hashed_browser_artifacts(tmp_path: Path) -> None:
+    trace = tmp_path / "playwright_trace.json"
+    browser = tmp_path / "browser_evidence.json"
+    trace.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    browser.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="b" * 40)
+    evidence = producer.build_gate(
+        "I",
+        [
+            producer.reference(trace, role="playwright_trace"),
+            producer.reference(browser, role="browser_evidence"),
+        ],
+    )
+    result = GateEvidenceVerifier().verify(
+        "I",
+        evidence,
+        expected_final_sha="b" * 40,
+    )
+    assert result["status"] == "PASS"
+    assert result["derived_facts"]["flow_completed"] is True
+
+
+def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_path: Path) -> None:
+    from runtime.control_plane import ReviewControlPlane
+
+    acceptance_spec = tmp_path / "acceptance.json"
+    acceptance_spec.write_text(
+        json.dumps({"gates": ["C"], "state_path": "state.json"}),
+        encoding="utf-8",
+    )
+    result = ReviewControlPlane(repo_root=Path.cwd()).acceptance_run(acceptance_spec)
+    assert result["status"] == "blocked"
+    assert result["gates"]["C"]["status"] == "NOT_VERIFIED"
+    state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert state["schema_version"] == "release-acceptance-run-state-v1"
+    assert state["final_sha"]
 
 
 def test_release_acceptance_budget_schema_rejects_typos() -> None:
@@ -253,6 +414,55 @@ def test_aggregate_provider_budget_state_survives_process_boundary(tmp_path: Pat
         )
 
 
+def test_provider_receipt_ledger_duplicate_identity_is_cross_process_safe(tmp_path: Path) -> None:
+    seed_ledger = ProviderRuntimeLedger(tmp_path / "seed.jsonl")
+    runtime = ProviderRuntime(ledger=seed_ledger, test_only=True)
+    admission = runtime.admit()
+    receipt = runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"text": "input"},
+        api_config={"model": "model", "api_base": "https://example.test"},
+        result={"status": "success", "content": {}, "attempts": 1, "output_tokens": 1},
+    )
+    payload_path = tmp_path / "receipt.json"
+    payload_path.write_text(json.dumps(receipt.to_dict()), encoding="utf-8")
+    target = tmp_path / "race.jsonl"
+    child = (
+        "import json,sys;"
+        "from runtime.provider_runtime import ProviderCallReceiptV1,ProviderRuntimeLedger;"
+        "payload=json.loads(open(sys.argv[2],encoding='utf-8').read());"
+        "ProviderRuntimeLedger(sys.argv[1]).append(ProviderCallReceiptV1.from_dict(payload)); print('ok')"
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", child, str(target), str(payload_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    outputs = [process.communicate(timeout=15) for process in processes]
+    assert all(stdout.strip() == "ok" for stdout, _stderr in outputs)
+    assert len(ProviderRuntimeLedger(target).list_receipts()) == 1
+
+    divergent = receipt.to_dict()
+    divergent["metadata"] = {"different_content": True}
+    divergent_path = tmp_path / "divergent.json"
+    divergent_path.write_text(json.dumps(divergent), encoding="utf-8")
+    conflict = subprocess.run(
+        [sys.executable, "-c", child, str(target), str(divergent_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert "ProviderReceiptConflict" in conflict.stderr
+
+
+
+
 def test_profile_path_rejects_traversal_and_save_is_atomic_boundary(tmp_path: Path) -> None:
     with pytest.raises(WorkspacePathError):
         get_profile_path(str(tmp_path), "../escape")
@@ -321,6 +531,48 @@ def test_strict_evidence_loader_rejects_tampered_required_artifact(tmp_path: Pat
         )
 
 
+def test_strict_evidence_loader_rejects_missing_hash_and_bounds_reads(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized.md"
+    chunks = tmp_path / "chunks.json"
+    page_index = tmp_path / "page_index.json"
+    manifest = tmp_path / "manifest.json"
+    normalized.write_text("x", encoding="utf-8")
+    chunks.write_text("[]", encoding="utf-8")
+    page_index.write_text("[]", encoding="utf-8")
+    manifest.write_text(
+        json.dumps(
+            {
+                "artifact_hashes": {
+                    "normalized.md": {
+                        "sha256": hashlib.sha256(normalized.read_bytes()).hexdigest(),
+                        "size": 1,
+                    },
+                    "chunks.json": {
+                        "sha256": hashlib.sha256(chunks.read_bytes()).hexdigest(),
+                        "size": 2,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationSourceAuthorityError, match="hash|identity"):
+        PreprocessEvidenceLoader().load_evidence(
+            normalized_text_path=str(normalized),
+            chunks_path=str(chunks),
+            page_index_path=str(page_index),
+            manifest_path=str(manifest),
+            strict=True,
+        )
+
+    oversized = tmp_path / "oversized.txt"
+    oversized.write_text("too large", encoding="utf-8")
+    with pytest.raises(ValidationSourceAuthorityError, match="size|bound"):
+        PreprocessEvidenceLoader(max_artifact_bytes=1)._read_bytes(
+            str(oversized), required=True, label="oversized"
+        )
+
+
 def test_preprocess_cache_binds_source_hash_fingerprint_and_atomic_generation(tmp_path: Path, monkeypatch) -> None:
     pdf = tmp_path / "paper.pdf"
     document = fitz.open()
@@ -340,6 +592,8 @@ def test_preprocess_cache_binds_source_hash_fingerprint_and_atomic_generation(tm
     )
     first = manager.prepare_pdf(str(pdf))
     assert first is not None
+    assert Path(first.manifest_path).parent.name.startswith("generation-")
+    assert not list(Path(first.cache_dir).glob(".generation.tmp-*"))
     manifest = json.loads(Path(first.manifest_path).read_text(encoding="utf-8"))
     assert len(manifest["source_pdf_sha256"]) == 64
     assert manifest["processing_fingerprint"] == manager.processing_fingerprint

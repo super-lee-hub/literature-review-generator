@@ -28,6 +28,18 @@ class PreprocessEvidence:
 
 class PreprocessEvidenceLoader:
     """预处理证据加载器，从磁盘加载各种预处理产物"""
+
+    DEFAULT_MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+
+    def __init__(self, *, max_artifact_bytes: int | None = None) -> None:
+        limit = (
+            self.DEFAULT_MAX_ARTIFACT_BYTES
+            if max_artifact_bytes is None
+            else int(max_artifact_bytes)
+        )
+        if limit <= 0:
+            raise ValueError("max_artifact_bytes must be positive")
+        self.max_artifact_bytes = limit
     
     def load_evidence(
         self,
@@ -123,7 +135,15 @@ class PreprocessEvidenceLoader:
                 "validation evidence manifest must be a JSON object",
                 path=str(manifest_path),
             )
-        self._verify_hash(manifest, str(manifest_path), manifest_bytes)
+        # The manifest is the root of trust for the other artifacts.  It is
+        # intentionally not required to contain a self-hash.
+        self._verify_hash(
+            manifest,
+            str(manifest_path),
+            manifest_bytes,
+            manifest_path=str(manifest_path),
+            allow_missing=True,
+        )
 
         def text_value(path: Optional[str], label: str, *, required_value: bool = False) -> str:
             if not path:
@@ -133,7 +153,12 @@ class PreprocessEvidenceLoader:
                     )
                 return ""
             raw = self._read_bytes(path, required=required_value, label=label)
-            self._verify_hash(manifest, path, raw)
+            self._verify_hash(
+                manifest,
+                path,
+                raw,
+                manifest_path=str(manifest_path),
+            )
             try:
                 value = raw.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -150,8 +175,26 @@ class PreprocessEvidenceLoader:
                     )
                 return default
             raw = self._read_bytes(path, required=required_value, label=label)
-            self._verify_hash(manifest, path, raw)
-            return self._parse_json(raw, path=path, label=label)
+            expectation = self._verify_hash(
+                manifest,
+                path,
+                raw,
+                manifest_path=str(manifest_path),
+            )
+            value = self._parse_json(raw, path=path, label=label)
+            expected_schema = (
+                expectation.get("schema_version")
+                if isinstance(expectation, Mapping)
+                else None
+            )
+            if expected_schema and isinstance(value, Mapping):
+                actual_schema = value.get("schema_version")
+                if actual_schema is not None and str(actual_schema) != str(expected_schema):
+                    raise ValidationSourceAuthorityError(
+                        f"validation evidence schema mismatch: {label}",
+                        path=path,
+                    )
+            return value
 
         normalized_text = text_value(normalized_text_path, "normalized text", required_value=True)
         plain_text = text_value(plain_text_path, "plain text") or normalized_text
@@ -181,8 +224,13 @@ class PreprocessEvidenceLoader:
             diagnostics=diagnostics,
         )
 
-    @staticmethod
-    def _read_bytes(path: str, *, required: bool, label: str) -> bytes:
+    def _read_bytes(
+        self,
+        path: str,
+        *,
+        required: bool,
+        label: str,
+    ) -> bytes:
         if not path:
             if required:
                 raise ValidationSourceAuthorityError(
@@ -190,8 +238,33 @@ class PreprocessEvidenceLoader:
                 )
             return b""
         try:
+            if os.path.islink(path):
+                raise ValidationSourceAuthorityError(
+                    f"validation evidence path is a symlink: {label}",
+                    path=path,
+                )
+            size_before = os.path.getsize(path)
+            if size_before > self.max_artifact_bytes:
+                raise ValidationSourceAuthorityError(
+                    f"validation evidence exceeds the bounded read size for {label}",
+                    path=path,
+                )
             with open(path, "rb") as handle:
-                return handle.read()
+                raw = handle.read(self.max_artifact_bytes + 1)
+                if len(raw) > self.max_artifact_bytes:
+                    raise ValidationSourceAuthorityError(
+                        f"validation evidence exceeds the bounded read size for {label}",
+                        path=path,
+                    )
+                size_after = os.fstat(handle.fileno()).st_size
+            if size_before != size_after or size_after != len(raw):
+                raise ValidationSourceAuthorityError(
+                    f"validation evidence changed while being read: {label}",
+                    path=path,
+                )
+            return raw
+        except ValidationSourceAuthorityError:
+            raise
         except (OSError, ValueError) as exc:
             raise ValidationSourceAuthorityError(
                 f"validation evidence cannot be read: {label}", path=path
@@ -207,36 +280,104 @@ class PreprocessEvidenceLoader:
             ) from exc
 
     @staticmethod
-    def _verify_hash(manifest: Mapping[str, Any], path: str, raw: bytes) -> None:
+    def _verify_hash(
+        manifest: Mapping[str, Any],
+        path: str,
+        raw: bytes,
+        *,
+        manifest_path: str = "",
+        allow_missing: bool = False,
+    ) -> Mapping[str, Any] | None:
+        """Verify one exact manifest path and return its expectation.
+
+        Relative manifest paths are resolved relative to the manifest itself.
+        Matching by basename alone is deliberately forbidden: two artifacts
+        with the same name in different directories must not share a hash
+        entry.
+        """
+
+        target = Path(path).expanduser().resolve()
+        root = Path(manifest_path).expanduser().resolve().parent if manifest_path else target.parent
+
+        def canonical(candidate: Any) -> Path | None:
+            value = str(candidate or "").strip()
+            if not value:
+                return None
+            candidate_path = Path(value).expanduser()
+            if not candidate_path.is_absolute():
+                candidate_path = root / candidate_path
+            return candidate_path.resolve()
+
+        matches: list[Mapping[str, Any]] = []
         hashes = manifest.get("artifact_hashes")
-        target = Path(path)
-        expected: Any = None
         if isinstance(hashes, Mapping):
             for key, value in hashes.items():
-                key_path = Path(str(key))
-                if (
-                    str(key_path).casefold() == str(target).casefold()
-                    or key_path.name.casefold() == target.name.casefold()
-                ):
-                    expected = value
-                    break
-        if expected is None:
+                if canonical(key) == target:
+                    matches.append(value if isinstance(value, Mapping) else {"sha256": value})
+        if not matches:
             # EvidenceManifestV1 uses typed artifact entries rather than the
-            # preprocess cache's basename-keyed artifact_hashes map.
+            # preprocess cache's artifact_hashes map.
             for entry in manifest.get("artifacts", ()) or ():
                 if not isinstance(entry, Mapping):
                     continue
-                entry_path = Path(str(entry.get("path") or ""))
-                if entry_path.name.casefold() == target.name.casefold():
-                    expected = entry.get("content_hash")
-                    break
-        if isinstance(expected, Mapping):
-            expected = expected.get("sha256")
-        expected_text = str(expected or "").strip().lower()
-        if expected_text and hashlib.sha256(raw).hexdigest() != expected_text:
+                entry_path = canonical(entry.get("path") or entry.get("relative_path"))
+                if entry_path == target:
+                    matches.append(
+                        {
+                            **dict(entry),
+                            "sha256": entry.get("sha256") or entry.get("content_hash"),
+                        }
+                    )
+        if len(matches) > 1:
+            raise ValidationSourceAuthorityError(
+                f"validation evidence identity is ambiguous: {target.name}",
+                path=path,
+            )
+        if not matches:
+            if allow_missing:
+                return None
+            raise ValidationSourceAuthorityError(
+                f"validation evidence has no exact hash identity: {target.name}",
+                path=path,
+            )
+        expectation = dict(matches[0])
+        expected_text = str(
+            expectation.get("sha256")
+            or expectation.get("content_hash")
+            or ""
+        ).strip()
+        if (
+            len(expected_text) != 64
+            or expected_text != expected_text.lower()
+            or any(char not in "0123456789abcdef" for char in expected_text)
+        ):
+            raise ValidationSourceAuthorityError(
+                f"validation evidence expected SHA-256 is invalid: {target.name}",
+                path=path,
+            )
+        expected_size = expectation.get("size")
+        if expected_size is not None:
+            if isinstance(expected_size, bool):
+                raise ValidationSourceAuthorityError(
+                    f"validation evidence expected size is invalid: {target.name}",
+                    path=path,
+                )
+            try:
+                if int(expected_size) != len(raw):
+                    raise ValidationSourceAuthorityError(
+                        f"validation evidence size mismatch: {target.name}",
+                        path=path,
+                    )
+            except (TypeError, ValueError) as exc:
+                raise ValidationSourceAuthorityError(
+                    f"validation evidence expected size is invalid: {target.name}",
+                    path=path,
+                ) from exc
+        if hashlib.sha256(raw).hexdigest() != expected_text:
             raise ValidationSourceAuthorityError(
                 f"validation evidence hash mismatch: {target.name}", path=path
             )
+        return expectation
     
     def _load_text(self, path: Optional[str]) -> str:
         """加载文本文件"""

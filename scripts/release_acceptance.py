@@ -47,6 +47,7 @@ DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_PROVIDER_CALL_CEILING = 24
 DEFAULT_OUTPUT_TOKEN_CEILING = 5_000_000
 DEFAULT_RETRY_CEILING = 2
+MAX_ACCEPTANCE_INDEX_BYTES = 16 * 1024 * 1024
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(bearer\s+)[^\s,}\"]+"),
@@ -146,6 +147,19 @@ def _contains_credential_blocker(payload: Any) -> bool:
     return any(marker.casefold() in text for marker in _CREDENTIAL_MARKERS)
 
 
+def _read_json_bounded(path: Path) -> Any:
+    try:
+        if path.stat().st_size > MAX_ACCEPTANCE_INDEX_BYTES:
+            raise ValueError("acceptance JSON exceeds bounded input size")
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_ACCEPTANCE_INDEX_BYTES + 1)
+        if len(raw) > MAX_ACCEPTANCE_INDEX_BYTES:
+            raise ValueError("acceptance JSON exceeds bounded input size")
+        return json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"acceptance JSON is unreadable: {type(exc).__name__}") from exc
+
+
 def _offline_gate(repo_root: Path, *, timeout_seconds: int) -> dict[str, Any]:
     pyright_command = ["-m", "pyright"]
     active_prefix = Path(sys.prefix).resolve()
@@ -184,8 +198,8 @@ def _offline_gate(repo_root: Path, *, timeout_seconds: int) -> dict[str, Any]:
 
 def _read_spec(spec: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     try:
-        payload = json.loads(spec.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = _read_json_bounded(spec)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         return None, {
             "gate": PREFLIGHT_GATE,
             "status": "BLOCKED_INPUT",
@@ -270,13 +284,13 @@ def _load_acceptance_spec(
     if path is None:
         return None, None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = _read_json_bounded(path)
         return ReleaseAcceptanceSpec.from_mapping(
             payload,
             origin_dir=path.parent,
             defaults=_command_budget(args),
         ), None
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ReleaseAcceptanceSpecError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, ReleaseAcceptanceSpecError) as exc:
         return None, {
             "gate": PREFLIGHT_GATE,
             "status": "BLOCKED_INPUT",
@@ -291,8 +305,8 @@ def _gate_evidence(
     if acceptance_spec is None or not acceptance_spec.evidence_manifest:
         return None
     try:
-        payload = json.loads(Path(acceptance_spec.evidence_manifest).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = _read_json_bounded(Path(acceptance_spec.evidence_manifest))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, Mapping):
         return None
@@ -328,6 +342,11 @@ def _preflight_gate(
     action = str(payload.get("action") or "run_all")
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
     stages = metadata.get("requested_stages") if isinstance(metadata, Mapping) else None
+    free_mode_enabled = bool(
+        str(payload.get("free_mode_profile") or "").strip()
+        or str(payload.get("free_mode_idea") or "").strip()
+        or (isinstance(metadata, Mapping) and metadata.get("free_mode_input"))
+    )
     try:
         budget = _effective_budget(payload, args, acceptance_spec)
     except (TypeError, ValueError) as exc:
@@ -349,6 +368,8 @@ def _preflight_gate(
     ]
     if stages:
         preflight_args.extend(["--stages", *[str(item) for item in stages]])
+    if free_mode_enabled:
+        preflight_args.append("--free-mode-enabled")
     preflight = _command(preflight_args, cwd=repo_root, timeout_seconds=budget["max_wall_seconds"])
     result: dict[str, Any] = {
         "gate": PREFLIGHT_GATE,
@@ -376,6 +397,8 @@ def _preflight_gate(
         ]
         if stages:
             probe_args.extend(["--stages", *[str(item) for item in stages]])
+        if free_mode_enabled:
+            probe_args.append("--free-mode-enabled")
         if acceptance_spec is not None and acceptance_spec.third_party_acknowledged:
             probe_args.append("--third-party-acknowledged")
             for host in acceptance_spec.third_party_hosts:
@@ -456,6 +479,14 @@ def _live_gate(
         gate,
         evidence,
         expected_final_sha=_current_sha(repo_root),
+        origin_dir=Path(acceptance_spec.evidence_manifest).parent
+        if acceptance_spec is not None and acceptance_spec.evidence_manifest
+        else None,
+        expected_job_id=str(
+            acceptance_spec.job_id
+            if acceptance_spec is not None and acceptance_spec.job_id
+            else payload.get("job_id") or ""
+        ),
     )
     return {
         "gate": gate,

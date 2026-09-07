@@ -361,48 +361,82 @@ class RuntimeJobSpec:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "RuntimeJobSpec":
-        source_mode = cast(
-            SourceMode,
-            "zotero" if payload.get("zotero_report") else str(payload.get("source_mode") or "direct"),
+        if not isinstance(payload, Mapping):
+            raise ValueError("RuntimeJobSpec mapping must be a JSON object")
+        if "source" in payload:
+            # Structured callers must use the same strict parser as the JSON
+            # file boundary; this method is not a permissive dict sink.
+            return cls.from_dict(payload)
+        allowed = frozenset(
+            {
+                "project_name",
+                "source_mode",
+                "pdf_folder",
+                "zotero_report",
+                "library_path",
+                *(
+                    field_name
+                    for field_name in _RUNTIME_JOB_FIELDS
+                    if field_name not in {"source", "metadata"}
+                ),
+                "metadata",
+            }
         )
-        return cls(
-            project_name=str(payload.get("project_name") or ""),
-            source=RuntimeSourceSpec(
-                mode=source_mode,
-                pdf_folder=str(payload.get("pdf_folder") or ""),
-                zotero_report=str(payload.get("zotero_report") or ""),
-                library_path=str(payload.get("library_path") or ""),
-            ),
-            job_id=str(payload.get("job_id") or ""),
-            config=str(payload.get("config") or "config.ini"),
-            action=str(payload.get("action") or "run_all"),
-            free_mode_profile=str(payload.get("free_mode_profile") or ""),
-            free_mode_idea=str(payload.get("free_mode_idea") or ""),
-            summary_file=str(payload.get("summary_file") or ""),
-            summary_sources=tuple(
-                str(item).strip()
-                for item in payload.get("summary_sources", [])
-                if str(item).strip()
-            ),
-            reuse_stage1=(
-                _optional_bool(payload["reuse_stage1"], field_name="reuse_stage1")
-                if payload.get("reuse_stage1") is not None
-                else None
-            ),
-            reuse_summary_files=tuple(
-                str(item).strip()
-                for item in payload.get("reuse_summary_files", [])
-                if str(item).strip()
-            ),
-            generate_section=(
-                int(payload["generate_section"])
-                if payload.get("generate_section") is not None
-                else None
-            ),
-            queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            workspace_path=str(payload.get("workspace_path") or ""),
-            metadata=dict(payload.get("metadata") or {}),
-        )
+        _reject_unknown_fields(payload, allowed, label="RuntimeJobSpec mapping")
+
+        def optional_text(name: str, default: str = "") -> str:
+            value = payload.get(name)
+            if value is None:
+                return default
+            if not isinstance(value, str):
+                raise ValueError(f"{name} must be a string")
+            return value
+
+        source_mode_raw = payload.get("source_mode")
+        if source_mode_raw is None:
+            source_mode_raw = "zotero" if payload.get("zotero_report") else "direct"
+        if not isinstance(source_mode_raw, str):
+            raise ValueError("source_mode must be a string")
+        metadata = payload.get("metadata", {})
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, Mapping):
+            raise ValueError("metadata must be a JSON object")
+        _reject_unknown_fields(metadata, _RUNTIME_METADATA_FIELDS, label="metadata")
+        summary_sources = payload.get("summary_sources", ())
+        reuse_summary_files = payload.get("reuse_summary_files", ())
+        if not isinstance(summary_sources, (list, tuple)):
+            raise ValueError("summary_sources must be an array of strings")
+        if not isinstance(reuse_summary_files, (list, tuple)):
+            raise ValueError("reuse_summary_files must be an array of strings")
+        if any(not isinstance(item, str) for item in (*summary_sources, *reuse_summary_files)):
+            raise ValueError("summary_sources and reuse_summary_files must contain strings")
+        raw_section = payload.get("generate_section")
+        if raw_section is not None and (isinstance(raw_section, bool) or not isinstance(raw_section, int)):
+            raise ValueError("generate_section must be an integer")
+        normalized = {
+            "project_name": optional_text("project_name"),
+            "source": {
+                "mode": source_mode_raw,
+                "pdf_folder": optional_text("pdf_folder"),
+                "zotero_report": optional_text("zotero_report"),
+                "library_path": optional_text("library_path"),
+            },
+            "job_id": optional_text("job_id"),
+            "config": optional_text("config", "config.ini"),
+            "action": optional_text("action", "run_all"),
+            "free_mode_profile": optional_text("free_mode_profile"),
+            "free_mode_idea": optional_text("free_mode_idea"),
+            "summary_file": optional_text("summary_file"),
+            "summary_sources": list(summary_sources),
+            "reuse_stage1": payload.get("reuse_stage1"),
+            "reuse_summary_files": list(reuse_summary_files),
+            "generate_section": raw_section,
+            "queue_file": optional_text("queue_file", "output/_queue/queue.json"),
+            "workspace_path": optional_text("workspace_path"),
+            "metadata": dict(metadata),
+        }
+        return cls.from_dict(normalized)
 
 
 def load_runtime_job_spec(path: str | Path) -> RuntimeJobSpec:

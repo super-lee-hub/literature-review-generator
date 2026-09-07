@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, cast
@@ -158,6 +159,9 @@ class PreprocessManager:
         self.force_rebuild = _as_bool(preprocess_section.get("force_rebuild", "false"))
         self.enable_local_rag = _as_bool(preprocess_section.get("enable_local_rag", "false"))
         self.rag_backend = str(preprocess_section.get("rag_backend", "chroma")).strip().lower()
+        self.local_rag_allow_model_download = _as_bool(
+            preprocess_section.get("local_rag_allow_model_download", "false")
+        )
         self.rag_persist_dir = os.path.join(self.cache_root, "_rag")
 
         self.parser_mode = str(preprocess_section.get("parser_mode", "local")).strip().lower() or "local"
@@ -308,6 +312,7 @@ class PreprocessManager:
         source_identity = self._source_identity(pdf_path)
         cache_dir = os.path.join(self.cache_root, self._pdf_cache_key(pdf_path, source_identity))
         os.makedirs(cache_dir, exist_ok=True)
+        self._gc_generations(cache_dir)
         active = self._active_generation(cache_dir)
         if (not self.force_rebuild) and active is not None:
             generation_dir, active_paths = active
@@ -342,8 +347,11 @@ class PreprocessManager:
                 if cached is not None:
                     return cached
 
-        generation_dir = tempfile.mkdtemp(prefix=".generation.tmp-", dir=cache_dir)
-        artifact_paths = self._artifact_paths(generation_dir)
+        staging_dir = tempfile.mkdtemp(prefix=".generation.tmp-", dir=cache_dir)
+        generation_id = f"generation-{uuid.uuid4().hex}"
+        generation_dir = os.path.join(cache_dir, generation_id)
+        artifact_paths = self._artifact_paths(staging_dir)
+        published_artifact_paths = self._artifact_paths(generation_dir)
         extraction = self._extract_preferred_content(pdf_path)
         if not extraction:
             return None
@@ -378,8 +386,10 @@ class PreprocessManager:
         scanned_like = any(item.scanned_candidate for item in page_diagnostics)
         used_ocr = any(item.used_ocr for item in page_diagnostics) or bool(extraction.get("used_ocr"))
         local_rag_built = self._maybe_build_local_rag(
-            collection_name=self._pdf_cache_key(pdf_path),
+            collection_name=self._pdf_cache_key(pdf_path, source_identity),
             chunks=chunks,
+            source_pdf_sha256=str(source_identity["sha256"]),
+            processing_fingerprint=self.processing_fingerprint,
         )
 
         extractor_used = str(extraction.get("extractor_used", "fitz") or "fitz")
@@ -401,6 +411,7 @@ class PreprocessManager:
             "used_ocr": used_ocr,
             "ocr_available": self._ocr_available(),
             "local_rag_enabled": self.enable_local_rag,
+            "local_rag_allow_model_download": self.local_rag_allow_model_download,
             "local_rag_built": local_rag_built,
             "mineru_attempted": mineru_attempted,
             "mineru_succeeded": mineru_succeeded,
@@ -442,6 +453,8 @@ class PreprocessManager:
             "source_pdf_size": source_identity["size"],
             "file_size": source_identity["size"],
             "modified_time": source_identity["mtime"],
+            "source_pdf_mtime_ns": source_identity["mtime_ns"],
+            "source_pdf_file_id": source_identity["file_id"],
             "processing_fingerprint": self.processing_fingerprint,
             "extractor_used": extractor_used,
             "layout_fidelity": layout_fidelity,
@@ -451,6 +464,7 @@ class PreprocessManager:
             "scanned_like": scanned_like,
             "used_ocr": used_ocr,
             "local_rag_enabled": self.enable_local_rag,
+            "local_rag_allow_model_download": self.local_rag_allow_model_download,
             "local_rag_built": local_rag_built,
             "local_rag_persist_dir": self.rag_persist_dir,
             "mineru_attempted": mineru_attempted,
@@ -468,6 +482,23 @@ class PreprocessManager:
             "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
             "artifacts": diagnostics_payload["artifact_paths"],
         }
+        # Keep all metadata path references stable across the staging-directory
+        # rename below.
+        stage1_manifest_payload = self._rewrite_generation_paths(
+            stage1_manifest_payload,
+            staging_dir,
+            generation_dir,
+        )
+        stage1_quality_report_payload = self._rewrite_generation_paths(
+            stage1_quality_report_payload,
+            staging_dir,
+            generation_dir,
+        )
+        diagnostics_payload = self._rewrite_generation_paths(
+            diagnostics_payload,
+            staging_dir,
+            generation_dir,
+        )
         self._write_text_durable(artifact_paths["markdown_path"], markdown_text)
         self._write_text_durable(artifact_paths["plain_text_path"], plain_text)
         self._write_json_durable(artifact_paths["page_index_path"], page_index)
@@ -491,26 +522,35 @@ class PreprocessManager:
             artifact_paths,
             exclude={"manifest_path"},
         )
+        # Metadata is durable evidence and must never retain the staging path
+        # which disappears when the generation is atomically published.
+        manifest_payload = self._rewrite_generation_paths(
+            manifest_payload,
+            staging_dir,
+            generation_dir,
+        )
         self._write_json_durable(artifact_paths["manifest_path"], manifest_payload)
+        os.replace(staging_dir, generation_dir)
         self._publish_active_generation(
             cache_dir,
             generation_dir,
-            manifest_path=artifact_paths["manifest_path"],
+            manifest_path=published_artifact_paths["manifest_path"],
         )
+        self._gc_generations(cache_dir, active_generation_id=generation_id)
 
         return PreprocessResult(
             pdf_path=pdf_path,
             cache_dir=cache_dir,
-            markdown_path=artifact_paths["markdown_path"],
-            plain_text_path=artifact_paths["plain_text_path"],
-            page_index_path=artifact_paths["page_index_path"],
-            chunks_path=artifact_paths["chunks_path"],
-            diagnostics_path=artifact_paths["diagnostics_path"],
-            structured_json_path=artifact_paths["structured_json_path"],
-            manifest_path=artifact_paths["manifest_path"],
-            stage1_input_path=artifact_paths["stage1_input_path"],
-            stage1_input_manifest_path=artifact_paths["stage1_input_manifest_path"],
-            stage1_quality_report_path=artifact_paths["stage1_quality_report_path"],
+            markdown_path=published_artifact_paths["markdown_path"],
+            plain_text_path=published_artifact_paths["plain_text_path"],
+            page_index_path=published_artifact_paths["page_index_path"],
+            chunks_path=published_artifact_paths["chunks_path"],
+            diagnostics_path=published_artifact_paths["diagnostics_path"],
+            structured_json_path=published_artifact_paths["structured_json_path"],
+            manifest_path=published_artifact_paths["manifest_path"],
+            stage1_input_path=published_artifact_paths["stage1_input_path"],
+            stage1_input_manifest_path=published_artifact_paths["stage1_input_manifest_path"],
+            stage1_quality_report_path=published_artifact_paths["stage1_quality_report_path"],
             markdown_text=markdown_text,
             plain_text=plain_text,
             stage1_input_text=stage1_selection.selected_text,
@@ -551,6 +591,90 @@ class PreprocessManager:
         }
 
     @staticmethod
+    def _rewrite_generation_paths(value: Any, staging_dir: str, generation_dir: str) -> Any:
+        """Rewrite only exact staging prefixes inside durable metadata."""
+
+        if isinstance(value, str):
+            prefix = os.path.abspath(staging_dir)
+            candidate = os.path.abspath(value) if os.path.isabs(value) else value
+            if isinstance(candidate, str) and candidate.startswith(prefix):
+                return os.path.abspath(generation_dir) + candidate[len(prefix):]
+            return value
+        if isinstance(value, dict):
+            return {
+                key: PreprocessManager._rewrite_generation_paths(
+                    item, staging_dir, generation_dir
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                PreprocessManager._rewrite_generation_paths(item, staging_dir, generation_dir)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                PreprocessManager._rewrite_generation_paths(item, staging_dir, generation_dir)
+                for item in value
+            )
+        return value
+
+    def _gc_generations(
+        self,
+        cache_dir: str,
+        *,
+        active_generation_id: str | None = None,
+        keep_generations: int = 1,
+        temp_ttl_seconds: float = 24 * 60 * 60,
+    ) -> dict[str, list[str]]:
+        """Safely remove only stale, non-active cache generations."""
+
+        root = Path(cache_dir).expanduser().resolve()
+        active_id = str(active_generation_id or "").strip()
+        if not active_id:
+            try:
+                pointer = json.loads((root / "active_generation.json").read_text(encoding="utf-8"))
+                active_id = str(pointer.get("generation_id") or "").strip()
+            except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+                active_id = ""
+        now = time.time()
+        removed_tmp: list[str] = []
+        removed_generations: list[str] = []
+        generation_dirs: list[tuple[float, Path]] = []
+        for child in root.iterdir() if root.is_dir() else ():
+            if child.is_symlink():
+                continue
+            if child.is_dir() and child.name.startswith(".generation.tmp-"):
+                try:
+                    if now - child.stat().st_mtime >= max(0.0, float(temp_ttl_seconds)):
+                        shutil.rmtree(child)
+                        removed_tmp.append(str(child))
+                except OSError:
+                    continue
+            elif child.is_dir() and child.name.startswith("generation-"):
+                try:
+                    generation_dirs.append((child.stat().st_mtime, child))
+                except OSError:
+                    continue
+        generation_dirs.sort(key=lambda item: item[0], reverse=True)
+        keep_count = max(1, int(keep_generations))
+        keep_names = {path.name for _mtime, path in generation_dirs[:keep_count]}
+        if active_id:
+            keep_names.add(active_id)
+        for _mtime, child in generation_dirs:
+            if child.name in keep_names:
+                continue
+            try:
+                shutil.rmtree(child)
+                removed_generations.append(str(child))
+            except OSError:
+                continue
+        return {
+            "removed_tmp": removed_tmp,
+            "removed_generations": removed_generations,
+        }
+
+    @staticmethod
     def _write_text_durable(path: str, value: str) -> None:
         directory = os.path.dirname(os.path.abspath(path))
         os.makedirs(directory, exist_ok=True)
@@ -578,16 +702,42 @@ class PreprocessManager:
 
     def _source_identity(self, pdf_path: str) -> Dict[str, Any]:
         canonical_path = os.path.realpath(os.path.abspath(pdf_path))
-        before = os.stat(canonical_path)
-        digest = self._file_sha256(canonical_path)
-        after = os.stat(canonical_path)
-        if before.st_size != after.st_size:
-            raise RuntimeError("source PDF changed while its content hash was being computed")
+        with open(canonical_path, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after_handle = os.fstat(handle.fileno())
+        after_path = os.stat(canonical_path)
+        before_tuple = (
+            int(before.st_dev),
+            int(getattr(before, "st_ino", 0)),
+            int(before.st_size),
+            int(getattr(before, "st_mtime_ns", int(before.st_mtime * 1_000_000_000))),
+        )
+        after_tuple = (
+            int(after_path.st_dev),
+            int(getattr(after_path, "st_ino", 0)),
+            int(after_path.st_size),
+            int(getattr(after_path, "st_mtime_ns", int(after_path.st_mtime * 1_000_000_000))),
+        )
+        handle_tuple = (
+            int(after_handle.st_dev),
+            int(getattr(after_handle, "st_ino", 0)),
+            int(after_handle.st_size),
+            int(getattr(after_handle, "st_mtime_ns", int(after_handle.st_mtime * 1_000_000_000))),
+        )
+        if before_tuple != handle_tuple or before_tuple != after_tuple:
+            raise RuntimeError(
+                "source PDF changed while its content hash and stable file identity were being computed"
+            )
         return {
             "canonical_path": canonical_path,
-            "size": int(after.st_size),
-            "mtime": float(after.st_mtime),
-            "sha256": digest,
+            "size": int(after_path.st_size),
+            "mtime": float(after_path.st_mtime),
+            "mtime_ns": int(after_path.st_mtime_ns),
+            "file_id": f"{int(after_path.st_dev)}:{int(getattr(after_path, 'st_ino', 0))}",
+            "sha256": digest.hexdigest(),
         }
 
     def _processing_fingerprint(self) -> str:
@@ -606,6 +756,7 @@ class PreprocessManager:
             "ocr_languages": self.ocr_languages,
             "mineru_model_version": self.mineru_model_version,
             "source_pdf_max_bytes": self.source_pdf_max_bytes,
+            "local_rag_allow_model_download": self.local_rag_allow_model_download,
         }
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -623,7 +774,11 @@ class PreprocessManager:
             if pointer.get("schema_version") != PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION:
                 return None
             generation_name = str(pointer.get("generation_id") or "").strip()
-            if not generation_name or os.path.basename(generation_name) != generation_name:
+            if (
+                not generation_name
+                or os.path.basename(generation_name) != generation_name
+                or not generation_name.startswith("generation-")
+            ):
                 return None
             generation_dir = os.path.join(cache_dir, generation_name)
             if os.path.realpath(generation_dir) != os.path.abspath(generation_dir):
@@ -643,6 +798,9 @@ class PreprocessManager:
         *,
         manifest_path: str,
     ) -> None:
+        generation_name = os.path.basename(generation_dir)
+        if not generation_name.startswith("generation-"):
+            raise RuntimeError("preprocess active-generation pointer requires a finalized generation")
         pointer_path = os.path.join(cache_dir, "active_generation.json")
         if os.path.islink(pointer_path):
             raise RuntimeError("preprocess active-generation pointer is a symlink")
@@ -650,7 +808,7 @@ class PreprocessManager:
             pointer_path,
             {
                 "schema_version": PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION,
-                "generation_id": os.path.basename(generation_dir),
+                "generation_id": generation_name,
                 "manifest_sha256": self._file_sha256(manifest_path),
             },
         )
@@ -854,16 +1012,6 @@ class PreprocessManager:
 
         if local_result:
             return local_result
-
-        legacy_result = self._extract_with_legacy_pdf_extractor(
-            pdf_path=pdf_path,
-            baseline_plain_text=baseline_plain_text,
-            baseline_page_diagnostics=baseline_page_diagnostics,
-            baseline_page_blocks=baseline_page_blocks,
-            baseline_page_index=baseline_page_index,
-        )
-        if legacy_result:
-            return legacy_result
 
         return None
 
@@ -1572,61 +1720,6 @@ class PreprocessManager:
 
 
 
-    def _extract_with_legacy_pdf_extractor(
-        self,
-        pdf_path: str,
-        baseline_plain_text: str,
-        baseline_page_diagnostics: List[PageDiagnostics],
-        baseline_page_blocks: List[Dict[str, Any]],
-        baseline_page_index: List[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        try:
-            from pdf_extractor import extract_text_from_pdf  # type: ignore
-        except Exception:
-            return None
-
-        try:
-            plain_text = str(extract_text_from_pdf(pdf_path) or "").strip()
-        except Exception as exc:
-            self._log(f"Legacy pdf_extractor fallback failed: {exc}", level="warning")
-            return None
-
-        if not plain_text:
-            plain_text = baseline_plain_text
-        if not plain_text:
-            return None
-
-        page_index = baseline_page_index
-        if not page_index:
-            page_index = [
-                {
-                    "page_number": 1,
-                    "text": plain_text,
-                    "text_length": len(plain_text),
-                    "image_count": 0,
-                    "block_count": 0,
-                    "scanned_candidate": False,
-                    "used_ocr": False,
-                    "low_quality": len(plain_text) < 80,
-                }
-            ]
-
-        return {
-            "markdown_text": self._fallback_markdown_from_text(plain_text),
-            "plain_text": plain_text,
-            "page_index": page_index,
-            "page_diagnostics": baseline_page_diagnostics,
-            "page_blocks": baseline_page_blocks,
-            "structured_payload": {
-                "pages": baseline_page_blocks,
-                "page_index": page_index,
-            },
-            "extractor_used": "legacy_pdf_extractor",
-            "layout_fidelity": "plain_text_only",
-            "conversion_used": "native_pdf",
-            "used_ocr": any(item.used_ocr for item in baseline_page_diagnostics),
-        }
-
     def _should_try_docling_fallback(
         self,
         plain_text: str,
@@ -2315,6 +2408,8 @@ class PreprocessManager:
                 str(manifest.get("canonical_source_path") or "") != source["canonical_path"]
                 or str(manifest.get("source_pdf_sha256") or "") != source["sha256"]
                 or int(manifest.get("source_pdf_size") or -1) != source["size"]
+                or int(manifest.get("source_pdf_mtime_ns") or -1) != source["mtime_ns"]
+                or str(manifest.get("source_pdf_file_id") or "") != source["file_id"]
                 or str(manifest.get("processing_fingerprint") or "") != self.processing_fingerprint
             ):
                 return False
@@ -2417,7 +2512,14 @@ class PreprocessManager:
             return value
         return str(value)
 
-    def _maybe_build_local_rag(self, collection_name: str, chunks: List[Dict[str, Any]]) -> bool:
+    def _maybe_build_local_rag(
+        self,
+        collection_name: str,
+        chunks: List[Dict[str, Any]],
+        *,
+        source_pdf_sha256: str = "",
+        processing_fingerprint: str = "",
+    ) -> bool:
         if not self.enable_local_rag or not chunks:
             return False
         if self.rag_backend != "chroma":
@@ -2427,7 +2529,13 @@ class PreprocessManager:
             from rag.local_rag import LocalRAGIndex
 
             index = LocalRAGIndex(persist_dir=self.rag_persist_dir, logger=self.logger)
-            built = index.build_from_chunks(collection_name=collection_name, chunks=chunks)
+            built = index.build_from_chunks(
+                collection_name=collection_name,
+                chunks=chunks,
+                source_pdf_sha256=source_pdf_sha256,
+                processing_fingerprint=processing_fingerprint,
+                allow_model_download=self.local_rag_allow_model_download,
+            )
             if not built:
                 self._log("Local RAG skipped because dependencies are unavailable or chunks are empty.", level="info")
             return built

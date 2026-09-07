@@ -248,6 +248,8 @@ retain_page_index = true
 retain_diagnostics = true
 enable_local_rag = false
 rag_backend = chroma
+# Local RAG never downloads an embedding model unless this is explicitly true.
+local_rag_allow_model_download = false
 source_pdf_max_bytes = 134217728
 
 [Stage1_Input]

@@ -37,40 +37,16 @@ def provider_sections_for_stage_plan(
     action: str,
     free_mode_enabled: bool = False,
 ) -> tuple[str, ...]:
-    """Return only provider roles reachable from the durable StagePlan."""
+    """Return provider sections from the authoritative reachable route plan."""
 
-    from runtime.stage_planning import build_stage_plan
+    from runtime.provider_routes import build_reachable_provider_route_plan
 
-    settings = ApplicationSettings.from_config(config)
-    plan = build_stage_plan(
+    return build_reachable_provider_route_plan(
+        config,
         action=action,
         requested_stages=requested_stages,
-        validation_enabled=settings.review_validation_enabled(),
-    )
-    roles: list[str] = []
-    stages = set(plan.requested_stages)
-    if "analyze" in stages:
-        roles.append("Primary_Reader_API")
-        stage1 = config.get("Stage1_Input", {})
-        primary_only = str(stage1.get("primary_reader_only") or "").strip().casefold() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        if not primary_only:
-            roles.append("Backup_Reader_API")
-        if settings.validation.stage1_enabled:
-            roles.append("Validator_API")
-    if "outline" in stages:
-        roles.append("Outline_API")
-    if "review" in stages:
-        roles.append("Writer_API")
-    if "validate" in stages:
-        roles.append("Validator_API")
-    if free_mode_enabled:
-        roles.append("Free_Mode_API")
-    return tuple(dict.fromkeys(roles))
+        free_mode_enabled=free_mode_enabled,
+    ).required_provider_sections
 
 
 def load_config(
@@ -208,8 +184,12 @@ def load_config(
             # A few integrations replace the validator with a legacy one-arg
             # callback.  Keep that seam compatible without swallowing real
             # validation failures from the production validator.
-            if "unexpected keyword" not in str(exc):
+            if "unexpected keyword" not in str(exc) or action is not None:
                 raise
+            # A no-action legacy helper may still be used by configuration
+            # editors. Once an action/StagePlan is present, silently dropping
+            # the route-aware validator arguments would make production
+            # admission non-authoritative and therefore fails closed.
             valid, messages = validate_all_config(config_dict)
         if not valid:
             raise configparser.Error("配置文件验证失败: " + "; ".join(messages))

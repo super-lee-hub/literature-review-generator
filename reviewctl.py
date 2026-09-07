@@ -188,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--action", default="analyze")
     preflight.add_argument("--stages", nargs="*", default=None)
     preflight.add_argument("--section", default="")
+    preflight.add_argument("--free-mode-enabled", action="store_true")
 
     micro_probe = subparsers.add_parser("micro-probe")
     micro_probe.add_argument("--config", dest="micro_probe_config", default="")
@@ -196,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     micro_probe.add_argument("--section", default="")
     micro_probe.add_argument("--third-party-acknowledged", action="store_true")
     micro_probe.add_argument("--third-party-host", action="append", default=[])
+    micro_probe.add_argument("--free-mode-enabled", action="store_true")
 
     config_migrate = subparsers.add_parser("config-migrate")
     config_migrate.add_argument("--config", dest="migrate_config", required=True)
@@ -210,6 +212,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = subparsers.add_parser("plan")
     plan.add_argument("--spec", required=True)
+
+    acceptance_run = subparsers.add_parser("acceptance-run")
+    acceptance_run.add_argument("--acceptance-spec", required=True)
 
     for command in ("run",):
         subparser = subparsers.add_parser(command)
@@ -292,6 +297,8 @@ def build_parser() -> argparse.ArgumentParser:
 def _exit_code(command: str, payload: dict[str, Any]) -> int:
     if command in {"doctor", "preflight", "micro-probe"}:
         return 0 if bool(payload.get("ok")) else 1
+    if command == "acceptance-run":
+        return 0 if bool(payload.get("ok")) else 1
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
     if command == "config-migrate":
@@ -328,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
                 action=args.action,
                 requested_stages=args.stages,
                 section=args.section or None,
+                free_mode_enabled=bool(args.free_mode_enabled),
             )
         elif args.command == "micro-probe":
             payload = control.provider_micro_probe(
@@ -337,11 +345,14 @@ def main(argv: list[str] | None = None) -> int:
                 section=args.section or None,
                 third_party_acknowledged=bool(args.third_party_acknowledged),
                 third_party_hosts=args.third_party_host,
+                free_mode_enabled=bool(args.free_mode_enabled),
             )
         elif args.command == "config-migrate":
             payload = _config_migrate_command(args)
         elif args.command == "plan":
             payload = control.plan(args.spec)
+        elif args.command == "acceptance-run":
+            payload = control.acceptance_run(args.acceptance_spec)
         elif args.command == "run":
             payload = control.run(
                 args.spec,
