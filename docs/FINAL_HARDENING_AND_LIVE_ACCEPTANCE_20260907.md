@@ -8,7 +8,7 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-FINAL_EXECUTABLE_SHA = 88d61026356820a57543770650db361aaa9c682b
+FINAL_EXECUTABLE_SHA = cb35ec19dcb28649dc9b575b883f54e954ea06e1
 REMOTE_HEAD_AT_CODE_ACCEPTANCE = PENDING_PUSH_READBACK
 HOSTED_CI_RUN = PENDING_EXACT_SHA_RUN
 HOSTED_CI_CONCLUSION = NOT_RUN
@@ -222,7 +222,7 @@ zero.
 
 ### Local exact-SHA checks
 
-The current executable commit is 88d61026356820a57543770650db361aaa9c682b.
+The current executable commit is cb35ec19dcb28649dc9b575b883f54e954ea06e1.
 The report-only update will be a child commit and does not change that
 executable SHA.
 
