@@ -9,8 +9,8 @@ PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
 FINAL_EXECUTABLE_SHA = cb35ec19dcb28649dc9b575b883f54e954ea06e1
-REMOTE_HEAD_AT_CODE_ACCEPTANCE = PENDING_PUSH_READBACK
-HOSTED_CI_RUN = PENDING_EXACT_SHA_RUN
+REMOTE_HEAD_AT_CODE_ACCEPTANCE = 556e4f197b154017b52a61f8d45874d72d816f47
+HOSTED_CI_RUN = NOT_RUN_FOR_CB35EC19
 HOSTED_CI_CONCLUSION = NOT_RUN
 ```
 
@@ -64,9 +64,9 @@ was not merged; Hosted CI for this new executable SHA is still pending.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at final code push | `PENDING_PUSH_READBACK` |
-| Hosted run | `PENDING_EXACT_SHA_RUN` |
-| Hosted head SHA | `PENDING_EXACT_SHA_RUN` |
+| Remote head at final code push | `556e4f197b154017b52a61f8d45874d72d816f47` (unchanged) |
+| Hosted run | `NOT_RUN_FOR_CB35EC19` |
+| Hosted head SHA | `NOT_APPLICABLE` |
 | Hosted result | `NOT_RUN` |
 
 The preceding Hosted run was intentionally not carried forward as evidence:
@@ -250,7 +250,7 @@ a local PASS.
 
 ### Hosted exact-SHA checks
 
-No Hosted run has yet been read back for 88d61026356820a57543770650db361aaa9c682b.
+No Hosted run has yet been read back for cb35ec19dcb28649dc9b575b883f54e954ea06e1.
 The earlier successful run belongs to the preceding executable SHA and is not
 evidence for this code revision.
 
@@ -346,6 +346,12 @@ runtime/architecture_gates.py, services/durable_io.py, rag/local_rag.py, and
 docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 ## Remaining owner actions
+
+0. Push the local report/code chain (cb35ec19 executable with report-only
+   child 56b8ab6) to the existing PR branch. The remote head is still
+   556e4f197b154017b52a61f8d45874d72d816f47; SSH was reset and the
+   authenticated GitHub ref update was not authorized by the external-write
+   policy.
 
 1. Supply an approved rotated credential through the supported `.env` or
    process-environment mechanism, without placing it in tracked files.
