@@ -2,198 +2,328 @@
 
 ## Release decision
 
-`NOT_READY_TO_MERGE`
+```text
+FINAL_STATUS = NOT_READY_TO_MERGE
+PR = #24
+PR_STATE = OPEN
+PR_DRAFT = false
+BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
+FINAL_EXECUTABLE_SHA = 15e896d4d97a723f7081737dcd09f44d85c0e5fd
+REMOTE_HEAD_AT_CODE_ACCEPTANCE = 15e896d4d97a723f7081737dcd09f44d85c0e5fd
+HOSTED_CI_RUN = 34101339072
+HOSTED_CI_CONCLUSION = SUCCESS
+```
 
-This report is evidence-bound. The current local detached worktree HEAD at
-the previous evidence capture was
-`f77ea1db06d041b02169ac5ded571e930dd3406a` (this report publication commit).
-The hardening code was committed locally at
-`d3ca43a5330cf5ebb0cb4fb91866c8590b956f53`. It has not reached GitHub because
-the authenticated OAuth credential rejected the workflow-file update for
-missing `workflow` scope. No merge was attempted.
+The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
+not merged. No live provider call, paid API call, Playwright acceptance run,
+heavy-OCR acceptance run, or real F1 corpus run was made in this round.
 
-The current local executable SHA is therefore `d3ca43a5330cf5ebb0cb4fb91866c8590b956f53`.
-The active PR's remote head remains the pre-hardening
-`2e6bdb32aca84c8d948adc846e3db76cd15b46b5` until a credential with the
-required GitHub scope is supplied.
+## Git, PR, and Hosted CI read-back
 
-## Git and PR state
-
-| Item | Current evidence |
+| Item | Read-back |
 |---|---|
-| Remote `main` | `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Local hardening commit | `d3ca43a5330cf5ebb0cb4fb91866c8590b956f53` |
-| Active PR | #24, `OPEN`, non-draft, base `main` |
-| Active PR remote head | `2e6bdb32aca84c8d948adc846e3db76cd15b46b5` |
-| PR #24 Hosted run | `34017515111`, `SUCCESS`, but on the old remote head |
-| PR #23 | `MERGED` at `4fa4e57aedc770dc18824ac15265fc36836ec791`; old head `50c0917c...` |
+| Branch | `codex/f1-validation-authority-closure` |
+| PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
+| Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
+| Remote head at final code push | `15e896d4d97a723f7081737dcd09f44d85c0e5fd` |
+| Hosted run | [34101339072](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34101339072) |
+| Hosted head SHA | `15e896d4d97a723f7081737dcd09f44d85c0e5fd` |
+| Hosted result | `SUCCESS` |
 
-GitHub governance readback: `main` is currently unprotected (`GET
-/branches/main/protection` returned 404). Required PR/status-check protection is
-therefore an owner action, not a code-level PASS.
+Hosted run steps all succeeded: Python 3.11 setup, installation from
+`requirements-py311-windows.lock`, `pip check`, compile check, collection,
+public CLI smoke, strict-offline suite, Pyright, Doctor, and committed-range
+whitespace check. Collection reported `1451 tests collected`; the strict-
+offline step reported:
 
-The SSH push was reset by the remote. HTTPS reached GitHub but was rejected:
-the OAuth App is not permitted to update `.github/workflows/windows-tests.yml`
-without the `workflow` scope. An alternate SSH-over-443 workaround was not
-used because it would bypass the current authorization boundary.
+```text
+1428 passed, 23 deselected in 1407.11s
+Pyright: 0 errors, 0 warnings, 0 informations
+```
 
-## Bugs found and hardened
+The 23 deselected tests are the repository's explicitly live/provider,
+Playwright, and heavy-OCR surfaces. No deselection was used to hide an
+offline assertion failure.
 
-- Credential source selection was implicit and could silently mix process
-  environment, dotenv, and `config.ini` values. It is now deterministic:
-  `process environment > .env beside the selected config > config.ini`.
-  Conflicting meaningful values fail closed. Diagnostics expose source and
-  presence booleans only; they never expose values, hashes, or headers.
-- Template/sentinel credentials and malformed required URLs now fail before
-  transport. Template/example configuration remains usable for read-only
-  doctor inspection, but not production execution.
-- Provider admission now follows the formal StagePlan, so an analyze-only
-  primary-reader run does not require an unused Backup Reader or Writer route.
-- `reviewctl preflight` now builds the same route, proxy policy, payload shape,
-  timeout, retry, and request identity used by formal transport, with zero HTTP
-  calls.
-- Queue JSON corruption is preserved in a quarantine copy and raises a typed
-  failure instead of becoming an empty queue. Queue locks and atomic writes
-  are bounded; internal `TypeError` is not used as a signature probe, so a job
-  executes once.
-- Registry, queue, latest-pointer, config/.env, publication, and receipt-ledger
-  replacements use the shared bounded atomic-replace helper. Registry rollback
-  and publication paths are covered by the same Windows sharing policy.
-- Workspace/project/job components, lexical traversal, resolved paths, and
-  reparse-point writes are fail-closed. Existing reparse leaves can be named
-  for inspection so the review-batch guard reports its domain-specific error;
-  actual workspace creation rejects them.
-- External Registry closure now verifies an immutable revision-bound snapshot,
-  proves the external revision is unchanged after recursive verification, and
-  retries a bounded three times on change without holding arbitrary cross-
-  Registry locks.
-- GUI config and `.env` persistence stages/fsyncs both files and rolls back the
-  first publication when the second fails. Control characters are rejected and
-  `.env` permissions are best-effort owner-only.
-- Provider endpoints are classified as official, third-party gateway, or
-  custom/local. GUI formal use and connection tests require an explicit
-  acknowledgement for third-party gateways; doctor/preflight show the
-  classification.
-- MinerU handling now bounds streamed response bytes, ZIP entries, total
-  uncompressed bytes, per-entry bytes, compression ratio, structured JSON,
-  markdown, and plain text. The exact HTTPS host allowlist remains in force.
-- A Python 3.11/Windows lock and `pip check` CI step were added. The interactive
-  setup wizard now supplies defaults for all new MinerU limits.
-- `scripts/release_acceptance.py` is offline by default, requires an explicit
-  spec/budget/preflight and `AUTO_GENERATE_RUN_LIVE_ACCEPTANCE=1` for real
-  runs, uses only `reviewctl`, applies a wall-clock timeout, and maps missing
-  credentials to `BLOCKED_CREDENTIALS` rather than PASS.
+## Bugs fixed in this round
 
-## Effective runtime route table
+- Replaced the release acceptance false-PASS path. A completed `reviewctl` job
+  can no longer mark crash/resume, GUI, OCR, heterogeneity, Validator, or
+  15-paper gates as PASS. Every specialized gate has a purpose, prerequisites,
+  actual action, live/offline requirement, required facts, and an independent
+  evidence validator bound to the tested SHA.
+- Added typed `ReleaseAcceptanceSpec` and `ReleaseAcceptanceBudget` with hard
+  aggregate limits for provider calls, output tokens, retries, and wall time.
+  `ProviderRuntime` reserves possible transport attempts and requested output
+  before transport, shares the controller across routes, persists usage state
+  across a process boundary, and records usage snapshots in durable receipts.
+- Added `reviewctl micro-probe` as a distinct real route probe. It uses the
+  normal config loader, StagePlan route admission, endpoint/proxy construction,
+  `ai_interface._call_ai_api_detailed`, `ProviderRuntime`, and a receipt ledger.
+  It is never implied by the zero-network dry preflight and requires explicit
+  third-party/custom-host acknowledgement.
+- Made `RuntimeJobSpec.from_dict`, its source object, metadata, and acceptance
+  budget schema reject unknown keys and invalid types instead of silently
+  defaulting them.
+- Completed StagePlan-aware config admission. Analyze-only primary-reader
+  jobs no longer require physically present Backup, Writer, Outline, or
+  Validator sections unless those stages are reachable; reachable missing
+  routes still fail closed.
+- Replaced preprocess freshness based on PDF size/mtime with canonical source
+  path plus PDF SHA-256, processing fingerprint, per-artifact hashes, and an
+  fsynced active-generation pointer. New generations are staged completely
+  before publication; missing/tampered/incompatible generations rebuild or
+  fail closed and are never mixed with an old manifest.
+- Added strict source-bound evidence loading. Required text, chunks, page
+  index, and manifests are read as immutable bytes, decoded/parsed from those
+  bytes, and checked against typed artifact hashes. Missing, locked, truncated,
+  invalid-UTF-8, invalid-JSON, and hash-mismatched evidence raises
+  `ValidationSourceAuthorityError` before formal Validator transport.
+- Hardened Free Mode profile names and output roots against traversal, reserved
+  Windows names, separators, reparse ancestors, and reparse profile leaves;
+  profile writes now use the durable atomic JSON writer.
+- Hardened `JobWorkspace` production artifact paths against existing symlink,
+  junction, and other reparse leaves while retaining a separate inspection-only
+  helper and review-batch domain-level fail-closed errors.
+- Hardened Zotero managed `storage:`/`attachments:` paths with key validation,
+  realpath containment, reparse checks, and explicit linked-file provenance.
+  Legitimate external linked files remain allowed and are marked as such;
+  managed-storage escapes are rejected.
+- Added MinerU source-PDF size admission and streaming upload. Upload bytes are
+  tracked; retries do not first create an unbounded whole-PDF bytes copy.
+- Preserved the earlier queue corruption quarantine, exactly-once callable
+  invocation, bounded Windows lock/replace retry, credential provenance,
+  Registry snapshot closure, Stage1 retry taxonomy, and remote ZIP/response
+  resource limits.
 
-The table below is generated from the current shipped `config.ini.example`
-through `reviewctl preflight`; the credential values used for that no-network
-probe were synthetic local sentinels and were never sent to a provider.
+## StagePlan admission matrix
 
-| Semantic role | Config section | Model | Protocol/route | Endpoint classification |
-|---|---|---|---|---|
-| Stage 1 Primary Reader | `Primary_Reader_API` | `deepseek-v4-flash-vision-exp` | DeepSeek Chat Completions at `https://api.deepseek.com/chat/completions` | Official DeepSeek host |
-| Stage 1 Backup Reader | `Backup_Reader_API` | `deepseek-v4-flash` | DeepSeek Chat Completions at `https://api.deepseek.com/chat/completions` | Official DeepSeek host |
-| Outline candidate generation | `Outline_API` | `claude-opus-5` | Anthropic Messages at `https://chat.178266.xyz/v1/messages` | Third-party gateway |
-| Outline arbitration | `Outline_API` | `claude-opus-5` | Anthropic Messages at `https://chat.178266.xyz/v1/messages` | Third-party gateway |
-| Outline relation adjudication | `Free_Mode_API` | `deepseek-v4-pro` | DeepSeek Chat Completions at `https://api.deepseek.com/chat/completions` | Official DeepSeek host |
-| Outline coverage critique | `Free_Mode_API` | `deepseek-v4-pro` | DeepSeek Chat Completions at `https://api.deepseek.com/chat/completions` | Official DeepSeek host |
-| Outline structure critique | `Writer_API` | `gpt-5.6-sol` | OpenAI Responses-compatible route at `https://ai.saigou.work/v1/responses` | Third-party gateway |
-| Outline evidence critique | `Writer_API` | `gpt-5.6-sol` | OpenAI Responses-compatible route at `https://ai.saigou.work/v1/responses` | Third-party gateway |
-| Stage 3 Writer | `Writer_API` | `gpt-5.6-sol` | Same Responses-compatible route, once per adopted Outline v3 section | Third-party gateway |
-| Validation | `Validator_API` | `deepseek-v4-flash` | DeepSeek Chat Completions at `https://api.deepseek.com/chat/completions` | Official DeepSeek host |
-
-“OpenAI-compatible” or “Anthropic-compatible” describes the wire protocol; it
-does not make `ai.saigou.work` or `chat.178266.xyz` an official OpenAI or
-Anthropic endpoint.
-
-## Profile and Stage 3 terminology
-
-“生成 profile” means Free Mode calls `generate_free_mode_profile` to turn a
-research idea into a structured planning context (research goal, concept
-relationship, focus points, and related fields), stores it as a workspace-bound
-JSON input, and projects it into the typed `ReviewIntent` used by the Writer.
-It is not a personal user profile and it is not a completed review.
-
-“Stage 3 Review/Writer” is one stage at two levels: Stage 3 is the review
-generation stage, while `Writer_API` is the provider/model called once for each
-adopted Outline v3 section. It is not two independent pipeline stages.
-
-## Verification evidence
-
-| Check | Result |
-|---|---|
-| `compileall` on changed runtime, services, GUI, setup, scripts, tests | PASS |
-| Pyright with the project Python 3.11 environment | `0 errors, 0 warnings, 0 informations` |
-| `pip check` | `No broken requirements found.` |
-| `git diff --check` | PASS; only expected LF/CRLF normalization notices |
-| Hardening + MinerU + setup + hygiene focused slice | `45 passed` |
-| Final strict-offline command | `1402 passed, 12 failed, 1 skipped, 1 deselected` |
-
-The 12 final local failures all occur before the test body at
-`multiprocessing.get_context("spawn").Queue()` / Windows named-pipe creation
-with `PermissionError: [WinError 5]`. They are:
-
-- `test_queue_claim_leases.py`: single-winner claim, stale-worker recovery
-  publication, queue-owned Registry publication, generation fencing, and
-  staged JSON/DOCX/export publication;
-- `test_queue_multiprocess_leases.py`: three multiprocess lease/fence tests;
-- `test_registry_transactions.py::test_two_processes_register_without_lost_update`;
-- `test_review_batch.py::test_review_batch_same_derivation_has_one_cross_process_writer`;
-- `test_runtime_lifecycle_parity.py::test_concurrent_explicit_job_claim_rejects_loser_before_workspace_mutation`;
-- `test_validation_adjudication_checkpoint.py::test_adjudication_checkpoint_single_flights_across_processes`.
-
-This sandbox cannot create the named pipes required by those tests. They were
-not skipped or weakened. The exact final Hosted Windows run is therefore still
-required and was not obtained because the push was blocked by GitHub scope.
-
-`reviewctl doctor --config config.ini.example` was read-only with
-`provider_network_calls=0`, `ok=true`, and expected warnings for absent real
-credentials/stale local locks. Template `reviewctl preflight` failed closed
-with `network_calls=0`; a separate synthetic-key preflight exercised all
-`run_all` routes and returned `status=pass`, also with `network_calls=0`.
-
-## Acceptance gates
-
-| Gate | Result | Evidence/boundary |
+| Action / policy | Reachable provider sections | Missing section result |
 |---|---|---|
-| 1 Offline regression | NOT_VERIFIED | 1402 passed, but 12 local named-pipe failures; Hosted exact-SHA not rerun |
-| 2 Exact-path provider preflight | BLOCKED_CREDENTIALS | Active worktree has no production `config.ini`/`.env`; example config correctly rejects template credentials |
-| 3 One real F1 paper | BLOCKED_CREDENTIALS / BLOCKED_INPUT | No live credential, authoritative F1 spec, or corpus in active worktree; no `reviewctl run` live call |
-| 4 Three heterogeneous papers | BLOCKED_CREDENTIALS / BLOCKED_INPUT | Not started because Gate 3 prerequisites are absent |
-| 5 Real cancel/crash/resume | NOT_VERIFIED | No real three-paper process lifecycle run |
-| 6 Live multi-provider Outline | BLOCKED_CREDENTIALS | No real gateway calls; synthetic preflight is not live evidence |
-| 7 Real Free Mode | BLOCKED_CREDENTIALS | No real Free_Mode_API call; profile/intent fixture contracts only |
-| 8 Real Validator | BLOCKED_CREDENTIALS | No real Validator call or current F1 closure |
-| 9 GUI Playwright | NOT_VERIFIED | No browser automation run in this round |
-| 10 Heavy OCR | NOT_VERIFIED | No live OCR acceptance sample/run |
-| Q Full F1 15-paper chain | BLOCKED_INPUT | `paper_artifact = 0/15` live evidence; no Outline/Review/Citation/DOCX/Validator closure |
-| R Negative live behavior | NOT_VERIFIED | Offline provider taxonomy tests exist; no live/mock acceptance gate run separately |
-| S Secret/privacy scan | NOT_VERIFIED | Scoped tracked-file scan found `.env` untracked/ignored, zero private-key/API-key candidates, and no non-test Authorization/Bearer hits; full history scan not run |
-| T Governance | BLOCKED | GitHub readback confirms `main` is unprotected; owner must configure required PR/Windows checks |
+| `analyze`, `primary_reader_only=true` | `Primary_Reader_API` (plus `Validator_API` only if Stage1 validation is enabled) | Primary missing: fail closed; Backup/Writer/Outline absence is allowed |
+| `analyze`, `primary_reader_only=false` | Primary + Backup (and optional Stage1 Validator) | Missing Backup: fail closed |
+| `generate_outline` | Outline route plus every section named by reachable `OutlineModels` roles | Missing route or role mapping: fail closed |
+| `generate_review` / `run_all` | Outline + Writer; `run_all` also reaches Validator when review validation is enabled | Missing reachable route: fail closed |
+| `validate_review` | Validator | Missing Validator: fail closed |
+| Free Mode | `Free_Mode_API` in addition to the stages explicitly reached | Incomplete Free Mode route: zero-call fail closed |
 
-Actual live Provider transport count is **0**. Actual F1 15-paper artifact
-count is **0/15**. Outline, Review, Citation, DOCX, Validator, repair, GUI,
-OCR, and live MinerU counts are not claimed.
+The physically minimal analyze regression has only `Application`, `Paths`,
+`Primary_Reader_API`, and `Stage1_Input`; it contains no Backup, Writer,
+Outline API, Outline model, or Outline cost-control sections and passes config
+load plus analyze admission when the primary-only policy is enabled.
+
+## Credential and trust policy
+
+Credential resolution is deterministic:
+
+```text
+process environment > .env beside the selected config > config.ini
+```
+
+Conflicting meaningful values fail closed. Template credentials are rejected
+for production routes. Diagnostics expose source presence and route identity,
+never credential values, hashes, or authorization headers.
+
+The current shipped example routes classify as follows. This is configuration
+read-back, not live connectivity evidence.
+
+| Semantic role | Section/model | Endpoint host | Trust classification |
+|---|---|---|---|
+| Stage 1 primary reader | `Primary_Reader_API` / `deepseek-v4-flash-vision-exp` | `api.deepseek.com` | official provider host |
+| Stage 1 backup reader | `Backup_Reader_API` / `deepseek-v4-flash` | `api.deepseek.com` | official provider host |
+| Outline candidate/arbitrator | `Outline_API` / `claude-opus-5` | `chat.178266.xyz` | third-party gateway |
+| Outline relation/coverage critique | `Free_Mode_API` / `deepseek-v4-pro` | `api.deepseek.com` | official provider host |
+| Outline structure/evidence critique and Writer | `Writer_API` / `gpt-5.6-sol` | `ai.saigou.work` | third-party gateway |
+| Validator | `Validator_API` / `deepseek-v4-flash` | `api.deepseek.com` | official provider host |
+
+Third-party and custom hosts require explicit acknowledgement and exact-host
+binding before content is sent. Protocol compatibility does not make a gateway
+an official OpenAI or Anthropic endpoint.
+
+## Acceptance budget and ledger
+
+The typed budget fields are:
+
+```text
+max_provider_calls_total
+max_output_tokens_total
+max_retry_attempts_total
+max_wall_seconds
+```
+
+Admission reserves `1 + possible retries` physical provider calls and the
+requested output allowance before transport. Completion reconciles actual
+reported usage conservatively; unreported usage retains its reservation rather
+than becoming an artificial zero. Durable receipt metadata contains the
+aggregate budget snapshot, while `ProviderRuntimeLedger.usage_summary()`
+recomputes physical calls, reported/unreported output, retries, and stage/
+provider breakdowns from receipts.
+
+No acceptance budget was exercised against a real provider in this round.
+Therefore actual live calls, output tokens, and retries are:
+
+```text
+provider calls = 0
+output tokens = 0 reported
+retries = 0
+```
+
+These are evidence counts, not a claim that a future live run will consume
+zero.
+
+## Preprocess, validation, path, and MinerU evidence
+
+- Cache manifests bind `canonical_source_path`, `source_pdf_sha256`, source
+  byte size, implementation/schema/selector versions, parser/OCR/MinerU
+  configuration, and a `processing_fingerprint`.
+- Required cache artifacts carry relative identity, type, schema version, size,
+  and SHA-256. Publication is through a complete staged generation and an
+  atomic `active_generation.json` pointer.
+- Formal Validation uses strict evidence mode when source-bound manifests are
+  present. The existing compatibility mode remains available to isolated
+  legacy unit callers without authority paths.
+- `source_pdf_max_bytes` is part of `[Preprocess]` and the shipped example;
+  MinerU upload uses a file handle, not `handle.read()` into a whole-PDF bytes
+  object.
+- Managed Zotero storage is contained under the attachment key's real storage
+  root. External linked files carry `attachment_source_type=linked_file`,
+  `external_to_library`, canonical resolved path, link mode, and raw-path
+  provenance.
+
+## Verification evidence on the final code SHA
+
+### Local exact-SHA checks
+
+The local worktree was clean at `15e896d...` before this report was authored.
+
+| Check | Result | Scope |
+|---|---|---|
+| Focused hardening/provider/config/cache suite | `25 passed, 1 skipped` | Local Python 3.13 environment; the one skip is optional symlink privilege |
+| Changed-file focused Pyright | `0 errors, 0 warnings, 0 informations` | Local changed runtime and integration files |
+| `compileall` | PASS | Current runtime/services/preprocess/validation/outline/free-mode/scripts surface |
+| `pip check` | PASS | Local interpreter |
+| `git diff --check` | PASS | Final code commit |
+| Full local strict-offline suite | `1415 passed, 12 failed, 1 skipped, 23 deselected` | The 12 failures are setup-time named-pipe `PermissionError: [WinError 5]`, not assertions |
+
+The local full-suite command was:
+
+```text
+python -m pytest -q --strict-markers -p no:cacheprovider \
+  -m "not live_api and not playwright and not heavy_ocr and not live_acceptance"
+```
+
+The 12 local failures occurred while creating Windows multiprocessing named
+pipes in queue, Registry, review-batch, lifecycle, and validation checkpoint
+tests. The same selected cross-process surface passed in Hosted Windows CI;
+the local result is retained as an environment limitation, not converted into
+a local PASS.
+
+### Hosted exact-SHA checks
+
+Hosted Windows run `34101339072` passed all steps on `15e896d...`, including
+the full selected suite (`1428 passed, 23 deselected`), Python 3.11 lock
+installation and `pip check`, compile, CLI smoke, Pyright with zero diagnostics,
+Doctor, and whitespace verification.
+
+## Gate results
+
+| Gate | Status | Exact evidence / boundary |
+|---|---|---|
+| A — exact-final-SHA offline closure | `PASS` (Hosted) / `NOT_VERIFIED_LOCAL` | Hosted run `34101339072` passed on `15e896d...`; local has 12 named-pipe permission failures and one optional symlink skip |
+| B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
+| B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
+| C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
+| D — three heterogeneous real papers | `BLOCKED_PREREQUISITE` | Gate C is blocked; no synthetic PDFs were substituted |
+| E — real process crash/cancel/resume | `NOT_VERIFIED` | No real three-paper provider run and no process-boundary interruption evidence |
+| F — real multi-provider Outline v3 | `BLOCKED_CREDENTIALS` | Role mapping is present in the example config, but no real gateway transport or receipts |
+| G — real Free Mode | `BLOCKED_CREDENTIALS` | No Free Mode credential or live route call; incomplete-route zero-call tests pass offline |
+| H — Validator defect injection/repair/revalidation | `BLOCKED_CREDENTIALS` | No real Validator transport or real-review baseline; controlled offline contracts are not substituted |
+| I — GUI Playwright | `NOT_VERIFIED` | No real browser flow/evidence artifact in this round |
+| J — heavy OCR | `BLOCKED_CORPUS` | No approved scanned/OCR-poor acceptance PDF in the scoped checkout |
+| K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Hosted exact Windows suite passed the selected cross-process queue/Registry/review-batch/lifecycle checks; no separate release acceptance manifest was produced |
+| Q — F1 15-paper full chain | `BLOCKED_F1_SPEC` / `BLOCKED_F1_CORPUS` | No authoritative 15-paper binding; canonical Stage 1 artifacts `0/15`, downstream Outline/Review/Citation/DOCX/Validation not run |
+| R — negative production behavior | `PASS_OFFLINE`, `NOT_VERIFIED_RELEASE_MANIFEST` | Typed config/auth/queue/path/cache/evidence/budget and false-PASS regressions are in the selected suite; no separate gate evidence manifest |
+| S — secret/privacy scan | `NOT_VERIFIED` | No production secret was used or printed; a full release-scope history/privacy evidence manifest was not generated |
+| T — branch governance | `BLOCKED` / `OWNER_ACTION_REQUIRED` | `GET /branches/main/protection` returned HTTP 404 (`Branch not protected`); required checks/protection are not configured |
+
+No gate is marked PASS from an unrelated completed job, fixture transport,
+sentinel response, recorded response, or zero-call dry preflight.
+
+## Real-provider and F1 artifact counts
+
+```text
+REAL_PRIMARY_READER_CALLS = 0
+REAL_BACKUP_READER_CALLS = 0
+REAL_OUTLINE_CALLS = 0
+REAL_WRITER_CALLS = 0
+REAL_FREE_MODE_CALLS = 0
+REAL_VALIDATOR_CALLS = 0
+REAL_MINERU_REMOTE_CALLS = 0
+REAL_F1_SOURCE_COUNT = 0/15 (not bound)
+REAL_STAGE1_CANONICAL_COUNT = 0/15 (not run)
+REAL_OUTLINE = not run
+REAL_REVIEW = not run
+REAL_CITATION_MANIFEST = not run
+REAL_DOCX = not run
+REAL_VALIDATION = not run
+REAL_REPAIR_REVALIDATION = not run
+FINAL_CANONICAL_CLOSURE = not asserted
+```
+
+The selected offline suite does exercise mocked/injected contract boundaries,
+but those receipts and callbacks are not counted as live provider evidence.
+
+## Files changed in this hardening round
+
+Production/runtime changes include:
+
+```text
+ai_interface.py
+config.ini.example
+config_loader.py
+config_validator.py
+free_mode/profile_manager.py
+free_mode/service.py
+outline/v3_executor.py
+preprocess/service.py
+reviewctl.py
+runtime/control_plane.py
+runtime/job_spec.py
+runtime/orchestrator.py
+runtime/provider_runtime.py
+runtime/release_acceptance.py
+runtime/runner.py
+runtime/source_intake.py
+runtime/zotero_attachment_resolver.py
+scripts/release_acceptance.py
+services/configuration_service.py
+services/job_workspace.py
+services/review_batch.py
+services/review_generation_service.py
+services/settings.py
+services/stage1_analysis_service.py
+setup_wizard.py
+validation/current_validation.py
+validation/evidence_loader.py
+validation/llm_adjudicator.py
+validation/review_validator.py
+```
+
+Regression coverage includes `tests/test_release_hardening.py` and the
+preprocess cache behavior update in `tests/test_preprocess_service.py`.
 
 ## Remaining owner actions
 
-1. Authenticate GitHub with a credential authorized to update workflow files
-   (`workflow` scope), then push local commit `d3ca43a...` to PR24. Do not
-   merge until the new Hosted Windows run is terminal and green on that exact
-   SHA.
-2. Provide/select the real F1 runtime spec, 15-paper corpus, and owner-approved
-   rotated credentials. Run the release entrypoint gates in order with explicit
-   call/token/timeout budgets; stop on the first failure.
-3. Run the 12 cross-process tests in a normal Windows context that permits
-   multiprocessing named pipes and record the exact result.
-4. Execute the real one-paper, three-paper resume, multi-provider Outline,
-   Free Mode, Validator, GUI, OCR, and 15-paper chain gates. Do not replace
-   them with synthetic transports or `/models` checks.
-5. Inspect branch protection/status checks as a repository owner action.
-
-No Provider credential was rotated, revoked, printed, or written by this
-round. No live API, Playwright, heavy OCR, or paid multi-provider call was
-made.
+1. Supply an approved rotated credential through the supported `.env` or
+   process-environment mechanism, without placing it in tracked files.
+2. Supply/select the authoritative F1 runtime spec and bound 15-paper corpus in
+   the scoped acceptance workspace; do not substitute another corpus.
+3. Run the explicit live route micro-probes with exact third-party host
+   acknowledgement and the typed aggregate budget.
+4. Execute Gates C-K and Q through the public control plane, capturing
+   final-SHA-bound gate evidence, durable receipts/ledger deltas, Registry
+   closure, DOCX QA, Validator defect detection, repair, and revalidation.
+5. Configure `main` branch protection and required Windows checks as a
+   repository-owner action; current API read-back proves it is not configured.
 
 **FINAL_STATUS: NOT_READY_TO_MERGE**
