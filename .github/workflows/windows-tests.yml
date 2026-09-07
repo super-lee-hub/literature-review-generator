@@ -31,7 +31,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --prefer-binary -r requirements-dev.txt
+          python -m pip install --prefer-binary -r requirements-py311-windows.lock
+          python -m pip check
       - name: Compile check
         run: python -m compileall -q .
       - name: Collect tests
@@ -42,6 +43,7 @@ jobs:
           python -m reviewctl plan --help
           python -m reviewctl run --help
           python -m reviewctl doctor --help
+          python -m reviewctl preflight --help
           python -m reviewctl status --help
           python -m reviewctl inspect --help
           python -m reviewctl next-action --help

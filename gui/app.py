@@ -14,6 +14,8 @@ from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 from free_mode.profile_manager import get_profile_path, normalize_profile
 from free_mode.service import generate_free_mode_profile, plan_free_mode_chat_turn
+from ai_interface import classify_provider_endpoint
+from config_loader import provider_sections_for_stage_plan
 from services.configuration_service import (
     API_ENV_MAPPING,
     MINERU_ENV_KEYS,
@@ -1207,6 +1209,7 @@ class WorkspaceController:
             },
         }
         self.api_cards: Dict[str, Dict[str, str]] = {}
+        self.third_party_gateway_acknowledged: Dict[str, str] = {}
         for section_name in API_ENV_MAPPING:
             section = self.sections.get(section_name, {})
             api_base = section.get("api_base", "")
@@ -2577,7 +2580,48 @@ class WorkspaceController:
             return "warning", self.t("请先填写模型名。")
         if not api_key:
             return "warning", self.t("API Key 还没有填写。")
+        classification = classify_provider_endpoint(
+            api_base,
+            str(card.get("provider_family") or card.get("provider") or ""),
+        )
+        if classification["classification"] == "third_party_gateway":
+            fingerprint = self._third_party_gateway_fingerprint(section_name)
+            if self.third_party_gateway_acknowledged.get(section_name) != fingerprint:
+                return "warning", (
+                    "该 API Base 是第三方 gateway；首次使用前请确认论文、prompt 和 credential "
+                    "会发送到该第三方 endpoint。"
+                )
         return "positive", self.t("当前配置格式看起来正确，可以点击“测试连接”。")
+
+    def _third_party_gateway_fingerprint(self, section_name: str) -> str:
+        card = self.api_cards[section_name]
+        classification = classify_provider_endpoint(
+            str(card.get("api_base") or ""),
+            str(card.get("provider_family") or card.get("provider") or ""),
+        )
+        return "|".join(
+            (
+                str(classification.get("classification") or ""),
+                str(classification.get("host") or ""),
+                str(card.get("model") or ""),
+                str(card.get("endpoint_type") or ""),
+            )
+        )
+
+    def acknowledge_third_party_gateway(self, section_name: str) -> None:
+        classification = classify_provider_endpoint(
+            str(self.api_cards[section_name].get("api_base") or ""),
+            str(self.api_cards[section_name].get("provider_family") or self.api_cards[section_name].get("provider") or ""),
+        )
+        if classification["classification"] != "third_party_gateway":
+            self.notify("当前 endpoint 不是第三方 gateway。", color="info")
+            return
+        self.third_party_gateway_acknowledged[section_name] = self._third_party_gateway_fingerprint(section_name)
+        self.notify(
+            f"已确认第三方 gateway：{classification.get('host') or 'unknown'}。",
+            color="warning",
+            multi_line=True,
+        )
 
     def preview_api_config(self, section_name: str, *, notify_user: bool = False) -> None:
         tone, message = self.assess_api_card(section_name)
@@ -2702,6 +2746,37 @@ class WorkspaceController:
 
         return True
 
+    def _require_third_party_gateway_acknowledgement(self, action: str) -> bool:
+        try:
+            required_sections = provider_sections_for_stage_plan(
+                self.sections,
+                requested_stages=None,
+                action=action,
+                free_mode_enabled=str(self.state["workflow"].get("work_mode") or "") == "free",
+            )
+        except Exception:
+            required_sections = tuple(self.api_cards)
+        for section_name in required_sections:
+            card = self.api_cards.get(section_name)
+            if not card:
+                continue
+            classification = classify_provider_endpoint(
+                str(card.get("api_base") or ""),
+                str(card.get("provider_family") or card.get("provider") or ""),
+            )
+            if classification["classification"] != "third_party_gateway":
+                continue
+            if self.third_party_gateway_acknowledged.get(section_name) == self._third_party_gateway_fingerprint(section_name):
+                continue
+            message = (
+                f"{section_name} 使用第三方 gateway {classification.get('host') or 'unknown'}。"
+                "请先点击“确认第三方 gateway”，再运行正式工作流。"
+            )
+            self.show_api_feedback(section_name, message, tone="warning")
+            self.notify(message, color="warning", multi_line=True)
+            return False
+        return True
+
     async def handle_test_api(self, section_name: str) -> None:
         if self.test_mode:
             message = self.tf("测试模式：已模拟 API 连通性检查（{section_name}）", section_name=section_name)
@@ -2711,6 +2786,19 @@ class WorkspaceController:
             return
 
         card = self.api_cards[section_name]
+        classification = classify_provider_endpoint(
+            str(card.get("api_base") or ""),
+            str(card.get("provider_family") or card.get("provider") or ""),
+        )
+        if (
+            classification["classification"] == "third_party_gateway"
+            and self.third_party_gateway_acknowledged.get(section_name)
+            != self._third_party_gateway_fingerprint(section_name)
+        ):
+            message = "请先确认该第三方 gateway 会接收论文内容、prompt 和 credential，再测试连接。"
+            self.show_api_feedback(section_name, message, tone="warning")
+            self.notify(message, color="warning", multi_line=True)
+            return
         api_base = normalize_api_base(card["api_base"], provider=card["provider"])
         card["api_base"] = api_base
         ok, message = await asyncio.to_thread(
@@ -2729,6 +2817,8 @@ class WorkspaceController:
 
     async def run_workflow(self, action: str) -> None:
         if not self.validate_workflow_request(action):
+            return
+        if not self._require_third_party_gateway_acknowledgement(action):
             return
 
         self.persist_config(notify_user=False)
@@ -3513,6 +3603,10 @@ def _render_api_card(controller: WorkspaceController, section_name: str, title: 
         with ui.row().classes("gap-2 q-mt-sm"):
             ui.button(controller.t("套用预设 URL"), on_click=apply_preset).props("outline")
             ui.button(controller.t("规范化 URL"), on_click=normalize_base).props("outline")
+            ui.button(
+                controller.t("确认第三方 gateway"),
+                on_click=lambda _event, s=section_name: controller.acknowledge_third_party_gateway(s),
+            ).props("outline color=warning")
             ui.button(controller.t("检查配置"), on_click=lambda _event, s=section_name: controller.preview_api_config(s, notify_user=True)).props("outline")
             ui.button(
                 controller.t("测试连接"),

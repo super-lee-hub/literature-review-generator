@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Mapping, Optional, Sequence
 
 from services.job_workspace import utc_now_iso
+from services.durable_io import AtomicReplaceTimeoutError, atomic_replace_with_retry
 
 
 REGISTRY_VERSION = "v2"
@@ -20,6 +21,7 @@ SUPPORTED_REGISTRY_VERSIONS = frozenset({REGISTRY_VERSION})
 DEFAULT_REGISTRY_LOCK_TIMEOUT_SECONDS = 5.0
 DEFAULT_REGISTRY_LOCK_RETRY_INTERVAL_MS = 50
 DEFAULT_REGISTRY_REVISION_RETRY_LIMIT = 3
+DEFAULT_EXTERNAL_SNAPSHOT_RETRY_LIMIT = 3
 
 
 class RegistryError(RuntimeError):
@@ -28,6 +30,10 @@ class RegistryError(RuntimeError):
 
 class RegistryLockTimeout(RegistryError):
     """Raised when the registry transaction lock cannot be acquired in time."""
+
+
+class RegistryAtomicReplaceTimeout(RegistryError):
+    """Raised when a registry publication is blocked by Windows sharing state."""
 
 
 class RegistryRevisionConflict(RegistryError):
@@ -48,6 +54,10 @@ class ArtifactNotFound(RegistryError):
 
 class UnverifiedDependency(RegistryError):
     """Raised when a ready artifact dependency cannot be verified durably."""
+
+
+class RegistrySnapshotChanged(UnverifiedDependency):
+    """Raised when an external Registry changes during closure verification."""
 
 
 class UnverifiedArtifact(RegistryError):
@@ -327,6 +337,7 @@ class ArtifactRegistry:
         registry_lock_timeout_seconds: float = DEFAULT_REGISTRY_LOCK_TIMEOUT_SECONDS,
         registry_lock_retry_interval_ms: int = DEFAULT_REGISTRY_LOCK_RETRY_INTERVAL_MS,
         registry_revision_retry_limit: int = DEFAULT_REGISTRY_REVISION_RETRY_LIMIT,
+        atomic_replace_timeout_seconds: float | None = None,
         publication_guard: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.registry_path = os.path.abspath(os.fspath(registry_path))
@@ -335,6 +346,14 @@ class ArtifactRegistry:
         self.registry_lock_timeout_seconds = max(0.0, float(registry_lock_timeout_seconds))
         self.registry_lock_retry_interval_ms = max(1, int(registry_lock_retry_interval_ms))
         self.registry_revision_retry_limit = max(1, int(registry_revision_retry_limit))
+        self.atomic_replace_timeout_seconds = max(
+            0.0,
+            float(
+                registry_lock_timeout_seconds
+                if atomic_replace_timeout_seconds is None
+                else atomic_replace_timeout_seconds
+            ),
+        )
         self._publication_guard = publication_guard
         self._process_lock = _process_lock_for(self.lock_path)
         self._artifacts: Dict[str, ArtifactRecord] = {}
@@ -541,7 +560,14 @@ class ArtifactRegistry:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, self.registry_path)
+            try:
+                atomic_replace_with_retry(
+                    temp_path,
+                    self.registry_path,
+                    timeout_seconds=self.atomic_replace_timeout_seconds,
+                )
+            except AtomicReplaceTimeoutError as exc:
+                raise RegistryAtomicReplaceTimeout(str(exc)) from exc
             replaced = True
             self._fsync_directory(directory)
         except Exception:
@@ -564,7 +590,11 @@ class ArtifactRegistry:
                             rollback_handle.write(previous_bytes)
                             rollback_handle.flush()
                             os.fsync(rollback_handle.fileno())
-                        os.replace(rollback_path, self.registry_path)
+                        atomic_replace_with_retry(
+                            rollback_path,
+                            self.registry_path,
+                            timeout_seconds=self.atomic_replace_timeout_seconds,
+                        )
                     else:
                         os.unlink(self.registry_path)
                 except (FileNotFoundError, OSError):
@@ -625,6 +655,34 @@ class ArtifactRegistry:
                     f"changed fields: {', '.join(changed)}"
                 )
 
+    @staticmethod
+    def _registry_snapshot_key(registry: "ArtifactRegistry") -> str:
+        return os.path.normcase(os.path.abspath(registry.registry_path))
+
+    @classmethod
+    def _read_registry_snapshot(
+        cls,
+        registry: "ArtifactRegistry",
+    ) -> tuple[int, Dict[str, ArtifactRecord]]:
+        """Read one external Registry revision under its own lock."""
+
+        with registry._transaction_lock():
+            return registry._read_registry_unlocked()
+
+    @classmethod
+    def _assert_external_snapshots_unchanged(
+        cls,
+        snapshots: Mapping[str, tuple["ArtifactRegistry", int, Mapping[str, ArtifactRecord]]],
+    ) -> None:
+        for registry, expected_revision, _artifacts in snapshots.values():
+            with registry._transaction_lock():
+                current_revision, _current_artifacts = registry._read_registry_unlocked()
+            if current_revision != expected_revision:
+                raise RegistrySnapshotChanged(
+                    f"external Registry revision changed during closure verification: "
+                    f"{registry.job_id} {expected_revision}->{current_revision}"
+                )
+
     def _normalize_dependencies(
         self,
         dependencies: Iterable[ArtifactDependencyRefV2 | Mapping[str, Any]],
@@ -635,7 +693,10 @@ class ArtifactRegistry:
         external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None = None,
         owner_record: ArtifactRecord | None = None,
         _dependency_stack: set[tuple[str, str]] | None = None,
+        external_snapshots: dict[str, tuple["ArtifactRegistry", int, Dict[str, ArtifactRecord]]] | None = None,
     ) -> List[ArtifactDependencyRefV2]:
+        if external_snapshots is None:
+            external_snapshots = {}
         normalized: List[ArtifactDependencyRefV2] = []
         for dependency in dependencies:
             if isinstance(dependency, ArtifactDependencyRefV2):
@@ -727,6 +788,7 @@ class ArtifactRegistry:
                     artifacts=artifacts,
                     external_registry_resolver=external_registry_resolver,
                     dependency_stack=dependency_stack,
+                    external_snapshots=external_snapshots,
                 )
                 normalized.append(
                     ArtifactDependencyRefV2(
@@ -772,6 +834,7 @@ class ArtifactRegistry:
                     artifacts=artifacts,
                     owner_job_id=owner_job_id,
                     external_registry_resolver=external_registry_resolver,
+                    external_snapshots=external_snapshots,
                 )
             normalized.append(normalized_ref)
         return normalized
@@ -783,7 +846,10 @@ class ArtifactRegistry:
         artifacts: Mapping[str, ArtifactRecord],
         external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None,
         dependency_stack: set[tuple[str, str]],
+        external_snapshots: dict[str, tuple["ArtifactRegistry", int, Dict[str, ArtifactRecord]]] | None = None,
     ) -> None:
+        if external_snapshots is None:
+            external_snapshots = {}
         key = (record.job_id, record.artifact_id)
         if key in dependency_stack:
             raise UnverifiedDependency(
@@ -800,6 +866,7 @@ class ArtifactRegistry:
                 external_registry_resolver=external_registry_resolver,
                 owner_record=record,
                 _dependency_stack=dependency_stack,
+                external_snapshots=external_snapshots,
             )
             for dependency in normalized:
                 if dependency.dependency_kind == "local_job":
@@ -817,10 +884,13 @@ class ArtifactRegistry:
                             "external dependency Registry is unavailable or has the wrong owner: "
                             f"{dependency.job_id}/{dependency.artifact_id}"
                         )
-                    target_registry.reload()
-                    target_artifacts = {
-                        item.artifact_id: item for item in target_registry.list_records()
-                    }
+                    snapshot_key = self._registry_snapshot_key(target_registry)
+                    snapshot = external_snapshots.get(snapshot_key)
+                    if snapshot is None:
+                        snapshot_revision, snapshot_artifacts = self._read_registry_snapshot(target_registry)
+                        snapshot = (target_registry, snapshot_revision, snapshot_artifacts)
+                        external_snapshots[snapshot_key] = snapshot
+                    target_artifacts = snapshot[2]
                     target = target_artifacts.get(dependency.artifact_id)
                 if target is None:
                     raise UnverifiedDependency(
@@ -831,6 +901,7 @@ class ArtifactRegistry:
                     artifacts=target_artifacts,
                     external_registry_resolver=external_registry_resolver,
                     dependency_stack=dependency_stack,
+                    external_snapshots=external_snapshots,
                 )
         finally:
             dependency_stack.remove(key)
@@ -842,7 +913,10 @@ class ArtifactRegistry:
         artifacts: Mapping[str, ArtifactRecord],
         owner_job_id: str,
         external_registry_resolver: Callable[[str], Optional["ArtifactRegistry"]] | None,
+        external_snapshots: dict[str, tuple["ArtifactRegistry", int, Dict[str, ArtifactRecord]]] | None = None,
     ) -> ArtifactDependencyRefV2:
+        if external_snapshots is None:
+            external_snapshots = {}
         if ref.dependency_kind == "local_job":
             if ref.job_id and ref.job_id != owner_job_id:
                 raise UnverifiedDependency(
@@ -868,8 +942,13 @@ class ArtifactRegistry:
                 raise UnverifiedDependency(
                     f"external dependency Registry owner mismatch: {ref.job_id}/{ref.artifact_id}"
                 )
-            target_registry.reload()
-            record = target_registry.get(ref.artifact_id)
+            snapshot_key = self._registry_snapshot_key(target_registry)
+            snapshot = external_snapshots.get(snapshot_key)
+            if snapshot is None:
+                snapshot_revision, snapshot_artifacts = self._read_registry_snapshot(target_registry)
+                snapshot = (target_registry, snapshot_revision, snapshot_artifacts)
+                external_snapshots[snapshot_key] = snapshot
+            record = snapshot[2].get(ref.artifact_id)
 
         if record is None:
             raise UnverifiedDependency(
@@ -1129,26 +1208,42 @@ class ArtifactRegistry:
                 f"{root_ref.job_id}/{root_ref.artifact_id}"
             )
 
-        with self._transaction_lock():
-            _revision, artifacts = self._read_registry_unlocked()
-            normalized_root = self._verify_ready_dependency(
-                root_ref,
-                artifacts=artifacts,
-                owner_job_id=self.job_id,
-                external_registry_resolver=external_registry_resolver,
-            )
-            target = artifacts.get(normalized_root.artifact_id)
-            if target is None:
-                raise UnverifiedDependency(
-                    f"dependency is not registered: {self.job_id}/{normalized_root.artifact_id}"
-                )
-            self._verify_ready_dependency_closure(
-                target,
-                artifacts=artifacts,
-                external_registry_resolver=external_registry_resolver,
-                dependency_stack=set(),
-            )
-            return self._copy_record(target)
+        last_snapshot_error: RegistrySnapshotChanged | None = None
+        for attempt in range(DEFAULT_EXTERNAL_SNAPSHOT_RETRY_LIMIT):
+            try:
+                with self._transaction_lock():
+                    _revision, artifacts = self._read_registry_unlocked()
+                    external_snapshots: dict[
+                        str, tuple[ArtifactRegistry, int, Dict[str, ArtifactRecord]]
+                    ] = {}
+                    normalized_root = self._verify_ready_dependency(
+                        root_ref,
+                        artifacts=artifacts,
+                        owner_job_id=self.job_id,
+                        external_registry_resolver=external_registry_resolver,
+                        external_snapshots=external_snapshots,
+                    )
+                    target = artifacts.get(normalized_root.artifact_id)
+                    if target is None:
+                        raise UnverifiedDependency(
+                            f"dependency is not registered: {self.job_id}/{normalized_root.artifact_id}"
+                        )
+                    self._verify_ready_dependency_closure(
+                        target,
+                        artifacts=artifacts,
+                        external_registry_resolver=external_registry_resolver,
+                        dependency_stack=set(),
+                        external_snapshots=external_snapshots,
+                    )
+                    self._assert_external_snapshots_unchanged(external_snapshots)
+                    return self._copy_record(target)
+            except RegistrySnapshotChanged as exc:
+                last_snapshot_error = exc
+                if attempt + 1 >= DEFAULT_EXTERNAL_SNAPSHOT_RETRY_LIMIT:
+                    break
+        raise UnverifiedDependency(
+            "external Registry snapshot changed during dependency closure verification"
+        ) from last_snapshot_error
 
     def register_file(
         self,
@@ -1365,7 +1460,12 @@ class ArtifactRegistry:
             return [self._copy_record(candidate) for candidate in candidates]
 
     @staticmethod
-    def _write_json_atomic(path: str | os.PathLike[str], payload: Mapping[str, Any]) -> None:
+    def _write_json_atomic(
+        path: str | os.PathLike[str],
+        payload: Mapping[str, Any],
+        *,
+        atomic_replace_timeout_seconds: float = DEFAULT_REGISTRY_LOCK_TIMEOUT_SECONDS,
+    ) -> None:
         target = os.path.abspath(os.fspath(path))
         directory = os.path.dirname(target) or os.curdir
         os.makedirs(directory, exist_ok=True)
@@ -1380,7 +1480,14 @@ class ArtifactRegistry:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, target)
+            try:
+                atomic_replace_with_retry(
+                    temp_path,
+                    target,
+                    timeout_seconds=atomic_replace_timeout_seconds,
+                )
+            except AtomicReplaceTimeoutError as exc:
+                raise RegistryAtomicReplaceTimeout(str(exc)) from exc
             ArtifactRegistry._fsync_directory(directory)
         except Exception:
             try:
@@ -1704,7 +1811,11 @@ class ArtifactRegistry:
                 os.path.dirname(self.registry_path),
                 f"{current_set.set_id.replace(':', '-')}.json",
             )
-            self._write_json_atomic(set_path, current_set.to_dict())
+            self._write_json_atomic(
+                set_path,
+                current_set.to_dict(),
+                atomic_replace_timeout_seconds=self.atomic_replace_timeout_seconds,
+            )
             set_content_hash = file_sha256(set_path)
             target_refs = [ArtifactDependencyRefV2.from_record(record) for record in target_records]
             promotion_ref = ArtifactDependencyRefV2.from_record(promotion_record)

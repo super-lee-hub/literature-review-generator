@@ -143,7 +143,7 @@ def test_stage1_length_retry_escalates_same_primary_budget_before_backup(
     assert all(receipt.route == "Primary_Reader_API" for receipt in receipts)
 
 
-def test_stage1_schema_retry_escalates_existing_primary_budget_before_backup(
+def test_stage1_schema_retry_uses_corrective_prompt_at_existing_budget(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
@@ -174,11 +174,12 @@ def test_stage1_schema_retry_escalates_existing_primary_budget_before_backup(
     result = service.run(bundle)
 
     assert result.generated_count == 1
-    assert calls == [("primary", 64000), ("primary", 128000)]
+    assert calls == [("primary", 64000), ("primary", 64000)]
     provider = result.summaries[0]["provider"]
-    assert provider["requested_output_budgets"] == [64000, 128000]
+    assert provider["requested_output_budgets"] == [64000, 64000]
     assert provider["length_retries"] == 0
     assert provider["schema_retries"] == 1
+    assert provider["semantic_retries"] == 0
 
 
 def test_stage1_length_budget_exhaustion_does_not_fallback_to_backup(

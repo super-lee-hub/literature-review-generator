@@ -19,6 +19,7 @@ import time
 from typing import Any, Literal, Mapping
 import uuid
 
+from services.durable_io import atomic_replace_with_retry
 from services.job_workspace import utc_now_iso
 
 
@@ -821,11 +822,17 @@ class ProviderRuntimeLedger:
             ]
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = self.path.with_suffix(self.path.suffix + f".retag-{uuid.uuid4().hex}.tmp")
-            with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
-                handle.writelines(encoded_lines)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, self.path)
+            try:
+                with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                    handle.writelines(encoded_lines)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                atomic_replace_with_retry(temp_path, self.path, timeout_seconds=5.0)
+            finally:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             return migrated_count
 
 

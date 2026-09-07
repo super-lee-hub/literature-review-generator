@@ -1,10 +1,14 @@
 import configparser
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from config_validator import validate_all_config
-from dotenv import load_dotenv  # type: ignore
+from dotenv import load_dotenv  # type: ignore  # compatibility for legacy callers/tests
+from services.credential_provenance import (
+    CredentialProvenance,
+    resolve_credentials,
+)
 from services.settings import ApplicationSettings, validate_config_keys
 
 
@@ -13,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 class ConfigDict(dict[str, Dict[str, str]]):
     """一个类似字典的配置对象，增加了对 getboolean 方法的支持。"""
+
+    credential_provenance: tuple[CredentialProvenance, ...] = ()
 
     def getboolean(self, section: str, option: str, fallback: bool = False) -> bool:
         try:
@@ -24,7 +30,56 @@ class ConfigDict(dict[str, Dict[str, str]]):
             return fallback
 
 
-def load_config(config_path: str = "config.ini") -> ConfigDict:
+def provider_sections_for_stage_plan(
+    config: Mapping[str, Mapping[str, Any]],
+    *,
+    requested_stages: Iterable[Any] | None,
+    action: str,
+    free_mode_enabled: bool = False,
+) -> tuple[str, ...]:
+    """Return only provider roles reachable from the durable StagePlan."""
+
+    from runtime.stage_planning import build_stage_plan
+
+    settings = ApplicationSettings.from_config(config)
+    plan = build_stage_plan(
+        action=action,
+        requested_stages=requested_stages,
+        validation_enabled=settings.review_validation_enabled(),
+    )
+    roles: list[str] = []
+    stages = set(plan.requested_stages)
+    if "analyze" in stages:
+        roles.append("Primary_Reader_API")
+        stage1 = config.get("Stage1_Input", {})
+        primary_only = str(stage1.get("primary_reader_only") or "").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not primary_only:
+            roles.append("Backup_Reader_API")
+    if "outline" in stages:
+        roles.append("Outline_API")
+    if "review" in stages:
+        roles.append("Writer_API")
+    if "validate" in stages:
+        roles.append("Validator_API")
+    if free_mode_enabled:
+        roles.append("Free_Mode_API")
+    return tuple(dict.fromkeys(roles))
+
+
+def load_config(
+    config_path: str = "config.ini",
+    *,
+    required_provider_sections: Iterable[str] | None = None,
+    action: str | None = None,
+    requested_stages: Iterable[Any] | None = None,
+    free_mode_enabled: bool = False,
+    allow_template_credentials: bool = False,
+) -> ConfigDict:
     """
     读取配置文件并返回一个 ConfigDict 对象。
     优先从环境变量（.env 文件）读取 API 密钥，如果没有则使用配置文件中的值。
@@ -97,37 +152,38 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
                 "配置文件错误：当启用验证功能时，必须提供 [Validator_API] 配置段。"
             )
 
-    # 加载 .env 文件，使用项目根目录作为基础路径
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-    if os.path.exists(env_path):
-        load_dotenv(env_path)
-        logger.info(f"从 {env_path} 加载环境变量")
-    else:
-        # 尝试在当前工作目录加载 .env 文件
-        load_dotenv()
-        logger.info("从当前工作目录加载环境变量")
+    # Resolve secrets without mutating the process environment.  The selected
+    # source is explicit and conflicting meaningful values fail closed.
+    config_dict, credential_provenance = resolve_credentials(
+        config_dict,
+        config_path=config_path,
+    )
 
-    api_sections_dict: Dict[str, str] = {
-        "Primary_Reader_API": "LLM_PRIMARY_READER_API",
-        "Backup_Reader_API": "LLM_BACKUP_READER_API",
-        "Writer_API": "LLM_WRITER_API",
-        "Outline_API": "LLM_OUTLINE_API",
-        "Free_Mode_API": "LLM_FREE_MODE_API",
-        "Validator_API": "LLM_VALIDATOR_API",
-    }
-
-    for section_name, env_var in api_sections_dict.items():
-        api_key_from_env: Optional[str] = os.getenv(env_var)
-        if not api_key_from_env:
-            continue
-        if section_name in config_dict:
-            config_dict[section_name]["api_key"] = api_key_from_env
-            logger.info(f"从环境变量加载 {section_name}.api_key")
-        else:
-            logger.warning(f"环境变量 {env_var} 对应的配置段 [{section_name}] 不存在")
+    resolved_required = required_provider_sections
+    if resolved_required is None and action is not None:
+        resolved_required = provider_sections_for_stage_plan(
+            config_dict,
+            requested_stages=requested_stages,
+            action=action,
+            free_mode_enabled=free_mode_enabled,
+        )
 
     try:
-        valid, messages = validate_all_config(config_dict)
+        try:
+            valid, messages = validate_all_config(
+                config_dict,
+                required_provider_sections=(
+                    tuple(resolved_required) if resolved_required is not None else None
+                ),
+                allow_template_credentials=allow_template_credentials,
+            )
+        except TypeError as exc:
+            # A few integrations replace the validator with a legacy one-arg
+            # callback.  Keep that seam compatible without swallowing real
+            # validation failures from the production validator.
+            if "unexpected keyword" not in str(exc):
+                raise
+            valid, messages = validate_all_config(config_dict)
         if not valid:
             raise configparser.Error("配置文件验证失败: " + "; ".join(messages))
         for message in messages:
@@ -137,7 +193,9 @@ def load_config(config_path: str = "config.ini") -> ConfigDict:
     except Exception as exc:
         raise configparser.Error(f"配置验证失败: {exc}") from exc
 
-    return ConfigDict(config_dict)
+    result = ConfigDict(config_dict)
+    result.credential_provenance = tuple(credential_provenance)
+    return result
 
 
 if __name__ == "__main__":

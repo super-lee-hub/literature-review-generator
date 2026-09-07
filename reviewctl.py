@@ -183,6 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--repo-root", dest="doctor_repo_root", default="")
     doctor.add_argument("--config", dest="doctor_config", default="")
 
+    preflight = subparsers.add_parser("preflight")
+    preflight.add_argument("--config", dest="preflight_config", default="")
+    preflight.add_argument("--action", default="analyze")
+    preflight.add_argument("--stages", nargs="*", default=None)
+    preflight.add_argument("--section", default="")
+
     config_migrate = subparsers.add_parser("config-migrate")
     config_migrate.add_argument("--config", dest="migrate_config", required=True)
     config_migrate.add_argument("--dry-run", action="store_true")
@@ -278,6 +284,8 @@ def build_parser() -> argparse.ArgumentParser:
 def _exit_code(command: str, payload: dict[str, Any]) -> int:
     if command == "doctor":
         return 0 if bool(payload.get("ok")) else 1
+    if command == "preflight":
+        return 0 if bool(payload.get("ok")) else 1
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
     if command == "config-migrate":
@@ -301,6 +309,13 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.doctor(
                 config_path=(getattr(args, "doctor_config", "") or args.config or None),
                 workspace=args.workspace or None,
+            )
+        elif args.command == "preflight":
+            payload = control.provider_preflight(
+                config_path=(getattr(args, "preflight_config", "") or args.config or None),
+                action=args.action,
+                requested_stages=args.stages,
+                section=args.section or None,
             )
         elif args.command == "config-migrate":
             payload = _config_migrate_command(args)

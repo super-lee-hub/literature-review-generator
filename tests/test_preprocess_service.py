@@ -404,6 +404,49 @@ def test_mineru_normalizer_does_not_treat_baseline_as_success_when_zip_download_
     assert normalized is None
 
 
+def test_mineru_zip_text_members_are_bounded(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_text_max_bytes = 8
+    raw_zip = io.BytesIO()
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("normalized.md", b"0123456789")
+
+    with pytest.raises(RuntimeError, match="markdown member exceeds"):
+        manager._artifacts_from_zip_bytes(raw_zip.getvalue())
+
+
+def test_mineru_streaming_binary_response_is_bounded(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_api_token = "token"
+    manager.mineru_allowed_url_hosts = {"cdn.example"}
+    manager.mineru_response_max_bytes = 4
+
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_content(self, *, chunk_size: int):
+            del chunk_size
+            return [b"123", b"45"]
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, _url: str, **_kwargs):
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("preprocess.service.requests.Session", FakeSession)
+
+    with pytest.raises(RuntimeError, match="response exceeded"):
+        manager._request_binary("https://cdn.example/result.zip")
+
+
 def test_mineru_binary_download_bypasses_environment_proxy(monkeypatch) -> None:
     manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
     manager.mineru_api_token = "token"

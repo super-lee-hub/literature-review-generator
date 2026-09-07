@@ -7,7 +7,8 @@ import os
 import time
 import re
 import requests  # type: ignore
-from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mapping
+from typing import Union, Dict, Optional, Any, List, Tuple, Callable, Set, Mapping, cast
+from urllib.parse import urlparse
 
 from models import APIConfig
 from config_loader import load_config
@@ -23,6 +24,7 @@ from services.model_capabilities import (
     resolve_model_capability,
 )
 from services.proxy_policy import should_bypass_environment_proxy
+from services.credential_provenance import is_template_credential
 from services.prompt_registry import default_prompt_registry
 from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
@@ -115,7 +117,24 @@ def _api_result(
     }
 
 
-def _extract_provider_error(response: Any) -> Dict[str, Any]:
+def _redact_provider_text(value: Any, secret: str = "") -> str:
+    text = str(value or "")
+    if secret:
+        text = text.replace(secret, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?(?:bearer\s+)?)[^,\s}\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(x-api-key|api[_-]?key|token|secret)['\"]?\s*[:=]\s*['\"]?[^,\s}\"']+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    return text[:2000]
+
+
+def _extract_provider_error(response: Any, *, secret: str = "") -> Dict[str, Any]:
     status_code = getattr(response, "status_code", None)
     provider_code = None
     message = ""
@@ -142,12 +161,12 @@ def _extract_provider_error(response: Any) -> Dict[str, Any]:
                 or error_payload.get("type")
                 or error_payload.get("error_code")
             )
-            message = str(error_payload.get("message") or error_payload.get("error") or "")
+            message = _redact_provider_text(error_payload.get("message") or error_payload.get("error") or "", secret)
         elif error_payload is not None:
-            message = str(error_payload)
-        raw_text = str(payload)
+            message = _redact_provider_text(error_payload, secret)
+        raw_text = _redact_provider_text(payload, secret)
     else:
-        raw_text = str(getattr(response, "text", "") or "")
+        raw_text = _redact_provider_text(getattr(response, "text", "") or "", secret)
         message = raw_text
 
     return {
@@ -163,8 +182,8 @@ def _looks_like_quota_error(*parts: Any) -> bool:
     return any(marker.casefold() in text for marker in _QUOTA_ERROR_MARKERS)
 
 
-def _classify_http_error(response: Any) -> Tuple[str, Optional[int], Optional[str], str]:
-    details = _extract_provider_error(response)
+def _classify_http_error(response: Any, *, secret: str = "") -> Tuple[str, Optional[int], Optional[str], str]:
+    details = _extract_provider_error(response, secret=secret)
     status_code = details.get("http_status")
     provider_code = str(details.get("provider_code") or "")
     message = str(details.get("message") or details.get("raw_text") or "")
@@ -762,6 +781,142 @@ def _post_with_proxy_mode(api_url: str, *, api_config: APIConfig, **kwargs: Any)
     return requests.post(api_url, **kwargs)
 
 
+def build_provider_transport_preflight(
+    api_config: Mapping[str, Any],
+    *,
+    credential_source: str = "unknown",
+    prompt: str = "preflight",
+    system_prompt: str = "preflight",
+) -> Dict[str, Any]:
+    """Build the exact route/payload shape used by the formal AI transport.
+
+    This is intentionally no-network: it exercises capability resolution,
+    endpoint construction, proxy policy, payload builders, and the canonical
+    request identity without exposing or hashing the credential.
+    """
+
+    api_key = str(api_config.get("api_key") or "").strip()
+    if not api_key or is_template_credential(api_key):
+        raise ValueError("provider preflight requires a non-template runtime credential")
+    model = str(api_config.get("model") or "").strip()
+    if not model:
+        raise ValueError("provider preflight requires a model")
+    api_base = str(api_config.get("api_base") or "").strip()
+    if not api_base:
+        raise ValueError("provider preflight requires an api_base")
+
+    typed_config = cast(APIConfig, api_config)
+    capability = resolve_model_capability(typed_config)
+    if capability.endpoint_type == "anthropic":
+        route, _headers = anthropic_request_target(api_base, typed_config, api_key)
+        payload = build_anthropic_messages_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    elif capability.endpoint_type == "responses":
+        route = f"{api_base.rstrip('/')}/responses"
+        payload = build_responses_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    else:
+        route = f"{api_base.rstrip('/')}/chat/completions"
+        payload = build_chat_completions_payload(
+            prompt,
+            api_config,  # type: ignore[arg-type]
+            system_prompt,
+            max_tokens=1,
+            temperature=0.0,
+            response_format="json",
+            user_content=None,
+            capability=capability,
+        )
+    input_identity = canonical_provider_request_payload(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        user_content=None,
+        response_format="json",
+        max_output_tokens=1,
+        temperature=0.0,
+    )
+    payload_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    input_bytes = json.dumps(
+        input_identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    timeout_seconds, retry_attempts = _load_api_runtime_settings(api_config)
+    bypass_proxy = should_bypass_environment_proxy(api_config)
+    endpoint_classification = classify_provider_endpoint(
+        api_base,
+        capability.provider_family,
+    )
+    return {
+        "provider_family": capability.provider_family,
+        "endpoint_type": capability.endpoint_type,
+        "api_base": api_base,
+        "model": model,
+        "proxy_mode": str(api_config.get("proxy_mode") or "environment"),
+        "trust_env": not bypass_proxy,
+        "credential_source": str(credential_source or "unknown"),
+        "endpoint_classification": endpoint_classification,
+        "request_method": "POST",
+        "request_route": route,
+        "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+        "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
+        "request_byte_estimate": len(payload_bytes),
+        "timeout_seconds": timeout_seconds,
+        "transport_retries": retry_attempts,
+    }
+
+
+def classify_provider_endpoint(api_base: str, provider_family: str = "") -> dict[str, Any]:
+    """Classify a provider host without contacting it or reading credentials."""
+
+    raw_base = str(api_base or "").strip()
+    host = str(urlparse(raw_base).hostname or "").casefold()
+    family = str(provider_family or "").strip().casefold().replace("-", "_")
+    official_hosts = {
+        "deepseek": {"api.deepseek.com"},
+        "anthropic": {"api.anthropic.com"},
+        "openai_responses": {"api.openai.com"},
+        "openai": {"api.openai.com"},
+    }
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if host in local_hosts:
+        classification = "custom_local_endpoint"
+        warning = "requests stay on a local/custom endpoint"
+    elif host in official_hosts.get(family, set()):
+        classification = "official_provider_host"
+        warning = "host matches the configured official provider family"
+    else:
+        classification = "third_party_gateway"
+        warning = "prompts, document content, and endpoint credentials are sent to a non-official/custom gateway"
+    return {
+        "host": host,
+        "classification": classification,
+        "warning": warning,
+    }
+
+
 def _default_core_variables() -> Dict[str, List[str]]:
     specialized = default_ai_summary()["specialized_details"]
     empirical = specialized.get("empirical") or {}
@@ -776,17 +931,17 @@ def _coerce_positive_int(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
-def _response_error_details(response: Any, limit: int = 500) -> str:
+def _response_error_details(response: Any, limit: int = 500, *, secret: str = "") -> str:
     if response is None:
         return "HTTP错误 ?"
 
     details = f"HTTP错误 {getattr(response, 'status_code', '?')}"
     try:
         error_response = response.json()
-        details += f"，响应: {str(error_response)[:limit]}"
+        details += f"，响应: {_redact_provider_text(error_response, secret)[:limit]}"
     except Exception:
         response_text = getattr(response, "text", "") or "无响应内容"
-        details += f"，响应文本: {response_text[:limit]}"
+        details += f"，响应文本: {_redact_provider_text(response_text, secret)[:limit]}"
     return details
 
 
@@ -1598,8 +1753,8 @@ def _call_ai_api_detailed_uninstrumented(
         api_base = api_config.get('api_base', 'https://api.openai.com/v1') or 'https://api.openai.com/v1'
         capability = resolve_model_capability(api_config)
 
-        if not api_key or not model_name:
-            message = "API config is missing api_key or model"
+        if not api_key or is_template_credential(api_key) or not model_name:
+            message = "API config is missing a real api_key or model"
             if logger:
                 logger.error(message)
             return finish(_api_result(status="failed", error_kind="fatal_config_or_auth", message=message))
@@ -1760,13 +1915,16 @@ def _call_ai_api_detailed_uninstrumented(
                 return finish(formatted)
 
             except requests.exceptions.HTTPError:
-                error_kind, http_status, provider_code, message = _classify_http_error(response)
+                error_kind, http_status, provider_code, message = _classify_http_error(
+                    response,
+                    secret=api_key,
+                )
                 last_failure = _api_result(
                     status="failed",
                     error_kind=error_kind,
                     http_status=http_status,
                     provider_code=provider_code,
-                    message=message or _response_error_details(response, limit=500),
+                    message=message or _response_error_details(response, limit=500, secret=api_key),
                 )
                 if (
                     capability.reasoning_param_style == "chat_reasoning"
@@ -1838,7 +1996,10 @@ def _call_ai_api_detailed_uninstrumented(
                 if can_start_attempt():
                     wait_time = 2 * (2 ** (attempt - 1))
                     if logger:
-                        logger.warning(f"{_response_error_details(response, limit=200)}，{wait_time:.1f}秒后重试...")
+                        logger.warning(
+                            f"{_response_error_details(response, limit=200, secret=api_key)}，"
+                            f"{wait_time:.1f}秒后重试..."
+                        )
                     time.sleep(wait_time)
                     continue
 
@@ -1849,7 +2010,10 @@ def _call_ai_api_detailed_uninstrumented(
             except Exception as exc:
                 response_status = getattr(response, "status_code", None)
                 if isinstance(response_status, int) and response_status >= 400:
-                    error_kind, http_status, provider_code, message = _classify_http_error(response)
+                    error_kind, http_status, provider_code, message = _classify_http_error(
+                        response,
+                        secret=api_key,
+                    )
                 else:
                     error_kind, message = _classify_exception(exc)
                     http_status = response_status
@@ -1932,6 +2096,23 @@ def _call_ai_api_detailed(
         max_output_tokens=int(max_tokens),
         temperature=temperature,
     )
+    runtime_api_key = str(api_config.get("api_key") or "").strip()
+    runtime_model = str(api_config.get("model") or "").strip()
+    if not runtime_api_key or is_template_credential(runtime_api_key) or not runtime_model:
+        receipt = provider_runtime.blocked_receipt(
+            prompt=prompt,
+            input_payload=request_payload,
+            api_config=api_config,
+            message="provider runtime rejected an empty/template credential or model before transport",
+            route=provider_route,
+        )
+        blocked = _api_result(
+            status="failed",
+            error_kind="fatal_config_or_auth",
+            message="provider runtime rejected an empty/template credential or model before transport",
+        )
+        blocked["provider_receipt"] = receipt.to_dict()
+        return blocked
     capability = resolve_model_capability(api_config)
     profile = ProviderContextProfile.conservative(
         provider=str(api_config.get("provider_family") or capability.provider_family),
@@ -2063,6 +2244,36 @@ def _call_ai_api_detailed(
             "successful_input_mode": "multimodal" if transport_report.get("images_actually_sent_count", 0) else "text_only",
         },
     }
+    if capability.endpoint_type == "anthropic":
+        request_route = anthropic_request_target(
+            str(api_config.get("api_base") or ""),
+            cast(APIConfig, api_config),
+            str(api_config.get("api_key") or ""),
+        )[0]
+    else:
+        request_route = (
+            f"{str(api_config.get('api_base') or '').rstrip('/')}/"
+            f"{'responses' if capability.endpoint_type == 'responses' else 'chat/completions'}"
+        )
+    transport_config = {
+        "provider_family": capability.provider_family,
+        "endpoint_type": capability.endpoint_type,
+        "api_base": str(api_config.get("api_base") or ""),
+        "model": str(api_config.get("model") or ""),
+        "proxy_mode": str(api_config.get("proxy_mode") or "environment"),
+        "trust_env": not should_bypass_environment_proxy(api_config),
+        "request_route": request_route,
+        "request_byte_estimate": len(
+            json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ),
+        "timeout_seconds": _load_api_runtime_settings(api_config)[0],
+        "transport_retries": _load_api_runtime_settings(api_config)[1],
+    }
     receipt = provider_runtime.complete(
         admission=admission,
         prompt=prompt,
@@ -2072,6 +2283,7 @@ def _call_ai_api_detailed(
         metadata={
             "request_budget": budget,
             "requested_output_tokens": int(max_tokens),
+            "transport_config": transport_config,
             **dict(result.get("transport_metadata") or {}),
         },
         route=provider_route,

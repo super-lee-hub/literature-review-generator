@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 import json
 import logging
+import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, cast
@@ -83,7 +84,13 @@ class _RuntimeStageHost:
         cancel_token: CancelToken,
     ) -> None:
         self.logger = logging.getLogger("auto_generate.runtime")
-        self.config = load_config(request.config)
+        self.config = load_config(
+            request.config,
+            action=request.action,
+            requested_stages=request.requested_stages,
+            free_mode_enabled=bool(request.free_mode_profile or request.free_mode_idea),
+            allow_template_credentials=os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1",
+        )
         if request.source_mode == "direct":
             # A direct job owns its source mode; configured Zotero defaults
             # must not silently override it during source-inventory planning.

@@ -14,7 +14,7 @@ import threading
 import time
 import zipfile
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, cast
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -33,6 +33,25 @@ DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
         "cdn-mineru.openxlab.org.cn",
     }
 )
+DEFAULT_MINERU_RESPONSE_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_MINERU_ZIP_MAX_ENTRIES = 4096
+DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES = 64 * 1024 * 1024
+DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO = 200.0
+DEFAULT_MINERU_JSON_MAX_BYTES = 32 * 1024 * 1024
+DEFAULT_MINERU_TEXT_MAX_BYTES = 64 * 1024 * 1024
+
+
+class MineruArtifactError(RuntimeError):
+    """Base class for malformed or resource-exhausting remote artifacts."""
+
+
+class MineruArtifactLimitError(MineruArtifactError):
+    """Raised when a remote response/archive exceeds a configured bound."""
+
+
+class MineruArtifactFormatError(MineruArtifactError):
+    """Raised when a remote artifact is not a valid supported archive."""
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -163,6 +182,61 @@ class PreprocessManager:
         self.mineru_poll_timeout_seconds = _as_float(os.getenv("MINERU_POLL_TIMEOUT_SECONDS", "900"), 900.0)
         self.mineru_request_max_retries = _as_int(os.getenv("MINERU_REQUEST_MAX_RETRIES", "2"), 2)
         self.mineru_retry_backoff_seconds = _as_float(os.getenv("MINERU_RETRY_BACKOFF_SECONDS", "1.5"), 1.5)
+        self.mineru_response_max_bytes = max(
+            1,
+            _as_int(
+                os.getenv("MINERU_RESPONSE_MAX_BYTES", str(DEFAULT_MINERU_RESPONSE_MAX_BYTES)),
+                DEFAULT_MINERU_RESPONSE_MAX_BYTES,
+            ),
+        )
+        self.mineru_zip_max_entries = max(
+            1,
+            _as_int(
+                os.getenv("MINERU_ZIP_MAX_ENTRIES", str(DEFAULT_MINERU_ZIP_MAX_ENTRIES)),
+                DEFAULT_MINERU_ZIP_MAX_ENTRIES,
+            ),
+        )
+        self.mineru_zip_max_uncompressed_bytes = max(
+            1,
+            _as_int(
+                os.getenv(
+                    "MINERU_ZIP_MAX_UNCOMPRESSED_BYTES",
+                    str(DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES),
+                ),
+                DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES,
+            ),
+        )
+        self.mineru_zip_max_entry_bytes = max(
+            1,
+            _as_int(
+                os.getenv("MINERU_ZIP_MAX_ENTRY_BYTES", str(DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES)),
+                DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES,
+            ),
+        )
+        self.mineru_zip_max_compression_ratio = max(
+            1.0,
+            _as_float(
+                os.getenv(
+                    "MINERU_ZIP_MAX_COMPRESSION_RATIO",
+                    str(DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO),
+                ),
+                DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO,
+            ),
+        )
+        self.mineru_json_max_bytes = max(
+            1,
+            _as_int(
+                os.getenv("MINERU_JSON_MAX_BYTES", str(DEFAULT_MINERU_JSON_MAX_BYTES)),
+                DEFAULT_MINERU_JSON_MAX_BYTES,
+            ),
+        )
+        self.mineru_text_max_bytes = max(
+            1,
+            _as_int(
+                os.getenv("MINERU_TEXT_MAX_BYTES", str(DEFAULT_MINERU_TEXT_MAX_BYTES)),
+                DEFAULT_MINERU_TEXT_MAX_BYTES,
+            ),
+        )
         configured_allowed_hosts = {
             item.strip().lower()
             for item in str(os.getenv("MINERU_ALLOWED_URL_HOSTS", "")).split(",")
@@ -494,6 +568,8 @@ class PreprocessManager:
                     remote_result["mineru_remote_requested"] = remote_requested
                     remote_result["mineru_remote_enabled"] = remote_enabled
                     return remote_result
+            except MineruArtifactError:
+                raise
             except Exception as exc:  # pragma: no cover - remote integration path.
                 self._log(f"MinerU remote parsing failed, falling back to local parser: {exc}", level="warning")
 
@@ -723,8 +799,26 @@ class PreprocessManager:
                         snapshot=self.mineru_circuit_breaker.snapshot,
                     )
                 response.raise_for_status()
+                content_length = getattr(response, "headers", {}).get("Content-Length")
+                try:
+                    advertised_bytes = int(content_length) if content_length else 0
+                except (TypeError, ValueError):
+                    advertised_bytes = 0
+                if advertised_bytes > self.mineru_response_max_bytes:
+                    raise MineruArtifactLimitError(
+                        "MinerU JSON response exceeds the configured byte limit "
+                        f"({advertised_bytes} > {self.mineru_response_max_bytes})"
+                    )
+                response_content = bytes(getattr(response, "content", b"") or b"")
+                if len(response_content) > self.mineru_response_max_bytes:
+                    raise MineruArtifactLimitError(
+                        "MinerU JSON response exceeds the configured byte limit "
+                        f"({len(response_content)} > {self.mineru_response_max_bytes})"
+                    )
                 return response.json()
             except ProviderCircuitOpen:
+                raise
+            except MineruArtifactError:
                 raise
             except Exception as exc:  # pragma: no cover - transport path.
                 last_exception = exc
@@ -751,7 +845,13 @@ class PreprocessManager:
                     if is_mineru_origin:
                         self.mineru_circuit_breaker.ensure_closed()
                     headers = self._mineru_headers() if is_mineru_origin else {}
-                    response = session.get(safe_url, headers=headers, timeout=120, allow_redirects=False)
+                    response = session.get(
+                        safe_url,
+                        headers=headers,
+                        timeout=120,
+                        allow_redirects=False,
+                        stream=True,
+                    )
                     status_code = int(getattr(response, "status_code", 200))
                     if status_code in {401, 403}:
                         self.mineru_circuit_breaker.open(
@@ -763,8 +863,45 @@ class PreprocessManager:
                             snapshot=self.mineru_circuit_breaker.snapshot,
                         )
                     response.raise_for_status()
-                    return response.content
+                    content_length = getattr(response, "headers", {}).get("Content-Length")
+                    try:
+                        advertised_bytes = int(content_length) if content_length else 0
+                    except (TypeError, ValueError):
+                        advertised_bytes = 0
+                    if advertised_bytes > self.mineru_response_max_bytes:
+                        raise MineruArtifactLimitError(
+                            "MinerU response exceeds the configured byte limit "
+                            f"({advertised_bytes} > {self.mineru_response_max_bytes})"
+                        )
+                    chunks: list[bytes] = []
+                    total_bytes = 0
+                    iterator = cast(
+                        Callable[..., Iterable[Any]] | None,
+                        getattr(response, "iter_content", None),
+                    )
+                    if callable(iterator):
+                        for chunk in iterator(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            chunk_bytes = bytes(chunk)
+                            total_bytes += len(chunk_bytes)
+                            if total_bytes > self.mineru_response_max_bytes:
+                                raise MineruArtifactLimitError(
+                                    "MinerU response exceeded the configured byte limit "
+                                    f"({total_bytes} > {self.mineru_response_max_bytes})"
+                                )
+                            chunks.append(chunk_bytes)
+                        return b"".join(chunks)
+                    content = bytes(getattr(response, "content", b"") or b"")
+                    if len(content) > self.mineru_response_max_bytes:
+                        raise MineruArtifactLimitError(
+                            "MinerU response exceeds the configured byte limit "
+                            f"({len(content)} > {self.mineru_response_max_bytes})"
+                        )
+                    return content
                 except ProviderCircuitOpen:
+                    raise
+                except MineruArtifactError:
                     raise
                 except Exception as exc:  # pragma: no cover - transport path.
                     last_exception = exc
@@ -888,6 +1025,8 @@ class PreprocessManager:
         if isinstance(zip_url, str) and zip_url.strip():
             try:
                 zip_artifacts = self._artifacts_from_zip_bytes(self._request_binary(self._join_base_url(zip_url)))
+            except MineruArtifactError:
+                raise
             except Exception as exc:  # pragma: no cover - transport path.
                 self._log(f"MinerU result zip download failed: {exc}", level="warning")
                 zip_artifacts = {}
@@ -938,7 +1077,39 @@ class PreprocessManager:
         artifacts: Dict[str, Any] = {}
         if not raw_bytes:
             return artifacts
-        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
+        if len(raw_bytes) > self.mineru_response_max_bytes:
+            raise MineruArtifactLimitError(
+                "MinerU archive response exceeds the configured byte limit "
+                f"({len(raw_bytes)} > {self.mineru_response_max_bytes})"
+            )
+        try:
+            archive_context = zipfile.ZipFile(io.BytesIO(raw_bytes))
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise MineruArtifactFormatError("MinerU result is not a valid ZIP archive") from exc
+        with archive_context as archive:
+            infos = archive.infolist()
+            if len(infos) > self.mineru_zip_max_entries:
+                raise MineruArtifactLimitError(
+                    "MinerU archive contains too many entries "
+                    f"({len(infos)} > {self.mineru_zip_max_entries})"
+                )
+            total_uncompressed = 0
+            for info in infos:
+                entry_bytes = int(info.file_size or 0)
+                compressed_bytes = int(info.compress_size or 0)
+                total_uncompressed += entry_bytes
+                if entry_bytes > self.mineru_zip_max_entry_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU archive entry is too large: {info.filename!r}"
+                    )
+                if total_uncompressed > self.mineru_zip_max_uncompressed_bytes:
+                    raise MineruArtifactLimitError(
+                        "MinerU archive exceeds the total uncompressed byte limit"
+                    )
+                if compressed_bytes > 0 and entry_bytes / compressed_bytes > self.mineru_zip_max_compression_ratio:
+                    raise MineruArtifactLimitError(
+                        f"MinerU archive entry has an excessive compression ratio: {info.filename!r}"
+                    )
             markdown_candidate = None
             structured_candidate = None
             page_index_candidate = None
@@ -954,20 +1125,50 @@ class PreprocessManager:
                 elif lowered.endswith("plain_text.txt"):
                     plain_text_candidate = name
             if markdown_candidate:
-                artifacts["markdown_text"] = archive.read(markdown_candidate).decode("utf-8", errors="ignore")
+                markdown_bytes = archive.read(markdown_candidate)
+                if len(markdown_bytes) > self.mineru_text_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU markdown member exceeds {self.mineru_text_max_bytes} bytes"
+                    )
+                artifacts["markdown_text"] = markdown_bytes.decode("utf-8", errors="ignore")
             if plain_text_candidate:
-                artifacts["plain_text"] = archive.read(plain_text_candidate).decode("utf-8", errors="ignore")
+                plain_text_bytes = archive.read(plain_text_candidate)
+                if len(plain_text_bytes) > self.mineru_text_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU plain-text member exceeds {self.mineru_text_max_bytes} bytes"
+                    )
+                artifacts["plain_text"] = plain_text_bytes.decode("utf-8", errors="ignore")
             if structured_candidate:
-                artifacts["structured_payload"] = json.loads(
-                    archive.read(structured_candidate).decode("utf-8", errors="ignore")
-                )
+                structured_bytes = archive.read(structured_candidate)
+                if len(structured_bytes) > self.mineru_json_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU structured JSON exceeds {self.mineru_json_max_bytes} bytes"
+                    )
+                try:
+                    artifacts["structured_payload"] = json.loads(
+                        structured_bytes.decode("utf-8", errors="ignore")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise MineruArtifactFormatError(
+                        f"MinerU structured JSON is invalid: {structured_candidate!r}"
+                    ) from exc
                 content_list = self._find_first_value(artifacts["structured_payload"], {"content_list", "contentList"})
                 if isinstance(content_list, list):
                     artifacts["content_list"] = content_list
             if page_index_candidate:
-                artifacts["page_index"] = json.loads(
-                    archive.read(page_index_candidate).decode("utf-8", errors="ignore")
-                )
+                page_index_bytes = archive.read(page_index_candidate)
+                if len(page_index_bytes) > self.mineru_json_max_bytes:
+                    raise MineruArtifactLimitError(
+                        f"MinerU page-index JSON exceeds {self.mineru_json_max_bytes} bytes"
+                    )
+                try:
+                    artifacts["page_index"] = json.loads(
+                        page_index_bytes.decode("utf-8", errors="ignore")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise MineruArtifactFormatError(
+                        f"MinerU page-index JSON is invalid: {page_index_candidate!r}"
+                    ) from exc
         return artifacts
 
     def _extract_with_docling(

@@ -22,7 +22,10 @@ import time
 from typing import Any, Mapping, Sequence, cast
 
 from config_loader import load_config
+from config_loader import provider_sections_for_stage_plan
 from config_validator import validate_all_config
+from ai_interface import build_provider_transport_preflight, classify_provider_endpoint
+from services.credential_provenance import is_template_credential, provenance_payload
 from models import APIConfig
 from runtime.job_spec import RuntimeJobSpec, load_runtime_job_spec
 from runtime.outline_v3_dag import OutlineNodeStore
@@ -517,7 +520,91 @@ class ReviewControlPlane:
             spec = replace(spec, job_id=job_id)
         runner = AgentRuntimeRunner(spec)
         result = runner.resume() if resume else runner.run()
-        return self._status_payload(result)
+        payload = self._status_payload(result)
+        if result.job_status != "completed" or result.completion_status != "complete":
+            payload["formal_runner_transport_diff"] = self._formal_runner_transport_diff(
+                spec,
+                result,
+            )
+        return payload
+
+    @staticmethod
+    def _formal_runner_transport_diff(
+        spec: RuntimeJobSpec,
+        result: RuntimeExecutionResult,
+    ) -> dict[str, Any]:
+        """Compare no-network preflight fields with redacted receipt snapshots."""
+
+        try:
+            preflight = ReviewControlPlane(repo_root=Path(spec.config).expanduser().resolve().parent).provider_preflight(
+                config_path=spec.config,
+                action=spec.action,
+                requested_stages=spec.metadata.get("requested_stages"),
+            )
+            expected = {
+                (
+                    str(item.get("provider_family") or ""),
+                    str(item.get("model") or ""),
+                    str(item.get("endpoint_type") or ""),
+                ): item
+                for item in (preflight.get("providers") or [])
+                if isinstance(item, Mapping)
+            }
+            workspace = Path(result.workspace_path).expanduser().resolve()
+            actual: list[dict[str, Any]] = []
+            for path in workspace.glob("artifacts/**/provider_receipts*.jsonl"):
+                try:
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        raw = json.loads(line)
+                        metadata = raw.get("metadata") if isinstance(raw, Mapping) else None
+                        snapshot = metadata.get("transport_config") if isinstance(metadata, Mapping) else None
+                        if isinstance(snapshot, Mapping):
+                            actual.append(dict(snapshot))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+            fields = (
+                "provider_family",
+                "endpoint_type",
+                "api_base",
+                "model",
+                "proxy_mode",
+                "trust_env",
+                "request_route",
+                "request_byte_estimate",
+                "timeout_seconds",
+                "transport_retries",
+            )
+            diffs: list[dict[str, Any]] = []
+            for snapshot in actual:
+                key = (
+                    str(snapshot.get("provider_family") or ""),
+                    str(snapshot.get("model") or ""),
+                    str(snapshot.get("endpoint_type") or ""),
+                )
+                target = expected.get(key)
+                if target is None:
+                    diffs.append({"actual": {field: snapshot.get(field) for field in fields}, "expected": None})
+                    continue
+                field_diff = {
+                    field: {"expected": target.get(field), "actual": snapshot.get(field)}
+                    for field in fields
+                    if target.get(field) != snapshot.get(field)
+                }
+                if field_diff:
+                    diffs.append(field_diff)
+            return {
+                "status": "diff" if diffs else "match" if actual and preflight.get("ok") else "unavailable",
+                "preflight_status": preflight.get("status"),
+                "provider_receipt_snapshot_count": len(actual),
+                "diffs": diffs,
+                "secret_values_included": False,
+            }
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "reason": type(exc).__name__,
+                "secret_values_included": False,
+            }
 
     def run(
         self,
@@ -1128,17 +1215,33 @@ class ReviewControlPlane:
             checks.append({"name": name, "status": status, "details": details})
 
         target_config = Path(config_path or self.repo_root / "config.ini").expanduser().resolve()
+        template_config = target_config.name.casefold().endswith(".example")
         normalized_config: Mapping[str, Mapping[str, Any]] = {}
         if not target_config.is_file():
             add("configuration", "fail", {"path": str(target_config), "error": "config.ini is missing"})
         else:
             try:
-                normalized_config = load_config(str(target_config))
-                valid, warnings = validate_all_config(dict(normalized_config))
+                normalized_config = load_config(
+                    str(target_config),
+                    required_provider_sections=(),
+                    allow_template_credentials=template_config,
+                )
+                valid, warnings = validate_all_config(
+                    dict(normalized_config),
+                    required_provider_sections=(),
+                    allow_template_credentials=template_config,
+                )
                 add(
                     "configuration",
                     "pass" if valid else "fail",
-                    {"path": str(target_config), "valid": bool(valid), "warnings": list(warnings)},
+                    {
+                        "path": str(target_config),
+                        "valid": bool(valid),
+                        "warnings": list(warnings),
+                        "credential_provenance": provenance_payload(
+                            list(getattr(normalized_config, "credential_provenance", ()))
+                        ),
+                    },
                 )
             except Exception as exc:
                 add("configuration", "fail", {"path": str(target_config), "error": str(exc)})
@@ -1154,7 +1257,8 @@ class ReviewControlPlane:
                 if section.get("model")
                 else None
             )
-            has_key = bool(str(section.get("api_key") or "").strip())
+            raw_key = str(section.get("api_key") or "").strip()
+            has_key = bool(raw_key) and not is_template_credential(raw_key)
             if not has_key and section_name in {"Primary_Reader_API", "Backup_Reader_API", "Writer_API"}:
                 missing_keys.append(section_name)
             provider_details.append(
@@ -1163,6 +1267,14 @@ class ReviewControlPlane:
                     "api_key_present": has_key,
                     "model_configured": bool(str(section.get("model") or "").strip()),
                     "api_base_configured": bool(str(section.get("api_base") or "").strip()),
+                    "endpoint_classification": (
+                        classify_provider_endpoint(
+                            str(section.get("api_base") or ""),
+                            capability.provider_family,
+                        )
+                        if capability is not None
+                        else None
+                    ),
                     "capability": (
                         {
                             "provider_family": capability.provider_family,
@@ -1278,6 +1390,73 @@ class ReviewControlPlane:
             "provider_network_calls": 0,
             "read_only": True,
         }
+
+    def provider_preflight(
+        self,
+        *,
+        config_path: str | Path | None = None,
+        action: str = "analyze",
+        requested_stages: Sequence[str] | None = None,
+        section: str | None = None,
+    ) -> dict[str, Any]:
+        """Exercise the formal config/route/payload construction without HTTP."""
+
+        target_config = Path(config_path or self.repo_root / "config.ini").expanduser().resolve()
+        try:
+            normalized = load_config(
+                str(target_config),
+                action=action,
+                requested_stages=requested_stages,
+                allow_template_credentials=False,
+            )
+            settings = ApplicationSettings.from_config(normalized)
+            roles = provider_sections_for_stage_plan(
+                normalized,
+                requested_stages=requested_stages,
+                action=action,
+            )
+            selected_roles = (section,) if section else roles
+            provenance = {
+                item.section: item.selected_source
+                for item in getattr(normalized, "credential_provenance", ())
+            }
+            providers: list[dict[str, Any]] = []
+            for role in selected_roles:
+                provider = dict(normalized.get(role) or {})
+                if not provider:
+                    raise ValueError(f"required provider section is missing: [{role}]")
+                details = build_provider_transport_preflight(
+                    provider,
+                    credential_source=provenance.get(role, "unknown"),
+                )
+                details["section"] = role
+                providers.append(details)
+            return {
+                "control_plane_version": CONTROL_PLANE_VERSION,
+                "status": "pass",
+                "ok": True,
+                "action": action,
+                "requested_stages": list(requested_stages or ()),
+                "provider_roles": list(selected_roles),
+                "providers": providers,
+                "credential_provenance": provenance_payload(
+                    list(getattr(normalized, "credential_provenance", ()))
+                ),
+                "proxy_policy": "formal ai_interface._post_with_proxy_mode",
+                "network_calls": 0,
+                "read_only": True,
+            }
+        except Exception as exc:
+            return {
+                "control_plane_version": CONTROL_PLANE_VERSION,
+                "status": "fail",
+                "ok": False,
+                "config_path": str(target_config),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "network_calls": 0,
+                "read_only": True,
+            }
 
     @staticmethod
     def _dependency_check() -> dict[str, Any]:

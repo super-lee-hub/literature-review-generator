@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
+import re
 import secrets
+import stat
 import tempfile
 import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict
+
+from services.durable_io import AtomicReplaceTimeoutError, atomic_replace_with_retry
 
 
 def utc_now_iso() -> str:
@@ -20,6 +25,87 @@ import time
 
 _POINTER_LOCKS_GUARD = threading.Lock()
 _POINTER_LOCKS: dict[str, threading.RLock] = {}
+DEFAULT_POINTER_LOCK_TIMEOUT_SECONDS = 5.0
+DEFAULT_POINTER_LOCK_RETRY_INTERVAL_MS = 50
+
+
+class WorkspacePathError(ValueError):
+    """Raised when a workspace identity or child path is unsafe."""
+
+
+class PointerLockTimeout(TimeoutError):
+    """Raised when the latest-job pointer lock cannot be acquired in time."""
+
+
+def _validate_path_component(value: str, *, field_name: str) -> str:
+    candidate = str(value or "")
+    if not candidate or candidate in {".", ".."}:
+        raise WorkspacePathError(f"{field_name} must be a non-empty path component")
+    if candidate != candidate.strip() or "/" in candidate or "\\" in candidate:
+        raise WorkspacePathError(f"{field_name} must not contain separators or surrounding whitespace")
+    if ntpath.isabs(candidate) or ntpath.splitdrive(candidate)[0]:
+        raise WorkspacePathError(f"{field_name} must not be absolute")
+    if any(ord(char) < 32 for char in candidate) or re.search(r'[<>:"|?*]', candidate):
+        raise WorkspacePathError(f"{field_name} contains invalid Windows path characters")
+    if candidate.endswith((".", " ")):
+        raise WorkspacePathError(f"{field_name} must not end with a dot or space")
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {
+        f"LPT{i}" for i in range(1, 10)
+    }
+    if candidate.split(".", 1)[0].upper() in reserved:
+        raise WorkspacePathError(f"{field_name} uses a reserved Windows name")
+    return candidate
+
+
+def validate_path_component(value: str, *, field_name: str = "path component") -> str:
+    """Validate one user-controlled component before it enters a filename."""
+
+    return _validate_path_component(value, field_name=field_name)
+
+
+def _is_reparse_path(path: str | os.PathLike[str]) -> bool:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(
+        flag and int(getattr(info, "st_file_attributes", 0)) & flag
+    )
+
+
+def _descendant_path(
+    base: str | os.PathLike[str],
+    candidate: str | os.PathLike[str],
+    *,
+    allow_existing_reparse_leaf: bool = False,
+) -> str:
+    # realpath matters on Windows too: an existing junction/symlink must not
+    # turn a lexical descendant into a path outside the configured root.
+    lexical_base = os.path.abspath(os.fspath(base))
+    lexical_candidate = os.path.abspath(os.fspath(candidate))
+    base_path = os.path.realpath(lexical_base)
+    candidate_path = os.path.realpath(lexical_candidate)
+    try:
+        common = os.path.commonpath([base_path, candidate_path])
+    except ValueError as exc:
+        raise WorkspacePathError("workspace path is on a different drive") from exc
+    if os.path.normcase(common) != os.path.normcase(base_path):
+        # A caller may need the lexical name of an already-created reparse
+        # leaf in order to reject it before any batch writes.  Permit only
+        # that one narrow inspection case: the lexical parent must still
+        # resolve inside the root.  A missing child, a nested reparse point,
+        # and any traversal outside the root remain fail-closed.
+        if allow_existing_reparse_leaf and os.path.lexists(lexical_candidate):
+            parent_path = os.path.realpath(os.path.dirname(lexical_candidate))
+            try:
+                parent_common = os.path.commonpath([base_path, parent_path])
+            except ValueError:
+                parent_common = ""
+            if os.path.normcase(parent_common) == os.path.normcase(base_path):
+                return lexical_candidate
+        raise WorkspacePathError(f"path escapes configured output root: {candidate_path}")
+    return lexical_candidate if allow_existing_reparse_leaf else candidate_path
 
 
 def _pointer_process_lock(path: str) -> threading.RLock:
@@ -29,9 +115,17 @@ def _pointer_process_lock(path: str) -> threading.RLock:
 
 
 @contextmanager
-def _latest_pointer_lock(pointer_path: str):
+def _latest_pointer_lock(
+    pointer_path: str,
+    *,
+    timeout_seconds: float = DEFAULT_POINTER_LOCK_TIMEOUT_SECONDS,
+    retry_interval_ms: int = DEFAULT_POINTER_LOCK_RETRY_INTERVAL_MS,
+):
     process_lock = _pointer_process_lock(pointer_path)
-    with process_lock:
+    timeout = max(0.0, float(timeout_seconds))
+    if not process_lock.acquire(timeout=timeout):
+        raise PointerLockTimeout(f"timed out acquiring pointer process lock: {pointer_path}")
+    try:
         lock_path = pointer_path + ".lock"
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         with open(lock_path, "a+b") as handle:
@@ -41,58 +135,65 @@ def _latest_pointer_lock(pointer_path: str):
                 handle.flush()
                 os.fsync(handle.fileno())
             handle.seek(0)
+            acquired = False
+            deadline = time.monotonic() + timeout
             if os.name == "nt":
                 import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                while not acquired:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                    except OSError as exc:
+                        if time.monotonic() >= deadline:
+                            raise PointerLockTimeout(f"timed out acquiring pointer lock: {lock_path}") from exc
+                        time.sleep(max(1, int(retry_interval_ms)) / 1000.0)
             else:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                while not acquired:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                    except (BlockingIOError, OSError) as exc:
+                        if time.monotonic() >= deadline:
+                            raise PointerLockTimeout(f"timed out acquiring pointer lock: {lock_path}") from exc
+                        time.sleep(max(1, int(retry_interval_ms)) / 1000.0)
             try:
                 yield
             finally:
-                handle.seek(0)
-                if os.name == "nt":
-                    import msvcrt
+                if acquired:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
 
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
 
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        process_lock.release()
 
 def atomic_write_json(path: str, payload: Any) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
 
-    max_retries = 3
-    retry_delay = 1.0
-
-    for attempt in range(max_retries):
-        fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
-                handle.flush()
-                os.fsync(handle.fileno())
+    fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace_with_retry(temp_path, path, timeout_seconds=5.0)
+    except AtomicReplaceTimeoutError:
+        raise
+    finally:
+        if os.path.exists(temp_path):
             try:
-                os.replace(temp_path, path)
-                return  # 成功写入，退出函数
-            except (PermissionError, OSError, IOError) as e:
-                if attempt < max_retries - 1:
-                    # 退避重试
-                    time.sleep(retry_delay)
-                    continue
-                else:
-                    # 达到最大重试次数，抛出异常
-                    raise
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except Exception:
-                    pass
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 def publish_json_artifact(
@@ -166,16 +267,41 @@ class LatestJobPointer:
 
 class JobWorkspace:
     def __init__(self, base_output_dir: str, project_name: str, job_id: str) -> None:
-        self.base_output_dir = os.path.abspath(base_output_dir)
-        self.project_name = project_name
-        self.job_id = job_id
+        self.base_output_dir = os.path.abspath(os.path.expanduser(str(base_output_dir)))
+        self.project_name = _validate_path_component(project_name, field_name="project_name")
+        self.job_id = _validate_path_component(job_id, field_name="job_id")
+        root_dir = _descendant_path(
+            self.base_output_dir,
+            os.path.join(self.base_output_dir, f"{self.project_name}__{self.job_id}"),
+            allow_existing_reparse_leaf=True,
+        )
         self.paths = WorkspacePaths(
-            root_dir=os.path.join(self.base_output_dir, f"{project_name}__{job_id}"),
-            artifacts_dir=os.path.join(self.base_output_dir, f"{project_name}__{job_id}", "artifacts"),
-            checkpoints_dir=os.path.join(self.base_output_dir, f"{project_name}__{job_id}", "checkpoints"),
-            logs_dir=os.path.join(self.base_output_dir, f"{project_name}__{job_id}", "logs"),
-            reports_dir=os.path.join(self.base_output_dir, f"{project_name}__{job_id}", "reports"),
-            registry_path=os.path.join(self.base_output_dir, f"{project_name}__{job_id}", "artifact_registry.json"),
+            root_dir=root_dir,
+            artifacts_dir=_descendant_path(
+                root_dir,
+                os.path.join(root_dir, "artifacts"),
+                allow_existing_reparse_leaf=True,
+            ),
+            checkpoints_dir=_descendant_path(
+                root_dir,
+                os.path.join(root_dir, "checkpoints"),
+                allow_existing_reparse_leaf=True,
+            ),
+            logs_dir=_descendant_path(
+                root_dir,
+                os.path.join(root_dir, "logs"),
+                allow_existing_reparse_leaf=True,
+            ),
+            reports_dir=_descendant_path(
+                root_dir,
+                os.path.join(root_dir, "reports"),
+                allow_existing_reparse_leaf=True,
+            ),
+            registry_path=_descendant_path(
+                root_dir,
+                os.path.join(root_dir, "artifact_registry.json"),
+                allow_existing_reparse_leaf=True,
+            ),
         )
 
     @classmethod
@@ -194,15 +320,37 @@ class JobWorkspace:
         workspace_path = os.path.abspath(workspace_path)
         base_output_dir = os.path.dirname(workspace_path)
         derived_job_id = job_id
-        prefix = f"{project_name}__"
+        safe_project = _validate_path_component(project_name, field_name="project_name")
+        prefix = f"{safe_project}__"
         basename = os.path.basename(workspace_path)
-        if derived_job_id is None and basename.startswith(prefix):
-            derived_job_id = basename[len(prefix):]
+        if basename.startswith(prefix):
+            path_job_id = basename[len(prefix):]
+            if derived_job_id is not None and str(derived_job_id) != path_job_id:
+                raise WorkspacePathError(
+                    "explicit job_id does not match the requested workspace path"
+                )
+            derived_job_id = path_job_id
+        elif derived_job_id is not None:
+            raise WorkspacePathError("workspace path does not match project_name__job_id identity")
         workspace = cls(base_output_dir=base_output_dir, project_name=project_name, job_id=derived_job_id or cls.generate_job_id())
+        if os.path.normcase(os.path.realpath(workspace.paths.root_dir)) != os.path.normcase(
+            os.path.realpath(workspace_path)
+        ):
+            raise WorkspacePathError("workspace path identity does not match project_name/job_id")
         workspace.ensure_exists()
         return workspace
 
     def ensure_exists(self) -> None:
+        for path in (
+            self.paths.root_dir,
+            self.paths.artifacts_dir,
+            self.paths.checkpoints_dir,
+            self.paths.logs_dir,
+            self.paths.reports_dir,
+            self.paths.registry_path,
+        ):
+            if _is_reparse_path(path):
+                raise WorkspacePathError(f"workspace path must not be a symlink or reparse point: {path}")
         os.makedirs(self.paths.root_dir, exist_ok=True)
         os.makedirs(self.paths.artifacts_dir, exist_ok=True)
         os.makedirs(self.paths.checkpoints_dir, exist_ok=True)
@@ -214,19 +362,23 @@ class JobWorkspace:
         return self.paths.root_dir
 
     def artifact_path(self, filename: str) -> str:
-        return os.path.join(self.paths.artifacts_dir, filename)
+        return _descendant_path(
+            self.paths.artifacts_dir,
+            os.path.join(self.paths.artifacts_dir, filename),
+            allow_existing_reparse_leaf=True,
+        )
 
     def checkpoint_path(self, filename: str) -> str:
-        return os.path.join(self.paths.checkpoints_dir, filename)
+        return _descendant_path(self.paths.checkpoints_dir, os.path.join(self.paths.checkpoints_dir, filename))
 
     def report_path(self, filename: str) -> str:
-        return os.path.join(self.paths.reports_dir, filename)
+        return _descendant_path(self.paths.reports_dir, os.path.join(self.paths.reports_dir, filename))
 
     def log_path(self, filename: str) -> str:
-        return os.path.join(self.paths.logs_dir, filename)
+        return _descendant_path(self.paths.logs_dir, os.path.join(self.paths.logs_dir, filename))
 
     def project_pointer_dir(self) -> str:
-        return os.path.join(self.base_output_dir, self.project_name)
+        return _descendant_path(self.base_output_dir, os.path.join(self.base_output_dir, self.project_name))
 
     def latest_pointer_path(self) -> str:
         return os.path.join(self.project_pointer_dir(), "_latest_job.json")

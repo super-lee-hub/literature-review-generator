@@ -22,6 +22,7 @@ from services.config_values import (
     StrictConfigValueError,
     normalize_stage1_config_sections,
 )
+from services.credential_provenance import is_template_credential
 from services.settings import ApplicationSettings, validate_config_keys
 
 
@@ -160,12 +161,19 @@ def validate_output_path(path: str, allow_empty: bool = False) -> Tuple[bool, st
         return False, f"无法创建或写入目录: {exc}"
 
 
-def validate_api_key(api_key: str, allow_empty: bool = False) -> Tuple[bool, str]:
+def validate_api_key(
+    api_key: str,
+    allow_empty: bool = False,
+    *,
+    allow_template: bool = False,
+) -> Tuple[bool, str]:
     if not api_key:
         return (True, "") if allow_empty else (False, "API Key不能为空")
     value = api_key.strip()
-    if value in {"loaded_from_.env_file", "YOUR_PRIMARY_READER_API_KEY_HERE", "YOUR_BACKUP_READER_API_KEY_HERE", "YOUR_WRITER_API_KEY_HERE", "YOUR_VALIDATOR_API_KEY_HERE"}:
-        return True, ""
+    if is_template_credential(value):
+        if allow_template:
+            return True, ""
+        return False, "API Key仍是模板占位符，生产运行拒绝发送请求"
     if len(value) < 8:
         return False, "API Key长度似乎过短，请确认是否正确"
     return True, ""
@@ -214,7 +222,12 @@ def validate_config_section(config_dict: Dict[str, Any], section_name: str, requ
     return True, ""
 
 
-def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def validate_all_config(
+    config_dict: Dict[str, Any],
+    *,
+    required_provider_sections: List[str] | Tuple[str, ...] | None = None,
+    allow_template_credentials: bool = False,
+) -> Tuple[bool, List[str]]:
     """Validate current settings and return ``(valid, messages)``."""
 
     schema_errors = validate_config_keys(config_dict)
@@ -230,22 +243,41 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         return False, ["配置项[Paths]output_path不能为空"]
 
     messages: List[str] = []
-    for section_name in ("Primary_Reader_API", "Backup_Reader_API", "Writer_API"):
+    required_sections = (
+        ("Primary_Reader_API", "Backup_Reader_API", "Writer_API")
+        if required_provider_sections is None
+        else tuple(dict.fromkeys(str(item) for item in required_provider_sections))
+    )
+    for section_name in required_sections:
         valid, error = validate_config_section(config_dict, section_name, ["api_key", "model", "api_base"])
         if not valid:
             return False, [error]
-        valid, error = validate_api_key(str(config_dict[section_name]["api_key"]), allow_empty=True)
+        valid, error = validate_api_key(
+            str(config_dict[section_name]["api_key"]),
+            allow_empty=False,
+            allow_template=allow_template_credentials,
+        )
         if not valid:
-            messages.append(f"[{section_name}] {error}")
+            return False, [f"[{section_name}] {error}"]
         combo_errors, combo_warnings = _validate_api_transport_combo(section_name, config_dict[section_name])
         if combo_errors:
             return False, combo_errors
         messages.extend(combo_warnings)
         valid, error = validate_url(str(config_dict[section_name]["api_base"]), allow_empty=True)
         if not valid:
-            messages.append(f"[{section_name}] {error}")
+            return False, [f"[{section_name}] {error}"]
 
-    for section_name in ("Outline_API", "Free_Mode_API", "Validator_API"):
+    optional_sections = (
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Validator_API",
+    )
+    for section_name in optional_sections:
+        if section_name in required_sections:
+            continue
         if section_name not in config_dict:
             continue
         section = config_dict[section_name]
@@ -254,13 +286,20 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_config_section(config_dict, section_name, ["api_key", "model", "api_base"])
         if not valid:
             return False, [error]
+        valid, error = validate_api_key(
+            str(section.get("api_key") or ""),
+            allow_empty=True,
+            allow_template=True,
+        )
+        if not valid:
+            messages.append(f"[{section_name}] {error}")
         combo_errors, combo_warnings = _validate_api_transport_combo(section_name, section)
         if combo_errors:
             return False, combo_errors
         messages.extend(combo_warnings)
         valid, error = validate_url(str(section["api_base"]), allow_empty=True)
         if not valid:
-            messages.append(f"[{section_name}] {error}")
+            return False, [f"[{section_name}] {error}"]
 
     runtime = config_dict.get("Runtime", {})
     for key, minimum, maximum in (("max_workers", 1, 64), ("transport_retries", 0, 10), ("node_retry_limit", 0, 1000), ("total_job_deadline_seconds", 0, 1000000)):

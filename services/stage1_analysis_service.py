@@ -1315,6 +1315,9 @@ class Stage1AnalysisService:
             if primary_hash:
                 variants.extend(primary_variants)
             variants.extend(backup_variants[:1])
+            semantic_retry_limit = stage1_semantic_retry_max_attempts(
+                item.stage1_input_settings
+            )
             primary_config_hash = primary_variants[0]["config_hash"]
             graph_seed.append(
                 {
@@ -1332,7 +1335,11 @@ class Stage1AnalysisService:
                     "config_hash": primary_config_hash,
                     "schema_hash": self._schema_hash(),
                     "artifact_path": self._paper_artifact_path(item.item),
-                    "max_attempts": len(primary_variants) + 1 if primary_hash else 1,
+                    "max_attempts": (
+                        len(primary_variants) + semantic_retry_limit + 1
+                        if primary_hash
+                        else 1
+                    ),
                     "usage_required": False,
                     "request_variants": tuple(variants),
                 }
@@ -1524,6 +1531,7 @@ class Stage1AnalysisService:
         output_tokens: int,
         timeout_seconds: int,
         retry_index: int,
+        semantic_retry_index: int = 0,
     ) -> dict[str, Any]:
         """Bind one stage budget/timeout to provider identity without changing route."""
 
@@ -1534,6 +1542,7 @@ class Stage1AnalysisService:
                 "stage1_output_stage": str(stage),
                 "stage1_output_budget_tokens": str(int(output_tokens)),
                 "stage1_length_retry_index": str(int(retry_index)),
+                "stage1_semantic_retry_index": str(int(semantic_retry_index)),
                 "stage1_request_timeout_seconds": str(int(timeout_seconds)),
             }
         )
@@ -1902,13 +1911,16 @@ class Stage1AnalysisService:
         primary_hash = primary_variants[0]["input_hash"]
         primary_config_hash = primary_variants[0]["config_hash"]
         request_variants = (*primary_variants, *backup_variants[:1])
+        semantic_retry_limit = stage1_semantic_retry_max_attempts(
+            prepared.stage1_input_settings
+        )
         self.expected_calls = tuple(
             replace(
                 expected,
                 input_hash=primary_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.input_hash,
                 config_hash=primary_config_hash if expected.call_id == self._synthesis_call_id(paper_key) else expected.config_hash,
                 prompt_hash=hash_text(prompt) if expected.call_id == self._synthesis_call_id(paper_key) else expected.prompt_hash,
-                max_attempts=(len(request_variants)
+                max_attempts=(len(request_variants) + semantic_retry_limit
                               if expected.call_id == self._synthesis_call_id(paper_key)
                               else expected.max_attempts),
                 request_variants=request_variants
@@ -2647,7 +2659,9 @@ class Stage1AnalysisService:
                     provider_result.get("stage1_schema_retries") or 0
                 ),
                 "semantic_retries": int(
-                    coverage.get("semantic_retries") or 0
+                    coverage.get("semantic_retries")
+                    or provider_result.get("stage1_semantic_retries")
+                    or 0
                 ),
                 "terminal_output_tokens": int(
                     provider_result.get("stage1_terminal_output_tokens")
@@ -4862,7 +4876,11 @@ class Stage1AnalysisService:
         )
         runtime = ProviderRuntime(
             budget=ProviderBudgetV1(
-                max_calls=len(synthesis_budgets) + 1,
+                max_calls=(
+                    len(synthesis_budgets)
+                    + stage1_semantic_retry_max_attempts(stage1_settings)
+                    + 1
+                ),
                 max_retries_per_call=self.settings.runtime.node_retry_limit,
             ),
             ledger=self.receipt_ledger,
@@ -4903,7 +4921,7 @@ class Stage1AnalysisService:
         )
         legacy_retry_index = max(
             0,
-            len(provider_result.get("stage1_requested_output_budgets") or ()) - 1,
+            int(provider_result.get("stage1_length_retries") or 0),
         )
         legacy_config = self._stage1_provider_config(
             legacy_base_config,
@@ -5091,69 +5109,92 @@ class Stage1AnalysisService:
         attempted_budgets: list[int] = []
         length_retry_count = 0
         schema_retry_count = 0
+        semantic_retry_count = 0
+        semantic_retry_limit = stage1_semantic_retry_max_attempts(stage1_input_settings)
         for retry_index, output_budget in enumerate(synthesis_budgets):
-            staged_primary_config = self._stage1_provider_config(
-                primary_config,
-                stage="synthesis",
-                output_tokens=output_budget,
-                timeout_seconds=request_timeout_seconds,
-                retry_index=retry_index,
-            )
-            primary_result = get_summary_from_ai_detailed(
-                built_input.prompt_text,
-                cast(APIConfig, staged_primary_config),
-                cast(APIConfig, dict(backup_config)),
-                engine_type="primary",
-                logger=self.logger,
-                config=self.config,
-                user_content=built_input.user_message_content,
-                retry_attempts=1,
-                timeout_seconds=request_timeout_seconds,
-                provider_runtime=runtime,
-                system_prompt=system_prompt,
-                normalize_summary=False,
-                max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
-                max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
-            )
-            attempted_budgets.append(output_budget)
-            if str(primary_result.get("status") or "").strip().casefold() == "success":
-                try:
-                    self._canonical_substantive_summary(primary_result)
-                except RuntimeError as exc:
-                    primary_result = {
-                        **dict(primary_result),
-                        "status": "failed",
-                        "error_kind": "invalid_response",
-                        "message": str(exc),
-                        "engine_type": "primary",
-                    }
+            semantic_retry_index = 0
+            budget_retry_required = False
+            while True:
+                staged_primary_config = self._stage1_provider_config(
+                    primary_config,
+                    stage="synthesis",
+                    output_tokens=output_budget,
+                    timeout_seconds=request_timeout_seconds,
+                    retry_index=retry_index,
+                    semantic_retry_index=semantic_retry_index,
+                )
+                request_prompt = built_input.prompt_text
+                if semantic_retry_index:
+                    request_prompt = self._canonical_retry_prompt(
+                        built_input.prompt_text,
+                        str(primary_result.get("message") or "canonical validation failed"),
+                    )
+                primary_result = get_summary_from_ai_detailed(
+                    request_prompt,
+                    cast(APIConfig, staged_primary_config),
+                    cast(APIConfig, dict(backup_config)),
+                    engine_type="primary",
+                    logger=self.logger,
+                    config=self.config,
+                    user_content=built_input.user_message_content,
+                    retry_attempts=1,
+                    timeout_seconds=request_timeout_seconds,
+                    provider_runtime=runtime,
+                    system_prompt=system_prompt,
+                    normalize_summary=False,
+                    max_single_image_bytes=visual_coverage.get("max_single_image_bytes"),
+                    max_request_image_bytes=visual_coverage.get("max_request_image_bytes"),
+                )
+                attempted_budgets.append(output_budget)
+                if str(primary_result.get("status") or "").strip().casefold() == "success":
+                    try:
+                        self._canonical_substantive_summary(primary_result)
+                    except RuntimeError as exc:
+                        error_text = str(exc)
+                        primary_result = {
+                            **dict(primary_result),
+                            "status": "failed",
+                            "error_kind": "invalid_response",
+                            "message": error_text,
+                            "engine_type": "primary",
+                        }
+                        if semantic_retry_index < semantic_retry_limit:
+                            if self._is_schema_validation_error(error_text):
+                                schema_retry_count += 1
+                            else:
+                                semantic_retry_count += 1
+                            semantic_retry_index += 1
+                            if self.logger:
+                                self.logger.warning(
+                                    "Stage 1 synthesis response failed canonical validation; "
+                                    "retrying with a corrective prompt at the same output budget "
+                                    f"({semantic_retry_index}/{semantic_retry_limit})."
+                                )
+                            continue
+                    else:
+                        return {
+                            **dict(primary_result),
+                            "stage1_output_stage": "synthesis",
+                            "stage1_requested_output_budgets": attempted_budgets,
+                            "stage1_length_retries": length_retry_count,
+                            "stage1_schema_retries": schema_retry_count,
+                            "stage1_semantic_retries": semantic_retry_count,
+                            "stage1_terminal_output_tokens": output_budget,
+                            "stage1_request_timeout_seconds": request_timeout_seconds,
+                        }
+                if self._is_length_result(primary_result):
                     if retry_index < len(synthesis_budgets) - 1:
-                        schema_retry_count += 1
+                        budget_retry_required = True
+                        length_retry_count += 1
                         if self.logger:
                             self.logger.warning(
-                                "Stage 1 synthesis response failed canonical validation; "
-                                "escalating the existing primary output budget "
+                                "Stage 1 synthesis response was truncated; escalating output budget "
                                 f"from {output_budget} to {synthesis_budgets[retry_index + 1]} tokens."
                             )
-                        continue
-                else:
-                    return {
-                        **dict(primary_result),
-                        "stage1_output_stage": "synthesis",
-                        "stage1_requested_output_budgets": attempted_budgets,
-                        "stage1_length_retries": length_retry_count,
-                        "stage1_schema_retries": schema_retry_count,
-                        "stage1_terminal_output_tokens": output_budget,
-                        "stage1_request_timeout_seconds": request_timeout_seconds,
-                    }
-            if not self._is_length_result(primary_result) or retry_index >= len(synthesis_budgets) - 1:
+                    break
                 break
-            length_retry_count += 1
-            if self.logger:
-                self.logger.warning(
-                    "Stage 1 synthesis response was truncated; escalating output budget "
-                    f"from {output_budget} to {synthesis_budgets[retry_index + 1]} tokens."
-                )
+            if not budget_retry_required:
+                break
 
         if self._is_length_result(primary_result):
             return {
@@ -5166,6 +5207,7 @@ class Stage1AnalysisService:
                 "stage1_requested_output_budgets": attempted_budgets,
                 "stage1_length_retries": length_retry_count,
                 "stage1_schema_retries": schema_retry_count,
+                "stage1_semantic_retries": semantic_retry_count,
                 "stage1_terminal_output_tokens": (
                     attempted_budgets[-1] if attempted_budgets else 0
                 ),
@@ -5186,6 +5228,7 @@ class Stage1AnalysisService:
                 "stage1_requested_output_budgets": attempted_budgets,
                 "stage1_length_retries": length_retry_count,
                 "stage1_schema_retries": schema_retry_count,
+                "stage1_semantic_retries": semantic_retry_count,
                 "stage1_terminal_output_tokens": (
                     attempted_budgets[-1] if attempted_budgets else 0
                 ),
@@ -5226,9 +5269,33 @@ class Stage1AnalysisService:
             "stage1_requested_output_budgets": attempted_budgets,
             "stage1_length_retries": length_retry_count,
             "stage1_schema_retries": schema_retry_count,
+            "stage1_semantic_retries": semantic_retry_count,
             "stage1_terminal_output_tokens": synthesis_budgets[0],
             "stage1_request_timeout_seconds": request_timeout_seconds,
         }
+
+    @staticmethod
+    def _is_schema_validation_error(error: str) -> bool:
+        text = str(error or "").casefold()
+        return any(
+            marker in text
+            for marker in (
+                "canonical summary schema",
+                "canonical core analysis",
+                "incomplete canonical summary",
+            )
+        )
+
+    @staticmethod
+    def _canonical_retry_prompt(prompt: str, error: str) -> str:
+        del error
+        return (
+            f"{prompt}\n\n"
+            "CORRECTIVE RETRY: The previous answer did not satisfy the required "
+            "canonical Stage 1 summary contract. Return only a complete JSON "
+            "object with substantive non-placeholder values for summary, "
+            "methodology, findings, and conclusions. Do not explain the retry."
+        )
 
     @staticmethod
     def _canonical_substantive_summary(provider_result: Mapping[str, Any]) -> dict[str, Any]:

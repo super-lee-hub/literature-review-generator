@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -434,7 +435,17 @@ class AgentRuntimeRunner:
         from runtime.stage_planning import StagePlanError, build_stage_plan
 
         try:
-            settings = ApplicationSettings.from_config(load_config(self.job_spec.config))
+            settings = ApplicationSettings.from_config(
+                load_config(
+                    self.job_spec.config,
+                    action=self.job_spec.action,
+                    requested_stages=requested_stages,
+                    free_mode_enabled=bool(
+                        self.job_spec.free_mode_profile or self.job_spec.free_mode_idea
+                    ),
+                    allow_template_credentials=os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1",
+                )
+            )
             plan = build_stage_plan(
                 action=self.job_spec.action,
                 requested_stages=requested_stages,
