@@ -11,10 +11,12 @@ worktree. No live Provider call was made and the PR was not merged.
 
 - Repository: `super-lee-hub/literature-review-generator`
 - PR: #24, `OPEN`, not draft, base `main`
-- Remote PR head inspected: `2e6bdb32aca84c8d948adc846e3db76cd15b46b5`
-- Isolated worktree HEAD: `2e6bdb32aca84c8d948adc846e3db76cd15b46b5`
+- Inspected base/initial PR head: `2e6bdb32aca84c8d948adc846e3db76cd15b46b5`
+- Final local and remote PR head: `0ff53dd4f11b409c486ff14a139c1c9483091089`
 - Hosted Windows check observed before edits: `SUCCESS` (workflow run `34017515111`)
-- Current implementation changes are still uncommitted in the isolated worktree and have not been pushed.
+- Final hardening/report chain pushed to the existing PR branch through `0ff53dd4f11b409c486ff14a139c1c9483091089`.
+- Post-push Hosted Windows run: `34082941338`, terminal `SUCCESS` on that exact SHA.
+- Local branch `codex/f1-validation-authority-closure` is clean.
 
 The original checkout at `D:\auto-generate` was an unborn local branch with a
 415-file staged snapshot, so all work was performed in a separate worktree at
@@ -233,10 +235,8 @@ QA were not executed.
    corpus in an acceptance workspace.
 3. Re-run Gates B through G through the public `reviewctl` control plane with
    strict call/token budgets.
-4. Refresh the revoked sandbox approval token before the final elevated
-   Pyright/full-suite recheck and Git push.
-5. Push the committed fixes to the existing PR #24 branch and read back the
-   remote SHA/CI. The PR remains unmerged.
+4. Keep PR #24 open until the live acceptance prerequisites are supplied and
+   Gates B-G are completed; the PR remains unmerged.
 
 ## 17. Post-report verification delta
 
@@ -249,7 +249,9 @@ A safe sandbox rerun of the focused tests reported `8 passed, 5 errors`; all
 five errors were pytest setup failures creating Windows temporary `.lock`
 directories. No assertion failure was reported in that rerun. The elevated
 full-suite/type-check recheck and Git staging/commit/push remain unavailable
-because the approval token's refresh token is revoked.
+because the prior approval token's refresh token had been revoked at the time
+of the initial report. Authorization was subsequently refreshed, the report
+was committed, and the complete chain was pushed successfully.
 
 ## 18. Final decision
 
