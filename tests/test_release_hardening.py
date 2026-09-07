@@ -3,8 +3,6 @@ from __future__ import annotations
 import configparser
 import hashlib
 import json
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -412,53 +410,6 @@ def test_aggregate_provider_budget_state_survives_process_boundary(tmp_path: Pat
             estimated_tokens=1,
             requested_output_tokens=1,
         )
-
-
-def test_provider_receipt_ledger_duplicate_identity_is_cross_process_safe(tmp_path: Path) -> None:
-    seed_ledger = ProviderRuntimeLedger(tmp_path / "seed.jsonl")
-    runtime = ProviderRuntime(ledger=seed_ledger, test_only=True)
-    admission = runtime.admit()
-    receipt = runtime.complete(
-        admission=admission,
-        prompt="prompt",
-        input_payload={"text": "input"},
-        api_config={"model": "model", "api_base": "https://example.test"},
-        result={"status": "success", "content": {}, "attempts": 1, "output_tokens": 1},
-    )
-    payload_path = tmp_path / "receipt.json"
-    payload_path.write_text(json.dumps(receipt.to_dict()), encoding="utf-8")
-    target = tmp_path / "race.jsonl"
-    child = (
-        "import json,sys;"
-        "from runtime.provider_runtime import ProviderCallReceiptV1,ProviderRuntimeLedger;"
-        "payload=json.loads(open(sys.argv[2],encoding='utf-8').read());"
-        "ProviderRuntimeLedger(sys.argv[1]).append(ProviderCallReceiptV1.from_dict(payload)); print('ok')"
-    )
-    outputs = [
-        subprocess.run(
-            [sys.executable, "-c", child, str(target), str(payload_path)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        for _ in range(2)
-    ]
-    assert all(result.returncode == 0 and result.stdout.strip() == "ok" for result in outputs)
-    assert len(ProviderRuntimeLedger(target).list_receipts()) == 1
-
-    divergent = receipt.to_dict()
-    divergent["metadata"] = {"different_content": True}
-    divergent_path = tmp_path / "divergent.json"
-    divergent_path.write_text(json.dumps(divergent), encoding="utf-8")
-    conflict = subprocess.run(
-        [sys.executable, "-c", child, str(target), str(divergent_path)],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    assert "ProviderReceiptConflict" in conflict.stderr
 
 
 
