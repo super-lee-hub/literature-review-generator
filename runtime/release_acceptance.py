@@ -991,6 +991,12 @@ class GateEvidenceVerifier:
                     "reason": "registry evidence does not contain an artifact array",
                     "contract": contract,
                 }
+            if registry.get("artifact_registry_version") != "v2":
+                return {
+                    "status": "FAIL",
+                    "reason": "registry evidence is not the current Registry schema",
+                    "contract": contract,
+                }
             for item in records:
                 if not isinstance(item, Mapping) or str(item.get("status") or "") != "ready":
                     continue
@@ -1039,6 +1045,36 @@ class GateEvidenceVerifier:
                         "reason": "registry artifact hash or size mismatch",
                         "contract": contract,
                     }
+            # Reuse the Registry's recursive verifier for canonical roots. It
+            # checks dependency identity, ready status, cycles, path, and
+            # content hashes; a hand-written summary field cannot replace it.
+            try:
+                from services.artifact_registry import ArtifactRegistry
+
+                registry_object = ArtifactRegistry(
+                    self._resolve_path(ref.path, origin_dir=origin_dir),
+                    registry_job_id,
+                )
+                critical_types = {
+                    "job_outcome",
+                    "runtime_stage_terminal",
+                    "provider_receipt_closure",
+                    "current_artifact_set",
+                    "review_docx",
+                    "review_docx_repaired",
+                    "validation_run_result",
+                    "validation_run_result_repaired",
+                }
+                for record in registry_object.list_records():
+                    if record.status != "ready" or record.artifact_type not in critical_types:
+                        continue
+                    registry_object.verify_ready_artifact_closure(record)
+            except Exception as exc:
+                return {
+                    "status": "FAIL",
+                    "reason": f"Registry dependency closure is not verified: {type(exc).__name__}",
+                    "contract": contract,
+                }
 
         required_roles = _GATE_REF_ROLES.get(str(gate), frozenset())
         missing_roles = sorted(required_roles - {ref.role for ref in refs})
