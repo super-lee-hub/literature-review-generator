@@ -8,15 +8,54 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-FINAL_EXECUTABLE_SHA = 15e896d4d97a723f7081737dcd09f44d85c0e5fd
-REMOTE_HEAD_AT_CODE_ACCEPTANCE = 15e896d4d97a723f7081737dcd09f44d85c0e5fd
-HOSTED_CI_RUN = 34101339072
-HOSTED_CI_CONCLUSION = SUCCESS
+FINAL_EXECUTABLE_SHA = 88d61026356820a57543770650db361aaa9c682b
+REMOTE_HEAD_AT_CODE_ACCEPTANCE = PENDING_PUSH_READBACK
+HOSTED_CI_RUN = PENDING_EXACT_SHA_RUN
+HOSTED_CI_CONCLUSION = NOT_RUN
 ```
 
 The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
 not merged. No live provider call, paid API call, Playwright acceptance run,
 heavy-OCR acceptance run, or real F1 corpus run was made in this round.
+
+## Second hardening round
+
+This code revision adds the following fail-closed boundaries:
+
+- runtime.provider_routes.ReachableProviderRoutePlan is now the shared
+  StagePlan-to-semantic-role projection. Configuration admission, doctor,
+  preflight, micro-probe, Outline v3, acceptance state, and route reporting
+  expose the same enabled OutlineModels routes; disabled critique roles are
+  not admitted or silently remapped.
+- GateEvidenceProducer, DurableEvidenceRefV1, and GateEvidenceVerifier replace
+  handwritten acceptance facts with durable path/identity/size/SHA references.
+  The verifier reopens the runtime spec, Registry and ready artifact hashes,
+  stage/attempt/outcome/closure artifacts, provider ledgers, and typed role
+  artifacts before deriving gate facts.
+- reviewctl acceptance-run --acceptance-spec <path> now persists a typed
+  resumable state and executes/resumes a supplied runtime spec only after the
+  explicit owner authorization flag. Missing credentials, corpus, or durable
+  evidence remains blocked.
+- Aggregate provider budgets persist an absolute wall-clock deadline,
+  process-owned reservations, transport-start markers, and cross-process
+  locked read/modify/write transactions. ProviderRuntimeLedger uses the same
+  OS-level lock and retains duplicate-ID conflict detection across processes.
+- Strict evidence reads are bounded and stable, require an exact manifest
+  identity plus expected lowercase SHA-256, and reject missing/ambiguous
+  identities; basename-only fallback is gone.
+- Preprocess generations are atomically renamed from .generation.tmp-* to
+  finalized generation-* directories, retain only safe non-active history,
+  clean stale staging directories, and bind source identity to a stable stat
+  tuple plus content hash. The reachable legacy pdf_extractor fallback was
+  removed; its standalone compatibility tests cover partial-parser duplication.
+- Local RAG identity binds source/fingerprint/chunk-schema/embedding model,
+  and embedding-model download is opt-in. Flat runtime-spec mappings reject
+  unknown fields, and action-bound config validation no longer falls back to a
+  legacy one-argument validator.
+- Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
+
+The executable acceptance claim remains bound to FINAL_EXECUTABLE_SHA. The PR
+was not merged; Hosted CI for this new executable SHA is still pending.
 
 ## Git, PR, and Hosted CI read-back
 
@@ -25,25 +64,14 @@ heavy-OCR acceptance run, or real F1 corpus run was made in this round.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at final code push | `15e896d4d97a723f7081737dcd09f44d85c0e5fd` |
-| Hosted run | [34101339072](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34101339072) |
-| Hosted head SHA | `15e896d4d97a723f7081737dcd09f44d85c0e5fd` |
-| Hosted result | `SUCCESS` |
+| Remote head at final code push | `PENDING_PUSH_READBACK` |
+| Hosted run | `PENDING_EXACT_SHA_RUN` |
+| Hosted head SHA | `PENDING_EXACT_SHA_RUN` |
+| Hosted result | `NOT_RUN` |
 
-Hosted run steps all succeeded: Python 3.11 setup, installation from
-`requirements-py311-windows.lock`, `pip check`, compile check, collection,
-public CLI smoke, strict-offline suite, Pyright, Doctor, and committed-range
-whitespace check. Collection reported `1451 tests collected`; the strict-
-offline step reported:
-
-```text
-1428 passed, 23 deselected in 1407.11s
-Pyright: 0 errors, 0 warnings, 0 informations
-```
-
-The 23 deselected tests are the repository's explicitly live/provider,
-Playwright, and heavy-OCR surfaces. No deselection was used to hide an
-offline assertion failure.
+The preceding Hosted run was intentionally not carried forward as evidence:
+it validated the prior executable SHA. The current revision requires a fresh
+exact-SHA run before any new offline closure claim is made.
 
 ## Bugs fixed in this round
 
@@ -194,16 +222,18 @@ zero.
 
 ### Local exact-SHA checks
 
-The local worktree was clean at `15e896d...` before this report was authored.
+The current executable commit is 88d61026356820a57543770650db361aaa9c682b.
+The report-only update will be a child commit and does not change that
+executable SHA.
 
 | Check | Result | Scope |
 |---|---|---|
-| Focused hardening/provider/config/cache suite | `25 passed, 1 skipped` | Local Python 3.13 environment; the one skip is optional symlink privilege |
+| Focused hardening/provider/config/cache suite | `PASS` in split runs | Local Python 3.11 environment; optional symlink privilege remains the only skip |
 | Changed-file focused Pyright | `0 errors, 0 warnings, 0 informations` | Local changed runtime and integration files |
 | `compileall` | PASS | Current runtime/services/preprocess/validation/outline/free-mode/scripts surface |
 | `pip check` | PASS | Local interpreter |
 | `git diff --check` | PASS | Final code commit |
-| Full local strict-offline suite | `1415 passed, 12 failed, 1 skipped, 23 deselected` | The 12 failures are setup-time named-pipe `PermissionError: [WinError 5]`, not assertions |
+| Full local strict-offline suite | `NOT RUN_TO_COMPLETION_THIS_ROUND` | Hosted exact-SHA execution is required for the full 1,400+ test surface |
 
 The local full-suite command was:
 
@@ -220,16 +250,15 @@ a local PASS.
 
 ### Hosted exact-SHA checks
 
-Hosted Windows run `34101339072` passed all steps on `15e896d...`, including
-the full selected suite (`1428 passed, 23 deselected`), Python 3.11 lock
-installation and `pip check`, compile, CLI smoke, Pyright with zero diagnostics,
-Doctor, and whitespace verification.
+No Hosted run has yet been read back for 88d61026356820a57543770650db361aaa9c682b.
+The earlier successful run belongs to the preceding executable SHA and is not
+evidence for this code revision.
 
 ## Gate results
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS` (Hosted) / `NOT_VERIFIED_LOCAL` | Hosted run `34101339072` passed on `15e896d...`; local has 12 named-pipe permission failures and one optional symlink skip |
+| A — exact-final-SHA offline closure | `PENDING_HOSTED` | Previous Hosted PASS is for the prior executable SHA; current exact-SHA run is pending |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
@@ -240,9 +269,9 @@ Doctor, and whitespace verification.
 | H — Validator defect injection/repair/revalidation | `BLOCKED_CREDENTIALS` | No real Validator transport or real-review baseline; controlled offline contracts are not substituted |
 | I — GUI Playwright | `NOT_VERIFIED` | No real browser flow/evidence artifact in this round |
 | J — heavy OCR | `BLOCKED_CORPUS` | No approved scanned/OCR-poor acceptance PDF in the scoped checkout |
-| K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Hosted exact Windows suite passed the selected cross-process queue/Registry/review-batch/lifecycle checks; no separate release acceptance manifest was produced |
+| K — real Windows contention | `NOT_VERIFIED_CURRENT_SHA` | Cross-process ledger/budget regression coverage is present locally; current executable Hosted evidence and a separate release acceptance manifest are pending |
 | Q — F1 15-paper full chain | `BLOCKED_F1_SPEC` / `BLOCKED_F1_CORPUS` | No authoritative 15-paper binding; canonical Stage 1 artifacts `0/15`, downstream Outline/Review/Citation/DOCX/Validation not run |
-| R — negative production behavior | `PASS_OFFLINE`, `NOT_VERIFIED_RELEASE_MANIFEST` | Typed config/auth/queue/path/cache/evidence/budget and false-PASS regressions are in the selected suite; no separate gate evidence manifest |
+| R — negative production behavior | `PASS_OFFLINE_LOCAL`, `NOT_VERIFIED_RELEASE_MANIFEST` | Typed config/auth/queue/path/cache/evidence/budget and false-PASS regressions are in the selected suite; no separate gate evidence manifest |
 | S — secret/privacy scan | `NOT_VERIFIED` | No production secret was used or printed; a full release-scope history/privacy evidence manifest was not generated |
 | T — branch governance | `BLOCKED` / `OWNER_ACTION_REQUIRED` | `GET /branches/main/protection` returned HTTP 404 (`Branch not protected`); required checks/protection are not configured |
 
@@ -311,6 +340,10 @@ validation/review_validator.py
 
 Regression coverage includes `tests/test_release_hardening.py` and the
 preprocess cache behavior update in `tests/test_preprocess_service.py`.
+
+The new executable/report scope also includes runtime/provider_routes.py,
+runtime/architecture_gates.py, services/durable_io.py, rag/local_rag.py, and
+docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 ## Remaining owner actions
 
