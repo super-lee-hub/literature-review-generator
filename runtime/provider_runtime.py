@@ -20,7 +20,7 @@ from typing import Any, Literal, Mapping
 import uuid
 
 from services.durable_io import atomic_replace_with_retry
-from services.job_workspace import utc_now_iso
+from services.job_workspace import atomic_write_json, utc_now_iso
 
 
 PROVIDER_RECEIPT_ARTIFACT_TYPE = "provider_call_receipt"
@@ -199,6 +199,73 @@ class ProviderBudgetController:
         self._calls_reserved = 0
         self._output_tokens_reserved = 0
         self._retry_attempts_reserved = 0
+        self._state_path: Path | None = None
+
+    def bind_state_path(self, path: str | Path) -> None:
+        """Bind aggregate usage to a job-owned durable state file."""
+
+        target = Path(path).expanduser().resolve()
+        with self._lock:
+            if self._state_path is not None and self._state_path != target:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget cannot be rebound to a different state path"
+                )
+            self._state_path = target
+            if not target.is_file():
+                self._persist_state_unlocked()
+                return
+            try:
+                payload = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ProviderRuntimeContractError(
+                    "provider aggregate budget state is unreadable"
+                ) from exc
+            if not isinstance(payload, Mapping) or payload.get("schema_version") != "provider-aggregate-budget-v1":
+                raise ProviderRuntimeContractError("provider aggregate budget state schema is invalid")
+            if payload.get("budget") != self.budget.to_dict():
+                raise ProviderRuntimeContractError("provider aggregate budget state limits changed")
+            for field_name, attribute in (
+                ("calls_used", "_calls_used"),
+                ("output_tokens_used", "_output_tokens_used"),
+                ("retry_attempts_used", "_retry_attempts_used"),
+            ):
+                raw = payload.get(field_name, 0)
+                if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                    raise ProviderRuntimeContractError(
+                        f"provider aggregate budget state field is invalid: {field_name}"
+                    )
+                setattr(self, attribute, raw)
+            reserved = {
+                name: payload.get(name, 0)
+                for name in (
+                    "calls_reserved",
+                    "output_tokens_reserved",
+                    "retry_attempts_reserved",
+                )
+            }
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in reserved.values()):
+                raise ProviderRuntimeContractError("provider aggregate budget reserved state is invalid")
+            if any(reserved.values()):
+                raise ProviderBudgetExceeded(
+                    "provider aggregate budget has unreleased reservations from a prior process"
+                )
+
+    def _persist_state_unlocked(self) -> None:
+        if self._state_path is None:
+            return
+        atomic_write_json(
+            str(self._state_path),
+            {
+                "schema_version": "provider-aggregate-budget-v1",
+                "budget": self.budget.to_dict(),
+                "calls_used": self._calls_used,
+                "output_tokens_used": self._output_tokens_used,
+                "retry_attempts_used": self._retry_attempts_used,
+                "calls_reserved": self._calls_reserved,
+                "output_tokens_reserved": self._output_tokens_reserved,
+                "retry_attempts_reserved": self._retry_attempts_reserved,
+            },
+        )
 
     def _check_wall(self) -> None:
         if self.budget.max_wall_seconds and (
@@ -219,19 +286,19 @@ class ProviderBudgetController:
             self._check_wall()
             if (
                 self.budget.max_provider_calls_total
-                and self._calls_reserved + provider_calls
+                and self._calls_used + self._calls_reserved + provider_calls
                 > self.budget.max_provider_calls_total
             ):
                 raise ProviderBudgetExceeded("aggregate provider call budget exhausted")
             if (
                 self.budget.max_output_tokens_total
-                and self._output_tokens_reserved + output_tokens
+                and self._output_tokens_used + self._output_tokens_reserved + output_tokens
                 > self.budget.max_output_tokens_total
             ):
                 raise ProviderBudgetExceeded("aggregate provider output-token budget exhausted")
             if (
                 self.budget.max_retry_attempts_total
-                and self._retry_attempts_reserved + retry_attempts
+                and self._retry_attempts_used + self._retry_attempts_reserved + retry_attempts
                 > self.budget.max_retry_attempts_total
             ):
                 raise ProviderBudgetExceeded("aggregate provider retry budget exhausted")
@@ -247,6 +314,14 @@ class ProviderBudgetController:
             self._calls_reserved += provider_calls
             self._output_tokens_reserved += output_tokens
             self._retry_attempts_reserved += retry_attempts
+            try:
+                self._persist_state_unlocked()
+            except BaseException:
+                del self._reservations[reservation.reservation_id]
+                self._calls_reserved -= provider_calls
+                self._output_tokens_reserved -= output_tokens
+                self._retry_attempts_reserved -= retry_attempts
+                raise
             return reservation
 
     def complete(
@@ -284,6 +359,7 @@ class ProviderBudgetController:
             self._calls_used += attempts
             self._output_tokens_used += actual_output
             self._retry_attempts_used += actual_retries
+            self._persist_state_unlocked()
             return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:
@@ -315,8 +391,10 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
             _ENV_BUDGET_RAW = ""
             _ENV_BUDGET_CONTROLLER = None
         return None
+    state_path = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH", "")).strip()
+    cache_key = raw + "\x00" + state_path
     with _ENV_BUDGET_LOCK:
-        if raw == _ENV_BUDGET_RAW and _ENV_BUDGET_CONTROLLER is not None:
+        if cache_key == _ENV_BUDGET_RAW and _ENV_BUDGET_CONTROLLER is not None:
             return _ENV_BUDGET_CONTROLLER
         try:
             payload = json.loads(raw)
@@ -331,7 +409,9 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
         controller = ProviderBudgetController(
             ProviderAggregateBudgetV1.from_mapping(payload)
         )
-        _ENV_BUDGET_RAW = raw
+        if state_path:
+            controller.bind_state_path(state_path)
+        _ENV_BUDGET_RAW = cache_key
         _ENV_BUDGET_CONTROLLER = controller
         return controller
 

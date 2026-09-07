@@ -390,6 +390,9 @@ class AgentRuntimeRunner:
         cancel_token: CancelToken | None = None,
         publication_context: Any | None = None,
     ) -> None:
+        from runtime.provider_runtime import provider_budget_controller_from_environment
+
+        provider_budget_controller_from_environment()
         resolved = job_spec.resolved_from(origin_dir) if origin_dir is not None else job_spec
         self._require_explicit_path_origins(resolved)
         resolved.validate()
@@ -1006,6 +1009,13 @@ class AgentRuntimeRunner:
             except AttemptAlreadyRunningError as exc:
                 raise RuntimeRunnerError(f"run rejected: {exc}") from exc
         try:
+            from runtime.provider_runtime import provider_budget_controller_from_environment
+
+            acceptance_budget = provider_budget_controller_from_environment()
+            if acceptance_budget is not None:
+                acceptance_budget.bind_state_path(
+                    session.context.workspace.log_path("acceptance_budget_state_v1.json")
+                )
             return self._execute_with_lease(
                 session=session,
                 spec=spec,

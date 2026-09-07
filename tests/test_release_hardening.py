@@ -217,6 +217,42 @@ def test_acceptance_budget_environment_binds_all_provider_runtimes(monkeypatch) 
         second.admit(estimated_tokens=1, requested_output_tokens=1)
 
 
+def test_aggregate_provider_budget_state_survives_process_boundary(tmp_path: Path) -> None:
+    budget = ProviderAggregateBudgetV1(
+        max_provider_calls_total=2,
+        max_output_tokens_total=8,
+        max_retry_attempts_total=1,
+        max_wall_seconds=60,
+    )
+    state_path = tmp_path / "budget-state.json"
+    first_controller = ProviderBudgetController(budget)
+    first_controller.bind_state_path(state_path)
+    first_runtime = ProviderRuntime(aggregate_budget=first_controller, test_only=True)
+    admission = first_runtime.admit(
+        estimated_tokens=1,
+        requested_output_tokens=4,
+        requested_retry_attempts=0,
+    )
+    first_runtime.complete(
+        admission=admission,
+        prompt="prompt",
+        input_payload={"text": "input"},
+        api_config={"model": "model", "api_base": "https://example.test"},
+        result={"status": "success", "content": {}, "attempts": 1, "output_tokens": 3},
+    )
+
+    second_controller = ProviderBudgetController(budget)
+    second_controller.bind_state_path(state_path)
+    assert second_controller.snapshot()["calls_used"] == 1
+    second_runtime = ProviderRuntime(aggregate_budget=second_controller, test_only=True)
+    second_runtime.admit(estimated_tokens=1, requested_output_tokens=5)
+    with pytest.raises(ProviderBudgetExceeded, match="call budget"):
+        ProviderRuntime(aggregate_budget=second_controller, test_only=True).admit(
+            estimated_tokens=1,
+            requested_output_tokens=1,
+        )
+
+
 def test_profile_path_rejects_traversal_and_save_is_atomic_boundary(tmp_path: Path) -> None:
     with pytest.raises(WorkspacePathError):
         get_profile_path(str(tmp_path), "../escape")

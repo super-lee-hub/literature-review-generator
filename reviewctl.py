@@ -306,6 +306,12 @@ def _exit_code(command: str, payload: dict[str, Any]) -> int:
 def main(argv: list[str] | None = None) -> int:
     configure_utf8_stdio()
     args = build_parser().parse_args(argv)
+    # Initialize an owner-supplied acceptance controller at process start so
+    # max_wall_seconds covers preprocessing, stage setup, and all later routes,
+    # not merely the first ProviderRuntime construction.
+    from runtime.provider_runtime import provider_budget_controller_from_environment
+
+    provider_budget_controller_from_environment()
     repo_root = args.repo_root or getattr(args, "doctor_repo_root", "")
     control = ReviewControlPlane(repo_root=repo_root or None)
     try:

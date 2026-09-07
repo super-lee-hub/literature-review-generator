@@ -1553,6 +1553,13 @@ class ReviewControlPlane:
                 providers.append({"section": role, "details": details, "config": provider})
 
             output_root = Path(str(normalized.get("Paths", {}).get("output_path") or self.repo_root / "output"))
+            from runtime.provider_runtime import provider_budget_controller_from_environment
+
+            acceptance_budget = provider_budget_controller_from_environment()
+            if acceptance_budget is not None:
+                acceptance_budget.bind_state_path(
+                    str(output_root / "_acceptance" / "provider_budget_state_v1.json")
+                )
             ledger = ProviderRuntimeLedger(output_root / "_acceptance" / "provider_micro_probe.jsonl")
             from ai_interface import _call_ai_api_detailed
 
