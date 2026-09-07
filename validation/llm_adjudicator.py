@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Mapping, Optional, cast
 
 from ai_interface import _call_ai_api
 from models import APIConfig
