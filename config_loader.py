@@ -60,6 +60,8 @@ def provider_sections_for_stage_plan(
         }
         if not primary_only:
             roles.append("Backup_Reader_API")
+        if settings.validation.stage1_enabled:
+            roles.append("Validator_API")
     if "outline" in stages:
         roles.append("Outline_API")
     if "review" in stages:
@@ -108,18 +110,11 @@ def load_config(
     except UnicodeDecodeError as exc:
         raise configparser.Error(f"配置文件编码错误，请使用 UTF-8 编码: {exc}")
 
-    required_sections: List[str] = [
-        "Application",
-        "Paths",
-        "Primary_Reader_API",
-        "Backup_Reader_API",
-        "Writer_API",
-        "Runtime",
-        "Validation",
-        "Outline",
-        "OutlineModels",
-        "OutlineCostControl",
-    ]
+    # Application/Paths are the base control-plane contract.  Provider and
+    # stage-specific sections are admitted below from the final StagePlan;
+    # requiring every shipped section here made an analyze-only job depend on
+    # unreachable Writer/Outline/Validation configuration.
+    required_sections: List[str] = ["Application", "Paths"]
     missing_sections = [section for section in required_sections if section not in config.sections()]
     if missing_sections:
         raise configparser.Error(f"配置文件缺少必需的段: {', '.join(missing_sections)}")
@@ -146,10 +141,35 @@ def load_config(
     if schema_errors:
         raise configparser.Error("配置文件包含不支持的字段: " + "; ".join(schema_errors))
     settings = ApplicationSettings.from_mutable_config(config_dict)
-    if settings.validation.stage1_enabled or settings.validation.review_enabled:
-        if "Validator_API" not in config.sections():
+    normalized_requested_stages = (
+        tuple(requested_stages) if requested_stages is not None else None
+    )
+    reachable_stages: tuple[str, ...] | None = None
+    if action is not None:
+        from runtime.stage_planning import StagePlanError, build_stage_plan
+
+        try:
+            plan = build_stage_plan(
+                action=action,
+                requested_stages=normalized_requested_stages,
+                validation_enabled=settings.review_validation_enabled(),
+            )
+        except StagePlanError:
+            # The runner owns the typed StagePlan error boundary and will
+            # expose it as RuntimeRunnerError. Keeping it typed here preserves
+            # the useful fail-closed reason for callers such as resume.
+            raise
+        except (TypeError, ValueError) as exc:
+            raise configparser.Error(f"无法构建 StagePlan: {exc}") from exc
+        reachable_stages = tuple(plan.requested_stages)
+        if (
+            ("validate" in reachable_stages or (
+                settings.validation.stage1_enabled and "analyze" in reachable_stages
+            ))
+            and "Validator_API" not in config.sections()
+        ):
             raise configparser.Error(
-                "配置文件错误：当启用验证功能时，必须提供 [Validator_API] 配置段。"
+                "配置文件错误：当前 StagePlan 可达验证阶段，但缺少 [Validator_API] 配置段。"
             )
 
     # Resolve secrets without mutating the process environment.  The selected
@@ -163,10 +183,16 @@ def load_config(
     if resolved_required is None and action is not None:
         resolved_required = provider_sections_for_stage_plan(
             config_dict,
-            requested_stages=requested_stages,
+            requested_stages=normalized_requested_stages,
             action=action,
             free_mode_enabled=free_mode_enabled,
         )
+    elif resolved_required is None and action is None:
+        if settings.validation.stage1_enabled or settings.validation.review_enabled:
+            if "Validator_API" not in config.sections():
+                raise configparser.Error(
+                    "配置文件错误：当启用验证功能时，必须提供 [Validator_API] 配置段。"
+                )
 
     try:
         try:
@@ -176,6 +202,7 @@ def load_config(
                     tuple(resolved_required) if resolved_required is not None else None
                 ),
                 allow_template_credentials=allow_template_credentials,
+                reachable_stages=reachable_stages,
             )
         except TypeError as exc:
             # A few integrations replace the validator with a legacy one-arg

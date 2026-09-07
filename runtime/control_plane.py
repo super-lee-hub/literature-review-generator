@@ -32,6 +32,7 @@ from runtime.outline_v3_dag import OutlineNodeStore
 from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
+from runtime.provider_runtime import ProviderRuntime, ProviderRuntimeLedger
 from runtime.stage_terminal import StageTerminalStore
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -1415,6 +1416,19 @@ class ReviewControlPlane:
                 requested_stages=requested_stages,
                 action=action,
             )
+            if section and section not in roles:
+                return {
+                    "control_plane_version": CONTROL_PLANE_VERSION,
+                    "status": "blocked",
+                    "ok": False,
+                    "action": action,
+                    "requested_stages": list(requested_stages or ()),
+                    "provider_roles": list(roles),
+                    "error_type": "UnreachableProviderRoute",
+                    "error": f"[{section}] is not reachable from the current StagePlan",
+                    "network_calls": 0,
+                    "read_only": True,
+                }
             selected_roles = (section,) if section else roles
             provenance = {
                 item.section: item.selected_source
@@ -1458,6 +1472,157 @@ class ReviewControlPlane:
                 "read_only": True,
             }
 
+    def provider_micro_probe(
+        self,
+        *,
+        config_path: str | Path | None = None,
+        action: str = "analyze",
+        requested_stages: Sequence[str] | None = None,
+        section: str | None = None,
+        third_party_acknowledged: bool = False,
+        third_party_hosts: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Make a minimal real request through the production transport path.
+
+        This is intentionally separate from :meth:`provider_preflight`, which
+        is a zero-network dry check.  The route, credential provenance, request
+        construction, ProviderRuntime admission, and receipt path are still
+        the same ones used by a production stage call.
+        """
+
+        target_config = Path(config_path or self.repo_root / "config.ini").expanduser().resolve()
+        try:
+            normalized = load_config(
+                str(target_config),
+                action=action,
+                requested_stages=requested_stages,
+                allow_template_credentials=False,
+            )
+            roles = provider_sections_for_stage_plan(
+                normalized,
+                requested_stages=requested_stages,
+                action=action,
+            )
+            selected_roles = (section,) if section else roles
+            if section and section not in roles:
+                return {
+                    "control_plane_version": CONTROL_PLANE_VERSION,
+                    "status": "BLOCKED_UNREACHABLE_ROUTE",
+                    "ok": False,
+                    "provider_roles": list(roles),
+                    "network_calls": 0,
+                    "read_only": False,
+                }
+            allowed_hosts = {
+                str(host).strip().casefold()
+                for host in (third_party_hosts or ())
+                if str(host).strip()
+            }
+            provenance = {
+                item.section: item.selected_source
+                for item in getattr(normalized, "credential_provenance", ())
+            }
+            providers: list[dict[str, Any]] = []
+            for role in selected_roles:
+                provider = dict(normalized.get(role) or {})
+                if not provider:
+                    raise ValueError(f"required provider section is missing: [{role}]")
+                details = build_provider_transport_preflight(
+                    provider,
+                    credential_source=provenance.get(role, "unknown"),
+                )
+                classification = details.get("endpoint_classification")
+                host = str((classification or {}).get("host") or "").casefold()
+                if (
+                    classification
+                    and classification.get("classification") != "official_provider_host"
+                    and (
+                        not third_party_acknowledged
+                        or host not in allowed_hosts
+                    )
+                ):
+                    return {
+                        "control_plane_version": CONTROL_PLANE_VERSION,
+                        "status": "BLOCKED_TRUST_POLICY",
+                        "ok": False,
+                        "provider_roles": list(selected_roles),
+                        "blocked_host": host,
+                        "network_calls": 0,
+                        "read_only": False,
+                    }
+                providers.append({"section": role, "details": details, "config": provider})
+
+            output_root = Path(str(normalized.get("Paths", {}).get("output_path") or self.repo_root / "output"))
+            ledger = ProviderRuntimeLedger(output_root / "_acceptance" / "provider_micro_probe.jsonl")
+            from ai_interface import _call_ai_api_detailed
+
+            results: list[dict[str, Any]] = []
+            total_calls = 0
+            for index, item in enumerate(providers, start=1):
+                role = str(item["section"])
+                provider = cast(APIConfig, item["config"])
+                capability = resolve_model_capability(provider)
+                runtime = ProviderRuntime(
+                    ledger=ledger,
+                    job_id="release-acceptance-micro-probe",
+                    attempt_id="micro-probe",
+                    stage_name="provider_micro_probe",
+                    route=role,
+                    node_id=f"micro-probe:{role}",
+                    call_id=f"micro-probe:{index}:{role}",
+                    endpoint_type=capability.endpoint_type,
+                )
+                result = _call_ai_api_detailed(
+                    "ping",
+                    provider,
+                    "Return one short token.",
+                    max_tokens=1,
+                    temperature=0.0,
+                    response_format="text",
+                    provider_runtime=runtime,
+                )
+                receipts = runtime.receipts
+                total_calls += sum(int(receipt.attempts) for receipt in receipts)
+                results.append(
+                    {
+                        "semantic_role": role,
+                        "provider_family": capability.provider_family,
+                        "model": str(provider.get("model") or ""),
+                        "endpoint_type": capability.endpoint_type,
+                        "hostname": str(item["details"].get("endpoint_classification", {}).get("host") or ""),
+                        "endpoint_classification": item["details"].get("endpoint_classification", {}),
+                        "credential_source": provenance.get(role, "unknown"),
+                        "status": result.get("status"),
+                        "error_kind": result.get("error_kind"),
+                        "receipt_ids": [receipt.receipt_id for receipt in receipts],
+                        "attempts": sum(int(receipt.attempts) for receipt in receipts),
+                        "usage_status": [receipt.usage_status for receipt in receipts],
+                    }
+                )
+            ok = bool(results) and all(item.get("status") == "success" for item in results)
+            usage = ledger.usage_summary()
+            return {
+                "control_plane_version": CONTROL_PLANE_VERSION,
+                "status": "pass" if ok else "fail",
+                "ok": ok,
+                "provider_roles": list(selected_roles),
+                "providers": results,
+                "network_calls": total_calls,
+                "usage": usage,
+                "receipt_ledger": str(ledger.path),
+                "read_only": False,
+            }
+        except Exception as exc:
+            return {
+                "control_plane_version": CONTROL_PLANE_VERSION,
+                "status": "fail",
+                "ok": False,
+                "config_path": str(target_config),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "network_calls": 0,
+                "read_only": False,
+            }
     @staticmethod
     def _dependency_check() -> dict[str, Any]:
         missing = [name for name in _REQUIRED_RUNTIME_MODULES if importlib.util.find_spec(name) is None]

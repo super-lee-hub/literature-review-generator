@@ -300,7 +300,11 @@ def run_adjudication_stage(
             )
             estimate = profile.estimate_request(request_payload)
             admission = provider_runtime.admit(
-                estimated_tokens=max(1, int(estimate["estimated_input_tokens"]))
+                estimated_tokens=max(1, int(estimate["estimated_input_tokens"])),
+                requested_output_tokens=output_limit,
+                requested_retry_attempts=max(0, int(report.get("attempts") or 1) - 1)
+                if isinstance(report, Mapping)
+                else 0,
             )
             provider_runtime.complete(
                 admission=admission,

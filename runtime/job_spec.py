@@ -10,6 +10,75 @@ from services.job_runner import JobRunRequest, resolve_stage1_reuse, validate_fr
 
 SourceMode = Literal["direct", "zotero"]
 
+_RUNTIME_SOURCE_FIELDS = frozenset({
+    "mode",
+    "pdf_folder",
+    "zotero_report",
+    "library_path",
+})
+_RUNTIME_JOB_FIELDS = frozenset({
+    "project_name",
+    "source",
+    "job_id",
+    "config",
+    "action",
+    "free_mode_profile",
+    "free_mode_idea",
+    "summary_file",
+    "summary_sources",
+    "reuse_stage1",
+    "reuse_summary_files",
+    "generate_section",
+    "queue_file",
+    "workspace_path",
+    "metadata",
+})
+_RUNTIME_METADATA_FIELDS = frozenset({
+    "review_batch_spec",
+    "requested_stages",
+    "free_mode_input",
+    "free_mode_context",
+    "review_intent",
+    "validation_required",
+    "require_clean_validation",
+    "allow_unvalidated_when_validation_optional",
+    "audit_actor",
+    "audit_reason",
+    "audit_scope",
+    "stage_plan",
+})
+
+
+def _reject_unknown_fields(
+    payload: Mapping[str, Any],
+    allowed: frozenset[str],
+    *,
+    label: str,
+) -> None:
+    unknown = sorted(str(key) for key in payload if str(key) not in allowed)
+    if unknown:
+        raise ValueError(f"{label} contains unknown fields: {', '.join(unknown)}")
+
+
+def _optional_string(payload: Mapping[str, Any], name: str, default: str = "") -> str:
+    if name not in payload or payload[name] is None:
+        return default
+    value = payload[name]
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a JSON string")
+    return value
+
+
+def _string_tuple(payload: Mapping[str, Any], name: str) -> tuple[str, ...]:
+    if name not in payload or payload[name] is None:
+        return ()
+    value = payload[name]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a JSON array of strings")
+    if any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a JSON array of strings")
+    return tuple(item.strip() for item in value if item.strip())
+
 
 def _optional_bool(value: Any, *, field_name: str) -> bool | None:
     if value is None:
@@ -44,12 +113,20 @@ class RuntimeSourceSpec:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeSourceSpec":
-        mode = cast(SourceMode, str(payload.get("mode") or "direct"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("source must be a JSON object")
+        _reject_unknown_fields(payload, _RUNTIME_SOURCE_FIELDS, label="source")
+        raw_mode = payload.get("mode", "direct")
+        if raw_mode is None:
+            raw_mode = "direct"
+        if not isinstance(raw_mode, str):
+            raise ValueError("source.mode must be a JSON string")
+        mode = cast(SourceMode, raw_mode)
         return cls(
             mode=mode,
-            pdf_folder=str(payload.get("pdf_folder") or ""),
-            zotero_report=str(payload.get("zotero_report") or ""),
-            library_path=str(payload.get("library_path") or ""),
+            pdf_folder=_optional_string(payload, "pdf_folder"),
+            zotero_report=_optional_string(payload, "zotero_report"),
+            library_path=_optional_string(payload, "library_path"),
         )
 
 
@@ -75,6 +152,9 @@ class RuntimeJobSpec:
         if not str(self.project_name or "").strip():
             raise ValueError("project_name is required")
         self.source.validate()
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("metadata must be a JSON object")
+        _reject_unknown_fields(self.metadata, _RUNTIME_METADATA_FIELDS, label="metadata")
         allowed_actions = {
             "analyze",
             "derive_review_batch",
@@ -95,17 +175,29 @@ class RuntimeJobSpec:
                 raise ValueError("generate_section must be greater than 0")
         if self.action == "derive_review_batch" and not self.metadata.get("review_batch_spec"):
             raise ValueError("derive_review_batch action requires review_batch_spec metadata")
-        if not isinstance(self.metadata.get("free_mode_input"), Mapping):
+        if "free_mode_input" in self.metadata and not isinstance(
+            self.metadata.get("free_mode_input"), Mapping
+        ):
+            raise ValueError("metadata.free_mode_input must be a JSON object")
+        if "free_mode_input" not in self.metadata:
             free_mode_error = validate_free_mode_options(
                 self.free_mode_profile,
                 self.free_mode_idea,
             )
             if free_mode_error:
                 raise ValueError(free_mode_error)
+        for field_name in ("audit_actor", "audit_reason"):
+            if field_name in self.metadata and not isinstance(self.metadata[field_name], str):
+                raise ValueError(f"metadata.{field_name} must be a JSON string")
+        for field_name in ("audit_scope", "stage_plan"):
+            if field_name in self.metadata and not isinstance(self.metadata[field_name], Mapping):
+                raise ValueError(f"metadata.{field_name} must be a JSON object")
         requested_stages = self.metadata.get("requested_stages")
         if requested_stages is not None:
             if not isinstance(requested_stages, (list, tuple)):
                 raise ValueError("requested_stages must be a JSON array")
+            if any(not isinstance(item, str) for item in requested_stages):
+                raise ValueError("requested_stages must contain only JSON strings")
             allowed_stages = {
                 "source_intake",
                 "analyze",
@@ -228,38 +320,43 @@ class RuntimeJobSpec:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeJobSpec":
+        if not isinstance(payload, Mapping):
+            raise ValueError("RuntimeJobSpec root must be a JSON object")
+        _reject_unknown_fields(payload, _RUNTIME_JOB_FIELDS, label="RuntimeJobSpec")
+        raw_source = payload.get("source", {})
+        if not isinstance(raw_source, Mapping):
+            raise ValueError("source must be a JSON object")
+        raw_metadata = payload.get("metadata", {})
+        if raw_metadata is None:
+            raw_metadata = {}
+        if not isinstance(raw_metadata, Mapping):
+            raise ValueError("metadata must be a JSON object")
+        _reject_unknown_fields(raw_metadata, _RUNTIME_METADATA_FIELDS, label="metadata")
+        raw_generate_section = payload.get("generate_section")
+        if raw_generate_section is not None and (
+            isinstance(raw_generate_section, bool) or not isinstance(raw_generate_section, int)
+        ):
+            raise ValueError("generate_section must be a JSON integer")
         return cls(
-            project_name=str(payload.get("project_name") or ""),
-            source=RuntimeSourceSpec.from_dict(dict(payload.get("source") or {})),
-            job_id=str(payload.get("job_id") or ""),
-            config=str(payload.get("config") or "config.ini"),
-            action=str(payload.get("action") or "run_all"),
-            free_mode_profile=str(payload.get("free_mode_profile") or ""),
-            free_mode_idea=str(payload.get("free_mode_idea") or ""),
-            summary_file=str(payload.get("summary_file") or ""),
-            summary_sources=tuple(
-                str(item).strip()
-                for item in payload.get("summary_sources", [])
-                if str(item).strip()
-            ),
+            project_name=_optional_string(payload, "project_name"),
+            source=RuntimeSourceSpec.from_dict(raw_source),
+            job_id=_optional_string(payload, "job_id"),
+            config=_optional_string(payload, "config", "config.ini"),
+            action=_optional_string(payload, "action", "run_all"),
+            free_mode_profile=_optional_string(payload, "free_mode_profile"),
+            free_mode_idea=_optional_string(payload, "free_mode_idea"),
+            summary_file=_optional_string(payload, "summary_file"),
+            summary_sources=_string_tuple(payload, "summary_sources"),
             reuse_stage1=(
                 _optional_bool(payload["reuse_stage1"], field_name="reuse_stage1")
                 if payload.get("reuse_stage1") is not None
                 else None
             ),
-            reuse_summary_files=tuple(
-                str(item).strip()
-                for item in payload.get("reuse_summary_files", [])
-                if str(item).strip()
-            ),
-            generate_section=(
-                int(payload["generate_section"])
-                if payload.get("generate_section") is not None
-                else None
-            ),
-            queue_file=str(payload.get("queue_file") or "output/_queue/queue.json"),
-            workspace_path=str(payload.get("workspace_path") or ""),
-            metadata=dict(payload.get("metadata") or {}),
+            reuse_summary_files=_string_tuple(payload, "reuse_summary_files"),
+            generate_section=raw_generate_section,
+            queue_file=_optional_string(payload, "queue_file", "output/_queue/queue.json"),
+            workspace_path=_optional_string(payload, "workspace_path"),
+            metadata=dict(raw_metadata),
         )
 
     @classmethod

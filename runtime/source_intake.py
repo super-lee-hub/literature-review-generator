@@ -214,6 +214,13 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
                     "attachment_title": str(attachment.get("attachment_title") or ""),
                     "raw_path": str(attachment.get("raw_path") or ""),
                     "link_mode": int(attachment.get("link_mode") or 0),
+                    "attachment_source_type": str(
+                        attachment.get("attachment_source_type") or ""
+                    ),
+                    "external_to_library": bool(attachment.get("external_to_library")),
+                    "attachment_resolution_error": str(
+                        attachment.get("resolution_error") or ""
+                    ),
                 }
             )
             if candidate_payload["exists"]:
@@ -229,6 +236,15 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
                             "attachment_title": candidate_payload["attachment_title"],
                             "raw_path": candidate_payload["raw_path"],
                             "link_mode": candidate_payload["link_mode"],
+                            "attachment_source_type": candidate_payload.get(
+                                "attachment_source_type", ""
+                            ),
+                            "external_to_library": candidate_payload.get(
+                                "external_to_library", False
+                            ),
+                            "attachment_resolution_error": candidate_payload.get(
+                                "attachment_resolution_error", ""
+                            ),
                         }
                     )
                     sources = list(existing.get("source_labels") or [existing.get("source") or ""])
@@ -349,6 +365,22 @@ def build_zotero_source_bundle(*, project_name: str, zotero_report: str, library
             "canonical_attachment_key": str(selected_candidate.get("attachment_key") or ""),
             "selected_role": str(selected_candidate.get("role") or ""),
             "selected_version_class": str(selected_candidate.get("version_class") or ""),
+            "attachment_source_type": str(
+                selected_candidate.get("attachment_source_type") or ""
+            ),
+            "external_to_library": bool(selected_candidate.get("external_to_library")),
+            "attachment_resolution_error": str(
+                selected_candidate.get("attachment_resolution_error") or ""
+            ),
+            "source_provenance": {
+                "raw_path": str(selected_candidate.get("raw_path") or ""),
+                "canonical_resolved_path": str(selected_candidate.get("path") or ""),
+                "attachment_source_type": str(
+                    selected_candidate.get("attachment_source_type") or ""
+                ),
+                "external_to_library": bool(selected_candidate.get("external_to_library")),
+                "link_mode": int(selected_candidate.get("link_mode") or 0),
+            },
             "selection_reason": list(canonical_selection.get("selection_reason") or []),
             "auxiliary_attachment_keys": [
                 str(item.get("attachment_key") or "")

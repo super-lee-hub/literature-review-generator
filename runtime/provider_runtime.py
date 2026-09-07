@@ -96,6 +96,246 @@ class ProviderReceiptConflict(RuntimeError):
     """Raised when an append-only receipt ID is reused with different content."""
 
 
+@dataclass(frozen=True)
+class ProviderAggregateBudgetV1:
+    """One hard budget shared by every provider route in a process.
+
+    The limits are reservation limits, not post-hoc report fields.  A call
+    reserves its possible transport attempts and requested output allowance
+    before the transport starts, so concurrent stage runtimes cannot overshoot
+    an acceptance budget.
+    """
+
+    max_provider_calls_total: int = 0
+    max_output_tokens_total: int = 0
+    max_retry_attempts_total: int = 0
+    max_wall_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_provider_calls_total",
+            "max_output_tokens_total",
+            "max_retry_attempts_total",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or int(value) < 0:
+                raise ProviderRuntimeContractError(f"{name} must be a non-negative integer")
+            object.__setattr__(self, name, int(value))
+        if isinstance(self.max_wall_seconds, bool) or float(self.max_wall_seconds) < 0:
+            raise ProviderRuntimeContractError("max_wall_seconds must be non-negative")
+        object.__setattr__(self, "max_wall_seconds", float(self.max_wall_seconds))
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any] | None) -> "ProviderAggregateBudgetV1":
+        source = value or {}
+        aliases = {
+            "max_provider_calls_total": ("max_provider_calls_total", "max_provider_calls"),
+            "max_output_tokens_total": ("max_output_tokens_total", "max_output_tokens"),
+            "max_retry_attempts_total": ("max_retry_attempts_total", "max_retry_attempts"),
+            "max_wall_seconds": ("max_wall_seconds", "timeout_seconds"),
+        }
+
+        def raw_for(name: str) -> Any:
+            for key in aliases[name]:
+                if key in source:
+                    return source[key]
+            return 0
+
+        def integer(name: str) -> int:
+            raw = raw_for(name)
+            if isinstance(raw, bool):
+                raise ProviderRuntimeContractError(f"{name} must be an integer")
+            try:
+                parsed = int(str(raw).strip())
+            except (TypeError, ValueError) as exc:
+                raise ProviderRuntimeContractError(f"{name} must be an integer") from exc
+            if parsed < 0:
+                raise ProviderRuntimeContractError(f"{name} must be non-negative")
+            return parsed
+
+        raw_wall = raw_for("max_wall_seconds")
+        try:
+            wall = float(str(raw_wall).strip())
+        except (TypeError, ValueError) as exc:
+            raise ProviderRuntimeContractError("max_wall_seconds must be a number") from exc
+        return cls(
+            max_provider_calls_total=integer("max_provider_calls_total"),
+            max_output_tokens_total=integer("max_output_tokens_total"),
+            max_retry_attempts_total=integer("max_retry_attempts_total"),
+            max_wall_seconds=wall,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ProviderAggregateReservationV1:
+    reservation_id: int
+    provider_calls: int
+    output_tokens: int
+    retry_attempts: int
+    admitted_at: str
+
+
+class ProviderBudgetController:
+    """Thread-safe aggregate reservation and durable-receipt accounting."""
+
+    def __init__(
+        self,
+        budget: ProviderAggregateBudgetV1,
+        *,
+        monotonic: Any = time.monotonic,
+    ) -> None:
+        self.budget = budget
+        self._monotonic = monotonic
+        self._started_monotonic = float(monotonic())
+        self._lock = threading.RLock()
+        self._next_reservation_id = 0
+        self._reservations: dict[int, ProviderAggregateReservationV1] = {}
+        self._calls_used = 0
+        self._output_tokens_used = 0
+        self._retry_attempts_used = 0
+        self._calls_reserved = 0
+        self._output_tokens_reserved = 0
+        self._retry_attempts_reserved = 0
+
+    def _check_wall(self) -> None:
+        if self.budget.max_wall_seconds and (
+            float(self._monotonic()) - self._started_monotonic
+        ) >= self.budget.max_wall_seconds:
+            raise ProviderBudgetExceeded("aggregate provider wall-clock budget exhausted")
+
+    def admit(
+        self,
+        *,
+        requested_output_tokens: int = 0,
+        requested_retry_attempts: int = 0,
+    ) -> ProviderAggregateReservationV1:
+        output_tokens = max(0, int(requested_output_tokens))
+        retry_attempts = max(0, int(requested_retry_attempts))
+        provider_calls = 1 + retry_attempts
+        with self._lock:
+            self._check_wall()
+            if (
+                self.budget.max_provider_calls_total
+                and self._calls_reserved + provider_calls
+                > self.budget.max_provider_calls_total
+            ):
+                raise ProviderBudgetExceeded("aggregate provider call budget exhausted")
+            if (
+                self.budget.max_output_tokens_total
+                and self._output_tokens_reserved + output_tokens
+                > self.budget.max_output_tokens_total
+            ):
+                raise ProviderBudgetExceeded("aggregate provider output-token budget exhausted")
+            if (
+                self.budget.max_retry_attempts_total
+                and self._retry_attempts_reserved + retry_attempts
+                > self.budget.max_retry_attempts_total
+            ):
+                raise ProviderBudgetExceeded("aggregate provider retry budget exhausted")
+            self._next_reservation_id += 1
+            reservation = ProviderAggregateReservationV1(
+                reservation_id=self._next_reservation_id,
+                provider_calls=provider_calls,
+                output_tokens=output_tokens,
+                retry_attempts=retry_attempts,
+                admitted_at=utc_now_iso(),
+            )
+            self._reservations[reservation.reservation_id] = reservation
+            self._calls_reserved += provider_calls
+            self._output_tokens_reserved += output_tokens
+            self._retry_attempts_reserved += retry_attempts
+            return reservation
+
+    def complete(
+        self,
+        reservation: ProviderAggregateReservationV1,
+        result: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            current = self._reservations.pop(reservation.reservation_id, None)
+            if current is None:
+                raise ProviderRuntimeContractError(
+                    f"unknown or already completed provider reservation: {reservation.reservation_id}"
+                )
+            try:
+                attempts = max(1, int(result.get("attempts") or 1))
+            except (TypeError, ValueError):
+                attempts = current.provider_calls
+            if attempts > current.provider_calls:
+                raise ProviderRuntimeContractError(
+                    "provider transport attempts exceeded the pre-admitted aggregate reservation"
+                )
+            actual_retries = max(0, attempts - 1)
+            raw_output = result.get("output_tokens")
+            try:
+                actual_output = int(raw_output) if raw_output is not None else current.output_tokens
+            except (TypeError, ValueError):
+                actual_output = current.output_tokens
+            if actual_output < 0 or actual_output > current.output_tokens:
+                raise ProviderRuntimeContractError(
+                    "provider output tokens exceeded the pre-admitted aggregate reservation"
+                )
+            self._calls_reserved -= current.provider_calls
+            self._output_tokens_reserved -= current.output_tokens
+            self._retry_attempts_reserved -= current.retry_attempts
+            self._calls_used += attempts
+            self._output_tokens_used += actual_output
+            self._retry_attempts_used += actual_retries
+            return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "budget": self.budget.to_dict(),
+                "calls_used": self._calls_used,
+                "output_tokens_used": self._output_tokens_used,
+                "retry_attempts_used": self._retry_attempts_used,
+                "calls_reserved": self._calls_reserved,
+                "output_tokens_reserved": self._output_tokens_reserved,
+                "retry_attempts_reserved": self._retry_attempts_reserved,
+                "elapsed_seconds": max(0.0, float(self._monotonic()) - self._started_monotonic),
+            }
+
+
+_ENV_BUDGET_LOCK = threading.Lock()
+_ENV_BUDGET_RAW = ""
+_ENV_BUDGET_CONTROLLER: ProviderBudgetController | None = None
+
+
+def provider_budget_controller_from_environment() -> ProviderBudgetController | None:
+    """Return one shared controller for the current acceptance subprocess."""
+
+    global _ENV_BUDGET_RAW, _ENV_BUDGET_CONTROLLER
+    raw = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON", "")).strip()
+    if not raw:
+        with _ENV_BUDGET_LOCK:
+            _ENV_BUDGET_RAW = ""
+            _ENV_BUDGET_CONTROLLER = None
+        return None
+    with _ENV_BUDGET_LOCK:
+        if raw == _ENV_BUDGET_RAW and _ENV_BUDGET_CONTROLLER is not None:
+            return _ENV_BUDGET_CONTROLLER
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ProviderRuntimeContractError(
+                "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON is not valid JSON"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ProviderRuntimeContractError(
+                "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON must be a JSON object"
+            )
+        controller = ProviderBudgetController(
+            ProviderAggregateBudgetV1.from_mapping(payload)
+        )
+        _ENV_BUDGET_RAW = raw
+        _ENV_BUDGET_CONTROLLER = controller
+        return controller
+
+
 def _ledger_lock(path: Path) -> threading.RLock:
     key = str(path.resolve()).casefold()
     with _LEDGER_LOCK_GUARD:
@@ -401,6 +641,10 @@ class ProviderCallAdmissionV1:
     admitted_at: str
     remaining_calls: int | None
     remaining_tokens: int | None
+    estimated_output_tokens: int = 0
+    reserved_call_attempts: int = 1
+    reserved_retry_attempts: int = 0
+    aggregate_reservation_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -779,6 +1023,54 @@ class ProviderRuntimeLedger:
         with self._lock:
             return tuple(self._read_unlocked())
 
+    def usage_summary(self) -> dict[str, Any]:
+        """Recompute physical call usage from durable receipts."""
+
+        receipts = self.list_receipts()
+
+        def attempted(receipt: ProviderCallReceiptV1) -> bool:
+            if receipt.status == "success":
+                return True
+            metadata = receipt.metadata if isinstance(receipt.metadata, Mapping) else {}
+            return bool(metadata.get("transport_config"))
+
+        used = [receipt for receipt in receipts if attempted(receipt)]
+
+        def breakdown(items: list[ProviderCallReceiptV1], key: str) -> dict[str, Any]:
+            grouped: dict[str, dict[str, Any]] = {}
+            for receipt in items:
+                group = str(getattr(receipt, key) or "unknown")
+                entry = grouped.setdefault(
+                    group,
+                    {"calls": 0, "output_tokens_reported": 0, "unreported_output_receipts": 0, "retries": 0},
+                )
+                entry["calls"] += int(receipt.attempts)
+                entry["retries"] += max(0, int(receipt.attempts) - 1)
+                if receipt.output_tokens is None:
+                    entry["unreported_output_receipts"] += 1
+                else:
+                    entry["output_tokens_reported"] += int(receipt.output_tokens)
+            return grouped
+
+        output_reported = sum(
+            int(receipt.output_tokens)
+            for receipt in used
+            if receipt.output_tokens is not None
+        )
+        return {
+            "receipt_count": len(receipts),
+            "physical_calls_used": sum(int(receipt.attempts) for receipt in used),
+            "output_tokens_reported": output_reported,
+            "unreported_output_receipts": sum(
+                1 for receipt in used if receipt.output_tokens is None
+            ),
+            "retry_attempts_used": sum(
+                max(0, int(receipt.attempts) - 1) for receipt in used
+            ),
+            "by_stage": breakdown(used, "stage_name"),
+            "by_provider": breakdown(used, "provider"),
+        }
+
     def retag_epoch(self, previous: str, current: str) -> int:
         """Rebind receipts written under ``previous`` to ``current``.
 
@@ -843,6 +1135,7 @@ class ProviderRuntime:
         self,
         *,
         budget: ProviderBudgetV1 | None = None,
+        aggregate_budget: ProviderBudgetController | None = None,
         ledger: ProviderRuntimeLedger | None = None,
         job_id: str = "",
         attempt_id: str = "",
@@ -878,6 +1171,7 @@ class ProviderRuntime:
                     "bound ProviderRuntime requires: " + ", ".join(missing)
                 )
         self.budget = budget or ProviderBudgetV1()
+        self.aggregate_budget = aggregate_budget or provider_budget_controller_from_environment()
         self.ledger = ledger
         self.job_id = job_id
         self.attempt_id = attempt_id
@@ -908,6 +1202,7 @@ class ProviderRuntime:
         self._lock = threading.RLock()
         self._calls = 0
         self._reserved_tokens = 0
+        self._aggregate_reservations: dict[int, ProviderAggregateReservationV1] = {}
         self._receipts: list[ProviderCallReceiptV1] = []
 
     @property
@@ -936,18 +1231,34 @@ class ProviderRuntime:
             return requested
         return min(requested, self.budget.max_retries_per_call + 1)
 
-    def admit(self, *, estimated_tokens: int = 0) -> ProviderCallAdmissionV1:
+    def admit(
+        self,
+        *,
+        estimated_tokens: int = 0,
+        requested_output_tokens: int = 0,
+        requested_retry_attempts: int = 0,
+    ) -> ProviderCallAdmissionV1:
         estimated = max(0, int(estimated_tokens))
+        output = max(0, int(requested_output_tokens))
+        retries = max(0, int(requested_retry_attempts))
         with self._lock:
             elapsed = time.monotonic() - self.started_monotonic
             if self.budget.max_elapsed_seconds and elapsed >= self.budget.max_elapsed_seconds:
                 raise ProviderBudgetExceeded("provider runtime elapsed-time budget exhausted")
             if self.budget.max_calls and self._calls >= self.budget.max_calls:
                 raise ProviderBudgetExceeded("provider runtime call budget exhausted")
-            if self.budget.max_total_tokens and self._reserved_tokens + estimated > self.budget.max_total_tokens:
+            if self.budget.max_total_tokens and self._reserved_tokens + estimated + output > self.budget.max_total_tokens:
                 raise ProviderBudgetExceeded("provider runtime token budget exhausted")
+            aggregate_reservation = None
+            if self.aggregate_budget is not None:
+                aggregate_reservation = self.aggregate_budget.admit(
+                    requested_output_tokens=output,
+                    requested_retry_attempts=retries,
+                )
             self._calls += 1
-            self._reserved_tokens += estimated
+            self._reserved_tokens += estimated + output
+            if aggregate_reservation is not None:
+                self._aggregate_reservations[self._calls] = aggregate_reservation
             return ProviderCallAdmissionV1(
                 sequence=self._calls,
                 estimated_tokens=estimated,
@@ -956,6 +1267,10 @@ class ProviderRuntime:
                 remaining_tokens=(self.budget.max_total_tokens - self._reserved_tokens)
                 if self.budget.max_total_tokens
                 else None,
+                estimated_output_tokens=output,
+                reserved_call_attempts=(aggregate_reservation.provider_calls if aggregate_reservation else 1 + retries),
+                reserved_retry_attempts=(aggregate_reservation.retry_attempts if aggregate_reservation else retries),
+                aggregate_reservation_id=(aggregate_reservation.reservation_id if aggregate_reservation else None),
             )
 
     def complete(
@@ -974,6 +1289,15 @@ class ProviderRuntime:
         model = str(api_config.get("model") or "")
         endpoint = str(api_config.get("api_base") or "")
         config_hash = hash_json(_redact_mapping(api_config))
+        aggregate_reservation = None
+        aggregate_snapshot: dict[str, Any] | None = None
+        with self._lock:
+            aggregate_reservation = self._aggregate_reservations.pop(admission.sequence, None)
+        if self.aggregate_budget is not None and aggregate_reservation is not None:
+            aggregate_snapshot = self.aggregate_budget.complete(aggregate_reservation, result)
+        receipt_metadata = dict(metadata or {})
+        if aggregate_snapshot is not None:
+            receipt_metadata["aggregate_budget"] = aggregate_snapshot
         receipt = ProviderCallReceiptV1.from_result(
             admission=admission,
             job_id=self.job_id,
@@ -990,7 +1314,7 @@ class ProviderRuntime:
             result=result,
             budget=self.budget,
             started_at=admission.admitted_at,
-            metadata=metadata,
+            metadata=receipt_metadata,
             node_id=self.node_id,
             call_id=str((metadata or {}).get("call_id") or self.call_id or f"call-{admission.sequence}"),
             closure_epoch_id=self.closure_epoch_id,
@@ -1002,6 +1326,12 @@ class ProviderRuntime:
             prompt_sha256=self.prompt_sha256,
         )
         with self._lock:
+            self._reserved_tokens = max(
+                0,
+                self._reserved_tokens
+                - admission.estimated_tokens
+                - admission.estimated_output_tokens,
+            )
             if self.ledger is not None:
                 self.ledger.append(receipt)
             self._receipts.append(receipt)
@@ -1028,6 +1358,9 @@ class ProviderRuntime:
                 remaining_tokens=self.budget.max_total_tokens - self._reserved_tokens
                 if self.budget.max_total_tokens
                 else None,
+                estimated_output_tokens=0,
+                reserved_call_attempts=0,
+                reserved_retry_attempts=0,
             )
         receipt = self.complete(
             admission=admission,
@@ -1043,6 +1376,9 @@ class ProviderRuntime:
 
 __all__ = [
     "ProviderBudgetExceeded",
+    "ProviderAggregateBudgetV1",
+    "ProviderAggregateReservationV1",
+    "ProviderBudgetController",
     "ProviderBudgetV1",
     "ProviderCallAdmissionV1",
     "ProviderCallReceiptV1",
@@ -1055,6 +1391,7 @@ __all__ = [
     "compute_closure_epoch_id",
     "hash_json",
     "hash_text",
+    "provider_budget_controller_from_environment",
     "provider_request_input_hash",
     "stable_provider_hash",
 ]

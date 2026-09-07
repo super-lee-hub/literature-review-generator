@@ -27,6 +27,7 @@ from services.repair_policy import (
     unsafe_auto_rewrite_enabled,
 )
 from validation.edge_checkpoint import ValidationEdgeCheckpointStore
+from validation.evidence_loader import ValidationSourceAuthorityError
 from validation.adjudication_checkpoint import AdjudicationCheckpointStore, sanitized_route_hash
 from validation.adjudication_reuse import (
     adjudication_call_id,
@@ -1379,6 +1380,24 @@ def run_current_validation(
     degradation_reasons = tuple(
         dict.fromkeys((*degradation_reasons, *source_diagnostics))
     )
+    if source_diagnostics:
+        return _terminal(
+            service,
+            status=ValidationExecutionStatus.FAILED,
+            policy=policy,
+            diagnostic="validation_source_authority_invalid",
+            failure_reason="; ".join(source_diagnostics),
+            output_dir=output_dir,
+            result_artifact_id=result_artifact_id,
+            result_artifact_type=result_artifact_type,
+            result_artifact_role=result_artifact_role,
+            dependency_records=(
+                review_draft_record_override,
+                citation_manifest_record_override,
+            )
+            if output_dir
+            else None,
+        )
 
     checkpoint_root = getattr(service.workspace.paths, "checkpoints_dir", "")
     validator = ReviewValidator(
@@ -1395,6 +1414,24 @@ def run_current_validation(
         base_report = validator.validate(max_workers=worker_count)
     except TypeError:
         base_report = validator.validate()
+    except ValidationSourceAuthorityError as exc:
+        return _terminal(
+            service,
+            status=ValidationExecutionStatus.FAILED,
+            policy=policy,
+            diagnostic="validation_source_authority_invalid",
+            failure_reason=str(exc),
+            output_dir=output_dir,
+            result_artifact_id=result_artifact_id,
+            result_artifact_type=result_artifact_type,
+            result_artifact_role=result_artifact_role,
+            dependency_records=(
+                review_draft_record_override,
+                citation_manifest_record_override,
+            )
+            if output_dir
+            else None,
+        )
     results = _adjudicate(service, base_report.citation_results)
     report = _build_report(results)
     result = ValidationRunResultV1.from_report(

@@ -240,6 +240,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "retain_diagnostics",
             "enable_local_rag",
             "rag_backend",
+            "source_pdf_max_bytes",
         }
     ),
     "Styling": frozenset({"font_name", "font_size_body", "font_size_heading1", "font_size_heading2"}),

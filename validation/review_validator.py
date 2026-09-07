@@ -847,15 +847,24 @@ class ReviewValidator:
                 "page_index_path": verified["page_index"],
             }
         paper_specific_metadata = self.paper_metadata.get(paper_id, {})
+        strict_evidence = bool(
+            evidence_manifest_path
+            or str(paper_preprocess_evidence.get("manifest_path") or "").strip()
+        )
         evidence = self.evidence_loader.load_evidence(
             normalized_text_path=paper_preprocess_evidence.get("markdown_path"),
             plain_text_path=paper_preprocess_evidence.get("plain_text_path"),
             page_index_path=paper_preprocess_evidence.get("page_index_path"),
             chunks_path=paper_preprocess_evidence.get("chunks_path"),
             structured_json_path=paper_preprocess_evidence.get("structured_json_path"),
-            manifest_path=paper_preprocess_evidence.get("manifest_path") or paper_preprocess_evidence.get("prepare_manifest_path"),
+            manifest_path=(
+                paper_preprocess_evidence.get("manifest_path")
+                or paper_preprocess_evidence.get("prepare_manifest_path")
+                or evidence_manifest_path
+            ),
             visual_artifacts_path=paper_preprocess_evidence.get("visual_artifacts_path"),
             diagnostics_path=paper_preprocess_evidence.get("diagnostics_path"),
+            strict=strict_evidence,
         )
         context = EvidenceResolverContext(
             paper_key=paper_id,

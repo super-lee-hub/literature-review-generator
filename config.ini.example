@@ -248,6 +248,7 @@ retain_page_index = true
 retain_diagnostics = true
 enable_local_rag = false
 rag_backend = chroma
+source_pdf_max_bytes = 134217728
 
 [Stage1_Input]
 # MinerU/full text is primary; selected visuals are bounded supplements.

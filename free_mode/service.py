@@ -135,7 +135,10 @@ def _complete_injected_free_mode_runtime(
         "error_kind": None if isinstance(response, dict) else "invalid_response",
     }
     try:
-        admission = provider_runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+        admission = provider_runtime.admit(
+            estimated_tokens=max(1, len(prompt) // 4),
+            requested_output_tokens=max(0, int(api_config.get("max_output_tokens") or 0)),
+        )
         provider_runtime.complete(
             admission=admission,
             prompt=prompt,

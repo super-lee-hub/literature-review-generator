@@ -75,6 +75,7 @@ MINERU_ENV_KEYS = [
     "MINERU_ZIP_MAX_COMPRESSION_RATIO",
     "MINERU_JSON_MAX_BYTES",
     "MINERU_TEXT_MAX_BYTES",
+    "MINERU_SOURCE_PDF_MAX_BYTES",
     "ALLOW_LOCAL_PARSE_FALLBACK",
 ]
 
@@ -241,6 +242,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "retain_diagnostics": "true",
             "enable_local_rag": "false",
             "rag_backend": "chroma",
+            "source_pdf_max_bytes": "134217728",
         },
         "Styling": {
             "font_name": "Times New Roman",

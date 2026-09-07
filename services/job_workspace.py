@@ -74,6 +74,34 @@ def _is_reparse_path(path: str | os.PathLike[str]) -> bool:
     )
 
 
+def is_reparse_path(path: str | os.PathLike[str]) -> bool:
+    """Public read-only check used by other safe filesystem boundaries."""
+
+    return _is_reparse_path(path)
+
+
+def _reject_reparse_components(base: str, candidate: str) -> None:
+    """Reject existing links/reparse points on a production write path."""
+
+    current = os.path.abspath(candidate)
+    base_abs = os.path.abspath(base)
+    while True:
+        if (
+            os.path.normcase(current) != os.path.normcase(base_abs)
+            and os.path.lexists(current)
+            and _is_reparse_path(current)
+        ):
+            raise WorkspacePathError(
+                f"production write path contains a symlink or reparse point: {current}"
+            )
+        if os.path.normcase(current) == os.path.normcase(base_abs):
+            return
+        parent = os.path.dirname(current)
+        if os.path.normcase(parent) == os.path.normcase(current):
+            return
+        current = parent
+
+
 def _descendant_path(
     base: str | os.PathLike[str],
     candidate: str | os.PathLike[str],
@@ -84,6 +112,8 @@ def _descendant_path(
     # turn a lexical descendant into a path outside the configured root.
     lexical_base = os.path.abspath(os.fspath(base))
     lexical_candidate = os.path.abspath(os.fspath(candidate))
+    if not allow_existing_reparse_leaf:
+        _reject_reparse_components(lexical_base, lexical_candidate)
     base_path = os.path.realpath(lexical_base)
     candidate_path = os.path.realpath(lexical_candidate)
     try:
@@ -273,34 +303,34 @@ class JobWorkspace:
         root_dir = _descendant_path(
             self.base_output_dir,
             os.path.join(self.base_output_dir, f"{self.project_name}__{self.job_id}"),
-            allow_existing_reparse_leaf=True,
+            allow_existing_reparse_leaf=False,
         )
         self.paths = WorkspacePaths(
             root_dir=root_dir,
             artifacts_dir=_descendant_path(
                 root_dir,
                 os.path.join(root_dir, "artifacts"),
-                allow_existing_reparse_leaf=True,
+                allow_existing_reparse_leaf=False,
             ),
             checkpoints_dir=_descendant_path(
                 root_dir,
                 os.path.join(root_dir, "checkpoints"),
-                allow_existing_reparse_leaf=True,
+                allow_existing_reparse_leaf=False,
             ),
             logs_dir=_descendant_path(
                 root_dir,
                 os.path.join(root_dir, "logs"),
-                allow_existing_reparse_leaf=True,
+                allow_existing_reparse_leaf=False,
             ),
             reports_dir=_descendant_path(
                 root_dir,
                 os.path.join(root_dir, "reports"),
-                allow_existing_reparse_leaf=True,
+                allow_existing_reparse_leaf=False,
             ),
             registry_path=_descendant_path(
                 root_dir,
                 os.path.join(root_dir, "artifact_registry.json"),
-                allow_existing_reparse_leaf=True,
+                allow_existing_reparse_leaf=False,
             ),
         )
 
@@ -362,6 +392,15 @@ class JobWorkspace:
         return self.paths.root_dir
 
     def artifact_path(self, filename: str) -> str:
+        return _descendant_path(
+            self.paths.artifacts_dir,
+            os.path.join(self.paths.artifacts_dir, filename),
+            allow_existing_reparse_leaf=False,
+        )
+
+    def inspect_artifact_path(self, filename: str) -> str:
+        """Return an existing artifact name for read-only diagnostics only."""
+
         return _descendant_path(
             self.paths.artifacts_dir,
             os.path.join(self.paths.artifacts_dir, filename),

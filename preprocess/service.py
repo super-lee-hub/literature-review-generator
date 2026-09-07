@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import threading
 import time
 import zipfile
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, cast
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, cast
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -25,6 +26,7 @@ import requests  # type: ignore
 
 from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
+from services.job_workspace import atomic_write_json
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
 
 DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
@@ -40,6 +42,11 @@ DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES = 64 * 1024 * 1024
 DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO = 200.0
 DEFAULT_MINERU_JSON_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_MINERU_TEXT_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES = 128 * 1024 * 1024
+PREPROCESS_MANIFEST_SCHEMA_VERSION = "preprocess-manifest-v2"
+PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION = "preprocess-active-generation-v1"
+STAGE1_INPUT_SELECTOR_VERSION = "stage1-input-selector-v1"
+PREPROCESS_IMPLEMENTATION_VERSION = "preprocess-service-20260907-v2"
 
 
 class MineruArtifactError(RuntimeError):
@@ -164,6 +171,16 @@ class PreprocessManager:
         self.retain_page_index = _as_bool(preprocess_section.get("retain_page_index", "true"), default=True)
         self.retain_diagnostics = _as_bool(preprocess_section.get("retain_diagnostics", "true"), default=True)
         self.force_docling_strategy = False
+        self.source_pdf_max_bytes = max(
+            1,
+            _as_int(
+                preprocess_section.get(
+                    "source_pdf_max_bytes",
+                    os.getenv("MINERU_SOURCE_PDF_MAX_BYTES", str(DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES)),
+                ),
+                DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES,
+            ),
+        )
 
         self.mineru_base_url = str(os.getenv("MINERU_BASE_URL", "https://mineru.net/api/v4")).strip().rstrip("/")
         self.mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
@@ -263,6 +280,8 @@ class PreprocessManager:
             120.0,
         )
         self.mineru_circuit_breaker = mineru_circuit_breaker or ProviderCircuitBreaker("mineru")
+        self.processing_fingerprint = self._processing_fingerprint()
+        self._last_mineru_upload_bytes = 0
 
     def preflight_mineru(self) -> None:
         """Validate local route configuration before creating a remote task."""
@@ -286,32 +305,45 @@ class PreprocessManager:
         if not self.enabled:
             return None
 
-        cache_dir = os.path.join(self.cache_root, self._pdf_cache_key(pdf_path))
-        artifact_paths = self._artifact_paths(cache_dir)
-
-        required_paths = [
-            artifact_paths["manifest_path"],
-            artifact_paths["markdown_path"],
-            artifact_paths["plain_text_path"],
-            artifact_paths["page_index_path"],
-            artifact_paths["chunks_path"],
-            artifact_paths["diagnostics_path"],
-            artifact_paths["structured_json_path"],
-        ]
-        if (not self.force_rebuild) and self._cache_is_fresh(pdf_path, artifact_paths["manifest_path"], *required_paths[1:]):
-            return self._load_cached_result(
-                pdf_path=pdf_path,
-                cache_dir=cache_dir,
-                markdown_path=artifact_paths["markdown_path"],
-                plain_text_path=artifact_paths["plain_text_path"],
-                page_index_path=artifact_paths["page_index_path"],
-                chunks_path=artifact_paths["chunks_path"],
-                diagnostics_path=artifact_paths["diagnostics_path"],
-                structured_json_path=artifact_paths["structured_json_path"],
-                manifest_path=artifact_paths["manifest_path"],
-            )
-
+        source_identity = self._source_identity(pdf_path)
+        cache_dir = os.path.join(self.cache_root, self._pdf_cache_key(pdf_path, source_identity))
         os.makedirs(cache_dir, exist_ok=True)
+        active = self._active_generation(cache_dir)
+        if (not self.force_rebuild) and active is not None:
+            generation_dir, active_paths = active
+            required_paths = [
+                active_paths["markdown_path"],
+                active_paths["plain_text_path"],
+                active_paths["page_index_path"],
+                active_paths["chunks_path"],
+                active_paths["diagnostics_path"],
+                active_paths["structured_json_path"],
+                active_paths["stage1_input_path"],
+                active_paths["stage1_input_manifest_path"],
+                active_paths["stage1_quality_report_path"],
+            ]
+            if self._cache_is_fresh(
+                pdf_path,
+                active_paths["manifest_path"],
+                *required_paths,
+            ):
+                cached = self._load_cached_result(
+                    pdf_path=pdf_path,
+                    cache_dir=cache_dir,
+                    generation_dir=generation_dir,
+                    markdown_path=active_paths["markdown_path"],
+                    plain_text_path=active_paths["plain_text_path"],
+                    page_index_path=active_paths["page_index_path"],
+                    chunks_path=active_paths["chunks_path"],
+                    diagnostics_path=active_paths["diagnostics_path"],
+                    structured_json_path=active_paths["structured_json_path"],
+                    manifest_path=active_paths["manifest_path"],
+                )
+                if cached is not None:
+                    return cached
+
+        generation_dir = tempfile.mkdtemp(prefix=".generation.tmp-", dir=cache_dir)
+        artifact_paths = self._artifact_paths(generation_dir)
         extraction = self._extract_preferred_content(pdf_path)
         if not extraction:
             return None
@@ -376,6 +408,7 @@ class PreprocessManager:
             "mineru_remote_requested": mineru_remote_requested,
             "mineru_remote_enabled": mineru_remote_enabled,
             "mineru_base_url": self.mineru_base_url,
+            "mineru_upload_bytes": int(extraction.get("mineru_upload_bytes") or self._last_mineru_upload_bytes),
             "page_diagnostics": [asdict(item) for item in page_diagnostics],
             "artifact_paths": {
                 "normalized_md": artifact_paths["markdown_path"],
@@ -400,9 +433,16 @@ class PreprocessManager:
             },
         }
         manifest_payload = {
+            "schema_version": PREPROCESS_MANIFEST_SCHEMA_VERSION,
+            "implementation_version": PREPROCESS_IMPLEMENTATION_VERSION,
+            "generation_id": os.path.basename(generation_dir),
             "pdf_path": pdf_path,
-            "file_size": os.path.getsize(pdf_path),
-            "modified_time": os.path.getmtime(pdf_path),
+            "canonical_source_path": source_identity["canonical_path"],
+            "source_pdf_sha256": source_identity["sha256"],
+            "source_pdf_size": source_identity["size"],
+            "file_size": source_identity["size"],
+            "modified_time": source_identity["mtime"],
+            "processing_fingerprint": self.processing_fingerprint,
             "extractor_used": extractor_used,
             "layout_fidelity": layout_fidelity,
             "conversion_used": conversion_used,
@@ -419,6 +459,7 @@ class PreprocessManager:
             "mineru_remote_requested": mineru_remote_requested,
             "mineru_remote_enabled": mineru_remote_enabled,
             "mineru_base_url": self.mineru_base_url,
+            "mineru_upload_bytes": int(extraction.get("mineru_upload_bytes") or self._last_mineru_upload_bytes),
             "selected_text_source": stage1_selection.selected_source,
             "stage1_quality_level": stage1_selection.quality_level,
             "stage1_quality_reasons": stage1_selection.stage1_quality_reasons,
@@ -427,39 +468,35 @@ class PreprocessManager:
             "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
             "artifacts": diagnostics_payload["artifact_paths"],
         }
-
-        with open(artifact_paths["markdown_path"], "w", encoding="utf-8") as handle:
-            handle.write(markdown_text)
-        with open(artifact_paths["plain_text_path"], "w", encoding="utf-8") as handle:
-            handle.write(plain_text)
-        with open(artifact_paths["page_index_path"], "w", encoding="utf-8") as handle:
-            json.dump(page_index, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
-            json.dump(chunks, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["stage1_input_path"], "w", encoding="utf-8") as handle:
-            handle.write(stage1_selection.selected_text)
-        with open(artifact_paths["stage1_input_manifest_path"], "w", encoding="utf-8") as handle:
-            json.dump(stage1_manifest_payload, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["stage1_quality_report_path"], "w", encoding="utf-8") as handle:
-            json.dump(stage1_quality_report_payload, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["diagnostics_path"], "w", encoding="utf-8") as handle:
-            json.dump(diagnostics_payload, handle, ensure_ascii=False, indent=2)
-        with open(artifact_paths["structured_json_path"], "w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "pages": page_blocks,
-                    "page_index": page_index,
-                    "plain_text": plain_text,
-                    "markdown_text": markdown_text,
-                    "stage1_input_text": stage1_selection.selected_text,
-                    "source_payload": self._make_json_safe(structured_payload),
-                },
-                handle,
-                ensure_ascii=False,
-                indent=2,
-            )
-        with open(artifact_paths["manifest_path"], "w", encoding="utf-8") as handle:
-            json.dump(manifest_payload, handle, ensure_ascii=False, indent=2)
+        self._write_text_durable(artifact_paths["markdown_path"], markdown_text)
+        self._write_text_durable(artifact_paths["plain_text_path"], plain_text)
+        self._write_json_durable(artifact_paths["page_index_path"], page_index)
+        self._write_json_durable(artifact_paths["chunks_path"], chunks)
+        self._write_text_durable(artifact_paths["stage1_input_path"], stage1_selection.selected_text)
+        self._write_json_durable(artifact_paths["stage1_input_manifest_path"], stage1_manifest_payload)
+        self._write_json_durable(artifact_paths["stage1_quality_report_path"], stage1_quality_report_payload)
+        self._write_json_durable(artifact_paths["diagnostics_path"], diagnostics_payload)
+        self._write_json_durable(
+            artifact_paths["structured_json_path"],
+            {
+                "pages": page_blocks,
+                "page_index": page_index,
+                "plain_text": plain_text,
+                "markdown_text": markdown_text,
+                "stage1_input_text": stage1_selection.selected_text,
+                "source_payload": self._make_json_safe(structured_payload),
+            },
+        )
+        manifest_payload["artifact_hashes"] = self._artifact_hashes(
+            artifact_paths,
+            exclude={"manifest_path"},
+        )
+        self._write_json_durable(artifact_paths["manifest_path"], manifest_payload)
+        self._publish_active_generation(
+            cache_dir,
+            generation_dir,
+            manifest_path=artifact_paths["manifest_path"],
+        )
 
         return PreprocessResult(
             pdf_path=pdf_path,
@@ -512,6 +549,132 @@ class PreprocessManager:
             "stage1_input_manifest_path": os.path.join(cache_dir, "stage1_input_manifest.json"),
             "stage1_quality_report_path": os.path.join(cache_dir, "stage1_text_quality_report.json"),
         }
+
+    @staticmethod
+    def _write_text_durable(path: str, value: str) -> None:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(str(value))
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _write_json_durable(path: str, value: Any) -> None:
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _source_identity(self, pdf_path: str) -> Dict[str, Any]:
+        canonical_path = os.path.realpath(os.path.abspath(pdf_path))
+        before = os.stat(canonical_path)
+        digest = self._file_sha256(canonical_path)
+        after = os.stat(canonical_path)
+        if before.st_size != after.st_size:
+            raise RuntimeError("source PDF changed while its content hash was being computed")
+        return {
+            "canonical_path": canonical_path,
+            "size": int(after.st_size),
+            "mtime": float(after.st_mtime),
+            "sha256": digest,
+        }
+
+    def _processing_fingerprint(self) -> str:
+        payload = {
+            "schema_version": PREPROCESS_MANIFEST_SCHEMA_VERSION,
+            "implementation_version": PREPROCESS_IMPLEMENTATION_VERSION,
+            "stage1_input_selector_version": STAGE1_INPUT_SELECTOR_VERSION,
+            "preprocess": self._make_json_safe(self.config.get("Preprocess", {})),
+            "stage1_input": self._make_json_safe(self.config.get("Stage1_Input", {})),
+            "stage1_visual": self._make_json_safe(self.config.get("Stage1_Visual", {})),
+            "extractor_profile": self.extractor_profile,
+            "parser_mode": self.parser_mode,
+            "primary_parser": self.primary_parser,
+            "fallback_parser": self.fallback_parser,
+            "ocr_mode": self.ocr_mode,
+            "ocr_languages": self.ocr_languages,
+            "mineru_model_version": self.mineru_model_version,
+            "source_pdf_max_bytes": self.source_pdf_max_bytes,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _active_generation(self, cache_dir: str) -> Optional[tuple[str, Dict[str, str]]]:
+        pointer_path = os.path.join(cache_dir, "active_generation.json")
+        if not os.path.isfile(pointer_path) or os.path.islink(pointer_path):
+            return None
+        try:
+            with open(pointer_path, "r", encoding="utf-8") as handle:
+                pointer = json.load(handle)
+            if not isinstance(pointer, dict):
+                return None
+            if pointer.get("schema_version") != PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION:
+                return None
+            generation_name = str(pointer.get("generation_id") or "").strip()
+            if not generation_name or os.path.basename(generation_name) != generation_name:
+                return None
+            generation_dir = os.path.join(cache_dir, generation_name)
+            if os.path.realpath(generation_dir) != os.path.abspath(generation_dir):
+                return None
+            paths = self._artifact_paths(generation_dir)
+            manifest_path = paths["manifest_path"]
+            if str(pointer.get("manifest_sha256") or "") != self._file_sha256(manifest_path):
+                return None
+            return generation_dir, paths
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _publish_active_generation(
+        self,
+        cache_dir: str,
+        generation_dir: str,
+        *,
+        manifest_path: str,
+    ) -> None:
+        pointer_path = os.path.join(cache_dir, "active_generation.json")
+        if os.path.islink(pointer_path):
+            raise RuntimeError("preprocess active-generation pointer is a symlink")
+        atomic_write_json(
+            pointer_path,
+            {
+                "schema_version": PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION,
+                "generation_id": os.path.basename(generation_dir),
+                "manifest_sha256": self._file_sha256(manifest_path),
+            },
+        )
+
+    def _artifact_hashes(
+        self,
+        artifact_paths: Mapping[str, str],
+        *,
+        exclude: set[str] | None = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        ignored = exclude or set()
+        result: Dict[str, Dict[str, Any]] = {}
+        for key, path in artifact_paths.items():
+            if key in ignored:
+                continue
+            target = Path(path)
+            result[target.name] = {
+                "relative_path": target.name,
+                "type": "json" if target.suffix.casefold() == ".json" else "text",
+                "schema_version": PREPROCESS_MANIFEST_SCHEMA_VERSION,
+                "size": int(os.path.getsize(path)),
+                "sha256": self._file_sha256(path),
+            }
+        return result
 
     def _extract_preferred_content(self, pdf_path: str) -> Optional[Dict[str, Any]]:
         baseline_plain_text, baseline_page_diagnostics, baseline_page_blocks = self._extract_local_page_data(
@@ -711,6 +874,15 @@ class PreprocessManager:
         baseline_page_blocks: List[Dict[str, Any]],
         baseline_page_index: List[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        try:
+            source_pdf_size = int(os.path.getsize(pdf_path))
+        except OSError as exc:
+            raise MineruArtifactError(f"cannot stat source PDF before upload: {exc}") from exc
+        if source_pdf_size > self.source_pdf_max_bytes:
+            raise MineruArtifactLimitError(
+                "source PDF exceeds the configured upload byte limit "
+                f"({source_pdf_size} > {self.source_pdf_max_bytes})"
+            )
         self.preflight_mineru()
         upload_url = self._join_base_url(self.mineru_upload_endpoint)
         payload = {
@@ -734,17 +906,17 @@ class PreprocessManager:
         if not upload_targets:
             raise RuntimeError("MinerU upload response did not include presigned upload URLs.")
 
-        with open(pdf_path, "rb") as handle:
-            pdf_bytes = handle.read()
-
+        self._last_mineru_upload_bytes = 0
         for target in upload_targets:
             self.mineru_circuit_breaker.ensure_closed()
-            response = requests.put(
-                self._validate_mineru_url(target, purpose="upload URL"),
-                data=pdf_bytes,
-                timeout=120,
-                allow_redirects=False,
-            )
+            with open(pdf_path, "rb") as handle:
+                response = requests.put(
+                    self._validate_mineru_url(target, purpose="upload URL"),
+                    data=handle,
+                    timeout=120,
+                    allow_redirects=False,
+                )
+            self._last_mineru_upload_bytes += source_pdf_size
             if response.status_code in {401, 403}:
                 self.mineru_circuit_breaker.open(
                     reason="upload_authorization_rejected",
@@ -773,6 +945,7 @@ class PreprocessManager:
         normalized["layout_fidelity"] = "layout_aware"
         normalized["conversion_used"] = "native_pdf"
         normalized["used_ocr"] = False
+        normalized["mineru_upload_bytes"] = self._last_mineru_upload_bytes
         return normalized
 
     def _request_json(self, method: str, url: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
@@ -1789,6 +1962,7 @@ class PreprocessManager:
         artifact_paths: Dict[str, str],
         diagnostics: Dict[str, Any],
         manifest: Dict[str, Any],
+        allow_rebuild: bool = True,
     ) -> tuple[str, str, str, List[str], List[Dict[str, Any]]]:
         stage1_paths = [
             artifact_paths["stage1_input_path"],
@@ -1806,6 +1980,8 @@ class PreprocessManager:
                 page_index=page_index,
             )
             if self._stage1_cache_needs_refresh(stage1_manifest, stage1_input_text, current_selection):
+                if not allow_rebuild:
+                    raise RuntimeError("cached Stage 1 selection is inconsistent with its generation")
                 chunks = self._write_stage1_selection_artifacts(
                     selection=current_selection,
                     artifact_paths=artifact_paths,
@@ -1829,10 +2005,26 @@ class PreprocessManager:
                 with open(artifact_paths["chunks_path"], "r", encoding="utf-8") as handle:
                     chunks = json.load(handle)
             except Exception:
+                if not allow_rebuild:
+                    raise RuntimeError("cached chunks artifact cannot be read")
                 chunks = self._build_chunks(stage1_input_text, page_index)
                 with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
                     json.dump(chunks, handle, ensure_ascii=False, indent=2)
+            if (
+                not self._chunks_use_selected_stage1(chunks)
+                and not str(stage1_input_text or "").strip()
+                and not str(current_selection.selected_text or "").strip()
+            ):
+                return (
+                    stage1_input_text,
+                    str(stage1_manifest.get("selected_text_source") or ""),
+                    str(stage1_manifest.get("stage1_quality_level") or ""),
+                    list(stage1_manifest.get("stage1_quality_reasons") or []),
+                    chunks if isinstance(chunks, list) else [],
+                )
             if not self._chunks_use_selected_stage1(chunks):
+                if not allow_rebuild:
+                    raise RuntimeError("cached chunks artifact is not bound to selected Stage 1 input")
                 chunks = self._build_chunks(stage1_input_text, page_index)
                 with open(artifact_paths["chunks_path"], "w", encoding="utf-8") as handle:
                     json.dump(chunks, handle, ensure_ascii=False, indent=2)
@@ -2023,6 +2215,7 @@ class PreprocessManager:
         self,
         pdf_path: str,
         cache_dir: str,
+        generation_dir: str,
         markdown_path: str,
         plain_text_path: str,
         page_index_path: str,
@@ -2032,7 +2225,7 @@ class PreprocessManager:
         manifest_path: str,
     ) -> Optional[PreprocessResult]:
         try:
-            artifact_paths = self._artifact_paths(cache_dir)
+            artifact_paths = self._artifact_paths(generation_dir)
             with open(markdown_path, "r", encoding="utf-8") as handle:
                 markdown_text = handle.read()
             with open(plain_text_path, "r", encoding="utf-8") as handle:
@@ -2058,6 +2251,7 @@ class PreprocessManager:
                 artifact_paths=artifact_paths,
                 diagnostics=diagnostics,
                 manifest=manifest,
+                allow_rebuild=False,
             )
             return PreprocessResult(
                 pdf_path=pdf_path,
@@ -2101,24 +2295,59 @@ class PreprocessManager:
             return None
 
     def _cache_is_fresh(self, pdf_path: str, manifest_path: str, *required_files: str) -> bool:
-        if not os.path.exists(manifest_path):
+        if not os.path.isfile(manifest_path) or os.path.islink(manifest_path):
             return False
-        if not all(os.path.exists(path) for path in required_files):
+        if not all(os.path.isfile(path) and not os.path.islink(path) for path in required_files):
             return False
         try:
             with open(manifest_path, "r", encoding="utf-8") as handle:
                 manifest = json.load(handle)
-            return (
-                manifest.get("file_size") == os.path.getsize(pdf_path)
-                and abs(float(manifest.get("modified_time", 0.0)) - os.path.getmtime(pdf_path)) < 0.001
-            )
-        except Exception:
+            if (
+                manifest.get("schema_version") != PREPROCESS_MANIFEST_SCHEMA_VERSION
+                or manifest.get("implementation_version") != PREPROCESS_IMPLEMENTATION_VERSION
+            ):
+                return False
+            generation_id = str(manifest.get("generation_id") or "")
+            if generation_id != os.path.basename(os.path.dirname(manifest_path)):
+                return False
+            source = self._source_identity(pdf_path)
+            if (
+                str(manifest.get("canonical_source_path") or "") != source["canonical_path"]
+                or str(manifest.get("source_pdf_sha256") or "") != source["sha256"]
+                or int(manifest.get("source_pdf_size") or -1) != source["size"]
+                or str(manifest.get("processing_fingerprint") or "") != self.processing_fingerprint
+            ):
+                return False
+            artifact_hashes = manifest.get("artifact_hashes")
+            if not isinstance(artifact_hashes, dict):
+                return False
+            for path in required_files:
+                entry = artifact_hashes.get(os.path.basename(path))
+                if not isinstance(entry, dict):
+                    return False
+                if str(entry.get("relative_path") or "") != os.path.basename(path):
+                    return False
+                if str(entry.get("schema_version") or "") != PREPROCESS_MANIFEST_SCHEMA_VERSION:
+                    return False
+                raw_size = entry.get("size")
+                if raw_size is None or int(raw_size) != os.path.getsize(path):
+                    return False
+                if str(entry.get("sha256") or "") != self._file_sha256(path):
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return False
 
-    def _pdf_cache_key(self, pdf_path: str) -> str:
-        stat = os.stat(pdf_path)
-        payload = f"{os.path.abspath(pdf_path)}::{stat.st_size}::{stat.st_mtime}".encode("utf-8")
-        return hashlib.md5(payload).hexdigest()
+    def _pdf_cache_key(
+        self,
+        pdf_path: str,
+        source_identity: Dict[str, Any] | None = None,
+    ) -> str:
+        source = source_identity or self._source_identity(pdf_path)
+        payload = (
+            f"{source['canonical_path']}::{source['size']}::{source['sha256']}"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     def _ocr_available(self) -> bool:
         return shutil.which("tesseract") is not None

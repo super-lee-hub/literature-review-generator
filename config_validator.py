@@ -227,6 +227,7 @@ def validate_all_config(
     *,
     required_provider_sections: List[str] | Tuple[str, ...] | None = None,
     allow_template_credentials: bool = False,
+    reachable_stages: Tuple[str, ...] | List[str] | None = None,
 ) -> Tuple[bool, List[str]]:
     """Validate current settings and return ``(valid, messages)``."""
 
@@ -405,15 +406,24 @@ def validate_all_config(
         parse_repair_policy(config_dict.get("Validation", {}).get("repair_policy"))
     except (TypeError, ValueError) as exc:
         return False, [str(exc)]
-    outline_errors = settings.validate_outline_config()
-    if outline_errors:
-        return False, outline_errors
-    # A critique that shares the generator's identity is legal but must never be
-    # invisible, so it is surfaced as a warning rather than silently accepted.
-    messages.extend(settings.outline_routing_diagnostics())
+    if reachable_stages is None or "outline" in reachable_stages:
+        outline_errors = settings.validate_outline_config()
+        if outline_errors:
+            return False, outline_errors
+        # A critique that shares the generator's identity is legal but must never be
+        # invisible, so it is surfaced as a warning rather than silently accepted.
+        messages.extend(settings.outline_routing_diagnostics())
     preprocess = config_dict.get("Preprocess", {})
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]
+    if "source_pdf_max_bytes" in preprocess:
+        valid, error = validate_numeric_range(
+            str(preprocess["source_pdf_max_bytes"]),
+            1,
+            10_000_000_000,
+        )
+        if not valid:
+            return False, [f"[Preprocess] source_pdf_max_bytes {error}"]
     return True, messages
 
 

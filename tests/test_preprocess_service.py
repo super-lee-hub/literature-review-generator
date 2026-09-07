@@ -77,7 +77,7 @@ def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monk
     manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
     stage1_manifest = json.loads(Path(result.stage1_input_manifest_path).read_text(encoding="utf-8"))
     quality_report = json.loads(Path(result.stage1_quality_report_path).read_text(encoding="utf-8"))
-    chunks = json.loads((Path(result.cache_dir) / "chunks.json").read_text(encoding="utf-8"))
+    chunks = json.loads(Path(result.chunks_path).read_text(encoding="utf-8"))
     assert diagnostics["extractor_used"] in {"fitz", "pymupdf4llm", "legacy_pdf_extractor"}
     assert diagnostics["mineru_token_present"] is False
     assert manifest["artifacts"]["normalized_md"] == result.markdown_path
@@ -162,7 +162,7 @@ def test_preprocess_manager_records_hybrid_skip_reason_without_losing_token_stat
     assert manifest["mineru_remote_enabled"] is False
 
 
-def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path, monkeypatch) -> None:
+def test_preprocess_manager_rebuilds_when_required_cache_artifact_is_missing(tmp_path: Path) -> None:
     pdf_path = tmp_path / "sample.pdf"
     cache_dir = tmp_path / "cache"
     _make_text_pdf(pdf_path)
@@ -187,22 +187,17 @@ def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path, monkeypatch) -> N
     ]:
         Path(path).unlink()
 
-    monkeypatch.setattr(
-        manager,
-        "_extract_preferred_content",
-        lambda _path: (_ for _ in ()).throw(AssertionError("fresh cache should not re-run parser")),
-    )
     second = manager.prepare_pdf(str(pdf_path))
 
     assert second is not None
     assert first.cache_dir == second.cache_dir
-    assert first.manifest_path == second.manifest_path
-    assert first.page_index_path == second.page_index_path
+    assert first.manifest_path != second.manifest_path
+    assert first.page_index_path != second.page_index_path
     assert Path(second.stage1_input_path).exists()
     assert Path(second.stage1_input_manifest_path).exists()
     assert Path(second.stage1_quality_report_path).exists()
     assert second.stage1_input_text
-    chunks = json.loads((Path(second.cache_dir) / "chunks.json").read_text(encoding="utf-8"))
+    chunks = json.loads(Path(second.chunks_path).read_text(encoding="utf-8"))
     assert chunks
     assert {chunk["chunk_source"] for chunk in chunks} == {"selected_stage1_input"}
 

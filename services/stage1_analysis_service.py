@@ -5344,7 +5344,17 @@ class Stage1AnalysisService:
         if runtime.receipts and not force:
             return
         try:
-            admission = runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+            admission = runtime.admit(
+                estimated_tokens=max(1, len(prompt) // 4),
+                requested_output_tokens=max(
+                    0,
+                    int(input_payload.get("max_output_tokens") or 0),
+                ),
+                requested_retry_attempts=max(
+                    0,
+                    int(result.get("attempts") or 1) - 1,
+                ),
+            )
             receipt_metadata: dict[str, Any] = {
                 "execution_mode": "injected_reader",
                 "requested_output_tokens": int(

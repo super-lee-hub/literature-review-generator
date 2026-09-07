@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional
 
+from services.job_workspace import (
+    WorkspacePathError,
+    atomic_write_json,
+    is_reparse_path,
+    validate_path_component,
+)
 
 DEFAULT_PROFILE: Dict[str, Any] = {
     "research_goal": "",
@@ -20,8 +27,37 @@ DEFAULT_PROFILE: Dict[str, Any] = {
 }
 
 
+def _reject_reparse_ancestors(path: Path) -> None:
+    current = path.absolute()
+    while True:
+        if is_reparse_path(current):
+            raise WorkspacePathError(
+                f"Free Mode profile path contains a symlink or reparse point: {current}"
+            )
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
 def get_profile_path(output_dir: str, project_name: str) -> str:
-    return os.path.join(output_dir, f"{project_name}_free_mode_profile.json")
+    root = Path(output_dir).expanduser().absolute()
+    safe_project = validate_path_component(project_name, field_name="project_name")
+    candidate = root / f"{safe_project}_free_mode_profile.json"
+    _reject_reparse_ancestors(root)
+    if is_reparse_path(candidate):
+        raise WorkspacePathError(
+            f"Free Mode profile path must not be a symlink or reparse point: {candidate}"
+        )
+    root_real = Path(os.path.realpath(root))
+    candidate_parent_real = Path(os.path.realpath(candidate.parent))
+    try:
+        common = os.path.commonpath([str(root_real), str(candidate_parent_real)])
+    except ValueError as exc:
+        raise WorkspacePathError("Free Mode profile path is on a different drive") from exc
+    if os.path.normcase(common) != os.path.normcase(str(root_real)):
+        raise WorkspacePathError("Free Mode profile path escapes its output root")
+    return str(candidate)
 
 
 def normalize_profile(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -36,10 +72,11 @@ def normalize_profile(profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def save_profile(profile: Dict[str, Any], output_dir: str, project_name: str) -> str:
-    os.makedirs(output_dir, exist_ok=True)
+    root = Path(output_dir).expanduser().absolute()
+    _reject_reparse_ancestors(root)
+    os.makedirs(root, exist_ok=True)
     path = get_profile_path(output_dir, project_name)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(normalize_profile(profile), handle, ensure_ascii=False, indent=2)
+    atomic_write_json(path, normalize_profile(profile))
     return path
 
 

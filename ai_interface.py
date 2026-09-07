@@ -2148,8 +2148,15 @@ def _call_ai_api_detailed(
         return blocked
 
     estimated_tokens = int(budget["estimated_input_tokens"])
+    configured_attempts = _load_api_runtime_settings(api_config)[1]
+    requested_attempts = retry_attempts if retry_attempts is not None else configured_attempts
+    effective_attempts = provider_runtime.max_attempts_for_call(requested_attempts)
     try:
-        admission = provider_runtime.admit(estimated_tokens=estimated_tokens)
+        admission = provider_runtime.admit(
+            estimated_tokens=estimated_tokens,
+            requested_output_tokens=max(0, int(max_tokens)),
+            requested_retry_attempts=max(0, effective_attempts - 1),
+        )
     except ProviderBudgetExceeded as exc:
         receipt = provider_runtime.blocked_receipt(
             prompt=prompt,
@@ -2179,9 +2186,9 @@ def _call_ai_api_detailed(
         response_format=response_format,
         logger=logger,
         user_content=admitted_user_content,
-        retry_attempts=retry_attempts,
+        retry_attempts=effective_attempts,
         timeout_seconds=timeout_seconds,
-        max_retries_per_call=provider_runtime.budget.max_retries_per_call,
+        max_retries_per_call=max(0, effective_attempts - 1),
         max_single_image_bytes=max_single_image_bytes,
         max_request_image_bytes=max_request_image_bytes,
     )

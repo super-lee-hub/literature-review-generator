@@ -189,6 +189,14 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--stages", nargs="*", default=None)
     preflight.add_argument("--section", default="")
 
+    micro_probe = subparsers.add_parser("micro-probe")
+    micro_probe.add_argument("--config", dest="micro_probe_config", default="")
+    micro_probe.add_argument("--action", default="analyze")
+    micro_probe.add_argument("--stages", nargs="*", default=None)
+    micro_probe.add_argument("--section", default="")
+    micro_probe.add_argument("--third-party-acknowledged", action="store_true")
+    micro_probe.add_argument("--third-party-host", action="append", default=[])
+
     config_migrate = subparsers.add_parser("config-migrate")
     config_migrate.add_argument("--config", dest="migrate_config", required=True)
     config_migrate.add_argument("--dry-run", action="store_true")
@@ -282,9 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _exit_code(command: str, payload: dict[str, Any]) -> int:
-    if command == "doctor":
-        return 0 if bool(payload.get("ok")) else 1
-    if command == "preflight":
+    if command in {"doctor", "preflight", "micro-probe"}:
         return 0 if bool(payload.get("ok")) else 1
     if command in {"status", "inspect", "next-action", "reconcile", "repair-plan", "validate", "validation-status", "attest", "export", "queue-list"}:
         return 0
@@ -316,6 +322,15 @@ def main(argv: list[str] | None = None) -> int:
                 action=args.action,
                 requested_stages=args.stages,
                 section=args.section or None,
+            )
+        elif args.command == "micro-probe":
+            payload = control.provider_micro_probe(
+                config_path=(getattr(args, "micro_probe_config", "") or args.config or None),
+                action=args.action,
+                requested_stages=args.stages,
+                section=args.section or None,
+                third_party_acknowledged=bool(args.third_party_acknowledged),
+                third_party_hosts=args.third_party_host,
             )
         elif args.command == "config-migrate":
             payload = _config_migrate_command(args)

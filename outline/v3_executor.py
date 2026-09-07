@@ -2509,7 +2509,10 @@ class OutlineV3Executor:
                 f"replay stale for {node_id}: {','.join(replay_lookup.stale_reasons)}"
             )
         runtime = ProviderRuntime(
-            budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=0),
+            budget=ProviderBudgetV1(
+                max_calls=1,
+                max_retries_per_call=max(0, int(api_config.get("transport_retries") or 0)),
+            ),
             ledger=self._receipt_ledger,
             job_id=self.job_id,
             attempt_id=call_id,
@@ -2529,7 +2532,13 @@ class OutlineV3Executor:
             receipt = runtime.blocked_receipt(prompt=json.dumps(request, sort_keys=True, ensure_ascii=False), input_payload=request, api_config=api_config, message="provider input exceeds verified context budget")
             self.receipts.append(receipt.receipt_id)
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
-        admission = runtime.admit(estimated_tokens=int(budget["estimated_input_tokens"]))
+        requested_attempts = max(1, int(api_config.get("transport_retries") or 1))
+        effective_attempts = runtime.max_attempts_for_call(requested_attempts)
+        admission = runtime.admit(
+            estimated_tokens=int(budget["estimated_input_tokens"]),
+            requested_output_tokens=int(profile.max_output_tokens),
+            requested_retry_attempts=max(0, effective_attempts - 1),
+        )
         if self.max_provider_calls is not None and self._provider_call_count >= self.max_provider_calls:
             raise OutlineV3ExecutionError(
                 f"outline provider call budget exhausted before {node_id}"

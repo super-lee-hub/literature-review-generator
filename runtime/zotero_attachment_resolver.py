@@ -14,13 +14,20 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 import sqlite3
+import os
 from typing import Any, Mapping
+from urllib.parse import unquote
 
 from services.paper_identity import (
     normalize_doi,
     normalized_author_surnames,
     normalized_title_key,
 )
+from services.job_workspace import is_reparse_path, validate_path_component, WorkspacePathError
+
+
+class ZoteroAttachmentResolutionError(ValueError):
+    """Raised when a managed Zotero attachment escapes its storage root."""
 
 
 @dataclass(frozen=True)
@@ -35,6 +42,10 @@ class ZoteroAttachmentRecord:
     exists: bool
     date_added: str = ""
     attachment_title: str = ""
+    attachment_source_type: str = "managed_storage"
+    external_to_library: bool = False
+    resolution_error: str = ""
+    canonical_resolved_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -84,17 +95,77 @@ class ZoteroAttachmentIndex:
             text = re.sub(r"\\{2,}", r"\\", text)
         return text
 
-    def _resolve_attachment_path(self, raw_path: str, attachment_key: str) -> Path:
+    @staticmethod
+    def _is_managed_path(raw_path: str) -> bool:
+        lowered = str(raw_path or "").casefold()
+        return lowered.startswith("storage:") or lowered.startswith("attachments:")
+
+    @staticmethod
+    def _path_is_descendant(base: Path, candidate: Path) -> bool:
+        try:
+            common = Path(os.path.commonpath([str(base), str(candidate)]))
+        except ValueError:
+            return False
+        return os.path.normcase(str(common)) == os.path.normcase(str(base))
+
+    def _resolve_attachment_path(
+        self,
+        raw_path: str,
+        attachment_key: str,
+        link_mode: int = 0,
+    ) -> Path:
         raw = self._collapse_windows_separators(raw_path)
         lowered = raw.casefold()
-        if lowered.startswith("storage:"):
-            relative = raw.split(":", 1)[1].lstrip("\\/")
-            return self.storage_root / attachment_key / relative
-        if lowered.startswith("attachments:"):
-            relative = raw.split(":", 1)[1].lstrip("\\/")
-            return self.storage_root / attachment_key / relative
+        managed = self._is_managed_path(raw)
+        if managed and int(link_mode or 0) != 2:
+            try:
+                safe_key = validate_path_component(
+                    attachment_key,
+                    field_name="Zotero attachment key",
+                )
+            except WorkspacePathError as exc:
+                raise ZoteroAttachmentResolutionError(str(exc)) from exc
+            raw_relative = raw.split(":", 1)[1]
+            if raw_relative.startswith(("/", "\\")):
+                raise ZoteroAttachmentResolutionError(
+                    "managed Zotero attachment path must not be absolute"
+                )
+            relative = raw_relative
+            relative_path = Path(unquote(relative))
+            if (
+                not relative
+                or relative_path.is_absolute()
+                or any(part in {"..", "."} for part in relative_path.parts)
+                or re.match(r"^[A-Za-z]:", relative)
+            ):
+                raise ZoteroAttachmentResolutionError(
+                    "managed Zotero attachment path must be a relative descendant"
+                )
+            attachment_root = self.storage_root / safe_key
+            if is_reparse_path(attachment_root):
+                raise ZoteroAttachmentResolutionError(
+                    "managed Zotero attachment storage root is a symlink or reparse point"
+                )
+            candidate = attachment_root / relative_path
+            candidate_real = Path(os.path.realpath(candidate))
+            root_real = Path(os.path.realpath(attachment_root))
+            if not self._path_is_descendant(root_real, candidate_real):
+                raise ZoteroAttachmentResolutionError(
+                    "managed Zotero attachment path escapes its storage root"
+                )
+            current = candidate
+            while os.path.normcase(str(current)) != os.path.normcase(str(attachment_root)):
+                if is_reparse_path(current):
+                    raise ZoteroAttachmentResolutionError(
+                        "managed Zotero attachment path contains a symlink or reparse point"
+                    )
+                parent = current.parent
+                if parent == current:
+                    break
+                current = parent
+            return candidate_real if candidate.exists() else candidate
         if lowered.startswith("file://"):
-            raw = re.sub(r"^file://", "", raw, flags=re.IGNORECASE)
+            raw = unquote(re.sub(r"^file://", "", raw, flags=re.IGNORECASE))
         path = Path(raw)
         return path if path.is_absolute() else self.zotero_root / raw
 
@@ -187,9 +258,27 @@ class ZoteroAttachmentIndex:
             "FROM itemAttachments a JOIN items ai ON ai.itemID=a.itemID"
         ):
             raw = str(raw_path or "")
-            resolved = self._resolve_attachment_path(raw, str(attachment_key or ""))
-            exists = resolved.is_file()
-            normalized_path = str(resolved.resolve()) if exists else str(resolved)
+            source_type = "managed_storage" if self._is_managed_path(raw) and int(link_mode or 0) != 2 else "linked_file"
+            external_to_library = False
+            resolution_error = ""
+            fallback_resolved = Path(raw)
+            try:
+                resolved = self._resolve_attachment_path(
+                    raw,
+                    str(attachment_key or ""),
+                    int(link_mode or 0),
+                )
+                exists = resolved.is_file()
+                normalized_path = str(resolved.resolve()) if exists else str(resolved)
+                if source_type == "linked_file":
+                    external_to_library = not self._path_is_descendant(
+                        Path(os.path.realpath(self.zotero_root)),
+                        Path(os.path.realpath(resolved)),
+                    )
+            except (OSError, ZoteroAttachmentResolutionError) as exc:
+                exists = False
+                normalized_path = str(fallback_resolved)
+                resolution_error = f"{type(exc).__name__}: {exc}"
             attachments_by_parent[int(parent_id)].append(
                 ZoteroAttachmentRecord(
                     item_id=int(item_id),
@@ -202,6 +291,10 @@ class ZoteroAttachmentIndex:
                     exists=exists,
                     date_added=str(attachment_date_added or ""),
                     attachment_title=str(values.get(int(item_id), {}).get("title") or ""),
+                    attachment_source_type=source_type,
+                    external_to_library=external_to_library,
+                    resolution_error=resolution_error,
+                    canonical_resolved_path=normalized_path,
                 )
             )
 
@@ -294,4 +387,5 @@ __all__ = [
     "ZoteroAttachmentIndex",
     "ZoteroAttachmentRecord",
     "ZoteroParentRecord",
+    "ZoteroAttachmentResolutionError",
 ]
