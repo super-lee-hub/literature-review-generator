@@ -434,17 +434,17 @@ def test_provider_receipt_ledger_duplicate_identity_is_cross_process_safe(tmp_pa
         "payload=json.loads(open(sys.argv[2],encoding='utf-8').read());"
         "ProviderRuntimeLedger(sys.argv[1]).append(ProviderCallReceiptV1.from_dict(payload)); print('ok')"
     )
-    processes = [
-        subprocess.Popen(
+    outputs = [
+        subprocess.run(
             [sys.executable, "-c", child, str(target), str(payload_path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
+            timeout=15,
+            check=False,
         )
         for _ in range(2)
     ]
-    outputs = [process.communicate(timeout=15) for process in processes]
-    assert all(stdout.strip() == "ok" for stdout, _stderr in outputs)
+    assert all(result.returncode == 0 and result.stdout.strip() == "ok" for result in outputs)
     assert len(ProviderRuntimeLedger(target).list_receipts()) == 1
 
     divergent = receipt.to_dict()
