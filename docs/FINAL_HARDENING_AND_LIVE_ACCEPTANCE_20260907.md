@@ -10,7 +10,7 @@ PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
 FINAL_EXECUTABLE_SHA = 91be02e457dca05fd92723db717ea51fba69f5c1
 REMOTE_HEAD_AT_CODE_ACCEPTANCE = 556e4f197b154017b52a61f8d45874d72d816f47
-HOSTED_CI_RUN = NOT_RUN_FOR_CB35EC19
+HOSTED_CI_RUN = NOT_RUN_FOR_91BE02E4
 HOSTED_CI_CONCLUSION = NOT_RUN
 ```
 
@@ -65,7 +65,7 @@ was not merged; Hosted CI for this new executable SHA is still pending.
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
 | Remote head at final code push | `556e4f197b154017b52a61f8d45874d72d816f47` (unchanged) |
-| Hosted run | `NOT_RUN_FOR_CB35EC19` |
+| Hosted run | `NOT_RUN_FOR_91BE02E4` |
 | Hosted head SHA | `NOT_APPLICABLE` |
 | Hosted result | `NOT_RUN` |
 
