@@ -1,4 +1,4 @@
-# Final hardening and live acceptance — 2026-09-07
+# Final hardening and live acceptance — 2026-09-09
 
 ## Release decision
 
@@ -8,16 +8,48 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-PRODUCTION_RUNTIME_SHA = 02a58c9c005271b56a83bd828b3f896c8c2ce5be
-FINAL_EXECUTABLE_SHA = 02a58c9c005271b56a83bd828b3f896c8c2ce5be
-REMOTE_HEAD_AT_CODE_ACCEPTANCE = 02a58c9c005271b56a83bd828b3f896c8c2ce5be
-HOSTED_CI_RUN = 34221892316
+PRODUCTION_RUNTIME_SHA = 27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3
+FINAL_EXECUTABLE_SHA = 27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3
+REMOTE_HEAD_AT_CODE_ACCEPTANCE = 27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3
+HOSTED_CI_RUN = 34273557814
 HOSTED_CI_CONCLUSION = SUCCESS
 ```
 
 The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
 not merged. No live provider call, paid API call, Playwright acceptance run,
 heavy-OCR acceptance run, or real F1 corpus run was made in this round.
+
+## Pasted-audit follow-up
+
+This follow-up closes the remaining false-PASS and provenance gaps identified
+in the pasted audit. The executable code/test SHA is
+`27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`; any later report commit is
+documentation-only and is not substituted for that SHA.
+
+- Windows provider liveness now uses non-destructive process inspection and
+  persists PID creation identity plus host identity; it never uses
+  `os.kill(pid, 0)` on Windows.
+- `AcceptanceExecutionContextV1` binds the acceptance run ID, executable SHA,
+  absolute deadline, aggregate budget, budget state, evidence root, process
+  event log, and scenario state. State binding reconnects orphan reservation
+  reconciliation before resume.
+- Each specialized acceptance scenario now reopens and hash-checks its durable
+  inputs. A blocked runtime or role-only inventory cannot become READY, and the
+  verifier rejects evidence belonging to a different acceptance run before
+  semantic facts are considered.
+- Gate D derives modality profiles from source artifacts; Gate E requires typed
+  interruption/resume lineage and ledger deltas; Gate F compares every enabled
+  semantic role to the authoritative route plan; Gate H requires a controlled
+  defect challenge and repair/revalidation; Gate I requires typed localhost
+  Playwright evidence; Gate J requires typed OCR lineage; Gate K runs two real
+  independent Windows processes; Gate Q counts distinct paper identities.
+- Preprocess cache keys are interprocess-locked, pinned generations survive GC,
+  formal source leaves are snapshotted before Stage 1 authority publication,
+  and staging cleanup is exercised under independent subprocess concurrency.
+- Doctor stale-lock reporting probes lock contention instead of mtime alone;
+  Local RAG identity changes create a new immutable collection; legacy manual
+  diagnostics are outside pytest and network-disabled by default; the public
+  CLI smoke covers both `micro-probe` and `acceptance-run` help.
 
 ## Second hardening round
 
@@ -58,7 +90,7 @@ This code revision adds the following fail-closed boundaries:
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`. Hosted
-run `34221892316` completed successfully on that exact SHA. Any later
+run `34273557814` completed successfully on that exact SHA. Any later
 docs-only report commit is not used as executable validation evidence.
 
 ## Git, PR, and Hosted CI read-back
@@ -68,9 +100,9 @@ docs-only report commit is not used as executable validation evidence.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at exact code/CI acceptance | `02a58c9c005271b56a83bd828b3f896c8c2ce5be` |
-| Hosted run | [34221892316](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34221892316) |
-| Hosted head SHA | `02a58c9c005271b56a83bd828b3f896c8c2ce5be` |
+| Remote head at exact code/CI acceptance | `27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3` |
+| Hosted run | [34273557814](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34273557814) |
+| Hosted head SHA | `27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3` |
 | Hosted result | `SUCCESS` |
 
 The Hosted evidence is bound to the exact final executable SHA. The report
@@ -226,13 +258,13 @@ zero.
 ### Local exact-SHA checks
 
 The current executable acceptance SHA is
-`02a58c9c005271b56a83bd828b3f896c8c2ce5be`. The report-only update is a child
+`27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`. The report-only update is a child
 commit and does not change the executable source under test.
 
 | Check | Result | Scope |
 |---|---|---|
 | Focused hardening/provider/config/cache suite | `PASS` in split runs | Local Python 3.11 environment; optional symlink privilege remains the only skip |
-| New evidence-binding regressions and adjacent acceptance checks | `6 passed` | Local elevated split runs; includes producer-binding, test-only receipt, browser evidence, handwritten-fact, budget, and StagePlan checks |
+| New evidence/scenario-binding regressions and adjacent acceptance checks | `10 passed` | Local focused run; includes nine blocked-inventory scenario cases plus cross-acceptance-run evidence isolation |
 | Provider runtime regression file | `12 passed` | Local elevated run |
 | Changed-file focused Pyright | `0 errors, 0 warnings, 0 informations` | Local changed runtime and integration files |
 | `compileall` | PASS | Current runtime/services/preprocess/validation/outline/free-mode/scripts surface |
@@ -254,21 +286,18 @@ surface is therefore closed by the Hosted run below.
 
 ### Hosted exact-SHA checks
 
-Hosted run `34221892316` passed all five Windows matrix jobs on
-`02a58c9c005271b56a83bd828b3f896c8c2ce5be`. Each job passed installation,
+Hosted run `34273557814` passed all five Windows matrix jobs on
+`27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`. Each job passed installation,
 compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
-and committed-range whitespace checks. The strict-offline process summaries
-were:
+and committed-range whitespace checks. The exact job read-back was:
 
 ```text
-test (1) job 102046716901: 384 passed, 0 nonzero pytest exits
-test (2) job 102046717074: 526 passed, 0 nonzero pytest exits
-test (3) job 102046716669: 465 selected nodes completed, 0 nonzero pytest exits
-test (4) job 102046716970: 58 passed, 0 nonzero pytest exits
-test (5) job 102046717152: 5 passed, 0 nonzero pytest exits
-total: 1438 selected tests completed with zero nonzero pytest exits
-collection: 1461 total, 23 deselected by the offline marker policy
-release hardening: 23/23 nodes started, each returned ExitCode=0
+test (1) job 102220921452: SUCCESS
+test (2) job 102220921296: SUCCESS
+test (3) job 102220921367: SUCCESS
+test (4) job 102220921454: SUCCESS
+test (5) job 102220920936: SUCCESS
+all five matrix jobs returned zero workflow exit status
 ```
 
 The three base shards used deterministic file isolation; the release-hardening
@@ -281,7 +310,7 @@ acceptance evidence.
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `NOT_VERIFIED_LOCAL` | Hosted run `34221892316` passed on exact SHA `02a58c9c005271b56a83bd828b3f896c8c2ce5be`; the full local suite was not completed |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `NOT_VERIFIED_LOCAL` | Hosted run `34273557814` passed on exact SHA `27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`; the full local suite was not completed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
@@ -292,14 +321,15 @@ acceptance evidence.
 | H — Validator defect injection/repair/revalidation | `BLOCKED_CREDENTIALS` | No real Validator transport or real-review baseline; controlled offline contracts are not substituted |
 | I — GUI Playwright | `NOT_VERIFIED` | No real browser flow/evidence artifact in this round |
 | J — heavy OCR | `BLOCKED_CORPUS` | No approved scanned/OCR-poor acceptance PDF in the scoped checkout |
-| K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Exact-SHA Hosted matrix passed the selected cross-process queue/Registry/budget/lifecycle checks; no separate live release-acceptance manifest was produced |
+| K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Exact-SHA Hosted matrix passed the independent-process queue/Registry/budget/lifecycle checks; no separate live release-acceptance manifest was produced |
 | Q — F1 15-paper full chain | `BLOCKED_F1_SPEC` / `BLOCKED_F1_CORPUS` | No authoritative 15-paper binding; canonical Stage 1 artifacts `0/15`, downstream Outline/Review/Citation/DOCX/Validation not run |
 | R — negative production behavior | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_RELEASE_MANIFEST` | Typed config/auth/queue/path/cache/evidence/budget and false-PASS regressions passed in the exact-SHA selected suite; no separate release manifest |
 | S — secret/privacy scan | `NOT_VERIFIED` | No production secret was used or printed; a full release-scope history/privacy evidence manifest was not generated |
 | T — branch governance | `BLOCKED` / `OWNER_ACTION_REQUIRED` | `GET /branches/main/protection` returned HTTP 404 (`Branch not protected`); required checks/protection are not configured |
 
 No gate is marked PASS from an unrelated completed job, fixture transport,
-sentinel response, recorded response, or zero-call dry preflight.
+sentinel response, recorded response, role-only inventory, cross-run manifest,
+or zero-call dry preflight.
 
 ## Real-provider and F1 artifact counts
 
