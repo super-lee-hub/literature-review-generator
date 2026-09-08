@@ -576,6 +576,14 @@ class ProviderBudgetController:
                     return
                 self._load_state_unlocked()
                 self._reconcile_dead_reservations_unlocked()
+                receipt_ledgers = tuple(
+                    str(reservation.context.get("ledger_path") or "").strip()
+                    for reservation in self._reservations.values()
+                    if isinstance(reservation.context, Mapping)
+                    and str(reservation.context.get("ledger_path") or "").strip()
+                )
+                if receipt_ledgers:
+                    self._reconcile_orphaned_unlocked(receipt_ledgers)
                 self._persist_state_unlocked()
 
     @staticmethod

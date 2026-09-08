@@ -103,6 +103,9 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "stage1_visual_observations",
         "stage1_visual_coverage",
         "stage1_visual_evidence",
+        "document_modality_profile",
+        "ocr_diagnostics",
+        "ocr_artifact",
     }
 )
 
@@ -2191,6 +2194,117 @@ def _validate_stage1_visual_coverage_v2(record: Any, _path: str | Path, root: Ma
         )
 
 
+def _validate_document_modality_profile(
+    _record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    if (
+        root.get("artifact_type") != "document_modality_profile"
+        or root.get("artifact_version") != "v1"
+        or root.get("schema_version") != "document-modality-profile-v1"
+    ):
+        raise ArtifactSchemaError("document modality profile identity is invalid")
+    source_hash = str(root.get("source_pdf_sha256") or "")
+    if len(source_hash) != 64 or source_hash != source_hash.lower() or any(
+        char not in "0123456789abcdef" for char in source_hash
+    ):
+        raise ArtifactSchemaError("document modality profile source hash is invalid")
+    _require_fields(
+        root,
+        (
+            "total_page_count",
+            "text_page_ratio",
+            "image_page_ratio",
+            "table_count",
+            "figure_count",
+            "scanned_candidate_page_count",
+            "ocr_used_page_count",
+            "selected_visual_count",
+            "extractor_used",
+        ),
+        "document_modality_profile",
+    )
+    if type(root.get("total_page_count")) is not int or int(root.get("total_page_count") or 0) <= 0:
+        raise ArtifactSchemaError("document modality profile page count is invalid")
+    for field_name in (
+        "table_count",
+        "figure_count",
+        "scanned_candidate_page_count",
+        "ocr_used_page_count",
+        "selected_visual_count",
+    ):
+        if type(root.get(field_name)) is not int or int(root.get(field_name) or 0) < 0:
+            raise ArtifactSchemaError(f"document modality profile {field_name} is invalid")
+    for field_name in ("text_page_ratio", "image_page_ratio"):
+        value = root.get(field_name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+            raise ArtifactSchemaError(f"document modality profile {field_name} is invalid")
+    if not str(root.get("extractor_used") or "").strip():
+        raise ArtifactSchemaError("document modality profile extractor is missing")
+
+
+def _validate_ocr_diagnostics(
+    _record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    if (
+        root.get("artifact_type") != "ocr_diagnostics"
+        or root.get("artifact_version") != "v1"
+        or root.get("schema_version") != "ocr-diagnostics-v1"
+    ):
+        raise ArtifactSchemaError("OCR diagnostics identity is invalid")
+    source_hash = str(root.get("source_pdf_sha256") or "")
+    if len(source_hash) != 64 or source_hash != source_hash.lower() or any(
+        char not in "0123456789abcdef" for char in source_hash
+    ):
+        raise ArtifactSchemaError("OCR diagnostics source hash is invalid")
+    pages = root.get("page_numbers")
+    if not isinstance(pages, list) or any(
+        type(page) is not int or page <= 0 for page in pages
+    ):
+        raise ArtifactSchemaError("OCR diagnostics page identity is invalid")
+    if root.get("ocr_page_count") != len(pages):
+        raise ArtifactSchemaError("OCR diagnostics page count is invalid")
+    if not isinstance(root.get("output_artifact_hashes"), Mapping):
+        raise ArtifactSchemaError("OCR diagnostics output hashes are invalid")
+    if not str(root.get("ocr_engine") or "").strip() or not str(
+        root.get("ocr_engine_version") or ""
+    ).strip():
+        raise ArtifactSchemaError("OCR diagnostics engine identity is missing")
+
+
+def _validate_ocr_artifact(
+    _record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    if (
+        root.get("artifact_type") != "ocr_artifact"
+        or root.get("artifact_version") != "v1"
+        or root.get("schema_version") != "ocr-artifact-v1"
+    ):
+        raise ArtifactSchemaError("OCR artifact identity is invalid")
+    for field_name in (
+        "source_pdf_sha256",
+        "diagnostics_sha256",
+        "stage1_input_sha256",
+    ):
+        value = str(root.get(field_name) or "")
+        if len(value) != 64 or value != value.lower() or any(
+            char not in "0123456789abcdef" for char in value
+        ):
+            raise ArtifactSchemaError(f"OCR artifact {field_name} is invalid")
+    pages = root.get("page_numbers")
+    if not isinstance(pages, list) or any(
+        type(page) is not int or page <= 0 for page in pages
+    ):
+        raise ArtifactSchemaError("OCR artifact page identity is invalid")
+    if not isinstance(root.get("page_text_hashes"), Mapping):
+        raise ArtifactSchemaError("OCR artifact page hashes are invalid")
+
+
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     version = str(getattr(record, "artifact_version", "") or "")
@@ -2240,7 +2354,10 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
             ("stage1_visual_observations", "v2"): _validate_stage1_visual_observations_v2,
             ("stage1_visual_coverage", "v1"): _validate_stage1_visual_coverage,
             ("stage1_visual_coverage", "v2"): _validate_stage1_visual_coverage_v2,
-            ("stage1_visual_evidence", "v3"): _validate_stage1_visual_evidence_v3,
+        ("stage1_visual_evidence", "v3"): _validate_stage1_visual_evidence_v3,
+        ("document_modality_profile", "v1"): _validate_document_modality_profile,
+        ("ocr_diagnostics", "v1"): _validate_ocr_diagnostics,
+        ("ocr_artifact", "v1"): _validate_ocr_artifact,
         }
     validator = validators.get((artifact_type, version))
     if validator is None:

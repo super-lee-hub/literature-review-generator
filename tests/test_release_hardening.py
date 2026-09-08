@@ -18,6 +18,7 @@ from runtime.job_spec import RuntimeJobSpec
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
     ProviderAggregateBudgetV1,
+    ProviderCallReceiptV1,
     ProviderBudgetExceeded,
     ProviderBudgetController,
     ProviderRuntime,
@@ -776,6 +777,69 @@ def test_aggregate_provider_budget_state_survives_process_boundary(tmp_path: Pat
         )
 
 
+
+
+def test_bind_state_path_reconciles_started_orphan_from_exact_receipt_ledger(tmp_path: Path) -> None:
+    budget = ProviderAggregateBudgetV1(
+        max_provider_calls_total=2,
+        max_output_tokens_total=4,
+        max_retry_attempts_total=1,
+        max_wall_seconds=60,
+    )
+    state_path = tmp_path / "budget-state.json"
+    ledger_path = tmp_path / "provider-receipts.jsonl"
+    controller = ProviderBudgetController(budget)
+    controller.bind_state_path(state_path)
+    runtime = ProviderRuntime(
+        aggregate_budget=controller,
+        ledger=ProviderRuntimeLedger(ledger_path),
+        job_id="job-orphan",
+        attempt_id="attempt-orphan",
+        stage_name="stage-orphan",
+        route="route-orphan",
+        node_id="node-orphan",
+        call_id="call-orphan",
+        endpoint_type="chat_completions",
+        test_only=True,
+    )
+    admission = runtime.admit(requested_output_tokens=1)
+    runtime.mark_transport_started(admission)
+    reservation_id = admission.aggregate_reservation_id
+    assert reservation_id
+    receipt = ProviderCallReceiptV1.from_result(
+        admission=admission,
+        job_id="job-orphan",
+        attempt_id="attempt-orphan",
+        stage_name="stage-orphan",
+        route="route-orphan",
+        provider="offline",
+        model="offline",
+        endpoint="https://offline.invalid",
+        prompt_hash="a" * 64,
+        input_hash="b" * 64,
+        config_hash="c" * 64,
+        schema_hash="d" * 64,
+        result={"status": "success", "content": {}, "output_tokens": 1},
+        budget=__import__("runtime.provider_runtime", fromlist=["ProviderBudgetV1"]).ProviderBudgetV1(),
+        started_at="2026-01-01T00:00:00Z",
+        metadata={"aggregate_reservation_id": reservation_id},
+        node_id="node-orphan",
+        call_id="call-orphan",
+        closure_epoch_id="epoch-orphan",
+        endpoint_type="chat_completions",
+        test_only=True,
+    )
+    ProviderRuntimeLedger(ledger_path).append(receipt)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["reservations"][0]["owner_pid"] = 999999999
+    state["reservations"][0]["owner_process_creation_time"] = 0.0
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    recovered = ProviderBudgetController(budget)
+    recovered.bind_state_path(state_path)
+
+    assert recovered.snapshot()["calls_used"] == 1
+    assert recovered.snapshot()["calls_reserved"] == 0
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires the Windows process API")

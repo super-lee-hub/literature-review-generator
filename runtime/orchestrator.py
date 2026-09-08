@@ -1037,6 +1037,19 @@ class InternalStageExecutorRegistry:
                 session=session, role=role, section_name=section
             ),
         )
+        reachable_route_plan_payload = reachable_route_plan.to_dict()
+        for route_payload in reachable_route_plan_payload.get("routes", []):
+            if not isinstance(route_payload, dict):
+                continue
+            role = str(route_payload.get("semantic_role") or "").strip()
+            if not role:
+                continue
+            try:
+                route_payload["route_fingerprint"] = provider_router.route_for(
+                    role
+                ).safe_config_fingerprint()
+            except (KeyError, TypeError, AttributeError):
+                route_payload["route_fingerprint"] = ""
         for diagnostic in provider_router.diagnostics:
             session.stage_host.logger.warning("outline routing: %s", diagnostic)
         stability = settings.outline_stability_settings()
@@ -1060,7 +1073,7 @@ class InternalStageExecutorRegistry:
             provider_profile=profile,
             provider_router=provider_router,
             enabled_semantic_roles=reachable_route_plan.semantic_roles,
-            reachable_provider_route_plan=reachable_route_plan.to_dict(),
+            reachable_provider_route_plan=reachable_route_plan_payload,
             candidate_count=settings.outline_candidate_count(),
             quality_gate=settings.outline_quality_gate(),
             review_intent=free_mode_review_intent,

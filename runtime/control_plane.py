@@ -830,7 +830,7 @@ class ReviewControlPlane:
             )
             scenario_results[str(gate)] = scenario_result
             scenario_refs[str(gate)] = scenario_result.evidence_refs
-        if refs:
+        if any(scenario_refs.values()):
             producer = GateEvidenceProducer(final_sha=current_sha)
             producer.write_manifest(
                 evidence_path,

@@ -2042,6 +2042,7 @@ class GateEvidenceVerifier:
             final_json_refs = lock_payload.get("final_json_refs")
             if not isinstance(final_json_refs, list) or not final_json_refs:
                 return {}, "contention result requires final JSON references"
+            parsed_final: dict[str, Any] = {}
             for item in final_json_refs:
                 if not isinstance(item, Mapping):
                     return {}, "contention final JSON reference is invalid"
@@ -2055,7 +2056,7 @@ class GateEvidenceVerifier:
                     final_raw = _bounded_read(final_path, max_bytes=self.max_bytes)
                     if len(final_raw) != raw_size or hashlib.sha256(final_raw).hexdigest() != expected_hash:
                         return {}, "contention final JSON reference hash or size mismatch"
-                    self._json_payload(final_raw, final_path)
+                    parsed_final[final_path.name.casefold()] = self._json_payload(final_raw, final_path)
                 except (OSError, UnicodeError, ValueError, json.JSONDecodeError, ReleaseAcceptanceSpecError) as exc:
                     return {}, f"contention final JSON is corrupt or unreadable: {type(exc).__name__}"
             budget = lock_payload.get("budget")
@@ -2076,6 +2077,72 @@ class GateEvidenceVerifier:
                 return {}, "contention budget derivation is invalid"
             if limit > 0 and (used < 0 or reserved < 0 or used + reserved > limit):
                 return {}, "contention budget derivation proves an overshoot"
+            budget_files = [
+                value for name, value in parsed_final.items()
+                if "budget" in name and isinstance(value, Mapping)
+            ]
+            if not budget_files:
+                return {}, "contention final references lack a parsed budget state"
+            budget_state = budget_files[0]
+            budget_payload = budget_state.get("budget")
+            if not isinstance(budget_payload, Mapping):
+                return {}, "contention final budget state lacks its budget object"
+            try:
+                state_limit = int(str(budget_payload.get("max_provider_calls_total") or 0))
+                state_used = int(str(budget_state.get("calls_used") or 0))
+                state_reserved = int(str(budget_state.get("calls_reserved") or 0))
+            except (TypeError, ValueError):
+                return {}, "contention final budget state counters are invalid"
+            if (state_limit, state_used, state_reserved) != (limit, used, reserved):
+                return {}, "contention result budget does not match the reopened budget state"
+            ledger_files = [
+                value for name, value in parsed_final.items()
+                if "receipt" in name and isinstance(value, list)
+            ]
+            if not ledger_files:
+                return {}, "contention final references lack a parsed provider ledger"
+            ledger_receipt_rows = [row for row in ledger_files[0] if isinstance(row, Mapping)]
+            actual_receipt_ids = [str(row.get("receipt_id") or "") for row in ledger_receipt_rows]
+            if any(not receipt_id for receipt_id in actual_receipt_ids):
+                return {}, "contention provider ledger has a missing receipt ID"
+            actual_duplicate_receipts = len(actual_receipt_ids) - len(set(actual_receipt_ids))
+            if actual_duplicate_receipts != 0:
+                return {}, "contention provider ledger contains duplicate receipt IDs"
+            registry_files = [
+                value for name, value in parsed_final.items()
+                if "registry" in name and isinstance(value, Mapping)
+            ]
+            if not registry_files:
+                return {}, "contention final references lack a parsed Registry"
+            registry_state = registry_files[0]
+            registry_artifacts = registry_state.get("artifacts")
+            if not isinstance(registry_artifacts, list):
+                return {}, "contention Registry artifacts are not an array"
+            registry_ids = [
+                str(item.get("artifact_id") or "")
+                for item in registry_artifacts
+                if isinstance(item, Mapping)
+            ]
+            if any(not item for item in registry_ids) or len(registry_ids) != len(set(registry_ids)):
+                return {}, "contention Registry artifact IDs are missing or duplicated"
+            if set(registry_ids) != set(str(item) for item in registry_map.get("artifact_ids") or []):
+                return {}, "contention Registry derivation does not match its reopened records"
+            queue_files = [
+                value for name, value in parsed_final.items()
+                if name == "queue.json" and isinstance(value, Mapping)
+            ]
+            if not queue_files:
+                return {}, "contention final references lack a parsed queue"
+            queue_state = queue_files[0]
+            queue_jobs = queue_state.get("jobs")
+            queue_runtimes = queue_state.get("runtimes")
+            if not isinstance(queue_jobs, Mapping) or not isinstance(queue_runtimes, Mapping):
+                return {}, "contention queue state is missing jobs or runtimes"
+            queue_job_ids = {str(item) for item in queue_jobs}
+            runtime_ids = {str(item) for item in queue_runtimes}
+            expected_worker_jobs = set(str(item) for item in queue_map.get("worker_job_ids") or [])
+            if not expected_worker_jobs or not expected_worker_jobs.issubset(queue_job_ids) or not expected_worker_jobs.issubset(runtime_ids):
+                return {}, "contention queue derivation does not contain every worker job"
             if (
                 ledger_map.get("duplicate_receipt_ids") != []
                 or ledger_map.get("conflicts") != []
@@ -2225,6 +2292,7 @@ class GateEvidenceVerifier:
                 expected_endpoint = str(route.get("endpoint_type") or "").strip()
                 expected_host = str(route.get("api_base_host") or "").strip().casefold()
                 expected_section = str(route.get("section") or "").strip()
+                expected_fingerprint = str(route.get("route_fingerprint") or "").strip()
                 for row in candidates:
                     raw_metadata = row.get("metadata")
                     metadata = cast(Mapping[str, Any], raw_metadata) if isinstance(raw_metadata, Mapping) else {}
@@ -2234,7 +2302,10 @@ class GateEvidenceVerifier:
                     try:
                         from urllib.parse import urlsplit
 
-                        actual_host = (urlsplit(actual_host).hostname or "").casefold()
+                        parsed_host = urlsplit(actual_host)
+                        actual_host = (parsed_host.hostname or "").casefold()
+                        if parsed_host.port:
+                            actual_host = f"{actual_host}:{parsed_host.port}"
                     except ValueError:
                         actual_host = ""
                     if (
@@ -2244,6 +2315,11 @@ class GateEvidenceVerifier:
                         or (expected_host and actual_host != expected_host)
                         or str(metadata.get("config_section") or "") != expected_section
                         or not str(metadata.get("route_fingerprint") or "").strip()
+                        or (
+                            expected_fingerprint
+                            and str(metadata.get("route_fingerprint") or "")
+                            != expected_fingerprint
+                        )
                     ):
                         mismatches.append(f"identity:{role}")
             if mismatches:
@@ -2507,7 +2583,13 @@ class GateEvidenceVerifier:
             for ref in by_role.get("citation_manifest", []):
                 payload = payloads.get(ref.ref_id)
                 if isinstance(payload, Mapping):
-                    entries = payload.get("citations") or payload.get("references") or payload.get("items")
+                    entries = (
+                        payload.get("citations")
+                        or payload.get("references")
+                        or payload.get("items")
+                        or payload.get("paper_entries")
+                        or payload.get("bibliography")
+                    )
                     citation_complete = isinstance(entries, list) and bool(entries)
             validation_complete = False
             for ref in by_role.get("validation_artifact", []):
