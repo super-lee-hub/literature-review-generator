@@ -34,6 +34,8 @@ from runtime.release_acceptance import (
     GateKScenario,
     ReleaseAcceptanceSpec,
     ReleaseAcceptanceSpecError,
+    gate_evidence_roles,
+    scenario_for_gate,
     validate_gate_evidence,
 )
 from runtime.provider_routes import build_reachable_provider_route_plan
@@ -278,6 +280,24 @@ def test_acceptance_does_not_trust_handwritten_gate_facts() -> None:
     )
     assert result["status"] == "NOT_VERIFIED"
     assert "durable" in str(result["reason"]).lower()
+
+
+def test_gate_evidence_verifier_rejects_evidence_from_another_acceptance_run() -> None:
+    evidence = GateEvidenceProducer(final_sha="a" * 40).build_gate(
+        "C",
+        [],
+        acceptance_run_id="old-acceptance-run",
+    )
+
+    result = GateEvidenceVerifier().verify(
+        "C",
+        evidence,
+        expected_final_sha="a" * 40,
+        expected_acceptance_run_id="current-acceptance-run",
+    )
+
+    assert result["status"] == "NOT_VERIFIED"
+    assert "different acceptance run" in str(result["reason"])
 
 
 def test_gate_evidence_verifier_rejects_unbound_metadata_even_with_durable_refs(tmp_path: Path) -> None:
@@ -848,6 +868,35 @@ def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_p
     state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     assert state["schema_version"] == "release-acceptance-run-state-v1"
     assert state["final_sha"]
+
+
+@pytest.mark.parametrize("gate", ("C", "D", "E", "F", "G", "H", "I", "J", "Q"))
+def test_acceptance_scenarios_do_not_ready_from_inventory_when_execution_is_blocked(
+    gate: str,
+) -> None:
+    context = AcceptanceScenarioContextV1(
+        acceptance_run_id="acceptance-scenario-boundary",
+        final_executable_sha="a" * 40,
+        runtime_spec_path="",
+        workspace_path="",
+        job_id="job-scenario-boundary",
+        evidence_root="",
+        process_event_log="",
+        owner_authorized=False,
+    )
+    inventory = [{"role": role} for role in gate_evidence_roles(gate)]
+
+    result = scenario_for_gate(gate).execute(
+        context,
+        inventory,
+        runtime_result={
+            "status": "BLOCKED_AUTHORIZATION",
+            "reason": "fixture deliberately did not execute the scenario",
+        },
+    )
+
+    assert result.status == "BLOCKED_SCENARIO_EXECUTION"
+    assert "did not complete" in result.reason
 
 
 def test_release_acceptance_budget_schema_rejects_typos() -> None:

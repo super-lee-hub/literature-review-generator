@@ -476,6 +476,54 @@ class AcceptanceScenario:
     """One gate-specific evidence boundary; never fabricates facts."""
 
     gate = ""
+    scenario_action = "execute the dedicated acceptance scenario"
+
+    @staticmethod
+    def _runtime_blocked(runtime_result: Mapping[str, Any] | None) -> bool:
+        if not isinstance(runtime_result, Mapping):
+            return False
+        status = str(runtime_result.get("status") or "").strip().casefold()
+        completion_status = str(runtime_result.get("completion_status") or "").strip().casefold()
+        return (
+            status.startswith("blocked")
+            or status in {"failed", "incomplete"}
+            or completion_status in {"blocked", "failed", "incomplete"}
+        )
+
+    def _blocked_execution(self, reason: str) -> AcceptanceScenarioResultV1:
+        return AcceptanceScenarioResultV1(
+            gate=self.gate,
+            scenario_id=self.gate,
+            status="BLOCKED_SCENARIO_EXECUTION",
+            reason=reason,
+        )
+
+    def _durable_refs(
+        self,
+        refs: Iterable[Mapping[str, Any]],
+    ) -> tuple[tuple[Mapping[str, Any], ...], str | None]:
+        """Accept only reopened, content-addressed inputs for this scenario.
+
+        A role inventory is not execution evidence.  Parsing and reopening each
+        selected reference here prevents a scenario from becoming READY merely
+        because a caller supplied the expected role names.
+        """
+
+        allowed = gate_evidence_roles(self.gate)
+        selected: list[Mapping[str, Any]] = []
+        for raw_ref in refs:
+            if not isinstance(raw_ref, Mapping) or str(raw_ref.get("role") or "") not in allowed:
+                continue
+            try:
+                ref = DurableEvidenceRefV1.from_mapping(raw_ref)
+                target = Path(ref.path).expanduser().resolve()
+                raw = _bounded_read(target, max_bytes=_MAX_EVIDENCE_BYTES)
+            except (OSError, ReleaseAcceptanceSpecError, TypeError, ValueError) as exc:
+                return (), f"{self.gate} scenario evidence reference is not durable: {type(exc).__name__}"
+            if len(raw) != ref.size or hashlib.sha256(raw).hexdigest() != ref.sha256:
+                return (), f"{self.gate} scenario evidence reference hash or size is stale: {ref.ref_id}"
+            selected.append(ref.to_dict())
+        return tuple(selected), None
 
     def execute(
         self,
@@ -486,7 +534,17 @@ class AcceptanceScenario:
     ) -> AcceptanceScenarioResultV1:
         """Run the scenario boundary and return only durable evidence refs."""
 
-        return self.collect(context, refs, runtime_result=runtime_result)
+        # A blocked production runtime is never converted into a ready gate by
+        # reusing a role inventory or an old manifest.  K is the sole offline
+        # scenario and owns its independent-process executor below.
+        if self.gate != "K" and self._runtime_blocked(runtime_result):
+            return self._blocked_execution(
+                f"{self.gate} scenario did not complete its dedicated action: {self.scenario_action}"
+            )
+        durable_refs, error = self._durable_refs(refs)
+        if error:
+            return self._blocked_execution(error)
+        return self.collect(context, durable_refs, runtime_result=runtime_result)
 
     def collect(
         self,
@@ -495,9 +553,12 @@ class AcceptanceScenario:
         *,
         runtime_result: Mapping[str, Any] | None,
     ) -> AcceptanceScenarioResultV1:
+        durable_refs, durable_error = self._durable_refs(refs)
+        if durable_error:
+            return self._blocked_execution(durable_error)
         allowed = gate_evidence_roles(self.gate)
         selected = tuple(
-            ref for ref in refs if str(ref.get("role") or "") in allowed
+            ref for ref in durable_refs if str(ref.get("role") or "") in allowed
         )
         present = {str(ref.get("role") or "") for ref in selected}
         missing = sorted(allowed - present)
@@ -523,22 +584,27 @@ class AcceptanceScenario:
 
 class GateCScenario(AcceptanceScenario):
     gate = "C"
+    scenario_action = "run one real F1 paper through the production control plane"
 
 
 class GateDScenario(AcceptanceScenario):
     gate = "D"
+    scenario_action = "run three approved heterogeneous PDFs through the production control plane"
 
 
 class GateEScenario(AcceptanceScenario):
     gate = "E"
+    scenario_action = "terminate and resume at a durable process boundary"
 
 
 class GateFScenario(AcceptanceScenario):
     gate = "F"
+    scenario_action = "execute Outline v3 for every enabled semantic role"
 
 
 class GateGScenario(AcceptanceScenario):
     gate = "G"
+    scenario_action = "execute Free Mode through its isolated provider route"
 
     def collect(
         self,
@@ -614,18 +680,22 @@ class GateGScenario(AcceptanceScenario):
 
 class GateHScenario(AcceptanceScenario):
     gate = "H"
+    scenario_action = "inject, detect, repair, and revalidate one controlled defect"
 
 
 class GateIScenario(AcceptanceScenario):
     gate = "I"
+    scenario_action = "execute the documented Playwright flow against localhost"
 
 
 class GateJScenario(AcceptanceScenario):
     gate = "J"
+    scenario_action = "run the heavy OCR path and consume its lineage in Stage 1"
 
 
 class GateKScenario(AcceptanceScenario):
     gate = "K"
+    scenario_action = "run two independent Windows/Python contention workers"
 
     def collect(
         self,
@@ -885,6 +955,7 @@ class GateKScenario(AcceptanceScenario):
 
 class GateQScenario(AcceptanceScenario):
     gate = "Q"
+    scenario_action = "run the complete bound fifteen-paper F1 chain"
 
 
 class GenericAcceptanceScenario(AcceptanceScenario):
@@ -2616,6 +2687,7 @@ class GateEvidenceVerifier:
         evidence: Mapping[str, Any] | None,
         *,
         expected_final_sha: str = "",
+        expected_acceptance_run_id: str = "",
         origin_dir: str | Path | None = None,
         expected_job_id: str = "",
     ) -> dict[str, Any]:
@@ -2645,6 +2717,15 @@ class GateEvidenceVerifier:
             return {
                 "status": "FAIL",
                 "reason": "gate evidence is bound to a different gate",
+                "contract": contract,
+            }
+        evidence_run_id = str(evidence.get("acceptance_run_id") or "").strip()
+        if expected_acceptance_run_id and evidence_run_id != str(expected_acceptance_run_id):
+            return {
+                "status": "NOT_VERIFIED",
+                "reason": "gate evidence belongs to a different acceptance run",
+                "evidence_acceptance_run_id": evidence_run_id,
+                "expected_acceptance_run_id": str(expected_acceptance_run_id),
                 "contract": contract,
             }
         if str(evidence.get("scenario_id") or "").strip() != str(gate):
@@ -3048,6 +3129,7 @@ def validate_gate_evidence(
     evidence: Mapping[str, Any] | None,
     *,
     expected_final_sha: str = "",
+    expected_acceptance_run_id: str = "",
     origin_dir: str | Path | None = None,
     expected_job_id: str = "",
 ) -> dict[str, Any]:
@@ -3057,6 +3139,7 @@ def validate_gate_evidence(
         gate,
         evidence,
         expected_final_sha=expected_final_sha,
+        expected_acceptance_run_id=expected_acceptance_run_id,
         origin_dir=origin_dir,
         expected_job_id=expected_job_id,
     )

@@ -856,6 +856,19 @@ class ReviewControlPlane:
             except (OSError, UnicodeError, json.JSONDecodeError):
                 evidence_payload = None
         for gate in gates:
+            scenario_result = scenario_results[str(gate)]
+            if scenario_result.status != "READY_FOR_SEMANTIC_VERIFICATION":
+                # Do not let a durable manifest from an earlier attempt turn a
+                # currently unexecuted or malformed scenario into PASS.  The
+                # scenario boundary is authoritative for this acceptance call;
+                # the verifier is only reached after that boundary succeeds.
+                verified_gates[str(gate)] = {
+                    "status": "NOT_VERIFIED",
+                    "reason": scenario_result.reason,
+                    "contract": gate_contract(str(gate)),
+                    "scenario": scenario_result.to_dict(),
+                }
+                continue
             gate_evidence = (
                 evidence_payload.get("gates", {}).get(gate)
                 if isinstance(evidence_payload, Mapping)
@@ -866,12 +879,13 @@ class ReviewControlPlane:
                 str(gate),
                 gate_evidence if isinstance(gate_evidence, Mapping) else None,
                 expected_final_sha=current_sha,
+                expected_acceptance_run_id=state.run_id,
                 origin_dir=evidence_path.parent,
                 expected_job_id=job_id,
             )
             verified_gates[str(gate)] = {
                 **verified_gates[str(gate)],
-                "scenario": scenario_results[str(gate)].to_dict(),
+                "scenario": scenario_result.to_dict(),
             }
             if verified_gates[str(gate)].get("status") == "PASS":
                 continue
