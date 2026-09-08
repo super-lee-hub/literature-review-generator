@@ -152,8 +152,25 @@ class ReleaseAcceptanceSpec:
         if not isinstance(payload, Mapping):
             raise ReleaseAcceptanceSpecError("release acceptance spec must be a JSON object")
         _reject_unknown(payload, _ACCEPTANCE_FIELDS, "release acceptance spec")
-        raw_budget = payload.get("budget", payload.get("acceptance_budget", {}))
-        budget = ReleaseAcceptanceBudget.from_mapping(raw_budget, defaults=defaults)
+        budget_values: list[ReleaseAcceptanceBudget] = []
+        for budget_field in ("budget", "acceptance_budget"):
+            if budget_field not in payload:
+                continue
+            raw_budget = payload[budget_field]
+            if not isinstance(raw_budget, Mapping):
+                raise ReleaseAcceptanceSpecError(
+                    f"{budget_field} must be a JSON object"
+                )
+            budget_values.append(
+                ReleaseAcceptanceBudget.from_mapping(raw_budget, defaults=defaults)
+            )
+        if len(budget_values) == 2 and budget_values[0] != budget_values[1]:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance budget aliases disagree"
+            )
+        budget = budget_values[0] if budget_values else ReleaseAcceptanceBudget.from_mapping(
+            {}, defaults=defaults
+        )
         evidence = payload.get("evidence_manifest", "")
         if evidence is None:
             evidence = ""

@@ -340,6 +340,16 @@ def test_release_acceptance_budget_schema_rejects_typos() -> None:
         )
 
 
+def test_release_acceptance_spec_rejects_conflicting_budget_aliases() -> None:
+    with pytest.raises(ReleaseAcceptanceSpecError, match="budget aliases"):
+        ReleaseAcceptanceSpec.from_mapping(
+            {
+                "budget": {"max_provider_calls_total": 1},
+                "acceptance_budget": {"max_provider_calls_total": 2},
+            }
+        )
+
+
 def test_aggregate_provider_budget_is_shared_and_reserves_transport_attempts() -> None:
     controller = ProviderBudgetController(
         ProviderAggregateBudgetV1(
