@@ -2927,6 +2927,11 @@ class GateEvidenceVerifier:
                     "review_docx_repaired",
                     "validation_run_result",
                     "validation_run_result_repaired",
+                    "paper_artifact",
+                    "evidence_manifest",
+                    "ocr_diagnostics",
+                    "ocr_artifact",
+                    "citation_manifest",
                 }
                 for record in registry_object.list_records():
                     if record.status != "ready" or record.artifact_type not in critical_types:
