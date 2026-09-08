@@ -48,12 +48,25 @@ def test_docs_root_contains_only_index_file_and_directories() -> None:
 
 
 def test_test_temp_is_not_tracked() -> None:
-    tracked = subprocess.check_output(
-        ["git", "ls-files", "test_temp"],
+    completed = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "maintenance.auto=false",
+            "ls-files",
+            "--",
+            "test_temp",
+        ],
         cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
         text=True,
-    ).splitlines()
-    assert tracked == []
+        check=True,
+        timeout=15,
+    )
+    assert completed.stdout.splitlines() == []
 
 
 def test_root_readme_and_agents_links_resolve() -> None:
