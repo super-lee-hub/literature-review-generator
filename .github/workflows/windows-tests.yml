@@ -91,11 +91,7 @@ jobs:
                     "test_runtime_lifecycle_parity.py",
                     "test_gui_playwright.py",
                     "test_deepseek_vision_smoke.py",
-                    "test_api_connection.py",
-                    "test_report_generator.py",
-                    "test_runtime_bridge_helpers.py",
-                    "test_validator_diagnostics.py",
-                    "test_writer_api.py"
+                    "test_runtime_bridge_helpers.py"
                   ))
                 ) {
                   $allTestFiles[$index].FullName

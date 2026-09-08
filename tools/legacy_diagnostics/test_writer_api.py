@@ -4,6 +4,7 @@
 Writer_API连接测试脚本
 """
 
+import argparse
 import requests
 import time
 import configparser
@@ -15,7 +16,7 @@ def load_config() -> configparser.ConfigParser:
     config.read('config.ini', encoding='utf-8')
     return config
 
-def check_writer_api():
+def check_writer_api(*, allow_network: bool = False):
     """测试Writer_API连接"""
     print("测试Writer_API连接...")
     
@@ -33,6 +34,9 @@ def check_writer_api():
     
     if not all([api_key, model, api_base]):
         print("错误: Writer_API配置不完整")
+        return False
+    if not allow_network:
+        print("网络诊断默认关闭；使用 --allow-network 才会发送请求")
         return False
     
     # 构建请求
@@ -99,7 +103,7 @@ def check_writer_api():
         print(f"未知错误: {e}")
         return False
 
-def check_with_different_models() -> Optional[str]:
+def check_with_different_models(*, allow_network: bool = False) -> Optional[str]:
     """测试不同的模型名称"""
     print("\n测试不同的模型名称...")
     
@@ -111,6 +115,9 @@ def check_with_different_models() -> Optional[str]:
     if not api_key:
         print("错误: 没有API密钥")
         return
+    if not allow_network:
+        print("网络诊断默认关闭；使用 --allow-network 才会发送请求")
+        return None
     
     # 可能的Gemini模型名称
     possible_models = [
@@ -165,7 +172,7 @@ def check_with_different_models() -> Optional[str]:
     
     return None
 
-def check_api_base():
+def check_api_base(*, allow_network: bool = False):
     """检查API地址是否有效"""
     print("\n检查API地址...")
     
@@ -175,6 +182,9 @@ def check_api_base():
     
     if not api_base:
         print("错误: 没有API地址")
+        return
+    if not allow_network:
+        print("网络诊断默认关闭；使用 --allow-network 才会发送请求")
         return
     
     # 常见的Gemini API地址
@@ -195,23 +205,26 @@ def check_api_base():
 
 def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description="Legacy Writer API diagnostic; network is disabled by default.")
+    parser.add_argument("--allow-network", action="store_true")
+    args = parser.parse_args()
     print("Writer_API连接诊断工具")
     print("=" * 60)
     
     # 1. 测试当前配置
     print("\n1. 测试当前配置:")
-    success = check_writer_api()
+    success = check_writer_api(allow_network=args.allow_network)
     
     if not success:
         print("\n2. 尝试不同的模型名称:")
-        working_model = check_with_different_models()
+        working_model = check_with_different_models(allow_network=args.allow_network)
         
         if working_model:
             print(f"\n找到可用的模型: {working_model}")
             print("建议更新config.ini中的model设置")
     
     print("\n3. 检查API地址:")
-    check_api_base()
+    check_api_base(allow_network=args.allow_network)
     
     print("\n" + "=" * 60)
     print("诊断完成")
