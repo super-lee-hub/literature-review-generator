@@ -646,6 +646,194 @@ def test_gate_e_rejects_filename_only_interruption_and_resume_files(tmp_path: Pa
     assert "interruption" in str(result["reason"]).lower()
 
 
+def test_gate_d_rejects_self_declared_modalities_without_three_derived_profiles(tmp_path: Path) -> None:
+    sources = []
+    profiles = []
+    for index in range(3):
+        source = tmp_path / f"source-{index}.pdf"
+        source.write_bytes(b"%PDF-1.4\nsynthetic source\n")
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        sources.append(source)
+        profile = tmp_path / f"profile-{index}.json"
+        profile.write_text(
+            json.dumps(
+                {
+                    "artifact_type": "document_modality_profile",
+                    "artifact_version": "v1",
+                    "schema_version": "document-modality-profile-v1",
+                    "source_pdf_sha256": source_hash,
+                    "total_page_count": 10,
+                    "text_page_ratio": 1.0,
+                    "image_page_ratio": 0.0,
+                    "table_count": 0,
+                    "figure_count": 0,
+                    "scanned_candidate_page_count": 0,
+                    "ocr_used_page_count": 0,
+                    "selected_visual_count": 0,
+                    "extractor_used": "self-declared",
+                }
+            ),
+            encoding="utf-8",
+        )
+        profiles.append(profile)
+    canonical = tmp_path / "canonical.json"
+    terminal = tmp_path / "terminal.json"
+    registry = tmp_path / "registry.json"
+    ledger = tmp_path / "ledger.jsonl"
+    closure = tmp_path / "closure.json"
+    canonical.write_text(json.dumps({"summaries": []}), encoding="utf-8")
+    terminal.write_text(json.dumps({"artifact_type": "runtime_stage_terminal", "status": "complete"}), encoding="utf-8")
+    registry.write_text(json.dumps({"artifact_registry_version": "v2", "job_id": "job-d", "artifacts": []}), encoding="utf-8")
+    ledger.write_text("", encoding="utf-8")
+    closure.write_text(json.dumps({"artifact_type": "provider_receipt_closure", "status": "complete"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="7" * 40)
+    refs = [
+        *[
+            producer.reference(source, role="source_pdf", artifact_type="source_pdf")
+            for source in sources
+        ],
+        *[
+            producer.reference(
+                profile,
+                role="modality_profile",
+                artifact_type="document_modality_profile",
+                artifact_version="v1",
+                schema_version="document-modality-profile-v1",
+            )
+            for profile in profiles
+        ],
+        producer.reference(canonical, role="canonical_stage1", artifact_type="summary_file"),
+        producer.reference(terminal, role="stage_terminal", artifact_type="runtime_stage_terminal"),
+        producer.reference(registry, role="registry"),
+        producer.reference(ledger, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger"),
+        producer.reference(closure, role="closure", artifact_type="provider_receipt_closure"),
+    ]
+
+    result = GateEvidenceVerifier().verify(
+        "D",
+        producer.build_gate("D", refs),
+        expected_final_sha="7" * 40,
+    )
+
+    assert result["status"] != "PASS"
+    assert "derived profiles" in str(result["reason"])
+
+
+def test_gate_h_rejects_generic_validation_findings_without_challenge_lineage(tmp_path: Path) -> None:
+    challenge = tmp_path / "defect_artifact.json"
+    validation = tmp_path / "validation.json"
+    repair = tmp_path / "repair.json"
+    ledger = tmp_path / "ledger.jsonl"
+    challenge.write_text(json.dumps({"findings": ["generic"]}), encoding="utf-8")
+    validation.write_text(json.dumps({"status": "completed", "findings": ["generic"]}), encoding="utf-8")
+    repair.write_text(json.dumps({"status": "completed", "findings": ["generic"]}), encoding="utf-8")
+    ledger.write_text("", encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="8" * 40)
+    evidence = producer.build_gate(
+        "H",
+        [
+            producer.reference(challenge, role="defect_artifact", artifact_type="validation_report_projection"),
+            producer.reference(validation, role="validation_artifact", artifact_type="validation_run_result"),
+            producer.reference(repair, role="repair_artifact", artifact_type="repair_transaction"),
+            producer.reference(ledger, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger"),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify("H", evidence, expected_final_sha="8" * 40)
+
+    assert result["status"] != "PASS"
+    assert "challenge" in str(result["reason"]).lower()
+
+
+def test_gate_j_rejects_used_ocr_without_dependency_lineage(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    diagnostics = tmp_path / "ocr_diagnostics.json"
+    artifact = tmp_path / "ocr_artifact.json"
+    canonical = tmp_path / "canonical.json"
+    registry = tmp_path / "registry.json"
+    source.write_bytes(b"%PDF-1.4\nsource\n")
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    diagnostics.write_text(
+        json.dumps(
+            {
+                "artifact_type": "ocr_diagnostics",
+                "artifact_version": "v1",
+                "schema_version": "ocr-diagnostics-v1",
+                "source_pdf_sha256": source_hash,
+                "ocr_engine": "tesseract",
+                "ocr_engine_version": "test",
+                "page_numbers": [1],
+                "ocr_page_count": 1,
+                "output_artifact_hashes": {"1": "a" * 64},
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifact.write_text(json.dumps({"used_ocr": True}), encoding="utf-8")
+    canonical.write_text(json.dumps({"used_ocr": True}), encoding="utf-8")
+    registry.write_text(json.dumps({"artifact_registry_version": "v2", "job_id": "job-j", "artifacts": []}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="9" * 40)
+    evidence = producer.build_gate(
+        "J",
+        [
+            producer.reference(source, role="source_pdf", artifact_type="source_pdf"),
+            producer.reference(diagnostics, role="ocr_diagnostics", artifact_type="ocr_diagnostics", artifact_version="v1", schema_version="ocr-diagnostics-v1"),
+            producer.reference(artifact, role="ocr_artifact", artifact_type="ocr_artifact", artifact_version="v1", schema_version="ocr-artifact-v1"),
+            producer.reference(canonical, role="canonical_stage1", artifact_type="summary_file"),
+            producer.reference(registry, role="registry"),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify("J", evidence, expected_final_sha="9" * 40)
+
+    assert result["status"] != "PASS"
+    assert "OCR" in str(result["reason"])
+
+
+def test_gate_q_rejects_single_aggregate_without_fifteen_paper_identities(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    canonical = tmp_path / "canonical.json"
+    outline = tmp_path / "outline.json"
+    docx = tmp_path / "review.docx"
+    validation = tmp_path / "validation.json"
+    ledger = tmp_path / "ledger.jsonl"
+    registry = tmp_path / "registry.json"
+    closure = tmp_path / "closure.json"
+    job_outcome = tmp_path / "outcome.json"
+    citation = tmp_path / "citation.json"
+    source.write_bytes(b"%PDF-1.4\nsource\n")
+    canonical.write_text(json.dumps({"summaries": [{"canonical_paper_key": "only-one"}]}), encoding="utf-8")
+    outline.write_text(json.dumps({"artifact_type": "runtime_stage_terminal", "status": "succeeded"}), encoding="utf-8")
+    docx.write_bytes(b"not-a-docx")
+    validation.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    ledger.write_text("", encoding="utf-8")
+    registry.write_text(json.dumps({"artifact_registry_version": "v2", "job_id": "job-q", "artifacts": []}), encoding="utf-8")
+    closure.write_text(json.dumps({"artifact_type": "provider_receipt_closure", "status": "complete"}), encoding="utf-8")
+    job_outcome.write_text(json.dumps({"job_status": "completed", "canonical_ready": True}), encoding="utf-8")
+    citation.write_text(json.dumps({"artifact_type": "citation_manifest", "paper_entries": []}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="a" * 40)
+    evidence = producer.build_gate(
+        "Q",
+        [
+            producer.reference(source, role="source_pdf", artifact_type="source_pdf"),
+            producer.reference(canonical, role="canonical_stage1", artifact_type="summary_file"),
+            producer.reference(outline, role="outline_terminal", artifact_type="runtime_stage_terminal"),
+            producer.reference(docx, role="review_docx", artifact_type="review_docx"),
+            producer.reference(validation, role="validation_artifact", artifact_type="validation_run_result"),
+            producer.reference(ledger, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger"),
+            producer.reference(registry, role="registry"),
+            producer.reference(closure, role="closure", artifact_type="provider_receipt_closure"),
+            producer.reference(job_outcome, role="job_outcome", artifact_type="job_outcome"),
+            producer.reference(citation, role="citation_manifest", artifact_type="citation_manifest", artifact_version="v3"),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify("Q", evidence, expected_final_sha="a" * 40)
+
+    assert result["status"] != "PASS"
+    assert "fifteen" in str(result["reason"]).lower()
+
+
 def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_path: Path) -> None:
     from runtime.control_plane import ReviewControlPlane
 
