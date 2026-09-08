@@ -749,7 +749,7 @@ def test_gate_d_rejects_self_declared_modalities_without_three_derived_profiles(
     )
 
     assert result["status"] != "PASS"
-    assert "derived profiles" in str(result["reason"])
+    assert "derived modality profiles" in str(result["reason"])
 
 
 def test_gate_h_rejects_generic_validation_findings_without_challenge_lineage(tmp_path: Path) -> None:
