@@ -85,7 +85,9 @@ jobs:
                   ($allTestFiles[$index].Name -notin @(
                     "test_repository_hygiene.py",
                     "test_review_batch.py",
-                    "test_runtime_lifecycle_parity.py"
+                    "test_runtime_lifecycle_parity.py",
+                    "test_gui_playwright.py",
+                    "test_deepseek_vision_smoke.py"
                   ))
                 ) {
                   $allTestFiles[$index].FullName
@@ -97,9 +99,15 @@ jobs:
             throw "No test files selected for shard $shard/$shardCount"
           }
           Write-Host "Running $($selectedTestFiles.Count) test files in shard $shard/$shardCount"
-          python -m pytest -vv --strict-markers `
-            -m "not live_api and not playwright and not heavy_ocr" `
-            $selectedTestFiles
+          foreach ($testFile in $selectedTestFiles) {
+            Write-Host "Running isolated pytest process for $testFile"
+            python -m pytest -vv -rs --strict-markers `
+              -m "not live_api and not playwright and not heavy_ocr" `
+              $testFile
+            if ($LASTEXITCODE -ne 0) {
+              throw "pytest failed for $testFile with exit code $LASTEXITCODE"
+            }
+          }
       - name: Type check
         run: python -m pyright
       - name: Doctor
