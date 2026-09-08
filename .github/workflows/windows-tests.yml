@@ -67,8 +67,14 @@ jobs:
           $shard = [int]"${{ matrix.shard }}"
           $shardCount = 3
           $selectedTestFiles = @(
+            if ($shard -eq 3) {
+              (Join-Path (Get-Location) "tests/test_repository_hygiene.py")
+            }
             for ($index = 0; $index -lt $allTestFiles.Count; $index++) {
-              if (($index % $shardCount) -eq ($shard - 1)) {
+              if (
+                (($index % $shardCount) -eq ($shard - 1)) -and
+                ($allTestFiles[$index].Name -ne "test_repository_hygiene.py")
+              ) {
                 $allTestFiles[$index].FullName
               }
             }
