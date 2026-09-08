@@ -28,6 +28,7 @@ import requests  # type: ignore
 from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
 from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
 from services.job_workspace import atomic_write_json
+from services.durable_io import interprocess_file_lock
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
 
 DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
@@ -301,7 +302,12 @@ class PreprocessManager:
             require_mineru_origin=True,
         )
 
-    def prepare_pdf(self, pdf_path: str) -> Optional[PreprocessResult]:
+    def prepare_pdf(
+        self,
+        pdf_path: str,
+        *,
+        pin_id: str = "",
+    ) -> Optional[PreprocessResult]:
         """Build or reuse cached preprocess artifacts for a PDF."""
 
         if not pdf_path or not os.path.exists(pdf_path):
@@ -312,6 +318,52 @@ class PreprocessManager:
         source_identity = self._source_identity(pdf_path)
         cache_dir = os.path.join(self.cache_root, self._pdf_cache_key(pdf_path, source_identity))
         os.makedirs(cache_dir, exist_ok=True)
+        with interprocess_file_lock(Path(cache_dir) / ".preprocess-cache"):
+            return self._prepare_pdf_locked(
+                pdf_path,
+                source_identity=source_identity,
+                cache_dir=cache_dir,
+                pin_id=pin_id,
+            )
+
+    def _prepare_pdf_locked(
+        self,
+        pdf_path: str,
+        *,
+        source_identity: Dict[str, Any],
+        cache_dir: str,
+        pin_id: str = "",
+    ) -> Optional[PreprocessResult]:
+        try:
+            return self._prepare_pdf_locked_impl(
+                pdf_path,
+                source_identity=source_identity,
+                cache_dir=cache_dir,
+                pin_id=pin_id,
+            )
+        except BaseException:
+            # The cache-key lock makes it safe to clean all staging siblings:
+            # no other prepare_pdf process can be building this key here.
+            self._gc_generations(cache_dir, temp_ttl_seconds=0)
+            raise
+
+    def _prepare_pdf_locked_impl(
+        self,
+        pdf_path: str,
+        *,
+        source_identity: Dict[str, Any],
+        cache_dir: str,
+        pin_id: str = "",
+    ) -> Optional[PreprocessResult]:
+        """Build or reuse one source cache while holding its per-key lock."""
+
+        active = self._active_generation(cache_dir)
+        if pin_id and active is not None:
+            self._pin_generation(
+                cache_dir,
+                Path(active[0]).name,
+                pin_id=pin_id,
+            )
         self._gc_generations(cache_dir)
         active = self._active_generation(cache_dir)
         if (not self.force_rebuild) and active is not None:
@@ -536,6 +588,8 @@ class PreprocessManager:
             generation_dir,
             manifest_path=published_artifact_paths["manifest_path"],
         )
+        if pin_id:
+            self._pin_generation(cache_dir, generation_id, pin_id=pin_id)
         self._gc_generations(cache_dir, active_generation_id=generation_id)
 
         return PreprocessResult(
@@ -659,6 +713,7 @@ class PreprocessManager:
         generation_dirs.sort(key=lambda item: item[0], reverse=True)
         keep_count = max(1, int(keep_generations))
         keep_names = {path.name for _mtime, path in generation_dirs[:keep_count]}
+        keep_names.update(self._pinned_generation_ids(root))
         if active_id:
             keep_names.add(active_id)
         for _mtime, child in generation_dirs:
@@ -673,6 +728,60 @@ class PreprocessManager:
             "removed_tmp": removed_tmp,
             "removed_generations": removed_generations,
         }
+
+    def _pin_generation(self, cache_dir: str, generation_id: str, *, pin_id: str) -> Path:
+        """Persist a job-owned pin so cache GC cannot remove its authority."""
+
+        generation_name = str(generation_id or "").strip()
+        if not generation_name.startswith("generation-") or os.path.basename(generation_name) != generation_name:
+            raise ValueError("preprocess generation pin requires a finalized generation")
+        generation_dir = Path(cache_dir).expanduser().resolve() / generation_name
+        manifest_path = generation_dir / "prepare_manifest.json"
+        if not generation_dir.is_dir() or not manifest_path.is_file():
+            raise FileNotFoundError(f"cannot pin missing preprocess generation: {generation_dir}")
+        safe_pin = hashlib.sha256(str(pin_id).encode("utf-8")).hexdigest()
+        pin_dir = Path(cache_dir).expanduser().resolve() / "generation_pins"
+        pin_path = pin_dir / f"{safe_pin}-{generation_name}.json"
+        atomic_write_json(
+            str(pin_path),
+            {
+                "schema_version": "preprocess-generation-pin-v1",
+                "pin_id": str(pin_id),
+                "generation_id": generation_name,
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": self._file_sha256(str(manifest_path)),
+            },
+        )
+        return pin_path
+
+    @staticmethod
+    def _pinned_generation_ids(root: Path) -> set[str]:
+        pin_dir = root / "generation_pins"
+        pinned: set[str] = set()
+        if not pin_dir.is_dir() or pin_dir.is_symlink():
+            return pinned
+        for pin_path in pin_dir.glob("*.json"):
+            if pin_path.is_symlink():
+                continue
+            try:
+                payload = json.loads(pin_path.read_text(encoding="utf-8"))
+                generation_id = str(payload.get("generation_id") or "").strip()
+                manifest_path = Path(str(payload.get("manifest_path") or "")).expanduser().resolve()
+                expected_hash = str(payload.get("manifest_sha256") or "").strip().lower()
+                generation_root = (root / generation_id).resolve()
+                if (
+                    payload.get("schema_version") == "preprocess-generation-pin-v1"
+                    and generation_id.startswith("generation-")
+                    and os.path.basename(generation_id) == generation_id
+                    and manifest_path.parent == generation_root
+                    and manifest_path.is_file()
+                    and expected_hash
+                    and PreprocessManager._file_sha256(str(manifest_path)) == expected_hash
+                ):
+                    pinned.add(generation_id)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return pinned
 
     @staticmethod
     def _write_text_durable(path: str, value: str) -> None:

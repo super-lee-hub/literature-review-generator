@@ -48,6 +48,8 @@ jobs:
           python -m reviewctl run --help
           python -m reviewctl doctor --help
           python -m reviewctl preflight --help
+          python -m reviewctl micro-probe --help
+          python -m reviewctl acceptance-run --help
           python -m reviewctl status --help
           python -m reviewctl inspect --help
           python -m reviewctl next-action --help

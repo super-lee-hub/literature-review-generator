@@ -3,7 +3,10 @@ from __future__ import annotations
 import configparser
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -13,11 +16,15 @@ from config_loader import load_config
 from free_mode.profile_manager import get_profile_path, save_profile
 from runtime.job_spec import RuntimeJobSpec
 from runtime.provider_runtime import (
+    AcceptanceExecutionContextV1,
     ProviderAggregateBudgetV1,
     ProviderBudgetExceeded,
     ProviderBudgetController,
     ProviderRuntime,
     ProviderRuntimeLedger,
+    bind_acceptance_execution_context,
+    is_process_alive,
+    process_identity_for_pid,
 )
 from runtime.release_acceptance import (
     GateEvidenceProducer,
@@ -313,8 +320,108 @@ def test_gate_evidence_verifier_reopens_hashed_browser_artifacts(tmp_path: Path)
         evidence,
         expected_final_sha="b" * 40,
     )
-    assert result["status"] == "PASS"
-    assert result["derived_facts"]["flow_completed"] is True
+    assert result["status"] != "PASS"
+    assert "Playwright" in str(result["reason"])
+
+
+def test_gate_k_rejects_fake_process_ids_and_lock_file(tmp_path: Path) -> None:
+    process_events = tmp_path / "process-events.jsonl"
+    lock_state = tmp_path / "lock-state.json"
+    process_events.write_text(
+        json.dumps({"pid": 1111, "event": "started"})
+        + "\n"
+        + json.dumps({"pid": 2222, "event": "started"})
+        + "\n",
+        encoding="utf-8",
+    )
+    lock_state.write_text(json.dumps({"status": "locked"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="e" * 40)
+    evidence = producer.build_gate(
+        "K",
+        [
+            producer.reference(process_events, role="process_events"),
+            producer.reference(lock_state, role="lock_state"),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify(
+        "K",
+        evidence,
+        expected_final_sha="e" * 40,
+    )
+
+    assert result["status"] != "PASS"
+    assert any(
+        field in str(result.get("reason", ""))
+        for field in ("corrupt", "lost", "contention", "derived")
+    )
+
+
+def test_live_gate_rejects_provider_receipt_missing_authoritative_job_binding(tmp_path: Path) -> None:
+    profile = tmp_path / "free_mode_profile.json"
+    receipt = tmp_path / "provider_receipts.jsonl"
+    terminal = tmp_path / "stage_terminal.json"
+    profile.write_text(json.dumps({"research_goal": "fixture"}), encoding="utf-8")
+    receipt.write_text(
+        json.dumps(
+            {
+                "artifact_type": "provider_call_receipt",
+                "artifact_version": "v2",
+                "receipt_id": "receipt-1",
+                "sequence": 1,
+                "attempt_id": "attempt-1",
+                "stage_name": "free_mode",
+                "route": "Free_Mode_API",
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "endpoint": "https://api.example.test",
+                "status": "success",
+                "attempts": 1,
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:00:01Z",
+                "closure_epoch_id": "epoch-1",
+                "node_id": "free-mode-node",
+                "call_id": "call-1",
+                "endpoint_type": "chat_completions",
+                "metadata": {"transport_config": {"api_base": "https://api.example.test"}},
+                "test_only": False,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    terminal.write_text(json.dumps({"artifact_type": "runtime_stage_terminal", "status": "complete"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="f" * 40)
+    evidence = producer.build_gate(
+        "G",
+        [
+            producer.reference(profile, role="free_mode_profile", job_id="job-1"),
+            producer.reference(
+                receipt,
+                role="provider_receipt_ledger",
+                artifact_type="provider_receipt_ledger",
+                artifact_version="v1",
+                job_id="job-1",
+            ),
+            producer.reference(
+                terminal,
+                role="stage_terminal",
+                artifact_type="runtime_stage_terminal",
+                artifact_version="v1",
+                job_id="job-1",
+            ),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify(
+        "G",
+        evidence,
+        expected_final_sha="f" * 40,
+        expected_job_id="job-1",
+    )
+
+    assert result["status"] != "PASS"
+    assert "job" in str(result["reason"]).lower()
 
 
 def test_live_gate_does_not_count_test_only_provider_receipts(tmp_path: Path) -> None:
@@ -364,7 +471,105 @@ def test_live_gate_does_not_count_test_only_provider_receipts(tmp_path: Path) ->
     )
 
     assert result["status"] != "PASS"
-    assert result["derived_facts"]["actual_transport_calls"] == 0
+    assert "provider receipt" in str(result["reason"]).lower()
+
+
+def test_gate_f_rejects_partial_semantic_role_receipts(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "outline_receipts.jsonl"
+    runtime = ProviderRuntime(
+        ledger=ProviderRuntimeLedger(ledger_path),
+        job_id="job-f",
+        attempt_id="attempt-f",
+        stage_name="outline_v3",
+        route="candidate_provider_generation",
+        node_id="candidate_1_provider_generation",
+        call_id="candidate-1",
+        endpoint_type="chat_completions",
+    )
+    admission = runtime.admit(requested_output_tokens=4)
+    runtime.complete(
+        admission=admission,
+        prompt="outline",
+        input_payload={"text": "source"},
+        api_config={
+            "provider_family": "deepseek",
+            "model": "model-a",
+            "api_base": "https://outline.example.test",
+            "endpoint_type": "chat_completions",
+        },
+        result={"status": "success", "content": {"ok": True}, "output_tokens": 1},
+        metadata={
+            "transport_config": {
+                "provider_family": "deepseek",
+                "model": "model-a",
+                "api_base": "https://outline.example.test",
+                "endpoint_type": "chat_completions",
+            },
+            "config_section": "Outline_API",
+            "route_fingerprint": "route-fingerprint",
+        },
+    )
+    canonical = tmp_path / "canonical.json"
+    plan = tmp_path / "plan.json"
+    terminal = tmp_path / "terminal.json"
+    closure = tmp_path / "closure.json"
+    canonical.write_text(json.dumps({"summaries": [{"paper_key": "paper-1"}]}), encoding="utf-8")
+    plan.write_text(
+        json.dumps(
+            {
+                "artifact_type": "outline_provider_call_plan",
+                "artifact_version": "v1",
+                "reachable_provider_route_plan": {
+                    "routes": [
+                        {
+                            "semantic_role": "candidate_provider_generation",
+                            "section": "Outline_API",
+                            "provider_family": "deepseek",
+                            "model": "model-a",
+                            "endpoint_type": "chat_completions",
+                            "api_base_host": "outline.example.test",
+                            "enabled": True,
+                            "resolved": True,
+                        },
+                        {
+                            "semantic_role": "relation_adjudication",
+                            "section": "Free_Mode_API",
+                            "provider_family": "deepseek",
+                            "model": "model-b",
+                            "endpoint_type": "chat_completions",
+                            "api_base_host": "free.example.test",
+                            "enabled": True,
+                            "resolved": True,
+                        },
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    terminal.write_text(json.dumps({"artifact_type": "runtime_stage_terminal", "status": "complete"}), encoding="utf-8")
+    closure.write_text(json.dumps({"artifact_type": "provider_receipt_closure", "status": "complete"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="2" * 40)
+    evidence = producer.build_gate(
+        "F",
+        [
+            producer.reference(canonical, role="canonical_stage1", artifact_type="stage1_canonical_summaries", job_id="job-f"),
+            producer.reference(plan, role="outline_provider_call_plan", artifact_type="outline_provider_call_plan", artifact_version="v1", job_id="job-f"),
+            producer.reference(ledger_path, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger", artifact_version="v1", job_id="job-f"),
+            producer.reference(terminal, role="stage_terminal", artifact_type="runtime_stage_terminal", job_id="job-f"),
+            producer.reference(closure, role="closure", artifact_type="provider_receipt_closure", job_id="job-f"),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify(
+        "F",
+        evidence,
+        expected_final_sha="2" * 40,
+        expected_job_id="job-f",
+    )
+
+    assert result["status"] != "PASS"
+    assert "relation_adjudication" in str(result["reason"])
 
 
 def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_path: Path) -> None:
@@ -498,6 +703,191 @@ def test_aggregate_provider_budget_state_survives_process_boundary(tmp_path: Pat
         )
 
 
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the Windows process API")
+def test_windows_process_liveness_probe_does_not_terminate_child() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        identity = process_identity_for_pid(child.pid)
+        assert identity.creation_time is not None
+        assert is_process_alive(identity) is True
+        assert child.poll() is None
+    finally:
+        assert child.wait(timeout=10) == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the Windows process API")
+def test_windows_process_liveness_rejects_wrong_creation_identity_without_killing_child() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        identity = process_identity_for_pid(child.pid)
+        assert identity.creation_time is not None
+        wrong_identity = type(identity)(
+            pid=identity.pid,
+            creation_time=identity.creation_time + 3600.0,
+            host_id=identity.host_id,
+        )
+        assert is_process_alive(wrong_identity) is False
+        assert child.poll() is None
+    finally:
+        assert child.wait(timeout=10) == 0
+
+
+def test_aggregate_budget_persists_owner_process_identity(tmp_path: Path) -> None:
+    controller = ProviderBudgetController(ProviderAggregateBudgetV1(max_provider_calls_total=1))
+    state_path = tmp_path / "budget-state.json"
+    controller.bind_state_path(state_path)
+    controller.admit(requested_output_tokens=1)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    reservation = state["reservations"][0]
+    assert reservation["owner_pid"] == os.getpid()
+    assert reservation["owner_host_id"]
+    assert reservation["owner_process_creation_time"] is not None
+
+
+def test_acceptance_execution_context_is_the_provider_budget_authority(tmp_path: Path, monkeypatch) -> None:
+    budget = ProviderAggregateBudgetV1(
+        max_provider_calls_total=1,
+        max_output_tokens_total=4,
+        max_retry_attempts_total=0,
+        max_wall_seconds=60,
+    )
+    state_path = tmp_path / "acceptance" / "run-1" / "provider_budget_state.json"
+    controller = ProviderBudgetController(budget)
+    controller.bind_state_path(state_path)
+    context = AcceptanceExecutionContextV1(
+        acceptance_run_id="run-1",
+        final_executable_sha="a" * 40,
+        absolute_deadline_epoch=controller.snapshot()["absolute_deadline_epoch"],
+        provider_budget=budget,
+        provider_budget_state_path=str(state_path),
+        evidence_root=str(state_path.parent / "evidence"),
+        process_event_log=str(state_path.parent / "process_events.jsonl"),
+        scenario_state_path=str(state_path.parent / "acceptance_state.json"),
+        owner_authorized=True,
+    )
+    monkeypatch.setenv(
+        "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON",
+        json.dumps(
+            {
+                "max_provider_calls_total": 99,
+                "max_output_tokens_total": 99,
+                "max_retry_attempts_total": 99,
+                "max_wall_seconds": 99,
+            }
+        ),
+    )
+    with bind_acceptance_execution_context(context, controller):
+        runtime = ProviderRuntime(test_only=True)
+        assert runtime.aggregate_budget is controller
+        runtime.admit(requested_output_tokens=4)
+        with pytest.raises(ProviderBudgetExceeded, match="call budget"):
+            ProviderRuntime(test_only=True).admit(requested_output_tokens=1)
+
+
+def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, monkeypatch) -> None:
+    runtime_spec = tmp_path / "runtime.json"
+    runtime_spec.write_text(
+        json.dumps(
+            {
+                "project_name": "acceptance-budget",
+                "source": {"mode": "direct", "pdf_folder": str(tmp_path / "pdfs")},
+                "config": str(tmp_path / "config.ini"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    acceptance_spec = tmp_path / "acceptance.json"
+    acceptance_spec.write_text(
+        json.dumps(
+            {
+                "runtime_spec": "runtime.json",
+                "state_path": "state.json",
+                "gates": ["C"],
+                "budget": {
+                    "max_provider_calls_total": 1,
+                    "max_output_tokens_total": 4,
+                    "max_retry_attempts_total": 0,
+                    "max_wall_seconds": 60,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    control = __import__("runtime.control_plane", fromlist=["ReviewControlPlane"]).ReviewControlPlane(
+        repo_root=Path.cwd()
+    )
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"route_plan": {}})
+    seen: dict[str, object] = {}
+
+    def fake_run(_spec_path: str | Path) -> dict[str, object]:
+        runtime = ProviderRuntime(test_only=True)
+        seen["controller"] = runtime.aggregate_budget
+        assert runtime.aggregate_budget is not None
+        runtime.admit(requested_output_tokens=4)
+        with pytest.raises(ProviderBudgetExceeded, match="call budget"):
+            ProviderRuntime(test_only=True).admit(requested_output_tokens=1)
+        return {"status": "BLOCKED_INPUT", "reason": "fixture execution", "job_id": "job-budget"}
+
+    monkeypatch.setattr(control, "run", fake_run)
+    result = control.acceptance_run(acceptance_spec)
+
+    assert seen["controller"] is not None
+    assert result["acceptance_execution_context"]["provider_budget"]["max_provider_calls_total"] == 1
+    assert Path(result["provider_budget_state_path"]).is_file()
+    assert Path(result["provider_budget_state_path"]).parent.name == result["run_id"]
+
+
+def test_acceptance_evidence_manifest_refreshes_with_revision_on_resume(tmp_path: Path) -> None:
+    first = tmp_path / "stage-a.json"
+    second = tmp_path / "stage-b.json"
+    manifest = tmp_path / "evidence-index.json"
+    first.write_text(json.dumps({"stage": "a"}), encoding="utf-8")
+    second.write_text(json.dumps({"stage": "b"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="1" * 40)
+
+    producer.write_manifest(
+        manifest,
+        {"C": [producer.reference(first, role="stage_terminal")]},
+        acceptance_run_id="run-1",
+        scenario_id="C",
+        job_id="job-1",
+    )
+    first_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    producer.write_manifest(
+        manifest,
+        {
+            "C": [
+                producer.reference(first, role="stage_terminal"),
+                producer.reference(second, role="job_outcome"),
+            ]
+        },
+        acceptance_run_id="run-1",
+        scenario_id="C",
+        job_id="job-1",
+    )
+    second_payload = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert first_payload["revision"] == 1
+    assert second_payload["revision"] == 2
+    assert second_payload["previous_revision_hash"] == hashlib.sha256(
+        json.dumps(first_payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    assert second_payload["acceptance_run_id"] == "run-1"
+    assert second_payload["scenario_id"] == "C"
+    assert second_payload["job_id"] == "job-1"
+    assert len(second_payload["gates"]["C"]["durable_refs"]) == 2
 
 
 def test_profile_path_rejects_traversal_and_save_is_atomic_boundary(tmp_path: Path) -> None:

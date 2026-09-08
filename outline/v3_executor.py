@@ -2599,6 +2599,8 @@ class OutlineV3Executor:
             metadata={
                 "node_id": node_id,
                 "semantic_node_id": semantic_node_id,
+                "config_section": route.config_section,
+                "route_fingerprint": route.safe_config_fingerprint(),
                 "closure_epoch_id": self.closure_epoch_id,
                 "estimation": budget,
                 "replay_status": replay_lookup.status,

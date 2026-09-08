@@ -89,6 +89,66 @@ def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monk
     assert {chunk["chunk_source"] for chunk in chunks} == {"selected_stage1_input"}
 
 
+def test_preprocess_pinned_generation_survives_cache_gc(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "pinned.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "true",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    first = manager.prepare_pdf(str(pdf_path), pin_id="job-a:paper-a")
+    second = manager.prepare_pdf(str(pdf_path), pin_id="job-a:paper-a")
+    assert first is not None and second is not None
+    assert first.manifest_path != second.manifest_path
+
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert Path(first.manifest_path).is_file()
+    assert Path(second.manifest_path).is_file()
+    pins = list((Path(first.cache_dir) / "generation_pins").glob("*.json"))
+    assert len(pins) >= 2
+
+
+def test_preprocess_failure_cleans_staging_generation(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "failed.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_extract_preferred_content",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("synthetic extraction failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic extraction failure"):
+        manager.prepare_pdf(str(pdf_path))
+
+    assert not list(cache_dir.glob("**/.generation.tmp-*"))
+
+
 def test_preprocess_manager_defaults_to_local_even_with_ambient_mineru_token(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "sample.pdf"
     cache_dir = tmp_path / "cache"

@@ -10,13 +10,14 @@ operation completed.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import importlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import uuid
@@ -32,7 +33,15 @@ from runtime.outline_v3_dag import OutlineNodeStore
 from runtime.outline_v3_replay import ModelCallReplayStore
 from runtime.orchestrator import AgentRuntimeBridge
 from runtime.runner import AgentRuntimeRunner, RuntimeExecutionResult, RuntimeRunnerError
-from runtime.provider_runtime import ProviderRuntime, ProviderRuntimeLedger
+from runtime.provider_runtime import (
+    AcceptanceExecutionContextV1,
+    ProviderBudgetController,
+    ProviderBudgetExceeded,
+    ProviderRuntime,
+    ProviderRuntimeLedger,
+    bind_acceptance_execution_context,
+    current_acceptance_execution_context,
+)
 from runtime.provider_routes import build_reachable_provider_route_plan
 from runtime.stage_terminal import StageTerminalStore
 from services.artifact_registry import (
@@ -636,7 +645,45 @@ class ReviewControlPlane:
                     },
                     updated_at=self._utc_now(),
                 )
+            run_dir = state_path.parent / state.run_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            state = replace(
+                state,
+                provider_budget_state_path=(
+                    state.provider_budget_state_path
+                    or str(run_dir / "provider_budget_state_v1.json")
+                ),
+                evidence_root=state.evidence_root or str(run_dir / "evidence"),
+                process_event_log=(
+                    state.process_event_log
+                    or str(run_dir / "process_events.jsonl")
+                ),
+            )
             atomic_write_json(str(state_path), state.to_dict())
+
+        if not acceptance_spec.evidence_manifest:
+            evidence_path = (
+                Path(state.evidence_root).expanduser().resolve()
+                / "acceptance_evidence_index_v1.json"
+            )
+        budget_controller = ProviderBudgetController(
+            acceptance_spec.budget.to_provider_budget()
+        )
+        budget_controller.bind_state_path(state.provider_budget_state_path)
+        budget_snapshot = budget_controller.snapshot()
+        execution_context = AcceptanceExecutionContextV1(
+            acceptance_run_id=state.run_id,
+            final_executable_sha=current_sha,
+            absolute_deadline_epoch=float(
+                budget_snapshot.get("absolute_deadline_epoch") or 0.0
+            ),
+            provider_budget=acceptance_spec.budget.to_provider_budget(),
+            provider_budget_state_path=state.provider_budget_state_path,
+            evidence_root=state.evidence_root,
+            process_event_log=state.process_event_log,
+            scenario_state_path=str(state_path),
+            owner_authorized=os.getenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "0") == "1",
+        )
 
         route_plan: dict[str, Any] | None = None
         runtime_result: dict[str, Any] | None = None
@@ -662,35 +709,47 @@ class ReviewControlPlane:
                 "reason": "set AUTO_GENERATE_RUN_LIVE_ACCEPTANCE=1 for owner-authorized acceptance execution",
             }
         else:
-            try:
-                runtime_payload = json.loads(runtime_spec.read_text(encoding="utf-8"))
-                runtime_job_spec = RuntimeJobSpec.from_dict(runtime_payload).resolved_from(
-                    runtime_spec.parent
-                )
-                config_path = Path(runtime_job_spec.config).expanduser().resolve()
-                route_plan = self.provider_preflight(
-                    config_path=config_path,
-                    action=runtime_job_spec.action,
-                    requested_stages=runtime_job_spec.metadata.get("requested_stages"),
-                    free_mode_enabled=bool(
-                        runtime_job_spec.free_mode_profile
-                        or runtime_job_spec.free_mode_idea
-                        or runtime_job_spec.metadata.get("free_mode_input")
-                    ),
-                ).get("route_plan")
-                prior_workspace = state.workspace_path if state else ""
-                if prior_workspace and Path(prior_workspace).is_dir():
-                    runtime_result = self.resume(
-                        workspace=prior_workspace,
-                        job_id=state.job_id if state else "",
+            with bind_acceptance_execution_context(execution_context, budget_controller):
+                try:
+                    runtime_payload = json.loads(runtime_spec.read_text(encoding="utf-8"))
+                    runtime_job_spec = RuntimeJobSpec.from_dict(runtime_payload).resolved_from(
+                        runtime_spec.parent
                     )
-                else:
-                    runtime_result = self.run(runtime_spec)
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, ControlPlaneError) as exc:
-                runtime_result = {
-                    "status": "BLOCKED_INPUT",
-                    "reason": f"acceptance runtime input is invalid or blocked: {type(exc).__name__}: {exc}",
-                }
+                    config_path = Path(runtime_job_spec.config).expanduser().resolve()
+                    route_plan = self.provider_preflight(
+                        config_path=config_path,
+                        action=runtime_job_spec.action,
+                        requested_stages=runtime_job_spec.metadata.get("requested_stages"),
+                        free_mode_enabled=bool(
+                            runtime_job_spec.free_mode_profile
+                            or runtime_job_spec.free_mode_idea
+                            or runtime_job_spec.metadata.get("free_mode_input")
+                        ),
+                    ).get("route_plan")
+                    prior_workspace = state.workspace_path if state else ""
+                    if prior_workspace and Path(prior_workspace).is_dir():
+                        budget_controller.reconcile_orphaned_reservations(
+                            receipt_ledgers=self._acceptance_provider_ledger_paths(
+                                prior_workspace,
+                                job_id=state.job_id if state else "",
+                            )
+                        )
+                        runtime_result = self.resume(
+                            workspace=prior_workspace,
+                            job_id=state.job_id if state else "",
+                        )
+                    else:
+                        runtime_result = self.run(runtime_spec)
+                except ProviderBudgetExceeded as exc:
+                    runtime_result = {
+                        "status": "BLOCKED_AMBIGUOUS_PROVIDER_CALL",
+                        "reason": str(exc),
+                    }
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, ControlPlaneError) as exc:
+                    runtime_result = {
+                        "status": "BLOCKED_INPUT",
+                        "reason": f"acceptance runtime input is invalid or blocked: {type(exc).__name__}: {exc}",
+                    }
 
         workspace_path = str(
             (runtime_result or {}).get("workspace_path")
@@ -726,22 +785,21 @@ class ReviewControlPlane:
             )
         if runtime_job_spec is not None:
             refs.extend(
-                self._acceptance_source_references(
+            self._acceptance_source_references(
                     runtime_job_spec,
                     final_sha=current_sha,
                     job_id=job_id,
+                    profile_root=Path(state.evidence_root).expanduser().resolve(),
                 )
             )
-        if (
-            refs
-            and not evidence_path.is_file()
-            and runtime_result is not None
-            and not str(runtime_result.get("status") or "").startswith("BLOCKED")
-        ):
+        if refs:
             producer = GateEvidenceProducer(final_sha=current_sha)
             producer.write_manifest(
                 evidence_path,
                 {str(gate): refs for gate in gates},
+                acceptance_run_id=state.run_id,
+                scenario_id="acceptance-run",
+                job_id=job_id,
             )
 
         verifier = GateEvidenceVerifier()
@@ -787,6 +845,17 @@ class ReviewControlPlane:
             if verified_gates and all(item.get("status") == "PASS" for item in verified_gates.values())
             else "blocked"
         )
+        evidence_revision = int(state.evidence_revision or 0)
+        evidence_manifest_hash = str(state.evidence_manifest_hash or "")
+        if evidence_path.is_file():
+            try:
+                evidence_raw = evidence_path.read_bytes()
+                evidence_payload_for_state = json.loads(evidence_raw.decode("utf-8"))
+                if isinstance(evidence_payload_for_state, Mapping):
+                    evidence_revision = int(evidence_payload_for_state.get("revision") or 0)
+                    evidence_manifest_hash = hashlib.sha256(evidence_raw).hexdigest()
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                pass
         state = AcceptanceRunStateV1(
             run_id=state.run_id if state else f"acceptance-{uuid.uuid4().hex}",
             final_sha=current_sha,
@@ -797,6 +866,12 @@ class ReviewControlPlane:
             workspace_path=workspace_path,
             job_id=job_id,
             updated_at=self._utc_now(),
+            provider_budget_state_path=state.provider_budget_state_path,
+            evidence_root=state.evidence_root,
+            process_event_log=state.process_event_log,
+            evidence_revision=evidence_revision,
+            evidence_manifest_hash=evidence_manifest_hash,
+            scenario_id="acceptance-run",
         )
         with interprocess_file_lock(state_path):
             atomic_write_json(str(state_path), state.to_dict())
@@ -809,6 +884,8 @@ class ReviewControlPlane:
             "acceptance_spec_path": str(spec_path),
             "state_path": str(state_path),
             "evidence_manifest": str(evidence_path) if evidence_path.is_file() else "",
+            "provider_budget_state_path": state.provider_budget_state_path,
+            "acceptance_execution_context": execution_context.to_dict(),
             "runtime_result": runtime_result,
             "route_plan": route_plan,
             "gates": verified_gates,
@@ -820,6 +897,53 @@ class ReviewControlPlane:
         from services.job_workspace import utc_now_iso
 
         return utc_now_iso()
+
+    def _acceptance_provider_ledger_paths(
+        self,
+        workspace_path: str | Path,
+        *,
+        job_id: str = "",
+    ) -> tuple[str, ...]:
+        """Resolve only job-owned provider ledgers for budget recovery."""
+
+        workspace = Path(workspace_path).expanduser().resolve()
+        if not workspace.is_dir():
+            return ()
+        paths: dict[str, Path] = {}
+        registry_path = workspace / "artifact_registry.json"
+        try:
+            registry_payload = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            registry_payload = {}
+        records = (
+            registry_payload.get("artifacts", [])
+            if isinstance(registry_payload, Mapping)
+            else []
+        )
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, Mapping):
+                    continue
+                if str(record.get("artifact_type") or "") != "provider_receipt_ledger":
+                    continue
+                if job_id and str(record.get("job_id") or "") != job_id:
+                    continue
+                raw_path = str(record.get("path") or "").strip()
+                if not raw_path:
+                    continue
+                candidate = Path(raw_path).expanduser().resolve()
+                try:
+                    candidate.relative_to(workspace)
+                except ValueError:
+                    continue
+                if candidate.is_file() and not candidate.is_symlink():
+                    paths[str(candidate).casefold()] = candidate
+        staging_root = workspace / "artifacts" / ".publication-staging" / "provider-receipts"
+        if staging_root.is_dir():
+            for candidate in staging_root.rglob("*.jsonl"):
+                if candidate.is_file() and not candidate.is_symlink():
+                    paths[str(candidate.resolve()).casefold()] = candidate.resolve()
+        return tuple(str(paths[key]) for key in sorted(paths))
 
     def _acceptance_workspace_references(
         self,
@@ -889,6 +1013,16 @@ class ReviewControlPlane:
                 "validation_run_result": "validation_artifact",
                 "validation_run_result_repaired": "repair_artifact",
                 "validation_report_projection": "defect_artifact",
+                "controlled_defect_challenge": "defect_artifact",
+                "document_modality_profile": "modality_profile",
+                "ocr_diagnostics": "ocr_diagnostics",
+                "ocr_artifact": "ocr_artifact",
+                "process_interruption_event": "interruption_event",
+                "process_resume_event": "resume_event",
+                "acceptance_process_event": "process_events",
+                "contention_result": "lock_state",
+                "citation_manifest_v3": "citation_manifest",
+                "citation_manifest": "citation_manifest",
                 "validation_receipt_closure": "closure",
                 "provider_receipt_closure": "closure",
             }.get(artifact_type, "")
@@ -900,21 +1034,6 @@ class ReviewControlPlane:
                     artifact_version=str(item.get("artifact_version") or ""),
                 )
 
-        for path in workspace.glob("**/*provider*receipt*.jsonl"):
-            add(
-                path,
-                role="provider_receipt_ledger",
-                artifact_type="provider_receipt_ledger",
-                artifact_version="v1",
-            )
-        for path in workspace.glob("**/*process*event*.jsonl"):
-            add(path, role="process_events")
-        for path in workspace.glob("**/*interruption*.*"):
-            add(path, role="interruption_event")
-        for path in workspace.glob("**/*resume*.*"):
-            add(path, role="resume_event")
-        for path in workspace.glob("**/*ocr*.*"):
-            add(path, role="ocr_diagnostics")
         return references
 
     @staticmethod
@@ -923,6 +1042,7 @@ class ReviewControlPlane:
         *,
         final_sha: str,
         job_id: str,
+        profile_root: str | Path | None = None,
     ) -> list[dict[str, Any]]:
         from runtime.release_acceptance import GateEvidenceProducer
 
@@ -937,18 +1057,85 @@ class ReviewControlPlane:
             if not path.is_file() or path.is_symlink():
                 continue
             try:
-                refs.append(
-                    producer.reference(
-                        path,
-                        role="source_pdf",
-                        artifact_type="source_pdf",
-                        job_id=job_id,
-                        modality="pdf",
-                    )
+                source_ref = producer.reference(
+                    path,
+                    role="source_pdf",
+                    artifact_type="source_pdf",
+                    job_id=job_id,
                 )
+                refs.append(source_ref)
+                if profile_root is not None:
+                    profile_path = ReviewControlPlane._write_modality_profile(
+                        path,
+                        source_sha256=str(source_ref["sha256"]),
+                        profile_root=Path(profile_root).expanduser().resolve(),
+                    )
+                    refs.append(
+                        producer.reference(
+                            profile_path,
+                            role="modality_profile",
+                            artifact_type="document_modality_profile",
+                            artifact_version="v1",
+                            schema_version="document-modality-profile-v1",
+                            job_id=job_id,
+                        )
+                    )
             except (OSError, ValueError):
                 continue
         return refs
+
+    @staticmethod
+    def _write_modality_profile(
+        source_pdf: Path,
+        *,
+        source_sha256: str,
+        profile_root: Path,
+    ) -> Path:
+        """Derive document modality from the source PDF without provider input."""
+
+        import fitz  # type: ignore
+
+        page_count = 0
+        text_pages = 0
+        image_pages = 0
+        scanned_pages = 0
+        table_count = 0
+        figure_count = 0
+        with fitz.open(str(source_pdf)) as document:
+            page_count = int(document.page_count)
+            for index in range(page_count):
+                page = document.load_page(index)
+                text = str(page.get_text("text") or "").strip()
+                image_count = len(page.get_images(full=True))
+                if len(text) >= 80:
+                    text_pages += 1
+                if image_count > 0:
+                    image_pages += 1
+                if len(text) < 80:
+                    scanned_pages += 1
+                lowered = text.casefold()
+                table_count += len(re.findall(r"\btable\s+[0-9ivx]+\b", lowered))
+                figure_count += len(re.findall(r"\b(?:figure|fig\.)\s+[0-9ivx]+\b", lowered))
+        if page_count <= 0:
+            raise ValueError("source PDF has no pages")
+        payload = {
+            "artifact_type": "document_modality_profile",
+            "artifact_version": "v1",
+            "schema_version": "document-modality-profile-v1",
+            "source_pdf_sha256": source_sha256,
+            "total_page_count": page_count,
+            "text_page_ratio": round(text_pages / page_count, 6),
+            "image_page_ratio": round(image_pages / page_count, 6),
+            "table_count": table_count,
+            "figure_count": figure_count,
+            "scanned_candidate_page_count": scanned_pages,
+            "ocr_used_page_count": 0,
+            "selected_visual_count": image_pages,
+            "extractor_used": "pymupdf-deterministic-profile",
+        }
+        target = Path(profile_root).expanduser().resolve() / "modality_profiles" / f"{source_sha256}.json"
+        atomic_write_json(str(target), payload)
+        return target
 
     @staticmethod
     def _formal_runner_transport_diff(
@@ -2023,8 +2210,14 @@ class ReviewControlPlane:
 
             acceptance_budget = provider_budget_controller_from_environment()
             if acceptance_budget is not None:
+                active_context = current_acceptance_execution_context()
+                budget_state_path = (
+                    Path(active_context.provider_budget_state_path)
+                    if active_context is not None
+                    else output_root / "_acceptance" / "provider_budget_state_v1.json"
+                )
                 acceptance_budget.bind_state_path(
-                    str(output_root / "_acceptance" / "provider_budget_state_v1.json")
+                    str(budget_state_path)
                 )
             ledger = ProviderRuntimeLedger(output_root / "_acceptance" / "provider_micro_probe.jsonl")
             from ai_interface import _call_ai_api_detailed
@@ -2130,13 +2323,66 @@ class ReviewControlPlane:
             for path in root.rglob("*.lock"):
                 if any(part in {".git", ".omx", "__pycache__"} for part in path.parts):
                     continue
+                if path.name.casefold() in {
+                    "requirements-py311-windows.lock",
+                    "uv.lock",
+                    "poetry.lock",
+                    "pipfile.lock",
+                }:
+                    continue
                 try:
                     age = max(0.0, now - path.stat().st_mtime)
                 except OSError:
                     continue
-                if age >= 3600:
-                    found.append({"path": str(path), "age_seconds": int(age)})
+                if self._probe_persistent_lock(path):
+                    continue
+                found.append(
+                    {
+                        "path": str(path),
+                        "age_seconds": int(age),
+                        "status": "active_or_contended",
+                    }
+                )
         return found
+
+    @staticmethod
+    def _probe_persistent_lock(path: Path) -> bool:
+        """Return whether a persistent lock file can be acquired now.
+
+        Lock files are intentionally retained after release.  The OS lock,
+        not mtime or file existence, is the authority for current contention.
+        """
+
+        try:
+            with path.open("a+b") as handle:
+                if handle.seek(0, os.SEEK_END) == 0:
+                    return True
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        return False
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                    return True
+                import fcntl
+
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (BlockingIOError, OSError):
+                    return False
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                return True
+        except OSError:
+            return False
 
     def _git_check(self) -> dict[str, Any]:
         try:

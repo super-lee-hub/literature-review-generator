@@ -8,16 +8,20 @@ facts needed to audit that decision.  Secrets and raw prompts never belong in
 a receipt.
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
+import ctypes
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
 import threading
 import time
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping, cast
 import uuid
 
 from services.durable_io import atomic_replace_with_retry, interprocess_file_lock
@@ -95,6 +99,229 @@ class ProviderBudgetExceeded(RuntimeError):
 
 class ProviderReceiptConflict(RuntimeError):
     """Raised when an append-only receipt ID is reused with different content."""
+
+
+ProcessLiveness = Literal["alive", "dead", "unknown"]
+
+
+@dataclass(frozen=True)
+class ProcessIdentityV1:
+    """Durable identity for a process owner used by recovery probes."""
+
+    pid: int
+    creation_time: float | None = None
+    host_id: str = ""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.pid, bool) or int(self.pid) < 0:
+            raise ProviderRuntimeContractError("process identity pid must be non-negative")
+        object.__setattr__(self, "pid", int(self.pid))
+        if self.creation_time is not None:
+            if (
+                isinstance(self.creation_time, bool)
+                or not math.isfinite(float(self.creation_time))
+                or float(self.creation_time) < 0
+            ):
+                raise ProviderRuntimeContractError(
+                    "process identity creation_time must be a finite non-negative number"
+                )
+            object.__setattr__(self, "creation_time", float(self.creation_time))
+        object.__setattr__(self, "host_id", str(self.host_id or "").strip().casefold())
+
+
+def _local_host_id() -> str:
+    try:
+        return socket.gethostname().strip().casefold()
+    except OSError:
+        return ""
+
+
+def _windows_filetime_seconds(filetime: Any) -> float:
+    ticks = (int(filetime.dwHighDateTime) << 32) | int(filetime.dwLowDateTime)
+    return ticks / 10_000_000.0
+
+
+def _windows_process_creation_time(pid: int) -> float | None:
+    if pid <= 0:
+        return None
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return None
+            return _windows_filetime_seconds(creation)
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _posix_process_creation_time(pid: int) -> float | None:
+    stat_path = Path(f"/proc/{pid}/stat")
+    boot_path = Path("/proc/stat")
+    try:
+        raw_stat = stat_path.read_text(encoding="utf-8")
+        closing_comm = raw_stat.rfind(")")
+        if closing_comm < 0:
+            return None
+        fields = raw_stat[closing_comm + 2 :].split()
+        start_ticks = int(fields[19])
+        boot_epoch = None
+        for line in boot_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                boot_epoch = float(line.split()[1])
+                break
+        if boot_epoch is None:
+            return None
+        sysconf = getattr(os, "sysconf", None)
+        if not callable(sysconf):
+            return None
+        clock_ticks = int(cast(Any, sysconf)("SC_CLK_TCK"))
+        if clock_ticks <= 0:
+            return None
+        return boot_epoch + (start_ticks / clock_ticks)
+    except (OSError, IndexError, TypeError, ValueError):
+        return None
+
+
+def process_identity_for_pid(pid: int) -> ProcessIdentityV1:
+    """Capture a PID plus the platform process-creation identity."""
+
+    normalized_pid = int(pid)
+    if normalized_pid <= 0:
+        return ProcessIdentityV1(pid=0, host_id=_local_host_id())
+    creation_time = (
+        _windows_process_creation_time(normalized_pid)
+        if os.name == "nt"
+        else _posix_process_creation_time(normalized_pid)
+    )
+    return ProcessIdentityV1(
+        pid=normalized_pid,
+        creation_time=creation_time,
+        host_id=_local_host_id(),
+    )
+
+
+def _windows_process_liveness(identity: ProcessIdentityV1) -> ProcessLiveness:
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, identity.pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            return "dead" if error in {6, 87} else "unknown"
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return "unknown"
+            if int(exit_code.value) != 259:  # STILL_ACTIVE
+                return "dead"
+            if identity.creation_time is None:
+                return "alive"
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel_time = wintypes.FILETIME()
+            user_time = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            ):
+                return "unknown"
+            actual_creation = _windows_filetime_seconds(creation)
+            return (
+                "alive"
+                if abs(actual_creation - float(identity.creation_time)) <= 0.01
+                else "dead"
+            )
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return "unknown"
+
+
+def process_liveness(identity: ProcessIdentityV1) -> ProcessLiveness:
+    """Probe a process without sending it a signal.
+
+    ``unknown`` is deliberately conservative: callers deciding whether to
+    release a durable reservation must treat it as still owned.
+    """
+
+    if identity.pid <= 0:
+        return "dead"
+    if identity.host_id and identity.host_id != _local_host_id():
+        return "unknown"
+    if os.name == "nt":
+        return _windows_process_liveness(identity)
+    try:
+        os.kill(identity.pid, 0)
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "unknown"
+    except OSError:
+        return "unknown"
+    if identity.creation_time is not None:
+        actual_creation = _posix_process_creation_time(identity.pid)
+        if actual_creation is None:
+            return "unknown"
+        if abs(actual_creation - float(identity.creation_time)) > 0.01:
+            return "dead"
+    return "alive"
+
+
+def is_process_alive(identity: ProcessIdentityV1) -> bool:
+    """Return a conservative boolean process-liveness result.
+
+    Access-denied and cross-host probes return ``True`` so recovery cannot
+    release a reservation without proof that its owner is gone.
+    """
+
+    return process_liveness(identity) != "dead"
 
 
 @dataclass(frozen=True)
@@ -175,6 +402,58 @@ class ProviderAggregateBudgetV1:
 
 
 @dataclass(frozen=True)
+class AcceptanceExecutionContextV1:
+    """Run-scoped acceptance authority propagated to provider runtimes."""
+
+    acceptance_run_id: str
+    final_executable_sha: str
+    absolute_deadline_epoch: float
+    provider_budget: ProviderAggregateBudgetV1
+    provider_budget_state_path: str
+    evidence_root: str
+    process_event_log: str
+    scenario_state_path: str
+    owner_authorized: bool
+
+    def __post_init__(self) -> None:
+        if not str(self.acceptance_run_id).strip():
+            raise ProviderRuntimeContractError("acceptance execution context run ID is required")
+        if not str(self.final_executable_sha).strip():
+            raise ProviderRuntimeContractError("acceptance execution context final SHA is required")
+        if (
+            isinstance(self.absolute_deadline_epoch, bool)
+            or not math.isfinite(float(self.absolute_deadline_epoch))
+            or float(self.absolute_deadline_epoch) < 0
+        ):
+            raise ProviderRuntimeContractError(
+                "acceptance execution context deadline must be a finite non-negative number"
+            )
+        for name in (
+            "provider_budget_state_path",
+            "evidence_root",
+            "process_event_log",
+            "scenario_state_path",
+        ):
+            if not str(getattr(self, name) or "").strip():
+                raise ProviderRuntimeContractError(
+                    f"acceptance execution context {name} is required"
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "acceptance_run_id": self.acceptance_run_id,
+            "final_executable_sha": self.final_executable_sha,
+            "absolute_deadline_epoch": self.absolute_deadline_epoch,
+            "provider_budget": self.provider_budget.to_dict(),
+            "provider_budget_state_path": self.provider_budget_state_path,
+            "evidence_root": self.evidence_root,
+            "process_event_log": self.process_event_log,
+            "scenario_state_path": self.scenario_state_path,
+            "owner_authorized": self.owner_authorized,
+        }
+
+
+@dataclass(frozen=True)
 class ProviderAggregateReservationV1:
     reservation_id: str
     provider_calls: int
@@ -185,6 +464,69 @@ class ProviderAggregateReservationV1:
     owner_pid: int = 0
     transport_started: bool = False
     context: Mapping[str, Any] = field(default_factory=dict)
+    owner_process_creation_time: float | None = None
+    owner_host_id: str = ""
+
+
+_ACTIVE_ACCEPTANCE_CONTEXT: ContextVar[AcceptanceExecutionContextV1 | None] = ContextVar(
+    "active_acceptance_execution_context",
+    default=None,
+)
+_ACTIVE_ACCEPTANCE_CONTROLLER: ContextVar["ProviderBudgetController | None"] = ContextVar(
+    "active_acceptance_budget_controller",
+    default=None,
+)
+
+
+def current_acceptance_execution_context() -> AcceptanceExecutionContextV1 | None:
+    return _ACTIVE_ACCEPTANCE_CONTEXT.get()
+
+
+@contextmanager
+def bind_acceptance_execution_context(
+    context: AcceptanceExecutionContextV1,
+    controller: "ProviderBudgetController",
+):
+    """Bind typed acceptance authority and a child-process environment bridge."""
+
+    if controller.budget != context.provider_budget:
+        raise ProviderRuntimeContractError(
+            "acceptance execution context budget does not match its controller"
+        )
+    context_token = _ACTIVE_ACCEPTANCE_CONTEXT.set(context)
+    controller_token = _ACTIVE_ACCEPTANCE_CONTROLLER.set(controller)
+    environment_keys = (
+        "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON",
+        "AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH",
+        "AUTO_GENERATE_ACCEPTANCE_RUN_ID",
+        "AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON",
+    )
+    previous = {key: os.environ.get(key) for key in environment_keys}
+    os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON"] = json.dumps(
+        context.provider_budget.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH"] = (
+        context.provider_budget_state_path
+    )
+    os.environ["AUTO_GENERATE_ACCEPTANCE_RUN_ID"] = context.acceptance_run_id
+    os.environ["AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON"] = json.dumps(
+        context.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    try:
+        yield context
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        _ACTIVE_ACCEPTANCE_CONTROLLER.reset(controller_token)
+        _ACTIVE_ACCEPTANCE_CONTEXT.reset(context_token)
 
 
 class ProviderBudgetController:
@@ -206,6 +548,7 @@ class ProviderBudgetController:
             else 0.0
         )
         self._owner_id = uuid.uuid4().hex
+        self._process_identity = process_identity_for_pid(os.getpid())
         self._lock = threading.RLock()
         self._reservations: dict[str, ProviderAggregateReservationV1] = {}
         self._calls_used = 0
@@ -237,13 +580,7 @@ class ProviderBudgetController:
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
+        return is_process_alive(process_identity_for_pid(pid))
 
     def _load_state_unlocked(self) -> None:
         if self._state_path is None or not self._state_path.is_file():
@@ -258,6 +595,7 @@ class ProviderBudgetController:
         if not isinstance(payload, Mapping) or state_schema not in {
             "provider-aggregate-budget-v1",
             "provider-aggregate-budget-v2",
+            "provider-aggregate-budget-v3",
         }:
             raise ProviderRuntimeContractError("provider aggregate budget state schema is invalid")
         if (
@@ -306,6 +644,7 @@ class ProviderBudgetController:
                 reservation_id = str(raw.get("reservation_id") or "").strip()
                 if not reservation_id:
                     raise ProviderRuntimeContractError("provider aggregate reservation ID is missing")
+                raw_creation_time = raw.get("owner_process_creation_time")
                 try:
                     reservation = ProviderAggregateReservationV1(
                         reservation_id=reservation_id,
@@ -315,6 +654,12 @@ class ProviderBudgetController:
                         admitted_at=str(raw.get("admitted_at") or ""),
                         owner_id=str(raw.get("owner_id") or ""),
                         owner_pid=int(raw.get("owner_pid") or 0),
+                        owner_process_creation_time=(
+                            None
+                            if raw_creation_time in (None, "")
+                            else float(str(raw_creation_time))
+                        ),
+                        owner_host_id=str(raw.get("owner_host_id") or ""),
                         transport_started=bool(raw.get("transport_started", False)),
                         context=dict(raw.get("context") or {}),
                     )
@@ -394,12 +739,29 @@ class ProviderBudgetController:
         self._output_tokens_reserved = sum(item.output_tokens for item in self._reservations.values())
         self._retry_attempts_reserved = sum(item.retry_attempts for item in self._reservations.values())
 
+    @staticmethod
+    def _reservation_process_identity(
+        reservation: ProviderAggregateReservationV1,
+    ) -> ProcessIdentityV1:
+        return ProcessIdentityV1(
+            pid=reservation.owner_pid,
+            creation_time=reservation.owner_process_creation_time,
+            host_id=reservation.owner_host_id,
+        )
+
+    @classmethod
+    def _reservation_owner_liveness(
+        cls,
+        reservation: ProviderAggregateReservationV1,
+    ) -> ProcessLiveness:
+        return process_liveness(cls._reservation_process_identity(reservation))
+
     def _reconcile_dead_reservations_unlocked(self) -> None:
         """Release only reservations proven to have died before transport."""
 
         stale: list[str] = []
         for reservation_id, reservation in self._reservations.items():
-            if self._pid_alive(reservation.owner_pid):
+            if self._reservation_owner_liveness(reservation) != "dead":
                 continue
             if reservation.transport_started:
                 self._ambiguous_reservation_ids.add(reservation_id)
@@ -415,7 +777,7 @@ class ProviderBudgetController:
         atomic_write_json(
             str(self._state_path),
             {
-                "schema_version": "provider-aggregate-budget-v2",
+                "schema_version": "provider-aggregate-budget-v3",
                 "budget": self.budget.to_dict(),
                 "calls_used": self._calls_used,
                 "output_tokens_used": self._output_tokens_used,
@@ -435,6 +797,8 @@ class ProviderBudgetController:
                         "admitted_at": reservation.admitted_at,
                         "owner_id": reservation.owner_id,
                         "owner_pid": reservation.owner_pid,
+                        "owner_process_creation_time": reservation.owner_process_creation_time,
+                        "owner_host_id": reservation.owner_host_id,
                         "transport_started": reservation.transport_started,
                         "context": dict(reservation.context),
                     }
@@ -519,7 +883,9 @@ class ProviderBudgetController:
                 retry_attempts=retry_attempts,
                 admitted_at=utc_now_iso(),
                 owner_id=self._owner_id,
-                owner_pid=os.getpid(),
+                owner_pid=self._process_identity.pid,
+                owner_process_creation_time=self._process_identity.creation_time,
+                owner_host_id=self._process_identity.host_id,
                 context=dict(context or {}),
         )
         self._reservations[reservation.reservation_id] = reservation
@@ -598,7 +964,7 @@ class ProviderBudgetController:
         recovered: list[str] = []
         ambiguous: list[str] = []
         for reservation_id, reservation in list(self._reservations.items()):
-            if self._pid_alive(reservation.owner_pid):
+            if self._reservation_owner_liveness(reservation) != "dead":
                 continue
             receipt = receipt_by_reservation.get(reservation_id)
             if receipt is not None:
@@ -736,6 +1102,9 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
     """Return one shared controller for the current acceptance subprocess."""
 
     global _ENV_BUDGET_RAW, _ENV_BUDGET_CONTROLLER
+    active_controller = _ACTIVE_ACCEPTANCE_CONTROLLER.get()
+    if active_controller is not None:
+        return active_controller
     raw = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON", "")).strip()
     if not raw:
         with _ENV_BUDGET_LOCK:
@@ -1193,6 +1562,59 @@ class ProviderCallReceiptV1:
         object.__setattr__(self, "metadata", _redact_mapping(dict(self.metadata)))
         object.__setattr__(self, "fallback_or_payload_mutations", tuple(str(item) for item in self.fallback_or_payload_mutations))
 
+    def validate_acceptance_authority(
+        self,
+        *,
+        expected_job_id: str = "",
+        expected_attempt_id: str = "",
+        expected_stage_name: str = "",
+    ) -> None:
+        """Require the complete identity needed for a live acceptance claim."""
+
+        if self.test_only is not False:
+            raise ProviderRuntimeContractError("test-only provider receipt cannot satisfy live acceptance")
+        for name in (
+            "receipt_id",
+            "job_id",
+            "attempt_id",
+            "stage_name",
+            "route",
+            "provider",
+            "model",
+            "endpoint",
+            "endpoint_type",
+            "node_id",
+            "call_id",
+            "closure_epoch_id",
+            "started_at",
+            "finished_at",
+        ):
+            if not str(getattr(self, name) or "").strip():
+                raise ProviderRuntimeContractError(
+                    f"acceptance provider receipt requires {name}"
+                )
+        for expected, actual, label in (
+            (expected_job_id, self.job_id, "job_id"),
+            (expected_attempt_id, self.attempt_id, "attempt_id"),
+            (expected_stage_name, self.stage_name, "stage_name"),
+        ):
+            if expected and actual != expected:
+                raise ProviderRuntimeContractError(
+                    f"acceptance provider receipt {label} does not match its evidence owner"
+                )
+        if not isinstance(self.metadata, Mapping):
+            raise ProviderRuntimeContractError("acceptance provider receipt metadata is invalid")
+        transport_config = self.metadata.get("transport_config")
+        if not isinstance(transport_config, Mapping):
+            raise ProviderRuntimeContractError(
+                "acceptance provider receipt lacks transport identity"
+            )
+        for name in ("provider_family", "endpoint_type", "api_base", "model"):
+            if not str(transport_config.get(name) or "").strip():
+                raise ProviderRuntimeContractError(
+                    f"acceptance provider receipt transport identity requires {name}"
+                )
+
     @classmethod
     def from_result(
         cls,
@@ -1456,6 +1878,24 @@ class ProviderRuntimeLedger:
             with interprocess_file_lock(self.path):
                 return tuple(self._read_unlocked())
 
+    def list_acceptance_receipts(
+        self,
+        *,
+        expected_job_id: str = "",
+        expected_attempt_id: str = "",
+        expected_stage_name: str = "",
+    ) -> tuple[ProviderCallReceiptV1, ...]:
+        """Load receipts through the strict live-acceptance authority parser."""
+
+        receipts = self.list_receipts()
+        for receipt in receipts:
+            receipt.validate_acceptance_authority(
+                expected_job_id=expected_job_id,
+                expected_attempt_id=expected_attempt_id,
+                expected_stage_name=expected_stage_name,
+            )
+        return receipts
+
     def usage_summary(self) -> dict[str, Any]:
         """Recompute physical call usage from durable receipts."""
 
@@ -1605,7 +2045,11 @@ class ProviderRuntime:
                     "bound ProviderRuntime requires: " + ", ".join(missing)
                 )
         self.budget = budget or ProviderBudgetV1()
-        self.aggregate_budget = aggregate_budget or provider_budget_controller_from_environment()
+        self.aggregate_budget = (
+            aggregate_budget
+            or _ACTIVE_ACCEPTANCE_CONTROLLER.get()
+            or provider_budget_controller_from_environment()
+        )
         self.ledger = ledger
         self.job_id = job_id
         self.attempt_id = attempt_id
@@ -1832,6 +2276,7 @@ class ProviderRuntime:
 
 
 __all__ = [
+    "AcceptanceExecutionContextV1",
     "ProviderBudgetExceeded",
     "ProviderAggregateBudgetV1",
     "ProviderAggregateReservationV1",
@@ -1844,10 +2289,17 @@ __all__ = [
     "ProviderRuntime",
     "ProviderRuntimeContractError",
     "ProviderRuntimeLedger",
+    "ProcessIdentityV1",
+    "ProcessLiveness",
     "canonical_provider_request_payload",
+    "bind_acceptance_execution_context",
     "compute_closure_epoch_id",
+    "current_acceptance_execution_context",
     "hash_json",
     "hash_text",
+    "is_process_alive",
+    "process_identity_for_pid",
+    "process_liveness",
     "provider_budget_controller_from_environment",
     "provider_request_input_hash",
     "stable_provider_hash",

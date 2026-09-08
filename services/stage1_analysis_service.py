@@ -13,8 +13,10 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any, Callable, Mapping, Sequence, cast
 
 from preprocess.service import PreprocessManager
@@ -336,6 +338,7 @@ class Stage1AnalysisService:
             )
         preprocess = self._preprocess(
             source_pdf,
+            paper_key=item.canonical_paper_key,
             source_role=str(item.paper_info.get("source_attachment_role") or ""),
         )
         preprocess_metadata = self._preprocess_metadata(preprocess)
@@ -4823,6 +4826,7 @@ class Stage1AnalysisService:
 
         preprocess = self._preprocess(
             source_pdf,
+            paper_key=item.canonical_paper_key,
             source_role=str(item.paper_info.get("source_attachment_role") or ""),
         )
         preprocess_metadata = self._preprocess_metadata(preprocess)
@@ -4981,7 +4985,13 @@ class Stage1AnalysisService:
             tuple(receipt.receipt_id for receipt in runtime.receipts),
         )
 
-    def _preprocess(self, source_pdf: str, *, source_role: str = "") -> Any:
+    def _preprocess(
+        self,
+        source_pdf: str,
+        *,
+        paper_key: str = "",
+        source_role: str = "",
+    ) -> Any:
         preprocess_config = {
             str(section): dict(values) if isinstance(values, Mapping) else values
             for section, values in self.config.items()
@@ -4991,7 +5001,10 @@ class Stage1AnalysisService:
             "cache_dir", self.workspace.artifact_path("preprocess_cache")
         )
         preprocess_config["Preprocess"] = preprocess_section
-        result = PreprocessManager(preprocess_config, logger=self.logger).prepare_pdf(source_pdf)
+        result = PreprocessManager(preprocess_config, logger=self.logger).prepare_pdf(
+            source_pdf,
+            pin_id=f"{self.job_id}:{paper_key or source_pdf}",
+        )
         if result is None:
             raise RuntimeError(f"Stage 1 preprocessing failed or was disabled for {source_pdf}")
         reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
@@ -5015,7 +5028,53 @@ class Stage1AnalysisService:
             raise RuntimeError(
                 f"SCANNED_PRIMARY preprocessing produced no page index for {source_pdf}"
             )
-        return result
+        return self._snapshot_preprocess_authority(result, paper_key=paper_key or source_pdf)
+
+    def _snapshot_preprocess_authority(self, result: Any, *, paper_key: str) -> Any:
+        """Move formal Stage 1 authority into the job-owned workspace.
+
+        The shared preprocess cache remains an acceleration layer. Registry and
+        EvidenceManifest references must survive cache generation GC, so every
+        path consumed by Stage 1 is copied into an immutable job-owned snapshot.
+        """
+
+        generation_root = Path(str(result.manifest_path)).expanduser().resolve().parent
+        generation_id = generation_root.name
+        paper_digest = hashlib.sha256(str(paper_key).encode("utf-8")).hexdigest()[:24]
+        snapshot_root = Path(
+            self.workspace.artifact_path(
+                f"source_evidence/{paper_digest}/{generation_id}"
+            )
+        ).expanduser().resolve()
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        path_fields = (
+            "markdown_path",
+            "plain_text_path",
+            "page_index_path",
+            "chunks_path",
+            "diagnostics_path",
+            "structured_json_path",
+            "manifest_path",
+            "stage1_input_path",
+            "stage1_input_manifest_path",
+            "stage1_quality_report_path",
+        )
+        replacements: dict[str, str] = {}
+        for field_name in path_fields:
+            source = Path(str(getattr(result, field_name))).expanduser().resolve()
+            if not source.is_file() or source.is_symlink():
+                raise RuntimeError(
+                    f"preprocess authority leaf is missing before snapshot: {source}"
+                )
+            target = snapshot_root / source.name
+            if not target.is_file():
+                shutil.copyfile(source, target)
+                with target.open("rb") as handle:
+                    os.fsync(handle.fileno())
+            if file_sha256(str(source)) != file_sha256(str(target)):
+                raise RuntimeError(f"preprocess authority snapshot hash mismatch: {source.name}")
+            replacements[field_name] = str(target)
+        return replace(result, **replacements)
 
     def _preprocess_metadata(self, result: Any) -> dict[str, Any]:
         metadata = asdict(result)

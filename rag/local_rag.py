@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import hashlib
-from typing import Any, Dict, List, TypeAlias
+import re
+from typing import Any, Dict, List, Mapping, TypeAlias
 
 
 MetadataValue: TypeAlias = str | int | float | bool | None
@@ -27,6 +28,18 @@ class LocalRAGIndex:
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _identity_key(identity: Mapping[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _collection_name_for_identity(collection_name: str, identity_key: str) -> str:
+        base = re.sub(r"[^A-Za-z0-9_-]+", "-", str(collection_name or "collection"))
+        suffix = str(identity_key or "")[:16]
+        return f"{base[:45]}-{suffix}"[:63].rstrip("-_")
 
     def build_from_chunks(
         self,
@@ -58,26 +71,41 @@ class LocalRAGIndex:
             "chunk_schema_version": str(chunk_schema_version or ""),
             "embedding_model": str(embedding_model or ""),
         }
-        identity_key = hashlib.sha256(
-            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        identity_key = self._identity_key(identity)
         os.makedirs(self.persist_dir, exist_ok=True)
-        identity_path = os.path.join(self.persist_dir, f"{collection_name}.identity.json")
-        if os.path.isfile(identity_path):
+        base_identity_path = os.path.join(self.persist_dir, f"{collection_name}.identity.json")
+        selected_collection_name = str(collection_name)
+        identity_path = base_identity_path
+        if os.path.isfile(base_identity_path):
             try:
-                with open(identity_path, "r", encoding="utf-8") as handle:
+                with open(base_identity_path, "r", encoding="utf-8") as handle:
                     existing = json.load(handle)
             except (OSError, UnicodeError, json.JSONDecodeError):
                 return False
             if not isinstance(existing, dict) or existing.get("identity_key") != identity_key:
                 if self.logger:
                     self.logger.warning(
-                        "Local RAG identity does not match the requested source; refusing stale reuse."
+                        "Local RAG identity changed; selecting a new immutable collection."
                     )
-                return False
+                selected_collection_name = self._collection_name_for_identity(
+                    collection_name,
+                    identity_key,
+                )
+                identity_path = os.path.join(
+                    self.persist_dir,
+                    f"{selected_collection_name}.identity.json",
+                )
+                if os.path.isfile(identity_path):
+                    try:
+                        with open(identity_path, "r", encoding="utf-8") as handle:
+                            selected_existing = json.load(handle)
+                    except (OSError, UnicodeError, json.JSONDecodeError):
+                        return False
+                    if not isinstance(selected_existing, dict) or selected_existing.get("identity_key") != identity_key:
+                        return False
         client = chromadb.PersistentClient(path=self.persist_dir)
         collection = client.get_or_create_collection(
-            name=collection_name,
+            name=selected_collection_name,
             metadata={"identity_key": identity_key, **identity},
         )
         try:
