@@ -15,7 +15,7 @@ in the repository.
 | 'outline/v3_executor.py' | active | Only current production Outline executor; receives enabled semantic routes from the route plan. |
 | 'services/review_generation_service.py' | active | Current Stage 3 writer and DOCX publication path. |
 | 'validation/execution_service.py' / 'validation/current_validation.py' | active | Current validation, repair, provisional/durable closure path. |
-| 'pdf_extractor.py' | compatibility-only | Legacy standalone extractor used only as the last local preprocess fallback; it cannot publish canonical artifacts by itself and its fallback buffer is reset on partial parser failure. |
+| 'pdf_extractor.py' | compatibility-only / unreachable from current runtime | No current `reviewctl`, GUI, or `preprocess.service` import/invocation; retained only for isolated compatibility tests. It cannot publish canonical artifacts, and its fallback buffer is reset on partial parser failure. |
 | 'validator.py' | legacy isolated | No current runtime import or public control-plane call. Current validation enters through 'ValidationExecutionService'; direct legacy callers must migrate and are not release evidence. |
 | 'main.py' | compatibility-only | Thin shim to 'reviewctl'; it is not an orchestration implementation. |
 | 'rag/local_rag.py' | optional active | Opt-in only; source/fingerprint identity is persisted and model downloads are blocked unless explicitly enabled. |
