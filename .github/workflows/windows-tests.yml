@@ -106,32 +106,44 @@ jobs:
           Write-Host "Running $($selectedTestFiles.Count) test files in shard $shard/$shardCount"
           foreach ($testFile in $selectedTestFiles) {
             if ((Split-Path -Leaf $testFile) -eq "test_release_hardening.py") {
-              $testNodes = @(
-                python -m pytest --collect-only -q --strict-markers `
+              $collectionOutput = @(
+                & python -m pytest --collect-only -q --strict-markers `
                   -m "not live_api and not playwright and not heavy_ocr" `
-                  $testFile |
-                  Where-Object { $_ -match "::" }
+                  $testFile 2>&1
               )
+              $collectionExitCode = $LASTEXITCODE
+              $testNodes = @(
+                $collectionOutput |
+                  Where-Object { $_ -match "::" } |
+                  ForEach-Object { [string]$_ }
+              )
+              Write-Host "Collected $($testNodes.Count) selected nodes for $testFile (pytest exit code $collectionExitCode)"
+              if ($collectionExitCode -ne 0) {
+                throw "pytest node collection failed for $testFile with exit code $collectionExitCode"
+              }
               if ($testNodes.Count -eq 0) {
                 throw "No selected test nodes found for $testFile"
               }
               foreach ($testNode in $testNodes) {
                 Write-Host "Running isolated pytest process for $testNode"
-                python -m pytest -vv -rs --strict-markers $testNode
-                if ($LASTEXITCODE -ne 0) {
-                  throw "pytest failed for $testNode with exit code $LASTEXITCODE"
+                & python -m pytest -vv -rs --strict-markers $testNode
+                $testExitCode = $LASTEXITCODE
+                if ($testExitCode -ne 0) {
+                  throw "pytest failed for $testNode with exit code $testExitCode"
                 }
               }
             } else {
               Write-Host "Running isolated pytest process for $testFile"
-              python -m pytest -vv -rs --strict-markers `
+              & python -m pytest -vv -rs --strict-markers `
                 -m "not live_api and not playwright and not heavy_ocr" `
                 $testFile
-              if ($LASTEXITCODE -ne 0) {
-                throw "pytest failed for $testFile with exit code $LASTEXITCODE"
+              $testExitCode = $LASTEXITCODE
+              if ($testExitCode -ne 0) {
+                throw "pytest failed for $testFile with exit code $testExitCode"
               }
             }
           }
+          exit 0
       - name: Type check
         run: python -m pyright
       - name: Doctor
