@@ -8,9 +8,9 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-FINAL_EXECUTABLE_SHA = e45e4916d3f338cd754b33de2a10c5c2dfa07e52
+FINAL_EXECUTABLE_SHA = 9ed7c8e80d3a177905631a4c4c31a7126a42d303
 REMOTE_HEAD_AT_CODE_ACCEPTANCE = efd27f9986ca36012e07293ba605e233ffcb6605
-HOSTED_CI_RUN = NOT_RUN_FOR_E45E4916
+HOSTED_CI_RUN = NOT_RUN_FOR_9ED7C8E8
 HOSTED_CI_CONCLUSION = NOT_RUN
 ```
 
@@ -222,7 +222,7 @@ zero.
 
 ### Local exact-SHA checks
 
-The current executable commit is e45e4916d3f338cd754b33de2a10c5c2dfa07e52.
+The current executable commit is 9ed7c8e80d3a177905631a4c4c31a7126a42d303.
 The report-only update will be a child commit and does not change that
 executable SHA.
 
@@ -250,9 +250,11 @@ a local PASS.
 
 ### Hosted exact-SHA checks
 
-Hosted runs 34167741790 and 34170040302 both stopped after 834 tests with
-KeyboardInterrupt at the now-removed subprocess fixture; neither is evidence
-for e45e4916d3f338cd754b33de2a10c5c2dfa07e52. A fresh exact-SHA run is pending.
+Hosted runs 34167741790 and 34170040302 stopped after 834 tests with
+KeyboardInterrupt at the then-present subprocess fixture; run 34171201672
+stopped after 852 tests with the fixture removed. None is evidence for
+9ed7c8e80d3a177905631a4c4c31a7126a42d303. A fresh verbose exact-SHA run is
+pending.
 The earlier successful run belongs to the preceding executable SHA and is not
 evidence for this code revision.
 
