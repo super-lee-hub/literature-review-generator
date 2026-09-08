@@ -663,6 +663,20 @@ class ReviewControlPlane:
             )
             atomic_write_json(str(state_path), state.to_dict())
 
+        if acceptance_spec.evidence_manifest and evidence_path.is_file():
+            try:
+                existing_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                existing_evidence = None
+            if (
+                not isinstance(existing_evidence, Mapping)
+                or str(existing_evidence.get("final_sha") or "") != current_sha
+                or str(existing_evidence.get("acceptance_run_id") or "") != state.run_id
+            ):
+                evidence_path = (
+                    Path(state.evidence_root).expanduser().resolve()
+                    / "acceptance_evidence_index_v1.json"
+                )
         if not acceptance_spec.evidence_manifest:
             evidence_path = (
                 Path(state.evidence_root).expanduser().resolve()
@@ -803,11 +817,13 @@ class ReviewControlPlane:
             evidence_root=state.evidence_root,
             process_event_log=state.process_event_log,
             owner_authorized=execution_context.owner_authorized,
+            provider_budget=execution_context.provider_budget.to_dict(),
+            provider_budget_state_path=execution_context.provider_budget_state_path,
         )
         scenario_results: dict[str, Any] = {}
         scenario_refs: dict[str, tuple[Mapping[str, Any], ...]] = {}
         for gate in gates:
-            scenario_result = scenario_for_gate(str(gate)).collect(
+            scenario_result = scenario_for_gate(str(gate)).execute(
                 scenario_context,
                 refs,
                 runtime_result=runtime_result,
@@ -1037,6 +1053,8 @@ class ReviewControlPlane:
                 "provider_call_receipt": "provider_receipt_ledger",
                 "provider_receipt_ledger": "provider_receipt_ledger",
                 "stage1_canonical_summaries": "canonical_stage1",
+                "summary_file": "canonical_stage1",
+                "paper_artifact": "canonical_stage1",
                 "outline_provider_call_plan": "outline_provider_call_plan",
                 "review_docx": "review_docx",
                 "validation_run_result": "validation_artifact",

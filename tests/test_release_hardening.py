@@ -27,8 +27,10 @@ from runtime.provider_runtime import (
     process_identity_for_pid,
 )
 from runtime.release_acceptance import (
+    AcceptanceScenarioContextV1,
     GateEvidenceProducer,
     GateEvidenceVerifier,
+    GateKScenario,
     ReleaseAcceptanceSpec,
     ReleaseAcceptanceSpecError,
     validate_gate_evidence,
@@ -355,6 +357,46 @@ def test_gate_k_rejects_fake_process_ids_and_lock_file(tmp_path: Path) -> None:
         field in str(result.get("reason", ""))
         for field in ("corrupt", "lost", "contention", "derived")
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires independent Windows processes")
+def test_gate_k_scenario_executes_real_dual_process_contention(tmp_path: Path) -> None:
+    context = AcceptanceScenarioContextV1(
+        acceptance_run_id="acceptance-k-test",
+        final_executable_sha="3" * 40,
+        runtime_spec_path="",
+        workspace_path="",
+        job_id="",
+        evidence_root=str(tmp_path / "evidence"),
+        process_event_log=str(tmp_path / "process_events.jsonl"),
+        owner_authorized=True,
+        provider_budget={
+            "max_provider_calls_total": 4,
+            "max_output_tokens_total": 8,
+            "max_retry_attempts_total": 0,
+            "max_wall_seconds": 60,
+        },
+        provider_budget_state_path=str(tmp_path / "budget.json"),
+    )
+
+    scenario = GateKScenario()
+    result = scenario.collect(context, [], runtime_result=None)
+
+    assert result.status == "READY_FOR_SEMANTIC_VERIFICATION"
+    evidence = GateEvidenceProducer(final_sha="3" * 40).build_gate(
+        "K",
+        result.evidence_refs,
+    )
+    verified = GateEvidenceVerifier().verify(
+        "K",
+        evidence,
+        expected_final_sha="3" * 40,
+    )
+
+    assert verified["status"] == "PASS", verified
+    assert verified["derived_facts"]["process_count"] == 2
+    assert verified["derived_facts"]["no_corrupt_json"] is True
+    assert verified["derived_facts"]["no_lost_update"] is True
 
 
 def test_live_gate_rejects_provider_receipt_missing_authoritative_job_binding(tmp_path: Path) -> None:
@@ -817,7 +859,7 @@ def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, mon
                 "budget": {
                     "max_provider_calls_total": 1,
                     "max_output_tokens_total": 4,
-                    "max_retry_attempts_total": 0,
+                    "max_retry_attempts_total": 1,
                     "max_wall_seconds": 60,
                 },
             }

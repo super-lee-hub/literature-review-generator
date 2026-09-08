@@ -2296,6 +2296,9 @@ def _call_ai_api_detailed(
             "request_budget": budget,
             "requested_output_tokens": int(max_tokens),
             "transport_config": transport_config,
+            "config_section": str(provider_runtime.route or "")
+            if str(provider_runtime.route or "").endswith("_API")
+            else "",
             **dict(result.get("transport_metadata") or {}),
         },
         route=provider_route,

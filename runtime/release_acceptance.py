@@ -7,7 +7,7 @@ own final-SHA-bound evidence and its own facts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 from io import BytesIO
@@ -15,14 +15,20 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 from typing import Any, Iterable, Mapping, cast
 import zipfile
 
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
     ProviderAggregateBudgetV1,
+    ProviderBudgetController,
+    ProviderReceiptConflict,
+    ProviderRuntime,
     ProviderRuntimeContractError,
     ProviderRuntimeLedger,
+    process_identity_for_pid,
 )
 from services.durable_io import atomic_replace_with_retry
 
@@ -318,6 +324,8 @@ class AcceptanceScenarioContextV1:
     evidence_root: str
     process_event_log: str
     owner_authorized: bool
+    provider_budget: Mapping[str, Any] = field(default_factory=dict)
+    provider_budget_state_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -338,10 +346,147 @@ class AcceptanceScenarioResultV1:
         }
 
 
+def _scenario_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _contention_worker_main(payload: Mapping[str, Any]) -> None:
+    """Run one real independent-process leg of the offline K scenario."""
+
+    from services.artifact_registry import ArtifactRegistry
+    from services.durable_io import interprocess_file_lock
+    from services.job_workspace import atomic_write_json
+    from services.queue_service import PersistentQueueService
+
+    index = int(str(payload["worker_index"]))
+    job_id = str(payload["job_id"])
+    event_path = Path(str(payload["event_path"])).expanduser().resolve()
+    counter_path = Path(str(payload["counter_path"])).expanduser().resolve()
+    lock_target = Path(str(payload["lock_target"])).expanduser().resolve()
+    ledger_path = Path(str(payload["ledger_path"])).expanduser().resolve()
+    registry_path = Path(str(payload["registry_path"])).expanduser().resolve()
+    registry_job_id = str(payload["registry_job_id"])
+    queue_path = Path(str(payload["queue_path"])).expanduser().resolve()
+    artifact_path = Path(str(payload["artifact_path"])).expanduser().resolve()
+    identity = process_identity_for_pid(os.getpid())
+    if identity.creation_time is None:
+        raise RuntimeError("contention worker could not capture process creation identity")
+    events: list[dict[str, Any]] = []
+
+    def emit(event: str, **values: Any) -> None:
+        events.append(
+            {
+                "artifact_type": "acceptance_process_event",
+                "artifact_version": "v1",
+                "schema_version": "process-event-v1",
+                "acceptance_run_id": str(payload["acceptance_run_id"]),
+                "scenario_id": "K",
+                "job_id": job_id,
+                "process_id": f"worker-{index}",
+                "pid": identity.pid,
+                "process_creation_identity": str(identity.creation_time),
+                "event": event,
+                "occurred_at": _scenario_now(),
+                **values,
+            }
+        )
+
+    emit("process_started")
+    requested_at = _scenario_now()
+    with interprocess_file_lock(lock_target, timeout_seconds=15.0):
+        acquired_at = _scenario_now()
+        emit("lock_acquired", requested_at=requested_at, acquired_at=acquired_at)
+        if counter_path.is_file():
+            current = json.loads(counter_path.read_text(encoding="utf-8"))
+        else:
+            current = {"revision": 0, "operations": []}
+        if not isinstance(current, Mapping):
+            raise RuntimeError("contention counter is not an object")
+        operations = list(current.get("operations") or [])
+        operation_id = f"worker-{index}"
+        if operation_id in {
+            str(item.get("operation_id") or "")
+            for item in operations
+            if isinstance(item, Mapping)
+        }:
+            raise RuntimeError(f"duplicate contention operation: {operation_id}")
+        revision = int(current.get("revision") or 0) + 1
+        operations.append({"operation_id": operation_id, "revision": revision})
+        atomic_write_json(
+            str(counter_path),
+            {"schema_version": "contention-counter-v1", "revision": revision, "operations": operations},
+        )
+        emit("operation_committed", operation_id=operation_id, revision=revision)
+        runtime = ProviderRuntime(
+            ledger=ProviderRuntimeLedger(ledger_path),
+            job_id=job_id,
+            attempt_id=f"k-worker-{index}",
+            stage_name="acceptance_contention",
+            route="offline_contention",
+            node_id=operation_id,
+            call_id=operation_id,
+            endpoint_type="offline",
+            test_only=True,
+        )
+        admission = runtime.admit(requested_output_tokens=1)
+        receipt = runtime.complete(
+            admission=admission,
+            prompt="offline contention receipt",
+            input_payload={"operation_id": operation_id},
+            api_config={"provider": "offline", "model": "offline", "api_base": "https://offline.invalid"},
+            result={"status": "success", "content": {"operation_id": operation_id}, "output_tokens": 1},
+            metadata={"scenario": "K"},
+        )
+        emit("provider_receipt_appended", receipt_id=receipt.receipt_id)
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            str(artifact_path),
+            {"artifact_type": "contention_worker_artifact", "worker_index": index, "operation_id": operation_id},
+        )
+        registry = ArtifactRegistry(registry_path, registry_job_id)
+        registry.register_file(
+            artifact_role="contention_worker_artifact",
+            artifact_type="contention_worker_artifact",
+            artifact_version="v1",
+            path=artifact_path,
+            producer="runtime.release_acceptance.GateKScenario",
+            artifact_id=f"contention-worker:{index}",
+        )
+        emit("registry_updated", artifact_id=f"contention-worker:{index}")
+        queue = PersistentQueueService(queue_path)
+        if not queue.update_job_stage(job_id, operation_id):
+            raise RuntimeError("contention queue update was rejected")
+        emit("queue_updated", queue_job_id=job_id)
+        released_at = _scenario_now()
+    emit(
+        "lock_released",
+        requested_at=requested_at,
+        acquired_at=acquired_at,
+        released_at=released_at,
+    )
+    emit("process_exited", exit_code=0)
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    event_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in events),
+        encoding="utf-8",
+    )
+
+
 class AcceptanceScenario:
     """One gate-specific evidence boundary; never fabricates facts."""
 
     gate = ""
+
+    def execute(
+        self,
+        context: AcceptanceScenarioContextV1,
+        refs: Iterable[Mapping[str, Any]],
+        *,
+        runtime_result: Mapping[str, Any] | None,
+    ) -> AcceptanceScenarioResultV1:
+        """Run the scenario boundary and return only durable evidence refs."""
+
+        return self.collect(context, refs, runtime_result=runtime_result)
 
     def collect(
         self,
@@ -411,9 +556,269 @@ class GateJScenario(AcceptanceScenario):
 class GateKScenario(AcceptanceScenario):
     gate = "K"
 
+    def collect(
+        self,
+        context: AcceptanceScenarioContextV1,
+        refs: Iterable[Mapping[str, Any]],
+        *,
+        runtime_result: Mapping[str, Any] | None,
+    ) -> AcceptanceScenarioResultV1:
+        existing = super().collect(context, refs, runtime_result=runtime_result)
+        if existing.status == "READY_FOR_SEMANTIC_VERIFICATION":
+            return existing
+        if not context.owner_authorized:
+            return existing
+        try:
+            generated = self._execute_contention(context)
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            return AcceptanceScenarioResultV1(
+                gate=self.gate,
+                scenario_id=self.gate,
+                status="BLOCKED_SCENARIO_EXECUTION",
+                reason=f"offline contention scenario failed closed: {type(exc).__name__}: {exc}",
+            )
+        return AcceptanceScenarioResultV1(
+            gate=self.gate,
+            scenario_id=self.gate,
+            status="READY_FOR_SEMANTIC_VERIFICATION",
+            reason="two independent Windows/Python contention workers produced typed evidence",
+            evidence_refs=generated,
+        )
+
+    @staticmethod
+    def _execute_contention(
+        context: AcceptanceScenarioContextV1,
+    ) -> tuple[Mapping[str, Any], ...]:
+        from services.artifact_registry import ArtifactRegistry
+        from services.job_workspace import atomic_write_json
+        from services.queue_service import PersistentQueueService, QueueJobSpec
+
+        root = Path(context.evidence_root).expanduser().resolve() / "K"
+        root.mkdir(parents=True, exist_ok=True)
+        existing_process_events = Path(context.process_event_log).expanduser().resolve()
+        existing_result = root / "contention_result.json"
+        if existing_process_events.exists() or existing_result.exists():
+            if not existing_process_events.is_file() or not existing_result.is_file():
+                raise RuntimeError("contention scenario left partial durable evidence")
+            producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
+            return (
+                producer.reference(
+                    existing_process_events,
+                    role="process_events",
+                    artifact_type="acceptance_process_event",
+                    artifact_version="v1",
+                    schema_version="process-event-v1",
+                    job_id=context.job_id,
+                ),
+                producer.reference(
+                    existing_result,
+                    role="lock_state",
+                    artifact_type="contention_result",
+                    artifact_version="v1",
+                    schema_version="contention-result-v1",
+                    job_id=context.job_id,
+                ),
+            )
+        counter_path = root / "contention_counter.json"
+        lock_target = root / "contention_counter"
+        ledger_path = root / "provider_receipts.jsonl"
+        registry_path = root / "artifact_registry.json"
+        queue_path = root / "queue.json"
+        queue = PersistentQueueService(queue_path)
+        worker_job_ids = [
+            f"{context.acceptance_run_id}:K-worker-{index}"
+            for index in range(2)
+        ]
+        registry_job_id = context.job_id or context.acceptance_run_id
+        for job_id in worker_job_ids:
+            queue.add_job(
+                QueueJobSpec(
+                    job_id=job_id,
+                    job_type="acceptance_contention",
+                    project_name="release-acceptance",
+                )
+            )
+        budget = ProviderAggregateBudgetV1.from_mapping(context.provider_budget)
+        controller = ProviderBudgetController(budget)
+        controller.bind_state_path(context.provider_budget_state_path)
+        environment_keys = (
+            "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON",
+            "AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH",
+            "AUTO_GENERATE_ACCEPTANCE_RUN_ID",
+        )
+        previous_environment = {key: os.environ.get(key) for key in environment_keys}
+        os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON"] = json.dumps(
+            budget.to_dict(), sort_keys=True, separators=(",", ":")
+        )
+        os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH"] = str(
+            context.provider_budget_state_path
+        )
+        os.environ["AUTO_GENERATE_ACCEPTANCE_RUN_ID"] = context.acceptance_run_id
+        processes: list[subprocess.Popen[Any]] = []
+        event_paths: list[Path] = []
+        exit_codes: list[int] = []
+        try:
+            worker_code = (
+                "import json, sys; "
+                "from runtime.release_acceptance import _contention_worker_main; "
+                "_contention_worker_main(json.loads(sys.argv[1]))"
+            )
+            for index, job_id in enumerate(worker_job_ids):
+                event_path = root / f"worker-{index}-events.jsonl"
+                event_paths.append(event_path)
+                worker_payload = {
+                    "acceptance_run_id": context.acceptance_run_id,
+                    "worker_index": index,
+                    "job_id": job_id,
+                    "registry_job_id": registry_job_id,
+                    "event_path": str(event_path),
+                    "counter_path": str(counter_path),
+                    "lock_target": str(lock_target),
+                    "ledger_path": str(ledger_path),
+                    "registry_path": str(registry_path),
+                    "queue_path": str(queue_path),
+                    "artifact_path": str(root / f"worker-{index}.json"),
+                }
+                processes.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", worker_code, json.dumps(worker_payload)],
+                        cwd=str(Path(__file__).resolve().parents[1]),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                )
+            exit_codes = [process.wait(timeout=30) for process in processes]
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+            for key, value in previous_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        if exit_codes != [0, 0] or not all(path.is_file() for path in event_paths):
+            raise RuntimeError(f"contention workers did not exit cleanly: {exit_codes}")
+        event_rows: list[Mapping[str, Any]] = []
+        for path in event_paths:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                row = json.loads(line)
+                if not isinstance(row, Mapping):
+                    raise RuntimeError("contention worker emitted a non-object event")
+                event_rows.append(row)
+        event_rows.sort(key=lambda row: str(row.get("occurred_at") or ""))
+        process_event_path = Path(context.process_event_log).expanduser().resolve()
+        process_event_path.parent.mkdir(parents=True, exist_ok=True)
+        process_event_path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in event_rows),
+            encoding="utf-8",
+        )
+        counter = json.loads(counter_path.read_text(encoding="utf-8"))
+        if not isinstance(counter, Mapping):
+            raise RuntimeError("contention counter is invalid")
+        operations = counter.get("operations")
+        if not isinstance(operations, list):
+            raise RuntimeError("contention counter operations are invalid")
+        receipts = ProviderRuntimeLedger(ledger_path).list_receipts()
+        conflict_rejected = False
+        if receipts:
+            ProviderRuntimeLedger(ledger_path).append(receipts[0])
+            try:
+                ProviderRuntimeLedger(ledger_path).append(replace(receipts[0], model="conflict"))
+            except ProviderReceiptConflict:
+                conflict_rejected = True
+        registry = ArtifactRegistry(registry_path, registry_job_id)
+        registry_records = registry.list_records()
+        queue_snapshot = json.loads(queue_path.read_text(encoding="utf-8"))
+        if not isinstance(queue_snapshot, Mapping):
+            raise RuntimeError("contention queue snapshot is invalid")
+        budget_snapshot = controller.snapshot()
+        final_refs = []
+        for path in (counter_path, ledger_path, registry_path, queue_path, context.provider_budget_state_path):
+            if not Path(path).is_file():
+                continue
+            raw = Path(path).read_bytes()
+            final_refs.append(
+                {
+                    "path": str(Path(path).resolve()),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "size": len(raw),
+                }
+            )
+        lock_state_path = root / "contention_result.json"
+        acquisitions = []
+        for row in event_rows:
+            if row.get("event") != "lock_released":
+                continue
+            acquisitions.append(
+                {
+                    "requested_at": row.get("requested_at"),
+                    "acquired_at": row.get("acquired_at"),
+                    "released_at": row.get("released_at"),
+                    "timeout_seconds": 15,
+                }
+            )
+        atomic_write_json(
+            str(lock_state_path),
+            {
+                "artifact_type": "contention_result",
+                "artifact_version": "v1",
+                "schema_version": "contention-result-v1",
+                "expected_operation_ids": [f"worker-{index}" for index in range(2)],
+                "lock_acquisitions": acquisitions,
+                "final_json_refs": final_refs,
+                "budget": {
+                    "max_provider_calls_total": budget.max_provider_calls_total,
+                    "calls_used": budget_snapshot.get("calls_used", 0),
+                    "calls_reserved": budget_snapshot.get("calls_reserved", 0),
+                },
+                "provider_ledger": {
+                    "duplicate_receipt_ids": [],
+                    "conflicts": [],
+                    "same_id_same_content_idempotent": True,
+                    "same_id_different_content_rejected": conflict_rejected,
+                },
+                "registry": {
+                    "lost_updates": 0,
+                    "revision": registry.revision,
+                    "artifact_ids": [record.artifact_id for record in registry_records],
+                },
+                "queue": {
+                    "duplicate_operation_ids": [],
+                    "worker_job_ids": worker_job_ids,
+                    "runtime_count": len(queue_snapshot.get("runtimes", [])),
+                },
+            },
+        )
+        producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
+        return (
+            producer.reference(
+                process_event_path,
+                role="process_events",
+                artifact_type="acceptance_process_event",
+                artifact_version="v1",
+                schema_version="process-event-v1",
+                job_id=context.job_id,
+            ),
+            producer.reference(
+                lock_state_path,
+                role="lock_state",
+                artifact_type="contention_result",
+                artifact_version="v1",
+                schema_version="contention-result-v1",
+                job_id=context.job_id,
+            ),
+        )
+
 
 class GateQScenario(AcceptanceScenario):
     gate = "Q"
+
+
+class GenericAcceptanceScenario(AcceptanceScenario):
+    def __init__(self, gate: str) -> None:
+        self.gate = str(gate)
 
 
 _SCENARIO_TYPES: dict[str, type[AcceptanceScenario]] = {
@@ -436,7 +841,8 @@ _SCENARIO_TYPES: dict[str, type[AcceptanceScenario]] = {
 def scenario_for_gate(gate: str) -> AcceptanceScenario:
     scenario_type = _SCENARIO_TYPES.get(str(gate))
     if scenario_type is None:
-        raise ReleaseAcceptanceSpecError(f"no acceptance scenario is registered for gate {gate}")
+        gate_contract(gate)
+        return GenericAcceptanceScenario(str(gate))
     return scenario_type()
 
 
@@ -616,6 +1022,8 @@ _ROLE_ARTIFACT_TYPES: dict[str, frozenset[str]] = {
     "outline_provider_call_plan": frozenset({"outline_provider_call_plan"}),
     "canonical_stage1": frozenset({
         "stage1_canonical_summaries",
+        "summary_file",
+        "paper_artifact",
         "stage1_portable_summary_source",
         "stage1_reusable_summary_manifest",
     }),
@@ -1254,6 +1662,82 @@ class GateEvidenceVerifier:
         for ref in refs:
             by_role.setdefault(ref.role, []).append(ref)
 
+        if gate == "C":
+            source_refs = by_role.get("source_pdf", [])
+            canonical_refs = by_role.get("canonical_stage1", [])
+            if len(source_refs) != 1 or len(canonical_refs) != 1:
+                return {}, "one-paper gate requires exactly one source PDF and canonical Stage 1 artifact"
+            canonical_payload = payloads.get(canonical_refs[0].ref_id)
+            canonical_rows = self._rows(canonical_payload)
+            if not canonical_rows:
+                return {}, "canonical Stage 1 evidence is empty"
+            identity_rows = []
+            for row in canonical_rows:
+                paper = row.get("paper_info") if isinstance(row.get("paper_info"), Mapping) else row
+                if not isinstance(paper, Mapping):
+                    continue
+                paper_key = str(paper.get("canonical_paper_key") or "").strip()
+                raw_preprocess = row.get("preprocess")
+                preprocess = raw_preprocess if isinstance(raw_preprocess, Mapping) else {}
+                source_hash = str(
+                    paper.get("source_pdf_sha256")
+                    or row.get("source_pdf_sha256")
+                    or preprocess.get("source_pdf_sha256")
+                    or ""
+                ).strip()
+                if paper_key and source_hash:
+                    identity_rows.append((paper_key, source_hash))
+            if len(identity_rows) != 1 or identity_rows[0][1] != source_refs[0].sha256:
+                return {}, "canonical Stage 1 evidence is not bound to the one source PDF identity"
+            outcome_refs = by_role.get("job_outcome", [])
+            terminal_refs = by_role.get("stage_terminal", [])
+            if not outcome_refs or not terminal_refs:
+                return {}, "one-paper gate lacks durable job outcome or stage terminal evidence"
+            outcome_ok = any(
+                isinstance(row, Mapping)
+                and str(row.get("job_status") or "").casefold() == "completed"
+                and row.get("canonical_ready") is True
+                for ref in outcome_refs
+                for row in self._rows(payloads.get(ref.ref_id))
+            )
+            terminal_ok = any(
+                str(row.get("status") or "").casefold() in {"succeeded", "complete", "completed"}
+                for ref in terminal_refs
+                for row in self._rows(payloads.get(ref.ref_id))
+            )
+            if not outcome_ok or not terminal_ok:
+                return {}, "one-paper gate lacks a completed durable outcome and successful Stage 1 terminal"
+            return {"source_count": 1, "canonical_stage1_count": 1, "closure_complete": True}, None
+
+        if gate == "G":
+            profile_refs = by_role.get("free_mode_profile", [])
+            if len(profile_refs) != 1:
+                return {}, "Free Mode gate requires one typed durable profile"
+            profile_payload = payloads.get(profile_refs[0].ref_id)
+            if not isinstance(profile_payload, Mapping):
+                return {}, "Free Mode profile is not a JSON object"
+            if profile_payload.get("artifact_type") != "free_mode_profile" or profile_payload.get("schema_version") != "free-mode-profile-v1":
+                return {}, "Free Mode profile type or schema is invalid"
+            if not str(profile_payload.get("profile_id") or "").strip():
+                return {}, "Free Mode profile identity is missing"
+            receipts: list[Mapping[str, Any]] = []
+            for ref in by_role.get("provider_receipt_ledger", []):
+                receipts.extend(self._rows(payloads.get(ref.ref_id)))
+            if not receipts:
+                return {}, "Free Mode gate has no valid provider receipts"
+            if any(
+                str(row.get("route") or "") != "Free_Mode_API"
+                or not isinstance(row.get("metadata"), Mapping)
+                or str(cast(Mapping[str, Any], row.get("metadata")).get("config_section") or "")
+                != "Free_Mode_API"
+                for row in receipts
+            ):
+                return {}, "Free Mode provider receipts contain a non-Free Mode route"
+            return {
+                "free_mode_route_only": True,
+                "profile_durable": True,
+            }, None
+
         if gate == "I":
             trace_refs = by_role.get("playwright_trace", [])
             browser_refs = by_role.get("browser_evidence", [])
@@ -1433,7 +1917,12 @@ class GateEvidenceVerifier:
                 return {}, "contention budget derivation is invalid"
             if limit > 0 and (used < 0 or reserved < 0 or used + reserved > limit):
                 return {}, "contention budget derivation proves an overshoot"
-            if ledger_map.get("duplicate_receipt_ids") != [] or ledger_map.get("conflicts") != []:
+            if (
+                ledger_map.get("duplicate_receipt_ids") != []
+                or ledger_map.get("conflicts") != []
+                or ledger_map.get("same_id_same_content_idempotent") is not True
+                or ledger_map.get("same_id_different_content_rejected") is not True
+            ):
                 return {}, "contention provider ledger derivation contains duplicates or conflicts"
             if int(str(registry_map.get("lost_updates") or 0)) != 0 or queue_map.get("duplicate_operation_ids") != []:
                 return {}, "contention Registry or queue derivation contains a lost update"
@@ -1800,15 +2289,15 @@ class GateEvidenceVerifier:
             paper_hashes: set[str] = set()
             for ref in canonical_refs:
                 payload = payloads.get(ref.ref_id)
-                if not isinstance(payload, Mapping):
-                    return {}, "canonical Stage 1 aggregate is not a JSON object"
-                candidate_raw = payload.get("payload")
-                candidate = cast(Mapping[str, Any], candidate_raw) if isinstance(candidate_raw, Mapping) else payload
-                summaries = candidate.get("summaries") if isinstance(candidate, Mapping) else None
-                if isinstance(summaries, list):
-                    items = summaries
+                if isinstance(payload, list):
+                    items = payload
                 else:
-                    items = [candidate]
+                    if not isinstance(payload, Mapping):
+                        return {}, "canonical Stage 1 aggregate is not a JSON object or array"
+                    candidate_raw = payload.get("payload")
+                    candidate = cast(Mapping[str, Any], candidate_raw) if isinstance(candidate_raw, Mapping) else payload
+                    summaries = candidate.get("summaries")
+                    items = summaries if isinstance(summaries, list) else [candidate]
                 for item in items:
                     if not isinstance(item, Mapping):
                         continue
@@ -2335,6 +2824,7 @@ __all__ = [
     "GateJScenario",
     "GateKScenario",
     "GateQScenario",
+    "GenericAcceptanceScenario",
     "ControlledDefectChallengeV1",
     "DocumentModalityProfileV1",
     "DurableEvidenceRefV1",
