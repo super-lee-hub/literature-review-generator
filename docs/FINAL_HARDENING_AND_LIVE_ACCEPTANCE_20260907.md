@@ -8,9 +8,9 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-FINAL_EXECUTABLE_SHA = 9ed7c8e80d3a177905631a4c4c31a7126a42d303
-REMOTE_HEAD_AT_CODE_ACCEPTANCE = efd27f9986ca36012e07293ba605e233ffcb6605
-HOSTED_CI_RUN = NOT_RUN_FOR_9ED7C8E8
+FINAL_EXECUTABLE_SHA = 80f4648ca449e13154108490bbd96da400f69ec7
+REMOTE_HEAD_AT_CODE_ACCEPTANCE = 88355785c68f3be507599eab6c94f2cfb7ef29e8
+HOSTED_CI_RUN = NOT_RUN_FOR_80F4648C
 HOSTED_CI_CONCLUSION = NOT_RUN
 ```
 
@@ -64,7 +64,7 @@ was not merged; Hosted CI for this new executable SHA is still pending.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head before final code push | `efd27f9986ca36012e07293ba605e233ffcb6605` |
+| Remote head before latest code push | `88355785c68f3be507599eab6c94f2cfb7ef29e8` |
 | Hosted run | `NOT_RUN_FOR_91BE02E4` |
 | Hosted head SHA | `NOT_APPLICABLE` |
 | Hosted result | `NOT_RUN` |
@@ -222,7 +222,7 @@ zero.
 
 ### Local exact-SHA checks
 
-The current executable commit is 9ed7c8e80d3a177905631a4c4c31a7126a42d303.
+The current executable commit is 80f4648ca449e13154108490bbd96da400f69ec7.
 The report-only update will be a child commit and does not change that
 executable SHA.
 
@@ -252,9 +252,10 @@ a local PASS.
 
 Hosted runs 34167741790 and 34170040302 stopped after 834 tests with
 KeyboardInterrupt at the then-present subprocess fixture; run 34171201672
-stopped after 852 tests with the fixture removed. None is evidence for
-9ed7c8e80d3a177905631a4c4c31a7126a42d303. A fresh verbose exact-SHA run is
-pending.
+stopped after 852 tests with that fixture removed; verbose run 34172418489
+stopped inside test_test_temp_is_not_tracked while invoking git. None is
+evidence for 80f4648ca449e13154108490bbd96da400f69ec7. A fresh exact-SHA run
+with a bounded Git probe is pending.
 The earlier successful run belongs to the preceding executable SHA and is not
 evidence for this code revision.
 
@@ -351,7 +352,7 @@ docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 ## Remaining owner actions
 
-0. Push the local report/code chain (e45e4916 executable with report-only
+0. Push the local report/code chain (80f4648c executable with report-only
    descendants) to the existing PR branch. The remote head is still
    556e4f197b154017b52a61f8d45874d72d816f47; SSH was reset and the
    authenticated GitHub ref update was not authorized by the external-write
