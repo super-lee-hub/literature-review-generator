@@ -55,7 +55,7 @@ jobs:
           python -m reviewctl queue-run --help
       - name: Strict-offline test suite
         run: >-
-          python -m pytest -q --strict-markers
+          python -m pytest -vv --strict-markers
           -m "not live_api and not playwright and not heavy_ocr"
       - name: Type check
         run: python -m pyright
