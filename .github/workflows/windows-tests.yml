@@ -105,7 +105,7 @@ jobs:
           }
           Write-Host "Running $($selectedTestFiles.Count) test files in shard $shard/$shardCount"
           foreach ($testFile in $selectedTestFiles) {
-            if ($testFile -like "*tests/test_release_hardening.py") {
+            if ((Split-Path -Leaf $testFile) -eq "test_release_hardening.py") {
               $testNodes = @(
                 python -m pytest --collect-only -q --strict-markers `
                   -m "not live_api and not playwright and not heavy_ocr" `
