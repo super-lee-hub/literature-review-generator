@@ -317,6 +317,56 @@ def test_gate_evidence_verifier_reopens_hashed_browser_artifacts(tmp_path: Path)
     assert result["derived_facts"]["flow_completed"] is True
 
 
+def test_live_gate_does_not_count_test_only_provider_receipts(tmp_path: Path) -> None:
+    profile = tmp_path / "free_mode_profile.json"
+    receipt = tmp_path / "provider_receipts.jsonl"
+    terminal = tmp_path / "stage_terminal.json"
+    profile.write_text(json.dumps({"research_goal": "fixture"}), encoding="utf-8")
+    receipt.write_text(
+        json.dumps(
+            {
+                "artifact_type": "provider_call_receipt",
+                "receipt_id": "test-only-receipt",
+                "status": "success",
+                "attempts": 1,
+                "route": "free_mode",
+                "provider": "fixture",
+                "test_only": True,
+                "metadata": {"transport_config": {"api_base": "https://fixture.invalid"}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    terminal.write_text(json.dumps({"status": "complete"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="d" * 40)
+    evidence = producer.build_gate(
+        "G",
+        [
+            producer.reference(profile, role="free_mode_profile"),
+            producer.reference(
+                receipt,
+                role="provider_receipt_ledger",
+                artifact_type="provider_receipt_ledger",
+            ),
+            producer.reference(
+                terminal,
+                role="stage_terminal",
+                artifact_type="runtime_stage_terminal",
+            ),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify(
+        "G",
+        evidence,
+        expected_final_sha="d" * 40,
+    )
+
+    assert result["status"] != "PASS"
+    assert result["derived_facts"]["actual_transport_calls"] == 0
+
+
 def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_path: Path) -> None:
     from runtime.control_plane import ReviewControlPlane
 

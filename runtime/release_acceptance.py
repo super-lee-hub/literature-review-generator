@@ -747,8 +747,38 @@ class GateEvidenceVerifier:
                         receipt_ids.add(receipt_id)
                     status = str(row.get("status") or "")
                     metadata = row.get("metadata")
-                    attempted = status == "success" or (
-                        isinstance(metadata, Mapping) and bool(metadata.get("transport_config"))
+                    test_only_value = row.get("test_only", False)
+                    metadata_test_only = (
+                        metadata.get("test_only", False)
+                        if isinstance(metadata, Mapping)
+                        else False
+                    )
+                    test_only = (
+                        test_only_value is True
+                        or (
+                            isinstance(test_only_value, str)
+                            and test_only_value.strip().casefold() == "true"
+                        )
+                        or metadata_test_only is True
+                        or (
+                            isinstance(metadata_test_only, str)
+                            and metadata_test_only.strip().casefold() == "true"
+                        )
+                    )
+                    malformed_test_only = (
+                        not isinstance(test_only_value, (bool, str))
+                    ) or (
+                        isinstance(test_only_value, str)
+                        and test_only_value.strip().casefold() not in {"true", "false", ""}
+                    ) or (
+                        not isinstance(metadata_test_only, (bool, str))
+                    ) or (
+                        isinstance(metadata_test_only, str)
+                        and metadata_test_only.strip().casefold() not in {"true", "false", ""}
+                    )
+                    attempted = not malformed_test_only and not test_only and (
+                        status == "success"
+                        or (isinstance(metadata, Mapping) and bool(metadata.get("transport_config")))
                     )
                     if attempted:
                         try:
