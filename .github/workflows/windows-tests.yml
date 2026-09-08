@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     env:
       AUTO_GENERATE_OFFLINE_TESTS: "1"
       AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP: "1"
@@ -70,6 +70,10 @@ jobs:
             $selectedTestFiles = @(
               (Join-Path (Get-Location) "tests/test_review_batch.py")
             )
+          } elseif ($shard -eq 5) {
+            $selectedTestFiles = @(
+              (Join-Path (Get-Location) "tests/test_runtime_lifecycle_parity.py")
+            )
           } else {
             $selectedTestFiles = @(
               if ($shard -eq 3) {
@@ -78,7 +82,11 @@ jobs:
               for ($index = 0; $index -lt $allTestFiles.Count; $index++) {
                 if (
                   (($index % $shardCount) -eq ($shard - 1)) -and
-                  ($allTestFiles[$index].Name -notin @("test_repository_hygiene.py", "test_review_batch.py"))
+                  ($allTestFiles[$index].Name -notin @(
+                    "test_repository_hygiene.py",
+                    "test_review_batch.py",
+                    "test_runtime_lifecycle_parity.py"
+                  ))
                 ) {
                   $allTestFiles[$index].FullName
                 }
