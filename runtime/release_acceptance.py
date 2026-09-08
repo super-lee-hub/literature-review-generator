@@ -393,6 +393,16 @@ _EVIDENCE_REF_FIELDS = frozenset(
         "modality",
     }
 )
+_GATE_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "final_sha",
+        "durable_refs",
+        "evidence_refs",
+        "producer",
+        "gate",
+    }
+)
 _MAX_EVIDENCE_BYTES = 128 * 1024 * 1024
 _SHA256_RE = r"^[0-9a-f]{64}$"
 
@@ -599,6 +609,7 @@ class GateEvidenceProducer:
         return ref.to_dict()
 
     def build_gate(self, gate: str, refs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+        gate_contract(str(gate))
         normalized = [DurableEvidenceRefV1.from_mapping(item).to_dict() for item in refs]
         return {
             "final_sha": self.final_sha,
@@ -812,7 +823,20 @@ class GateEvidenceVerifier:
                 "reason": "gate evidence schema is not the durable reference schema",
                 "contract": contract,
             }
-        if evidence.get("gate") not in (None, str(gate)):
+        if evidence.get("producer") != "runtime.release_acceptance.GateEvidenceProducer":
+            return {
+                "status": "NOT_VERIFIED",
+                "reason": "gate evidence producer binding is missing or invalid",
+                "contract": contract,
+            }
+        unknown = sorted(str(key) for key in evidence if str(key) not in _GATE_EVIDENCE_FIELDS)
+        if unknown:
+            return {
+                "status": "FAIL",
+                "reason": "gate evidence contains unknown fields: " + ", ".join(unknown),
+                "contract": contract,
+            }
+        if evidence.get("gate") != str(gate):
             return {
                 "status": "FAIL",
                 "reason": "gate evidence is bound to a different gate",

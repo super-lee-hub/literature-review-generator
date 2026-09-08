@@ -750,7 +750,13 @@ class ReviewControlPlane:
         if evidence_path.is_file():
             try:
                 loaded_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-                if isinstance(loaded_evidence, Mapping):
+                if (
+                    isinstance(loaded_evidence, Mapping)
+                    and loaded_evidence.get("schema_version")
+                    == "release-acceptance-evidence-index-v1"
+                    and str(loaded_evidence.get("final_sha") or "") == current_sha
+                    and isinstance(loaded_evidence.get("gates"), Mapping)
+                ):
                     evidence_payload = loaded_evidence
             except (OSError, UnicodeError, json.JSONDecodeError):
                 evidence_payload = None

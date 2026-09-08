@@ -269,6 +269,32 @@ def test_acceptance_does_not_trust_handwritten_gate_facts() -> None:
     assert "durable" in str(result["reason"]).lower()
 
 
+def test_gate_evidence_verifier_rejects_unbound_metadata_even_with_durable_refs(tmp_path: Path) -> None:
+    trace = tmp_path / "playwright_trace.json"
+    browser = tmp_path / "browser_evidence.json"
+    trace.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
+    browser.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="c" * 40)
+    evidence = producer.build_gate(
+        "I",
+        [
+            producer.reference(trace, role="playwright_trace"),
+            producer.reference(browser, role="browser_evidence"),
+        ],
+    )
+    evidence.pop("producer")
+    evidence["actual_transport_calls"] = 99
+
+    result = GateEvidenceVerifier().verify(
+        "I",
+        evidence,
+        expected_final_sha="c" * 40,
+    )
+
+    assert result["status"] == "NOT_VERIFIED"
+    assert "producer" in str(result["reason"]).lower()
+
+
 def test_gate_evidence_verifier_reopens_hashed_browser_artifacts(tmp_path: Path) -> None:
     trace = tmp_path / "playwright_trace.json"
     browser = tmp_path / "browser_evidence.json"
