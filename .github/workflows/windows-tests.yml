@@ -127,8 +127,10 @@ jobs:
               }
               foreach ($testNode in $testNodes) {
                 Write-Host "Running isolated pytest process for $testNode"
-                & python -m pytest -vv -rs --strict-markers $testNode
-                $testExitCode = [int]$LASTEXITCODE
+                $testProcess = Start-Process -FilePath "python" -ArgumentList @(
+                  "-m", "pytest", "-vv", "-rs", "--strict-markers", $testNode
+                ) -NoNewWindow -Wait -PassThru
+                $testExitCode = [int]$testProcess.ExitCode
                 Write-Host "pytest exit code for $testNode = $testExitCode"
                 if ($testExitCode -ne 0) {
                   throw "pytest failed for $testNode with exit code $testExitCode"
