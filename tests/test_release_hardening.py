@@ -459,7 +459,14 @@ def test_live_gate_rejects_provider_receipt_missing_authoritative_job_binding(tm
     evidence = producer.build_gate(
         "G",
         [
-            producer.reference(profile, role="free_mode_profile", job_id="job-1"),
+            producer.reference(
+                profile,
+                role="free_mode_profile",
+                artifact_type="free_mode_profile",
+                artifact_version="v1",
+                schema_version="free-mode-profile-v1",
+                job_id="job-1",
+            ),
             producer.reference(
                 receipt,
                 role="provider_receipt_ledger",
