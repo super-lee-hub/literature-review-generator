@@ -8,14 +8,17 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-FINAL_EXECUTABLE_SHA = 80f4648ca449e13154108490bbd96da400f69ec7
-REMOTE_HEAD_AT_CODE_ACCEPTANCE = 88355785c68f3be507599eab6c94f2cfb7ef29e8
-HOSTED_CI_RUN = NOT_RUN_FOR_80F4648C
-HOSTED_CI_CONCLUSION = NOT_RUN
+PRODUCTION_RUNTIME_SHA = 80f4648ca449e13154108490bbd96da400f69ec7
+FINAL_EXECUTABLE_SHA = bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8
+REMOTE_HEAD_AT_CODE_ACCEPTANCE = bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8
+HOSTED_CI_RUN = 34209120471
+HOSTED_CI_CONCLUSION = SUCCESS
 ```
 
-The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
-not merged. No live provider call, paid API call, Playwright acceptance run,
+The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. Production
+runtime code last changed at `PRODUCTION_RUNTIME_SHA`; the later descendants
+only harden the Hosted CI execution wrapper and diagnostics. The PR was not
+merged. No live provider call, paid API call, Playwright acceptance run,
 heavy-OCR acceptance run, or real F1 corpus run was made in this round.
 
 ## Second hardening round
@@ -54,8 +57,9 @@ This code revision adds the following fail-closed boundaries:
   legacy one-argument validator.
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
-The executable acceptance claim remains bound to FINAL_EXECUTABLE_SHA. The PR
-was not merged; Hosted CI for this new executable SHA is still pending.
+The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`. Hosted
+run `34209120471` completed successfully on that exact SHA. Any later
+docs-only report commit is not used as executable validation evidence.
 
 ## Git, PR, and Hosted CI read-back
 
@@ -64,14 +68,13 @@ was not merged; Hosted CI for this new executable SHA is still pending.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head before latest code push | `88355785c68f3be507599eab6c94f2cfb7ef29e8` |
-| Hosted run | `NOT_RUN_FOR_91BE02E4` |
-| Hosted head SHA | `NOT_APPLICABLE` |
-| Hosted result | `NOT_RUN` |
+| Remote head at exact code/CI acceptance | `bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8` |
+| Hosted run | [34209120471](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34209120471) |
+| Hosted head SHA | `bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8` |
+| Hosted result | `SUCCESS` |
 
-The preceding Hosted run was intentionally not carried forward as evidence:
-it validated the prior executable SHA. The current revision requires a fresh
-exact-SHA run before any new offline closure claim is made.
+The Hosted evidence is bound to the exact final executable SHA. The report
+commit itself is a docs-only descendant and is not substituted for that SHA.
 
 ## Bugs fixed in this round
 
@@ -222,9 +225,11 @@ zero.
 
 ### Local exact-SHA checks
 
-The current executable commit is 80f4648ca449e13154108490bbd96da400f69ec7.
-The report-only update will be a child commit and does not change that
-executable SHA.
+The current executable acceptance SHA is
+`bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8`. Production runtime code last
+changed at `80f4648ca449e13154108490bbd96da400f69ec7`; the executable SHA also
+contains the later CI/test-harness hardening commits. The report-only update is
+a child commit and does not change the executable source under test.
 
 | Check | Result | Scope |
 |---|---|---|
@@ -242,28 +247,41 @@ python -m pytest -q --strict-markers -p no:cacheprovider \
   -m "not live_api and not playwright and not heavy_ocr and not live_acceptance"
 ```
 
-The 12 local failures occurred while creating Windows multiprocessing named
-pipes in queue, Registry, review-batch, lifecycle, and validation checkpoint
-tests. The same selected cross-process surface passed in Hosted Windows CI;
-the local result is retained as an environment limitation, not converted into
-a local PASS.
+No complete local full-suite run was completed in this round. Earlier local
+attempts were blocked by Windows temporary-directory and multiprocessing
+permission errors; no local full-suite PASS is claimed. The exact selected
+surface is therefore closed by the Hosted run below.
 
 ### Hosted exact-SHA checks
 
-Hosted runs 34167741790 and 34170040302 stopped after 834 tests with
-KeyboardInterrupt at the then-present subprocess fixture; run 34171201672
-stopped after 852 tests with that fixture removed; verbose run 34172418489
-stopped inside test_test_temp_is_not_tracked while invoking git. None is
-evidence for 80f4648ca449e13154108490bbd96da400f69ec7. A fresh exact-SHA run
-with a bounded Git probe is pending.
-The earlier successful run belongs to the preceding executable SHA and is not
-evidence for this code revision.
+Hosted run `34209120471` passed all five Windows matrix jobs on
+`bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8`. Each job passed installation,
+compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
+and committed-range whitespace checks. The strict-offline process summaries
+were:
+
+```text
+test (1) job 102005636847: 384 passed, 0 nonzero pytest exits
+test (2) job 102005637016: 526 passed, 0 nonzero pytest exits
+test (3) job 102005636963: 462 passed, 0 nonzero pytest exits
+test (4) job 102005636645: 58 passed, 0 nonzero pytest exits
+test (5) job 102005637036: 5 passed, 0 nonzero pytest exits
+total: 1435 selected tests passed
+collection: 1458 total, 23 deselected by the offline marker policy
+release hardening: 20/20 nodes started, each returned ExitCode=0
+```
+
+The three base shards used deterministic file isolation; the release-hardening
+file used node isolation with redirected child stdout/stderr and explicit
+process exit-code checks. The matrix is offline contract evidence only: it
+does not constitute live provider, F1-corpus, GUI-browser, or heavy-OCR
+acceptance evidence.
 
 ## Gate results
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PENDING_HOSTED` | Previous Hosted PASS is for the prior executable SHA; current exact-SHA run is pending |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `NOT_VERIFIED_LOCAL` | Hosted run `34209120471` passed on exact SHA `bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8`; the full local suite was not completed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
@@ -274,9 +292,9 @@ evidence for this code revision.
 | H — Validator defect injection/repair/revalidation | `BLOCKED_CREDENTIALS` | No real Validator transport or real-review baseline; controlled offline contracts are not substituted |
 | I — GUI Playwright | `NOT_VERIFIED` | No real browser flow/evidence artifact in this round |
 | J — heavy OCR | `BLOCKED_CORPUS` | No approved scanned/OCR-poor acceptance PDF in the scoped checkout |
-| K — real Windows contention | `NOT_VERIFIED_CURRENT_SHA` | Cross-process ledger/budget regression coverage is present locally; current executable Hosted evidence and a separate release acceptance manifest are pending |
+| K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Exact-SHA Hosted matrix passed the selected cross-process queue/Registry/budget/lifecycle checks; no separate live release-acceptance manifest was produced |
 | Q — F1 15-paper full chain | `BLOCKED_F1_SPEC` / `BLOCKED_F1_CORPUS` | No authoritative 15-paper binding; canonical Stage 1 artifacts `0/15`, downstream Outline/Review/Citation/DOCX/Validation not run |
-| R — negative production behavior | `PASS_OFFLINE_LOCAL`, `NOT_VERIFIED_RELEASE_MANIFEST` | Typed config/auth/queue/path/cache/evidence/budget and false-PASS regressions are in the selected suite; no separate gate evidence manifest |
+| R — negative production behavior | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_RELEASE_MANIFEST` | Typed config/auth/queue/path/cache/evidence/budget and false-PASS regressions passed in the exact-SHA selected suite; no separate release manifest |
 | S — secret/privacy scan | `NOT_VERIFIED` | No production secret was used or printed; a full release-scope history/privacy evidence manifest was not generated |
 | T — branch governance | `BLOCKED` / `OWNER_ACTION_REQUIRED` | `GET /branches/main/protection` returned HTTP 404 (`Branch not protected`); required checks/protection are not configured |
 
@@ -351,12 +369,6 @@ runtime/architecture_gates.py, services/durable_io.py, rag/local_rag.py, and
 docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 ## Remaining owner actions
-
-0. Push the local report/code chain (80f4648c executable with report-only
-   descendants) to the existing PR branch. The remote head is still
-   556e4f197b154017b52a61f8d45874d72d816f47; SSH was reset and the
-   authenticated GitHub ref update was not authorized by the external-write
-   policy.
 
 1. Supply an approved rotated credential through the supported `.env` or
    process-environment mechanism, without placing it in tracked files.
