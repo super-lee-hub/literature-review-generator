@@ -29,4 +29,3 @@ The table is a code reachability inventory, not proof that a provider, corpus,
 GUI browser, OCR engine, or branch-protection API was exercised. Those claims
 require the corresponding durable acceptance references and are reported as
 'NOT_VERIFIED' when absent.
-

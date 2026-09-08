@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     env:
       AUTO_GENERATE_OFFLINE_TESTS: "1"
       AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP: "1"
@@ -66,19 +66,25 @@ jobs:
           )
           $shard = [int]"${{ matrix.shard }}"
           $shardCount = 3
-          $selectedTestFiles = @(
-            if ($shard -eq 3) {
-              (Join-Path (Get-Location) "tests/test_repository_hygiene.py")
-            }
-            for ($index = 0; $index -lt $allTestFiles.Count; $index++) {
-              if (
-                (($index % $shardCount) -eq ($shard - 1)) -and
-                ($allTestFiles[$index].Name -ne "test_repository_hygiene.py")
-              ) {
-                $allTestFiles[$index].FullName
+          if ($shard -eq 4) {
+            $selectedTestFiles = @(
+              (Join-Path (Get-Location) "tests/test_review_batch.py")
+            )
+          } else {
+            $selectedTestFiles = @(
+              if ($shard -eq 3) {
+                (Join-Path (Get-Location) "tests/test_repository_hygiene.py")
               }
-            }
-          )
+              for ($index = 0; $index -lt $allTestFiles.Count; $index++) {
+                if (
+                  (($index % $shardCount) -eq ($shard - 1)) -and
+                  ($allTestFiles[$index].Name -notin @("test_repository_hygiene.py", "test_review_batch.py"))
+                ) {
+                  $allTestFiles[$index].FullName
+                }
+              }
+            )
+          }
           if ($selectedTestFiles.Count -eq 0) {
             throw "No test files selected for shard $shard/$shardCount"
           }
