@@ -521,7 +521,13 @@ def test_live_gate_does_not_count_test_only_provider_receipts(tmp_path: Path) ->
     evidence = producer.build_gate(
         "G",
         [
-            producer.reference(profile, role="free_mode_profile"),
+            producer.reference(
+                profile,
+                role="free_mode_profile",
+                artifact_type="free_mode_profile",
+                artifact_version="v1",
+                schema_version="free-mode-profile-v1",
+            ),
             producer.reference(
                 receipt,
                 role="provider_receipt_ledger",
