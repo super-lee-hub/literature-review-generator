@@ -386,6 +386,12 @@ class Stage1AnalysisService:
         )
         preprocess_metadata["evidence_manifest_path"] = evidence_record.path
         preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
+        preprocess_metadata["evidence_manifest_artifact_id"] = evidence_record.artifact_id
+        self._publish_ocr_artifacts(
+            paper_key=item.canonical_paper_key,
+            preprocess_metadata=preprocess_metadata,
+            evidence_record=evidence_record,
+        )
         visual_bundle = self._build_visual_bundle(item, preprocess_metadata)
         stage1_settings = dict(self.settings.section("Stage1_Input"))
         if not stage1_settings:
@@ -2605,6 +2611,10 @@ class Stage1AnalysisService:
                 "source_pdf_sha256": file_sha256(str(item.source_pdf)),
                 "source_mode": item.source_mode,
             },
+            "ocr_lineage": self._ocr_lineage(
+                prepared.preprocess_metadata,
+                source_pdf=str(item.source_pdf),
+            ),
             "source_mode": item.source_mode,
             "text_length": int(prepared.preprocess_metadata.get("selected_text_length") or 0),
             "processing_time": "",
@@ -4853,6 +4863,12 @@ class Stage1AnalysisService:
         )
         preprocess_metadata["evidence_manifest_path"] = evidence_record.path
         preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
+        preprocess_metadata["evidence_manifest_artifact_id"] = evidence_record.artifact_id
+        self._publish_ocr_artifacts(
+            paper_key=item.canonical_paper_key,
+            preprocess_metadata=preprocess_metadata,
+            evidence_record=evidence_record,
+        )
         visual_bundle = self._build_visual_bundle(item, preprocess_metadata)
         stage1_settings = dict(self.settings.section("Stage1_Input"))
         if not stage1_settings:
@@ -4971,6 +4987,10 @@ class Stage1AnalysisService:
                     "source_pdf_sha256": file_sha256(source_pdf),
                     "source_mode": item.source_mode,
                 },
+                "ocr_lineage": self._ocr_lineage(
+                    preprocess_metadata,
+                    source_pdf=source_pdf,
+                ),
                 "source_mode": item.source_mode,
                 "text_length": len(preprocess.stage1_input_text),
                 "processing_time": "",
@@ -5055,6 +5075,8 @@ class Stage1AnalysisService:
             "page_index_path",
             "chunks_path",
             "diagnostics_path",
+            "ocr_diagnostics_path",
+            "ocr_artifact_path",
             "structured_json_path",
             "manifest_path",
             "stage1_input_path",
@@ -5098,6 +5120,101 @@ class Stage1AnalysisService:
             chunk_count=int(result.chunk_count or 0),
         )
         return metadata
+
+    def _publish_ocr_artifacts(
+        self,
+        *,
+        paper_key: str,
+        preprocess_metadata: dict[str, Any],
+        evidence_record: ArtifactRecord,
+    ) -> tuple[ArtifactRecord, ArtifactRecord] | None:
+        """Publish OCR diagnostics/output as Registry-owned lineage nodes."""
+
+        diagnostics_path = Path(
+            str(preprocess_metadata.get("ocr_diagnostics_path") or "")
+        ).expanduser().resolve()
+        artifact_path = Path(
+            str(preprocess_metadata.get("ocr_artifact_path") or "")
+        ).expanduser().resolve()
+        if not diagnostics_path.is_file() or not artifact_path.is_file():
+            return None
+        try:
+            diagnostics_payload = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+            artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("preprocess OCR artifacts are not valid JSON") from exc
+        if not isinstance(diagnostics_payload, Mapping) or not isinstance(artifact_payload, Mapping):
+            raise RuntimeError("preprocess OCR artifacts must be JSON objects")
+        digest = hashlib.sha256(str(paper_key).encode("utf-8")).hexdigest()[:24]
+        diagnostics_digest = file_sha256(str(diagnostics_path))[:24]
+        artifact_digest = file_sha256(str(artifact_path))[:24]
+        dependency = ArtifactDependencyRefV2.from_record(evidence_record)
+        diagnostics_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.workspace.artifact_path(f"ocr/{digest}/diagnostics.json"),
+            diagnostics_payload,
+            artifact_role="ocr_diagnostics",
+            artifact_type="ocr_diagnostics",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"ocr_diagnostics:{paper_key}:{diagnostics_digest}",
+            depends_on=[dependency],
+            metadata={"canonical_paper_key": paper_key},
+        )
+        artifact_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            self.workspace.artifact_path(f"ocr/{digest}/artifact.json"),
+            artifact_payload,
+            artifact_role="ocr_artifact",
+            artifact_type="ocr_artifact",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"ocr_artifact:{paper_key}:{artifact_digest}",
+            depends_on=[dependency, ArtifactDependencyRefV2.from_record(diagnostics_record)],
+            metadata={"canonical_paper_key": paper_key},
+        )
+        preprocess_metadata.update(
+            {
+                "ocr_diagnostics_artifact_id": diagnostics_record.artifact_id,
+                "ocr_diagnostics_artifact_hash": diagnostics_record.content_hash,
+                "ocr_diagnostics_artifact_path": diagnostics_record.path,
+                "ocr_artifact_id": artifact_record.artifact_id,
+                "ocr_artifact_hash": artifact_record.content_hash,
+                "ocr_artifact_path_registered": artifact_record.path,
+            }
+        )
+        return diagnostics_record, artifact_record
+
+    @staticmethod
+    def _ocr_lineage(
+        preprocess_metadata: Mapping[str, Any],
+        *,
+        source_pdf: str,
+    ) -> dict[str, Any]:
+        source_hash = file_sha256(source_pdf)
+        stage1_input_path = str(preprocess_metadata.get("stage1_input_path") or "")
+        stage1_input_hash = file_sha256(stage1_input_path) if stage1_input_path and Path(stage1_input_path).is_file() else ""
+        diagnostics_hash = str(preprocess_metadata.get("ocr_diagnostics_artifact_hash") or "")
+        artifact_hash = str(preprocess_metadata.get("ocr_artifact_hash") or "")
+        dependency_ids = [
+            str(preprocess_metadata.get(name) or "").strip()
+            for name in (
+                "evidence_manifest_artifact_id",
+                "ocr_diagnostics_artifact_id",
+                "ocr_artifact_id",
+            )
+            if str(preprocess_metadata.get(name) or "").strip()
+        ]
+        return {
+            "source_pdf_sha256": source_hash,
+            "ocr_diagnostics_sha256": diagnostics_hash,
+            "ocr_artifact_sha256": artifact_hash,
+            "stage1_input_sha256": stage1_input_hash,
+            "registry_dependency_artifact_ids": dependency_ids,
+            "ocr_used": bool(preprocess_metadata.get("used_ocr")),
+        }
 
     def _build_visual_bundle(
         self,

@@ -42,6 +42,7 @@ from runtime.zotero_attachment_resolver import (
 )
 from services.job_workspace import JobWorkspace, WorkspacePathError
 from preprocess.service import MineruArtifactLimitError, PreprocessManager
+from rag.local_rag import LocalRAGIndex
 from validation.evidence_loader import (
     PreprocessEvidenceLoader,
     ValidationSourceAuthorityError,
@@ -614,6 +615,36 @@ def test_gate_f_rejects_partial_semantic_role_receipts(tmp_path: Path) -> None:
     assert "relation_adjudication" in str(result["reason"])
 
 
+def test_gate_e_rejects_filename_only_interruption_and_resume_files(tmp_path: Path) -> None:
+    interruption = tmp_path / "interruption_event.json"
+    resume = tmp_path / "resume_event.json"
+    events = tmp_path / "process_events.jsonl"
+    ledger = tmp_path / "provider_receipts.jsonl"
+    interruption.write_text(json.dumps({"status": "interrupted"}), encoding="utf-8")
+    resume.write_text(json.dumps({"status": "resumed"}), encoding="utf-8")
+    events.write_text(json.dumps({"event": "resume"}) + "\n", encoding="utf-8")
+    ledger.write_text("", encoding="utf-8")
+    producer = GateEvidenceProducer(final_sha="5" * 40)
+    evidence = producer.build_gate(
+        "E",
+        [
+            producer.reference(interruption, role="interruption_event"),
+            producer.reference(resume, role="resume_event"),
+            producer.reference(ledger, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger"),
+            producer.reference(events, role="process_events"),
+        ],
+    )
+
+    result = GateEvidenceVerifier().verify(
+        "E",
+        evidence,
+        expected_final_sha="5" * 40,
+    )
+
+    assert result["status"] != "PASS"
+    assert "interruption" in str(result["reason"]).lower()
+
+
 def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_path: Path) -> None:
     from runtime.control_plane import ReviewControlPlane
 
@@ -930,6 +961,15 @@ def test_acceptance_evidence_manifest_refreshes_with_revision_on_resume(tmp_path
     assert second_payload["scenario_id"] == "C"
     assert second_payload["job_id"] == "job-1"
     assert len(second_payload["gates"]["C"]["durable_refs"]) == 2
+
+
+def test_local_rag_identity_change_selects_a_new_immutable_collection() -> None:
+    first = LocalRAGIndex._collection_name_for_identity("source", "a" * 64)
+    second = LocalRAGIndex._collection_name_for_identity("source", "b" * 64)
+
+    assert first != second
+    assert len(first) <= 63
+    assert len(second) <= 63
 
 
 def test_profile_path_rejects_traversal_and_save_is_atomic_boundary(tmp_path: Path) -> None:

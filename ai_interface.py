@@ -4,6 +4,8 @@ import hashlib
 import json
 import mimetypes
 import os
+from pathlib import Path
+import tempfile
 import time
 import re
 import requests  # type: ignore
@@ -30,6 +32,7 @@ from runtime.provider_context import ProviderContextProfile
 from runtime.provider_runtime import (
     ProviderBudgetExceeded,
     ProviderRuntime,
+    ProviderRuntimeLedger,
     canonical_provider_request_payload,
 )
 from summary_schema import (
@@ -2306,6 +2309,49 @@ def _call_ai_api_detailed(
     enriched = dict(result)
     enriched["provider_receipt"] = receipt.to_dict()
     return enriched
+
+
+def probe_provider_connection(
+    api_config: Mapping[str, Any],
+    *,
+    logger: Any = None,
+) -> Dict[str, Any]:
+    """Run the canonical one-token provider probe through the real transport."""
+
+    descriptor, ledger_path = tempfile.mkstemp(
+        prefix="auto-generate-provider-probe-",
+        suffix=".jsonl",
+    )
+    os.close(descriptor)
+    target = Path(ledger_path)
+    try:
+        capability = resolve_model_capability(cast(APIConfig, dict(api_config)))
+        runtime = ProviderRuntime(
+            ledger=ProviderRuntimeLedger(target),
+            job_id="configuration-provider-probe",
+            attempt_id=f"probe-{os.getpid()}",
+            stage_name="configuration_probe",
+            route="configuration_probe",
+            node_id="configuration_probe",
+            call_id=f"configuration_probe:{os.getpid()}",
+            endpoint_type=capability.endpoint_type,
+        )
+        return _call_ai_api_detailed(
+            "ping",
+            cast(APIConfig, dict(api_config)),
+            "Return one short token.",
+            max_tokens=1,
+            temperature=0.0,
+            response_format="text",
+            logger=logger,
+            provider_runtime=runtime,
+        )
+    finally:
+        try:
+            target.unlink(missing_ok=True)
+            target.with_name(target.name + ".lock").unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _call_ai_api(prompt: str, api_config: APIConfig, system_prompt: str, max_tokens: int = 4000,

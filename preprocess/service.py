@@ -104,6 +104,8 @@ class PreprocessResult:
     page_index_path: str
     chunks_path: str
     diagnostics_path: str
+    ocr_diagnostics_path: str
+    ocr_artifact_path: str
     structured_json_path: str
     manifest_path: str
     stage1_input_path: str
@@ -374,6 +376,8 @@ class PreprocessManager:
                 active_paths["page_index_path"],
                 active_paths["chunks_path"],
                 active_paths["diagnostics_path"],
+                active_paths["ocr_diagnostics_path"],
+                active_paths["ocr_artifact_path"],
                 active_paths["structured_json_path"],
                 active_paths["stage1_input_path"],
                 active_paths["stage1_input_manifest_path"],
@@ -393,6 +397,8 @@ class PreprocessManager:
                     page_index_path=active_paths["page_index_path"],
                     chunks_path=active_paths["chunks_path"],
                     diagnostics_path=active_paths["diagnostics_path"],
+                    ocr_diagnostics_path=active_paths["ocr_diagnostics_path"],
+                    ocr_artifact_path=active_paths["ocr_artifact_path"],
                     structured_json_path=active_paths["structured_json_path"],
                     manifest_path=active_paths["manifest_path"],
                 )
@@ -453,6 +459,26 @@ class PreprocessManager:
         mineru_remote_requested = bool(extraction.get("mineru_remote_requested"))
         mineru_remote_enabled = bool(extraction.get("mineru_remote_enabled"))
         structured_payload = extraction.get("structured_payload", {})
+        ocr_page_numbers = [
+            int(item.page_number)
+            for item in page_diagnostics
+            if bool(item.used_ocr)
+        ]
+        ocr_page_text_hashes = {
+            str(item.page_number): hashlib.sha256(
+                str(next(
+                    (
+                        page.get("text")
+                        for page in page_index
+                        if isinstance(page, Mapping)
+                        and int(page.get("page_number") or 0) == int(item.page_number)
+                    ),
+                    "",
+                ) or "").encode("utf-8")
+            ).hexdigest()
+            for item in page_diagnostics
+            if bool(item.used_ocr)
+        }
 
         diagnostics_payload = {
             "extractor_used": extractor_used,
@@ -480,6 +506,8 @@ class PreprocessManager:
                 "structured": artifact_paths["structured_json_path"],
                 "chunks": artifact_paths["chunks_path"],
                 "diagnostics": artifact_paths["diagnostics_path"],
+                "ocr_diagnostics": artifact_paths["ocr_diagnostics_path"],
+                "ocr_artifact": artifact_paths["ocr_artifact_path"],
                 "prepare_manifest": artifact_paths["manifest_path"],
                 "stage1_input": artifact_paths["stage1_input_path"],
                 "stage1_input_manifest": artifact_paths["stage1_input_manifest_path"],
@@ -494,6 +522,29 @@ class PreprocessManager:
                 "stage1_input_manifest_path": artifact_paths["stage1_input_manifest_path"],
                 "stage1_quality_report_path": artifact_paths["stage1_quality_report_path"],
             },
+        }
+        ocr_diagnostics_payload = {
+            "artifact_type": "ocr_diagnostics",
+            "artifact_version": "v1",
+            "schema_version": "ocr-diagnostics-v1",
+            "source_pdf_sha256": str(source_identity["sha256"]),
+            "ocr_engine": "tesseract" if ocr_page_numbers else "none",
+            "ocr_engine_version": "runtime-detected" if ocr_page_numbers else "not-used",
+            "page_numbers": ocr_page_numbers,
+            "ocr_page_count": len(ocr_page_numbers),
+            "output_artifact_hashes": dict(ocr_page_text_hashes),
+        }
+        ocr_artifact_payload = {
+            "artifact_type": "ocr_artifact",
+            "artifact_version": "v1",
+            "schema_version": "ocr-artifact-v1",
+            "source_pdf_sha256": str(source_identity["sha256"]),
+            "diagnostics_sha256": "",
+            "page_numbers": ocr_page_numbers,
+            "page_text_hashes": dict(ocr_page_text_hashes),
+            "stage1_input_sha256": hashlib.sha256(
+                str(stage1_selection.selected_text or "").encode("utf-8")
+            ).hexdigest(),
         }
         manifest_payload = {
             "schema_version": PREPROCESS_MANIFEST_SCHEMA_VERSION,
@@ -560,6 +611,17 @@ class PreprocessManager:
         self._write_json_durable(artifact_paths["stage1_quality_report_path"], stage1_quality_report_payload)
         self._write_json_durable(artifact_paths["diagnostics_path"], diagnostics_payload)
         self._write_json_durable(
+            artifact_paths["ocr_diagnostics_path"],
+            ocr_diagnostics_payload,
+        )
+        ocr_artifact_payload["diagnostics_sha256"] = self._file_sha256(
+            artifact_paths["ocr_diagnostics_path"]
+        )
+        self._write_json_durable(
+            artifact_paths["ocr_artifact_path"],
+            ocr_artifact_payload,
+        )
+        self._write_json_durable(
             artifact_paths["structured_json_path"],
             {
                 "pages": page_blocks,
@@ -600,6 +662,8 @@ class PreprocessManager:
             page_index_path=published_artifact_paths["page_index_path"],
             chunks_path=published_artifact_paths["chunks_path"],
             diagnostics_path=published_artifact_paths["diagnostics_path"],
+            ocr_diagnostics_path=published_artifact_paths["ocr_diagnostics_path"],
+            ocr_artifact_path=published_artifact_paths["ocr_artifact_path"],
             structured_json_path=published_artifact_paths["structured_json_path"],
             manifest_path=published_artifact_paths["manifest_path"],
             stage1_input_path=published_artifact_paths["stage1_input_path"],
@@ -637,6 +701,8 @@ class PreprocessManager:
             "page_index_path": os.path.join(cache_dir, "page_index.json"),
             "chunks_path": os.path.join(cache_dir, "chunks.json"),
             "diagnostics_path": os.path.join(cache_dir, "diagnostics.json"),
+            "ocr_diagnostics_path": os.path.join(cache_dir, "ocr_diagnostics.json"),
+            "ocr_artifact_path": os.path.join(cache_dir, "ocr_artifact.json"),
             "structured_json_path": os.path.join(cache_dir, "structured.json"),
             "manifest_path": os.path.join(cache_dir, "prepare_manifest.json"),
             "stage1_input_path": os.path.join(cache_dir, "stage1_input.md"),
@@ -2423,6 +2489,8 @@ class PreprocessManager:
         page_index_path: str,
         chunks_path: str,
         diagnostics_path: str,
+        ocr_diagnostics_path: str,
+        ocr_artifact_path: str,
         structured_json_path: str,
         manifest_path: str,
     ) -> Optional[PreprocessResult]:
@@ -2463,6 +2531,8 @@ class PreprocessManager:
                 page_index_path=page_index_path,
                 chunks_path=chunks_path,
                 diagnostics_path=diagnostics_path,
+                ocr_diagnostics_path=ocr_diagnostics_path,
+                ocr_artifact_path=ocr_artifact_path,
                 structured_json_path=structured_json_path,
                 manifest_path=manifest_path,
                 stage1_input_path=artifact_paths["stage1_input_path"],

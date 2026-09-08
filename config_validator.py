@@ -3,20 +3,14 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Any, Dict, List, Tuple
 
-import requests  # type: ignore
-
 from services.model_capabilities import (
-    DEFAULT_ANTHROPIC_VERSION,
     resolve_anthropic_effort,
-    resolve_anthropic_messages_url,
     resolve_model_capability,
 )
-from services.proxy_policy import should_bypass_environment_proxy
 from services.repair_policy import parse_repair_policy
 from services.config_values import (
     StrictConfigValueError,
@@ -42,6 +36,14 @@ _ANTHROPIC_EFFORT_VALUES = frozenset({
 
 def _normalize_config_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _probe_provider_connection(api_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Late-bound bridge to the canonical instrumented provider probe."""
+
+    from ai_interface import probe_provider_connection
+
+    return probe_provider_connection(api_config)
 
 
 def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) -> Tuple[List[str], List[str]]:
@@ -459,83 +461,34 @@ def test_api_connection(
     anthropic_path: str = "",
     anthropic_version: str = "",
 ) -> Tuple[bool, str]:
-    """Probe the configured wire protocol without exposing credentials.
+    """Delegate the GUI connection test to the canonical provider transport."""
 
-    OpenAI-compatible providers expose a model-list endpoint. Native Anthropic
-    Messages providers are probed with a one-token request instead: the native
-    endpoint is the meaningful connectivity check, and it must use
-    ``x-api-key`` plus ``anthropic-version`` rather than an OpenAI Bearer
-    header.
-    """
-
-    base = api_base.rstrip("/")
-    normalized_endpoint = _normalize_config_text(endpoint_type).replace("-", "_").casefold()
-    normalized_family = _normalize_config_text(provider_family).replace("-", "_").casefold()
-
-    if normalized_endpoint == "anthropic" or normalized_family == "anthropic":
-        # Same resolver the runtime uses. A probe that builds its own URL can
-        # pass while the real request 400s on a duplicated /v1, which is the
-        # most misleading failure this validator could produce.
-        url = resolve_anthropic_messages_url(base, _normalize_config_text(anthropic_path))
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": _normalize_config_text(anthropic_version) or DEFAULT_ANTHROPIC_VERSION,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "ping"}],
-        }
-        try:
-            if should_bypass_environment_proxy({"proxy_mode": proxy_mode}):
-                with requests.Session() as session:
-                    session.trust_env = False
-                    response = session.post(url, headers=headers, json=payload, timeout=10)
-            else:
-                response = requests.post(url, headers=headers, json=payload, timeout=10)
-            if response.status_code == 200:
-                return True, f"Anthropic API 连通成功，模型'{model}'可用"
-            return False, f"Anthropic API请求失败：HTTP {response.status_code}"
-        except requests.exceptions.Timeout:
-            return False, "连接超时：API服务器响应时间过长"
-        except requests.exceptions.RequestException:
-            # Do not echo the exception: a malformed endpoint may contain
-            # userinfo/query material, and request libraries include the URL in
-            # their error text. Credentials must never reach UI/log output.
-            return False, "请求异常：无法连接 Anthropic API 服务器"
-
-    base = re.sub(r"/chat/completions/?$", "", base, flags=re.IGNORECASE)
-    base = re.sub(r"/v1/chat/completions/?$", "/v1", base, flags=re.IGNORECASE)
-    base = re.sub(r"/models/?$", "", base, flags=re.IGNORECASE)
-    if not re.search(r"/v\d+$", base, flags=re.IGNORECASE):
-        base = f"{base}/v1"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
-        if should_bypass_environment_proxy({"proxy_mode": proxy_mode}):
-            with requests.Session() as session:
-                session.trust_env = False
-                response = session.get(f"{base}/models", headers=headers, timeout=10)
-        else:
-            response = requests.get(f"{base}/models", headers=headers, timeout=10)
-        if response.status_code != 200:
-            return False, f"API请求失败：HTTP {response.status_code}"
-        try:
-            model_ids = [str(item.get("id", "")) for item in response.json().get("data", [])]
-        except (AttributeError, json.JSONDecodeError, TypeError):
-            return False, "API响应格式异常：无法解析模型列表"
-        if model in model_ids:
-            return True, f"API连通成功，模型'{model}'可用"
-        for model_id in model_ids:
-            if model.lower() in model_id.lower() or model_id.lower() in model.lower():
-                return True, f"API连通成功，找到匹配模型'{model_id}'"
-        return False, f"模型不可用：指定模型'{model}'不存在或无权访问"
-    except requests.exceptions.Timeout:
-        return False, "连接超时：API服务器响应时间过长"
-    except requests.exceptions.RequestException:
-        # Keep provider errors safe even when an endpoint was entered with
-        # credential-shaped URL material.
+        result = _probe_provider_connection(
+            {
+                "api_key": api_key,
+                "api_base": api_base,
+                "model": model,
+                "proxy_mode": proxy_mode,
+                "provider_family": provider_family,
+                "endpoint_type": endpoint_type,
+                "anthropic_path": anthropic_path,
+                "anthropic_version": anthropic_version,
+            }
+        )
+    except (OSError, TypeError, ValueError, RuntimeError):
         return False, "请求异常：无法连接 API 服务器"
+    if str(result.get("status") or "") == "success":
+        family = _normalize_config_text(provider_family) or "provider"
+        return True, f"{family} API 连通成功，模型'{model}'可用"
+    error_kind = _normalize_config_text(result.get("error_kind"))
+    if error_kind == "quota_exhausted":
+        return False, "请求失败：Provider 配额不足"
+    if error_kind == "fatal_config_or_auth":
+        return False, "请求失败：Provider 配置或认证无效"
+    if error_kind == "budget_exhausted":
+        return False, "请求失败：Provider 预算已耗尽"
+    return False, "请求异常：无法连接 API 服务器"
 
 
 def validate_zotero_library_path(library_path: str) -> Tuple[bool, str]:

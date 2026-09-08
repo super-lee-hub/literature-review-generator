@@ -1,4 +1,5 @@
 import pytest
+import config_validator
 
 from config_validator import test_api_connection as probe_api_connection, validate_all_config
 from services.config_values import StrictConfigValueError
@@ -47,15 +48,11 @@ def _base_config():
 def test_anthropic_connection_uses_native_messages_headers_and_path(monkeypatch):
     calls = {}
 
-    class Response:
-        status_code = 200
+    def fake_probe(api_config):
+        calls.update(api_config)
+        return {"status": "success"}
 
-    def fake_post(url, *, headers, json, timeout):
-        calls.update(url=url, headers=headers, json=json, timeout=timeout)
-        return Response()
-
-    monkeypatch.setattr("config_validator.requests.post", fake_post)
-    monkeypatch.setattr("config_validator.should_bypass_environment_proxy", lambda _config: False)
+    monkeypatch.setattr(config_validator, "_probe_provider_connection", fake_probe)
 
     ok, message = probe_api_connection(
         "anthropic-secret",
@@ -68,15 +65,16 @@ def test_anthropic_connection_uses_native_messages_headers_and_path(monkeypatch)
     )
 
     assert ok is True
-    assert "Anthropic API" in message
-    assert calls["url"] == "https://chat.example.test/v1/messages"
-    assert calls["headers"]["x-api-key"] == "anthropic-secret"
-    assert calls["headers"]["anthropic-version"] == "2023-06-01"
-    assert "Authorization" not in calls["headers"]
-    assert calls["json"] == {
+    assert "anthropic" in message
+    assert calls == {
+        "api_key": "anthropic-secret",
+        "api_base": "https://chat.example.test",
         "model": "claude-opus-5",
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "ping"}],
+        "proxy_mode": "environment",
+        "provider_family": "anthropic",
+        "endpoint_type": "anthropic",
+        "anthropic_path": "/v1/messages",
+        "anthropic_version": "2023-06-01",
     }
 
 

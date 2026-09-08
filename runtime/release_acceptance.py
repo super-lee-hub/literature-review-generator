@@ -540,6 +540,77 @@ class GateFScenario(AcceptanceScenario):
 class GateGScenario(AcceptanceScenario):
     gate = "G"
 
+    def collect(
+        self,
+        context: AcceptanceScenarioContextV1,
+        refs: Iterable[Mapping[str, Any]],
+        *,
+        runtime_result: Mapping[str, Any] | None,
+    ) -> AcceptanceScenarioResultV1:
+        source_refs = list(refs)
+        if not any(str(ref.get("role") or "") == "free_mode_profile" for ref in source_refs):
+            profile_path = self._profile_path(context)
+            if profile_path is not None:
+                from services.job_workspace import atomic_write_json
+
+                raw = profile_path.read_bytes()
+                try:
+                    profile = json.loads(raw.decode("utf-8"))
+                except (UnicodeError, json.JSONDecodeError):
+                    profile = None
+                if isinstance(profile, Mapping):
+                    wrapper_path = (
+                        Path(context.evidence_root).expanduser().resolve()
+                        / "G"
+                        / "free_mode_profile.json"
+                    )
+                    atomic_write_json(
+                        str(wrapper_path),
+                        {
+                            "artifact_type": "free_mode_profile",
+                            "artifact_version": "v1",
+                            "schema_version": "free-mode-profile-v1",
+                            "profile_id": hashlib.sha256(raw).hexdigest(),
+                            "profile_sha256": hashlib.sha256(raw).hexdigest(),
+                            "profile_path": str(profile_path),
+                            "profile": dict(profile),
+                        },
+                    )
+                    source_refs.append(
+                        GateEvidenceProducer(
+                            final_sha=context.final_executable_sha
+                        ).reference(
+                            wrapper_path,
+                            role="free_mode_profile",
+                            artifact_type="free_mode_profile",
+                            artifact_version="v1",
+                            schema_version="free-mode-profile-v1",
+                            job_id=context.job_id,
+                        )
+                    )
+        return super().collect(context, source_refs, runtime_result=runtime_result)
+
+    @staticmethod
+    def _profile_path(context: AcceptanceScenarioContextV1) -> Path | None:
+        if not context.runtime_spec_path:
+            return None
+        try:
+            payload = json.loads(
+                Path(context.runtime_spec_path).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        raw_path = str(payload.get("free_mode_profile") or "").strip()
+        if not raw_path:
+            return None
+        profile_path = Path(raw_path).expanduser()
+        if not profile_path.is_absolute():
+            profile_path = Path(context.runtime_spec_path).expanduser().resolve().parent / profile_path
+        profile_path = profile_path.resolve()
+        return profile_path if profile_path.is_file() and not profile_path.is_symlink() else None
+
 
 class GateHScenario(AcceptanceScenario):
     gate = "H"
@@ -1039,6 +1110,7 @@ _ROLE_ARTIFACT_TYPES: dict[str, frozenset[str]] = {
         "validation_completion_projection",
     }),
     "citation_manifest": frozenset({"citation_manifest", "citation_manifest_v3"}),
+    "free_mode_profile": frozenset({"free_mode_profile"}),
     "ocr_diagnostics": frozenset({"ocr_diagnostics"}),
     "ocr_artifact": frozenset({"ocr_artifact"}),
     "defect_artifact": frozenset({
@@ -1287,6 +1359,96 @@ class ControlledDefectChallengeV1:
                     f"controlled defect challenge {name} is not SHA-256"
                 )
         return cls(**values)
+
+
+@dataclass(frozen=True)
+class ProcessInterruptionEventV1:
+    event_id: str
+    acceptance_run_id: str
+    scenario_id: str
+    job_id: str
+    attempt_id: str
+    pid: int
+    process_creation_identity: str
+    started_at: str
+    interrupted_at: str
+    interruption_method: str
+    exit_code: int
+    last_durable_stage: str
+    last_durable_receipt_id: str = ""
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "ProcessInterruptionEventV1":
+        if payload.get("artifact_type") != "process_interruption_event" or payload.get("schema_version") != "process-interruption-event-v1":
+            raise ReleaseAcceptanceSpecError("process interruption event type or schema is invalid")
+        values = {
+            "event_id": str(payload.get("event_id") or "").strip(),
+            "acceptance_run_id": str(payload.get("acceptance_run_id") or "").strip(),
+            "scenario_id": str(payload.get("scenario_id") or "").strip(),
+            "job_id": str(payload.get("job_id") or "").strip(),
+            "attempt_id": str(payload.get("attempt_id") or "").strip(),
+            "process_creation_identity": str(payload.get("process_creation_identity") or "").strip(),
+            "started_at": str(payload.get("started_at") or "").strip(),
+            "interrupted_at": str(payload.get("interrupted_at") or "").strip(),
+            "interruption_method": str(payload.get("interruption_method") or "").strip(),
+            "last_durable_stage": str(payload.get("last_durable_stage") or "").strip(),
+            "last_durable_receipt_id": str(payload.get("last_durable_receipt_id") or "").strip(),
+        }
+        if any(not values[name] for name in (
+            "event_id", "acceptance_run_id", "scenario_id", "job_id", "attempt_id",
+            "process_creation_identity", "started_at", "interrupted_at",
+            "interruption_method", "last_durable_stage",
+        )):
+            raise ReleaseAcceptanceSpecError("process interruption event identity is incomplete")
+        raw_pid = payload.get("pid")
+        raw_exit = payload.get("exit_code")
+        if isinstance(raw_pid, bool) or isinstance(raw_exit, bool):
+            raise ReleaseAcceptanceSpecError("process interruption event numeric fields are invalid")
+        try:
+            pid = int(str(raw_pid))
+            exit_code = int(str(raw_exit))
+        except (TypeError, ValueError):
+            raise ReleaseAcceptanceSpecError("process interruption event numeric fields are invalid") from None
+        if pid <= 0:
+            raise ReleaseAcceptanceSpecError("process interruption event pid is invalid")
+        return cls(pid=pid, exit_code=exit_code, **values)
+
+
+@dataclass(frozen=True)
+class ProcessResumeEventV1:
+    event_id: str
+    acceptance_run_id: str
+    scenario_id: str
+    job_id: str
+    interruption_event_id: str
+    interruption_event_sha256: str
+    previous_attempt_id: str
+    new_attempt_id: str
+    new_pid: int
+    resumed_at: str
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "ProcessResumeEventV1":
+        if payload.get("artifact_type") != "process_resume_event" or payload.get("schema_version") != "process-resume-event-v1":
+            raise ReleaseAcceptanceSpecError("process resume event type or schema is invalid")
+        text_fields = (
+            "event_id", "acceptance_run_id", "scenario_id", "job_id",
+            "interruption_event_id", "interruption_event_sha256",
+            "previous_attempt_id", "new_attempt_id", "resumed_at",
+        )
+        values = {name: str(payload.get(name) or "").strip() for name in text_fields}
+        if any(not value for value in values.values()) or not _valid_sha256(values["interruption_event_sha256"]):
+            raise ReleaseAcceptanceSpecError("process resume event identity is incomplete")
+        raw_pid = payload.get("new_pid")
+        if isinstance(raw_pid, bool):
+            raise ReleaseAcceptanceSpecError("process resume event pid is invalid")
+        try:
+            new_pid = int(str(raw_pid))
+        except (TypeError, ValueError):
+            raise ReleaseAcceptanceSpecError("process resume event pid is invalid") from None
+        if new_pid <= 0:
+            raise ReleaseAcceptanceSpecError("process resume event pid is invalid")
+        return cls(new_pid=new_pid, **values)
 
 
 class GateEvidenceProducer:
@@ -1665,29 +1827,26 @@ class GateEvidenceVerifier:
         if gate == "C":
             source_refs = by_role.get("source_pdf", [])
             canonical_refs = by_role.get("canonical_stage1", [])
-            if len(source_refs) != 1 or len(canonical_refs) != 1:
-                return {}, "one-paper gate requires exactly one source PDF and canonical Stage 1 artifact"
-            canonical_payload = payloads.get(canonical_refs[0].ref_id)
-            canonical_rows = self._rows(canonical_payload)
-            if not canonical_rows:
-                return {}, "canonical Stage 1 evidence is empty"
+            if len(source_refs) != 1 or not canonical_refs:
+                return {}, "one-paper gate requires exactly one source PDF and canonical Stage 1 evidence"
             identity_rows = []
-            for row in canonical_rows:
-                paper = row.get("paper_info") if isinstance(row.get("paper_info"), Mapping) else row
-                if not isinstance(paper, Mapping):
-                    continue
-                paper_key = str(paper.get("canonical_paper_key") or "").strip()
-                raw_preprocess = row.get("preprocess")
-                preprocess = raw_preprocess if isinstance(raw_preprocess, Mapping) else {}
-                source_hash = str(
-                    paper.get("source_pdf_sha256")
-                    or row.get("source_pdf_sha256")
-                    or preprocess.get("source_pdf_sha256")
-                    or ""
-                ).strip()
-                if paper_key and source_hash:
-                    identity_rows.append((paper_key, source_hash))
-            if len(identity_rows) != 1 or identity_rows[0][1] != source_refs[0].sha256:
+            for canonical_ref in canonical_refs:
+                for row in self._rows(payloads.get(canonical_ref.ref_id)):
+                    paper = row.get("paper_info") if isinstance(row.get("paper_info"), Mapping) else row
+                    if not isinstance(paper, Mapping):
+                        continue
+                    paper_key = str(paper.get("canonical_paper_key") or "").strip()
+                    raw_preprocess = row.get("preprocess")
+                    preprocess = raw_preprocess if isinstance(raw_preprocess, Mapping) else {}
+                    source_hash = str(
+                        paper.get("source_pdf_sha256")
+                        or row.get("source_pdf_sha256")
+                        or preprocess.get("source_pdf_sha256")
+                        or ""
+                    ).strip()
+                    if paper_key and source_hash:
+                        identity_rows.append((paper_key, source_hash))
+            if not any(source_hash == source_refs[0].sha256 for _key, source_hash in identity_rows):
                 return {}, "canonical Stage 1 evidence is not bound to the one source PDF identity"
             outcome_refs = by_role.get("job_outcome", [])
             terminal_refs = by_role.get("stage_terminal", [])
@@ -1939,36 +2098,26 @@ class GateEvidenceVerifier:
             event_refs = by_role.get("process_events", [])
             if len(interruption_refs) != 1 or len(resume_refs) != 1 or len(event_refs) != 1:
                 return {}, "resume evidence requires one typed interruption, resume, and process-event artifact"
-            interruption = payloads.get(interruption_refs[0].ref_id)
-            resume = payloads.get(resume_refs[0].ref_id)
-            if not isinstance(interruption, Mapping) or not isinstance(resume, Mapping):
+            interruption_payload = payloads.get(interruption_refs[0].ref_id)
+            resume_payload = payloads.get(resume_refs[0].ref_id)
+            if not isinstance(interruption_payload, Mapping) or not isinstance(resume_payload, Mapping):
                 return {}, "interruption and resume evidence must be JSON objects"
-            if interruption.get("artifact_type") != "process_interruption_event" or interruption.get("schema_version") != "process-interruption-event-v1":
-                return {}, "interruption evidence type or schema is invalid"
-            if resume.get("artifact_type") != "process_resume_event" or resume.get("schema_version") != "process-resume-event-v1":
-                return {}, "resume evidence type or schema is invalid"
-            interruption_id = str(interruption.get("event_id") or "").strip()
-            interruption_job = str(interruption.get("job_id") or "").strip()
-            interruption_attempt = str(interruption.get("attempt_id") or "").strip()
-            if not interruption_id or not interruption_job or not interruption_attempt:
-                return {}, "interruption evidence lacks event, job, or attempt identity"
-            if expected_job_id and interruption_job != expected_job_id:
+            try:
+                interruption = ProcessInterruptionEventV1.from_mapping(interruption_payload)
+                resume = ProcessResumeEventV1.from_mapping(resume_payload)
+            except ReleaseAcceptanceSpecError as exc:
+                return {}, str(exc)
+            if expected_job_id and interruption.job_id != expected_job_id:
                 return {}, "interruption evidence belongs to a different job"
-            for name in ("pid", "process_creation_identity", "interrupted_at", "interruption_method", "last_durable_stage"):
-                if not str(interruption.get(name) or "").strip():
-                    return {}, f"interruption evidence requires {name}"
-            if self._timestamp(interruption.get("started_at")) is None or self._timestamp(interruption.get("interrupted_at")) is None:
+            if self._timestamp(interruption.started_at) is None or self._timestamp(interruption.interrupted_at) is None:
                 return {}, "interruption evidence timestamps are invalid"
-            if interruption.get("exit_code") is None:
-                return {}, "interruption evidence requires child exit_code"
-            if str(resume.get("interruption_event_id") or "") != interruption_id:
+            if resume.interruption_event_id != interruption.event_id:
                 return {}, "resume evidence does not reference the interruption event"
-            if str(resume.get("interruption_event_sha256") or "") != interruption_refs[0].sha256:
+            if resume.interruption_event_sha256 != interruption_refs[0].sha256:
                 return {}, "resume evidence is not hash-bound to the interruption event"
-            if str(resume.get("previous_attempt_id") or "") != interruption_attempt:
+            if resume.previous_attempt_id != interruption.attempt_id:
                 return {}, "resume evidence previous attempt does not match interruption"
-            new_attempt = str(resume.get("new_attempt_id") or "").strip()
-            if not new_attempt or new_attempt == interruption_attempt or not str(resume.get("new_pid") or "").strip():
+            if resume.new_attempt_id == interruption.attempt_id or self._timestamp(resume.resumed_at) is None:
                 return {}, "resume evidence lacks a distinct new attempt and process"
             event_rows = self._rows(payloads.get(event_refs[0].ref_id))
             if not event_rows or any(
@@ -2221,7 +2370,7 @@ class GateEvidenceVerifier:
             artifact_refs = by_role.get("ocr_artifact", [])
             canonical_refs = by_role.get("canonical_stage1", [])
             registry_refs = by_role.get("registry", [])
-            if len(source_refs) != 1 or len(diagnostics_refs) != 1 or len(artifact_refs) != 1 or len(canonical_refs) != 1 or len(registry_refs) != 1:
+            if len(source_refs) != 1 or len(diagnostics_refs) != 1 or len(artifact_refs) != 1 or not canonical_refs or len(registry_refs) != 1:
                 return {}, "OCR gate requires one source, diagnostics, OCR artifact, canonical Stage 1, and Registry reference"
             source_hash = source_refs[0].sha256
             diagnostics = payloads.get(diagnostics_refs[0].ref_id)
@@ -2249,8 +2398,27 @@ class GateEvidenceVerifier:
                 return {}, "OCR output artifact source hash does not match the source PDF"
             if str(ocr_artifact.get("diagnostics_sha256") or "") != diagnostics_refs[0].sha256:
                 return {}, "OCR output artifact is not bound to diagnostics"
-            canonical_payload = canonical.get("payload") if isinstance(canonical.get("payload"), Mapping) else canonical
-            lineage = canonical_payload.get("ocr_lineage") if isinstance(canonical_payload, Mapping) else None
+            artifact_pages = self._string_list(ocr_artifact.get("page_numbers"))
+            if artifact_pages != page_numbers or not isinstance(ocr_artifact.get("page_text_hashes"), Mapping):
+                return {}, "OCR output artifact page lineage is incomplete"
+            if isinstance(canonical, list):
+                canonical_items = [item for item in canonical if isinstance(item, Mapping)]
+            else:
+                nested_canonical = canonical.get("payload")
+                canonical_items = [
+                    cast(Mapping[str, Any], nested_canonical)
+                    if isinstance(nested_canonical, Mapping)
+                    else canonical
+                ]
+            lineage = next(
+                (
+                    item.get("ocr_lineage")
+                    for item in canonical_items
+                    if str(item.get("source_pdf_sha256") or "") == source_hash
+                    and isinstance(item.get("ocr_lineage"), Mapping)
+                ),
+                None,
+            )
             if not isinstance(lineage, Mapping):
                 return {}, "canonical Stage 1 artifact lacks OCR lineage"
             if (
@@ -2825,6 +2993,8 @@ __all__ = [
     "GateKScenario",
     "GateQScenario",
     "GenericAcceptanceScenario",
+    "ProcessInterruptionEventV1",
+    "ProcessResumeEventV1",
     "ControlledDefectChallengeV1",
     "DocumentModalityProfileV1",
     "DurableEvidenceRefV1",

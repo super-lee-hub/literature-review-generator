@@ -1,5 +1,7 @@
 import io
 import json
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -147,6 +149,60 @@ def test_preprocess_failure_cleans_staging_generation(tmp_path: Path, monkeypatc
         manager.prepare_pdf(str(pdf_path))
 
     assert not list(cache_dir.glob("**/.generation.tmp-*"))
+
+
+def test_preprocess_same_cache_key_serializes_independent_processes(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "concurrent.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    worker_code = (
+        "import json,sys; "
+        "from preprocess.service import PreprocessManager; "
+        "cfg=json.loads(sys.argv[1]); "
+        "result=PreprocessManager(config=cfg).prepare_pdf(cfg['pdf'], pin_id=cfg['pin_id']); "
+        "json.dump({'manifest_path': result.manifest_path if result else ''}, open(cfg['result'],'w'), sort_keys=True)"
+    )
+    processes: list[subprocess.Popen[bytes]] = []
+    result_paths: list[Path] = []
+    try:
+        for index in range(2):
+            result_path = tmp_path / f"worker-{index}.json"
+            result_paths.append(result_path)
+            config = {
+                "Paths": {"output_path": str(tmp_path)},
+                "Preprocess": {
+                    "enabled": "true",
+                    "cache_dir": str(cache_dir),
+                    "ocr_mode": "off",
+                    "force_rebuild": "true",
+                    "extractor_profile": "fitz",
+                },
+                "pdf": str(pdf_path),
+                "pin_id": f"concurrent-job-{index}",
+                "result": str(result_path),
+            }
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", worker_code, json.dumps(config)],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        assert [process.wait(timeout=60) for process in processes] == [0, 0]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+
+    manifests = [
+        Path(json.loads(path.read_text(encoding="utf-8"))["manifest_path"])
+        for path in result_paths
+    ]
+    assert all(path.is_file() for path in manifests)
+    assert len({path.parent.name for path in manifests}) >= 1
+    assert all(json.loads(path.read_text(encoding="utf-8"))["generation_id"] == path.parent.name for path in manifests)
 
 
 def test_preprocess_manager_defaults_to_local_even_with_ambient_mineru_token(tmp_path: Path, monkeypatch) -> None:
