@@ -306,6 +306,140 @@ class AcceptanceRunStateV1:
         )
 
 
+@dataclass(frozen=True)
+class AcceptanceScenarioContextV1:
+    """Immutable inputs shared with exactly one acceptance scenario."""
+
+    acceptance_run_id: str
+    final_executable_sha: str
+    runtime_spec_path: str
+    workspace_path: str
+    job_id: str
+    evidence_root: str
+    process_event_log: str
+    owner_authorized: bool
+
+
+@dataclass(frozen=True)
+class AcceptanceScenarioResultV1:
+    gate: str
+    scenario_id: str
+    status: str
+    reason: str
+    evidence_refs: tuple[Mapping[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "gate": self.gate,
+            "scenario_id": self.scenario_id,
+            "status": self.status,
+            "reason": self.reason,
+            "evidence_ref_count": len(self.evidence_refs),
+        }
+
+
+class AcceptanceScenario:
+    """One gate-specific evidence boundary; never fabricates facts."""
+
+    gate = ""
+
+    def collect(
+        self,
+        context: AcceptanceScenarioContextV1,
+        refs: Iterable[Mapping[str, Any]],
+        *,
+        runtime_result: Mapping[str, Any] | None,
+    ) -> AcceptanceScenarioResultV1:
+        allowed = gate_evidence_roles(self.gate)
+        selected = tuple(
+            ref for ref in refs if str(ref.get("role") or "") in allowed
+        )
+        present = {str(ref.get("role") or "") for ref in selected}
+        missing = sorted(allowed - present)
+        if missing:
+            reason = "scenario evidence is missing roles: " + ", ".join(missing)
+            if runtime_result and str(runtime_result.get("status") or "").startswith("BLOCKED"):
+                reason += "; runtime execution was blocked"
+            return AcceptanceScenarioResultV1(
+                gate=self.gate,
+                scenario_id=self.gate,
+                status="BLOCKED_MISSING_INPUT",
+                reason=reason,
+                evidence_refs=selected,
+            )
+        return AcceptanceScenarioResultV1(
+            gate=self.gate,
+            scenario_id=self.gate,
+            status="READY_FOR_SEMANTIC_VERIFICATION",
+            reason="dedicated gate roles were selected from durable sources",
+            evidence_refs=selected,
+        )
+
+
+class GateCScenario(AcceptanceScenario):
+    gate = "C"
+
+
+class GateDScenario(AcceptanceScenario):
+    gate = "D"
+
+
+class GateEScenario(AcceptanceScenario):
+    gate = "E"
+
+
+class GateFScenario(AcceptanceScenario):
+    gate = "F"
+
+
+class GateGScenario(AcceptanceScenario):
+    gate = "G"
+
+
+class GateHScenario(AcceptanceScenario):
+    gate = "H"
+
+
+class GateIScenario(AcceptanceScenario):
+    gate = "I"
+
+
+class GateJScenario(AcceptanceScenario):
+    gate = "J"
+
+
+class GateKScenario(AcceptanceScenario):
+    gate = "K"
+
+
+class GateQScenario(AcceptanceScenario):
+    gate = "Q"
+
+
+_SCENARIO_TYPES: dict[str, type[AcceptanceScenario]] = {
+    scenario.gate: scenario
+    for scenario in (
+        GateCScenario,
+        GateDScenario,
+        GateEScenario,
+        GateFScenario,
+        GateGScenario,
+        GateHScenario,
+        GateIScenario,
+        GateJScenario,
+        GateKScenario,
+        GateQScenario,
+    )
+}
+
+
+def scenario_for_gate(gate: str) -> AcceptanceScenario:
+    scenario_type = _SCENARIO_TYPES.get(str(gate))
+    if scenario_type is None:
+        raise ReleaseAcceptanceSpecError(f"no acceptance scenario is registered for gate {gate}")
+    return scenario_type()
+
+
 GATE_CONTRACTS: dict[str, dict[str, Any]] = {
     "A": {
         "purpose": "exact-final-SHA offline closure",
@@ -441,6 +575,9 @@ _GATE_EVIDENCE_FIELDS = frozenset(
     {
         "schema_version",
         "final_sha",
+        "acceptance_run_id",
+        "scenario_id",
+        "job_id",
         "durable_refs",
         "evidence_refs",
         "producer",
@@ -462,6 +599,13 @@ _GATE_REF_ROLES: dict[str, frozenset[str]] = {
     "K": frozenset({"process_events", "lock_state"}),
     "Q": frozenset({"source_pdf", "canonical_stage1", "outline_terminal", "review_docx", "validation_artifact", "provider_receipt_ledger", "registry", "closure", "job_outcome", "citation_manifest"}),
 }
+
+
+def gate_evidence_roles(gate: str) -> frozenset[str]:
+    """Return the only evidence roles admitted to one specialized scenario."""
+
+    gate_contract(gate)
+    return _GATE_REF_ROLES.get(str(gate), frozenset())
 
 _ROLE_ARTIFACT_TYPES: dict[str, frozenset[str]] = {
     "stage_terminal": frozenset({"runtime_stage_terminal"}),
@@ -784,11 +928,22 @@ class GateEvidenceProducer:
         )
         return ref.to_dict()
 
-    def build_gate(self, gate: str, refs: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    def build_gate(
+        self,
+        gate: str,
+        refs: Iterable[Mapping[str, Any]],
+        *,
+        acceptance_run_id: str = "",
+        scenario_id: str = "",
+        job_id: str = "",
+    ) -> dict[str, Any]:
         gate_contract(str(gate))
         normalized = [DurableEvidenceRefV1.from_mapping(item).to_dict() for item in refs]
         return {
             "final_sha": self.final_sha,
+            "acceptance_run_id": str(acceptance_run_id or ""),
+            "scenario_id": str(scenario_id or gate),
+            "job_id": str(job_id or ""),
             "durable_refs": normalized,
             "producer": "runtime.release_acceptance.GateEvidenceProducer",
             "schema_version": "release-acceptance-gate-evidence-v1",
@@ -842,7 +997,13 @@ class GateEvidenceProducer:
                 hashlib.sha256(previous_raw).hexdigest() if previous_raw else ""
             ),
             "gates": {
-                str(gate): self.build_gate(str(gate), list(refs))
+                str(gate): self.build_gate(
+                    str(gate),
+                    list(refs),
+                    acceptance_run_id=acceptance_run_id,
+                    scenario_id=scenario_id or str(gate),
+                    job_id=job_id,
+                )
                 for gate, refs in gates.items()
             },
         }
@@ -1747,6 +1908,19 @@ class GateEvidenceVerifier:
                 "reason": "gate evidence is bound to a different gate",
                 "contract": contract,
             }
+        if str(evidence.get("scenario_id") or "").strip() != str(gate):
+            return {
+                "status": "NOT_VERIFIED",
+                "reason": "gate evidence is not bound to its dedicated scenario",
+                "contract": contract,
+            }
+        evidence_job_id = str(evidence.get("job_id") or "").strip()
+        if expected_job_id and evidence_job_id and evidence_job_id != str(expected_job_id):
+            return {
+                "status": "FAIL",
+                "reason": "gate evidence job identity does not match the tested job",
+                "contract": contract,
+            }
         evidence_sha = str(evidence.get("final_sha") or "").strip()
         if not _valid_checkout_sha(evidence_sha):
             return {
@@ -2027,6 +2201,13 @@ class GateEvidenceVerifier:
                 }
 
         required_roles = _GATE_REF_ROLES.get(str(gate), frozenset())
+        unexpected_roles = sorted({ref.role for ref in refs} - required_roles)
+        if unexpected_roles:
+            return {
+                "status": "FAIL",
+                "reason": "gate evidence contains roles owned by another scenario: " + ", ".join(unexpected_roles),
+                "contract": contract,
+            }
         missing_roles = sorted(required_roles - {ref.role for ref in refs})
         if missing_roles:
             return {
@@ -2139,8 +2320,21 @@ def validate_gate_evidence(
 
 __all__ = [
     "AcceptanceExecutionContextV1",
+    "AcceptanceScenario",
+    "AcceptanceScenarioContextV1",
+    "AcceptanceScenarioResultV1",
     "GATE_CONTRACTS",
     "AcceptanceRunStateV1",
+    "GateCScenario",
+    "GateDScenario",
+    "GateEScenario",
+    "GateFScenario",
+    "GateGScenario",
+    "GateHScenario",
+    "GateIScenario",
+    "GateJScenario",
+    "GateKScenario",
+    "GateQScenario",
     "ControlledDefectChallengeV1",
     "DocumentModalityProfileV1",
     "DurableEvidenceRefV1",
@@ -2150,5 +2344,7 @@ __all__ = [
     "ReleaseAcceptanceSpec",
     "ReleaseAcceptanceSpecError",
     "gate_contract",
+    "gate_evidence_roles",
+    "scenario_for_gate",
     "validate_gate_evidence",
 ]

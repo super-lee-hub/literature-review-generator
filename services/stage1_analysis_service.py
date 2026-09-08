@@ -5069,7 +5069,7 @@ class Stage1AnalysisService:
             target = snapshot_root / source.name
             if not target.is_file():
                 shutil.copyfile(source, target)
-                with target.open("rb") as handle:
+                with target.open("r+b") as handle:
                     os.fsync(handle.fileno())
             if file_sha256(str(source)) != file_sha256(str(target)):
                 raise RuntimeError(f"preprocess authority snapshot hash mismatch: {source.name}")

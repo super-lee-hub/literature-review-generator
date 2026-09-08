@@ -554,11 +554,13 @@ class ReviewControlPlane:
 
         from runtime.release_acceptance import (
             AcceptanceRunStateV1,
+            AcceptanceScenarioContextV1,
             GateEvidenceProducer,
             GateEvidenceVerifier,
             ReleaseAcceptanceSpec,
             ReleaseAcceptanceSpecError,
             gate_contract,
+            scenario_for_gate,
         )
 
         spec_path = Path(acceptance_spec_path).expanduser().resolve()
@@ -785,20 +787,39 @@ class ReviewControlPlane:
             )
         if runtime_job_spec is not None:
             refs.extend(
-            self._acceptance_source_references(
+                self._acceptance_source_references(
                     runtime_job_spec,
                     final_sha=current_sha,
                     job_id=job_id,
                     profile_root=Path(state.evidence_root).expanduser().resolve(),
                 )
             )
+        scenario_context = AcceptanceScenarioContextV1(
+            acceptance_run_id=state.run_id,
+            final_executable_sha=current_sha,
+            runtime_spec_path=str(runtime_spec or ""),
+            workspace_path=workspace_path,
+            job_id=job_id,
+            evidence_root=state.evidence_root,
+            process_event_log=state.process_event_log,
+            owner_authorized=execution_context.owner_authorized,
+        )
+        scenario_results: dict[str, Any] = {}
+        scenario_refs: dict[str, tuple[Mapping[str, Any], ...]] = {}
+        for gate in gates:
+            scenario_result = scenario_for_gate(str(gate)).collect(
+                scenario_context,
+                refs,
+                runtime_result=runtime_result,
+            )
+            scenario_results[str(gate)] = scenario_result
+            scenario_refs[str(gate)] = scenario_result.evidence_refs
         if refs:
             producer = GateEvidenceProducer(final_sha=current_sha)
             producer.write_manifest(
                 evidence_path,
-                {str(gate): refs for gate in gates},
+                scenario_refs,
                 acceptance_run_id=state.run_id,
-                scenario_id="acceptance-run",
                 job_id=job_id,
             )
 
@@ -832,6 +853,10 @@ class ReviewControlPlane:
                 origin_dir=evidence_path.parent,
                 expected_job_id=job_id,
             )
+            verified_gates[str(gate)] = {
+                **verified_gates[str(gate)],
+                "scenario": scenario_results[str(gate)].to_dict(),
+            }
             if verified_gates[str(gate)].get("status") == "PASS":
                 continue
             if runtime_result and str(runtime_result.get("status") or "").startswith("BLOCKED"):
@@ -888,6 +913,10 @@ class ReviewControlPlane:
             "acceptance_execution_context": execution_context.to_dict(),
             "runtime_result": runtime_result,
             "route_plan": route_plan,
+            "scenarios": {
+                gate: result.to_dict()
+                for gate, result in scenario_results.items()
+            },
             "gates": verified_gates,
             "read_only": False,
         }
