@@ -105,12 +105,31 @@ jobs:
           }
           Write-Host "Running $($selectedTestFiles.Count) test files in shard $shard/$shardCount"
           foreach ($testFile in $selectedTestFiles) {
-            Write-Host "Running isolated pytest process for $testFile"
-            python -m pytest -vv -rs --strict-markers `
-              -m "not live_api and not playwright and not heavy_ocr" `
-              $testFile
-            if ($LASTEXITCODE -ne 0) {
-              throw "pytest failed for $testFile with exit code $LASTEXITCODE"
+            if ($testFile -like "*tests/test_release_hardening.py") {
+              $testNodes = @(
+                python -m pytest --collect-only -q --strict-markers `
+                  -m "not live_api and not playwright and not heavy_ocr" `
+                  $testFile |
+                  Where-Object { $_ -match "::" }
+              )
+              if ($testNodes.Count -eq 0) {
+                throw "No selected test nodes found for $testFile"
+              }
+              foreach ($testNode in $testNodes) {
+                Write-Host "Running isolated pytest process for $testNode"
+                python -m pytest -vv -rs --strict-markers $testNode
+                if ($LASTEXITCODE -ne 0) {
+                  throw "pytest failed for $testNode with exit code $LASTEXITCODE"
+                }
+              }
+            } else {
+              Write-Host "Running isolated pytest process for $testFile"
+              python -m pytest -vv -rs --strict-markers `
+                -m "not live_api and not playwright and not heavy_ocr" `
+                $testFile
+              if ($LASTEXITCODE -ne 0) {
+                throw "pytest failed for $testFile with exit code $LASTEXITCODE"
+              }
             }
           }
       - name: Type check
