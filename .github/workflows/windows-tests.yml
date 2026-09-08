@@ -127,10 +127,24 @@ jobs:
               }
               foreach ($testNode in $testNodes) {
                 Write-Host "Running isolated pytest process for $testNode"
-                $testProcess = Start-Process -FilePath "python" -ArgumentList @(
-                  "-m", "pytest", "-vv", "-rs", "--strict-markers", $testNode
-                ) -NoNewWindow -Wait -PassThru
-                $testExitCode = [int]$testProcess.ExitCode
+                $stdoutPath = Join-Path $env:RUNNER_TEMP ("pytest-" + [guid]::NewGuid().ToString("N") + ".stdout")
+                $stderrPath = Join-Path $env:RUNNER_TEMP ("pytest-" + [guid]::NewGuid().ToString("N") + ".stderr")
+                try {
+                  $testProcess = Start-Process -FilePath "python" -ArgumentList @(
+                    "-m", "pytest", "-vv", "-rs", "--strict-markers", $testNode
+                  ) -WorkingDirectory (Get-Location).Path `
+                    -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+                    -Wait -PassThru -ErrorAction Stop
+                  $testExitCode = [int]$testProcess.ExitCode
+                } finally {
+                  if (Test-Path -LiteralPath $stdoutPath) {
+                    Get-Content -LiteralPath $stdoutPath | ForEach-Object { Write-Host $_ }
+                  }
+                  if (Test-Path -LiteralPath $stderrPath) {
+                    Get-Content -LiteralPath $stderrPath | ForEach-Object { Write-Host $_ }
+                  }
+                  Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
+                }
                 Write-Host "pytest exit code for $testNode = $testExitCode"
                 if ($testExitCode -ne 0) {
                   throw "pytest failed for $testNode with exit code $testExitCode"
