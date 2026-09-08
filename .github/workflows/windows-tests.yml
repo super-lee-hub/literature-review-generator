@@ -60,6 +60,7 @@ jobs:
       - name: Strict-offline test suite
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $allTestFiles = @(
             Get-ChildItem -LiteralPath tests -Filter "test_*.py" -File -Recurse |
               Sort-Object -Property FullName
@@ -127,7 +128,8 @@ jobs:
               foreach ($testNode in $testNodes) {
                 Write-Host "Running isolated pytest process for $testNode"
                 & python -m pytest -vv -rs --strict-markers $testNode
-                $testExitCode = $LASTEXITCODE
+                $testExitCode = [int]$LASTEXITCODE
+                Write-Host "pytest exit code for $testNode = $testExitCode"
                 if ($testExitCode -ne 0) {
                   throw "pytest failed for $testNode with exit code $testExitCode"
                 }
@@ -137,7 +139,8 @@ jobs:
               & python -m pytest -vv -rs --strict-markers `
                 -m "not live_api and not playwright and not heavy_ocr" `
                 $testFile
-              $testExitCode = $LASTEXITCODE
+              $testExitCode = [int]$LASTEXITCODE
+              Write-Host "pytest exit code for $testFile = $testExitCode"
               if ($testExitCode -ne 0) {
                 throw "pytest failed for $testFile with exit code $testExitCode"
               }
