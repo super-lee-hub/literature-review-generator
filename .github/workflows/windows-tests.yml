@@ -13,6 +13,10 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       AUTO_GENERATE_OFFLINE_TESTS: "1"
       AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP: "1"
@@ -54,9 +58,28 @@ jobs:
           python -m reviewctl queue-add --help
           python -m reviewctl queue-run --help
       - name: Strict-offline test suite
-        run: >-
-          python -m pytest -vv --strict-markers
-          -m "not live_api and not playwright and not heavy_ocr"
+        shell: pwsh
+        run: |
+          $allTestFiles = @(
+            Get-ChildItem -LiteralPath tests -Filter "test_*.py" -File -Recurse |
+              Sort-Object -Property FullName
+          )
+          $shard = [int]"${{ matrix.shard }}"
+          $shardCount = 3
+          $selectedTestFiles = @(
+            for ($index = 0; $index -lt $allTestFiles.Count; $index++) {
+              if (($index % $shardCount) -eq ($shard - 1)) {
+                $allTestFiles[$index].FullName
+              }
+            }
+          )
+          if ($selectedTestFiles.Count -eq 0) {
+            throw "No test files selected for shard $shard/$shardCount"
+          }
+          Write-Host "Running $($selectedTestFiles.Count) test files in shard $shard/$shardCount"
+          python -m pytest -vv --strict-markers `
+            -m "not live_api and not playwright and not heavy_ocr" `
+            $selectedTestFiles
       - name: Type check
         run: python -m pyright
       - name: Doctor
