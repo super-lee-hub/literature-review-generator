@@ -8,17 +8,15 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-PRODUCTION_RUNTIME_SHA = 80f4648ca449e13154108490bbd96da400f69ec7
-FINAL_EXECUTABLE_SHA = bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8
-REMOTE_HEAD_AT_CODE_ACCEPTANCE = bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8
-HOSTED_CI_RUN = 34209120471
+PRODUCTION_RUNTIME_SHA = bbf200f9f130afcb8858f5ec5d0a08d959cb62db
+FINAL_EXECUTABLE_SHA = bbf200f9f130afcb8858f5ec5d0a08d959cb62db
+REMOTE_HEAD_AT_CODE_ACCEPTANCE = bbf200f9f130afcb8858f5ec5d0a08d959cb62db
+HOSTED_CI_RUN = 34216177075
 HOSTED_CI_CONCLUSION = SUCCESS
 ```
 
-The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. Production
-runtime code last changed at `PRODUCTION_RUNTIME_SHA`; the later descendants
-only harden the Hosted CI execution wrapper and diagnostics. The PR was not
-merged. No live provider call, paid API call, Playwright acceptance run,
+The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
+not merged. No live provider call, paid API call, Playwright acceptance run,
 heavy-OCR acceptance run, or real F1 corpus run was made in this round.
 
 ## Second hardening round
@@ -32,7 +30,8 @@ This code revision adds the following fail-closed boundaries:
   not admitted or silently remapped.
 - GateEvidenceProducer, DurableEvidenceRefV1, and GateEvidenceVerifier replace
   handwritten acceptance facts with durable path/identity/size/SHA references.
-  The verifier reopens the runtime spec, Registry and ready artifact hashes,
+  Evidence indexes now also require the exact producer and gate binding and
+  reject unknown top-level fact fields. The verifier reopens the runtime spec, Registry and ready artifact hashes,
   stage/attempt/outcome/closure artifacts, provider ledgers, and typed role
   artifacts before deriving gate facts.
 - reviewctl acceptance-run --acceptance-spec <path> now persists a typed
@@ -58,7 +57,7 @@ This code revision adds the following fail-closed boundaries:
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`. Hosted
-run `34209120471` completed successfully on that exact SHA. Any later
+run `34216177075` completed successfully on that exact SHA. Any later
 docs-only report commit is not used as executable validation evidence.
 
 ## Git, PR, and Hosted CI read-back
@@ -68,9 +67,9 @@ docs-only report commit is not used as executable validation evidence.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at exact code/CI acceptance | `bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8` |
-| Hosted run | [34209120471](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34209120471) |
-| Hosted head SHA | `bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8` |
+| Remote head at exact code/CI acceptance | `bbf200f9f130afcb8858f5ec5d0a08d959cb62db` |
+| Hosted run | [34216177075](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34216177075) |
+| Hosted head SHA | `bbf200f9f130afcb8858f5ec5d0a08d959cb62db` |
 | Hosted result | `SUCCESS` |
 
 The Hosted evidence is bound to the exact final executable SHA. The report
@@ -226,14 +225,14 @@ zero.
 ### Local exact-SHA checks
 
 The current executable acceptance SHA is
-`bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8`. Production runtime code last
-changed at `80f4648ca449e13154108490bbd96da400f69ec7`; the executable SHA also
-contains the later CI/test-harness hardening commits. The report-only update is
-a child commit and does not change the executable source under test.
+`bbf200f9f130afcb8858f5ec5d0a08d959cb62db`. The report-only update is a child
+commit and does not change the executable source under test.
 
 | Check | Result | Scope |
 |---|---|---|
 | Focused hardening/provider/config/cache suite | `PASS` in split runs | Local Python 3.11 environment; optional symlink privilege remains the only skip |
+| New evidence-binding regressions and adjacent acceptance checks | `5 passed` | Local elevated split runs; includes red producer-binding regression, browser evidence, handwritten-fact, budget, and StagePlan checks |
+| Provider runtime regression file | `12 passed` | Local elevated run |
 | Changed-file focused Pyright | `0 errors, 0 warnings, 0 informations` | Local changed runtime and integration files |
 | `compileall` | PASS | Current runtime/services/preprocess/validation/outline/free-mode/scripts surface |
 | `pip check` | PASS | Local interpreter |
@@ -254,21 +253,21 @@ surface is therefore closed by the Hosted run below.
 
 ### Hosted exact-SHA checks
 
-Hosted run `34209120471` passed all five Windows matrix jobs on
-`bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8`. Each job passed installation,
+Hosted run `34216177075` passed all five Windows matrix jobs on
+`bbf200f9f130afcb8858f5ec5d0a08d959cb62db`. Each job passed installation,
 compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
 and committed-range whitespace checks. The strict-offline process summaries
 were:
 
 ```text
-test (1) job 102005636847: 384 passed, 0 nonzero pytest exits
-test (2) job 102005637016: 526 passed, 0 nonzero pytest exits
-test (3) job 102005636963: 462 passed, 0 nonzero pytest exits
-test (4) job 102005636645: 58 passed, 0 nonzero pytest exits
-test (5) job 102005637036: 5 passed, 0 nonzero pytest exits
-total: 1435 selected tests passed
-collection: 1458 total, 23 deselected by the offline marker policy
-release hardening: 20/20 nodes started, each returned ExitCode=0
+test (1) job 102028326218: 384 passed, 0 nonzero pytest exits
+test (2) job 102028326632: 526 passed, 0 nonzero pytest exits
+test (3) job 102028326497: 463 selected tests, 0 nonzero pytest exits
+test (4) job 102028326623: 58 passed, 0 nonzero pytest exits
+test (5) job 102028326583: 5 passed, 0 nonzero pytest exits
+total: 1436 selected tests passed
+collection: 1459 total, 23 deselected by the offline marker policy
+release hardening: 21/21 nodes started, each returned ExitCode=0
 ```
 
 The three base shards used deterministic file isolation; the release-hardening
@@ -281,7 +280,7 @@ acceptance evidence.
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `NOT_VERIFIED_LOCAL` | Hosted run `34209120471` passed on exact SHA `bdc9669b2d6881b7f4fbf4fe0eb4eda6d4b250e8`; the full local suite was not completed |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `NOT_VERIFIED_LOCAL` | Hosted run `34216177075` passed on exact SHA `bbf200f9f130afcb8858f5ec5d0a08d959cb62db`; the full local suite was not completed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
