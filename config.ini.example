@@ -250,6 +250,8 @@ enable_local_rag = false
 rag_backend = chroma
 # Local RAG never downloads an embedding model unless this is explicitly true.
 local_rag_allow_model_download = false
+# Keep the current immutable identity plus this many recent identities per source.
+local_rag_retain_recent_identities = 2
 source_pdf_max_bytes = 134217728
 
 [Stage1_Input]

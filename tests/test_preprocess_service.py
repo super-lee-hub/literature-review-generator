@@ -389,6 +389,53 @@ def test_preprocess_generation_lease_rejects_reparse_lease_directory(
         )
 
 
+def test_preprocess_forwards_local_rag_retention_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rag.local_rag import LocalRAGIndex
+
+    observed: dict[str, object] = {}
+
+    def fake_build(
+        _index: LocalRAGIndex,
+        collection_name: str,
+        chunks: list[dict[str, object]],
+        **kwargs: object,
+    ) -> bool:
+        observed.update(
+            {
+                "collection_name": collection_name,
+                "chunks": chunks,
+                **kwargs,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(LocalRAGIndex, "build_from_chunks", fake_build)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "enable_local_rag": "true",
+                "rag_backend": "chroma",
+                "local_rag_retain_recent_identities": "1",
+            },
+        },
+        logger=None,
+    )
+
+    assert manager._maybe_build_local_rag(
+        "paper-cache-key",
+        [{"chunk_id": "chunk-1", "text": "evidence"}],
+        source_pdf_sha256="a" * 64,
+        processing_fingerprint="b" * 64,
+    )
+    assert observed["retain_recent_identities"] == 1
+
+
 def test_preprocess_failure_cleans_staging_generation(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "failed.pdf"
     cache_dir = tmp_path / "cache"

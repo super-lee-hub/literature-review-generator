@@ -439,6 +439,14 @@ def validate_all_config(
     preprocess = config_dict.get("Preprocess", {})
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]
+    if "local_rag_retain_recent_identities" in preprocess:
+        valid, error = validate_numeric_range(
+            str(preprocess["local_rag_retain_recent_identities"]),
+            0,
+            1000,
+        )
+        if not valid:
+            return False, [f"[Preprocess] local_rag_retain_recent_identities {error}"]
     if "source_pdf_max_bytes" in preprocess:
         valid, error = validate_numeric_range(
             str(preprocess["source_pdf_max_bytes"]),

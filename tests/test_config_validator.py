@@ -78,6 +78,17 @@ def test_anthropic_connection_uses_native_messages_headers_and_path(monkeypatch)
     }
 
 
+@pytest.mark.parametrize("value", ("-1", "not-a-number", "1001"))
+def test_local_rag_retention_rejects_invalid_values(value: str) -> None:
+    config = _base_config()
+    config["Preprocess"]["local_rag_retain_recent_identities"] = value
+
+    ok, messages = validate_all_config(config)
+
+    assert ok is False
+    assert any("local_rag_retain_recent_identities" in message for message in messages)
+
+
 def test_validate_all_config_accepts_default_reasoning_transport_combo():
     valid, warnings = validate_all_config(_base_config())
 

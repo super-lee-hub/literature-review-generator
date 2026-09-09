@@ -241,6 +241,7 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "enable_local_rag",
             "rag_backend",
             "local_rag_allow_model_download",
+            "local_rag_retain_recent_identities",
             "source_pdf_max_bytes",
         }
     ),

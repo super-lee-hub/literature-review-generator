@@ -243,6 +243,7 @@ def default_config_sections() -> Dict[str, Dict[str, str]]:
             "enable_local_rag": "false",
             "rag_backend": "chroma",
             "local_rag_allow_model_download": "false",
+            "local_rag_retain_recent_identities": "2",
             "source_pdf_max_bytes": "134217728",
         },
         "Styling": {

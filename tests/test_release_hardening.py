@@ -1554,6 +1554,151 @@ def test_local_rag_identity_change_selects_a_new_immutable_collection() -> None:
     assert len(second) <= 63
 
 
+def test_local_rag_retention_keeps_current_and_recent_identity_collections(
+    tmp_path: Path,
+) -> None:
+    class Collection:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class Client:
+        def __init__(self, names: list[str]) -> None:
+            self.names = set(names)
+            self.deleted: list[str] = []
+
+        def list_collections(self) -> list[Collection]:
+            return [Collection(name) for name in sorted(self.names)]
+
+        def delete_collection(self, *, name: str) -> None:
+            self.names.remove(name)
+            self.deleted.append(name)
+
+    index = LocalRAGIndex(str(tmp_path))
+    identities = [
+        {"source_pdf_sha256": character * 64}
+        for character in ("a", "b", "c", "d")
+    ]
+    keys = [index._identity_key(identity) for identity in identities]
+    names = [
+        "source",
+        *(index._collection_name_for_identity("source", key) for key in keys[1:]),
+    ]
+    for order, (identity, identity_key, name) in enumerate(
+        zip(identities, keys, names, strict=True),
+        start=1,
+    ):
+        identity_path = tmp_path / f"{name}.identity.json"
+        identity_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "local-rag-identity-v1",
+                    "identity_key": identity_key,
+                    "identity": identity,
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.utime(identity_path, (float(order), float(order)))
+    client = Client(names)
+
+    removed = index._prune_stale_identity_collections(
+        client,
+        collection_name="source",
+        current_collection_name=names[-1],
+        retain_recent_identities=2,
+    )
+
+    assert removed == (names[0],)
+    assert client.deleted == [names[0]]
+    assert not (tmp_path / f"{names[0]}.identity.json").exists()
+    assert all((tmp_path / f"{name}.identity.json").is_file() for name in names[1:])
+
+
+def test_local_rag_retention_never_deletes_current_identity(tmp_path: Path) -> None:
+    class Client:
+        def __init__(self, names: list[str]) -> None:
+            self.names = set(names)
+            self.deleted: list[str] = []
+
+        def list_collections(self) -> list[str]:
+            return sorted(self.names)
+
+        def delete_collection(self, *, name: str) -> None:
+            self.names.remove(name)
+            self.deleted.append(name)
+
+    index = LocalRAGIndex(str(tmp_path))
+    current_key = index._identity_key({"source_pdf_sha256": "a" * 64})
+    newer_key = index._identity_key({"source_pdf_sha256": "b" * 64})
+    current_name = index._collection_name_for_identity("source", current_key)
+    newer_name = index._collection_name_for_identity("source", newer_key)
+    for order, (identity_key, name) in enumerate(
+        ((current_key, current_name), (newer_key, newer_name)),
+        start=1,
+    ):
+        identity_path = tmp_path / f"{name}.identity.json"
+        identity_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "local-rag-identity-v1",
+                    "identity_key": identity_key,
+                    "identity": {"source_pdf_sha256": identity_key},
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.utime(identity_path, (float(order), float(order)))
+    client = Client([current_name, newer_name])
+
+    removed = index._prune_stale_identity_collections(
+        client,
+        collection_name="source",
+        current_collection_name=current_name,
+        retain_recent_identities=0,
+    )
+
+    assert removed == (newer_name,)
+    assert current_name not in client.deleted
+    assert (tmp_path / f"{current_name}.identity.json").is_file()
+
+
+def test_local_rag_retention_preserves_sidecar_when_backend_delete_fails(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        def list_collections(self) -> list[str]:
+            return ["source"]
+
+        def delete_collection(self, *, name: str) -> None:
+            raise RuntimeError(f"cannot delete {name}")
+
+    identity = {"source_pdf_sha256": "a" * 64}
+    identity_key = LocalRAGIndex._identity_key(identity)
+    identity_path = tmp_path / "source.identity.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "local-rag-identity-v1",
+                "identity_key": identity_key,
+                "identity": identity,
+            }
+        ),
+        encoding="utf-8",
+    )
+    index = LocalRAGIndex(str(tmp_path))
+    current_name = index._collection_name_for_identity("source", "b" * 64)
+
+    removed = index._prune_stale_identity_collections(
+        Client(),
+        collection_name="source",
+        current_collection_name=current_name,
+        retain_recent_identities=0,
+    )
+
+    assert removed == ()
+    assert identity_path.is_file()
+
+
 def test_profile_path_rejects_traversal_and_save_is_atomic_boundary(tmp_path: Path) -> None:
     with pytest.raises(WorkspacePathError):
         get_profile_path(str(tmp_path), "../escape")

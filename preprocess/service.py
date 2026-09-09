@@ -283,6 +283,16 @@ class PreprocessManager:
         self.local_rag_allow_model_download = _as_bool(
             preprocess_section.get("local_rag_allow_model_download", "false")
         )
+        self.local_rag_retain_recent_identities = min(
+            1000,
+            max(
+                0,
+                _as_int(
+                    preprocess_section.get("local_rag_retain_recent_identities", "2"),
+                    2,
+                ),
+            ),
+        )
         self.rag_persist_dir = os.path.join(self.cache_root, "_rag")
 
         self.parser_mode = str(preprocess_section.get("parser_mode", "local")).strip().lower() or "local"
@@ -3215,6 +3225,7 @@ class PreprocessManager:
                 source_pdf_sha256=source_pdf_sha256,
                 processing_fingerprint=processing_fingerprint,
                 allow_model_download=self.local_rag_allow_model_download,
+                retain_recent_identities=self.local_rag_retain_recent_identities,
             )
             if not built:
                 self._log("Local RAG skipped because dependencies are unavailable or chunks are empty.", level="info")
