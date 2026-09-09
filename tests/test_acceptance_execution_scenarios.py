@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -247,7 +246,7 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
     ]
     assert {gate: result["scenarios"][gate]["status"] for gate in ("C", "D", "Q")} == {
         "C": "NOT_VERIFIED",
-        "D": "NOT_VERIFIED",
+        "D": "BLOCKED",
         "Q": "NOT_VERIFIED",
     }
 
@@ -291,6 +290,7 @@ def test_acceptance_context_child_environment_does_not_mutate_parent_environment
 
 
 def test_stage1_snapshot_replaces_partial_target_atomically(tmp_path: Path) -> None:
+    from preprocess.service import PreprocessResult
     from services.job_workspace import JobWorkspace
     from services.stage1_analysis_service import Stage1AnalysisService
 
@@ -318,7 +318,34 @@ def test_stage1_snapshot_replaces_partial_target_atomically(tmp_path: Path) -> N
         source = generation_dir / f"{field_name}-{index}.dat"
         source.write_bytes(f"complete-{field_name}".encode("utf-8"))
         paths[field_name] = source
-    result = SimpleNamespace(**{key: str(value) for key, value in paths.items()})
+    result = PreprocessResult(
+        pdf_path="source.pdf",
+        cache_dir=str(tmp_path / "cache"),
+        **{key: str(value) for key, value in paths.items()},
+        markdown_text="",
+        plain_text="",
+        stage1_input_text="",
+        page_index=[],
+        page_diagnostics=[],
+        low_quality=False,
+        scanned_like=False,
+        used_ocr=False,
+        extractor_used="fitz",
+        chunk_count=0,
+        local_rag_enabled=False,
+        local_rag_built=False,
+        local_rag_persist_dir="",
+        layout_fidelity="page_text",
+        conversion_used="native_pdf",
+        mineru_attempted=False,
+        mineru_succeeded=False,
+        mineru_token_present=False,
+        mineru_remote_requested=False,
+        mineru_remote_enabled=False,
+        mineru_base_url="",
+        selected_text_source="plain_text",
+        stage1_quality_level="good",
+    )
     digest = hashlib.sha256(b"paper").hexdigest()[:24]
     relative_target = f"source_evidence/{digest}/generation-1/{paths['markdown_path'].name}"
     target = Path(service.workspace.artifact_path(relative_target))
