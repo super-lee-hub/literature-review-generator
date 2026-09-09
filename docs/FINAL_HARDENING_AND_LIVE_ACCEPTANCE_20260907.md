@@ -8,11 +8,11 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-PRODUCTION_RUNTIME_SHA = 85cc230edf4a2684d728c07d85235ce21b1ac327
-FINAL_EXECUTABLE_SHA = 85cc230edf4a2684d728c07d85235ce21b1ac327
-PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 85cc230edf4a2684d728c07d85235ce21b1ac327
+PRODUCTION_RUNTIME_SHA = 6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc
+FINAL_EXECUTABLE_SHA = 6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc
+PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc
 REPORT_ONLY_SHA = recorded in PR #24 body after this self-referential report commit is pushed
-HOSTED_CI_RUN = 34341107981
+HOSTED_CI_RUN = 34350868961
 HOSTED_CI_CONCLUSION = SUCCESS
 CODE_HARDENING_STATUS = PASS
 OFFLINE_HOSTED_STATUS = PASS
@@ -31,7 +31,7 @@ push because an immutable Git object cannot truthfully include its own SHA.
 
 This follow-up closes the remaining false-PASS and provenance gaps identified
 in the pasted audit. The executable code/test SHA is
-`85cc230edf4a2684d728c07d85235ce21b1ac327`; any later report commit is
+`6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc`; any later report commit is
 documentation-only and is not substituted for that SHA.
 
 - Windows provider liveness now uses non-destructive process inspection and
@@ -58,6 +58,15 @@ documentation-only and is not substituted for that SHA.
   Local RAG identity changes create a new immutable collection; legacy manual
   diagnostics are outside pytest and network-disabled by default; the public
   CLI smoke covers both `micro-probe` and `acceptance-run` help.
+- Parent-plan child execution now binds every runtime child to the declared
+  `RuntimeJobSpec` job/workspace identity, rejects shared child workspaces or
+  explicit job IDs, and records a non-PASSED receipt when the final scenario
+  action fails after preliminary evidence collection.
+- Gate D production modality references are carried into the child evidence
+  manifest after Registry publication. Gate E proves the terminated child is
+  dead by PID creation identity. Gate I registers trace, browser metadata,
+  screenshot manifest, and screenshot artifacts in the resulting job Registry;
+  the screenshot manifest is required and bound to the browser run.
 
 ## Second hardening round
 
@@ -98,7 +107,7 @@ This code revision adds the following fail-closed boundaries:
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`. Hosted
-run `34341107981` completed successfully on that exact SHA. Any later
+run `34350868961` completed successfully on that exact SHA. Any later
 docs-only report commit is not used as executable validation evidence.
 
 ## Git, PR, and Hosted CI read-back
@@ -108,9 +117,9 @@ docs-only report commit is not used as executable validation evidence.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at exact code/CI acceptance | `85cc230edf4a2684d728c07d85235ce21b1ac327` |
-| Hosted run | [34341107981](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34341107981) |
-| Hosted head SHA | `85cc230edf4a2684d728c07d85235ce21b1ac327` |
+| Remote head at exact code/CI acceptance | `6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc` |
+| Hosted run | [34350868961](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34350868961) |
+| Hosted head SHA | `6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc` |
 | Hosted result | `SUCCESS` |
 
 The Hosted evidence is bound to the exact final executable SHA. The report
@@ -266,13 +275,13 @@ zero.
 ### Local exact-SHA checks
 
 The current executable acceptance SHA is
-`85cc230edf4a2684d728c07d85235ce21b1ac327`. The report-only update is a child
+`6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc`. The report-only update is a child
 commit and does not change the executable source under test.
 
 | Check | Result | Scope |
 |---|---|---|
 | Focused hardening/provider/config/cache suite | `PASS` in split runs | Local Python 3.11 environment; optional symlink privilege remains the only skip |
-| New evidence/scenario-binding regressions and adjacent acceptance checks | `10 passed` | Local focused run; includes nine blocked-inventory scenario cases plus cross-acceptance-run evidence isolation |
+| New evidence/scenario-binding regressions and adjacent acceptance checks | `66 passed, 1 skipped` | Local focused acceptance, Playwright, and release-hardening suite |
 | Provider runtime regression file | `12 passed` | Local elevated run |
 | Changed-file focused Pyright | `0 errors, 0 warnings, 0 informations` | Local changed runtime and integration files |
 | `compileall` | PASS | Current runtime/services/preprocess/validation/outline/free-mode/scripts surface |
@@ -294,17 +303,17 @@ surface is therefore closed by the Hosted run below.
 
 ### Hosted exact-SHA checks
 
-Hosted run `34341107981` passed all five Windows matrix jobs on
-`85cc230edf4a2684d728c07d85235ce21b1ac327`. Each job passed installation,
+Hosted run `34350868961` passed all five Windows matrix jobs on
+`6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc`. Each job passed installation,
 compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
 and committed-range whitespace checks. The exact job read-back was:
 
 ```text
-test (1) job 102220921452: SUCCESS
-test (2) job 102220921296: SUCCESS
-test (3) job 102220921367: SUCCESS
-test (4) job 102220921454: SUCCESS
-test (5) job 102220920936: SUCCESS
+test (1) job 102463539355: SUCCESS
+test (2) job 102463539532: SUCCESS
+test (3) job 102463539362: SUCCESS
+test (4) job 102463539359: SUCCESS
+test (5) job 102463539331: SUCCESS
 all five matrix jobs returned zero workflow exit status
 ```
 
@@ -318,7 +327,7 @@ acceptance evidence.
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FOCUSED` | Hosted run `34341107981` passed on exact SHA `85cc230edf4a2684d728c07d85235ce21b1ac327`; the focused local acceptance suite passed |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FOCUSED` | Hosted run `34350868961` passed on exact SHA `6a3cb61ddd5f535af58a735d8aa0f44d3c8b61fc`; the focused local acceptance suite passed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
@@ -327,7 +336,7 @@ acceptance evidence.
 | F — real multi-provider Outline v3 | `BLOCKED_CREDENTIALS` | Role mapping is present in the example config, but no real gateway transport or receipts |
 | G — real Free Mode | `BLOCKED_CREDENTIALS` | No Free Mode credential or live route call; incomplete-route zero-call tests pass offline |
 | H — Validator defect injection/repair/revalidation | `BLOCKED_CREDENTIALS` | No real Validator transport or real-review baseline; controlled offline contracts are not substituted |
-| I — GUI Playwright | `NOT_VERIFIED` | No real browser flow/evidence artifact in this round |
+| I — GUI Playwright | `NOT_VERIFIED` | Executor now requires Registry-backed trace/browser/screenshot artifacts, but no real browser flow was run this round |
 | J — heavy OCR | `BLOCKED_CORPUS` | No approved scanned/OCR-poor acceptance PDF in the scoped checkout |
 | K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Exact-SHA Hosted matrix passed the independent-process queue/Registry/budget/lifecycle checks, including the Gate K scenario test; no separate live release-acceptance manifest was produced |
 | Q — F1 15-paper full chain | `BLOCKED_F1_SPEC` / `BLOCKED_F1_CORPUS` | No authoritative 15-paper binding; canonical Stage 1 artifacts `0/15`, downstream Outline/Review/Citation/DOCX/Validation not run |
