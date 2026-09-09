@@ -1164,7 +1164,9 @@ def _contention_worker_main(payload: Mapping[str, Any]) -> None:
     from services.queue_service import PersistentQueueService
 
     index = int(str(payload["worker_index"]))
-    job_id = str(payload["job_id"])
+    worker_job_id = str(payload["job_id"])
+    scenario_job_id = str(payload.get("scenario_job_id") or worker_job_id)
+    job_id = worker_job_id
     event_path = Path(str(payload["event_path"])).expanduser().resolve()
     counter_path = Path(str(payload["counter_path"])).expanduser().resolve()
     lock_target = Path(str(payload["lock_target"])).expanduser().resolve()
@@ -1186,7 +1188,8 @@ def _contention_worker_main(payload: Mapping[str, Any]) -> None:
                 "schema_version": "process-event-v1",
                 "acceptance_run_id": str(payload["acceptance_run_id"]),
                 "scenario_id": "K",
-                "job_id": job_id,
+                "job_id": scenario_job_id,
+                "worker_job_id": worker_job_id,
                 "process_id": f"worker-{index}",
                 "pid": identity.pid,
                 "process_creation_identity": str(identity.creation_time),
@@ -1782,6 +1785,7 @@ class GateKScenario(AcceptanceScenario):
                     "worker_index": index,
                     "job_id": job_id,
                     "registry_job_id": registry_job_id,
+                    "scenario_job_id": scenario_job_id,
                     "event_path": str(event_path),
                     "counter_path": str(counter_path),
                     "lock_target": str(lock_target),
