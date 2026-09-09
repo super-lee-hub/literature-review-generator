@@ -8,22 +8,30 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-PRODUCTION_RUNTIME_SHA = 27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3
-FINAL_EXECUTABLE_SHA = 27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3
-REMOTE_HEAD_AT_CODE_ACCEPTANCE = 27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3
-HOSTED_CI_RUN = 34273557814
+PRODUCTION_RUNTIME_SHA = 85cc230edf4a2684d728c07d85235ce21b1ac327
+FINAL_EXECUTABLE_SHA = 85cc230edf4a2684d728c07d85235ce21b1ac327
+PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 85cc230edf4a2684d728c07d85235ce21b1ac327
+REPORT_ONLY_SHA = recorded in PR #24 body after this self-referential report commit is pushed
+HOSTED_CI_RUN = 34341107981
 HOSTED_CI_CONCLUSION = SUCCESS
+CODE_HARDENING_STATUS = PASS
+OFFLINE_HOSTED_STATUS = PASS
+LIVE_ACCEPTANCE_STATUS = BLOCKED_OWNER_INPUTS
+PARENT_ACCEPTANCE_RUN_ID = NOT_RUN_BLOCKED_OWNER_INPUTS
+CHILD_SCENARIO_IDS = C,D,E,F,G,H,I,J,K,Q (implemented; not live-executed)
 ```
 
 The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
 not merged. No live provider call, paid API call, Playwright acceptance run,
-heavy-OCR acceptance run, or real F1 corpus run was made in this round.
+heavy-OCR acceptance run, parent acceptance plan, or real F1 corpus run was
+made in this round. The report-only commit SHA is recorded in the PR body after
+push because an immutable Git object cannot truthfully include its own SHA.
 
 ## Pasted-audit follow-up
 
 This follow-up closes the remaining false-PASS and provenance gaps identified
 in the pasted audit. The executable code/test SHA is
-`27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`; any later report commit is
+`85cc230edf4a2684d728c07d85235ce21b1ac327`; any later report commit is
 documentation-only and is not substituted for that SHA.
 
 - Windows provider liveness now uses non-destructive process inspection and
@@ -90,7 +98,7 @@ This code revision adds the following fail-closed boundaries:
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`. Hosted
-run `34273557814` completed successfully on that exact SHA. Any later
+run `34341107981` completed successfully on that exact SHA. Any later
 docs-only report commit is not used as executable validation evidence.
 
 ## Git, PR, and Hosted CI read-back
@@ -100,9 +108,9 @@ docs-only report commit is not used as executable validation evidence.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at exact code/CI acceptance | `27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3` |
-| Hosted run | [34273557814](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34273557814) |
-| Hosted head SHA | `27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3` |
+| Remote head at exact code/CI acceptance | `85cc230edf4a2684d728c07d85235ce21b1ac327` |
+| Hosted run | [34341107981](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34341107981) |
+| Hosted head SHA | `85cc230edf4a2684d728c07d85235ce21b1ac327` |
 | Hosted result | `SUCCESS` |
 
 The Hosted evidence is bound to the exact final executable SHA. The report
@@ -258,7 +266,7 @@ zero.
 ### Local exact-SHA checks
 
 The current executable acceptance SHA is
-`27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`. The report-only update is a child
+`85cc230edf4a2684d728c07d85235ce21b1ac327`. The report-only update is a child
 commit and does not change the executable source under test.
 
 | Check | Result | Scope |
@@ -286,8 +294,8 @@ surface is therefore closed by the Hosted run below.
 
 ### Hosted exact-SHA checks
 
-Hosted run `34273557814` passed all five Windows matrix jobs on
-`27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`. Each job passed installation,
+Hosted run `34341107981` passed all five Windows matrix jobs on
+`85cc230edf4a2684d728c07d85235ce21b1ac327`. Each job passed installation,
 compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
 and committed-range whitespace checks. The exact job read-back was:
 
@@ -310,7 +318,7 @@ acceptance evidence.
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `NOT_VERIFIED_LOCAL` | Hosted run `34273557814` passed on exact SHA `27b32c960600aeb7fbc0d6a4c90f75d4da4f1af3`; the full local suite was not completed |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FOCUSED` | Hosted run `34341107981` passed on exact SHA `85cc230edf4a2684d728c07d85235ce21b1ac327`; the focused local acceptance suite passed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
@@ -321,7 +329,7 @@ acceptance evidence.
 | H — Validator defect injection/repair/revalidation | `BLOCKED_CREDENTIALS` | No real Validator transport or real-review baseline; controlled offline contracts are not substituted |
 | I — GUI Playwright | `NOT_VERIFIED` | No real browser flow/evidence artifact in this round |
 | J — heavy OCR | `BLOCKED_CORPUS` | No approved scanned/OCR-poor acceptance PDF in the scoped checkout |
-| K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Exact-SHA Hosted matrix passed the independent-process queue/Registry/budget/lifecycle checks; no separate live release-acceptance manifest was produced |
+| K — real Windows contention | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_AS_LIVE_ACCEPTANCE` | Exact-SHA Hosted matrix passed the independent-process queue/Registry/budget/lifecycle checks, including the Gate K scenario test; no separate live release-acceptance manifest was produced |
 | Q — F1 15-paper full chain | `BLOCKED_F1_SPEC` / `BLOCKED_F1_CORPUS` | No authoritative 15-paper binding; canonical Stage 1 artifacts `0/15`, downstream Outline/Review/Citation/DOCX/Validation not run |
 | R — negative production behavior | `PASS_OFFLINE_HOSTED`, `NOT_VERIFIED_RELEASE_MANIFEST` | Typed config/auth/queue/path/cache/evidence/budget and false-PASS regressions passed in the exact-SHA selected suite; no separate release manifest |
 | S — secret/privacy scan | `NOT_VERIFIED` | No production secret was used or printed; a full release-scope history/privacy evidence manifest was not generated |
