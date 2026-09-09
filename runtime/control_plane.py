@@ -2259,6 +2259,7 @@ class ReviewControlPlane:
         )
         child_states = dict(state.child_states)
         child_results: dict[str, dict[str, Any]] = {}
+        expected_child_bindings: dict[str, dict[str, Any]] = {}
         for gate, child in plan.scenarios.items():
             child_runtime_hash = self._acceptance_file_hash(
                 child.runtime_spec,
@@ -2268,6 +2269,20 @@ class ReviewControlPlane:
                 child,
                 runtime_spec_hash=child_runtime_hash,
             )
+            expected_binding: dict[str, Any] = {
+                "plan_sha256": plan_sha,
+                "runtime_spec_sha256": child_runtime_hash,
+                "input_identity_sha256": input_identity,
+                "budget_domain": child.budget_domain,
+            }
+            if child.job_id:
+                expected_binding["job_id"] = child.job_id
+            elif child.execution_mode in {"runtime", "ocr", "crash_resume", "validator_challenge"}:
+                try:
+                    expected_binding["job_id"] = load_runtime_job_spec(child.runtime_spec).job_id
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                    pass
+            expected_child_bindings[gate] = expected_binding
             existing = self._load_acceptance_child_result(
                 child_states.get(gate, {}) if isinstance(child_states.get(gate), Mapping) else {},
                 gate=gate,
@@ -2286,6 +2301,7 @@ class ReviewControlPlane:
             evidence_root.mkdir(parents=True, exist_ok=True)
             receipt_path = child_dir / "scenario_execution_receipt.json"
             evidence_path = child_dir / "evidence_index_v1.json"
+            child_state_path = child_dir / "scenario_state_v2.json"
             child_job_id = child.job_id or f"{state.run_id}:{gate}"
             child_context = AcceptanceScenarioContextV1(
                 acceptance_run_id=state.run_id,
@@ -2684,6 +2700,25 @@ class ReviewControlPlane:
                             "receipt_path": str(receipt_path),
                             "evidence_manifest": str(evidence_path),
                         }
+            atomic_write_json(
+                str(child_state_path),
+                {
+                    "schema_version": "release-acceptance-child-state-v2",
+                    "parent_acceptance_run_id": state.run_id,
+                    "plan_sha256": plan_sha,
+                    "final_executable_sha": current_sha,
+                    "scenario_id": gate,
+                    "gate": gate,
+                    "status": child_results[gate]["status"],
+                    "job_id": str(
+                        child_results[gate].get("receipt", {}).get("job_id")
+                        or child_job_id
+                    ),
+                    "receipt_path": child_results[gate]["receipt_path"],
+                    "evidence_manifest": child_results[gate].get("evidence_manifest", ""),
+                    "updated_at": self._utc_now(),
+                },
+            )
             child_states[gate] = {
                 "gate": gate,
                 "scenario_id": gate,
@@ -2691,6 +2726,7 @@ class ReviewControlPlane:
                 "receipt_path": child_results[gate]["receipt_path"],
                 "evidence_manifest": child_results[gate].get("evidence_manifest", ""),
                 "job_id": str(child_results[gate].get("receipt", {}).get("job_id") or child_job_id),
+                "state_path": str(child_state_path),
             }
             state = replace(
                 state,
@@ -2712,6 +2748,7 @@ class ReviewControlPlane:
             final_executable_sha=current_sha,
             child_results=child_results,
             required_scenarios=plan.gates,
+            expected_child_bindings=expected_child_bindings,
         )
         parent_result_path = Path(
             acceptance_spec.evidence_manifest or run_dir / "parent_acceptance_result_v2.json"

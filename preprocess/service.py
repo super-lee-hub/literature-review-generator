@@ -6,7 +6,6 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -16,6 +15,8 @@ import time
 import uuid
 import zipfile
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, cast
 from urllib.parse import urljoin, urlparse
 
@@ -25,11 +26,14 @@ except ImportError:  # pragma: no cover - compatibility with older PyMuPDF relea
     import fitz  # type: ignore
 import requests  # type: ignore
 
-from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
-from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
-from services.job_workspace import atomic_write_json
-from services.durable_io import interprocess_file_lock
 from preprocess.provider_circuit import ProviderCircuitBreaker, ProviderCircuitOpen
+from services.durable_io import interprocess_file_lock
+from services.job_workspace import atomic_write_json, is_reparse_path
+from services.stage1_input_completeness import (
+    build_completeness_metrics,
+    has_blocking_stage1_reason,
+)
+from services.stage1_input_selector import Stage1InputSelection, select_stage1_input
 
 DEFAULT_MINERU_ALLOWED_URL_HOSTS = frozenset(
     {
@@ -47,6 +51,8 @@ DEFAULT_MINERU_TEXT_MAX_BYTES = 64 * 1024 * 1024
 DEFAULT_MINERU_SOURCE_PDF_MAX_BYTES = 128 * 1024 * 1024
 PREPROCESS_MANIFEST_SCHEMA_VERSION = "preprocess-manifest-v2"
 PREPROCESS_ACTIVE_POINTER_SCHEMA_VERSION = "preprocess-active-generation-v1"
+PREPROCESS_GENERATION_LEASE_SCHEMA_VERSION = "preprocess-generation-lease-v1"
+DEFAULT_PREPROCESS_GENERATION_LEASE_TTL_SECONDS = 6 * 60 * 60
 STAGE1_INPUT_SELECTOR_VERSION = "stage1-input-selector-v1"
 PREPROCESS_IMPLEMENTATION_VERSION = "preprocess-service-20260907-v2"
 
@@ -83,6 +89,108 @@ def _as_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+@dataclass(frozen=True)
+class PreprocessGenerationLeaseV1:
+    lease_id: str
+    job_id: str
+    paper_key: str
+    generation_id: str
+    manifest_path: str
+    manifest_sha256: str
+    created_at: str
+    expires_at: str
+    parent_run_id: str = ""
+    lifecycle_state: str = "active"
+    schema_version: str = PREPROCESS_GENERATION_LEASE_SCHEMA_VERSION
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "PreprocessGenerationLeaseV1":
+        allowed = {
+            "schema_version",
+            "lease_id",
+            "job_id",
+            "paper_key",
+            "parent_run_id",
+            "generation_id",
+            "manifest_path",
+            "manifest_sha256",
+            "created_at",
+            "expires_at",
+            "lifecycle_state",
+        }
+        unknown = sorted(str(key) for key in raw if str(key) not in allowed)
+        if unknown:
+            raise ValueError(
+                "preprocess generation lease has unknown fields: " + ", ".join(unknown)
+            )
+        lease = cls(
+            schema_version=str(raw.get("schema_version") or ""),
+            lease_id=str(raw.get("lease_id") or "").strip(),
+            job_id=str(raw.get("job_id") or "").strip(),
+            paper_key=str(raw.get("paper_key") or "").strip(),
+            parent_run_id=str(raw.get("parent_run_id") or "").strip(),
+            generation_id=str(raw.get("generation_id") or "").strip(),
+            manifest_path=str(raw.get("manifest_path") or "").strip(),
+            manifest_sha256=str(raw.get("manifest_sha256") or "").strip().lower(),
+            created_at=str(raw.get("created_at") or "").strip(),
+            expires_at=str(raw.get("expires_at") or "").strip(),
+            lifecycle_state=str(raw.get("lifecycle_state") or "").strip(),
+        )
+        return lease.validate()
+
+    def validate(self) -> "PreprocessGenerationLeaseV1":
+        if self.schema_version != PREPROCESS_GENERATION_LEASE_SCHEMA_VERSION:
+            raise ValueError("preprocess generation lease schema is invalid")
+        if not self.lease_id or not self.job_id or not self.paper_key:
+            raise ValueError(
+                "preprocess generation lease requires lease_id, job_id, and paper_key"
+            )
+        if (
+            not self.generation_id.startswith("generation-")
+            or os.path.basename(self.generation_id) != self.generation_id
+            or self.generation_id in {"generation-", ".", ".."}
+        ):
+            raise ValueError("preprocess generation lease generation_id is invalid")
+        if not os.path.isabs(self.manifest_path):
+            raise ValueError("preprocess generation lease manifest_path must be absolute")
+        if len(self.manifest_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.manifest_sha256
+        ):
+            raise ValueError("preprocess generation lease manifest_sha256 is invalid")
+        created = self.parse_timestamp(self.created_at)
+        expires = self.parse_timestamp(self.expires_at)
+        if created >= expires:
+            raise ValueError("preprocess generation lease expiry must follow creation")
+        if self.lifecycle_state != "active":
+            raise ValueError("preprocess generation lease lifecycle_state is invalid")
+        return self
+
+    @staticmethod
+    def parse_timestamp(value: object) -> datetime:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("preprocess generation lease timestamp is required")
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("preprocess generation lease timestamp must be timezone-aware")
+        return parsed.astimezone(timezone.utc)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "lease_id": self.lease_id,
+            "job_id": self.job_id,
+            "paper_key": self.paper_key,
+            "parent_run_id": self.parent_run_id,
+            "generation_id": self.generation_id,
+            "manifest_path": self.manifest_path,
+            "manifest_sha256": self.manifest_sha256,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "lifecycle_state": self.lifecycle_state,
+        }
 
 
 @dataclass
@@ -160,6 +268,16 @@ class PreprocessManager:
         self.ocr_mode = str(preprocess_section.get("ocr_mode", "auto")).strip().lower()
         self.ocr_languages = str(preprocess_section.get("ocr_languages", "eng")).strip() or "eng"
         self.force_rebuild = _as_bool(preprocess_section.get("force_rebuild", "false"))
+        self.generation_lease_ttl_seconds = max(
+            60.0,
+            _as_float(
+                preprocess_section.get(
+                    "generation_lease_ttl_seconds",
+                    DEFAULT_PREPROCESS_GENERATION_LEASE_TTL_SECONDS,
+                ),
+                DEFAULT_PREPROCESS_GENERATION_LEASE_TTL_SECONDS,
+            ),
+        )
         self.enable_local_rag = _as_bool(preprocess_section.get("enable_local_rag", "false"))
         self.rag_backend = str(preprocess_section.get("rag_backend", "chroma")).strip().lower()
         self.local_rag_allow_model_download = _as_bool(
@@ -309,6 +427,10 @@ class PreprocessManager:
         pdf_path: str,
         *,
         pin_id: str = "",
+        lease_id: str = "",
+        lease_job_id: str = "",
+        lease_paper_key: str = "",
+        lease_parent_run_id: str = "",
     ) -> Optional[PreprocessResult]:
         """Build or reuse cached preprocess artifacts for a PDF."""
 
@@ -316,6 +438,15 @@ class PreprocessManager:
             return None
         if not self.enabled:
             return None
+        if lease_id and (not str(lease_job_id).strip() or not str(lease_paper_key).strip()):
+            raise ValueError(
+                "preprocess generation lease requires lease_job_id and lease_paper_key"
+            )
+        if not lease_id and any(
+            str(value or "").strip()
+            for value in (lease_job_id, lease_paper_key, lease_parent_run_id)
+        ):
+            raise ValueError("preprocess generation lease metadata requires lease_id")
 
         source_identity = self._source_identity(pdf_path)
         cache_dir = os.path.join(self.cache_root, self._pdf_cache_key(pdf_path, source_identity))
@@ -326,6 +457,10 @@ class PreprocessManager:
                 source_identity=source_identity,
                 cache_dir=cache_dir,
                 pin_id=pin_id,
+                lease_id=lease_id,
+                lease_job_id=lease_job_id,
+                lease_paper_key=lease_paper_key,
+                lease_parent_run_id=lease_parent_run_id,
             )
 
     def _prepare_pdf_locked(
@@ -335,6 +470,10 @@ class PreprocessManager:
         source_identity: Dict[str, Any],
         cache_dir: str,
         pin_id: str = "",
+        lease_id: str = "",
+        lease_job_id: str = "",
+        lease_paper_key: str = "",
+        lease_parent_run_id: str = "",
     ) -> Optional[PreprocessResult]:
         try:
             return self._prepare_pdf_locked_impl(
@@ -342,6 +481,10 @@ class PreprocessManager:
                 source_identity=source_identity,
                 cache_dir=cache_dir,
                 pin_id=pin_id,
+                lease_id=lease_id,
+                lease_job_id=lease_job_id,
+                lease_paper_key=lease_paper_key,
+                lease_parent_run_id=lease_parent_run_id,
             )
         except BaseException:
             # The cache-key lock makes it safe to clean all staging siblings:
@@ -356,6 +499,10 @@ class PreprocessManager:
         source_identity: Dict[str, Any],
         cache_dir: str,
         pin_id: str = "",
+        lease_id: str = "",
+        lease_job_id: str = "",
+        lease_paper_key: str = "",
+        lease_parent_run_id: str = "",
     ) -> Optional[PreprocessResult]:
         """Build or reuse one source cache while holding its per-key lock."""
 
@@ -404,6 +551,15 @@ class PreprocessManager:
                             cache_dir,
                             Path(generation_dir).name,
                             pin_id=pin_id,
+                        )
+                    if lease_id:
+                        self._acquire_generation_lease_locked(
+                            cache_dir,
+                            generation_id=Path(generation_dir).name,
+                            lease_id=lease_id,
+                            job_id=lease_job_id,
+                            paper_key=lease_paper_key,
+                            parent_run_id=lease_parent_run_id,
                         )
                     return cached
 
@@ -661,6 +817,15 @@ class PreprocessManager:
         )
         if pin_id:
             self._pin_generation(cache_dir, generation_id, pin_id=pin_id)
+        if lease_id:
+            self._acquire_generation_lease_locked(
+                cache_dir,
+                generation_id=generation_id,
+                lease_id=lease_id,
+                job_id=lease_job_id,
+                paper_key=lease_paper_key,
+                parent_run_id=lease_parent_run_id,
+            )
         self._gc_generations(cache_dir, active_generation_id=generation_id)
 
         return PreprocessResult(
@@ -758,7 +923,7 @@ class PreprocessManager:
     ) -> dict[str, list[str]]:
         """Safely remove only stale, non-active cache generations."""
 
-        root = Path(cache_dir).expanduser().resolve()
+        root = self._validated_cache_root(cache_dir)
         active_id = str(active_generation_id or "").strip()
         if not active_id:
             try:
@@ -771,7 +936,11 @@ class PreprocessManager:
         removed_generations: list[str] = []
         generation_dirs: list[tuple[float, Path]] = []
         for child in root.iterdir() if root.is_dir() else ():
-            if child.is_symlink():
+            if is_reparse_path(child):
+                if child.name.startswith(("generation-", ".generation.tmp-")):
+                    raise RuntimeError(
+                        f"preprocess generation cache contains a reparse path: {child}"
+                    )
                 continue
             if child.is_dir() and child.name.startswith(".generation.tmp-"):
                 try:
@@ -789,6 +958,7 @@ class PreprocessManager:
         keep_count = max(1, int(keep_generations))
         keep_names = {path.name for _mtime, path in generation_dirs[:keep_count]}
         keep_names.update(self._pinned_generation_ids(root))
+        keep_names.update(self._leased_generation_ids(root))
         if active_id:
             keep_names.add(active_id)
         for _mtime, child in generation_dirs:
@@ -828,6 +998,303 @@ class PreprocessManager:
             },
         )
         return pin_path
+
+    def acquire_generation_lease(
+        self,
+        cache_dir: str,
+        *,
+        generation_id: str,
+        lease_id: str,
+        job_id: str,
+        paper_key: str,
+        parent_run_id: str = "",
+        ttl_seconds: float | None = None,
+    ) -> Path:
+        """Acquire a validated, short-lived generation lease.
+
+        The lease is intentionally separate from the legacy pin format so a
+        cache reference can be released after job-owned authority is published.
+        """
+
+        root = self._validated_cache_root(cache_dir)
+        with interprocess_file_lock(root / ".preprocess-cache"):
+            return self._acquire_generation_lease_locked(
+                str(root),
+                generation_id=generation_id,
+                lease_id=lease_id,
+                job_id=job_id,
+                paper_key=paper_key,
+                parent_run_id=parent_run_id,
+                ttl_seconds=ttl_seconds,
+            )
+
+    def _acquire_generation_lease_locked(
+        self,
+        cache_dir: str,
+        *,
+        generation_id: str,
+        lease_id: str,
+        job_id: str,
+        paper_key: str,
+        parent_run_id: str = "",
+        ttl_seconds: float | None = None,
+    ) -> Path:
+        generation_name = self._validated_generation_name(generation_id)
+        lease_name = str(lease_id or "").strip()
+        owner_job_id = str(job_id or "").strip()
+        owner_paper_key = str(paper_key or "").strip()
+        if not lease_name or not owner_job_id or not owner_paper_key:
+            raise ValueError(
+                "preprocess generation lease requires lease_id, job_id, and paper_key"
+            )
+        root = self._validated_cache_root(cache_dir)
+        _generation_root, manifest_path = self._validated_generation_manifest(
+            root, generation_name
+        )
+        lease_dir = self._validated_lease_directory(root, create=True)
+        if lease_dir is None:  # pragma: no cover - create=True is total.
+            raise RuntimeError("preprocess generation lease directory was not created")
+        lease_path = lease_dir / (
+            f"{hashlib.sha256(lease_name.encode('utf-8')).hexdigest()}-"
+            f"{generation_name}.json"
+        )
+        if lease_path.exists() and is_reparse_path(lease_path):
+            raise RuntimeError(
+                f"preprocess generation lease path is a reparse point: {lease_path}"
+            )
+        lease_ttl = max(
+            60.0,
+            float(
+                self.generation_lease_ttl_seconds
+                if ttl_seconds is None
+                else ttl_seconds
+            ),
+        )
+        created = datetime.now(timezone.utc)
+        expires = created + timedelta(seconds=lease_ttl)
+        lease = PreprocessGenerationLeaseV1(
+            lease_id=lease_name,
+            job_id=owner_job_id,
+            paper_key=owner_paper_key,
+            parent_run_id=str(parent_run_id or "").strip(),
+            generation_id=generation_name,
+            manifest_path=str(manifest_path),
+            manifest_sha256=self._file_sha256(str(manifest_path)),
+            created_at=self._utc_iso(created),
+            expires_at=self._utc_iso(expires),
+        ).validate()
+        atomic_write_json(
+            str(lease_path),
+            lease.to_dict(),
+        )
+        return lease_path
+
+    def release_generation_lease(
+        self,
+        cache_dir: str,
+        *,
+        lease_id: str,
+        generation_id: str = "",
+    ) -> int:
+        """Release one short-lived generation lease after authority publication."""
+
+        try:
+            root = self._validated_cache_root(cache_dir)
+        except FileNotFoundError:
+            return 0
+        lease_name = str(lease_id or "").strip()
+        if not lease_name:
+            raise ValueError("preprocess generation lease release requires lease_id")
+        safe_lease = hashlib.sha256(lease_name.encode("utf-8")).hexdigest()
+        wanted_generation = (
+            self._validated_generation_name(generation_id) if generation_id else ""
+        )
+        removed = 0
+        with interprocess_file_lock(root / ".preprocess-cache"):
+            lease_dir = self._validated_lease_directory(root, create=False)
+            if lease_dir is None:
+                return 0
+            for lease_path in lease_dir.glob(f"{safe_lease}-*.json"):
+                if is_reparse_path(lease_path):
+                    raise RuntimeError(
+                        f"preprocess generation lease path is a reparse point: {lease_path}"
+                    )
+                if wanted_generation and not lease_path.name.endswith(f"-{wanted_generation}.json"):
+                    continue
+                try:
+                    payload = json.loads(lease_path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, Mapping):
+                        raise TypeError("preprocess generation lease must be an object")
+                    lease = PreprocessGenerationLeaseV1.from_mapping(payload)
+                    if lease.lease_id != lease_name:
+                        raise RuntimeError(
+                            f"preprocess generation lease identity is invalid: {lease_path}"
+                        )
+                    lease_path.unlink()
+                    removed += 1
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+        return removed
+
+    def _leased_generation_ids(self, root: Path) -> set[str]:
+        lease_dir = self._validated_lease_directory(root, create=False)
+        if lease_dir is None:
+            return set()
+        now = datetime.now(timezone.utc)
+        leased: set[str] = set()
+        for lease_path in lease_dir.glob("*.json"):
+            if is_reparse_path(lease_path):
+                raise RuntimeError(
+                    f"preprocess generation lease path is a reparse point: {lease_path}"
+                )
+            remove_invalid = False
+            try:
+                payload = json.loads(lease_path.read_text(encoding="utf-8"))
+                if not isinstance(payload, Mapping):
+                    raise TypeError("lease payload must be an object")
+                lease = PreprocessGenerationLeaseV1.from_mapping(payload)
+                generation_id = lease.generation_id
+                created_at = lease.parse_timestamp(lease.created_at)
+                expires_at = lease.parse_timestamp(lease.expires_at)
+                expected_name = (
+                    f"{hashlib.sha256(lease.lease_id.encode('utf-8')).hexdigest()}-"
+                    f"{generation_id}.json"
+                )
+                if (
+                    lease_path.name != expected_name
+                    or created_at > now + timedelta(minutes=5)
+                    or expires_at <= now
+                ):
+                    remove_invalid = True
+                else:
+                    _generation_root, manifest_path = self._validated_generation_manifest(
+                        root, generation_id
+                    )
+                    stored_manifest = Path(
+                        os.path.abspath(
+                            os.path.expanduser(lease.manifest_path)
+                        )
+                    )
+                    if (
+                        os.path.normcase(str(stored_manifest))
+                        != os.path.normcase(str(manifest_path))
+                        or self._file_sha256(str(manifest_path))
+                        != lease.manifest_sha256
+                    ):
+                        remove_invalid = True
+                    else:
+                        leased.add(generation_id)
+            except (
+                FileNotFoundError,
+                OSError,
+                TypeError,
+                ValueError,
+                UnicodeError,
+                json.JSONDecodeError,
+            ):
+                remove_invalid = True
+            if remove_invalid:
+                try:
+                    lease_path.unlink()
+                except OSError:
+                    pass
+        return leased
+
+    @staticmethod
+    def _validated_generation_name(generation_id: object) -> str:
+        generation_name = str(generation_id or "").strip()
+        if (
+            not generation_name.startswith("generation-")
+            or os.path.basename(generation_name) != generation_name
+            or generation_name in {"generation-", ".", ".."}
+        ):
+            raise ValueError(
+                "preprocess generation lease requires a finalized generation"
+            )
+        return generation_name
+
+    @staticmethod
+    def _reject_reparse_components(path: Path) -> None:
+        current = Path(os.path.abspath(os.path.expanduser(str(path))))
+        while True:
+            if current.exists() and is_reparse_path(current):
+                raise RuntimeError(
+                    f"preprocess cache path contains a reparse point: {current}"
+                )
+            parent = current.parent
+            if parent == current:
+                return
+            current = parent
+
+    def _validated_cache_root(self, cache_dir: str | os.PathLike[str]) -> Path:
+        root = Path(os.path.abspath(os.path.expanduser(str(cache_dir))))
+        if not root.is_dir():
+            raise FileNotFoundError(f"preprocess cache root is missing: {root}")
+        self._reject_reparse_components(root)
+        return root.resolve(strict=True)
+
+    def _validated_generation_manifest(
+        self,
+        root: Path,
+        generation_id: str,
+    ) -> tuple[Path, Path]:
+        generation_name = self._validated_generation_name(generation_id)
+        generation_lexical = root / generation_name
+        if is_reparse_path(generation_lexical):
+            raise RuntimeError(
+                "preprocess generation lease rejects a reparse generation: "
+                f"{generation_lexical}"
+            )
+        if not generation_lexical.is_dir():
+            raise FileNotFoundError(
+                f"cannot lease missing preprocess generation: {generation_lexical}"
+            )
+        generation_root = generation_lexical.resolve(strict=True)
+        if os.path.normcase(str(generation_root.parent)) != os.path.normcase(str(root)):
+            raise RuntimeError(
+                f"preprocess generation lease escapes the cache root: {generation_lexical}"
+            )
+        manifest_lexical = generation_lexical / "prepare_manifest.json"
+        if is_reparse_path(manifest_lexical):
+            raise RuntimeError(
+                "preprocess generation lease rejects a reparse manifest: "
+                f"{manifest_lexical}"
+            )
+        if not manifest_lexical.is_file():
+            raise FileNotFoundError(
+                f"cannot lease missing preprocess manifest: {manifest_lexical}"
+            )
+        manifest_path = manifest_lexical.resolve(strict=True)
+        if os.path.normcase(str(manifest_path.parent)) != os.path.normcase(
+            str(generation_root)
+        ):
+            raise RuntimeError(
+                f"preprocess generation manifest escapes its generation: {manifest_lexical}"
+            )
+        return generation_root, manifest_path
+
+    def _validated_lease_directory(
+        self,
+        root: Path,
+        *,
+        create: bool,
+    ) -> Path | None:
+        lease_dir = root / "generation_leases"
+        if lease_dir.exists():
+            if is_reparse_path(lease_dir) or not lease_dir.is_dir():
+                raise RuntimeError(
+                    f"preprocess generation lease directory is unsafe: {lease_dir}"
+                )
+        elif not create:
+            return None
+        else:
+            lease_dir.mkdir(parents=False, exist_ok=False)
+        self._reject_reparse_components(lease_dir)
+        return lease_dir.resolve(strict=True)
+
+    @staticmethod
+    def _utc_iso(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def release_pin(self, cache_dir: str, *, pin_id: str, generation_id: str = "") -> int:
         """Release a short-lived cache pin after job-owned snapshot publication."""

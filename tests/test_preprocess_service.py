@@ -150,6 +150,245 @@ def test_preprocess_short_lived_pin_can_be_released_after_snapshot(tmp_path: Pat
     assert not list(pin_dir.glob("*.json"))
 
 
+def test_preprocess_generation_lease_survives_gc_until_released(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "leased.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "true",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    first = manager.prepare_pdf(
+        str(pdf_path),
+        lease_id="lease-a",
+        lease_job_id="job-a",
+        lease_paper_key="paper-a",
+    )
+    second = manager.prepare_pdf(str(pdf_path))
+    assert first is not None and second is not None
+    assert first.manifest_path != second.manifest_path
+
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert Path(first.manifest_path).is_file()
+    assert Path(second.manifest_path).is_file()
+    lease_paths = list((Path(first.cache_dir) / "generation_leases").glob("*.json"))
+    assert len(lease_paths) == 1
+    lease = json.loads(lease_paths[0].read_text(encoding="utf-8"))
+    assert lease["schema_version"] == "preprocess-generation-lease-v1"
+    assert lease["lease_id"] == "lease-a"
+    assert lease["job_id"] == "job-a"
+    assert lease["paper_key"] == "paper-a"
+    assert lease["generation_id"] == Path(first.manifest_path).parent.name
+    assert lease["lifecycle_state"] == "active"
+    assert lease["created_at"] < lease["expires_at"]
+
+    assert (
+        manager.release_generation_lease(
+            first.cache_dir,
+            lease_id="lease-a",
+            generation_id=Path(first.manifest_path).parent.name,
+        )
+        == 1
+    )
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert not Path(first.manifest_path).exists()
+    assert Path(second.manifest_path).is_file()
+
+
+def test_preprocess_stale_generation_is_not_leased(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stale.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "false",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    first = manager.prepare_pdf(str(pdf_path))
+    assert first is not None
+    first_generation = Path(first.manifest_path).parent.name
+    manager.processing_fingerprint = "f" * 64
+
+    second = manager.prepare_pdf(
+        str(pdf_path),
+        lease_id="fresh-only",
+        lease_job_id="job-b",
+        lease_paper_key="paper-b",
+    )
+    assert second is not None
+    second_generation = Path(second.manifest_path).parent.name
+    assert second_generation != first_generation
+
+    leases = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (Path(second.cache_dir) / "generation_leases").glob("*.json")
+    ]
+    assert [item["generation_id"] for item in leases] == [second_generation]
+    manager._gc_generations(second.cache_dir, keep_generations=1)
+    assert not Path(first.manifest_path).exists()
+
+
+def test_preprocess_expired_generation_lease_is_collected(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "expired.pdf"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "ocr_mode": "off",
+                "force_rebuild": "true",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    first = manager.prepare_pdf(
+        str(pdf_path),
+        lease_id="expired-lease",
+        lease_job_id="job-expired",
+        lease_paper_key="paper-expired",
+    )
+    second = manager.prepare_pdf(str(pdf_path))
+    assert first is not None and second is not None
+    lease_path = next((Path(first.cache_dir) / "generation_leases").glob("*.json"))
+    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    lease["created_at"] = "2020-01-01T00:00:00Z"
+    lease["expires_at"] = "2020-01-01T01:00:00Z"
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert not lease_path.exists()
+    assert not Path(first.manifest_path).exists()
+    assert Path(second.manifest_path).is_file()
+
+
+def test_preprocess_generation_lease_rejects_invalid_generation_name(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    manager = PreprocessManager(
+        config={"Preprocess": {"enabled": "true", "cache_dir": str(cache_dir)}},
+        logger=None,
+    )
+
+    with pytest.raises(ValueError, match="finalized generation"):
+        manager.acquire_generation_lease(
+            str(cache_dir),
+            generation_id="../generation-outside",
+            lease_id="unsafe",
+            job_id="job-invalid",
+            paper_key="paper-invalid",
+        )
+
+
+def test_preprocess_generation_lease_rejects_reparse_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "reparse.pdf"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "ocr_mode": "off",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    result = manager.prepare_pdf(str(pdf_path))
+    assert result is not None
+    generation_root = Path(result.manifest_path).parent
+    from preprocess import service as preprocess_service
+
+    original_is_reparse_path = preprocess_service.is_reparse_path
+    monkeypatch.setattr(
+        preprocess_service,
+        "is_reparse_path",
+        lambda path: Path(path) == generation_root or original_is_reparse_path(path),
+    )
+
+    with pytest.raises(RuntimeError, match="reparse"):
+        manager.acquire_generation_lease(
+            result.cache_dir,
+            generation_id=generation_root.name,
+            lease_id="unsafe",
+            job_id="job-c",
+            paper_key="paper-c",
+        )
+
+
+def test_preprocess_generation_lease_rejects_reparse_lease_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "lease-dir.pdf"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "ocr_mode": "off",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    result = manager.prepare_pdf(str(pdf_path))
+    assert result is not None
+    lease_dir = Path(result.cache_dir) / "generation_leases"
+    lease_dir.mkdir()
+    from preprocess import service as preprocess_service
+
+    original_is_reparse_path = preprocess_service.is_reparse_path
+    monkeypatch.setattr(
+        preprocess_service,
+        "is_reparse_path",
+        lambda path: Path(path) == lease_dir or original_is_reparse_path(path),
+    )
+
+    with pytest.raises(RuntimeError, match="lease directory is unsafe"):
+        manager.acquire_generation_lease(
+            result.cache_dir,
+            generation_id=Path(result.manifest_path).parent.name,
+            lease_id="unsafe-dir",
+            job_id="job-dir",
+            paper_key="paper-dir",
+        )
+
+
 def test_preprocess_failure_cleans_staging_generation(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "failed.pdf"
     cache_dir = tmp_path / "cache"

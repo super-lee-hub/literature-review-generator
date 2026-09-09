@@ -9,32 +9,37 @@ runtime, and only a substantive canonical summary is returned to the runtime
 checkpoint.
 """
 
-from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import shutil
 import tempfile
-from typing import Any, Callable, Mapping, Sequence, cast
+import uuid
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping, Sequence, cast
 
+from models import APIConfig
 from preprocess.service import PreprocessManager
 from preprocess.visual_artifacts import Stage1VisualArtifactBuilder
-from models import APIConfig
+from runtime.provider_receipt_closure import (
+    ExpectedProviderCall,
+    ProviderReceiptClosure,
+)
 from runtime.provider_runtime import (
-    ProviderBudgetV1,
     ProviderBudgetExceeded,
+    ProviderBudgetV1,
     ProviderRuntime,
     ProviderRuntimeLedger,
     _redact_mapping,
-    compute_closure_epoch_id,
     canonical_provider_request_payload,
+    compute_closure_epoch_id,
     hash_json,
     hash_text,
 )
-from runtime.provider_receipt_closure import ExpectedProviderCall, ProviderReceiptClosure
 from runtime.stage_contracts import PaperWorkItem, SourceBundle
 from services.artifact_registry import (
     ArtifactDependencyRefV2,
@@ -43,59 +48,64 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
+from services.config_values import parse_strict_bool
 from services.durable_io import atomic_replace_with_retry
 from services.evidence_manifest import build_evidence_manifest_v1
 from services.job_workspace import (
     JobWorkspace,
-    atomic_write_json,
     is_reparse_path,
     publish_bytes_artifact,
     publish_json_artifact,
     utc_now_iso,
 )
+from services.multimodal_capability import detect_multimodal_capability
+from services.prompt_registry import PromptRegistry
 from services.settings import ApplicationSettings
 from services.stage1_input_builder import Stage1InputBuilder
-from services.stage1_input_completeness import build_completeness_metrics, has_blocking_stage1_reason
+from services.stage1_input_completeness import (
+    build_completeness_metrics,
+    has_blocking_stage1_reason,
+)
 from services.stage1_output_budget import (
     stage1_output_budget_sequence,
     stage1_output_budget_snapshot,
     stage1_request_timeout_seconds,
     stage1_semantic_retry_max_attempts,
 )
-from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
-from services.prompt_registry import PromptRegistry
+from services.stage1_reuse import (
+    STAGE1_REUSE_POLICY,
+    Stage1ReusableSummaryBindingV1,
+    Stage1ReusableSummaryManifestV1,
+    Stage1ReuseEligibilityV1,
+    Stage1VisualEvidenceQualificationV1,
+    build_binding_hash,
+    evaluate_stage1_reuse,
+    verify_stage1_typed_manifest_authority,
+)
+from services.stage1_visual_contract import SELECTIVE_VISUAL_CONTRACT_VERSION
 from services.stage1_visual_scan import (
-    VisualScanBatch,
     VISUAL_EVIDENCE_ARTIFACT_TYPE,
     VISUAL_EVIDENCE_VERSION,
     VISUAL_EXTRACT_PROMPT_ID,
     VISUAL_OBSERVATIONS_VERSION,
     VISUAL_SCAN_PROMPT_ID,
+    VisualScanBatch,
     build_visual_extract_prompt,
     build_visual_scan_prompt,
     build_visual_scan_user_content,
     estimate_encoded_image_bytes,
     normalize_visual_byte_budgets,
+    select_final_visual_refs_after_scan,
     summarize_raw_reinspection_groups,
     validate_current_visual_observations_v2,
     validate_selected_visual_evidence_v3,
-    select_final_visual_refs_after_scan,
 )
-from services.config_values import parse_strict_bool
-from services.multimodal_capability import detect_multimodal_capability
-from services.stage1_visual_contract import SELECTIVE_VISUAL_CONTRACT_VERSION
-from services.stage1_reuse import (
-    STAGE1_REUSE_POLICY,
-    Stage1ReusableSummaryBindingV1,
-    Stage1ReusableSummaryManifestV1,
-    Stage1VisualEvidenceQualificationV1,
-    Stage1ReuseEligibilityV1,
-    build_binding_hash,
-    evaluate_stage1_reuse,
-    verify_stage1_typed_manifest_authority,
+from services.stage1_visual_schema import VISUAL_EVIDENCE_KINDS
+from summary_schema import (
+    build_summary_schema_contract,
+    is_canonical_ai_summary,
+    normalize_ai_summary,
 )
-from summary_schema import build_summary_schema_contract, is_canonical_ai_summary, normalize_ai_summary
-
 
 ReaderCallable = Callable[..., Mapping[str, Any]]
 
@@ -339,57 +349,16 @@ class Stage1AnalysisService:
             raise RuntimeError(
                 f"Stage 1 source PDF is missing for {self._paper_key(item)}: {source_pdf or '<empty>'}"
             )
-        preprocess = self._preprocess(
+        with self._preprocess(
             source_pdf,
             paper_key=item.canonical_paper_key,
             source_role=str(item.paper_info.get("source_attachment_role") or ""),
-        )
-        preprocess_metadata = self._preprocess_metadata(preprocess)
-        evidence_manifest = build_evidence_manifest_v1(
-            job_id=self.job_id,
-            canonical_paper_key=item.canonical_paper_key,
-            preprocess=preprocess_metadata,
-        )
-        existing_evidence = self.registry.get(
-            f"evidence_manifest:{item.canonical_paper_key}"
-        )
-        if existing_evidence is not None and existing_evidence.status == "ready":
-            try:
-                existing_payload = json.loads(
-                    Path(existing_evidence.path).read_text(encoding="utf-8")
-                )
-                if (
-                    isinstance(existing_payload, Mapping)
-                    and str(existing_payload.get("created_at") or "")
-                    and hash_json(existing_payload.get("artifacts") or [])
-                    == hash_json(
-                        [item.to_dict() for item in evidence_manifest.artifacts]
-                    )
-                ):
-                    evidence_manifest = replace(
-                        evidence_manifest,
-                        created_at=str(existing_payload["created_at"]),
-                    )
-            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-                pass
-        evidence_manifest_path = self.workspace.artifact_path(
-            "evidence_manifests/"
-            f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
-        )
-        evidence_record = publish_json_artifact(
-            self.publication_context,
-            self.registry,
-            evidence_manifest_path,
-            evidence_manifest.to_dict(),
-            artifact_role="evidence_manifest",
-            artifact_type="evidence_manifest",
-            artifact_version="v1",
-            producer="services.stage1_analysis_service.Stage1AnalysisService",
-            artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
-        )
-        preprocess_metadata["evidence_manifest_path"] = evidence_record.path
-        preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
-        preprocess_metadata["evidence_manifest_artifact_id"] = evidence_record.artifact_id
+        ) as preprocess:
+            preprocess_metadata, evidence_record = self._publish_preprocess_evidence(
+                item=item,
+                preprocess=preprocess,
+                preserve_existing_created_at=True,
+            )
         self._publish_ocr_artifacts(
             paper_key=item.canonical_paper_key,
             preprocess_metadata=preprocess_metadata,
@@ -4838,35 +4807,16 @@ class Stage1AnalysisService:
                 f"Stage 1 source PDF is missing for {self._paper_key(item)}: {source_pdf or '<empty>'}"
             )
 
-        preprocess = self._preprocess(
+        with self._preprocess(
             source_pdf,
             paper_key=item.canonical_paper_key,
             source_role=str(item.paper_info.get("source_attachment_role") or ""),
-        )
-        preprocess_metadata = self._preprocess_metadata(preprocess)
-        evidence_manifest = build_evidence_manifest_v1(
-            job_id=self.job_id,
-            canonical_paper_key=item.canonical_paper_key,
-            preprocess=preprocess_metadata,
-        )
-        evidence_manifest_path = self.workspace.artifact_path(
-            "evidence_manifests/"
-            f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
-        )
-        evidence_record = publish_json_artifact(
-            self.publication_context,
-            self.registry,
-            evidence_manifest_path,
-            evidence_manifest.to_dict(),
-            artifact_role="evidence_manifest",
-            artifact_type="evidence_manifest",
-            artifact_version="v1",
-            producer="services.stage1_analysis_service.Stage1AnalysisService",
-            artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
-        )
-        preprocess_metadata["evidence_manifest_path"] = evidence_record.path
-        preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
-        preprocess_metadata["evidence_manifest_artifact_id"] = evidence_record.artifact_id
+        ) as preprocess:
+            preprocess_metadata, evidence_record = self._publish_preprocess_evidence(
+                item=item,
+                preprocess=preprocess,
+                preserve_existing_created_at=False,
+            )
         self._publish_ocr_artifacts(
             paper_key=item.canonical_paper_key,
             preprocess_metadata=preprocess_metadata,
@@ -5010,13 +4960,14 @@ class Stage1AnalysisService:
             tuple(receipt.receipt_id for receipt in runtime.receipts),
         )
 
+    @contextmanager
     def _preprocess(
         self,
         source_pdf: str,
         *,
         paper_key: str = "",
         source_role: str = "",
-    ) -> Any:
+    ) -> Iterator[Any]:
         preprocess_config = {
             str(section): dict(values) if isinstance(values, Mapping) else values
             for section, values in self.config.items()
@@ -5027,11 +4978,23 @@ class Stage1AnalysisService:
         )
         preprocess_config["Preprocess"] = preprocess_section
         manager = PreprocessManager(preprocess_config, logger=self.logger)
-        pin_id = f"{self.job_id}:{paper_key or source_pdf}"
-        result = manager.prepare_pdf(source_pdf, pin_id=pin_id)
+        owner_paper_key = str(paper_key or source_pdf)
+        lease_id = (
+            f"stage1:{self.job_id}:{self.attempt_id}:{owner_paper_key}:"
+            f"{uuid.uuid4().hex}"
+        )
+        result = None
+        generation_id = ""
         try:
+            result = manager.prepare_pdf(
+                source_pdf,
+                lease_id=lease_id,
+                lease_job_id=self.job_id,
+                lease_paper_key=owner_paper_key,
+            )
             if result is None:
                 raise RuntimeError(f"Stage 1 preprocessing failed or was disabled for {source_pdf}")
+            generation_id = Path(str(result.manifest_path)).parent.name
             reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
             scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
             if has_blocking_stage1_reason(reasons) and not scanned_primary:
@@ -5053,10 +5016,17 @@ class Stage1AnalysisService:
                 raise RuntimeError(
                     f"SCANNED_PRIMARY preprocessing produced no page index for {source_pdf}"
                 )
-            return self._snapshot_preprocess_authority(result, paper_key=paper_key or source_pdf)
+            yield self._snapshot_preprocess_authority(
+                result,
+                paper_key=owner_paper_key,
+            )
         finally:
             if result is not None:
-                manager.release_pin(result.cache_dir, pin_id=pin_id)
+                manager.release_generation_lease(
+                    result.cache_dir,
+                    lease_id=lease_id,
+                    generation_id=generation_id,
+                )
 
     def _snapshot_preprocess_authority(self, result: Any, *, paper_key: str) -> Any:
         """Move formal Stage 1 authority into the job-owned workspace.
@@ -5183,6 +5153,70 @@ class Stage1AnalysisService:
                 raise RuntimeError(f"preprocess authority snapshot hash mismatch: {source.name}")
             replacements[field_name] = str(target)
         return replace(result, **replacements)
+
+    def _publish_preprocess_evidence(
+        self,
+        *,
+        item: PaperWorkItem,
+        preprocess: Any,
+        preserve_existing_created_at: bool,
+    ) -> tuple[dict[str, Any], ArtifactRecord]:
+        """Publish the Registry authority before releasing the cache lease."""
+
+        preprocess_metadata = self._preprocess_metadata(preprocess)
+        evidence_manifest = build_evidence_manifest_v1(
+            job_id=self.job_id,
+            canonical_paper_key=item.canonical_paper_key,
+            preprocess=preprocess_metadata,
+        )
+        if preserve_existing_created_at:
+            existing_evidence = self.registry.get(
+                f"evidence_manifest:{item.canonical_paper_key}"
+            )
+            if existing_evidence is not None and existing_evidence.status == "ready":
+                try:
+                    existing_payload = json.loads(
+                        Path(existing_evidence.path).read_text(encoding="utf-8")
+                    )
+                    if (
+                        isinstance(existing_payload, Mapping)
+                        and str(existing_payload.get("created_at") or "")
+                        and hash_json(existing_payload.get("artifacts") or [])
+                        == hash_json(
+                            [entry.to_dict() for entry in evidence_manifest.artifacts]
+                        )
+                    ):
+                        evidence_manifest = replace(
+                            evidence_manifest,
+                            created_at=str(existing_payload["created_at"]),
+                        )
+                except (
+                    OSError,
+                    UnicodeError,
+                    json.JSONDecodeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    pass
+        evidence_manifest_path = self.workspace.artifact_path(
+            "evidence_manifests/"
+            f"{hashlib.sha256(item.canonical_paper_key.encode('utf-8')).hexdigest()[:24]}_v1.json"
+        )
+        evidence_record = publish_json_artifact(
+            self.publication_context,
+            self.registry,
+            evidence_manifest_path,
+            evidence_manifest.to_dict(),
+            artifact_role="evidence_manifest",
+            artifact_type="evidence_manifest",
+            artifact_version="v1",
+            producer="services.stage1_analysis_service.Stage1AnalysisService",
+            artifact_id=f"evidence_manifest:{item.canonical_paper_key}",
+        )
+        preprocess_metadata["evidence_manifest_path"] = evidence_record.path
+        preprocess_metadata["evidence_manifest_hash"] = evidence_record.content_hash
+        preprocess_metadata["evidence_manifest_artifact_id"] = evidence_record.artifact_id
+        return preprocess_metadata, evidence_record
 
     def _preprocess_metadata(self, result: Any) -> dict[str, Any]:
         metadata = asdict(result)

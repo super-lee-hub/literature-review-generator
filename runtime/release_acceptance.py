@@ -788,6 +788,7 @@ class ParentAcceptanceResultV2:
         final_executable_sha: str,
         child_results: Mapping[str, Mapping[str, Any]],
         required_scenarios: Iterable[str],
+        expected_child_bindings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> "ParentAcceptanceResultV2":
         required = tuple(str(item).strip().upper() for item in required_scenarios)
         normalized: dict[str, Mapping[str, Any]] = {}
@@ -815,8 +816,26 @@ class ParentAcceptanceResultV2:
                 or receipt.scenario_id != scenario_id
             ):
                 issues.append(f"child binding mismatch {scenario_id}")
+            expected_binding = (
+                expected_child_bindings.get(scenario_id, {})
+                if isinstance(expected_child_bindings, Mapping)
+                else {}
+            )
+            for field_name in (
+                "plan_sha256",
+                "runtime_spec_sha256",
+                "input_identity_sha256",
+                "workspace_identity_sha256",
+                "job_id",
+                "budget_domain",
+            ):
+                expected_value = str(expected_binding.get(field_name) or "").strip()
+                if expected_value and str(getattr(receipt, field_name, "") or "").strip() != expected_value:
+                    issues.append(f"child {field_name} binding mismatch {scenario_id}")
             status = str(raw.get("status") or "").strip().upper()
             statuses.append(status)
+            if status in {"PASS", "PASS_OFFLINE", "PASS_OFFLINE_HOSTED"} and receipt.status != "PASSED":
+                issues.append(f"child status/receipt terminal mismatch {scenario_id}")
             normalized[scenario_id] = {
                 **dict(raw),
                 "receipt": receipt.to_dict(),

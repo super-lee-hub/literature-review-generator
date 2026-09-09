@@ -5,6 +5,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -190,6 +191,36 @@ def test_parent_result_cannot_turn_offline_executor_receipt_into_live_ready() ->
     assert result.to_dict()["terminal_status"] != "READY_TO_MERGE"
 
 
+def test_parent_result_rejects_cross_input_child_receipt() -> None:
+    result = ParentAcceptanceResultV2.from_child_results(
+        parent_acceptance_run_id="parent-acceptance-1",
+        final_executable_sha="a" * 40,
+        child_results={
+            "C": {
+                "status": "PASS",
+                "receipt": _receipt_payload(
+                    plan_sha256="b" * 64,
+                    runtime_spec_sha256="c" * 64,
+                    input_identity_sha256="d" * 64,
+                    budget_domain="live",
+                ),
+            }
+        },
+        required_scenarios=("C",),
+        expected_child_bindings={
+            "C": {
+                "plan_sha256": "e" * 64,
+                "runtime_spec_sha256": "f" * 64,
+                "input_identity_sha256": "0" * 64,
+                "budget_domain": "live",
+            }
+        },
+    )
+
+    assert result.status == "NOT_VERIFIED"
+    assert "binding mismatch" in result.reason
+
+
 def test_parent_acceptance_plan_persists_independent_blocked_children_without_owner_inputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -211,6 +242,12 @@ def test_parent_acceptance_plan_persists_independent_blocked_children_without_ow
     state = json.loads((tmp_path / "acceptance-state.json").read_text(encoding="utf-8"))
     assert state["plan_sha256"]
     assert set(state["child_states"]) == {"C", "D", "Q"}
+    child_state_paths = [
+        Path(item["state_path"])
+        for item in state["child_states"].values()
+    ]
+    assert len(set(child_state_paths)) == 3
+    assert all(path.is_file() for path in child_state_paths)
 
 
 def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
@@ -514,7 +551,7 @@ def test_stage1_snapshot_replaces_partial_target_atomically(tmp_path: Path) -> N
         )
     ):
         source = generation_dir / f"{field_name}-{index}.dat"
-        source.write_bytes(f"complete-{field_name}".encode("utf-8"))
+        source.write_bytes(f"complete-{field_name}".encode())
         paths[field_name] = source
     result = PreprocessResult(
         pdf_path="source.pdf",
@@ -554,6 +591,81 @@ def test_stage1_snapshot_replaces_partial_target_atomically(tmp_path: Path) -> N
 
     assert Path(snapped.markdown_path).read_bytes() == paths["markdown_path"].read_bytes()
     assert target.read_bytes() == paths["markdown_path"].read_bytes()
+
+
+@pytest.mark.parametrize("raise_in_consumer", (False, True))
+def test_stage1_preprocess_releases_generation_lease_on_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raise_in_consumer: bool,
+) -> None:
+    from services.job_workspace import JobWorkspace
+    from services.stage1_analysis_service import Stage1AnalysisService
+
+    release_calls: list[dict[str, str]] = []
+    generation_root = tmp_path / "cache" / "generation-lease-test"
+    generation_root.mkdir(parents=True)
+    manifest_path = generation_root / "prepare_manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    preprocess_result = SimpleNamespace(
+        cache_dir=str(tmp_path / "cache"),
+        manifest_path=str(manifest_path),
+        stage1_quality_reasons=[],
+        stage1_input_text="Substantive Stage 1 source text.",
+        plain_text="Substantive Stage 1 source text.",
+        markdown_text="Substantive Stage 1 source text.",
+        page_index=[{"page_number": 1}],
+    )
+
+    class FakePreprocessManager:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def prepare_pdf(self, _source_pdf: str, **kwargs: str) -> object:
+            assert kwargs["lease_id"]
+            assert kwargs["lease_job_id"] == "job-lease"
+            assert kwargs["lease_paper_key"] == "paper-lease"
+            return preprocess_result
+
+        def release_generation_lease(self, _cache_dir: str, **kwargs: str) -> int:
+            release_calls.append(dict(kwargs))
+            return 1
+
+    service = object.__new__(Stage1AnalysisService)
+    service.job_id = "job-lease"
+    service.attempt_id = "attempt-lease"
+    service.config = {}
+    service.logger = None
+    service.workspace = JobWorkspace.create(
+        str(tmp_path / "output"), "lease-project", "job-lease"
+    )
+    monkeypatch.setattr(
+        "services.stage1_analysis_service.PreprocessManager",
+        FakePreprocessManager,
+    )
+    monkeypatch.setattr(
+        service,
+        "_snapshot_preprocess_authority",
+        lambda result, *, paper_key: result,
+    )
+
+    if raise_in_consumer:
+        with (
+            pytest.raises(RuntimeError, match="consumer failure"),
+            service._preprocess(
+                "paper.pdf", paper_key="paper-lease"
+            ) as prepared,
+        ):
+            assert prepared is preprocess_result
+            raise RuntimeError("consumer failure")
+    else:
+        with service._preprocess("paper.pdf", paper_key="paper-lease") as prepared:
+            assert prepared is preprocess_result
+            assert release_calls == []
+
+    assert len(release_calls) == 1
+    assert release_calls[0]["generation_id"] == generation_root.name
+    assert release_calls[0]["lease_id"]
 
 
 def test_terminate_interruption_event_cannot_claim_a_graceful_exit() -> None:
