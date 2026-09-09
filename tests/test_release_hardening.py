@@ -71,6 +71,57 @@ def _runtime_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
+def _scenario_receipt_ref(
+    tmp_path: Path,
+    producer: GateEvidenceProducer,
+    *,
+    gate: str,
+    final_sha: str,
+    acceptance_run_id: str,
+    job_id: str = "",
+) -> dict[str, object]:
+    receipt_path = tmp_path / f"scenario-execution-receipt-{gate}.json"
+    receipt_path.write_text(
+        json.dumps(
+            {
+                "artifact_type": "scenario_execution_receipt",
+                "artifact_version": "v1",
+                "schema_version": "scenario-execution-receipt-v1",
+                "parent_acceptance_run_id": acceptance_run_id,
+                "scenario_id": gate,
+                "gate": gate,
+                "final_executable_sha": final_sha,
+                "plan_sha256": "a" * 64,
+                "runtime_spec_sha256": "b" * 64,
+                "input_identity_sha256": "c" * 64,
+                "workspace_identity_sha256": "d" * 64,
+                "executor_pid": os.getpid(),
+                "executor_process_creation_identity": "test-process",
+                "executor_host_id": "test-host",
+                "started_at": "2026-01-01T00:00:00Z",
+                "completed_at": "2026-01-01T00:00:01Z",
+                "action_type": f"gate-{gate.lower()}-test",
+                "workspace": str(tmp_path),
+                "job_id": job_id or f"job-{gate.lower()}",
+                "attempt_id": f"attempt-{gate.lower()}",
+                "budget_domain": "live",
+                "status": "PASSED",
+                "exit_status": 0,
+                "produced_evidence_refs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return producer.reference(
+        receipt_path,
+        role="scenario_execution_receipt",
+        artifact_type="scenario_execution_receipt",
+        artifact_version="v1",
+        schema_version="scenario-execution-receipt-v1",
+        job_id=job_id,
+    )
+
+
 def test_runtime_job_spec_rejects_unknown_top_level_and_nested_keys() -> None:
     with pytest.raises(ValueError, match="pdf_fodler"):
         RuntimeJobSpec.from_dict(_runtime_payload(pdf_fodler="papers"))
@@ -516,6 +567,7 @@ def test_live_gate_rejects_provider_receipt_missing_authoritative_job_binding(tm
     )
     terminal.write_text(json.dumps({"artifact_type": "runtime_stage_terminal", "status": "complete"}), encoding="utf-8")
     producer = GateEvidenceProducer(final_sha="f" * 40)
+    acceptance_run_id = "test-run-g-binding"
     evidence = producer.build_gate(
         "G",
         [
@@ -541,7 +593,17 @@ def test_live_gate_rejects_provider_receipt_missing_authoritative_job_binding(tm
                 artifact_version="v1",
                 job_id="job-1",
             ),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="G",
+                final_sha="f" * 40,
+                acceptance_run_id=acceptance_run_id,
+                job_id="job-1",
+            ),
         ],
+        acceptance_run_id=acceptance_run_id,
+        scenario_id="G",
     )
 
     result = GateEvidenceVerifier().verify(
@@ -578,6 +640,7 @@ def test_live_gate_does_not_count_test_only_provider_receipts(tmp_path: Path) ->
     )
     terminal.write_text(json.dumps({"status": "complete"}), encoding="utf-8")
     producer = GateEvidenceProducer(final_sha="d" * 40)
+    acceptance_run_id = "test-run-g-test-only"
     evidence = producer.build_gate(
         "G",
         [
@@ -598,7 +661,16 @@ def test_live_gate_does_not_count_test_only_provider_receipts(tmp_path: Path) ->
                 role="stage_terminal",
                 artifact_type="runtime_stage_terminal",
             ),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="G",
+                final_sha="d" * 40,
+                acceptance_run_id=acceptance_run_id,
+            ),
         ],
+        acceptance_run_id=acceptance_run_id,
+        scenario_id="G",
     )
 
     result = GateEvidenceVerifier().verify(
@@ -695,7 +767,17 @@ def test_gate_f_rejects_partial_semantic_role_receipts(tmp_path: Path) -> None:
             producer.reference(ledger_path, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger", artifact_version="v1", job_id="job-f"),
             producer.reference(terminal, role="stage_terminal", artifact_type="runtime_stage_terminal", job_id="job-f"),
             producer.reference(closure, role="closure", artifact_type="provider_receipt_closure", job_id="job-f"),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="F",
+                final_sha="2" * 40,
+                acceptance_run_id="test-run-f",
+                job_id="job-f",
+            ),
         ],
+        acceptance_run_id="test-run-f",
+        scenario_id="F",
     )
 
     result = GateEvidenceVerifier().verify(
@@ -719,6 +801,7 @@ def test_gate_e_rejects_filename_only_interruption_and_resume_files(tmp_path: Pa
     events.write_text(json.dumps({"event": "resume"}) + "\n", encoding="utf-8")
     ledger.write_text("", encoding="utf-8")
     producer = GateEvidenceProducer(final_sha="5" * 40)
+    acceptance_run_id = "test-run-e"
     evidence = producer.build_gate(
         "E",
         [
@@ -726,7 +809,16 @@ def test_gate_e_rejects_filename_only_interruption_and_resume_files(tmp_path: Pa
             producer.reference(resume, role="resume_event"),
             producer.reference(ledger, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger"),
             producer.reference(events, role="process_events"),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="E",
+                final_sha="5" * 40,
+                acceptance_run_id=acceptance_run_id,
+            ),
         ],
+        acceptance_run_id=acceptance_run_id,
+        scenario_id="E",
     )
 
     result = GateEvidenceVerifier().verify(
@@ -780,6 +872,7 @@ def test_gate_d_rejects_self_declared_modalities_without_three_derived_profiles(
     ledger.write_text("", encoding="utf-8")
     closure.write_text(json.dumps({"artifact_type": "provider_receipt_closure", "status": "complete"}), encoding="utf-8")
     producer = GateEvidenceProducer(final_sha="7" * 40)
+    acceptance_run_id = "test-run-d"
     refs = [
         *[
             producer.reference(source, role="source_pdf", artifact_type="source_pdf")
@@ -800,11 +893,23 @@ def test_gate_d_rejects_self_declared_modalities_without_three_derived_profiles(
         producer.reference(registry, role="registry"),
         producer.reference(ledger, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger"),
         producer.reference(closure, role="closure", artifact_type="provider_receipt_closure"),
+        _scenario_receipt_ref(
+            tmp_path,
+            producer,
+            gate="D",
+            final_sha="7" * 40,
+            acceptance_run_id=acceptance_run_id,
+        ),
     ]
 
     result = GateEvidenceVerifier().verify(
         "D",
-        producer.build_gate("D", refs),
+        producer.build_gate(
+            "D",
+            refs,
+            acceptance_run_id=acceptance_run_id,
+            scenario_id="D",
+        ),
         expected_final_sha="7" * 40,
     )
 
@@ -822,6 +927,7 @@ def test_gate_h_rejects_generic_validation_findings_without_challenge_lineage(tm
     repair.write_text(json.dumps({"status": "completed", "findings": ["generic"]}), encoding="utf-8")
     ledger.write_text("", encoding="utf-8")
     producer = GateEvidenceProducer(final_sha="8" * 40)
+    acceptance_run_id = "test-run-h"
     evidence = producer.build_gate(
         "H",
         [
@@ -829,7 +935,16 @@ def test_gate_h_rejects_generic_validation_findings_without_challenge_lineage(tm
             producer.reference(validation, role="validation_artifact", artifact_type="validation_run_result"),
             producer.reference(repair, role="repair_artifact", artifact_type="repair_transaction"),
             producer.reference(ledger, role="provider_receipt_ledger", artifact_type="provider_receipt_ledger"),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="H",
+                final_sha="8" * 40,
+                acceptance_run_id=acceptance_run_id,
+            ),
         ],
+        acceptance_run_id=acceptance_run_id,
+        scenario_id="H",
     )
 
     result = GateEvidenceVerifier().verify("H", evidence, expected_final_sha="8" * 40)
@@ -866,6 +981,7 @@ def test_gate_j_rejects_used_ocr_without_dependency_lineage(tmp_path: Path) -> N
     canonical.write_text(json.dumps({"used_ocr": True}), encoding="utf-8")
     registry.write_text(json.dumps({"artifact_registry_version": "v2", "job_id": "job-j", "artifacts": []}), encoding="utf-8")
     producer = GateEvidenceProducer(final_sha="9" * 40)
+    acceptance_run_id = "test-run-j"
     evidence = producer.build_gate(
         "J",
         [
@@ -874,7 +990,16 @@ def test_gate_j_rejects_used_ocr_without_dependency_lineage(tmp_path: Path) -> N
             producer.reference(artifact, role="ocr_artifact", artifact_type="ocr_artifact", artifact_version="v1", schema_version="ocr-artifact-v1"),
             producer.reference(canonical, role="canonical_stage1", artifact_type="summary_file"),
             producer.reference(registry, role="registry"),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="J",
+                final_sha="9" * 40,
+                acceptance_run_id=acceptance_run_id,
+            ),
         ],
+        acceptance_run_id=acceptance_run_id,
+        scenario_id="J",
     )
 
     result = GateEvidenceVerifier().verify("J", evidence, expected_final_sha="9" * 40)
@@ -905,6 +1030,7 @@ def test_gate_q_rejects_single_aggregate_without_fifteen_paper_identities(tmp_pa
     job_outcome.write_text(json.dumps({"job_status": "completed", "canonical_ready": True}), encoding="utf-8")
     citation.write_text(json.dumps({"artifact_type": "citation_manifest", "paper_entries": []}), encoding="utf-8")
     producer = GateEvidenceProducer(final_sha="a" * 40)
+    acceptance_run_id = "test-run-q"
     evidence = producer.build_gate(
         "Q",
         [
@@ -918,7 +1044,16 @@ def test_gate_q_rejects_single_aggregate_without_fifteen_paper_identities(tmp_pa
             producer.reference(closure, role="closure", artifact_type="provider_receipt_closure"),
             producer.reference(job_outcome, role="job_outcome", artifact_type="job_outcome"),
             producer.reference(citation, role="citation_manifest", artifact_type="citation_manifest", artifact_version="v3"),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="Q",
+                final_sha="a" * 40,
+                acceptance_run_id=acceptance_run_id,
+            ),
         ],
+        acceptance_run_id=acceptance_run_id,
+        scenario_id="Q",
     )
 
     result = GateEvidenceVerifier().verify("Q", evidence, expected_final_sha="a" * 40)

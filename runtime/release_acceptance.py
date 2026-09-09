@@ -1844,7 +1844,9 @@ class GateKScenario(AcceptanceScenario):
         )
         try:
             event_temp.write_text(event_payload, encoding="utf-8", newline="\n")
-            with event_temp.open("rb") as handle:
+            # Windows rejects fsync on a read-only descriptor.  Reopen the
+            # fully-written temporary file read/write before flushing it.
+            with event_temp.open("r+b") as handle:
                 os.fsync(handle.fileno())
             atomic_replace_with_retry(event_temp, process_event_path, timeout_seconds=5.0)
         finally:
