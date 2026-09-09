@@ -4118,7 +4118,7 @@ class GateEvidenceVerifier:
                             else "FAIL"
                         ),
                         "reason": (
-                            "FAIL_NOT_PLAYWRIGHT_EVIDENCE: "
+                            "Playwright evidence invalid (FAIL_NOT_PLAYWRIGHT_EVIDENCE): "
                             if not_playwright
                             else ""
                         )
