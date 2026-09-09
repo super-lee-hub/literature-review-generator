@@ -389,6 +389,7 @@ reviewctl.py
 runtime/control_plane.py
 runtime/job_spec.py
 runtime/orchestrator.py
+runtime/playwright_evidence.py
 runtime/provider_runtime.py
 runtime/release_acceptance.py
 runtime/runner.py
@@ -408,7 +409,8 @@ validation/llm_adjudicator.py
 validation/review_validator.py
 ```
 
-Regression coverage includes `tests/test_release_hardening.py` and the
+Regression coverage includes `tests/test_acceptance_execution_scenarios.py`,
+`tests/test_playwright_evidence.py`, `tests/test_release_hardening.py`, and the
 preprocess cache behavior update in `tests/test_preprocess_service.py`.
 
 The new executable/report scope also includes runtime/provider_routes.py,
