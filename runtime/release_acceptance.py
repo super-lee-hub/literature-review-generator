@@ -4103,9 +4103,22 @@ class GateEvidenceVerifier:
                     }
                 allowed_types = _ROLE_ARTIFACT_TYPES.get(ref.role)
                 if allowed_types is not None and ref.artifact_type not in allowed_types:
+                    not_playwright = ref.role in {
+                        "playwright_trace",
+                        "browser_evidence",
+                    }
                     return {
-                        "status": "FAIL",
-                        "reason": f"durable evidence role/type binding is invalid: {ref.ref_id}",
+                        "status": (
+                            "FAIL_NOT_PLAYWRIGHT_EVIDENCE"
+                            if not_playwright
+                            else "FAIL"
+                        ),
+                        "reason": (
+                            "FAIL_NOT_PLAYWRIGHT_EVIDENCE: "
+                            if not_playwright
+                            else ""
+                        )
+                        + f"durable evidence role/type binding is invalid: {ref.ref_id}",
                         "contract": contract,
                     }
                 if ref.role == "provider_receipt_ledger":
@@ -4443,7 +4456,11 @@ class GateEvidenceVerifier:
             }
         if semantic_error:
             return {
-                "status": "FAIL",
+                "status": (
+                    "FAIL_NOT_PLAYWRIGHT_EVIDENCE"
+                    if str(gate) == "I"
+                    else "FAIL"
+                ),
                 "reason": semantic_error,
                 "derived_facts": self._derive_facts(str(gate), refs, payloads),
                 "contract": contract,
