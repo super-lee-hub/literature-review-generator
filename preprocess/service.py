@@ -359,13 +359,6 @@ class PreprocessManager:
     ) -> Optional[PreprocessResult]:
         """Build or reuse one source cache while holding its per-key lock."""
 
-        active = self._active_generation(cache_dir)
-        if pin_id and active is not None:
-            self._pin_generation(
-                cache_dir,
-                Path(active[0]).name,
-                pin_id=pin_id,
-            )
         self._gc_generations(cache_dir)
         active = self._active_generation(cache_dir)
         if (not self.force_rebuild) and active is not None:
@@ -403,6 +396,15 @@ class PreprocessManager:
                     manifest_path=active_paths["manifest_path"],
                 )
                 if cached is not None:
+                    if pin_id:
+                        # Only pin after the complete freshness/hash check has
+                        # accepted this generation.  A stale active generation
+                        # must remain eligible for collection.
+                        self._pin_generation(
+                            cache_dir,
+                            Path(generation_dir).name,
+                            pin_id=pin_id,
+                        )
                     return cached
 
         staging_dir = tempfile.mkdtemp(prefix=".generation.tmp-", dir=cache_dir)
@@ -412,6 +414,13 @@ class PreprocessManager:
         published_artifact_paths = self._artifact_paths(generation_dir)
         extraction = self._extract_preferred_content(pdf_path)
         if not extraction:
+            # A normal extraction failure is still a staging failure.  Remove
+            # the temporary generation immediately; the TTL collector is only
+            # crash recovery and must not be the normal cleanup path.
+            try:
+                shutil.rmtree(staging_dir)
+            except OSError:
+                pass
             return None
 
         markdown_text = str(extraction.get("markdown_text", "") or "")
@@ -819,6 +828,31 @@ class PreprocessManager:
             },
         )
         return pin_path
+
+    def release_pin(self, cache_dir: str, *, pin_id: str, generation_id: str = "") -> int:
+        """Release a short-lived cache pin after job-owned snapshot publication."""
+
+        root = Path(cache_dir).expanduser().resolve()
+        if not root.is_dir() or root.is_symlink():
+            return 0
+        safe_pin = hashlib.sha256(str(pin_id).encode("utf-8")).hexdigest()
+        wanted_generation = str(generation_id or "").strip()
+        removed = 0
+        with interprocess_file_lock(root / ".preprocess-cache"):
+            pin_dir = root / "generation_pins"
+            if not pin_dir.is_dir() or pin_dir.is_symlink():
+                return 0
+            for pin_path in pin_dir.glob(f"{safe_pin}-*.json"):
+                if pin_path.is_symlink():
+                    continue
+                if wanted_generation and not pin_path.name.endswith(f"-{wanted_generation}.json"):
+                    continue
+                try:
+                    pin_path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
 
     @staticmethod
     def _pinned_generation_ids(root: Path) -> set[str]:

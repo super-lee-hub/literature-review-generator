@@ -28,6 +28,7 @@ from runtime.provider_runtime import (
     ProviderRuntime,
     ProviderRuntimeContractError,
     ProviderRuntimeLedger,
+    is_process_alive,
     process_identity_for_pid,
 )
 from services.durable_io import atomic_replace_with_retry
@@ -52,6 +53,11 @@ _BUDGET_FIELDS = frozenset(
 )
 _ACCEPTANCE_FIELDS = frozenset(
     {
+        "schema_version",
+        "parent_run_id",
+        "final_executable_sha",
+        "executable_sha",
+        "scenarios",
         "budget",
         "acceptance_budget",
         "evidence_manifest",
@@ -63,6 +69,121 @@ _ACCEPTANCE_FIELDS = frozenset(
         "gates",
     }
 )
+_PLAN_FIELDS = frozenset(
+    {
+        "schema_version",
+        "parent_run_id",
+        "final_executable_sha",
+        "executable_sha",
+        "budget",
+        "acceptance_budget",
+        "scenarios",
+        "third_party_acknowledged",
+        "third_party_acknowledgement",
+        "third_party_hosts",
+        "evidence_manifest",
+        "state_path",
+        "job_id",
+        "gates",
+    }
+)
+_CHILD_SCENARIO_FIELDS = frozenset(
+    {
+        "scenario_id",
+        "gate",
+        "runtime_spec",
+        "workspace",
+        "input_manifest",
+        "execution_mode",
+        "budget_domain",
+        "prerequisites",
+        "job_id",
+    }
+)
+_SCENARIO_RECEIPT_FIELDS = frozenset(
+    {
+        "artifact_type",
+        "artifact_version",
+        "schema_version",
+        "parent_acceptance_run_id",
+        "scenario_id",
+        "gate",
+        "final_executable_sha",
+        "plan_sha256",
+        "runtime_spec_sha256",
+        "input_identity_sha256",
+        "workspace_identity_sha256",
+        "executor_pid",
+        "executor_process_creation_identity",
+        "executor_host_id",
+        "started_at",
+        "completed_at",
+        "action_type",
+        "workspace",
+        "job_id",
+        "attempt_id",
+        "budget_domain",
+        "status",
+        "exit_status",
+        "produced_evidence_refs",
+    }
+)
+_PROCESS_RESUME_FIELDS = frozenset(
+    {
+        "artifact_type",
+        "artifact_version",
+        "schema_version",
+        "event_id",
+        "acceptance_run_id",
+        "scenario_id",
+        "job_id",
+        "interruption_event_id",
+        "interruption_event_sha256",
+        "previous_attempt_id",
+        "new_attempt_id",
+        "new_pid",
+        "new_process_creation_identity",
+        "resumed_at",
+    }
+)
+_VALIDATOR_CHALLENGE_INPUT_FIELDS = frozenset(
+    {
+        "artifact_type",
+        "artifact_version",
+        "schema_version",
+        "challenge_id",
+        "job_id",
+        "workspace",
+        "baseline_review_artifact_id",
+        "baseline_review_hash",
+        "block_id",
+        "mutation_type",
+        "mutated_text",
+        "expected_detection_class",
+    }
+)
+
+
+def _resolve_acceptance_path(
+    value: Any,
+    *,
+    field_name: str,
+    origin_dir: str | Path | None,
+    required: bool = False,
+) -> str:
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise ReleaseAcceptanceSpecError(f"{field_name} must be a JSON string")
+    value = value.strip()
+    if required and not value:
+        raise ReleaseAcceptanceSpecError(f"{field_name} is required")
+    if not value:
+        return ""
+    path = Path(value).expanduser()
+    if origin_dir is not None and not path.is_absolute():
+        path = Path(origin_dir).expanduser().resolve() / path
+    return str(path.resolve())
 
 
 def _reject_unknown(payload: Mapping[str, Any], allowed: frozenset[str], label: str) -> None:
@@ -146,6 +267,642 @@ class ReleaseAcceptanceBudget:
 
 
 @dataclass(frozen=True)
+class AcceptanceValidatorChallengeInputV1:
+    """Owner-supplied input for the real Gate H challenge executor."""
+
+    challenge_id: str
+    job_id: str
+    workspace: str
+    baseline_review_artifact_id: str
+    baseline_review_hash: str
+    block_id: str
+    mutation_type: str
+    mutated_text: str
+    expected_detection_class: str
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        origin_dir: str | Path | None = None,
+    ) -> "AcceptanceValidatorChallengeInputV1":
+        if not isinstance(payload, Mapping):
+            raise ReleaseAcceptanceSpecError(
+                "Validator challenge input must be a JSON object"
+            )
+        _reject_unknown(
+            payload,
+            _VALIDATOR_CHALLENGE_INPUT_FIELDS,
+            "Validator challenge input",
+        )
+        if (
+            payload.get("artifact_type") != "acceptance_validator_challenge_input"
+            or payload.get("artifact_version") != "v1"
+            or payload.get("schema_version")
+            != "acceptance-validator-challenge-input-v1"
+        ):
+            raise ReleaseAcceptanceSpecError(
+                "Validator challenge input schema is invalid"
+            )
+        text_fields = (
+            "challenge_id",
+            "job_id",
+            "baseline_review_artifact_id",
+            "block_id",
+            "mutation_type",
+            "mutated_text",
+            "expected_detection_class",
+        )
+        values = {name: str(payload.get(name) or "").strip() for name in text_fields}
+        if any(not value for value in values.values()):
+            raise ReleaseAcceptanceSpecError(
+                "Validator challenge input identity is incomplete"
+            )
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", values["challenge_id"]):
+            raise ReleaseAcceptanceSpecError(
+                "Validator challenge input challenge_id is unsafe"
+            )
+        if values["mutation_type"] != "replace_block_text":
+            raise ReleaseAcceptanceSpecError(
+                "Validator challenge input mutation_type is unsupported"
+            )
+        workspace = _resolve_acceptance_path(
+            payload.get("workspace", ""),
+            field_name="Validator challenge input workspace",
+            origin_dir=origin_dir,
+            required=True,
+        )
+        baseline_hash = str(payload.get("baseline_review_hash") or "").strip().lower()
+        if not _valid_sha256(baseline_hash):
+            raise ReleaseAcceptanceSpecError(
+                "Validator challenge input baseline_review_hash is invalid"
+            )
+        return cls(
+            **values,
+            workspace=workspace,
+            baseline_review_hash=baseline_hash,
+        )
+
+
+@dataclass(frozen=True)
+class AcceptanceChildScenarioSpecV2:
+    """One independently executable child of a parent acceptance plan."""
+
+    scenario_id: str
+    gate: str
+    runtime_spec: str = ""
+    workspace: str = ""
+    input_manifest: str = ""
+    execution_mode: str = "runtime"
+    budget_domain: str = "live"
+    prerequisites: tuple[str, ...] = ()
+    job_id: str = ""
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        origin_dir: str | Path | None = None,
+    ) -> "AcceptanceChildScenarioSpecV2":
+        if not isinstance(payload, Mapping):
+            raise ReleaseAcceptanceSpecError("acceptance child scenario must be a JSON object")
+        _reject_unknown(payload, _CHILD_SCENARIO_FIELDS, "acceptance child scenario")
+        scenario_id = str(payload.get("scenario_id") or "").strip()
+        gate = str(payload.get("gate") or "").strip().upper()
+        if not scenario_id:
+            raise ReleaseAcceptanceSpecError("acceptance child scenario_id is required")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", scenario_id):
+            raise ReleaseAcceptanceSpecError("acceptance child scenario_id contains unsafe characters")
+        if gate not in {"C", "D", "E", "F", "G", "H", "I", "J", "K", "Q"}:
+            raise ReleaseAcceptanceSpecError(f"unsupported acceptance child gate: {gate}")
+        if scenario_id != gate:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance child scenario_id must equal its gate for the current plan schema"
+            )
+        execution_mode = str(payload.get("execution_mode") or "runtime").strip()
+        budget_domain = str(payload.get("budget_domain") or "live").strip().lower()
+        if not execution_mode:
+            raise ReleaseAcceptanceSpecError("acceptance child execution_mode is required")
+        if execution_mode not in {
+            "runtime",
+            "ocr",
+            "crash_resume",
+            "validator_challenge",
+            "playwright",
+            "offline-k",
+        }:
+            raise ReleaseAcceptanceSpecError(
+                f"unsupported acceptance child execution_mode: {execution_mode}"
+            )
+        mode_gate = {
+            "ocr": "J",
+            "crash_resume": "E",
+            "validator_challenge": "H",
+            "playwright": "I",
+            "offline-k": "K",
+        }.get(execution_mode)
+        if mode_gate is not None and gate != mode_gate:
+            raise ReleaseAcceptanceSpecError(
+                f"acceptance child execution_mode {execution_mode} belongs to Gate {mode_gate}"
+            )
+        if budget_domain not in {"live", "offline-k"}:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance child budget_domain must be live or offline-k"
+            )
+        if gate == "K" and budget_domain != "offline-k":
+            raise ReleaseAcceptanceSpecError(
+                "Gate K acceptance child must use the offline-k budget domain"
+            )
+        raw_prerequisites = payload.get("prerequisites", [])
+        if not isinstance(raw_prerequisites, (list, tuple)) or any(
+            not isinstance(item, str) or not item.strip() for item in raw_prerequisites
+        ):
+            raise ReleaseAcceptanceSpecError(
+                "acceptance child prerequisites must be a non-empty-string array"
+            )
+        runtime_spec = _resolve_acceptance_path(
+            payload.get("runtime_spec", ""),
+            field_name="acceptance child runtime_spec",
+            origin_dir=origin_dir,
+            required=execution_mode in {"runtime", "ocr", "crash_resume", "validator_challenge"},
+        )
+        workspace = _resolve_acceptance_path(
+            payload.get("workspace", ""),
+            field_name="acceptance child workspace",
+            origin_dir=origin_dir,
+        )
+        if not workspace:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance child workspace is required for an independent child namespace"
+            )
+        if execution_mode == "crash_resume" and not workspace:
+            raise ReleaseAcceptanceSpecError(
+                "crash_resume acceptance child requires an explicit workspace"
+            )
+        if gate in {"J"} and execution_mode == "ocr" and not runtime_spec:
+            raise ReleaseAcceptanceSpecError(
+                "OCR acceptance child requires an independent RuntimeJobSpec"
+            )
+        if gate in {"H", "I"} and execution_mode in {
+            "validator_challenge",
+            "playwright",
+        } and not str(payload.get("input_manifest") or "").strip():
+            raise ReleaseAcceptanceSpecError(
+                f"{gate} acceptance child requires an explicit input_manifest"
+            )
+        return cls(
+            scenario_id=scenario_id,
+            gate=gate,
+            runtime_spec=runtime_spec,
+            workspace=workspace,
+            input_manifest=_resolve_acceptance_path(
+                payload.get("input_manifest", ""),
+                field_name="acceptance child input_manifest",
+                origin_dir=origin_dir,
+            ),
+            execution_mode=execution_mode,
+            budget_domain=budget_domain,
+            prerequisites=tuple(str(item).strip() for item in raw_prerequisites),
+            job_id=str(payload.get("job_id") or "").strip(),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scenario_id": self.scenario_id,
+            "gate": self.gate,
+            "runtime_spec": self.runtime_spec,
+            "workspace": self.workspace,
+            "input_manifest": self.input_manifest,
+            "execution_mode": self.execution_mode,
+            "budget_domain": self.budget_domain,
+            "prerequisites": list(self.prerequisites),
+            "job_id": self.job_id,
+        }
+
+
+@dataclass(frozen=True)
+class ReleaseAcceptancePlanV2:
+    """Parent acceptance plan containing independently executable children."""
+
+    parent_run_id: str
+    budget: ReleaseAcceptanceBudget
+    scenarios: Mapping[str, AcceptanceChildScenarioSpecV2]
+    final_executable_sha: str = ""
+    third_party_acknowledged: bool = False
+    third_party_hosts: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        origin_dir: str | Path | None = None,
+        defaults: ReleaseAcceptanceBudget | None = None,
+    ) -> "ReleaseAcceptancePlanV2":
+        if not isinstance(payload, Mapping):
+            raise ReleaseAcceptanceSpecError("release acceptance plan must be a JSON object")
+        if payload.get("schema_version") != "release-acceptance-plan-v2":
+            raise ReleaseAcceptanceSpecError("release acceptance plan schema is invalid")
+        _reject_unknown(payload, _PLAN_FIELDS, "release acceptance plan")
+        parent_run_id = str(payload.get("parent_run_id") or "").strip()
+        if not parent_run_id:
+            raise ReleaseAcceptanceSpecError("release acceptance plan parent_run_id is required")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", parent_run_id):
+            raise ReleaseAcceptanceSpecError("release acceptance plan parent_run_id contains unsafe characters")
+        budget_values: list[ReleaseAcceptanceBudget] = []
+        for budget_field in ("budget", "acceptance_budget"):
+            if budget_field not in payload:
+                continue
+            raw_budget = payload[budget_field]
+            if not isinstance(raw_budget, Mapping):
+                raise ReleaseAcceptanceSpecError(f"{budget_field} must be a JSON object")
+            budget_values.append(
+                ReleaseAcceptanceBudget.from_mapping(raw_budget, defaults=defaults)
+            )
+        if len(budget_values) == 2 and budget_values[0] != budget_values[1]:
+            raise ReleaseAcceptanceSpecError("acceptance plan budget aliases disagree")
+        budget = budget_values[0] if budget_values else ReleaseAcceptanceBudget.from_mapping({}, defaults=defaults)
+        raw_scenarios = payload.get("scenarios")
+        if not isinstance(raw_scenarios, Mapping) or not raw_scenarios:
+            raise ReleaseAcceptanceSpecError("release acceptance plan scenarios must be a non-empty object")
+        scenarios: dict[str, AcceptanceChildScenarioSpecV2] = {}
+        scenario_ids: set[str] = set()
+        for raw_gate, raw_child in raw_scenarios.items():
+            gate = str(raw_gate).strip().upper()
+            child = AcceptanceChildScenarioSpecV2.from_mapping(
+                raw_child,
+                origin_dir=origin_dir,
+            )
+            if child.gate != gate:
+                raise ReleaseAcceptanceSpecError(
+                    f"acceptance plan scenario key {gate} does not match child gate {child.gate}"
+                )
+            if child.scenario_id in scenario_ids:
+                raise ReleaseAcceptanceSpecError("acceptance plan child scenario IDs must be unique")
+            scenario_ids.add(child.scenario_id)
+            scenarios[gate] = child
+        cardinality_gates = [scenarios[gate] for gate in ("C", "D", "Q") if gate in scenarios]
+        runtime_specs = [item.runtime_spec.casefold() for item in cardinality_gates if item.runtime_spec]
+        workspaces = [item.workspace.casefold() for item in cardinality_gates if item.workspace]
+        if len(runtime_specs) != len(set(runtime_specs)):
+            raise ReleaseAcceptanceSpecError(
+                "C, D, and Q acceptance children require independent runtime specs"
+            )
+        if len(workspaces) != len(set(workspaces)):
+            raise ReleaseAcceptanceSpecError(
+                "C, D, and Q acceptance children require independent workspaces"
+            )
+        raw_ack = payload.get("third_party_acknowledged", payload.get("third_party_acknowledgement", False))
+        if isinstance(raw_ack, Mapping):
+            raw_ack = raw_ack.get("acknowledged", False)
+        if not isinstance(raw_ack, bool):
+            raise ReleaseAcceptanceSpecError("third_party_acknowledged must be a JSON boolean")
+        raw_hosts = payload.get("third_party_hosts", [])
+        if not isinstance(raw_hosts, (list, tuple)) or any(not isinstance(item, str) for item in raw_hosts):
+            raise ReleaseAcceptanceSpecError("third_party_hosts must be an array of strings")
+        raw_sha = payload.get("final_executable_sha", payload.get("executable_sha", "")) or ""
+        if not isinstance(raw_sha, str):
+            raise ReleaseAcceptanceSpecError("final_executable_sha must be a JSON string")
+        final_sha = raw_sha.strip().lower()
+        if final_sha and (len(final_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in final_sha)):
+            raise ReleaseAcceptanceSpecError("final_executable_sha must be a lowercase checkout SHA")
+        return cls(
+            parent_run_id=parent_run_id,
+            budget=budget,
+            scenarios=scenarios,
+            final_executable_sha=final_sha,
+            third_party_acknowledged=raw_ack,
+            third_party_hosts=tuple(item.strip() for item in raw_hosts if item.strip()),
+        )
+
+    @property
+    def gates(self) -> tuple[str, ...]:
+        return tuple(self.scenarios)
+
+    def child(self, gate: str) -> AcceptanceChildScenarioSpecV2:
+        try:
+            return self.scenarios[str(gate).strip().upper()]
+        except KeyError as exc:
+            raise ReleaseAcceptanceSpecError(
+                f"acceptance plan has no child scenario for gate {gate}"
+            ) from exc
+
+    def plan_sha256(self) -> str:
+        encoded = json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "release-acceptance-plan-v2",
+            "parent_run_id": self.parent_run_id,
+            "final_executable_sha": self.final_executable_sha,
+            "budget": self.budget.to_dict(),
+            "third_party_acknowledged": self.third_party_acknowledged,
+            "third_party_hosts": list(self.third_party_hosts),
+            "scenarios": {gate: child.to_dict() for gate, child in self.scenarios.items()},
+        }
+
+
+def _receipt_timestamp(value: Any, *, field_name: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ReleaseAcceptanceSpecError(f"scenario receipt {field_name} is required")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ReleaseAcceptanceSpecError(f"scenario receipt {field_name} is invalid") from exc
+    if parsed.tzinfo is None:
+        raise ReleaseAcceptanceSpecError(f"scenario receipt {field_name} must include timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass(frozen=True)
+class ScenarioExecutionReceiptV1:
+    """Executor-owned proof that one acceptance child actually ran."""
+
+    parent_acceptance_run_id: str
+    scenario_id: str
+    gate: str
+    final_executable_sha: str
+    plan_sha256: str
+    runtime_spec_sha256: str
+    input_identity_sha256: str
+    workspace_identity_sha256: str
+    executor_pid: int
+    executor_process_creation_identity: str
+    executor_host_id: str
+    started_at: str
+    completed_at: str
+    action_type: str
+    workspace: str
+    job_id: str
+    attempt_id: str
+    budget_domain: str
+    status: str
+    exit_status: int
+    produced_evidence_refs: tuple[Mapping[str, Any], ...] = ()
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "ScenarioExecutionReceiptV1":
+        if not isinstance(payload, Mapping):
+            raise ReleaseAcceptanceSpecError("scenario execution receipt must be a JSON object")
+        _reject_unknown(payload, _SCENARIO_RECEIPT_FIELDS, "scenario execution receipt")
+        if payload.get("artifact_type") != "scenario_execution_receipt":
+            raise ReleaseAcceptanceSpecError("scenario execution receipt artifact type is invalid")
+        if payload.get("artifact_version") != "v1" or payload.get("schema_version") != "scenario-execution-receipt-v1":
+            raise ReleaseAcceptanceSpecError("scenario execution receipt schema is invalid")
+        text_values = (
+            "parent_acceptance_run_id",
+            "scenario_id",
+            "gate",
+            "final_executable_sha",
+            "plan_sha256",
+            "runtime_spec_sha256",
+            "input_identity_sha256",
+            "workspace_identity_sha256",
+            "executor_process_creation_identity",
+            "executor_host_id",
+            "action_type",
+            "workspace",
+            "job_id",
+            "attempt_id",
+            "budget_domain",
+            "status",
+        )
+        values = {name: str(payload.get(name) or "").strip() for name in text_values}
+        if any(not values[name] for name in text_values):
+            missing = [name for name in text_values if not values[name]]
+            raise ReleaseAcceptanceSpecError(
+                "scenario execution receipt is missing: " + ", ".join(missing)
+            )
+        if values["gate"] not in {"C", "D", "E", "F", "G", "H", "I", "J", "K", "Q"}:
+            raise ReleaseAcceptanceSpecError("scenario execution receipt gate is invalid")
+        if values["scenario_id"] != values["gate"]:
+            raise ReleaseAcceptanceSpecError("scenario execution receipt scenario does not match gate")
+        if len(values["final_executable_sha"]) not in {40, 64} or any(
+            char not in "0123456789abcdef" for char in values["final_executable_sha"].lower()
+        ) or values["final_executable_sha"] != values["final_executable_sha"].lower():
+            raise ReleaseAcceptanceSpecError("scenario execution receipt final SHA is invalid")
+        for name in (
+            "plan_sha256",
+            "runtime_spec_sha256",
+            "input_identity_sha256",
+            "workspace_identity_sha256",
+        ):
+            if not _valid_sha256(values[name]):
+                raise ReleaseAcceptanceSpecError(f"scenario execution receipt {name} is invalid")
+        raw_pid = payload.get("executor_pid")
+        if isinstance(raw_pid, bool) or not isinstance(raw_pid, int) or raw_pid <= 0:
+            raise ReleaseAcceptanceSpecError("scenario execution receipt executor_pid is invalid")
+        raw_exit = payload.get("exit_status")
+        if isinstance(raw_exit, bool) or not isinstance(raw_exit, int):
+            raise ReleaseAcceptanceSpecError("scenario execution receipt exit_status is invalid")
+        budget_domain = values.pop("budget_domain").lower()
+        if budget_domain not in {"live", "offline-k"}:
+            raise ReleaseAcceptanceSpecError("scenario execution receipt budget domain is invalid")
+        status = values.pop("status").upper()
+        if status not in {"PASSED", "BLOCKED", "FAILED", "CANCELLED", "NOT_VERIFIED"}:
+            raise ReleaseAcceptanceSpecError("scenario execution receipt status is invalid")
+        started = _receipt_timestamp(payload.get("started_at"), field_name="started_at")
+        completed = _receipt_timestamp(payload.get("completed_at"), field_name="completed_at")
+        if completed < started:
+            raise ReleaseAcceptanceSpecError("scenario execution receipt completed_at precedes started_at")
+        if status == "PASSED" and raw_exit != 0:
+            raise ReleaseAcceptanceSpecError("passed scenario execution receipt must have exit_status 0")
+        raw_refs = payload.get("produced_evidence_refs")
+        if not isinstance(raw_refs, (list, tuple)):
+            raise ReleaseAcceptanceSpecError("scenario execution receipt produced_evidence_refs must be an array")
+        normalized_refs: list[Mapping[str, Any]] = []
+        for raw_ref in raw_refs:
+            try:
+                normalized_refs.append(DurableEvidenceRefV1.from_mapping(raw_ref).to_dict())
+            except (ReleaseAcceptanceSpecError, TypeError, ValueError) as exc:
+                raise ReleaseAcceptanceSpecError(
+                    "scenario execution receipt contains an invalid durable evidence ref"
+                ) from exc
+        return cls(
+            **values,
+            started_at=str(payload["started_at"]).strip(),
+            completed_at=str(payload["completed_at"]).strip(),
+            executor_pid=raw_pid,
+            exit_status=raw_exit,
+            budget_domain=budget_domain,
+            status=status,
+            produced_evidence_refs=tuple(normalized_refs),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_type": "scenario_execution_receipt",
+            "artifact_version": "v1",
+            "schema_version": "scenario-execution-receipt-v1",
+            "parent_acceptance_run_id": self.parent_acceptance_run_id,
+            "scenario_id": self.scenario_id,
+            "gate": self.gate,
+            "final_executable_sha": self.final_executable_sha,
+            "plan_sha256": self.plan_sha256,
+            "runtime_spec_sha256": self.runtime_spec_sha256,
+            "input_identity_sha256": self.input_identity_sha256,
+            "workspace_identity_sha256": self.workspace_identity_sha256,
+            "executor_pid": self.executor_pid,
+            "executor_process_creation_identity": self.executor_process_creation_identity,
+            "executor_host_id": self.executor_host_id,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "action_type": self.action_type,
+            "workspace": self.workspace,
+            "job_id": self.job_id,
+            "attempt_id": self.attempt_id,
+            "budget_domain": self.budget_domain,
+            "status": self.status,
+            "exit_status": self.exit_status,
+            "produced_evidence_refs": [dict(item) for item in self.produced_evidence_refs],
+        }
+
+
+@dataclass(frozen=True)
+class ParentAcceptanceResultV2:
+    """Machine-derived parent projection; caller live flags are ignored."""
+
+    parent_acceptance_run_id: str
+    final_executable_sha: str
+    status: str
+    terminal_status: str
+    live_pass: bool
+    ready_to_merge: bool
+    reason: str
+    child_results: Mapping[str, Mapping[str, Any]]
+
+    @classmethod
+    def from_child_results(
+        cls,
+        *,
+        parent_acceptance_run_id: str,
+        final_executable_sha: str,
+        child_results: Mapping[str, Mapping[str, Any]],
+        required_scenarios: Iterable[str],
+    ) -> "ParentAcceptanceResultV2":
+        required = tuple(str(item).strip().upper() for item in required_scenarios)
+        normalized: dict[str, Mapping[str, Any]] = {}
+        issues: list[str] = []
+        statuses: list[str] = []
+        live_authority = True
+        required_live_scenarios = False
+        for scenario_id in required:
+            raw = child_results.get(scenario_id)
+            if not isinstance(raw, Mapping):
+                issues.append(f"missing child {scenario_id}")
+                continue
+            raw_receipt = raw.get("receipt")
+            try:
+                receipt = ScenarioExecutionReceiptV1.from_mapping(raw_receipt)
+            except (ReleaseAcceptanceSpecError, TypeError, ValueError) as exc:
+                issues.append(f"invalid child receipt {scenario_id}: {exc}")
+                continue
+            if (
+                receipt.parent_acceptance_run_id != parent_acceptance_run_id
+                or receipt.final_executable_sha != final_executable_sha
+                or receipt.scenario_id != scenario_id
+            ):
+                issues.append(f"child binding mismatch {scenario_id}")
+            status = str(raw.get("status") or "").strip().upper()
+            statuses.append(status)
+            normalized[scenario_id] = {
+                **dict(raw),
+                "receipt": receipt.to_dict(),
+                "live_pass": False,
+                "ready_to_merge": False,
+            }
+            contract = GATE_CONTRACTS.get(scenario_id, {})
+            if bool(contract.get("required_live")):
+                required_live_scenarios = True
+                live_authority = live_authority and _receipt_has_live_authority(receipt)
+        if issues:
+            status = "NOT_VERIFIED"
+            reason = "; ".join(issues)
+        elif any(item in {"BLOCKED", "NOT_RUN", "NOT_VERIFIED", "FAILED", "CANCELLED"} for item in statuses):
+            status = "BLOCKED" if any(item == "BLOCKED" for item in statuses) else "NOT_VERIFIED"
+            reason = "one or more required child scenarios did not pass"
+        elif statuses and all(item in {"PASS_OFFLINE", "PASS_OFFLINE_HOSTED"} for item in statuses):
+            status = "PASS_OFFLINE"
+            reason = "all children are offline evidence; live acceptance remains unproven"
+        elif (
+            statuses
+            and all(item == "PASS" for item in statuses)
+            and required_live_scenarios
+            and live_authority
+        ):
+            status = "READY_TO_MERGE"
+            reason = "all required children have independently verified live authority receipts"
+        elif statuses and all(item == "PASS" for item in statuses):
+            if required_live_scenarios:
+                status = "NOT_VERIFIED"
+                reason = "live-required children passed without live provider authority"
+            else:
+                status = "PASS_OFFLINE"
+                reason = "children passed, but no required live provider authority was requested"
+        else:
+            status = "NOT_VERIFIED"
+            reason = "child statuses or live authority receipts are incomplete"
+        live_pass = status == "READY_TO_MERGE"
+        ready_to_merge = live_pass
+        return cls(
+            parent_acceptance_run_id=parent_acceptance_run_id,
+            final_executable_sha=final_executable_sha,
+            status=status,
+            terminal_status=status,
+            live_pass=live_pass,
+            ready_to_merge=ready_to_merge,
+            reason=reason,
+            child_results=normalized,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "parent-acceptance-result-v2",
+            "parent_acceptance_run_id": self.parent_acceptance_run_id,
+            "final_executable_sha": self.final_executable_sha,
+            "status": self.status,
+            "terminal_status": self.terminal_status,
+            "live_pass": self.live_pass,
+            "ready_to_merge": self.ready_to_merge,
+            "reason": self.reason,
+            "child_results": {key: dict(value) for key, value in self.child_results.items()},
+        }
+
+
+def _receipt_has_live_authority(receipt: ScenarioExecutionReceiptV1) -> bool:
+    if receipt.budget_domain != "live":
+        return False
+    for raw_ref in receipt.produced_evidence_refs:
+        try:
+            ref = DurableEvidenceRefV1.from_mapping(raw_ref)
+        except (ReleaseAcceptanceSpecError, TypeError, ValueError):
+            continue
+        if ref.role != "provider_receipt_ledger" or ref.artifact_type != "provider_receipt_ledger":
+            continue
+        try:
+            ledger = ProviderRuntimeLedger(Path(ref.path))
+            receipts = ledger.list_acceptance_receipts(expected_job_id=receipt.job_id)
+        except (OSError, ValueError, ProviderRuntimeContractError):
+            continue
+        if not receipts or any(item.test_only for item in receipts):
+            continue
+        if any(
+            item.status == "success"
+            or (
+                isinstance(item.metadata, Mapping)
+                and bool(item.metadata.get("transport_config"))
+            )
+            for item in receipts
+        ):
+            return True
+    return False
+
+
+@dataclass(frozen=True)
 class ReleaseAcceptanceSpec:
     budget: ReleaseAcceptanceBudget = field(default_factory=ReleaseAcceptanceBudget)
     evidence_manifest: str = ""
@@ -155,6 +912,7 @@ class ReleaseAcceptanceSpec:
     third_party_acknowledged: bool = False
     third_party_hosts: tuple[str, ...] = ()
     gates: tuple[str, ...] = ()
+    plan: ReleaseAcceptancePlanV2 | None = None
 
     @classmethod
     def from_mapping(
@@ -167,25 +925,34 @@ class ReleaseAcceptanceSpec:
         if not isinstance(payload, Mapping):
             raise ReleaseAcceptanceSpecError("release acceptance spec must be a JSON object")
         _reject_unknown(payload, _ACCEPTANCE_FIELDS, "release acceptance spec")
-        budget_values: list[ReleaseAcceptanceBudget] = []
-        for budget_field in ("budget", "acceptance_budget"):
-            if budget_field not in payload:
-                continue
-            raw_budget = payload[budget_field]
-            if not isinstance(raw_budget, Mapping):
-                raise ReleaseAcceptanceSpecError(
-                    f"{budget_field} must be a JSON object"
+        plan: ReleaseAcceptancePlanV2 | None = None
+        if payload.get("schema_version") == "release-acceptance-plan-v2":
+            plan = ReleaseAcceptancePlanV2.from_mapping(
+                payload,
+                origin_dir=origin_dir,
+                defaults=defaults,
+            )
+            budget = plan.budget
+        else:
+            budget_values: list[ReleaseAcceptanceBudget] = []
+            for budget_field in ("budget", "acceptance_budget"):
+                if budget_field not in payload:
+                    continue
+                raw_budget = payload[budget_field]
+                if not isinstance(raw_budget, Mapping):
+                    raise ReleaseAcceptanceSpecError(
+                        f"{budget_field} must be a JSON object"
+                    )
+                budget_values.append(
+                    ReleaseAcceptanceBudget.from_mapping(raw_budget, defaults=defaults)
                 )
-            budget_values.append(
-                ReleaseAcceptanceBudget.from_mapping(raw_budget, defaults=defaults)
+            if len(budget_values) == 2 and budget_values[0] != budget_values[1]:
+                raise ReleaseAcceptanceSpecError(
+                    "acceptance budget aliases disagree"
+                )
+            budget = budget_values[0] if budget_values else ReleaseAcceptanceBudget.from_mapping(
+                {}, defaults=defaults
             )
-        if len(budget_values) == 2 and budget_values[0] != budget_values[1]:
-            raise ReleaseAcceptanceSpecError(
-                "acceptance budget aliases disagree"
-            )
-        budget = budget_values[0] if budget_values else ReleaseAcceptanceBudget.from_mapping(
-            {}, defaults=defaults
-        )
         evidence = payload.get("evidence_manifest", "")
         if evidence is None:
             evidence = ""
@@ -215,19 +982,34 @@ class ReleaseAcceptanceSpec:
             job_id = ""
         if not isinstance(job_id, str):
             raise ReleaseAcceptanceSpecError("job_id must be a JSON string")
-        acknowledged = payload.get("third_party_acknowledged", False)
+        acknowledged = payload.get(
+            "third_party_acknowledged",
+            plan.third_party_acknowledged if plan is not None else False,
+        )
         if not isinstance(acknowledged, bool):
             raise ReleaseAcceptanceSpecError("third_party_acknowledged must be a JSON boolean")
-        raw_hosts = payload.get("third_party_hosts", [])
+        raw_hosts = payload.get(
+            "third_party_hosts",
+            list(plan.third_party_hosts) if plan is not None else [],
+        )
         if not isinstance(raw_hosts, (list, tuple)) or any(
             not isinstance(item, str) for item in raw_hosts
         ):
             raise ReleaseAcceptanceSpecError("third_party_hosts must be an array of strings")
-        raw_gates = payload.get("gates", [])
+        raw_gates = payload.get("gates", list(plan.gates) if plan is not None else [])
         if not isinstance(raw_gates, (list, tuple)) or any(
             not isinstance(item, str) for item in raw_gates
         ):
             raise ReleaseAcceptanceSpecError("gates must be an array of strings")
+        gates = tuple(item.strip() for item in raw_gates if item.strip())
+        if plan is not None and gates != plan.gates:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance plan gates must match its child scenario keys"
+            )
+        if plan is None and len(gates) > 1:
+            raise ReleaseAcceptanceSpecError(
+                "multi-gate acceptance requires independent child scenarios"
+            )
         return cls(
             budget=budget,
             evidence_manifest=str(evidence_path) if evidence_path is not None else "",
@@ -236,7 +1018,8 @@ class ReleaseAcceptanceSpec:
             job_id=job_id.strip(),
             third_party_acknowledged=acknowledged,
             third_party_hosts=tuple(item.strip() for item in raw_hosts if item.strip()),
-            gates=tuple(item.strip() for item in raw_gates if item.strip()),
+            gates=gates,
+            plan=plan,
         )
 
 
@@ -259,6 +1042,9 @@ class AcceptanceRunStateV1:
     evidence_revision: int = 0
     evidence_manifest_hash: str = ""
     scenario_id: str = ""
+    plan_sha256: str = ""
+    child_states: Mapping[str, Any] = field(default_factory=dict)
+    parent_result: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -278,6 +1064,9 @@ class AcceptanceRunStateV1:
             "evidence_revision": self.evidence_revision,
             "evidence_manifest_hash": self.evidence_manifest_hash,
             "scenario_id": self.scenario_id,
+            "plan_sha256": self.plan_sha256,
+            "child_states": dict(self.child_states),
+            "parent_result": dict(self.parent_result),
         }
 
     @classmethod
@@ -309,6 +1098,13 @@ class AcceptanceRunStateV1:
             evidence_revision=int(payload.get("evidence_revision") or 0),
             evidence_manifest_hash=str(payload.get("evidence_manifest_hash") or ""),
             scenario_id=str(payload.get("scenario_id") or ""),
+            plan_sha256=str(payload.get("plan_sha256") or ""),
+            child_states=dict(payload.get("child_states") or {})
+            if isinstance(payload.get("child_states"), Mapping)
+            else {},
+            parent_result=dict(payload.get("parent_result") or {})
+            if isinstance(payload.get("parent_result"), Mapping)
+            else {},
         )
 
 
@@ -326,6 +1122,12 @@ class AcceptanceScenarioContextV1:
     owner_authorized: bool
     provider_budget: Mapping[str, Any] = field(default_factory=dict)
     provider_budget_state_path: str = ""
+    plan_sha256: str = ""
+    runtime_spec_sha256: str = ""
+    scenario_execution_receipt_path: str = ""
+    input_identity_sha256: str = ""
+    budget_domain: str = "live"
+    input_manifest_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -552,11 +1354,14 @@ class AcceptanceScenario:
         refs: Iterable[Mapping[str, Any]],
         *,
         runtime_result: Mapping[str, Any] | None,
+        require_executor_receipt: bool = True,
     ) -> AcceptanceScenarioResultV1:
         durable_refs, durable_error = self._durable_refs(refs)
         if durable_error:
             return self._blocked_execution(durable_error)
         allowed = gate_evidence_roles(self.gate)
+        if not require_executor_receipt:
+            allowed = allowed - {"scenario_execution_receipt"}
         selected = tuple(
             ref for ref in durable_refs if str(ref.get("role") or "") in allowed
         )
@@ -612,6 +1417,7 @@ class GateGScenario(AcceptanceScenario):
         refs: Iterable[Mapping[str, Any]],
         *,
         runtime_result: Mapping[str, Any] | None,
+        require_executor_receipt: bool = True,
     ) -> AcceptanceScenarioResultV1:
         source_refs = list(refs)
         if not any(str(ref.get("role") or "") == "free_mode_profile" for ref in source_refs):
@@ -654,7 +1460,12 @@ class GateGScenario(AcceptanceScenario):
                             job_id=context.job_id,
                         )
                     )
-        return super().collect(context, source_refs, runtime_result=runtime_result)
+        return super().collect(
+            context,
+            source_refs,
+            runtime_result=runtime_result,
+            require_executor_receipt=require_executor_receipt,
+        )
 
     @staticmethod
     def _profile_path(context: AcceptanceScenarioContextV1) -> Path | None:
@@ -686,6 +1497,139 @@ class GateHScenario(AcceptanceScenario):
 class GateIScenario(AcceptanceScenario):
     gate = "I"
     scenario_action = "execute the documented Playwright flow against localhost"
+
+    def execute(
+        self,
+        context: AcceptanceScenarioContextV1,
+        refs: Iterable[Mapping[str, Any]],
+        *,
+        runtime_result: Mapping[str, Any] | None,
+    ) -> AcceptanceScenarioResultV1:
+        incoming_refs = tuple(refs)
+        if {
+            str(item.get("role") or "")
+            for item in incoming_refs
+            if isinstance(item, Mapping)
+        }.issuperset({"playwright_trace", "browser_evidence", "scenario_execution_receipt"}):
+            return super().execute(
+                context,
+                incoming_refs,
+                runtime_result=runtime_result,
+            )
+        if not context.input_manifest_path:
+            return self._blocked_execution(
+                "Gate I requires an explicit acceptance GUI input manifest"
+            )
+        if not context.owner_authorized and os.getenv("AUTO_GENERATE_RUN_PLAYWRIGHT") != "1":
+            return self._blocked_execution(
+                "Gate I requires explicit Playwright owner authorization"
+            )
+        try:
+            input_path = Path(context.input_manifest_path).expanduser().resolve()
+            raw = input_path.read_bytes()
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError("Gate I input manifest is not an object")
+            resolved_payload = dict(payload)
+            for field_name in ("config_path", "workspace", "repo_root"):
+                raw_value = str(resolved_payload.get(field_name) or "").strip()
+                if raw_value and not Path(raw_value).expanduser().is_absolute():
+                    resolved_payload[field_name] = str(
+                        (input_path.parent / raw_value).resolve()
+                    )
+            from runtime.playwright_evidence import (
+                PlaywrightEvidenceCollector,
+                PlaywrightEvidenceError,
+                PlaywrightScenarioInputV1,
+            )
+
+            scenario_input = PlaywrightScenarioInputV1.from_mapping(resolved_payload)
+            if context.job_id and context.job_id != scenario_input.resulting_job_id:
+                raise PlaywrightEvidenceError(
+                    "Gate I resulting job ID does not match the child context"
+                )
+            collector = PlaywrightEvidenceCollector(
+                scenario_input,
+                acceptance_run_id=context.acceptance_run_id,
+                scenario_id="I",
+                final_executable_sha=context.final_executable_sha,
+            )
+            result = collector.run()
+            producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
+            browser_ref = producer.reference(
+                result.browser_evidence_path,
+                role="browser_evidence",
+                artifact_type="playwright_run_evidence",
+                artifact_version="v1",
+                schema_version="playwright-run-evidence-v1",
+                job_id=context.job_id or scenario_input.resulting_job_id,
+            )
+            trace_ref = producer.reference(
+                result.trace_path,
+                role="playwright_trace",
+                artifact_type="playwright_trace",
+                artifact_version="v1",
+                schema_version="playwright-trace-v1",
+                job_id=context.job_id or scenario_input.resulting_job_id,
+            )
+            job_id = scenario_input.resulting_job_id
+            receipt_path = Path(
+                context.scenario_execution_receipt_path
+                or Path(context.evidence_root) / "I" / "scenario_execution_receipt.json"
+            ).expanduser().resolve()
+            executor_identity = process_identity_for_pid(os.getpid())
+            workspace_identity = hashlib.sha256(
+                json.dumps(
+                    {"workspace": scenario_input.workspace, "job_id": job_id},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            receipt = ScenarioExecutionReceiptV1(
+                parent_acceptance_run_id=context.acceptance_run_id,
+                scenario_id="I",
+                gate="I",
+                final_executable_sha=context.final_executable_sha,
+                plan_sha256=context.plan_sha256 or hashlib.sha256(b"gate-i-v1").hexdigest(),
+                runtime_spec_sha256=context.runtime_spec_sha256 or hashlib.sha256(b"").hexdigest(),
+                input_identity_sha256=context.input_identity_sha256 or hashlib.sha256(raw).hexdigest(),
+                workspace_identity_sha256=workspace_identity,
+                executor_pid=executor_identity.pid,
+                executor_process_creation_identity=str(executor_identity.creation_time or "unknown"),
+                executor_host_id=executor_identity.host_id,
+                started_at=_scenario_now(),
+                completed_at=_scenario_now(),
+                action_type="playwright-gui-flow",
+                workspace=scenario_input.workspace,
+                job_id=job_id,
+                attempt_id=f"{context.acceptance_run_id}:I:{executor_identity.pid}",
+                budget_domain=context.budget_domain,
+                status="PASSED",
+                exit_status=0,
+                produced_evidence_refs=(browser_ref, trace_ref),
+            )
+            from services.job_workspace import atomic_write_json
+
+            atomic_write_json(str(receipt_path), receipt.to_dict())
+            receipt_ref = producer.reference(
+                receipt_path,
+                role="scenario_execution_receipt",
+                artifact_type="scenario_execution_receipt",
+                artifact_version="v1",
+                schema_version="scenario-execution-receipt-v1",
+                job_id=job_id,
+            )
+            return AcceptanceScenarioResultV1(
+                gate="I",
+                scenario_id="I",
+                status="READY_FOR_SEMANTIC_VERIFICATION",
+                reason="real localhost GUI and Playwright collector produced typed evidence",
+                evidence_refs=(browser_ref, trace_ref, receipt_ref),
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RuntimeError) as exc:
+            return self._blocked_execution(
+                f"Gate I Playwright execution failed closed: {type(exc).__name__}: {exc}"
+            )
 
 
 class GateJScenario(AcceptanceScenario):
@@ -738,8 +1682,16 @@ class GateKScenario(AcceptanceScenario):
         root.mkdir(parents=True, exist_ok=True)
         existing_process_events = Path(context.process_event_log).expanduser().resolve()
         existing_result = root / "contention_result.json"
+        offline_budget_state_path = root / "offline_contention_budget_state.json"
+        receipt_path = root / "scenario_execution_receipt.json"
+        scenario_job_id = context.job_id or f"{context.acceptance_run_id}:K"
         if existing_process_events.exists() or existing_result.exists():
-            if not existing_process_events.is_file() or not existing_result.is_file():
+            if (
+                not existing_process_events.is_file()
+                or not existing_result.is_file()
+                or not offline_budget_state_path.is_file()
+                or not receipt_path.is_file()
+            ):
                 raise RuntimeError("contention scenario left partial durable evidence")
             producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
             return (
@@ -749,7 +1701,7 @@ class GateKScenario(AcceptanceScenario):
                     artifact_type="acceptance_process_event",
                     artifact_version="v1",
                     schema_version="process-event-v1",
-                    job_id=context.job_id,
+                    job_id=scenario_job_id,
                 ),
                 producer.reference(
                     existing_result,
@@ -757,9 +1709,24 @@ class GateKScenario(AcceptanceScenario):
                     artifact_type="contention_result",
                     artifact_version="v1",
                     schema_version="contention-result-v1",
-                    job_id=context.job_id,
+                    job_id=scenario_job_id,
+                ),
+                producer.reference(
+                    receipt_path,
+                    role="scenario_execution_receipt",
+                    artifact_type="scenario_execution_receipt",
+                    artifact_version="v1",
+                    schema_version="scenario-execution-receipt-v1",
+                    job_id=scenario_job_id,
                 ),
             )
+        scenario_started_at = _scenario_now()
+        parent_budget_path = Path(context.provider_budget_state_path).expanduser().resolve()
+        parent_budget_before = (
+            hashlib.sha256(parent_budget_path.read_bytes()).hexdigest()
+            if parent_budget_path.is_file()
+            else ""
+        )
         counter_path = root / "contention_counter.json"
         lock_target = root / "contention_counter"
         ledger_path = root / "provider_receipts.jsonl"
@@ -781,23 +1748,17 @@ class GateKScenario(AcceptanceScenario):
             )
         budget = ProviderAggregateBudgetV1.from_mapping(context.provider_budget)
         controller = ProviderBudgetController(budget)
-        controller.bind_state_path(context.provider_budget_state_path)
-        environment_keys = (
-            "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON",
-            "AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH",
-            "AUTO_GENERATE_ACCEPTANCE_RUN_ID",
-        )
-        previous_environment = {key: os.environ.get(key) for key in environment_keys}
-        os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON"] = json.dumps(
+        controller.bind_state_path(offline_budget_state_path)
+        worker_environment = os.environ.copy()
+        worker_environment["AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON"] = json.dumps(
             budget.to_dict(), sort_keys=True, separators=(",", ":")
         )
-        os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH"] = str(
-            context.provider_budget_state_path
-        )
-        os.environ["AUTO_GENERATE_ACCEPTANCE_RUN_ID"] = context.acceptance_run_id
+        worker_environment["AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH"] = str(offline_budget_state_path)
+        worker_environment["AUTO_GENERATE_ACCEPTANCE_RUN_ID"] = context.acceptance_run_id
         processes: list[subprocess.Popen[Any]] = []
         event_paths: list[Path] = []
         exit_codes: list[int] = []
+        liveness_checks: list[dict[str, Any]] = []
         try:
             worker_code = (
                 "import json, sys; "
@@ -824,9 +1785,24 @@ class GateKScenario(AcceptanceScenario):
                     subprocess.Popen(
                         [sys.executable, "-c", worker_code, json.dumps(worker_payload)],
                         cwd=str(Path(__file__).resolve().parents[1]),
+                        env=worker_environment,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
+                )
+                worker_identity = process_identity_for_pid(processes[-1].pid)
+                if worker_identity.creation_time is None or not is_process_alive(worker_identity):
+                    raise RuntimeError(
+                        f"contention worker {index} failed the production liveness probe"
+                    )
+                liveness_checks.append(
+                    {
+                        "target_pid": worker_identity.pid,
+                        "target_process_creation_identity": str(
+                            worker_identity.creation_time
+                        ),
+                        "alive": True,
+                    }
                 )
             exit_codes = [process.wait(timeout=30) for process in processes]
         finally:
@@ -834,11 +1810,6 @@ class GateKScenario(AcceptanceScenario):
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=10)
-            for key, value in previous_environment.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
         if exit_codes != [0, 0] or not all(path.is_file() for path in event_paths):
             raise RuntimeError(f"contention workers did not exit cleanly: {exit_codes}")
         event_rows: list[Mapping[str, Any]] = []
@@ -851,10 +1822,23 @@ class GateKScenario(AcceptanceScenario):
         event_rows.sort(key=lambda row: str(row.get("occurred_at") or ""))
         process_event_path = Path(context.process_event_log).expanduser().resolve()
         process_event_path.parent.mkdir(parents=True, exist_ok=True)
-        process_event_path.write_text(
-            "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in event_rows),
-            encoding="utf-8",
+        event_payload = "".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+            for row in event_rows
         )
+        event_temp = process_event_path.with_name(
+            f".{process_event_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            event_temp.write_text(event_payload, encoding="utf-8", newline="\n")
+            with event_temp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            atomic_replace_with_retry(event_temp, process_event_path, timeout_seconds=5.0)
+        finally:
+            try:
+                event_temp.unlink(missing_ok=True)
+            except OSError:
+                pass
         counter = json.loads(counter_path.read_text(encoding="utf-8"))
         if not isinstance(counter, Mapping):
             raise RuntimeError("contention counter is invalid")
@@ -875,8 +1859,15 @@ class GateKScenario(AcceptanceScenario):
         if not isinstance(queue_snapshot, Mapping):
             raise RuntimeError("contention queue snapshot is invalid")
         budget_snapshot = controller.snapshot()
+        parent_budget_after = (
+            hashlib.sha256(parent_budget_path.read_bytes()).hexdigest()
+            if parent_budget_path.is_file()
+            else ""
+        )
+        if parent_budget_before != parent_budget_after:
+            raise RuntimeError("offline contention mutated the parent live budget state")
         final_refs = []
-        for path in (counter_path, ledger_path, registry_path, queue_path, context.provider_budget_state_path):
+        for path in (counter_path, ledger_path, registry_path, queue_path, offline_budget_state_path):
             if not Path(path).is_file():
                 continue
             raw = Path(path).read_bytes()
@@ -913,6 +1904,14 @@ class GateKScenario(AcceptanceScenario):
                     "max_provider_calls_total": budget.max_provider_calls_total,
                     "calls_used": budget_snapshot.get("calls_used", 0),
                     "calls_reserved": budget_snapshot.get("calls_reserved", 0),
+                    "domain": "offline-k",
+                    "state_path": str(offline_budget_state_path),
+                },
+                "live_parent_budget": {
+                    "state_path": str(parent_budget_path),
+                    "sha256_before": parent_budget_before,
+                    "sha256_after": parent_budget_after,
+                    "unchanged": parent_budget_before == parent_budget_after,
                 },
                 "provider_ledger": {
                     "duplicate_receipt_ids": [],
@@ -930,25 +1929,73 @@ class GateKScenario(AcceptanceScenario):
                     "worker_job_ids": worker_job_ids,
                     "runtime_count": len(queue_snapshot.get("runtimes", [])),
                 },
+                "liveness_probes": liveness_checks,
             },
         )
         producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
+        process_ref = producer.reference(
+            process_event_path,
+            role="process_events",
+            artifact_type="acceptance_process_event",
+            artifact_version="v1",
+            schema_version="process-event-v1",
+            job_id=scenario_job_id,
+        )
+        lock_ref = producer.reference(
+            lock_state_path,
+            role="lock_state",
+            artifact_type="contention_result",
+            artifact_version="v1",
+            schema_version="contention-result-v1",
+            job_id=scenario_job_id,
+        )
+        executor_identity = process_identity_for_pid(os.getpid())
+        input_identity = hashlib.sha256(
+            json.dumps(
+                {"acceptance_run_id": context.acceptance_run_id, "worker_job_ids": worker_job_ids},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        workspace_identity = hashlib.sha256(
+            json.dumps(final_refs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        atomic_write_json(
+            str(receipt_path),
+            ScenarioExecutionReceiptV1(
+                parent_acceptance_run_id=context.acceptance_run_id,
+                scenario_id="K",
+                gate="K",
+                final_executable_sha=context.final_executable_sha,
+                plan_sha256=context.plan_sha256 or hashlib.sha256(b"gate-k-offline-v1").hexdigest(),
+                runtime_spec_sha256=context.runtime_spec_sha256 or hashlib.sha256(b"").hexdigest(),
+                input_identity_sha256=context.input_identity_sha256 or input_identity,
+                workspace_identity_sha256=workspace_identity,
+                executor_pid=executor_identity.pid,
+                executor_process_creation_identity=str(executor_identity.creation_time or "unknown"),
+                executor_host_id=executor_identity.host_id,
+                started_at=scenario_started_at,
+                completed_at=_scenario_now(),
+                action_type="offline-contention",
+                workspace=str(root),
+                job_id=scenario_job_id,
+                attempt_id=f"{context.acceptance_run_id}:K",
+                budget_domain="offline-k",
+                status="PASSED",
+                exit_status=0,
+                produced_evidence_refs=(process_ref, lock_ref),
+            ).to_dict(),
+        )
         return (
+            process_ref,
+            lock_ref,
             producer.reference(
-                process_event_path,
-                role="process_events",
-                artifact_type="acceptance_process_event",
+                receipt_path,
+                role="scenario_execution_receipt",
+                artifact_type="scenario_execution_receipt",
                 artifact_version="v1",
-                schema_version="process-event-v1",
-                job_id=context.job_id,
-            ),
-            producer.reference(
-                lock_state_path,
-                role="lock_state",
-                artifact_type="contention_result",
-                artifact_version="v1",
-                schema_version="contention-result-v1",
-                job_id=context.job_id,
+                schema_version="scenario-execution-receipt-v1",
+                job_id=scenario_job_id,
             ),
         )
 
@@ -1136,16 +2183,16 @@ _MAX_EVIDENCE_BYTES = 128 * 1024 * 1024
 _SHA256_RE = r"^[0-9a-f]{64}$"
 
 _GATE_REF_ROLES: dict[str, frozenset[str]] = {
-    "C": frozenset({"runtime_spec", "source_pdf", "canonical_stage1", "stage_terminal", "job_outcome", "attempt", "registry", "provider_receipt_ledger", "closure"}),
-    "D": frozenset({"source_pdf", "modality_profile", "canonical_stage1", "stage_terminal", "registry", "provider_receipt_ledger", "closure"}),
-    "E": frozenset({"interruption_event", "resume_event", "provider_receipt_ledger", "process_events"}),
-    "F": frozenset({"canonical_stage1", "outline_provider_call_plan", "provider_receipt_ledger", "stage_terminal", "closure"}),
-    "G": frozenset({"free_mode_profile", "provider_receipt_ledger", "stage_terminal"}),
-    "H": frozenset({"defect_artifact", "repair_artifact", "validation_artifact", "provider_receipt_ledger"}),
-    "I": frozenset({"playwright_trace", "browser_evidence"}),
-    "J": frozenset({"source_pdf", "ocr_diagnostics", "ocr_artifact", "canonical_stage1", "registry"}),
-    "K": frozenset({"process_events", "lock_state"}),
-    "Q": frozenset({"source_pdf", "canonical_stage1", "outline_terminal", "review_docx", "validation_artifact", "provider_receipt_ledger", "registry", "closure", "job_outcome", "citation_manifest"}),
+    "C": frozenset({"runtime_spec", "source_pdf", "canonical_stage1", "stage_terminal", "job_outcome", "attempt", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
+    "D": frozenset({"source_pdf", "modality_profile", "canonical_stage1", "stage_terminal", "registry", "provider_receipt_ledger", "closure", "scenario_execution_receipt"}),
+    "E": frozenset({"interruption_event", "resume_event", "provider_receipt_ledger", "process_events", "scenario_execution_receipt"}),
+    "F": frozenset({"canonical_stage1", "outline_provider_call_plan", "provider_receipt_ledger", "stage_terminal", "closure", "scenario_execution_receipt"}),
+    "G": frozenset({"free_mode_profile", "provider_receipt_ledger", "stage_terminal", "scenario_execution_receipt"}),
+    "H": frozenset({"defect_artifact", "repair_artifact", "validation_artifact", "provider_receipt_ledger", "scenario_execution_receipt"}),
+    "I": frozenset({"playwright_trace", "browser_evidence", "scenario_execution_receipt"}),
+    "J": frozenset({"source_pdf", "ocr_diagnostics", "ocr_artifact", "canonical_stage1", "registry", "scenario_execution_receipt"}),
+    "K": frozenset({"process_events", "lock_state", "scenario_execution_receipt"}),
+    "Q": frozenset({"source_pdf", "canonical_stage1", "outline_terminal", "review_docx", "validation_artifact", "provider_receipt_ledger", "registry", "closure", "job_outcome", "citation_manifest", "scenario_execution_receipt"}),
 }
 
 
@@ -1194,6 +2241,9 @@ _ROLE_ARTIFACT_TYPES: dict[str, frozenset[str]] = {
         "repair_transaction",
         "validation_run_result_repaired",
     }),
+    "playwright_trace": frozenset({"playwright_trace"}),
+    "browser_evidence": frozenset({"playwright_run_evidence"}),
+    "scenario_execution_receipt": frozenset({"scenario_execution_receipt"}),
 }
 
 
@@ -1389,6 +2439,87 @@ class DocumentModalityProfileV1:
 
 
 @dataclass(frozen=True)
+class DocumentModalityProfileV2:
+    """Production-lineage modality profile for Gate D."""
+
+    source_pdf_sha256: str
+    preprocess_manifest_hash: str
+    stage1_input_manifest_hash: str
+    actual_extractor: str
+    page_count: int
+    text_page_count: int
+    image_page_count: int
+    table_count: int
+    figure_count: int
+    scanned_candidate_pages: int
+    actual_ocr_pages: int
+    actual_selected_visual_count: int
+    stage1_input_mode: str
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "DocumentModalityProfileV2":
+        if (
+            payload.get("artifact_type") != "document_modality_profile"
+            or payload.get("artifact_version") != "v2"
+            or payload.get("schema_version") != "document-modality-profile-v2"
+        ):
+            raise ReleaseAcceptanceSpecError(
+                "document modality profile is not a production-derived v2 artifact"
+            )
+        text_fields = (
+            "source_pdf_sha256",
+            "preprocess_manifest_hash",
+            "stage1_input_manifest_hash",
+            "actual_extractor",
+            "stage1_input_mode",
+        )
+        values = {name: str(payload.get(name) or "").strip() for name in text_fields}
+        if any(not values[name] for name in text_fields):
+            raise ReleaseAcceptanceSpecError(
+                "production modality profile lineage fields are incomplete"
+            )
+        for name in (
+            "source_pdf_sha256",
+            "preprocess_manifest_hash",
+            "stage1_input_manifest_hash",
+        ):
+            if not _valid_sha256(values[name]):
+                raise ReleaseAcceptanceSpecError(
+                    f"production modality profile {name} is invalid"
+                )
+        integer_values: dict[str, int] = {}
+        for name in (
+            "page_count",
+            "text_page_count",
+            "image_page_count",
+            "table_count",
+            "figure_count",
+            "scanned_candidate_pages",
+            "actual_ocr_pages",
+            "actual_selected_visual_count",
+        ):
+            raw = payload.get(name)
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+                raise ReleaseAcceptanceSpecError(
+                    f"production modality profile {name} is invalid"
+                )
+            integer_values[name] = raw
+        if integer_values["page_count"] <= 0:
+            raise ReleaseAcceptanceSpecError("production modality profile page_count is invalid")
+        if integer_values["text_page_count"] > integer_values["page_count"] or integer_values["image_page_count"] > integer_values["page_count"]:
+            raise ReleaseAcceptanceSpecError("production modality profile page counts are inconsistent")
+        return cls(**values, **integer_values)
+
+    @property
+    def derived_modality(self) -> str:
+        if self.actual_ocr_pages > 0 or self.scanned_candidate_pages / self.page_count >= 0.25:
+            return "ocr_scanned"
+        if self.image_page_count / self.page_count >= 0.5 or self.table_count + self.figure_count >= max(1, self.page_count // 3):
+            return "visual_table_heavy"
+        return "text_heavy"
+
+
+@dataclass(frozen=True)
 class ControlledDefectChallengeV1:
     """Typed challenge lineage for Validator defect injection and repair."""
 
@@ -1450,7 +2581,13 @@ class ProcessInterruptionEventV1:
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ProcessInterruptionEventV1":
-        if payload.get("artifact_type") != "process_interruption_event" or payload.get("schema_version") != "process-interruption-event-v1":
+        if not isinstance(payload, Mapping):
+            raise ReleaseAcceptanceSpecError("process interruption event must be a JSON object")
+        if (
+            payload.get("artifact_type") != "process_interruption_event"
+            or payload.get("artifact_version") != "v1"
+            or payload.get("schema_version") != "process-interruption-event-v1"
+        ):
             raise ReleaseAcceptanceSpecError("process interruption event type or schema is invalid")
         values = {
             "event_id": str(payload.get("event_id") or "").strip(),
@@ -1482,6 +2619,25 @@ class ProcessInterruptionEventV1:
             raise ReleaseAcceptanceSpecError("process interruption event numeric fields are invalid") from None
         if pid <= 0:
             raise ReleaseAcceptanceSpecError("process interruption event pid is invalid")
+        if values["interruption_method"] not in {
+            "terminate",
+            "kill",
+            "ctrl_break",
+            "external_crash",
+        }:
+            raise ReleaseAcceptanceSpecError(
+                "process interruption event method is invalid"
+            )
+        if exit_code == 0:
+            raise ReleaseAcceptanceSpecError(
+                "process interruption event termination must have a non-zero exit code"
+            )
+        started = _receipt_timestamp(values["started_at"], field_name="started_at")
+        interrupted = _receipt_timestamp(values["interrupted_at"], field_name="interrupted_at")
+        if interrupted < started:
+            raise ReleaseAcceptanceSpecError(
+                "process interruption event interrupted_at precedes started_at"
+            )
         return cls(pid=pid, exit_code=exit_code, **values)
 
 
@@ -1496,16 +2652,22 @@ class ProcessResumeEventV1:
     previous_attempt_id: str
     new_attempt_id: str
     new_pid: int
+    new_process_creation_identity: str
     resumed_at: str
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ProcessResumeEventV1":
+        if not isinstance(payload, Mapping):
+            raise ReleaseAcceptanceSpecError("process resume event must be a JSON object")
+        _reject_unknown(payload, _PROCESS_RESUME_FIELDS, "process resume event")
         if payload.get("artifact_type") != "process_resume_event" or payload.get("schema_version") != "process-resume-event-v1":
             raise ReleaseAcceptanceSpecError("process resume event type or schema is invalid")
+        if payload.get("artifact_version") != "v1":
+            raise ReleaseAcceptanceSpecError("process resume event artifact version is invalid")
         text_fields = (
             "event_id", "acceptance_run_id", "scenario_id", "job_id",
             "interruption_event_id", "interruption_event_sha256",
-            "previous_attempt_id", "new_attempt_id", "resumed_at",
+            "previous_attempt_id", "new_attempt_id", "new_process_creation_identity", "resumed_at",
         )
         values = {name: str(payload.get(name) or "").strip() for name in text_fields}
         if any(not value for value in values.values()) or not _valid_sha256(values["interruption_event_sha256"]):
@@ -1519,6 +2681,8 @@ class ProcessResumeEventV1:
             raise ReleaseAcceptanceSpecError("process resume event pid is invalid") from None
         if new_pid <= 0:
             raise ReleaseAcceptanceSpecError("process resume event pid is invalid")
+        if _receipt_timestamp(values["resumed_at"], field_name="resumed_at") is None:
+            raise ReleaseAcceptanceSpecError("process resume event timestamp is invalid")
         return cls(new_pid=new_pid, **values)
 
 
@@ -1615,7 +2779,11 @@ class GateEvidenceProducer:
                 raise ReleaseAcceptanceSpecError(
                     "existing acceptance evidence index is not an object"
                 )
-            previous_sha = str(previous_payload.get("final_sha") or "").strip()
+            previous_sha = str(
+                previous_payload.get("final_executable_sha")
+                or previous_payload.get("final_sha")
+                or ""
+            ).strip()
             if previous_sha and previous_sha != self.final_sha:
                 raise ReleaseAcceptanceSpecError(
                     "acceptance evidence index belongs to a different executable SHA"
@@ -1627,26 +2795,34 @@ class GateEvidenceProducer:
                 )
             previous_revision = raw_revision
         revision = previous_revision + 1
+        normalized_gates = {
+            str(gate): self.build_gate(
+                str(gate),
+                list(refs),
+                acceptance_run_id=acceptance_run_id,
+                scenario_id=scenario_id or str(gate),
+                job_id=job_id,
+            )
+            for gate, refs in gates.items()
+        }
         payload = {
             "schema_version": "release-acceptance-evidence-index-v1",
             "final_sha": self.final_sha,
+            "final_executable_sha": self.final_sha,
             "acceptance_run_id": str(acceptance_run_id or ""),
             "scenario_id": str(scenario_id or ""),
             "job_id": str(job_id or ""),
             "revision": revision,
+            "created_at": _scenario_now(),
             "previous_revision_hash": (
                 hashlib.sha256(previous_raw).hexdigest() if previous_raw else ""
             ),
-            "gates": {
-                str(gate): self.build_gate(
-                    str(gate),
-                    list(refs),
-                    acceptance_run_id=acceptance_run_id,
-                    scenario_id=scenario_id or str(gate),
-                    job_id=job_id,
-                )
-                for gate, refs in gates.items()
-            },
+            "refs": [
+                ref
+                for gate_payload in normalized_gates.values()
+                for ref in gate_payload["durable_refs"]
+            ],
+            "gates": normalized_gates,
         }
         target.parent.mkdir(parents=True, exist_ok=True)
         encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
@@ -2140,6 +3316,37 @@ class GateEvidenceVerifier:
             ledger_map = cast(Mapping[str, Any], ledger)
             registry_map = cast(Mapping[str, Any], registry)
             queue_map = cast(Mapping[str, Any], queue)
+            liveness_probes = lock_payload.get("liveness_probes")
+            if not isinstance(liveness_probes, list) or len(liveness_probes) < 2:
+                return {}, "contention result lacks two real process liveness probes"
+            for probe in liveness_probes:
+                if not isinstance(probe, Mapping) or probe.get("alive") is not True:
+                    return {}, "contention process liveness probe did not report alive"
+                raw_pid = probe.get("target_pid")
+                creation = str(
+                    probe.get("target_process_creation_identity") or ""
+                ).strip()
+                if (
+                    isinstance(raw_pid, bool)
+                    or not isinstance(raw_pid, int)
+                    or raw_pid <= 0
+                    or not creation
+                    or (str(raw_pid), creation) not in process_identities
+                ):
+                    return {}, "contention liveness probe is not bound to a worker identity"
+            if budget_map.get("domain") != "offline-k" or not str(
+                budget_map.get("state_path") or ""
+            ).endswith("offline_contention_budget_state.json"):
+                return {}, "contention budget is not isolated in the offline-k namespace"
+            live_parent_budget = lock_payload.get("live_parent_budget")
+            if not isinstance(live_parent_budget, Mapping):
+                return {}, "contention result lacks parent live budget invariance"
+            if (
+                live_parent_budget.get("unchanged") is not True
+                or str(live_parent_budget.get("sha256_before") or "")
+                != str(live_parent_budget.get("sha256_after") or "")
+            ):
+                return {}, "contention scenario changed the parent live budget"
             try:
                 limit = int(str(budget_map.get("max_provider_calls_total") or 0))
                 used = int(str(budget_map.get("calls_used") or 0))
@@ -2228,6 +3435,8 @@ class GateEvidenceVerifier:
                 "bounded_wait": True,
                 "no_corrupt_json": True,
                 "no_lost_update": True,
+                "offline_contention_calls": used,
+                "live_budget_unchanged": True,
             }, None
 
         if gate == "E":
@@ -2265,14 +3474,42 @@ class GateEvidenceVerifier:
             ):
                 return {}, "resume process events are not typed acceptance records"
             snapshots: dict[str, Mapping[str, Any]] = {}
+            budget_snapshots: dict[str, Mapping[str, Any]] = {}
             for row in event_rows:
+                if (
+                    str(row.get("acceptance_run_id") or "")
+                    != interruption.acceptance_run_id
+                    or str(row.get("scenario_id") or "") != "E"
+                    or str(row.get("job_id") or "") != interruption.job_id
+                ):
+                    return {}, "resume process events are not bound to the interruption job"
                 if str(row.get("event") or "") != "ledger_snapshot":
+                    if str(row.get("event") or "") == "budget_snapshot":
+                        name = str(row.get("snapshot_name") or "").strip()
+                        if name in {"before", "at_interruption", "after_resume"}:
+                            budget_snapshots[name] = row
                     continue
                 name = str(row.get("snapshot_name") or "").strip()
                 if name in {"before", "at_interruption", "after_resume"}:
                     snapshots[name] = row
             if set(snapshots) != {"before", "at_interruption", "after_resume"}:
                 return {}, "resume evidence requires before, interruption, and after-resume ledger snapshots"
+            if set(budget_snapshots) != {"before", "at_interruption", "after_resume"}:
+                return {}, "resume evidence requires durable budget snapshots at each process boundary"
+            resume_started = next(
+                (
+                    row
+                    for row in event_rows
+                    if str(row.get("event") or "") == "resume_started"
+                ),
+                None,
+            )
+            if not isinstance(resume_started, Mapping) or (
+                str(resume_started.get("new_pid") or "") != str(resume.new_pid)
+                or str(resume_started.get("new_process_creation_identity") or "")
+                != resume.new_process_creation_identity
+            ):
+                return {}, "resume evidence does not bind the fresh process identity"
             receipt_refs = by_role.get("provider_receipt_ledger", [])
             receipts: list[Mapping[str, Any]] = []
             for ref in receipt_refs:
@@ -2305,6 +3542,41 @@ class GateEvidenceVerifier:
                 return {}, "resume ledger snapshot usage counters are invalid"
             if (actual_calls, actual_output, actual_retries) != (after_calls, after_output, after_retries):
                 return {}, "resume ledger snapshot usage does not match the reopened provider ledger"
+            try:
+                budget_limit = int(
+                    str(
+                        budget_snapshots["after_resume"].get(
+                            "budget", {}
+                        ).get("max_provider_calls_total")
+                        if isinstance(budget_snapshots["after_resume"].get("budget"), Mapping)
+                        else 0
+                    )
+                )
+                before_deadline = float(
+                    str(budget_snapshots["before"].get("absolute_deadline_epoch") or 0.0)
+                )
+                after_deadline = float(
+                    str(
+                        budget_snapshots["after_resume"].get(
+                            "absolute_deadline_epoch"
+                        )
+                        or 0.0
+                    )
+                )
+                after_reserved = int(
+                    str(budget_snapshots["after_resume"].get("calls_reserved") or 0)
+                )
+                after_used = int(
+                    str(budget_snapshots["after_resume"].get("calls_used") or 0)
+                )
+            except (TypeError, ValueError, AttributeError):
+                return {}, "resume budget snapshots contain invalid counters"
+            if before_deadline <= 0 or after_deadline != before_deadline:
+                return {}, "resume reset or lost the absolute acceptance deadline"
+            if after_reserved != 0 or after_used < 0 or (
+                budget_limit > 0 and after_used > budget_limit
+            ):
+                return {}, "resume budget reconciliation left an invalid reservation state"
             return {
                 "interruption": True,
                 "resume": True,
@@ -2319,6 +3591,10 @@ class GateEvidenceVerifier:
                     "output_tokens_delta": after_output - int(str(snapshots["before"].get("output_tokens") or 0)),
                     "retry_delta": after_retries - int(str(snapshots["before"].get("retry_attempts") or 0)),
                 },
+                "budget_before_crash": dict(budget_snapshots["before"]),
+                "budget_at_interruption": dict(budget_snapshots["at_interruption"]),
+                "budget_after_reconciliation": dict(budget_snapshots["after_resume"]),
+                "budget_after_resume": dict(budget_snapshots["after_resume"]),
             }, None
 
         if gate == "F":
@@ -2411,15 +3687,15 @@ class GateEvidenceVerifier:
             source_hashes = {ref.sha256 for ref in source_refs}
             if len(source_hashes) < 3 or len(profile_refs) < 3:
                 return {}, "heterogeneous gate requires three source PDFs and three derived modality profiles"
-            profiles: list[DocumentModalityProfileV1] = []
+            profiles: list[DocumentModalityProfileV2] = []
             for ref in profile_refs:
                 payload = payloads.get(ref.ref_id)
                 if not isinstance(payload, Mapping):
                     return {}, "document modality profile is not a JSON object"
                 try:
-                    profile = DocumentModalityProfileV1.from_mapping(payload)
+                    profile = DocumentModalityProfileV2.from_mapping(payload)
                 except ReleaseAcceptanceSpecError as exc:
-                    return {}, str(exc)
+                    return {}, "heterogeneous gate requires three production-derived modality profiles: " + str(exc)
                 if profile.source_pdf_sha256 not in source_hashes:
                     return {}, "document modality profile is not bound to a source PDF"
                 profiles.append(profile)
@@ -2472,6 +3748,11 @@ class GateEvidenceVerifier:
                             if not isinstance(finding, Mapping):
                                 continue
                             if str(finding.get("mutation_locator") or "") == challenge.mutation_locator:
+                                if (
+                                    str(finding.get("detection_class") or "").casefold()
+                                    != challenge.expected_detection_class.casefold()
+                                ):
+                                    continue
                                 finding_id = str(finding.get("finding_id") or "").strip()
                                 if finding_id:
                                     detected_ids.add(finding_id)
@@ -2535,7 +3816,13 @@ class GateEvidenceVerifier:
             if str(diagnostics.get("source_pdf_sha256") or "") != source_hash:
                 return {}, "OCR diagnostics source hash does not match the source PDF"
             page_numbers = self._string_list(diagnostics.get("page_numbers"))
-            if not page_numbers or int(diagnostics.get("ocr_page_count") or 0) != len(page_numbers):
+            raw_ocr_page_count = diagnostics.get("ocr_page_count")
+            if (
+                not page_numbers
+                or isinstance(raw_ocr_page_count, bool)
+                or not isinstance(raw_ocr_page_count, int)
+                or raw_ocr_page_count != len(page_numbers)
+            ):
                 return {}, "OCR diagnostics page identity is incomplete"
             if not str(diagnostics.get("ocr_engine") or "").strip() or not str(diagnostics.get("ocr_engine_version") or "").strip():
                 return {}, "OCR diagnostics engine identity is incomplete"
@@ -2817,6 +4104,24 @@ class GateEvidenceVerifier:
                         }
                     payloads[ref.ref_id] = [receipt.to_dict() for receipt in receipts]
                     continue
+                if ref.role == "scenario_execution_receipt":
+                    if path.suffix.casefold() != ".json":
+                        return {
+                            "status": "FAIL",
+                            "reason": f"scenario execution receipt evidence must be JSON: {ref.ref_id}",
+                            "contract": contract,
+                        }
+                    try:
+                        receipt_payload = self._json_payload(raw, path)
+                        receipt = ScenarioExecutionReceiptV1.from_mapping(receipt_payload)
+                    except (OSError, UnicodeError, json.JSONDecodeError, ReleaseAcceptanceSpecError, TypeError, ValueError) as exc:
+                        return {
+                            "status": "FAIL",
+                            "reason": f"invalid scenario execution receipt: {exc}",
+                            "contract": contract,
+                        }
+                    payloads[ref.ref_id] = receipt.to_dict()
+                    continue
                 payload: Any = None
                 if ref.artifact_type and path.suffix.casefold() in {".json", ".jsonl"}:
                     payload = self._json_payload(raw, path)
@@ -2901,6 +4206,59 @@ class GateEvidenceVerifier:
                     payloads[ref.ref_id] = payload
         except (OSError, UnicodeError, json.JSONDecodeError, ReleaseAcceptanceSpecError) as exc:
             return {"status": "FAIL", "reason": str(exc), "contract": contract}
+
+        scenario_receipt_refs = [
+            ref for ref in refs if ref.role == "scenario_execution_receipt"
+        ]
+        if len(scenario_receipt_refs) != 1:
+            return {
+                "status": "NOT_VERIFIED",
+                "reason": "gate evidence requires exactly one executor-owned scenario receipt",
+                "contract": contract,
+            }
+        try:
+            scenario_receipt = ScenarioExecutionReceiptV1.from_mapping(
+                payloads[scenario_receipt_refs[0].ref_id]
+            )
+        except (KeyError, ReleaseAcceptanceSpecError, TypeError, ValueError) as exc:
+            return {
+                "status": "FAIL",
+                "reason": f"invalid scenario execution receipt: {exc}",
+                "contract": contract,
+            }
+        if not evidence_run_id:
+            return {
+                "status": "NOT_VERIFIED",
+                "reason": "gate evidence must carry a non-empty acceptance run for executor binding",
+                "contract": contract,
+            }
+        if (
+            scenario_receipt.parent_acceptance_run_id != evidence_run_id
+            or scenario_receipt.scenario_id != str(gate)
+            or scenario_receipt.final_executable_sha != evidence_sha
+            or (expected_job_id and scenario_receipt.job_id != str(expected_job_id))
+        ):
+            return {
+                "status": "FAIL",
+                "reason": "scenario execution receipt is not bound to this gate run, SHA, or job",
+                "contract": contract,
+            }
+        evidence_ref_ids = {ref.ref_id for ref in refs}
+        if any(
+            str(item.get("ref_id") or "") not in evidence_ref_ids
+            for item in scenario_receipt.produced_evidence_refs
+        ):
+            return {
+                "status": "FAIL",
+                "reason": "scenario execution receipt names evidence refs absent from the gate",
+                "contract": contract,
+            }
+        if scenario_receipt.status != "PASSED":
+            return {
+                "status": "NOT_VERIFIED",
+                "reason": "scenario execution receipt is not a successful executor terminal",
+                "contract": contract,
+            }
 
         # A hash of artifact_registry.json is not enough by itself. Reopen and
         # verify every ready record it names, including its owner and content
@@ -3012,6 +4370,11 @@ class GateEvidenceVerifier:
                     "evidence_manifest",
                     "ocr_diagnostics",
                     "ocr_artifact",
+                    "document_modality_profile",
+                    "scenario_execution_receipt",
+                    "playwright_run_evidence",
+                    "playwright_screenshot_manifest",
+                    "playwright_trace",
                     "citation_manifest",
                 }
                 for record in registry_object.list_records():
@@ -3040,14 +4403,21 @@ class GateEvidenceVerifier:
                 "reason": "durable evidence is missing required references: " + ", ".join(missing_roles),
                 "contract": contract,
             }
-        semantic_facts, semantic_error = self._derive_semantic_facts(
-            str(gate),
-            refs,
-            payloads,
-            raw_by_ref,
-            origin_dir=origin_dir,
-            expected_job_id=expected_job_id,
-        )
+        try:
+            semantic_facts, semantic_error = self._derive_semantic_facts(
+                str(gate),
+                refs,
+                payloads,
+                raw_by_ref,
+                origin_dir=origin_dir,
+                expected_job_id=expected_job_id,
+            )
+        except Exception as exc:
+            return {
+                "status": "FAIL",
+                "reason": f"durable evidence semantic verification failed closed: {type(exc).__name__}",
+                "contract": contract,
+            }
         if semantic_error:
             return {
                 "status": "FAIL",
@@ -3103,9 +4473,9 @@ class GateEvidenceVerifier:
             return {"status": "FAIL", "reason": "one-paper counts were not derived as a matching durable pair", "derived_facts": facts, "contract": contract}
         if gate == "Q" and (
             int(facts.get("source_count") or 0) != 15
-            or int(facts.get("canonical_stage1_count") or 0) != 15
+            or int(facts.get("paper_identity_count") or 0) != 15
         ):
-            return {"status": "FAIL", "reason": "F1 counts were not derived as exactly fifteen durable artifacts", "derived_facts": facts, "contract": contract}
+            return {"status": "FAIL", "reason": "F1 counts were not derived as exactly fifteen durable paper identities", "derived_facts": facts, "contract": contract}
         if gate == "E" and int(facts.get("duplicate_receipts") or 0) != 0:
             return {"status": "FAIL", "reason": "resume gate recorded duplicate receipt identities", "derived_facts": facts, "contract": contract}
         if gate == "E" and facts.get("reexecuted_completed_call_ids"):
@@ -3147,11 +4517,13 @@ def validate_gate_evidence(
 
 __all__ = [
     "AcceptanceExecutionContextV1",
+    "AcceptanceChildScenarioSpecV2",
     "AcceptanceScenario",
     "AcceptanceScenarioContextV1",
     "AcceptanceScenarioResultV1",
     "GATE_CONTRACTS",
     "AcceptanceRunStateV1",
+    "ParentAcceptanceResultV2",
     "GateCScenario",
     "GateDScenario",
     "GateEScenario",
@@ -3166,13 +4538,17 @@ __all__ = [
     "ProcessInterruptionEventV1",
     "ProcessResumeEventV1",
     "ControlledDefectChallengeV1",
+    "AcceptanceValidatorChallengeInputV1",
     "DocumentModalityProfileV1",
+    "DocumentModalityProfileV2",
     "DurableEvidenceRefV1",
     "GateEvidenceProducer",
     "GateEvidenceVerifier",
     "ReleaseAcceptanceBudget",
+    "ReleaseAcceptancePlanV2",
     "ReleaseAcceptanceSpec",
     "ReleaseAcceptanceSpecError",
+    "ScenarioExecutionReceiptV1",
     "gate_contract",
     "gate_evidence_roles",
     "scenario_for_gate",

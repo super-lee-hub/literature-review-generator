@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -408,17 +409,23 @@ def test_gate_k_scenario_executes_real_dual_process_contention(tmp_path: Path) -
     evidence = GateEvidenceProducer(final_sha="3" * 40).build_gate(
         "K",
         result.evidence_refs,
+        acceptance_run_id=context.acceptance_run_id,
+        job_id="acceptance-k-test:K",
     )
     verified = GateEvidenceVerifier().verify(
         "K",
         evidence,
         expected_final_sha="3" * 40,
+        expected_acceptance_run_id=context.acceptance_run_id,
+        expected_job_id="acceptance-k-test:K",
     )
 
     assert verified["status"] == "PASS", verified
     assert verified["derived_facts"]["process_count"] == 2
     assert verified["derived_facts"]["no_corrupt_json"] is True
     assert verified["derived_facts"]["no_lost_update"] is True
+    assert not Path(context.provider_budget_state_path).is_file()
+    assert Path(context.evidence_root, "K", "offline_contention_budget_state.json").is_file()
 
 
 def test_live_gate_rejects_provider_receipt_missing_authoritative_job_binding(tmp_path: Path) -> None:
@@ -1124,6 +1131,49 @@ def test_windows_process_liveness_rejects_wrong_creation_identity_without_killin
             host_id=identity.host_id,
         )
         assert is_process_alive(wrong_identity) is False
+        assert child.poll() is None
+    finally:
+        assert child.wait(timeout=10) == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the Windows process API")
+def test_windows_liveness_probe_runs_in_an_independent_process_without_killing_child(
+    tmp_path: Path,
+) -> None:
+    identity_path = tmp_path / "child-process-identity.json"
+    child_code = (
+        "import json,sys,time; "
+        "from runtime.provider_runtime import process_identity_for_pid; "
+        "identity=process_identity_for_pid(__import__('os').getpid()); "
+        "open(sys.argv[1],'w',encoding='utf-8').write(json.dumps(identity.__dict__)); "
+        "time.sleep(5)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(identity_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not identity_path.is_file() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert identity_path.is_file()
+        probe_code = (
+            "import json,sys; "
+            "from runtime.provider_runtime import ProcessIdentityV1,is_process_alive; "
+            "payload=json.loads(open(sys.argv[1],encoding='utf-8').read()); "
+            "identity=ProcessIdentityV1(**payload); "
+            "print(json.dumps({'alive':is_process_alive(identity)}))"
+        )
+        probe = subprocess.run(
+            [sys.executable, "-c", probe_code, str(identity_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        assert probe.returncode == 0
+        assert json.loads(probe.stdout.strip())["alive"] is True
         assert child.poll() is None
     finally:
         assert child.wait(timeout=10) == 0

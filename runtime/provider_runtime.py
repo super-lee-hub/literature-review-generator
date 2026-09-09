@@ -10,7 +10,7 @@ a receipt.
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 import ctypes
 import hashlib
 import json
@@ -418,8 +418,12 @@ class AcceptanceExecutionContextV1:
     def __post_init__(self) -> None:
         if not str(self.acceptance_run_id).strip():
             raise ProviderRuntimeContractError("acceptance execution context run ID is required")
-        if not str(self.final_executable_sha).strip():
+        normalized_sha = str(self.final_executable_sha).strip().lower()
+        if len(normalized_sha) not in {40, 64} or any(
+            char not in "0123456789abcdef" for char in normalized_sha
+        ):
             raise ProviderRuntimeContractError("acceptance execution context final SHA is required")
+        object.__setattr__(self, "final_executable_sha", normalized_sha)
         if (
             isinstance(self.absolute_deadline_epoch, bool)
             or not math.isfinite(float(self.absolute_deadline_epoch))
@@ -438,6 +442,10 @@ class AcceptanceExecutionContextV1:
                 raise ProviderRuntimeContractError(
                     f"acceptance execution context {name} is required"
                 )
+        if not isinstance(self.owner_authorized, bool):
+            raise ProviderRuntimeContractError(
+                "acceptance execution context owner_authorized must be a boolean"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -451,6 +459,59 @@ class AcceptanceExecutionContextV1:
             "scenario_state_path": self.scenario_state_path,
             "owner_authorized": self.owner_authorized,
         }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "AcceptanceExecutionContextV1":
+        if not isinstance(payload, Mapping):
+            raise ProviderRuntimeContractError(
+                "acceptance execution context must be a JSON object"
+            )
+        allowed = {
+            "acceptance_run_id",
+            "final_executable_sha",
+            "absolute_deadline_epoch",
+            "provider_budget",
+            "provider_budget_state_path",
+            "evidence_root",
+            "process_event_log",
+            "scenario_state_path",
+            "owner_authorized",
+        }
+        unknown = sorted(str(key) for key in payload if str(key) not in allowed)
+        if unknown:
+            raise ProviderRuntimeContractError(
+                "acceptance execution context contains unknown fields: "
+                + ", ".join(unknown)
+            )
+        raw_budget = payload.get("provider_budget")
+        if not isinstance(raw_budget, Mapping):
+            raise ProviderRuntimeContractError(
+                "acceptance execution context provider_budget must be an object"
+            )
+        owner_authorized = payload.get("owner_authorized")
+        if not isinstance(owner_authorized, bool):
+            raise ProviderRuntimeContractError(
+                "acceptance execution context owner_authorized must be a boolean"
+            )
+        try:
+            deadline = float(payload.get("absolute_deadline_epoch"))
+        except (TypeError, ValueError) as exc:
+            raise ProviderRuntimeContractError(
+                "acceptance execution context deadline must be numeric"
+            ) from exc
+        return cls(
+            acceptance_run_id=str(payload.get("acceptance_run_id") or ""),
+            final_executable_sha=str(payload.get("final_executable_sha") or ""),
+            absolute_deadline_epoch=deadline,
+            provider_budget=ProviderAggregateBudgetV1.from_mapping(raw_budget),
+            provider_budget_state_path=str(
+                payload.get("provider_budget_state_path") or ""
+            ),
+            evidence_root=str(payload.get("evidence_root") or ""),
+            process_event_log=str(payload.get("process_event_log") or ""),
+            scenario_state_path=str(payload.get("scenario_state_path") or ""),
+            owner_authorized=owner_authorized,
+        )
 
 
 @dataclass(frozen=True)
@@ -495,38 +556,45 @@ def bind_acceptance_execution_context(
         )
     context_token = _ACTIVE_ACCEPTANCE_CONTEXT.set(context)
     controller_token = _ACTIVE_ACCEPTANCE_CONTROLLER.set(controller)
-    environment_keys = (
-        "AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON",
-        "AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH",
-        "AUTO_GENERATE_ACCEPTANCE_RUN_ID",
-        "AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON",
-    )
-    previous = {key: os.environ.get(key) for key in environment_keys}
-    os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON"] = json.dumps(
-        context.provider_budget.to_dict(),
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    os.environ["AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH"] = (
-        context.provider_budget_state_path
-    )
-    os.environ["AUTO_GENERATE_ACCEPTANCE_RUN_ID"] = context.acceptance_run_id
-    os.environ["AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON"] = json.dumps(
-        context.to_dict(),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     try:
         yield context
     finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
         _ACTIVE_ACCEPTANCE_CONTROLLER.reset(controller_token)
         _ACTIVE_ACCEPTANCE_CONTEXT.reset(context_token)
+
+
+def acceptance_context_environment(
+    context: AcceptanceExecutionContextV1,
+    *,
+    base_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a child-process environment without mutating the parent process."""
+
+    environment = dict(base_environment if base_environment is not None else os.environ)
+    environment["AUTO_GENERATE_ACCEPTANCE_BUDGET_JSON"] = json.dumps(
+        context.provider_budget.to_dict(), sort_keys=True, separators=(",", ":")
+    )
+    environment["AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH"] = (
+        context.provider_budget_state_path
+    )
+    environment["AUTO_GENERATE_ACCEPTANCE_RUN_ID"] = context.acceptance_run_id
+    environment["AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON"] = json.dumps(
+        context.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return environment
+
+
+def acceptance_execution_context_from_environment() -> AcceptanceExecutionContextV1 | None:
+    raw = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON", "")).strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderRuntimeContractError(
+            "AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON is not valid JSON"
+        ) from exc
+    return AcceptanceExecutionContextV1.from_mapping(payload)
 
 
 class ProviderBudgetController:
@@ -1120,7 +1188,20 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
             _ENV_BUDGET_CONTROLLER = None
         return None
     state_path = str(os.getenv("AUTO_GENERATE_ACCEPTANCE_BUDGET_STATE_PATH", "")).strip()
-    cache_key = raw + "\x00" + state_path
+    serialized_context_raw = str(
+        os.getenv("AUTO_GENERATE_ACCEPTANCE_CONTEXT_JSON", "")
+    ).strip()
+    serialized_context = acceptance_execution_context_from_environment()
+    if serialized_context is not None:
+        if str(os.getenv("AUTO_GENERATE_ACCEPTANCE_RUN_ID", "")).strip() != serialized_context.acceptance_run_id:
+            raise ProviderRuntimeContractError(
+                "acceptance execution context run ID does not match its environment bridge"
+            )
+        if state_path != serialized_context.provider_budget_state_path:
+            raise ProviderRuntimeContractError(
+                "acceptance execution context budget state does not match its environment bridge"
+            )
+    cache_key = raw + "\x00" + state_path + "\x00" + serialized_context_raw
     with _ENV_BUDGET_LOCK:
         if cache_key == _ENV_BUDGET_RAW and _ENV_BUDGET_CONTROLLER is not None:
             return _ENV_BUDGET_CONTROLLER
@@ -1137,6 +1218,10 @@ def provider_budget_controller_from_environment() -> ProviderBudgetController | 
         controller = ProviderBudgetController(
             ProviderAggregateBudgetV1.from_mapping(payload)
         )
+        if serialized_context is not None and controller.budget != serialized_context.provider_budget:
+            raise ProviderRuntimeContractError(
+                "acceptance execution context budget does not match its environment bridge"
+            )
         if state_path:
             controller.bind_state_path(state_path)
         _ENV_BUDGET_RAW = cache_key
@@ -1726,6 +1811,62 @@ class ProviderCallReceiptV1:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ProviderCallReceiptV1":
+        if not isinstance(payload, Mapping):
+            raise ProviderRuntimeContractError("provider receipt must be a JSON object")
+        allowed = {item.name for item in fields(cls)}
+        unknown = sorted(str(key) for key in payload if str(key) not in allowed)
+        if unknown:
+            raise ProviderRuntimeContractError(
+                "provider receipt contains unknown fields: " + ", ".join(unknown)
+            )
+        required = {
+            "artifact_type",
+            "artifact_version",
+            "receipt_id",
+            "sequence",
+            "job_id",
+            "attempt_id",
+            "stage_name",
+            "route",
+            "provider",
+            "model",
+            "endpoint",
+            "prompt_hash",
+            "input_hash",
+            "config_hash",
+            "schema_hash",
+            "status",
+            "attempts",
+            "started_at",
+            "finished_at",
+            "budget",
+            "metadata",
+            "test_only",
+        }
+        missing = sorted(name for name in required if name not in payload)
+        if missing:
+            raise ProviderRuntimeContractError(
+                "provider receipt is missing: " + ", ".join(missing)
+            )
+        for name in ("sequence", "attempts"):
+            value = payload.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ProviderRuntimeContractError(
+                    f"provider receipt {name} must be an integer"
+                )
+        if not isinstance(payload.get("test_only"), bool):
+            raise ProviderRuntimeContractError(
+                "provider receipt test_only must be a boolean"
+            )
+        if not isinstance(payload.get("budget"), Mapping) or not isinstance(
+            payload.get("metadata"), Mapping
+        ):
+            raise ProviderRuntimeContractError(
+                "provider receipt budget and metadata must be objects"
+            )
+        raw_status = payload.get("status")
+        if not isinstance(raw_status, str):
+            raise ProviderRuntimeContractError("provider receipt status must be a string")
         raw_budget = payload.get("budget")
         budget = raw_budget if isinstance(raw_budget, Mapping) else {}
         raw_metadata = payload.get("metadata")
@@ -1734,7 +1875,7 @@ class ProviderCallReceiptV1:
             artifact_type=str(payload.get("artifact_type") or ""),
             artifact_version=str(payload.get("artifact_version") or ""),
             receipt_id=str(payload.get("receipt_id") or ""),
-            sequence=int(payload.get("sequence") or 0),
+            sequence=payload["sequence"],
             job_id=str(payload.get("job_id") or ""),
             attempt_id=str(payload.get("attempt_id") or ""),
             stage_name=str(payload.get("stage_name") or ""),
@@ -1746,11 +1887,11 @@ class ProviderCallReceiptV1:
             input_hash=str(payload.get("input_hash") or ""),
             config_hash=str(payload.get("config_hash") or ""),
             schema_hash=str(payload.get("schema_hash") or ""),
-            status=str(payload.get("status") or "") if payload.get("status") else "failed",  # type: ignore[arg-type]
+            status=raw_status,  # type: ignore[arg-type]
             error_kind=str(payload.get("error_kind") or "") or None,
             http_status=int(payload["http_status"]) if payload.get("http_status") is not None else None,
             provider_code=str(payload.get("provider_code") or "") or None,
-            attempts=int(payload.get("attempts") or 0),
+            attempts=payload["attempts"],
             retry_after_seconds=(
                 float(payload["retry_after_seconds"])
                 if payload.get("retry_after_seconds") is not None
@@ -1780,7 +1921,7 @@ class ProviderCallReceiptV1:
             total_latency_ms=_optional_float(payload.get("total_latency_ms")),
             timeout_kind=str(payload.get("timeout_kind") or ""),
             usage_status=str(payload.get("usage_status") or "unreported"),
-            test_only=bool(payload.get("test_only", False)),
+            test_only=payload["test_only"],
             prompt_id=str(payload.get("prompt_id") or ""),
             prompt_version=str(payload.get("prompt_version") or ""),
             prompt_sha256=str(payload.get("prompt_sha256") or ""),
@@ -2285,6 +2426,8 @@ class ProviderRuntime:
 
 __all__ = [
     "AcceptanceExecutionContextV1",
+    "acceptance_context_environment",
+    "acceptance_execution_context_from_environment",
     "ProviderBudgetExceeded",
     "ProviderAggregateBudgetV1",
     "ProviderAggregateReservationV1",

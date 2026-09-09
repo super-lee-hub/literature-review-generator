@@ -1009,12 +1009,23 @@ class AgentRuntimeRunner:
             except AttemptAlreadyRunningError as exc:
                 raise RuntimeRunnerError(f"run rejected: {exc}") from exc
         try:
-            from runtime.provider_runtime import provider_budget_controller_from_environment
+            from runtime.provider_runtime import (
+                current_acceptance_execution_context,
+                provider_budget_controller_from_environment,
+            )
 
             acceptance_budget = provider_budget_controller_from_environment()
             if acceptance_budget is not None:
+                active_acceptance_context = current_acceptance_execution_context()
+                acceptance_state_path = (
+                    Path(active_acceptance_context.provider_budget_state_path)
+                    if active_acceptance_context is not None
+                    else session.context.workspace.log_path(
+                        "acceptance_budget_state_v1.json"
+                    )
+                )
                 acceptance_budget.bind_state_path(
-                    session.context.workspace.log_path("acceptance_budget_state_v1.json")
+                    acceptance_state_path
                 )
             return self._execute_with_lease(
                 session=session,

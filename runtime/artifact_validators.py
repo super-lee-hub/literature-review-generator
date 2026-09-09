@@ -106,6 +106,10 @@ CURRENT_PRODUCTION_ARTIFACT_TYPES = frozenset(
         "document_modality_profile",
         "ocr_diagnostics",
         "ocr_artifact",
+        "scenario_execution_receipt",
+        "playwright_run_evidence",
+        "playwright_screenshot_manifest",
+        "playwright_trace",
     }
 )
 
@@ -2244,6 +2248,62 @@ def _validate_document_modality_profile(
         raise ArtifactSchemaError("document modality profile extractor is missing")
 
 
+def _validate_document_modality_profile_v2(
+    _record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    if (
+        root.get("artifact_type") != "document_modality_profile"
+        or root.get("artifact_version") != "v2"
+        or root.get("schema_version") != "document-modality-profile-v2"
+    ):
+        raise ArtifactSchemaError("production document modality profile identity is invalid")
+    for name in (
+        "source_pdf_sha256",
+        "preprocess_manifest_hash",
+        "stage1_input_manifest_hash",
+    ):
+        value = str(root.get(name) or "")
+        if len(value) != 64 or value != value.lower() or any(
+            char not in "0123456789abcdef" for char in value
+        ):
+            raise ArtifactSchemaError(f"production document modality profile {name} is invalid")
+    _require_fields(
+        root,
+        (
+            "actual_extractor",
+            "page_count",
+            "text_page_count",
+            "image_page_count",
+            "table_count",
+            "figure_count",
+            "scanned_candidate_pages",
+            "actual_ocr_pages",
+            "actual_selected_visual_count",
+            "stage1_input_mode",
+        ),
+        "document_modality_profile_v2",
+    )
+    if type(root.get("page_count")) is not int or int(root.get("page_count") or 0) <= 0:
+        raise ArtifactSchemaError("production document modality profile page count is invalid")
+    for name in (
+        "text_page_count",
+        "image_page_count",
+        "table_count",
+        "figure_count",
+        "scanned_candidate_pages",
+        "actual_ocr_pages",
+        "actual_selected_visual_count",
+    ):
+        if type(root.get(name)) is not int or int(root.get(name) or 0) < 0:
+            raise ArtifactSchemaError(f"production document modality profile {name} is invalid")
+    if int(root.get("text_page_count") or 0) > int(root.get("page_count") or 0) or int(root.get("image_page_count") or 0) > int(root.get("page_count") or 0):
+        raise ArtifactSchemaError("production document modality profile page counts are inconsistent")
+    if not str(root.get("actual_extractor") or "").strip() or not str(root.get("stage1_input_mode") or "").strip():
+        raise ArtifactSchemaError("production document modality profile lineage is incomplete")
+
+
 def _validate_ocr_diagnostics(
     _record: Any,
     _path: str | Path,
@@ -2305,6 +2365,96 @@ def _validate_ocr_artifact(
         raise ArtifactSchemaError("OCR artifact page hashes are invalid")
 
 
+def _validate_scenario_execution_receipt(
+    _record: Any,
+    _path: str | Path,
+    _root: Mapping[str, Any],
+) -> None:
+    try:
+        from runtime.release_acceptance import ScenarioExecutionReceiptV1
+
+        ScenarioExecutionReceiptV1.from_mapping(_root)
+    except (ImportError, TypeError, ValueError) as exc:
+        raise ArtifactSchemaError(
+            f"scenario execution receipt is invalid: {type(exc).__name__}"
+        ) from exc
+
+
+def _validate_playwright_run_evidence(
+    _record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    if (
+        root.get("artifact_type") != "playwright_run_evidence"
+        or root.get("artifact_version") != "v1"
+        or root.get("schema_version") != "playwright-run-evidence-v1"
+    ):
+        raise ArtifactSchemaError("Playwright run evidence identity is invalid")
+    for name in ("run_id", "session_id", "url", "resulting_job_id", "trace_sha256"):
+        if not str(root.get(name) or "").strip():
+            raise ArtifactSchemaError(f"Playwright run evidence {name} is missing")
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(str(root["url"]))
+    if parsed.scheme != "http" or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ArtifactSchemaError("Playwright run evidence URL is not localhost")
+    trace_hash = str(root.get("trace_sha256") or "")
+    if len(trace_hash) != 64 or trace_hash != trace_hash.lower() or any(
+        char not in "0123456789abcdef" for char in trace_hash
+    ):
+        raise ArtifactSchemaError("Playwright run evidence trace hash is invalid")
+    assertions = root.get("flow_assertions")
+    if not isinstance(assertions, list) or not assertions or any(
+        not isinstance(item, Mapping)
+        or item.get("passed") is not True
+        or not str(item.get("name") or "").strip()
+        for item in assertions
+    ):
+        raise ArtifactSchemaError("Playwright run evidence assertions are incomplete")
+    if not isinstance(root.get("console_errors"), list) or not isinstance(root.get("page_errors"), list):
+        raise ArtifactSchemaError("Playwright run evidence errors must be arrays")
+    if root.get("console_errors") or root.get("page_errors"):
+        raise ArtifactSchemaError("Playwright run evidence contains browser errors")
+
+
+def _validate_playwright_screenshot_manifest(
+    _record: Any,
+    _path: str | Path,
+    root: Mapping[str, Any],
+) -> None:
+    if (
+        root.get("artifact_type") != "playwright_screenshot_manifest"
+        or root.get("artifact_version") != "v1"
+        or root.get("schema_version") != "playwright-screenshot-manifest-v1"
+    ):
+        raise ArtifactSchemaError("Playwright screenshot manifest identity is invalid")
+    screenshots = root.get("screenshots")
+    if not isinstance(screenshots, list) or any(
+        not isinstance(item, Mapping) or not str(item.get("name") or "").strip()
+        or not str(item.get("path") or "").strip()
+        for item in screenshots
+    ):
+        raise ArtifactSchemaError("Playwright screenshot manifest entries are invalid")
+
+
+def _validate_playwright_trace(
+    _record: Any,
+    path: str | Path,
+    _root: Mapping[str, Any] | None,
+) -> None:
+    trace_path = Path(path)
+    try:
+        with zipfile.ZipFile(trace_path) as archive:
+            if archive.testzip() is not None or not any(
+                name.casefold().lstrip("/").endswith("trace.trace")
+                for name in archive.namelist()
+            ):
+                raise ArtifactSchemaError("Playwright trace archive is incomplete")
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ArtifactSchemaError("Playwright trace archive is invalid") from exc
+
+
 def _validate_current_production_artifact(record: Any, path: str | Path, root: Mapping[str, Any] | None) -> None:
     artifact_type = str(getattr(record, "artifact_type", "") or "")
     version = str(getattr(record, "artifact_version", "") or "")
@@ -2356,8 +2506,13 @@ def _validate_current_production_artifact(record: Any, path: str | Path, root: M
             ("stage1_visual_coverage", "v2"): _validate_stage1_visual_coverage_v2,
         ("stage1_visual_evidence", "v3"): _validate_stage1_visual_evidence_v3,
         ("document_modality_profile", "v1"): _validate_document_modality_profile,
+        ("document_modality_profile", "v2"): _validate_document_modality_profile_v2,
         ("ocr_diagnostics", "v1"): _validate_ocr_diagnostics,
-        ("ocr_artifact", "v1"): _validate_ocr_artifact,
+         ("ocr_artifact", "v1"): _validate_ocr_artifact,
+        ("scenario_execution_receipt", "v1"): _validate_scenario_execution_receipt,
+        ("playwright_run_evidence", "v1"): _validate_playwright_run_evidence,
+        ("playwright_screenshot_manifest", "v1"): _validate_playwright_screenshot_manifest,
+        ("playwright_trace", "v1"): _validate_playwright_trace,
         }
     validator = validators.get((artifact_type, version))
     if validator is None:
@@ -2396,6 +2551,7 @@ def validate_registered_artifact(record: Any, path: str | Path) -> None:
             "review_replay_ledger",
             "stage1_portable_summary_source",
             "stage1_portable_provider_ledger",
+            "playwright_trace",
         }:
             root = None
         else:

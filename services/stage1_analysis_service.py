@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import tempfile
 from typing import Any, Callable, Mapping, Sequence, cast
 
 from preprocess.service import PreprocessManager
@@ -42,10 +43,12 @@ from services.artifact_registry import (
     RegistryError,
     file_sha256,
 )
+from services.durable_io import atomic_replace_with_retry
 from services.evidence_manifest import build_evidence_manifest_v1
 from services.job_workspace import (
     JobWorkspace,
     atomic_write_json,
+    is_reparse_path,
     publish_bytes_artifact,
     publish_json_artifact,
     utc_now_iso,
@@ -5023,34 +5026,37 @@ class Stage1AnalysisService:
             "cache_dir", self.workspace.artifact_path("preprocess_cache")
         )
         preprocess_config["Preprocess"] = preprocess_section
-        result = PreprocessManager(preprocess_config, logger=self.logger).prepare_pdf(
-            source_pdf,
-            pin_id=f"{self.job_id}:{paper_key or source_pdf}",
-        )
-        if result is None:
-            raise RuntimeError(f"Stage 1 preprocessing failed or was disabled for {source_pdf}")
-        reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
-        scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
-        if has_blocking_stage1_reason(reasons) and not scanned_primary:
-            raise RuntimeError(
-                f"Stage 1 preprocessing is incomplete for {source_pdf}: {', '.join(reasons)}"
-            )
-        if not str(result.stage1_input_text or "").strip():
-            fallback_text = str(result.plain_text or result.markdown_text or "").strip()
-            if fallback_text and _has_substantive_stage1_text(fallback_text):
-                result = replace(
-                    result,
-                    stage1_input_text=fallback_text,
-                    selected_text_source="plain_text_fallback",
-                    stage1_quality_level="fallback",
+        manager = PreprocessManager(preprocess_config, logger=self.logger)
+        pin_id = f"{self.job_id}:{paper_key or source_pdf}"
+        result = manager.prepare_pdf(source_pdf, pin_id=pin_id)
+        try:
+            if result is None:
+                raise RuntimeError(f"Stage 1 preprocessing failed or was disabled for {source_pdf}")
+            reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
+            scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
+            if has_blocking_stage1_reason(reasons) and not scanned_primary:
+                raise RuntimeError(
+                    f"Stage 1 preprocessing is incomplete for {source_pdf}: {', '.join(reasons)}"
                 )
-        if not str(result.stage1_input_text or "").strip() and not scanned_primary:
-            raise RuntimeError(f"Stage 1 preprocessing produced empty input for {source_pdf}")
-        if scanned_primary and not list(getattr(result, "page_index", []) or []):
-            raise RuntimeError(
-                f"SCANNED_PRIMARY preprocessing produced no page index for {source_pdf}"
-            )
-        return self._snapshot_preprocess_authority(result, paper_key=paper_key or source_pdf)
+            if not str(result.stage1_input_text or "").strip():
+                fallback_text = str(result.plain_text or result.markdown_text or "").strip()
+                if fallback_text and _has_substantive_stage1_text(fallback_text):
+                    result = replace(
+                        result,
+                        stage1_input_text=fallback_text,
+                        selected_text_source="plain_text_fallback",
+                        stage1_quality_level="fallback",
+                    )
+            if not str(result.stage1_input_text or "").strip() and not scanned_primary:
+                raise RuntimeError(f"Stage 1 preprocessing produced empty input for {source_pdf}")
+            if scanned_primary and not list(getattr(result, "page_index", []) or []):
+                raise RuntimeError(
+                    f"SCANNED_PRIMARY preprocessing produced no page index for {source_pdf}"
+                )
+            return self._snapshot_preprocess_authority(result, paper_key=paper_key or source_pdf)
+        finally:
+            if result is not None:
+                manager.release_pin(result.cache_dir, pin_id=pin_id)
 
     def _snapshot_preprocess_authority(self, result: Any, *, paper_key: str) -> Any:
         """Move formal Stage 1 authority into the job-owned workspace.
@@ -5060,7 +5066,13 @@ class Stage1AnalysisService:
         path consumed by Stage 1 is copied into an immutable job-owned snapshot.
         """
 
-        generation_root = Path(str(result.manifest_path)).expanduser().resolve().parent
+        manifest_lexical = Path(str(result.manifest_path)).expanduser()
+        generation_root_lexical = Path(os.path.abspath(str(manifest_lexical.parent)))
+        if is_reparse_path(generation_root_lexical):
+            raise RuntimeError(
+                f"preprocess authority generation root is a reparse point: {generation_root_lexical}"
+            )
+        generation_root = generation_root_lexical.resolve()
         generation_id = generation_root.name
         paper_digest = hashlib.sha256(str(paper_key).encode("utf-8")).hexdigest()[:24]
         snapshot_root = Path(
@@ -5085,17 +5097,89 @@ class Stage1AnalysisService:
         )
         replacements: dict[str, str] = {}
         for field_name in path_fields:
-            source = Path(str(getattr(result, field_name))).expanduser().resolve()
-            if not source.is_file() or source.is_symlink():
+            raw_source = Path(str(getattr(result, field_name))).expanduser()
+            lexical_source = Path(os.path.abspath(str(raw_source)))
+            try:
+                common = os.path.commonpath(
+                    [str(generation_root_lexical), str(lexical_source)]
+                )
+            except ValueError:
+                common = ""
+            if os.path.normcase(common) != os.path.normcase(str(generation_root_lexical)):
+                raise RuntimeError(
+                    f"preprocess authority source escapes its generation: {lexical_source}"
+                )
+            current = lexical_source
+            while os.path.normcase(str(current)) != os.path.normcase(
+                str(generation_root_lexical)
+            ):
+                if current.exists() and is_reparse_path(current):
+                    raise RuntimeError(
+                        f"preprocess authority source path contains a reparse point: {current}"
+                    )
+                parent = current.parent
+                if parent == current:
+                    raise RuntimeError(
+                        f"preprocess authority source generation boundary is invalid: {lexical_source}"
+                    )
+                current = parent
+            if lexical_source.is_symlink() or is_reparse_path(lexical_source):
+                raise RuntimeError(
+                    f"preprocess authority source is a reparse leaf: {lexical_source}"
+                )
+            source = lexical_source.resolve()
+            if not source.is_file() or is_reparse_path(source):
                 raise RuntimeError(
                     f"preprocess authority leaf is missing before snapshot: {source}"
                 )
-            target = snapshot_root / source.name
-            if not target.is_file():
-                shutil.copyfile(source, target)
-                with target.open("r+b") as handle:
+            relative_target = (
+                f"source_evidence/{paper_digest}/{generation_id}/{source.name}"
+            )
+            target = Path(self.workspace.artifact_path(relative_target)).expanduser().resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if is_reparse_path(target) or any(
+                is_reparse_path(parent)
+                for parent in (target.parent, target.parent.parent, target.parent.parent.parent)
+                if parent.exists()
+            ):
+                raise RuntimeError(
+                    f"preprocess authority snapshot path contains a reparse point: {target}"
+                )
+            source_hash = file_sha256(str(source))
+            if target.is_file() and not is_reparse_path(target) and file_sha256(str(target)) == source_hash:
+                replacements[field_name] = str(target)
+                continue
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=str(target.parent),
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as handle, source.open("rb") as source_handle:
+                    shutil.copyfileobj(source_handle, handle, length=1024 * 1024)
+                    handle.flush()
                     os.fsync(handle.fileno())
-            if file_sha256(str(source)) != file_sha256(str(target)):
+                if file_sha256(temp_name) != source_hash:
+                    raise RuntimeError(
+                        f"preprocess authority snapshot temp hash mismatch: {source.name}"
+                    )
+                atomic_replace_with_retry(temp_name, str(target), timeout_seconds=5.0)
+                try:
+                    directory_fd = os.open(str(target.parent), os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    # Windows does not allow fsync on every directory handle;
+                    # file durability and atomic replacement remain mandatory.
+                    pass
+            finally:
+                try:
+                    Path(temp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if source_hash != file_sha256(str(target)):
                 raise RuntimeError(f"preprocess authority snapshot hash mismatch: {source.name}")
             replacements[field_name] = str(target)
         return replace(result, **replacements)

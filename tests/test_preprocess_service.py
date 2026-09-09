@@ -123,6 +123,33 @@ def test_preprocess_pinned_generation_survives_cache_gc(tmp_path: Path, monkeypa
     assert len(pins) >= 2
 
 
+def test_preprocess_short_lived_pin_can_be_released_after_snapshot(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "lease.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "false",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    result = manager.prepare_pdf(str(pdf_path), pin_id="short-lived:paper")
+    assert result is not None
+    pin_dir = Path(result.cache_dir) / "generation_pins"
+    assert list(pin_dir.glob("*.json"))
+
+    assert manager.release_pin(result.cache_dir, pin_id="short-lived:paper") == 1
+    assert not list(pin_dir.glob("*.json"))
+
+
 def test_preprocess_failure_cleans_staging_generation(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "failed.pdf"
     cache_dir = tmp_path / "cache"
