@@ -494,7 +494,7 @@ class AcceptanceExecutionContextV1:
                 "acceptance execution context owner_authorized must be a boolean"
             )
         try:
-            deadline = float(payload.get("absolute_deadline_epoch"))
+            deadline = float(str(payload.get("absolute_deadline_epoch") or ""))
         except (TypeError, ValueError) as exc:
             raise ProviderRuntimeContractError(
                 "acceptance execution context deadline must be numeric"

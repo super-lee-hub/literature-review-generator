@@ -2178,6 +2178,8 @@ class ReviewControlPlane:
                     updated_at=self._utc_now(),
                     plan_sha256=plan_sha,
                 )
+            if state is None:
+                raise ControlPlaneError("acceptance plan state could not be initialized")
             run_dir = state_path.parent / state.run_id
             run_dir.mkdir(parents=True, exist_ok=True)
             state = replace(
@@ -2192,6 +2194,8 @@ class ReviewControlPlane:
             )
             atomic_write_json(str(state_path), state.to_dict())
 
+        if state is None:
+            raise ControlPlaneError("acceptance plan state could not be initialized")
         budget_controller = ProviderBudgetController(plan.budget.to_provider_budget())
         budget_controller.bind_state_path(state.provider_budget_state_path)
         budget_snapshot = budget_controller.snapshot()

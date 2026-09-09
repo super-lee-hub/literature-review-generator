@@ -796,6 +796,9 @@ class ParentAcceptanceResultV2:
                 issues.append(f"missing child {scenario_id}")
                 continue
             raw_receipt = raw.get("receipt")
+            if not isinstance(raw_receipt, Mapping):
+                issues.append(f"invalid child receipt {scenario_id}: receipt is not an object")
+                continue
             try:
                 receipt = ScenarioExecutionReceiptV1.from_mapping(raw_receipt)
             except (ReleaseAcceptanceSpecError, TypeError, ValueError) as exc:
@@ -1647,8 +1650,14 @@ class GateKScenario(AcceptanceScenario):
         refs: Iterable[Mapping[str, Any]],
         *,
         runtime_result: Mapping[str, Any] | None,
+        require_executor_receipt: bool = True,
     ) -> AcceptanceScenarioResultV1:
-        existing = super().collect(context, refs, runtime_result=runtime_result)
+        existing = super().collect(
+            context,
+            refs,
+            runtime_result=runtime_result,
+            require_executor_receipt=require_executor_receipt,
+        )
         if existing.status == "READY_FOR_SEMANTIC_VERIFICATION":
             return existing
         if not context.owner_authorized:
@@ -2508,7 +2517,21 @@ class DocumentModalityProfileV2:
             raise ReleaseAcceptanceSpecError("production modality profile page_count is invalid")
         if integer_values["text_page_count"] > integer_values["page_count"] or integer_values["image_page_count"] > integer_values["page_count"]:
             raise ReleaseAcceptanceSpecError("production modality profile page counts are inconsistent")
-        return cls(**values, **integer_values)
+        return cls(
+            source_pdf_sha256=values["source_pdf_sha256"],
+            preprocess_manifest_hash=values["preprocess_manifest_hash"],
+            stage1_input_manifest_hash=values["stage1_input_manifest_hash"],
+            actual_extractor=values["actual_extractor"],
+            stage1_input_mode=values["stage1_input_mode"],
+            page_count=integer_values["page_count"],
+            text_page_count=integer_values["text_page_count"],
+            image_page_count=integer_values["image_page_count"],
+            table_count=integer_values["table_count"],
+            figure_count=integer_values["figure_count"],
+            scanned_candidate_pages=integer_values["scanned_candidate_pages"],
+            actual_ocr_pages=integer_values["actual_ocr_pages"],
+            actual_selected_visual_count=integer_values["actual_selected_visual_count"],
+        )
 
     @property
     def derived_modality(self) -> str:

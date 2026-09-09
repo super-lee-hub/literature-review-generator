@@ -154,7 +154,7 @@ class PlaywrightEvidenceCollector:
 
     def run(self) -> PlaywrightEvidenceResultV1:
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
             raise PlaywrightEvidenceError("Playwright runtime is not installed") from exc
 
@@ -282,7 +282,7 @@ class PlaywrightEvidenceCollector:
                     gui_process.kill()
                     gui_process.wait(timeout=10)
 
-    def _wait_for_server(self, process: subprocess.Popen[str]) -> None:
+    def _wait_for_server(self, process: subprocess.Popen[Any]) -> None:
         from urllib.request import urlopen
 
         deadline = time.time() + self.input.startup_timeout_seconds
