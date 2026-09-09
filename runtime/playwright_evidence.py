@@ -8,18 +8,16 @@ bound resulting runtime job.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
-import json
 import os
-from pathlib import Path
-import socket
 import subprocess
 import sys
 import time
-from typing import Any, Mapping
 import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping
 
 from services.job_workspace import atomic_write_json
 
@@ -154,7 +152,9 @@ class PlaywrightEvidenceCollector:
 
     def run(self) -> PlaywrightEvidenceResultV1:
         try:
-            from playwright.sync_api import sync_playwright  # pyright: ignore[reportMissingImports]
+            from playwright.sync_api import (  # pyright: ignore[reportMissingImports]
+                sync_playwright,
+            )
         except ImportError as exc:
             raise PlaywrightEvidenceError("Playwright runtime is not installed") from exc
 
@@ -235,6 +235,7 @@ class PlaywrightEvidenceCollector:
                     "schema_version": "playwright-screenshot-manifest-v1",
                     "acceptance_run_id": self.acceptance_run_id,
                     "scenario_id": self.scenario_id,
+                    "job_id": self.input.resulting_job_id,
                     "screenshots": screenshots,
                 },
             )
@@ -260,6 +261,12 @@ class PlaywrightEvidenceCollector:
             )
             if any(item.get("passed") is not True for item in assertions) or console_errors or page_errors:
                 raise PlaywrightEvidenceError("documented Playwright flow did not complete cleanly")
+            self._register_artifacts(
+                browser_path=browser_path,
+                trace_path=trace_path,
+                screenshot_manifest_path=screenshot_manifest_path,
+                screenshot_path=screenshot_path,
+            )
             return PlaywrightEvidenceResultV1(
                 browser_evidence_path=browser_path,
                 trace_path=trace_path,
@@ -281,6 +288,54 @@ class PlaywrightEvidenceCollector:
                 except subprocess.TimeoutExpired:
                     gui_process.kill()
                     gui_process.wait(timeout=10)
+
+    def _register_artifacts(
+        self,
+        *,
+        browser_path: Path,
+        trace_path: Path,
+        screenshot_manifest_path: Path,
+        screenshot_path: Path,
+    ) -> None:
+        """Publish browser outputs to the resulting job's current Registry."""
+
+        from services.artifact_registry import ArtifactRegistry, RegistryError
+
+        registry_path = Path(self.input.workspace).expanduser().resolve() / "artifact_registry.json"
+        registry = ArtifactRegistry(registry_path, self.input.resulting_job_id)
+        files = (
+            ("playwright_run_evidence", "playwright_run_evidence", browser_path),
+            ("playwright_trace", "playwright_trace", trace_path),
+            (
+                "playwright_screenshot_manifest",
+                "playwright_screenshot_manifest",
+                screenshot_manifest_path,
+            ),
+            ("playwright_screenshot", "playwright_screenshot", screenshot_path),
+        )
+        records = []
+        for role, artifact_type, path in files:
+            if not path.is_file() or path.is_symlink():
+                raise PlaywrightEvidenceError(
+                    f"Playwright artifact is missing or unsafe: {path.name}"
+                )
+            records.append(
+                {
+                    "artifact_id": f"acceptance-I:{artifact_type}:{_sha256(path)[:32]}",
+                    "artifact_role": role,
+                    "artifact_type": artifact_type,
+                    "artifact_version": "v1",
+                    "path": str(path),
+                    "producer": "runtime.playwright_evidence.PlaywrightEvidenceCollector",
+                    "job_id": self.input.resulting_job_id,
+                }
+            )
+        try:
+            registry.register_files_atomic(records)
+        except (OSError, RegistryError, TypeError, ValueError) as exc:
+            raise PlaywrightEvidenceError(
+                f"Playwright artifact Registry publication failed: {type(exc).__name__}"
+            ) from exc
 
     def _wait_for_server(self, process: subprocess.Popen[Any]) -> None:
         from urllib.request import urlopen

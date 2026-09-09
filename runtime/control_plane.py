@@ -44,6 +44,7 @@ from runtime.provider_runtime import (
     acceptance_context_environment,
     bind_acceptance_execution_context,
     current_acceptance_execution_context,
+    is_process_alive,
     process_identity_for_pid,
 )
 from runtime.provider_routes import build_reachable_provider_route_plan
@@ -562,7 +563,6 @@ class ReviewControlPlane:
             GateEvidenceProducer,
             GateEvidenceVerifier,
             ReleaseAcceptanceSpec,
-            ReleaseAcceptanceSpecError,
             gate_contract,
             scenario_for_gate,
         )
@@ -1037,6 +1037,44 @@ class ReviewControlPlane:
         ).hexdigest()
 
     @staticmethod
+    def _acceptance_runtime_child_binding(
+        child: Any,
+        runtime_spec: RuntimeJobSpec,
+    ) -> tuple[Path, str]:
+        """Require the plan, RuntimeJobSpec, and runner to share child identity.
+
+        A parent plan's C/D/Q workspace isolation is only meaningful if the
+        referenced RuntimeJobSpec names that exact workspace and job.  Keeping
+        those bindings at this boundary prevents an apparently independent
+        child from silently running in another child's mutable workspace.
+        """
+
+        child_workspace_text = str(getattr(child, "workspace", "") or "").strip()
+        if not child_workspace_text:
+            raise ControlPlaneError("runtime child is missing its declared workspace")
+        child_workspace = Path(child_workspace_text).expanduser().resolve()
+        runtime_workspace_text = str(runtime_spec.workspace_path or "").strip()
+        if not runtime_workspace_text:
+            raise ControlPlaneError(
+                "runtime child RuntimeJobSpec must declare workspace_path"
+            )
+        runtime_workspace = Path(runtime_workspace_text).expanduser().resolve()
+        if runtime_workspace != child_workspace:
+            raise ControlPlaneError(
+                "runtime child RuntimeJobSpec workspace_path does not match the plan workspace"
+            )
+
+        runtime_job_id = str(runtime_spec.job_id or "").strip()
+        if not runtime_job_id:
+            raise ControlPlaneError("runtime child RuntimeJobSpec must declare job_id")
+        child_job_id = str(getattr(child, "job_id", "") or "").strip()
+        if child_job_id and child_job_id != runtime_job_id:
+            raise ControlPlaneError(
+                "runtime child RuntimeJobSpec job_id does not match the plan job_id"
+            )
+        return child_workspace, runtime_job_id
+
+    @staticmethod
     def _acceptance_receipt_ref(
         receipt_path: Path,
         *,
@@ -1303,15 +1341,14 @@ class ReviewControlPlane:
         if not workspace_text:
             raise ControlPlaneError("crash/resume child requires an explicit workspace")
         workspace = Path(workspace_text).expanduser().resolve()
-        job_id = str(child.job_id or runtime_spec.job_id or "").strip()
+        declared_workspace, declared_job_id = self._acceptance_runtime_child_binding(
+            child,
+            runtime_spec,
+        )
+        workspace = declared_workspace
+        job_id = declared_job_id
         if not job_id:
             raise ControlPlaneError("crash/resume child requires a stable job_id")
-        if runtime_spec.workspace_path:
-            declared_workspace = Path(runtime_spec.workspace_path).expanduser().resolve()
-            if declared_workspace != workspace:
-                raise ControlPlaneError(
-                    "crash/resume child workspace does not match RuntimeJobSpec workspace"
-                )
         child_env = acceptance_context_environment(context)
         child_env["AUTO_GENERATE_ACCEPTANCE_RUN_LIVE_ACCEPTANCE"] = "1"
         initial = subprocess.Popen(
@@ -1323,6 +1360,13 @@ class ReviewControlPlane:
             text=True,
         )
         initial_identity = process_identity_for_pid(initial.pid)
+        if initial_identity.creation_time is None:
+            if initial.poll() is None:
+                initial.terminate()
+                initial.wait(timeout=10)
+            raise ControlPlaneError(
+                "crash/resume child process creation identity is unavailable"
+            )
         started_at = self._utc_now()
         initial_output = ""
         boundary_reached = False
@@ -1376,6 +1420,10 @@ class ReviewControlPlane:
         if initial_exit == 0:
             raise ControlPlaneError(
                 "crash/resume terminate scenario received a graceful child exit"
+            )
+        if is_process_alive(initial_identity):
+            raise ControlPlaneError(
+                "crash/resume child remained alive after its reported termination"
             )
         attempt_id = str(before["attempt_ids"][-1] if before["attempt_ids"] else f"{job_id}:initial")
         process_events_path = child_dir / "process_events.jsonl"
@@ -2121,7 +2169,6 @@ class ReviewControlPlane:
             GateEvidenceProducer,
             GateEvidenceVerifier,
             ParentAcceptanceResultV2,
-            ScenarioExecutionReceiptV1,
             gate_contract,
             scenario_for_gate,
         )
@@ -2281,9 +2328,18 @@ class ReviewControlPlane:
                     elif not child.runtime_spec:
                         blocked_reason = "runtime child is missing an independent RuntimeJobSpec"
                     else:
+                        runtime_job_spec = load_runtime_job_spec(child.runtime_spec)
+                        declared_workspace, declared_job_id = self._acceptance_runtime_child_binding(
+                            child,
+                            runtime_job_spec,
+                        )
                         with bind_acceptance_execution_context(execution_context, budget_controller):
                             runtime_result = self.run(child.runtime_spec)
-                        job_value = str(runtime_result.get("job_id") or child_job_id)
+                        job_value = str(runtime_result.get("job_id") or declared_job_id)
+                        if job_value != declared_job_id:
+                            raise ControlPlaneError(
+                                "runtime child result job_id does not match the RuntimeJobSpec"
+                            )
                         child_context = replace(child_context, job_id=job_value)
                         refs.append(
                             GateEvidenceProducer(final_sha=current_sha).reference(
@@ -2294,18 +2350,25 @@ class ReviewControlPlane:
                                 job_id=job_value,
                             )
                         )
-                        workspace = str(runtime_result.get("workspace_path") or child.workspace or "")
-                        runtime_job_spec = load_runtime_job_spec(child.runtime_spec)
+                        workspace = str(
+                            runtime_result.get("workspace_path") or declared_workspace
+                        )
+                        if Path(workspace).expanduser().resolve() != declared_workspace:
+                            raise ControlPlaneError(
+                                "runtime child result workspace_path does not match the RuntimeJobSpec"
+                            )
                         if gate == "D":
                             # Profile publication updates the child Registry;
                             # inventory it only afterwards so the Registry ref
                             # carries the post-profile content hash.
-                            self._acceptance_production_modality_references(
-                                runtime_job_spec,
-                                workspace=workspace,
-                                final_sha=current_sha,
-                                job_id=job_value,
-                                profile_root=evidence_root,
+                            refs.extend(
+                                self._acceptance_production_modality_references(
+                                    runtime_job_spec,
+                                    workspace=workspace,
+                                    final_sha=current_sha,
+                                    job_id=job_value,
+                                    profile_root=evidence_root,
+                                )
                             )
                         if workspace and Path(workspace).is_dir():
                             refs.extend(
@@ -2563,32 +2626,64 @@ class ReviewControlPlane:
                         [*preliminary.evidence_refs, receipt_ref],
                         runtime_result=runtime_result,
                     )
-                    final_refs = list(final_scenario.evidence_refs)
-                    evidence_path = self._write_acceptance_child_manifest(
-                        evidence_path,
-                        gate=gate,
-                        refs=final_refs,
-                        final_sha=current_sha,
-                        parent_run_id=state.run_id,
-                        job_id=child_context.job_id,
-                    )
-                    gate_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))["gates"][gate]
-                    verified = GateEvidenceVerifier().verify(
-                        gate,
-                        gate_evidence,
-                        expected_final_sha=current_sha,
-                        expected_acceptance_run_id=state.run_id,
-                        origin_dir=evidence_path.parent,
-                        expected_job_id=child_context.job_id,
-                    )
-                    child_results[gate] = {
-                        "status": str(verified.get("status") or "NOT_VERIFIED"),
-                        "scenario_id": gate,
-                        "verified": verified,
-                        "receipt": receipt,
-                        "receipt_path": str(receipt_path),
-                        "evidence_manifest": str(evidence_path),
-                    }
+                    if final_scenario.status != "READY_FOR_SEMANTIC_VERIFICATION":
+                        receipt, receipt_ref = self._write_acceptance_receipt(
+                            receipt_path,
+                            parent_run_id=state.run_id,
+                            plan_sha256=plan_sha,
+                            child=child,
+                            final_sha=current_sha,
+                            runtime_spec_sha256=child_runtime_hash,
+                            input_identity_sha256=input_identity,
+                            workspace=child_context.workspace_path or str(child_dir),
+                            job_id=child_context.job_id,
+                            attempt_id=f"{child_context.job_id}:not-verified",
+                            status="NOT_VERIFIED",
+                            exit_status=1,
+                            produced_evidence_refs=(
+                                ref
+                                for ref in final_scenario.evidence_refs
+                                if str(ref.get("role") or "")
+                                != "scenario_execution_receipt"
+                            ),
+                            started_at=started_at,
+                            completed_at=self._utc_now(),
+                        )
+                        child_results[gate] = {
+                            "status": "NOT_VERIFIED",
+                            "scenario_id": gate,
+                            "reason": final_scenario.reason,
+                            "receipt": receipt,
+                            "receipt_path": str(receipt_path),
+                            "evidence_manifest": "",
+                        }
+                    else:
+                        final_refs = list(final_scenario.evidence_refs)
+                        evidence_path = self._write_acceptance_child_manifest(
+                            evidence_path,
+                            gate=gate,
+                            refs=final_refs,
+                            final_sha=current_sha,
+                            parent_run_id=state.run_id,
+                            job_id=child_context.job_id,
+                        )
+                        gate_evidence = json.loads(evidence_path.read_text(encoding="utf-8"))["gates"][gate]
+                        verified = GateEvidenceVerifier().verify(
+                            gate,
+                            gate_evidence,
+                            expected_final_sha=current_sha,
+                            expected_acceptance_run_id=state.run_id,
+                            origin_dir=evidence_path.parent,
+                            expected_job_id=child_context.job_id,
+                        )
+                        child_results[gate] = {
+                            "status": str(verified.get("status") or "NOT_VERIFIED"),
+                            "scenario_id": gate,
+                            "verified": verified,
+                            "receipt": receipt,
+                            "receipt_path": str(receipt_path),
+                            "evidence_manifest": str(evidence_path),
+                        }
             child_states[gate] = {
                 "gate": gate,
                 "scenario_id": gate,

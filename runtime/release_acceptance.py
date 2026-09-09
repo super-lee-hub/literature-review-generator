@@ -545,14 +545,19 @@ class ReleaseAcceptancePlanV2:
             scenarios[gate] = child
         cardinality_gates = [scenarios[gate] for gate in ("C", "D", "Q") if gate in scenarios]
         runtime_specs = [item.runtime_spec.casefold() for item in cardinality_gates if item.runtime_spec]
-        workspaces = [item.workspace.casefold() for item in cardinality_gates if item.workspace]
+        workspaces = [item.workspace.casefold() for item in scenarios.values() if item.workspace]
         if len(runtime_specs) != len(set(runtime_specs)):
             raise ReleaseAcceptanceSpecError(
                 "C, D, and Q acceptance children require independent runtime specs"
             )
         if len(workspaces) != len(set(workspaces)):
             raise ReleaseAcceptanceSpecError(
-                "C, D, and Q acceptance children require independent workspaces"
+                "acceptance children require independent workspaces"
+            )
+        job_ids = [child.job_id.casefold() for child in scenarios.values() if child.job_id]
+        if len(job_ids) != len(set(job_ids)):
+            raise ReleaseAcceptanceSpecError(
+                "acceptance children require independent explicit job IDs"
             )
         raw_ack = payload.get("third_party_acknowledged", payload.get("third_party_acknowledgement", False))
         if isinstance(raw_ack, Mapping):
@@ -1516,7 +1521,14 @@ class GateIScenario(AcceptanceScenario):
             str(item.get("role") or "")
             for item in incoming_refs
             if isinstance(item, Mapping)
-        }.issuperset({"playwright_trace", "browser_evidence", "scenario_execution_receipt"}):
+        }.issuperset(
+            {
+                "playwright_trace",
+                "browser_evidence",
+                "playwright_screenshot_manifest",
+                "scenario_execution_receipt",
+            }
+        ):
             return super().execute(
                 context,
                 incoming_refs,
@@ -1578,6 +1590,14 @@ class GateIScenario(AcceptanceScenario):
                 schema_version="playwright-trace-v1",
                 job_id=context.job_id or scenario_input.resulting_job_id,
             )
+            screenshot_manifest_ref = producer.reference(
+                result.screenshot_manifest_path,
+                role="playwright_screenshot_manifest",
+                artifact_type="playwright_screenshot_manifest",
+                artifact_version="v1",
+                schema_version="playwright-screenshot-manifest-v1",
+                job_id=context.job_id or scenario_input.resulting_job_id,
+            )
             job_id = scenario_input.resulting_job_id
             receipt_path = Path(
                 context.scenario_execution_receipt_path
@@ -1612,7 +1632,7 @@ class GateIScenario(AcceptanceScenario):
                 budget_domain=context.budget_domain,
                 status="PASSED",
                 exit_status=0,
-                produced_evidence_refs=(browser_ref, trace_ref),
+                produced_evidence_refs=(browser_ref, trace_ref, screenshot_manifest_ref),
             )
             from services.job_workspace import atomic_write_json
 
@@ -1630,7 +1650,7 @@ class GateIScenario(AcceptanceScenario):
                 scenario_id="I",
                 status="READY_FOR_SEMANTIC_VERIFICATION",
                 reason="real localhost GUI and Playwright collector produced typed evidence",
-                evidence_refs=(browser_ref, trace_ref, receipt_ref),
+                evidence_refs=(browser_ref, trace_ref, screenshot_manifest_ref, receipt_ref),
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RuntimeError) as exc:
             return self._blocked_execution(
@@ -2204,7 +2224,12 @@ _GATE_REF_ROLES: dict[str, frozenset[str]] = {
     "F": frozenset({"canonical_stage1", "outline_provider_call_plan", "provider_receipt_ledger", "stage_terminal", "closure", "scenario_execution_receipt"}),
     "G": frozenset({"free_mode_profile", "provider_receipt_ledger", "stage_terminal", "scenario_execution_receipt"}),
     "H": frozenset({"defect_artifact", "repair_artifact", "validation_artifact", "provider_receipt_ledger", "scenario_execution_receipt"}),
-    "I": frozenset({"playwright_trace", "browser_evidence", "scenario_execution_receipt"}),
+    "I": frozenset({
+        "playwright_trace",
+        "browser_evidence",
+        "playwright_screenshot_manifest",
+        "scenario_execution_receipt",
+    }),
     "J": frozenset({"source_pdf", "ocr_diagnostics", "ocr_artifact", "canonical_stage1", "registry", "scenario_execution_receipt"}),
     "K": frozenset({"process_events", "lock_state", "scenario_execution_receipt"}),
     "Q": frozenset({"source_pdf", "canonical_stage1", "outline_terminal", "review_docx", "validation_artifact", "provider_receipt_ledger", "registry", "closure", "job_outcome", "citation_manifest", "scenario_execution_receipt"}),
@@ -2258,6 +2283,7 @@ _ROLE_ARTIFACT_TYPES: dict[str, frozenset[str]] = {
     }),
     "playwright_trace": frozenset({"playwright_trace"}),
     "browser_evidence": frozenset({"playwright_run_evidence"}),
+    "playwright_screenshot_manifest": frozenset({"playwright_screenshot_manifest"}),
     "scenario_execution_receipt": frozenset({"scenario_execution_receipt"}),
 }
 
@@ -3176,8 +3202,16 @@ class GateEvidenceVerifier:
         if gate == "I":
             trace_refs = by_role.get("playwright_trace", [])
             browser_refs = by_role.get("browser_evidence", [])
-            if len(trace_refs) != 1 or len(browser_refs) != 1:
-                return {}, "Playwright evidence requires one trace archive and one run metadata artifact"
+            screenshot_manifest_refs = by_role.get("playwright_screenshot_manifest", [])
+            if (
+                len(trace_refs) != 1
+                or len(browser_refs) != 1
+                or len(screenshot_manifest_refs) != 1
+            ):
+                return {}, (
+                    "Playwright evidence requires one trace archive, one run metadata "
+                    "artifact, and one screenshot manifest"
+                )
             trace_ref = trace_refs[0]
             trace_path = self._resolve_path(trace_ref.path, origin_dir=origin_dir)
             if trace_path.suffix.casefold() != ".zip":
@@ -3234,6 +3268,30 @@ class GateEvidenceVerifier:
                 return {}, "Playwright run metadata is not bound to the trace archive"
             if expected_job_id and str(browser_payload.get("resulting_job_id")) != expected_job_id:
                 return {}, "Playwright run metadata resulting job does not match acceptance job"
+            screenshot_manifest = payloads.get(screenshot_manifest_refs[0].ref_id)
+            if not isinstance(screenshot_manifest, Mapping):
+                return {}, "Playwright screenshot manifest must be a JSON object"
+            if (
+                screenshot_manifest.get("artifact_type") != "playwright_screenshot_manifest"
+                or screenshot_manifest.get("schema_version")
+                != "playwright-screenshot-manifest-v1"
+            ):
+                return {}, "Playwright screenshot manifest schema is invalid"
+            if (
+                screenshot_manifest.get("acceptance_run_id") != browser_payload.get("run_id")
+                or screenshot_manifest.get("scenario_id") != "I"
+                or screenshot_manifest.get("job_id")
+                != browser_payload.get("resulting_job_id")
+            ):
+                return {}, "Playwright screenshot manifest is not bound to the browser run"
+            screenshots = screenshot_manifest.get("screenshots")
+            if not isinstance(screenshots, list) or not screenshots or any(
+                not isinstance(item, Mapping)
+                or not str(item.get("name") or "").strip()
+                or not str(item.get("path") or "").strip()
+                for item in screenshots
+            ):
+                return {}, "Playwright screenshot manifest has no valid screenshot records"
             return {
                 "playwright": True,
                 "browser_evidence": True,
@@ -4112,6 +4170,7 @@ class GateEvidenceVerifier:
                     not_playwright = ref.role in {
                         "playwright_trace",
                         "browser_evidence",
+                        "playwright_screenshot_manifest",
                     }
                     return {
                         "status": (

@@ -1,27 +1,28 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from runtime.release_acceptance import (
-    ParentAcceptanceResultV2,
-    ReleaseAcceptancePlanV2,
-    ReleaseAcceptanceSpec,
-    ReleaseAcceptanceSpecError,
-    ScenarioExecutionReceiptV1,
-    ProcessInterruptionEventV1,
-)
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
     ProviderAggregateBudgetV1,
     ProviderBudgetController,
-    bind_acceptance_execution_context,
     acceptance_context_environment,
+    bind_acceptance_execution_context,
+)
+from runtime.release_acceptance import (
+    AcceptanceScenarioResultV1,
+    ParentAcceptanceResultV2,
+    ProcessInterruptionEventV1,
+    ReleaseAcceptancePlanV2,
+    ReleaseAcceptanceSpec,
+    ReleaseAcceptanceSpecError,
+    ScenarioExecutionReceiptV1,
 )
 
 
@@ -69,6 +70,21 @@ def test_parent_plan_requires_independent_child_specs_for_incompatible_gates() -
                 "gates": ["C", "D", "Q"],
             }
         )
+
+
+@pytest.mark.parametrize("field", ("workspace", "job_id"))
+def test_parent_plan_rejects_shared_child_identity(field: str) -> None:
+    payload = _plan_payload()
+    payload["scenarios"] = {
+        "C": _child("C", "c-runtime.json"),
+        "D": _child("D", "d-runtime.json"),
+    }
+    payload["scenarios"]["D"][field] = payload["scenarios"]["C"][field] = (
+        "shared-child-identity" if field == "workspace" else "shared-job"
+    )
+
+    with pytest.raises(ReleaseAcceptanceSpecError, match="independent"):
+        ReleaseAcceptancePlanV2.from_mapping(payload)
 
 
 def _receipt_payload(**overrides: object) -> dict[str, object]:
@@ -207,11 +223,13 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
     payload = _plan_payload()
     payload["state_path"] = "acceptance-state.json"
     for gate in ("C", "D", "Q"):
+        workspace = tmp_path / f"workspace-{gate}"
         (tmp_path / f"{gate.lower()}-runtime.json").write_text(
             json.dumps(
                 {
                     "project_name": f"acceptance-{gate.lower()}",
                     "job_id": f"job-{gate.lower()}",
+                    "workspace_path": str(workspace),
                     "source": {"mode": "direct", "pdf_folder": "missing-papers"},
                 }
             ),
@@ -229,7 +247,7 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
             "completion_status": "complete",
             "success": True,
             "job_id": f"job-{gate.lower()}",
-            "workspace_path": str(tmp_path / f"workspace-{gate.lower()}"),
+            "workspace_path": str(tmp_path / f"workspace-{gate}"),
         }
 
     monkeypatch.setattr(control, "run", fake_run)
@@ -249,6 +267,186 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
         "D": "BLOCKED",
         "Q": "NOT_VERIFIED",
     }
+
+
+def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A published Gate D profile is evidence, not only a Registry side effect."""
+
+    import runtime.release_acceptance as release_acceptance_module
+    from runtime.control_plane import ReviewControlPlane
+    from runtime.release_acceptance import GateEvidenceProducer
+
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    source_dir = tmp_path / "papers"
+    source_dir.mkdir()
+    workspace = tmp_path / "workspace-d"
+    workspace.mkdir()
+    runtime_spec = tmp_path / "d-runtime.json"
+    runtime_spec.write_text(
+        json.dumps(
+            {
+                "project_name": "acceptance-d",
+                "job_id": "job-d",
+                "workspace_path": str(workspace),
+                "source": {"mode": "direct", "pdf_folder": str(source_dir)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    payload = {
+        "schema_version": "release-acceptance-plan-v2",
+        "parent_run_id": "parent-d",
+        "budget": {"max_provider_calls_total": 1},
+        "state_path": "acceptance-state.json",
+        "scenarios": {
+            "D": {
+                "scenario_id": "D",
+                "gate": "D",
+                "runtime_spec": "d-runtime.json",
+                "workspace": str(workspace),
+                "job_id": "job-d",
+                "execution_mode": "runtime",
+                "budget_domain": "live",
+                "prerequisites": [],
+            }
+        },
+    }
+    plan_path = tmp_path / "acceptance-plan.json"
+    plan_path.write_text(json.dumps(payload), encoding="utf-8")
+    control = ReviewControlPlane(repo_root=Path.cwd())
+    final_sha = control._acceptance_checkout_sha(control.repo_root)
+    modality_path = tmp_path / "modality-profile.json"
+    modality_path.write_text("{}", encoding="utf-8")
+    modality_ref = GateEvidenceProducer(final_sha=final_sha).reference(
+        modality_path,
+        role="modality_profile",
+        artifact_type="document_modality_profile",
+        artifact_version="v2",
+        schema_version="document-modality-profile-v2",
+        job_id="job-d",
+    )
+    collected: list[dict[str, object]] = []
+
+    class SpyScenario:
+        def collect(self, _context, refs, **_kwargs):
+            collected.extend(dict(ref) for ref in refs)
+            return AcceptanceScenarioResultV1(
+                gate="D",
+                scenario_id="D",
+                status="READY_FOR_SEMANTIC_VERIFICATION",
+                reason="test scenario",
+                evidence_refs=tuple(refs),
+            )
+
+        def execute(self, _context, refs, **_kwargs):
+            return AcceptanceScenarioResultV1(
+                gate="D",
+                scenario_id="D",
+                status="BLOCKED_SCENARIO_EXECUTION",
+                reason="final scenario action was blocked",
+                evidence_refs=tuple(refs),
+            )
+
+    class FakeVerifier:
+        def verify(self, *_args, **_kwargs):
+            return {"status": "NOT_VERIFIED", "reason": "test verifier"}
+
+    monkeypatch.setattr(
+        control,
+        "run",
+        lambda _path: {
+            "status": "complete",
+            "job_status": "completed",
+            "completion_status": "complete",
+            "job_id": "job-d",
+            "workspace_path": str(workspace),
+        },
+    )
+    monkeypatch.setattr(
+        control,
+        "_acceptance_production_modality_references",
+        lambda *_args, **_kwargs: [modality_ref],
+    )
+    monkeypatch.setattr(control, "_acceptance_workspace_references", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(control, "_acceptance_source_references", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(release_acceptance_module, "scenario_for_gate", lambda _gate: SpyScenario())
+    monkeypatch.setattr(release_acceptance_module, "GateEvidenceVerifier", FakeVerifier)
+
+    result = control.acceptance_run(plan_path)
+
+    assert result["scenarios"]["D"]["status"] == "NOT_VERIFIED"
+    assert result["scenarios"]["D"]["receipt"]["status"] == "NOT_VERIFIED"
+    assert any(ref.get("role") == "modality_profile" for ref in collected)
+
+
+@pytest.mark.parametrize("mismatch", ("workspace", "job_id"))
+def test_runtime_child_rejects_plan_to_runtime_identity_mismatch_before_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    from runtime.control_plane import ReviewControlPlane
+
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    source_dir = tmp_path / "papers"
+    source_dir.mkdir()
+    expected_workspace = tmp_path / "workspace-d"
+    runtime_workspace = (
+        tmp_path / "other-workspace" if mismatch == "workspace" else expected_workspace
+    )
+    expected_job_id = "job-d"
+    runtime_job_id = "other-job" if mismatch == "job_id" else expected_job_id
+    runtime_spec = tmp_path / "d-runtime.json"
+    runtime_spec.write_text(
+        json.dumps(
+            {
+                "project_name": "acceptance-d",
+                "job_id": runtime_job_id,
+                "workspace_path": str(runtime_workspace),
+                "source": {"mode": "direct", "pdf_folder": str(source_dir)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_path = tmp_path / "acceptance-plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "release-acceptance-plan-v2",
+                "parent_run_id": f"parent-{mismatch}",
+                "state_path": "acceptance-state.json",
+                "scenarios": {
+                    "D": {
+                        "scenario_id": "D",
+                        "gate": "D",
+                        "runtime_spec": "d-runtime.json",
+                        "workspace": str(expected_workspace),
+                        "job_id": expected_job_id,
+                        "execution_mode": "runtime",
+                        "budget_domain": "live",
+                        "prerequisites": [],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+    control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(
+        control,
+        "run",
+        lambda path: calls.append(str(path)) or {"status": "complete"},
+    )
+
+    result = control.acceptance_run(plan_path)
+
+    assert calls == []
+    assert result["scenarios"]["D"]["status"] == "BLOCKED"
+    assert mismatch in str(result["scenarios"]["D"]["reason"])
 
 
 def test_acceptance_context_child_environment_does_not_mutate_parent_environment(

@@ -381,15 +381,45 @@ def test_gate_evidence_verifier_rejects_unbound_metadata_even_with_durable_refs(
 def test_gate_evidence_verifier_reopens_hashed_browser_artifacts(tmp_path: Path) -> None:
     trace = tmp_path / "playwright_trace.json"
     browser = tmp_path / "browser_evidence.json"
+    screenshot_manifest = tmp_path / "screenshot_manifest.json"
     trace.write_text(json.dumps({"status": "passed"}), encoding="utf-8")
     browser.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    screenshot_manifest.write_text(
+        json.dumps(
+            {
+                "artifact_type": "playwright_screenshot_manifest",
+                "artifact_version": "v1",
+                "schema_version": "playwright-screenshot-manifest-v1",
+                "acceptance_run_id": "test-run-i",
+                "scenario_id": "I",
+                "screenshots": [{"name": "dashboard", "path": "dashboard.png"}],
+            }
+        ),
+        encoding="utf-8",
+    )
     producer = GateEvidenceProducer(final_sha="b" * 40)
     evidence = producer.build_gate(
         "I",
         [
             producer.reference(trace, role="playwright_trace"),
             producer.reference(browser, role="browser_evidence"),
+            producer.reference(
+                screenshot_manifest,
+                role="playwright_screenshot_manifest",
+                artifact_type="playwright_screenshot_manifest",
+                artifact_version="v1",
+                schema_version="playwright-screenshot-manifest-v1",
+            ),
+            _scenario_receipt_ref(
+                tmp_path,
+                producer,
+                gate="I",
+                final_sha="b" * 40,
+                acceptance_run_id="test-run-i",
+            ),
         ],
+        acceptance_run_id="test-run-i",
+        scenario_id="I",
     )
     result = GateEvidenceVerifier().verify(
         "I",
