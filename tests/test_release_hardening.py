@@ -352,6 +352,7 @@ def test_gate_evidence_verifier_reopens_hashed_browser_artifacts(tmp_path: Path)
 def test_gate_k_rejects_fake_process_ids_and_lock_file(tmp_path: Path) -> None:
     process_events = tmp_path / "process-events.jsonl"
     lock_state = tmp_path / "lock-state.json"
+    scenario_receipt = tmp_path / "scenario-execution-receipt.json"
     process_events.write_text(
         json.dumps({"pid": 1111, "event": "started"})
         + "\n"
@@ -360,13 +361,65 @@ def test_gate_k_rejects_fake_process_ids_and_lock_file(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     lock_state.write_text(json.dumps({"status": "locked"}), encoding="utf-8")
+    scenario_receipt.write_text(
+        json.dumps(
+            {
+                "artifact_type": "scenario_execution_receipt",
+                "artifact_version": "v1",
+                "schema_version": "scenario-execution-receipt-v1",
+                "parent_acceptance_run_id": "test-run",
+                "scenario_id": "K",
+                "gate": "K",
+                "final_executable_sha": "e" * 40,
+                "plan_sha256": "a" * 64,
+                "runtime_spec_sha256": "b" * 64,
+                "input_identity_sha256": "c" * 64,
+                "workspace_identity_sha256": "d" * 64,
+                "executor_pid": os.getpid(),
+                "executor_process_creation_identity": "test-process",
+                "executor_host_id": "test-host",
+                "started_at": "2026-01-01T00:00:00Z",
+                "completed_at": "2026-01-01T00:00:01Z",
+                "action_type": "offline-k",
+                "workspace": str(tmp_path),
+                "job_id": "test-job",
+                "attempt_id": "test-attempt",
+                "budget_domain": "offline-k",
+                "status": "PASSED",
+                "exit_status": 0,
+                "produced_evidence_refs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
     producer = GateEvidenceProducer(final_sha="e" * 40)
     evidence = producer.build_gate(
         "K",
         [
-            producer.reference(process_events, role="process_events"),
-            producer.reference(lock_state, role="lock_state"),
+            producer.reference(
+                process_events,
+                role="process_events",
+                artifact_type="acceptance_process_event",
+                artifact_version="v1",
+                schema_version="process-event-v1",
+            ),
+            producer.reference(
+                lock_state,
+                role="lock_state",
+                artifact_type="contention_result",
+                artifact_version="v1",
+                schema_version="contention-result-v1",
+            ),
+            producer.reference(
+                scenario_receipt,
+                role="scenario_execution_receipt",
+                artifact_type="scenario_execution_receipt",
+                artifact_version="v1",
+                schema_version="scenario-execution-receipt-v1",
+            ),
         ],
+        acceptance_run_id="test-run",
+        scenario_id="K",
     )
 
     result = GateEvidenceVerifier().verify(
