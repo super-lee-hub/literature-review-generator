@@ -1,4 +1,4 @@
-# Final hardening and live acceptance — 2026-09-09
+# Final hardening and live acceptance — 2026-09-10
 
 ## Release decision
 
@@ -8,11 +8,11 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-PRODUCTION_RUNTIME_SHA = c966473a80e1ce9da30144833a36d15e86e3a04a
-FINAL_EXECUTABLE_SHA = c966473a80e1ce9da30144833a36d15e86e3a04a
-PR_HEAD_SHA_AT_CODE_ACCEPTANCE = c966473a80e1ce9da30144833a36d15e86e3a04a
+PRODUCTION_RUNTIME_SHA = 53b18f51b5fee58e23ed3014383a6660baa2471d
+FINAL_EXECUTABLE_SHA = 53b18f51b5fee58e23ed3014383a6660baa2471d
+PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 53b18f51b5fee58e23ed3014383a6660baa2471d
 REPORT_ONLY_SHA = recorded in PR #24 body after this self-referential report commit is pushed
-HOSTED_CI_RUN = 34370711332
+HOSTED_CI_RUN = 34381147976
 HOSTED_CI_CONCLUSION = SUCCESS
 CODE_HARDENING_STATUS = PASS
 OFFLINE_HOSTED_STATUS = PASS
@@ -31,7 +31,7 @@ push because an immutable Git object cannot truthfully include its own SHA.
 
 This follow-up closes the remaining false-PASS and provenance gaps identified
 in the pasted audit. The executable code/test SHA is
-`c966473a80e1ce9da30144833a36d15e86e3a04a`; any later report commit is
+`53b18f51b5fee58e23ed3014383a6660baa2471d`; any later report commit is
 documentation-only and is not substituted for that SHA.
 
 - Windows provider liveness now uses non-destructive process inspection and
@@ -57,10 +57,14 @@ documentation-only and is not substituted for that SHA.
   EvidenceManifest are durable, then is released in both success and exception
   paths. GC rejects reparse paths and removes expired or malformed leases;
   legacy `pin_id` callers remain compatible.
-- Doctor stale-lock reporting probes lock contention instead of mtime alone;
-  Local RAG identity changes create a new immutable collection; legacy manual
-  diagnostics are outside pytest and network-disabled by default; the public
-  CLI smoke covers both `micro-probe` and `acceptance-run` help.
+- Doctor stale-lock reporting probes lock contention instead of mtime alone.
+  Local RAG identity changes create immutable collections, and the cache now
+  retains the current identity plus a configurable number of recent identities
+  per collection family. Only hash-valid sidecars can authorize deletion, the
+  current collection is always protected, and backend deletion failure retains
+  the sidecar for a later retry. Legacy manual diagnostics are outside pytest
+  and network-disabled by default; the public CLI smoke covers both
+  `micro-probe` and `acceptance-run` help.
 - Parent-plan child execution now binds every runtime child to the declared
   `RuntimeJobSpec` job/workspace identity, rejects shared child workspaces or
   explicit job IDs, and records a non-PASSED receipt when the final scenario
@@ -108,13 +112,14 @@ This code revision adds the following fail-closed boundaries:
   tuple plus content hash. The reachable legacy pdf_extractor fallback was
   removed; its standalone compatibility tests cover partial-parser duplication.
 - Local RAG identity binds source/fingerprint/chunk-schema/embedding model,
-  and embedding-model download is opt-in. Flat runtime-spec mappings reject
-  unknown fields, and action-bound config validation no longer falls back to a
-  legacy one-argument validator.
+  embedding-model download is opt-in, and immutable identity retention is
+  bounded by `local_rag_retain_recent_identities` (default `2`, allowed
+  `0..1000`). Flat runtime-spec mappings reject unknown fields, and action-bound
+  config validation no longer falls back to a legacy one-argument validator.
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`. Hosted
-run `34370711332` completed successfully on that exact SHA. Any later
+run `34381147976` completed successfully on that exact SHA. Any later
 docs-only report commit is not used as executable validation evidence.
 
 ## Git, PR, and Hosted CI read-back
@@ -124,9 +129,9 @@ docs-only report commit is not used as executable validation evidence.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at exact code/CI acceptance | `c966473a80e1ce9da30144833a36d15e86e3a04a` |
-| Hosted run | [34370711332](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34370711332) |
-| Hosted head SHA | `c966473a80e1ce9da30144833a36d15e86e3a04a` |
+| Remote head at exact code/CI acceptance | `53b18f51b5fee58e23ed3014383a6660baa2471d` |
+| Hosted run | [34381147976](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34381147976) |
+| Hosted head SHA | `53b18f51b5fee58e23ed3014383a6660baa2471d` |
 | Hosted result | `SUCCESS` |
 
 The Hosted evidence is bound to the exact final executable SHA. The report
@@ -282,13 +287,15 @@ zero.
 ### Local exact-SHA checks
 
 The current executable acceptance SHA is
-`c966473a80e1ce9da30144833a36d15e86e3a04a`. The report-only update is a child
+`53b18f51b5fee58e23ed3014383a6660baa2471d`. The report-only update is a child
 commit and does not change the executable source under test.
 
 | Check | Result | Scope |
 |---|---|---|
 | Typed generation-lease and Stage 1 lifecycle regressions | `8 passed` | Final local bytes; covers lease retention/release, expiry cleanup, stale-generation rejection, reparse rejection, and success/exception release |
-| Test collection | `1520 collected` | Final local bytes; collection only, not a local full-suite execution claim |
+| Local RAG retention focused regressions | `9 passed` | Final local bytes; covers bounded retention, current protection, deletion retry, config forwarding, and strict invalid-value rejection |
+| Preprocess/release/config/setup adjacency suite | `131 passed, 1 skipped` | Final local bytes; optional Windows symlink privilege is the only skip |
+| Test collection | `1527 collected` | Final local bytes; collection only, not a local full-suite execution claim |
 | Full Pyright | `0 errors, 0 warnings, 0 informations` | Final local bytes across the repository |
 | `compileall` | PASS | Current runtime/services/preprocess/validation/outline/free-mode/scripts surface |
 | `pip check` | PASS | Local interpreter |
@@ -309,17 +316,17 @@ surface is therefore closed by the Hosted run below.
 
 ### Hosted exact-SHA checks
 
-Hosted run `34370711332` passed all five Windows matrix jobs on
-`c966473a80e1ce9da30144833a36d15e86e3a04a`. Each job passed installation,
+Hosted run `34381147976` passed all five Windows matrix jobs on
+`53b18f51b5fee58e23ed3014383a6660baa2471d`. Each job passed installation,
 compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
 and committed-range whitespace checks. The exact job read-back was:
 
 ```text
-test (1) job 102530901046: SUCCESS
-test (2) job 102530901071: SUCCESS
-test (3) job 102530901105: SUCCESS
-test (4) job 102530900811: SUCCESS
-test (5) job 102530901065: SUCCESS
+test (1) job 102566030002: SUCCESS
+test (2) job 102566030122: SUCCESS
+test (3) job 102566029664: SUCCESS
+test (4) job 102566029990: SUCCESS
+test (5) job 102566030794: SUCCESS
 all five matrix jobs returned zero workflow exit status
 ```
 
@@ -333,7 +340,7 @@ acceptance evidence.
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FOCUSED` | Hosted run `34370711332` passed on exact SHA `c966473a80e1ce9da30144833a36d15e86e3a04a`; focused local lease tests and static checks passed |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FOCUSED` | Hosted run `34381147976` passed on exact SHA `53b18f51b5fee58e23ed3014383a6660baa2471d`; focused local lease/retention tests and static checks passed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
