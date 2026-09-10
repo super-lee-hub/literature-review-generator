@@ -20,7 +20,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence, cast
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, cast
 
 from models import APIConfig
 from preprocess.service import PreprocessManager
@@ -53,6 +53,7 @@ from services.durable_io import atomic_replace_with_retry
 from services.evidence_manifest import build_evidence_manifest_v1
 from services.job_workspace import (
     JobWorkspace,
+    atomic_write_json,
     is_reparse_path,
     publish_bytes_artifact,
     publish_json_artifact,
@@ -115,6 +116,10 @@ _PLACEHOLDER_RE = re.compile(
     re.IGNORECASE,
 )
 _PAGE_MARKER_ONLY_RE = re.compile(r"(?m)^\s*(?:--- Page \d+ ---|## Page \d+)\s*$")
+_STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_TYPE = (
+    "stage1_generation_lease_cleanup_failure"
+)
+_STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_VERSION = "v1"
 
 
 def _has_substantive_stage1_text(value: Any) -> bool:
@@ -151,6 +156,20 @@ class _PreparedStage1Item:
     visual_bundle: dict[str, Any]
     reuse_eligibility: Stage1ReuseEligibilityV1 | None = None
     current_binding: Stage1ReusableSummaryBindingV1 = Stage1ReusableSummaryBindingV1()
+
+
+@dataclass(frozen=True)
+class _Stage1ItemDeclaration:
+    """Lightweight predeclaration retained while the provider graph is frozen."""
+
+    item: PaperWorkItem
+    previous: dict[str, Any] | None
+    current_binding: Stage1ReusableSummaryBindingV1
+    current_binding_hash: str
+    reuse_eligibility: Stage1ReuseEligibilityV1 | None
+    primary_config: dict[str, Any]
+    backup_config: dict[str, Any]
+    stage1_input_settings: dict[str, Any]
 
 
 class Stage1AnalysisService:
@@ -234,31 +253,52 @@ class Stage1AnalysisService:
         reused_count = 0
         generated_count = 0
 
-        # Preprocess and bind every work item before the first provider call.
-        # The expected graph is therefore independent of whichever item or
-        # retry happens to execute first.
-        prepared = [
-            self._prepare_item(item, existing.get(self._paper_key(item)))
-            for item in bundle.paper_work_items
-        ]
-        self._predeclare_expected_calls(bundle, prepared)
-        prepared = [
-            replace(item, current_binding=self._bind_execution_provenance(item.current_binding))
-            for item in prepared
-        ]
-        for item in prepared:
+        # Freeze the complete expected graph before any provider transport,
+        # while retaining only lightweight declarations.  Each heavy
+        # ``_PreparedStage1Item`` produced by the generator is released as
+        # soon as its call identities have been projected into the graph.
+        declarations = self._predeclare_expected_calls(
+            bundle,
+            (
+                self._prepare_item(item, existing.get(self._paper_key(item)))
+                for item in bundle.paper_work_items
+            ),
+        )
+        declarations = tuple(
+            replace(
+                declaration,
+                current_binding=self._bind_execution_provenance(declaration.current_binding),
+            )
+            for declaration in declarations
+        )
+        for declaration in declarations:
             self._check_cancelled()
-            summary, receipt_ids = self._execute_prepared(item)
+            # Reuse adjudication already happened during predeclaration.  The
+            # JIT pass rebuilds input materialization with no prior-summary
+            # side effects, then restores that frozen adjudication before the
+            # provider/reuse executor runs.
+            prepared = self._prepare_item(declaration.item, None)
+            prepared = replace(
+                prepared,
+                previous=declaration.previous,
+                reuse_eligibility=declaration.reuse_eligibility,
+            )
+            self._assert_jit_declaration_matches(declaration, prepared)
+            prepared = replace(
+                prepared,
+                current_binding=self._bind_execution_provenance(prepared.current_binding),
+            )
+            summary, receipt_ids = self._execute_prepared(prepared)
             summaries.append(summary)
-            paper_key = self._paper_key(item.item)
+            paper_key = self._paper_key(prepared.item)
             preprocess = summary.get("preprocess") if isinstance(summary, Mapping) else None
-            preprocess = preprocess if isinstance(preprocess, Mapping) else item.preprocess_metadata
+            preprocess = preprocess if isinstance(preprocess, Mapping) else prepared.preprocess_metadata
             source_items.append(
                 {
                     "canonical_paper_key": paper_key,
-                    "source_paper_id": item.item.source_paper_id,
-                    "source_pdf": item.item.source_pdf,
-                    "disposition": "reused" if item.previous is not None else "provider_generated",
+                    "source_paper_id": prepared.item.source_paper_id,
+                    "source_pdf": prepared.item.source_pdf,
+                    "disposition": "reused" if prepared.previous is not None else "provider_generated",
                     "provider_receipt_ids": list(receipt_ids),
                     "reuse_evidence_id": str(
                         (summary.get("reuse_metadata") or {}).get("reuse_evidence_id") or ""
@@ -269,10 +309,15 @@ class Stage1AnalysisService:
                     "evidence_manifest_hash": str(preprocess.get("evidence_manifest_hash") or ""),
                 }
             )
-            if item.previous is not None:
+            if prepared.previous is not None:
                 reused_count += 1
             else:
                 generated_count += 1
+
+            # Drop references to large prompt/content structures before the
+            # next paper is materialized.  The loop variable is rebound on the
+            # next iteration and declarations contain no heavy inputs.
+            del prepared
 
         if len(summaries) != len(bundle.paper_work_items):
             raise RuntimeError("Stage 1 did not produce one result for every source work item")
@@ -415,6 +460,63 @@ class Stage1AnalysisService:
             reuse_eligibility=reuse_eligibility,
             current_binding=current_binding,
         )
+
+    @staticmethod
+    def _stage1_binding_identity_hash(
+        binding: Stage1ReusableSummaryBindingV1,
+    ) -> str:
+        """Hash the input binding used to prove JIT materialization parity."""
+
+        # Only immutable input semantics belong here. Evidence-manifest,
+        # Registry, receipt-closure, graph, and ``extra`` fields are execution
+        # provenance and may legitimately change when a scanned generation is
+        # rebuilt during JIT materialization.
+        identity_fields = (
+            "canonical_paper_key",
+            "source_mode",
+            "source_pdf_content_sha256",
+            "stage1_extracted_text_hash",
+            "stage1_semantic_input_hash",
+            "preprocess_contract_hash",
+            "prompt_id",
+            "prompt_version",
+            "prompt_sha256",
+            "prompt_template_hash",
+            "input_builder_policy_hash",
+            "provider",
+            "model",
+            "endpoint_type",
+            "provider_config_hash",
+            "summary_schema_hash",
+            "visual_input_manifest_hash",
+            "visual_coverage_hash",
+            "visual_scan_schema_hash",
+        )
+        payload = {
+            field_name: getattr(binding, field_name)
+            for field_name in identity_fields
+        }
+        return hash_json(payload)
+
+    def _assert_jit_declaration_matches(
+        self,
+        declaration: _Stage1ItemDeclaration,
+        prepared: _PreparedStage1Item,
+    ) -> None:
+        current_hash = self._stage1_binding_identity_hash(prepared.current_binding)
+        if current_hash != declaration.current_binding_hash:
+            raise RuntimeError(
+                "Stage 1 JIT materialization identity mismatch for "
+                f"{self._paper_key(declaration.item)}: "
+                f"declared={declaration.current_binding_hash}, current={current_hash}"
+            )
+        declared_reuse = declaration.previous is not None
+        current_reuse = prepared.previous is not None
+        if declared_reuse != current_reuse:
+            raise RuntimeError(
+                "Stage 1 JIT reuse disposition changed after expected-call graph "
+                f"freeze for {self._paper_key(declaration.item)}"
+            )
 
     def _build_current_binding(
         self,
@@ -1146,14 +1248,51 @@ class Stage1AnalysisService:
     def _predeclare_expected_calls(
         self,
         bundle: SourceBundle,
-        prepared: Sequence[_PreparedStage1Item],
-    ) -> None:
+        prepared: Iterable[_PreparedStage1Item],
+    ) -> tuple[_Stage1ItemDeclaration, ...]:
         source_bundle_hash, runtime_spec_hash = self._ensure_durable_input_records(bundle)
         # Exact summary reuse is evidence, not provider work. The expected
         # graph contains only items that can genuinely produce a receipt.
         graph_seed: list[dict[str, Any]] = []
+        declarations: list[_Stage1ItemDeclaration] = []
+        config_facts: list[dict[str, Any]] = []
         for item in prepared:
+            config_facts.append(
+                {
+                    "primary_reader": dict(item.primary_config),
+                    "stage1_input": _redact_mapping(item.stage1_input_settings),
+                    "stage1_output_budget_plans": {
+                        "visual_scan": stage1_output_budget_snapshot(
+                            "visual_scan",
+                            item.stage1_input_settings,
+                            provider_config=item.primary_config,
+                        ),
+                        "synthesis": stage1_output_budget_snapshot(
+                            "synthesis",
+                            item.stage1_input_settings,
+                            provider_config=item.primary_config,
+                        ),
+                        "timeout_seconds": stage1_request_timeout_seconds(
+                            item.stage1_input_settings,
+                        ),
+                        "semantic_retry_max_attempts": stage1_semantic_retry_max_attempts(
+                            item.stage1_input_settings,
+                        ),
+                    },
+                }
+            )
+            declaration = _Stage1ItemDeclaration(
+                item=item.item,
+                previous=item.previous,
+                current_binding=item.current_binding,
+                current_binding_hash=self._stage1_binding_identity_hash(item.current_binding),
+                reuse_eligibility=item.reuse_eligibility,
+                primary_config=dict(item.primary_config),
+                backup_config=dict(item.backup_config),
+                stage1_input_settings=dict(item.stage1_input_settings),
+            )
             if item.previous is not None:
+                declarations.append(declaration)
                 continue
             paper_key = self._paper_key(item.item)
             vision_enabled = detect_multimodal_capability(item.primary_config).supports_image_input
@@ -1291,7 +1430,7 @@ class Stage1AnalysisService:
                 if scan_call_planned
                 else primary_variants[0]["input_hash"]
             )
-            backup_hash = backup_variants[0]["input_hash"]
+            backup_variants[0]["input_hash"]
             variants = []
             if primary_hash:
                 variants.extend(primary_variants)
@@ -1325,6 +1464,7 @@ class Stage1AnalysisService:
                     "request_variants": tuple(variants),
                 }
             )
+            declarations.append(declaration)
         graph_hash = hash_json({
             "identity_version": "stage1_expected_call_graph/v2",
             "job_id": self.job_id,
@@ -1345,35 +1485,16 @@ class Stage1AnalysisService:
                 for item in graph_seed
             ],
         })
-        config_hash = hash_json({
-            "primary_reader": [item.primary_config for item in prepared],
-            "stage1_input": [
-                _redact_mapping(item.stage1_input_settings)
-                for item in prepared
-            ],
-            "stage1_output_budget_plans": [
-                {
-                    "visual_scan": stage1_output_budget_snapshot(
-                        "visual_scan",
-                        item.stage1_input_settings,
-                        provider_config=item.primary_config,
-                    ),
-                    "synthesis": stage1_output_budget_snapshot(
-                        "synthesis",
-                        item.stage1_input_settings,
-                        provider_config=item.primary_config,
-                    ),
-                    "timeout_seconds": stage1_request_timeout_seconds(
-                        item.stage1_input_settings,
-                    ),
-                    "semantic_retry_max_attempts": stage1_semantic_retry_max_attempts(
-                        item.stage1_input_settings,
-                    ),
-                }
-                for item in prepared
-            ],
-            "stage": "stage1_analyze",
-        })
+        config_hash = hash_json(
+            {
+                "primary_reader": [item["primary_reader"] for item in config_facts],
+                "stage1_input": [item["stage1_input"] for item in config_facts],
+                "stage1_output_budget_plans": [
+                    item["stage1_output_budget_plans"] for item in config_facts
+                ],
+                "stage": "stage1_analyze",
+            }
+        )
         self._expected_provider_config_hash = config_hash
         epoch = compute_closure_epoch_id(
             job_id=self.job_id,
@@ -1401,6 +1522,7 @@ class Stage1AnalysisService:
         )
         self.expected_call_graph_path = self.workspace.artifact_path("stage1/provider_expected_calls.json")
         self._publish_expected_call_graph()
+        return tuple(declarations)
 
     @staticmethod
     def _text_only_content(content: Any) -> Any:
@@ -2348,7 +2470,7 @@ class Stage1AnalysisService:
             for value in (transport_metadata.get("sent_visual_ids") or [])
             if str(value)
         ]
-        planned_visual_ids = [
+        [
             str(value)
             for value in (coverage.get("planned_visual_ids") or [])
             if str(value)
@@ -3298,7 +3420,7 @@ class Stage1AnalysisService:
                 ],
             }
         )
-        coverage_record = self._publish_visual_coverage(
+        self._publish_visual_coverage(
             prepared=prepared,
             coverage=coverage,
             observation_records=observation_records,
@@ -5020,13 +5142,147 @@ class Stage1AnalysisService:
                 result,
                 paper_key=owner_paper_key,
             )
-        finally:
+        except BaseException as primary_error:
             if result is not None:
-                manager.release_generation_lease(
-                    result.cache_dir,
+                try:
+                    self._release_generation_lease(
+                        manager,
+                        cache_dir=str(result.cache_dir),
+                        lease_id=lease_id,
+                        generation_id=generation_id,
+                    )
+                except BaseException as cleanup_error:
+                    self._handle_generation_lease_cleanup_failure(
+                        primary_error,
+                        cleanup_error,
+                        source_pdf=source_pdf,
+                        paper_key=owner_paper_key,
+                        cache_dir=str(result.cache_dir),
+                        lease_id=lease_id,
+                        generation_id=generation_id,
+                    )
+            raise
+        else:
+            if result is not None:
+                self._release_generation_lease(
+                    manager,
+                    cache_dir=str(result.cache_dir),
                     lease_id=lease_id,
                     generation_id=generation_id,
                 )
+
+    @staticmethod
+    def _release_generation_lease(
+        manager: Any,
+        *,
+        cache_dir: str,
+        lease_id: str,
+        generation_id: str,
+    ) -> None:
+        released = manager.release_generation_lease(
+            cache_dir,
+            lease_id=lease_id,
+            generation_id=generation_id,
+        )
+        if released != 1:
+            raise RuntimeError(
+                "Stage 1 generation lease cleanup failed: expected exactly one "
+                f"lease release, removed {released!r} for generation "
+                f"{generation_id or '<unknown>'}"
+            )
+
+    def _handle_generation_lease_cleanup_failure(
+        self,
+        primary_error: BaseException,
+        cleanup_error: BaseException,
+        *,
+        source_pdf: str,
+        paper_key: str,
+        cache_dir: str,
+        lease_id: str,
+        generation_id: str,
+    ) -> None:
+        record_path = ""
+        record_error: BaseException | None = None
+        try:
+            record_path = self._record_generation_lease_cleanup_failure(
+                source_pdf=source_pdf,
+                paper_key=paper_key,
+                cache_dir=cache_dir,
+                lease_id=lease_id,
+                generation_id=generation_id,
+                cleanup_error=cleanup_error,
+            )
+        except BaseException as persistence_error:
+            record_error = persistence_error
+
+        cleanup_summary = f"{type(cleanup_error).__name__}: {cleanup_error}"
+        note = "Stage 1 generation lease cleanup integrity failure: " + cleanup_summary
+        if record_path:
+            note += f"; durable record: {record_path}"
+        if record_error is not None:
+            note += (
+                "; durable record persistence also failed: "
+                f"{type(record_error).__name__}: {record_error}"
+            )
+        try:
+            primary_error.add_note(note)
+        except BaseException:
+            pass
+        try:
+            setattr(
+                primary_error,
+                "stage1_generation_lease_cleanup_error",
+                cleanup_error,
+            )
+        except BaseException:
+            pass
+
+    def _record_generation_lease_cleanup_failure(
+        self,
+        *,
+        source_pdf: str,
+        paper_key: str,
+        cache_dir: str,
+        lease_id: str,
+        generation_id: str,
+        cleanup_error: BaseException,
+    ) -> str:
+        failure_id = hash_json(
+            {
+                "job_id": self.job_id,
+                "attempt_id": self.attempt_id,
+                "paper_key": paper_key,
+                "lease_id": lease_id,
+                "generation_id": generation_id,
+            }
+        )[:24]
+        path = self.workspace.artifact_path(
+            "stage1/generation_lease_cleanup_failures/"
+            f"{failure_id}.json"
+        )
+        atomic_write_json(
+            path,
+            {
+                "artifact_type": _STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_TYPE,
+                "artifact_version": _STAGE1_GENERATION_LEASE_CLEANUP_ARTIFACT_VERSION,
+                "schema_version": "stage1-generation-lease-cleanup-failure-v1",
+                "status": "integrity_blocked",
+                "job_id": self.job_id,
+                "attempt_id": self.attempt_id,
+                "stage_name": "stage1_analyze",
+                "paper_key": paper_key,
+                "source_pdf": source_pdf,
+                "cache_dir": cache_dir,
+                "lease_id": lease_id,
+                "generation_id": generation_id,
+                "cleanup_error_type": type(cleanup_error).__name__,
+                "cleanup_error": str(cleanup_error),
+                "failure_id": failure_id,
+                "recorded_at": utc_now_iso(),
+            },
+        )
+        return path
 
     def _snapshot_preprocess_authority(self, result: Any, *, paper_key: str) -> Any:
         """Move formal Stage 1 authority into the job-owned workspace.

@@ -1628,12 +1628,17 @@ def test_local_rag_retention_never_deletes_current_identity(tmp_path: Path) -> N
             self.deleted.append(name)
 
     index = LocalRAGIndex(str(tmp_path))
-    current_key = index._identity_key({"source_pdf_sha256": "a" * 64})
-    newer_key = index._identity_key({"source_pdf_sha256": "b" * 64})
-    current_name = index._collection_name_for_identity("source", current_key)
-    newer_name = index._collection_name_for_identity("source", newer_key)
-    for order, (identity_key, name) in enumerate(
-        ((current_key, current_name), (newer_key, newer_name)),
+    identities = [
+        {"source_pdf_sha256": character * 64}
+        for character in ("a", "b")
+    ]
+    identity_keys = [index._identity_key(identity) for identity in identities]
+    names = [
+        index._collection_name_for_identity("source", identity_key)
+        for identity_key in identity_keys
+    ]
+    for order, (identity, identity_key, name) in enumerate(
+        zip(identities, identity_keys, names, strict=True),
         start=1,
     ):
         identity_path = tmp_path / f"{name}.identity.json"
@@ -1642,24 +1647,24 @@ def test_local_rag_retention_never_deletes_current_identity(tmp_path: Path) -> N
                 {
                     "schema_version": "local-rag-identity-v1",
                     "identity_key": identity_key,
-                    "identity": {"source_pdf_sha256": identity_key},
+                    "identity": identity,
                 }
             ),
             encoding="utf-8",
         )
         os.utime(identity_path, (float(order), float(order)))
-    client = Client([current_name, newer_name])
+    client = Client(names)
 
     removed = index._prune_stale_identity_collections(
         client,
         collection_name="source",
-        current_collection_name=current_name,
+        current_collection_name=names[0],
         retain_recent_identities=0,
     )
 
-    assert removed == (newer_name,)
-    assert current_name not in client.deleted
-    assert (tmp_path / f"{current_name}.identity.json").is_file()
+    assert removed == (names[1],)
+    assert names[0] not in client.deleted
+    assert (tmp_path / f"{names[0]}.identity.json").is_file()
 
 
 def test_local_rag_retention_preserves_sidecar_when_backend_delete_fails(

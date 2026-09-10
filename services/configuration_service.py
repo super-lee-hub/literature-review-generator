@@ -582,7 +582,7 @@ def _publish_config_env_pair(
     config_target = Path(config_path).expanduser().resolve()
     env_target = Path(env_path).expanduser().resolve()
     previous_config = config_target.read_bytes() if config_target.is_file() else None
-    previous_env = env_target.read_bytes() if env_target.is_file() else None
+    env_target.read_bytes() if env_target.is_file() else None
     staged_config = _stage_bytes(config_target, config_bytes)
     try:
         staged_env = _stage_bytes(env_target, env_bytes)

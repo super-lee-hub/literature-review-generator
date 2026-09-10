@@ -391,7 +391,7 @@ def test_stage1_semantic_retry_accepts_only_schema_valid_visual_observation(
         nonlocal invalidated
         if kwargs.get("purpose") == "visual_scan":
             batch = kwargs["visual_scan_batch"]
-            candidates = list(batch.get("child_candidates") or [])
+            list(batch.get("child_candidates") or [])
             is_invalid_attempt = not invalidated
             if is_invalid_attempt:
                 invalidated = True

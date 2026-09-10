@@ -367,7 +367,7 @@ def validate_all_config(
             return False, [
                 "[Stage1_Visual] selection_mode must be selective or adaptive_page_scan"
             ]
-        render_all = _normalize_config_text(stage1_visual.get("render_all_nonblank_pages"))
+        _normalize_config_text(stage1_visual.get("render_all_nonblank_pages"))
         for key in ("page_format", "crop_format"):
             if key in stage1_visual:
                 image_format = _normalize_config_text(stage1_visual[key]).casefold()

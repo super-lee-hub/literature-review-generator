@@ -3587,7 +3587,7 @@ class OutlineV3Executor:
                             self._publish_repair_failure(candidate_id, repair_failure)
                             raise
                     generation_route = self._node_route(generation_node_id)
-                    generation = self._persist(
+                    self._persist(
                         generation_node_id,
                         self._artifact(OutlineCandidate, content, generation_deps),
                         depends_on=tuple(generation_deps.values()),

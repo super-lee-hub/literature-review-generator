@@ -483,7 +483,7 @@ def test_free_mode_profile_does_not_invalidate_stage1_reuse(tmp_path: Path) -> N
         reader,
         job_id="stage1-free-parent",
     )
-    parent_result = parent_service.run(parent_bundle)
+    parent_service.run(parent_bundle)
 
     profile_a = _profile_file(tmp_path / "a", research_goal="Explain A")
     profile_b = _profile_file(tmp_path / "b", research_goal="Explain B")

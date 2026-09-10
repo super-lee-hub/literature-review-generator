@@ -168,7 +168,7 @@ class Stage1InputBuilder:
             field="Stage1_Input.send_selected_visuals",
             default=True,
         )
-        mode = parse_enum(
+        parse_enum(
             stage1_settings.get("mode"),
             field="Stage1_Input.mode",
             allowed={
@@ -178,7 +178,7 @@ class Stage1InputBuilder:
             },
             default="text_first",
         )
-        image_transport = parse_enum(
+        parse_enum(
             stage1_settings.get("image_transport"),
             field="Stage1_Input.image_transport",
             allowed=("base64",),
@@ -206,9 +206,9 @@ class Stage1InputBuilder:
         # ``single_call_max_pages`` is retained as a compatibility setting for
         # old callers, but page count is no longer a reason to launch visual
         # provider calls in the current selective contract.
-        single_call_max_pages = max(1, int(stage1_settings.get("single_call_max_pages", 12) or 12))
+        max(1, int(stage1_settings.get("single_call_max_pages", 12) or 12))
         visual_scan_batch_size = max(1, int(stage1_settings.get("visual_scan_batch_size", 8) or 8))
-        final_image_refs_max = max(0, int(stage1_settings.get("final_image_refs_max", 8) or 8))
+        max(0, int(stage1_settings.get("final_image_refs_max", 8) or 8))
         max_request_image_bytes, max_single_image_bytes = normalize_visual_byte_budgets(
             max_request_image_bytes=stage1_settings.get(
                 "max_request_image_bytes", DEFAULT_MAX_REQUEST_IMAGE_BYTES
@@ -241,7 +241,7 @@ class Stage1InputBuilder:
             [item for item in all_visual_refs if str(item.get("artifact_type") or "") == "page_snapshot"],
             key=lambda item: int(item.get("page_no") or 0),
         )
-        crop_refs = sorted(
+        sorted(
             [item for item in all_visual_refs if str(item.get("artifact_type") or "") != "page_snapshot"],
             key=lambda item: (-float(item.get("selection_score") or 0.0), int(item.get("page_no") or 0)),
         )

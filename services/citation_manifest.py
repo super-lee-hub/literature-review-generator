@@ -11,6 +11,7 @@ from services.citation_catalog import (
     extract_doi_aliases,
     format_reference_entry,
 )
+from services.citation_style import CitationStyleEngine
 from services.citation_ref_catalog import extract_ref_ids_from_token, resolve_ref_id
 from services.job_workspace import utc_now_iso
 from services.sentence_segmenter import segment_sentences
@@ -20,8 +21,8 @@ DEFAULT_RENDER_POLICY: Dict[str, str] = {
     "citation_style": "APA7",
     "citation_locale": "en-US",
     "citation_render_mode": "structured_refs",
-    "style_engine_version": "auto-generate-render-v1",
-    "bibliography_sort_policy": "manifest_order",
+    "style_engine_version": CitationStyleEngine.version,
+    "bibliography_sort_policy": "style_order",
     "narrative_parenthetical_policy": "preserve_source_refs",
 }
 
@@ -64,6 +65,8 @@ class CitationOccurrence:
     ref_id: str = ""
     canonical_paper_key: str = ""
     source_type: str = "structured_ref"
+    mode: str = "parenthetical"
+    locator: Optional[str] = None
     spans: List[CitationSpan] = field(default_factory=list)
     context_before: str = ""
     context_after: str = ""
@@ -81,6 +84,8 @@ class CitationOccurrence:
             "ref_id": self.ref_id,
             "canonical_paper_key": self.canonical_paper_key,
             "source_type": self.source_type,
+            "mode": self.mode,
+            "locator": self.locator,
             "spans": [span.to_dict() for span in self.spans],
             "context_before": self.context_before,
             "context_after": self.context_after,
@@ -102,6 +107,8 @@ class CitationOccurrence:
                 data.get("canonical_paper_key") or data.get("paper_key") or ""
             ),
             source_type=str(data.get("source_type") or "structured_ref"),
+            mode=str(data.get("mode") or "parenthetical"),
+            locator=(str(data["locator"]) if data.get("locator") else None),
             spans=[CitationSpan.from_dict(span) for span in data.get("spans", [])],
             context_before=str(data.get("context_before") or ""),
             context_after=str(data.get("context_after") or ""),
@@ -207,6 +214,15 @@ class CitationPaperEntry:
     decision_threshold: float = 0.85
     decision_source: str = "rule"
     source_fields: Dict[str, str] = field(default_factory=dict)
+    creators: List[Dict[str, str]] = field(default_factory=list)
+    container_title: str = ""
+    volume: str = ""
+    issue: str = ""
+    pages: str = ""
+    article_number: str = ""
+    publisher: str = ""
+    url: str = ""
+    year_suffix: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -229,6 +245,15 @@ class CitationPaperEntry:
             decision_threshold=float(data.get("decision_threshold") or 0.0),
             decision_source=str(data.get("decision_source") or "rule"),
             source_fields={str(k): str(v) for k, v in dict(data.get("source_fields") or {}).items()},
+            creators=[dict(item) for item in data.get("creators", []) if isinstance(item, Mapping)],
+            container_title=str(data.get("container_title") or ""),
+            volume=str(data.get("volume") or ""),
+            issue=str(data.get("issue") or ""),
+            pages=str(data.get("pages") or ""),
+            article_number=str(data.get("article_number") or ""),
+            publisher=str(data.get("publisher") or ""),
+            url=str(data.get("url") or ""),
+            year_suffix=str(data.get("year_suffix") or ""),
         )
 
 
@@ -340,6 +365,8 @@ def _build_occurrence(
     block_text: str,
     span_start: Optional[int] = None,
     span_end: Optional[int] = None,
+    mode: str = "parenthetical",
+    locator: Optional[str] = None,
 ) -> CitationOccurrence:
     safe_paper_id = str(paper_id or "unknown").strip() or "unknown"
     safe_paper_key = str(paper_key or safe_paper_id).strip() or "unknown"
@@ -380,6 +407,8 @@ def _build_occurrence(
         ref_id=ref_id,
         canonical_paper_key=safe_canonical_key,
         source_type=source_type,
+        mode=str(mode or "parenthetical"),
+        locator=str(locator) if locator else None,
         spans=spans,
         context_before=context_before,
         context_after=context_after,
@@ -758,6 +787,10 @@ def build_citation_manifest_from_review_draft(
     occurrences: List[CitationOccurrence] = []
     clusters: List[CitationCluster] = []
     bibliography: List[BibliographyEntry] = []
+    effective_render_policy = {
+        **DEFAULT_RENDER_POLICY,
+        **dict(render_policy or {}),
+    }
 
     entries, alias_map = build_citation_catalog(paper_summaries)
     entries, alias_map = augment_citation_catalog_from_literature_map(
@@ -836,6 +869,8 @@ def build_citation_manifest_from_review_draft(
                         block_text=block_text,
                         span_start=citation.get("span_start"),
                         span_end=citation.get("span_end"),
+                        mode=str(citation.get("mode") or "parenthetical"),
+                        locator=(str(citation["locator"]) if citation.get("locator") else None),
                     )
                     occurrences.append(occurrence)
                     if occurrence.paper_id != "unknown":
@@ -884,6 +919,18 @@ def build_citation_manifest_from_review_draft(
             )
         )
 
+    style_engine = CitationStyleEngine(str(effective_render_policy.get("citation_style") or "APA7"))
+    bibliography_entry_by_paper_id = {
+        entry.paper_id: entry for entry in entries
+    }
+    bibliography.sort(
+        key=lambda item: style_engine.sort_key(
+            bibliography_entry_by_paper_id.get(item.paper_id)
+            or bibliography_entry_by_paper_id.get(item.paper_key)
+            or item
+        )
+    )
+
     citation_sets = _build_citation_set_bundles(
         occurrences=occurrences,
         review_draft=review_draft,
@@ -910,6 +957,15 @@ def build_citation_manifest_from_review_draft(
             decision_threshold=entry.decision_threshold,
             decision_source=entry.decision_source,
             source_fields=dict(entry.source_fields or {}),
+            creators=list(entry.creators or []),
+            container_title=entry.container_title,
+            volume=entry.volume,
+            issue=entry.issue,
+            pages=entry.pages,
+            article_number=entry.article_number,
+            publisher=entry.publisher,
+            url=entry.url,
+            year_suffix=entry.year_suffix,
         )
         paper_entries.append(paper_entry)
     return CitationManifestV3(
@@ -939,8 +995,5 @@ def build_citation_manifest_from_review_draft(
             "citation_ref_catalog_path": citation_ref_catalog_path,
             "citation_ref_catalog_hash": citation_ref_catalog_hash,
         },
-        render_policy={
-            **DEFAULT_RENDER_POLICY,
-            **dict(render_policy or {}),
-        },
+        render_policy=effective_render_policy,
     )

@@ -668,6 +668,141 @@ def test_stage1_preprocess_releases_generation_lease_on_exit(
     assert release_calls[0]["lease_id"]
 
 
+@pytest.mark.parametrize(
+    ("release_mode", "expected_message"),
+    (
+        ("raises", "release failure"),
+        ("removes_zero", "expected exactly one lease release"),
+    ),
+)
+def test_stage1_preprocess_release_failure_surfaces_and_does_not_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_mode: str,
+    expected_message: str,
+) -> None:
+    from services.job_workspace import JobWorkspace
+    from services.stage1_analysis_service import Stage1AnalysisService
+
+    generation_root = tmp_path / "cache" / "generation-lease-corrupt"
+    generation_root.mkdir(parents=True)
+    manifest_path = generation_root / "prepare_manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    preprocess_result = SimpleNamespace(
+        cache_dir=str(tmp_path / "cache"),
+        manifest_path=str(manifest_path),
+        stage1_quality_reasons=[],
+        stage1_input_text="Substantive Stage 1 source text.",
+        plain_text="Substantive Stage 1 source text.",
+        markdown_text="Substantive Stage 1 source text.",
+        page_index=[{"page_number": 1}],
+    )
+
+    class FakePreprocessManager:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def prepare_pdf(self, _source_pdf: str, **_kwargs: str) -> object:
+            return preprocess_result
+
+        def release_generation_lease(self, _cache_dir: str, **_kwargs: str) -> int:
+            if release_mode == "raises":
+                raise RuntimeError("release failure")
+            return 0
+
+    service = object.__new__(Stage1AnalysisService)
+    service.job_id = "job-lease"
+    service.attempt_id = "attempt-lease"
+    service.config = {}
+    service.logger = None
+    service.workspace = JobWorkspace.create(
+        str(tmp_path / "output"), "lease-project", "job-lease"
+    )
+    monkeypatch.setattr(
+        "services.stage1_analysis_service.PreprocessManager",
+        FakePreprocessManager,
+    )
+    monkeypatch.setattr(
+        service,
+        "_snapshot_preprocess_authority",
+        lambda result, *, paper_key: result,
+    )
+
+    with pytest.raises(RuntimeError, match=expected_message):
+        with service._preprocess("paper.pdf", paper_key="paper-lease"):
+            pass
+
+
+def test_stage1_preprocess_double_failure_preserves_primary_and_records_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.job_workspace import JobWorkspace
+    from services.stage1_analysis_service import Stage1AnalysisService
+
+    generation_root = tmp_path / "cache" / "generation-lease-double-failure"
+    generation_root.mkdir(parents=True)
+    manifest_path = generation_root / "prepare_manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    preprocess_result = SimpleNamespace(
+        cache_dir=str(tmp_path / "cache"),
+        manifest_path=str(manifest_path),
+        stage1_quality_reasons=[],
+        stage1_input_text="Substantive Stage 1 source text.",
+        plain_text="Substantive Stage 1 source text.",
+        markdown_text="Substantive Stage 1 source text.",
+        page_index=[{"page_number": 1}],
+    )
+    cleanup_error = RuntimeError("corrupt generation lease payload")
+
+    class FakePreprocessManager:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def prepare_pdf(self, _source_pdf: str, **_kwargs: str) -> object:
+            return preprocess_result
+
+        def release_generation_lease(self, _cache_dir: str, **_kwargs: str) -> int:
+            raise cleanup_error
+
+    service = object.__new__(Stage1AnalysisService)
+    service.job_id = "job-lease"
+    service.attempt_id = "attempt-lease"
+    service.config = {}
+    service.logger = None
+    service.workspace = JobWorkspace.create(
+        str(tmp_path / "output"), "lease-project", "job-lease"
+    )
+    monkeypatch.setattr(
+        "services.stage1_analysis_service.PreprocessManager",
+        FakePreprocessManager,
+    )
+    monkeypatch.setattr(
+        service,
+        "_snapshot_preprocess_authority",
+        lambda result, *, paper_key: result,
+    )
+
+    with pytest.raises(RuntimeError, match="primary consumer failure") as raised:
+        with service._preprocess("paper.pdf", paper_key="paper-lease"):
+            raise RuntimeError("primary consumer failure")
+
+    primary_error = raised.value
+    assert str(primary_error) == "primary consumer failure"
+    assert primary_error.stage1_generation_lease_cleanup_error is cleanup_error
+    assert any("corrupt generation lease payload" in note for note in primary_error.__notes__)
+    durable_records = list(
+        Path(service.workspace.artifact_path(
+            "stage1/generation_lease_cleanup_failures"
+        )).glob("*.json")
+    )
+    assert len(durable_records) == 1
+    record = json.loads(durable_records[0].read_text(encoding="utf-8"))
+    assert record["status"] == "integrity_blocked"
+    assert record["cleanup_error_type"] == "RuntimeError"
+    assert record["cleanup_error"] == "corrupt generation lease payload"
+
+
 def test_terminate_interruption_event_cannot_claim_a_graceful_exit() -> None:
     with pytest.raises(ReleaseAcceptanceSpecError, match="non-zero"):
         ProcessInterruptionEventV1.from_mapping(

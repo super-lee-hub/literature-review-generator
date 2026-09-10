@@ -1,0 +1,5 @@
+# Optional local RAG backend. This is not installed by the production release
+# lock because the current ChromaDB line has unresolved security advisories.
+# Enable only in an isolated environment after reviewing the current audit.
+chromadb<1.5.0
+sentence-transformers

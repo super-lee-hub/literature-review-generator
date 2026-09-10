@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypeAlias
@@ -14,6 +15,21 @@ MetadataValue: TypeAlias = str | int | float | bool | None
 ChunkMetadata: TypeAlias = dict[str, MetadataValue]
 LOCAL_RAG_IDENTITY_SCHEMA_VERSION = "local-rag-identity-v1"
 DEFAULT_LOCAL_RAG_RETAIN_RECENT_IDENTITIES = 2
+
+
+def _is_reparse_path(path: Path) -> bool:
+    """Treat links and Windows reparse points as untrusted sidecars."""
+
+    try:
+        path_stat = os.lstat(os.fspath(path))
+    except OSError:
+        return True
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+    return bool(
+        getattr(path_stat, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+    )
 
 
 class LocalRAGIndex:
@@ -44,12 +60,56 @@ class LocalRAGIndex:
         suffix = str(identity_key or "")[:16]
         return f"{base[:45]}-{suffix}"[:63].rstrip("-_")
 
+    def _read_identity_sidecar(
+        self,
+        identity_path: Path,
+        *,
+        collection_name: str,
+        candidate_name: str,
+    ) -> tuple[str, dict[str, Any]] | None:
+        if _is_reparse_path(identity_path):
+            return None
+        try:
+            if not identity_path.is_file():
+                return None
+            payload = json.loads(identity_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                return None
+            identity_key = payload["identity_key"]
+            if (
+                payload.get("schema_version") != LOCAL_RAG_IDENTITY_SCHEMA_VERSION
+                or not isinstance(identity_key, str)
+                or len(identity_key) != 64
+                or any(character not in "0123456789abcdef" for character in identity_key)
+                or not isinstance(payload.get("identity"), Mapping)
+            ):
+                return None
+            if self._identity_key(payload["identity"]) != identity_key:
+                return None
+            if candidate_name != collection_name and candidate_name != self._collection_name_for_identity(
+                collection_name,
+                identity_key,
+            ):
+                return None
+            return identity_key, dict(payload["identity"])
+        except (
+            KeyError,
+            OSError,
+            UnicodeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            RecursionError,
+            json.JSONDecodeError,
+        ):
+            return None
+
     def _identity_records(
         self,
         collection_name: str,
     ) -> list[tuple[float, str, Path]]:
         root = Path(self.persist_dir)
-        if not root.is_dir():
+        if not root.is_dir() or _is_reparse_path(root):
             return []
         base_name = str(collection_name)
         base_filename = f"{base_name}.identity.json"
@@ -58,8 +118,6 @@ class LocalRAGIndex:
         )[:45] + "-"
         records: list[tuple[float, str, Path]] = []
         for identity_path in root.iterdir():
-            if identity_path.is_symlink() or not identity_path.is_file():
-                continue
             if identity_path.name == base_filename:
                 candidate_name = base_name
             elif (
@@ -69,28 +127,61 @@ class LocalRAGIndex:
                 candidate_name = identity_path.name[: -len(".identity.json")]
             else:
                 continue
-            try:
-                payload = json.loads(identity_path.read_text(encoding="utf-8"))
-                if not isinstance(payload, Mapping):
-                    continue
-                identity_key = str(payload.get("identity_key") or "").strip().lower()
-                if (
-                    payload.get("schema_version") != LOCAL_RAG_IDENTITY_SCHEMA_VERSION
-                    or len(identity_key) != 64
-                    or any(character not in "0123456789abcdef" for character in identity_key)
-                    or not isinstance(payload.get("identity"), Mapping)
-                ):
-                    continue
-                if candidate_name != base_name and candidate_name != self._collection_name_for_identity(
-                    base_name, identity_key
-                ):
-                    continue
-                records.append(
-                    (float(identity_path.stat().st_mtime_ns), candidate_name, identity_path)
+            if (
+                self._read_identity_sidecar(
+                    identity_path,
+                    collection_name=base_name,
+                    candidate_name=candidate_name,
                 )
-            except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+                is None
+            ):
+                continue
+            try:
+                records.append(
+                    (float(identity_path.lstat().st_mtime_ns), candidate_name, identity_path)
+                )
+            except OSError:
                 continue
         return records
+
+    def _collection_metadata_matches(
+        self,
+        client: Any,
+        *,
+        collection_name: str,
+        identity_key: str,
+        identity: Mapping[str, Any],
+    ) -> bool:
+        get_collection = getattr(client, "get_collection", None)
+        if get_collection is None:
+            return True
+        try:
+            collection = get_collection(name=collection_name)
+            metadata = getattr(collection, "metadata", None)
+        except Exception as exc:  # noqa: BLE001 - fail closed on backend uncertainty.
+            if self.logger:
+                self.logger.warning(
+                    f"Local RAG collection metadata lookup failed for {collection_name}: {exc}"
+                )
+            return False
+        if metadata is None:
+            return True
+        if not isinstance(metadata, Mapping):
+            return False
+        if metadata.get("identity_key") != identity_key:
+            return False
+        metadata_identity: dict[str, Any] = {}
+        for field, expected_value in identity.items():
+            if field in metadata and metadata[field] != expected_value:
+                return False
+            if field in metadata:
+                metadata_identity[field] = metadata[field]
+        if len(metadata_identity) != len(identity):
+            return True
+        try:
+            return self._identity_key(metadata_identity) == identity_key
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return False
 
     def _prune_stale_identity_collections(
         self,
@@ -131,9 +222,30 @@ class LocalRAGIndex:
         ):
             if candidate_name in keep_names:
                 continue
+            identity_record = self._read_identity_sidecar(
+                identity_path,
+                collection_name=str(collection_name),
+                candidate_name=candidate_name,
+            )
+            if identity_record is None:
+                continue
+            identity_key, identity = identity_record
             try:
+                if _is_reparse_path(identity_path):
+                    continue
                 if candidate_name in existing_names:
+                    if not self._collection_metadata_matches(
+                        client,
+                        collection_name=candidate_name,
+                        identity_key=identity_key,
+                        identity=identity,
+                    ):
+                        continue
+                    if _is_reparse_path(identity_path):
+                        continue
                     client.delete_collection(name=candidate_name)
+                if _is_reparse_path(identity_path):
+                    continue
                 identity_path.unlink()
             except (OSError, TypeError, ValueError) as exc:
                 if self.logger:
@@ -186,13 +298,13 @@ class LocalRAGIndex:
         base_identity_path = os.path.join(self.persist_dir, f"{collection_name}.identity.json")
         selected_collection_name = str(collection_name)
         identity_path = base_identity_path
-        if os.path.isfile(base_identity_path):
-            try:
-                with open(base_identity_path, "r", encoding="utf-8") as handle:
-                    existing = json.load(handle)
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                return False
-            if not isinstance(existing, dict) or existing.get("identity_key") != identity_key:
+        if os.path.lexists(base_identity_path):
+            existing = self._read_identity_sidecar(
+                Path(base_identity_path),
+                collection_name=str(collection_name),
+                candidate_name=str(collection_name),
+            )
+            if existing is None or existing[0] != identity_key:
                 if self.logger:
                     self.logger.warning(
                         "Local RAG identity changed; selecting a new immutable collection."
@@ -205,13 +317,13 @@ class LocalRAGIndex:
                     self.persist_dir,
                     f"{selected_collection_name}.identity.json",
                 )
-                if os.path.isfile(identity_path):
-                    try:
-                        with open(identity_path, "r", encoding="utf-8") as handle:
-                            selected_existing = json.load(handle)
-                    except (OSError, UnicodeError, json.JSONDecodeError):
-                        return False
-                    if not isinstance(selected_existing, dict) or selected_existing.get("identity_key") != identity_key:
+                if os.path.lexists(identity_path):
+                    selected_existing = self._read_identity_sidecar(
+                        Path(identity_path),
+                        collection_name=str(collection_name),
+                        candidate_name=selected_collection_name,
+                    )
+                    if selected_existing is None or selected_existing[0] != identity_key:
                         return False
         elif self._identity_records(collection_name):
             selected_collection_name = self._collection_name_for_identity(
@@ -222,16 +334,13 @@ class LocalRAGIndex:
                 self.persist_dir,
                 f"{selected_collection_name}.identity.json",
             )
-            if os.path.isfile(identity_path):
-                try:
-                    with open(identity_path, "r", encoding="utf-8") as handle:
-                        selected_existing = json.load(handle)
-                except (OSError, UnicodeError, json.JSONDecodeError):
-                    return False
-                if (
-                    not isinstance(selected_existing, dict)
-                    or selected_existing.get("identity_key") != identity_key
-                ):
+            if os.path.lexists(identity_path):
+                selected_existing = self._read_identity_sidecar(
+                    Path(identity_path),
+                    collection_name=str(collection_name),
+                    candidate_name=selected_collection_name,
+                )
+                if selected_existing is None or selected_existing[0] != identity_key:
                     return False
         client = chromadb.PersistentClient(path=self.persist_dir)
         collection = client.get_or_create_collection(
