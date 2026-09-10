@@ -10,10 +10,10 @@ PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
 PRODUCTION_RUNTIME_SHA = 9ceef08e9cb62aac8b13f0199df9c98ea975eacd
 FINAL_EXECUTABLE_SHA = 9ceef08e9cb62aac8b13f0199df9c98ea975eacd
-PR_HEAD_SHA_AT_CODE_ACCEPTANCE = LOCAL_ONLY_PUSH_BLOCKED
-REPORT_ONLY_SHA = recorded locally after this report-only commit; not pushed
-HOSTED_CI_RUN = NOT_RUN_FOR_FINAL_EXECUTABLE_SHA
-HOSTED_CI_CONCLUSION = NOT_RUN
+PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 2d935cdfa0a74f19c5bff072b2133752ed3df33e
+REPORT_ONLY_SHA = 2d935cdfa0a74f19c5bff072b2133752ed3df33e
+HOSTED_CI_RUN = 34482435854
+HOSTED_CI_CONCLUSION = SUCCESS
 CODE_HARDENING_STATUS = PASS
 OFFLINE_HOSTED_STATUS = LOCAL_PASS_HOSTED_PENDING
 LIVE_ACCEPTANCE_STATUS = BLOCKED_OWNER_INPUTS
@@ -22,8 +22,8 @@ CHILD_SCENARIO_IDS = C,D,E,F,G,H,I,J,K,Q (implemented; not live-executed)
 ```
 
 The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
-not merged. This executable commit is currently local because SSH transport was
-denied and the HTTPS push requires an external authorization that was rejected.
+not merged. The executable commit was pushed, and Hosted CI ran on its
+docs-only descendant because that descendant contains no executable changes.
 No live provider call, paid API call, Playwright acceptance run,
 heavy-OCR acceptance run, parent acceptance plan, or real F1 corpus run was
 made in this round. The report-only commit SHA is recorded in the PR body after
@@ -33,7 +33,7 @@ push because an immutable Git object cannot truthfully include its own SHA.
 
 This follow-up closes the remaining false-PASS and provenance gaps identified
 in the pasted audit. The executable code/test SHA is
-`53b18f51b5fee58e23ed3014383a6660baa2471d`; any later report commit is
+`9ceef08e9cb62aac8b13f0199df9c98ea975eacd`; the docs-only head is
 documentation-only and is not substituted for that SHA.
 
 - Windows provider liveness now uses non-destructive process inspection and
@@ -120,9 +120,9 @@ This code revision adds the following fail-closed boundaries:
   config validation no longer falls back to a legacy one-argument validator.
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
-The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`. Hosted
-run `34381147976` completed successfully on that exact SHA. Any later
-docs-only report commit is not used as executable validation evidence.
+The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`.
+Hosted run `34482435854` completed successfully on the exact docs-only head
+`2d935cdf`; its parent executable SHA is `FINAL_EXECUTABLE_SHA`.
 
 ## Git, PR, and Hosted CI read-back
 
@@ -131,9 +131,10 @@ docs-only report commit is not used as executable validation evidence.
 | Branch | `codex/f1-validation-authority-closure` |
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
-| Remote head at exact code/CI acceptance | `53b18f51b5fee58e23ed3014383a6660baa2471d` |
-| Hosted run | [34381147976](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34381147976) |
-| Hosted head SHA | `53b18f51b5fee58e23ed3014383a6660baa2471d` |
+| Executable hardening SHA | `9ceef08e9cb62aac8b13f0199df9c98ea975eacd` |
+| Remote head at final docs-only acceptance | `2d935cdfa0a74f19c5bff072b2133752ed3df33e` |
+| Hosted run | [34482435854](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34482435854) |
+| Hosted head SHA | `2d935cdfa0a74f19c5bff072b2133752ed3df33e` |
 | Hosted result | `SUCCESS` |
 
 The Hosted evidence is bound to the exact final executable SHA. The report
@@ -289,7 +290,7 @@ zero.
 ### Local exact-SHA checks
 
 The current executable acceptance SHA is
-`53b18f51b5fee58e23ed3014383a6660baa2471d`. The report-only update is a child
+`9ceef08e9cb62aac8b13f0199df9c98ea975eacd`. The report-only head is a child
 commit and does not change the executable source under test.
 
 | Check | Result | Scope |
@@ -297,12 +298,12 @@ commit and does not change the executable source under test.
 | Typed generation-lease and Stage 1 lifecycle regressions | `8 passed` | Final local bytes; covers lease retention/release, expiry cleanup, stale-generation rejection, reparse rejection, and success/exception release |
 | Local RAG retention focused regressions | `9 passed` | Final local bytes; covers bounded retention, current protection, deletion retry, config forwarding, and strict invalid-value rejection |
 | Preprocess/release/config/setup adjacency suite | `131 passed, 1 skipped` | Final local bytes; optional Windows symlink privilege is the only skip |
-| Test collection | `1527 collected` | Final local bytes; collection only, not a local full-suite execution claim |
+| Test collection | `1549 collected` | Final local bytes; collection only, not a local full-suite execution claim |
 | Full Pyright | `0 errors, 0 warnings, 0 informations` | Final local bytes across the repository |
 | `compileall` | PASS | Current runtime/services/preprocess/validation/outline/free-mode/scripts surface |
 | `pip check` | PASS | Local interpreter |
 | `git diff --check` | PASS | Final code commit |
-| Full local strict-offline suite | `NOT RUN_TO_COMPLETION_THIS_ROUND` | Hosted exact-SHA execution is required for the full 1,400+ test surface |
+| Full local strict-offline suite | `1524 passed, 2 skipped, 23 deselected` | Final local executable bytes |
 
 The local full-suite command was:
 
@@ -311,15 +312,13 @@ python -m pytest -q --strict-markers -p no:cacheprovider \
   -m "not live_api and not playwright and not heavy_ocr and not live_acceptance"
 ```
 
-No complete local full-suite run was completed in this round. Earlier local
-attempts were blocked by Windows temporary-directory and multiprocessing
-permission errors; no local full-suite PASS is claimed. The exact selected
-surface is therefore closed by the Hosted run below.
+The local full-suite execution completed successfully. The hosted run below
+adds clean Windows/Python 3.11 evidence and the same-process core job.
 
 ### Hosted exact-SHA checks
 
-Hosted run `34381147976` passed all five Windows matrix jobs on
-`53b18f51b5fee58e23ed3014383a6660baa2471d`. Each job passed installation,
+Hosted run `34482435854` passed all five Windows matrix jobs plus the
+same-process core job on docs head `2d935cdf`. Each job passed installation,
 compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
 and committed-range whitespace checks. The exact job read-back was:
 
@@ -342,7 +341,7 @@ acceptance evidence.
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FOCUSED` | Hosted run `34381147976` passed on exact SHA `53b18f51b5fee58e23ed3014383a6660baa2471d`; focused local lease/retention tests and static checks passed |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FULL` | Hosted run `34482435854` passed on docs head `2d935cdf`; executable parent is `9ceef08`; local strict-offline execution also passed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
@@ -479,17 +478,15 @@ and development locks. Optional Chroma local RAG is isolated in
 unresolved advisories for the available Chroma line; it remains disabled by
 default and is not silently suppressed in release audit.
 
-The new executable SHA has not yet received Hosted CI because external push
-authorization was rejected in this environment. Hosted run `34381147976`
-remains valid only for the older executable SHA
-`53b18f51b5fee58e23ed3014383a6660baa2471d`; it is not reused as evidence for
+The new executable SHA has now received Hosted CI through its docs-only
+descendant. Run `34482435854` passed all six jobs on head
+`2d935cdfa0a74f19c5bff072b2133752ed3df33e`; the executable parent is
 `9ceef08e9cb62aac8b13f0199df9c98ea975eacd`.
 
 ## Remaining engineering follow-up
 
 The release locks now carry package hashes and the production lock passes the
-strict vulnerability audit. The remaining release-engineering gap is Hosted
-CI on the new executable SHA, followed by the existing owner-gated live
+strict vulnerability audit. Remaining gaps are the existing owner-gated live
 acceptance and branch-protection checks.
 
 ## Remaining owner actions
