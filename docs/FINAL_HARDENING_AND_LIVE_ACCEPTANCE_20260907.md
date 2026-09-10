@@ -430,6 +430,14 @@ The new executable/report scope also includes runtime/provider_routes.py,
 runtime/architecture_gates.py, services/durable_io.py, rag/local_rag.py, and
 docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
+## Remaining engineering follow-up
+
+`requirements-py311-windows.lock` pins package versions but does not yet carry
+package hashes or an equivalent immutable package-integrity proof. This is
+recorded as `FOLLOW_UP_SUPPLY_CHAIN_HARDENING`. It is not presented as live
+acceptance evidence and does not replace the credential, corpus, browser, OCR,
+or branch-governance blockers below.
+
 ## Remaining owner actions
 
 1. Supply an approved rotated credential through the supported `.env` or
