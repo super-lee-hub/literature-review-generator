@@ -8,21 +8,23 @@ PR = #24
 PR_STATE = OPEN
 PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
-PRODUCTION_RUNTIME_SHA = 53b18f51b5fee58e23ed3014383a6660baa2471d
-FINAL_EXECUTABLE_SHA = 53b18f51b5fee58e23ed3014383a6660baa2471d
-PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 53b18f51b5fee58e23ed3014383a6660baa2471d
-REPORT_ONLY_SHA = recorded in PR #24 body after this self-referential report commit is pushed
-HOSTED_CI_RUN = 34381147976
-HOSTED_CI_CONCLUSION = SUCCESS
+PRODUCTION_RUNTIME_SHA = 9ceef08e9cb62aac8b13f0199df9c98ea975eacd
+FINAL_EXECUTABLE_SHA = 9ceef08e9cb62aac8b13f0199df9c98ea975eacd
+PR_HEAD_SHA_AT_CODE_ACCEPTANCE = LOCAL_ONLY_PUSH_BLOCKED
+REPORT_ONLY_SHA = recorded locally after this report-only commit; not pushed
+HOSTED_CI_RUN = NOT_RUN_FOR_FINAL_EXECUTABLE_SHA
+HOSTED_CI_CONCLUSION = NOT_RUN
 CODE_HARDENING_STATUS = PASS
-OFFLINE_HOSTED_STATUS = PASS
+OFFLINE_HOSTED_STATUS = LOCAL_PASS_HOSTED_PENDING
 LIVE_ACCEPTANCE_STATUS = BLOCKED_OWNER_INPUTS
 PARENT_ACCEPTANCE_RUN_ID = NOT_RUN_BLOCKED_OWNER_INPUTS
 CHILD_SCENARIO_IDS = C,D,E,F,G,H,I,J,K,Q (implemented; not live-executed)
 ```
 
 The executable acceptance claim is bound to `FINAL_EXECUTABLE_SHA`. The PR was
-not merged. No live provider call, paid API call, Playwright acceptance run,
+not merged. This executable commit is currently local because SSH transport was
+denied and the HTTPS push requires an external authorization that was rejected.
+No live provider call, paid API call, Playwright acceptance run,
 heavy-OCR acceptance run, parent acceptance plan, or real F1 corpus run was
 made in this round. The report-only commit SHA is recorded in the PR body after
 push because an immutable Git object cannot truthfully include its own SHA.
@@ -430,13 +432,65 @@ The new executable/report scope also includes runtime/provider_routes.py,
 runtime/architecture_gates.py, services/durable_io.py, rag/local_rag.py, and
 docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
+## Continuation evidence — 2026-09-10
+
+The executable hardening commit is
+`9ceef08e9cb62aac8b13f0199df9c98ea975eacd`.
+
+Implemented and locally verified in this continuation:
+
+- APA7/CSL-like citation style boundary with creator normalization, author
+  count rules, narrative/parenthetical modes, same-author/year suffixes,
+  style ordering, DOI normalization, CJK and organization support, and richer
+  journal metadata.
+- DOCX reference runs with real italic formatting, hanging indents and
+  spacing; scanner rejection of legacy/unresolved tokens, leaked `R###` IDs,
+  uncited bibliography entries, and malformed manifest occurrences.
+- Local RAG sidecar identity recomputation, filename derivation checks,
+  Chroma metadata cross-checks, reparse rejection, and deletion fail-closed
+  behavior.
+- Bounded MinerU JSON handling is present in the executable baseline, with
+  streaming reads and limit tests.
+- Stage1 lease cleanup preserves a primary exception and records a durable
+  integrity-blocked cleanup failure; Stage1 graph predeclaration now retains
+  lightweight declarations and JIT-materializes heavy per-paper inputs while
+  checking stable semantic binding identity.
+
+Fresh local evidence for this continuation:
+
+| Check | Result |
+|---|---|
+| Full collection | `1549 collected` |
+| Strict-offline executed suite | `1524 passed, 2 skipped, 23 deselected` |
+| Same-process Stage1/core suite | `89 passed, 1 skipped` |
+| Citation/DOCX targeted suite | `43 passed` |
+| Local RAG targeted suite | `12 passed, 1 skipped` |
+| MinerU/preprocess targeted suite | `42 passed` |
+| Lease cleanup targeted suite | `4 passed` |
+| Pyright | `0 errors, 0 warnings, 0 informations` |
+| Compileall | passed |
+| `pip check` | `No broken requirements found` |
+| Fatal Ruff (`E9,F821,F841`) | passed |
+| Strict `pip-audit` on hashed production lock | `No known vulnerabilities found` |
+
+Release installation now uses separate hashed Windows/Python 3.11 production
+and development locks. Optional Chroma local RAG is isolated in
+`requirements-optional-rag.txt` because the current audit feed reports
+unresolved advisories for the available Chroma line; it remains disabled by
+default and is not silently suppressed in release audit.
+
+The new executable SHA has not yet received Hosted CI because external push
+authorization was rejected in this environment. Hosted run `34381147976`
+remains valid only for the older executable SHA
+`53b18f51b5fee58e23ed3014383a6660baa2471d`; it is not reused as evidence for
+`9ceef08e9cb62aac8b13f0199df9c98ea975eacd`.
+
 ## Remaining engineering follow-up
 
-`requirements-py311-windows.lock` pins package versions but does not yet carry
-package hashes or an equivalent immutable package-integrity proof. This is
-recorded as `FOLLOW_UP_SUPPLY_CHAIN_HARDENING`. It is not presented as live
-acceptance evidence and does not replace the credential, corpus, browser, OCR,
-or branch-governance blockers below.
+The release locks now carry package hashes and the production lock passes the
+strict vulnerability audit. The remaining release-engineering gap is Hosted
+CI on the new executable SHA, followed by the existing owner-gated live
+acceptance and branch-protection checks.
 
 ## Remaining owner actions
 

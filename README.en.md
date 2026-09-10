@@ -38,7 +38,7 @@ repair, queue execution, and multi-model outline review.
 ## Quick start
 
 ```bash
-pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements-py311-windows-prod.lock
 python setup_wizard.py
 python launch_gui.py
 ```
