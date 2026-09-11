@@ -10,12 +10,12 @@ PR_DRAFT = false
 BASE_SHA = 4a5d56e83bf00a7eea529115798c772e0e1f15d6
 PRODUCTION_RUNTIME_SHA = 9ceef08e9cb62aac8b13f0199df9c98ea975eacd
 FINAL_EXECUTABLE_SHA = 9ceef08e9cb62aac8b13f0199df9c98ea975eacd
-PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 2d935cdfa0a74f19c5bff072b2133752ed3df33e
-REPORT_ONLY_SHA = 2d935cdfa0a74f19c5bff072b2133752ed3df33e
-HOSTED_CI_RUN = 34482435854
+PR_HEAD_SHA_AT_CODE_ACCEPTANCE = 940a26dff0ad64c4d8f2c072c5de0284e61b4566
+REPORT_ONLY_SHA = 940a26dff0ad64c4d8f2c072c5de0284e61b4566
+HOSTED_CI_RUN = 34484852413
 HOSTED_CI_CONCLUSION = SUCCESS
 CODE_HARDENING_STATUS = PASS
-OFFLINE_HOSTED_STATUS = LOCAL_PASS_HOSTED_PENDING
+OFFLINE_HOSTED_STATUS = LOCAL_PASS_HOSTED_PASS
 LIVE_ACCEPTANCE_STATUS = BLOCKED_OWNER_INPUTS
 PARENT_ACCEPTANCE_RUN_ID = NOT_RUN_BLOCKED_OWNER_INPUTS
 CHILD_SCENARIO_IDS = C,D,E,F,G,H,I,J,K,Q (implemented; not live-executed)
@@ -121,8 +121,8 @@ This code revision adds the following fail-closed boundaries:
 - Added docs/implementation/PRODUCTION_REACHABILITY_INVENTORY_20260907.md.
 
 The executable acceptance claim remains bound to `FINAL_EXECUTABLE_SHA`.
-Hosted run `34482435854` completed successfully on the exact docs-only head
-`2d935cdf`; its parent executable SHA is `FINAL_EXECUTABLE_SHA`.
+Hosted run `34484852413` completed successfully on the exact docs-only head
+`940a26d`; its parent executable SHA is `FINAL_EXECUTABLE_SHA`.
 
 ## Git, PR, and Hosted CI read-back
 
@@ -132,9 +132,9 @@ Hosted run `34482435854` completed successfully on the exact docs-only head
 | PR | [#24](https://github.com/super-lee-hub/literature-review-generator/pull/24), OPEN, non-draft |
 | Base | `main` at `4a5d56e83bf00a7eea529115798c772e0e1f15d6` |
 | Executable hardening SHA | `9ceef08e9cb62aac8b13f0199df9c98ea975eacd` |
-| Remote head at final docs-only acceptance | `2d935cdfa0a74f19c5bff072b2133752ed3df33e` |
-| Hosted run | [34482435854](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34482435854) |
-| Hosted head SHA | `2d935cdfa0a74f19c5bff072b2133752ed3df33e` |
+| Remote head at final docs-only acceptance | `940a26dff0ad64c4d8f2c072c5de0284e61b4566` |
+| Hosted run | [34484852413](https://github.com/super-lee-hub/literature-review-generator/actions/runs/34484852413) |
+| Hosted head SHA | `940a26dff0ad64c4d8f2c072c5de0284e61b4566` |
 | Hosted result | `SUCCESS` |
 
 The Hosted evidence is bound to the exact final executable SHA. The report
@@ -317,18 +317,19 @@ adds clean Windows/Python 3.11 evidence and the same-process core job.
 
 ### Hosted exact-SHA checks
 
-Hosted run `34482435854` passed all five Windows matrix jobs plus the
-same-process core job on docs head `2d935cdf`. Each job passed installation,
+Hosted run `34484852413` passed all five Windows matrix jobs plus the
+same-process core job on docs head `940a26d`. Each job passed installation,
 compile, collection, public CLI smoke, strict-offline tests, Pyright, Doctor,
 and committed-range whitespace checks. The exact job read-back was:
 
 ```text
-test (1) job 102566030002: SUCCESS
-test (2) job 102566030122: SUCCESS
-test (3) job 102566029664: SUCCESS
-test (4) job 102566029990: SUCCESS
-test (5) job 102566030794: SUCCESS
-all five matrix jobs returned zero workflow exit status
+same-process-core job 102896434733: SUCCESS
+test (1) job 102896435217: SUCCESS
+test (2) job 102896435289: SUCCESS
+test (3) job 102896435072: SUCCESS
+test (4) job 102896435226: SUCCESS
+test (5) job 102896434920: SUCCESS
+all six Hosted jobs returned zero workflow exit status
 ```
 
 The three base shards used deterministic file isolation; the release-hardening
@@ -341,7 +342,7 @@ acceptance evidence.
 
 | Gate | Status | Exact evidence / boundary |
 |---|---|---|
-| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FULL` | Hosted run `34482435854` passed on docs head `2d935cdf`; executable parent is `9ceef08`; local strict-offline execution also passed |
+| A — exact-final-SHA offline closure | `PASS_HOSTED_MATRIX` / `PASS_LOCAL_FULL` | Hosted run `34484852413` passed on docs head `940a26d`; executable parent is `9ceef08`; local strict-offline execution also passed |
 | B — dry transport preflight | `BLOCKED_CREDENTIALS` / `BLOCKED_INPUT` | Example config rejects template Primary credential before HTTP; active checkout has no production `config.ini` or `.env`; `network_calls=0` |
 | B-live — route micro-probe | `BLOCKED_CREDENTIALS` | `reviewctl micro-probe` is implemented and explicit, but no approved credential exists; no call was made |
 | C — one real F1 paper | `BLOCKED_F1_SPEC` / `BLOCKED_CREDENTIAL` | No authoritative F1 spec/corpus or approved credential in the scoped checkout; no production run |
@@ -479,8 +480,8 @@ unresolved advisories for the available Chroma line; it remains disabled by
 default and is not silently suppressed in release audit.
 
 The new executable SHA has now received Hosted CI through its docs-only
-descendant. Run `34482435854` passed all six jobs on head
-`2d935cdfa0a74f19c5bff072b2133752ed3df33e`; the executable parent is
+descendant. Run `34484852413` passed all six jobs on head
+`940a26dff0ad64c4d8f2c072c5de0284e61b4566`; the executable parent is
 `9ceef08e9cb62aac8b13f0199df9c98ea975eacd`.
 
 ## Remaining engineering follow-up
