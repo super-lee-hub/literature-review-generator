@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from services.citation_metadata import normalize_summary_paper_metadata
+from services.citation_style import (
+    CitationStyleEngine,
+    creator_family,
+    normalize_creators,
+)
 from services.paper_identity import (
     build_paper_key as build_legacy_paper_key,
     normalize_doi,
@@ -102,11 +107,19 @@ class CitationCatalogEntry:
     decision_threshold: float = 0.85
     decision_source: str = "rule"
     source_fields: Dict[str, str] | None = None
+    creators: List[Dict[str, str]] | None = None
+    container_title: str = ""
+    volume: str = ""
+    issue: str = ""
+    pages: str = ""
+    article_number: str = ""
+    publisher: str = ""
+    url: str = ""
+    year_suffix: str = ""
 
 
 def _author_surname(author: str) -> str:
-    parts = str(author or "").strip().split()
-    return parts[-1] if parts else "Anonymous"
+    return creator_family(author)
 
 
 _CJK_PINYIN = {
@@ -318,24 +331,19 @@ def format_in_text_citation(
     mode: str = "parenthetical",
     locator: Optional[str] = None,
 ) -> str:
-    authors = entry.authors or ["Anonymous"]
-    surnames = [_author_surname(author) for author in authors]
-    if len(surnames) == 1:
-        author_text = surnames[0]
-    elif len(surnames) == 2:
-        author_text = f"{surnames[0]} & {surnames[1]}"
-    else:
-        author_text = f"{surnames[0]} et al."
-
-    year = entry.year or "n.d."
-    locator_text = f", {locator}" if locator else ""
-    mode_normalized = str(mode or "parenthetical").strip().lower()
-    if mode_normalized == "narrative":
-        return f"{author_text} ({year}{locator_text})"
-    return f"({author_text}, {year}{locator_text})"
+    return CitationStyleEngine().format_in_text(
+        entry,
+        mode=mode,
+        locator=locator,
+        year_suffix=entry.year_suffix,
+    )
 
 
-def references_from_catalog_payload(catalog: Mapping[str, Any]) -> list[str]:
+def references_from_catalog_payload(
+    catalog: Mapping[str, Any],
+    *,
+    cited_paper_keys: Iterable[str] | None = None,
+) -> list[str]:
     """Build the canonical bibliography reference strings from a catalog payload.
 
     Single bibliography authority: the same ``format_reference_entry`` used by
@@ -346,12 +354,30 @@ def references_from_catalog_payload(catalog: Mapping[str, Any]) -> list[str]:
     entries = catalog.get("entries")
     if not isinstance(entries, list):
         return []
-    references: list[str] = []
+    wanted = (
+        {str(item).strip() for item in cited_paper_keys if str(item).strip()}
+        if cited_paper_keys is not None
+        else None
+    )
+    selected: list[CitationCatalogEntry] = []
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, Mapping):
             continue
         if str(entry.get("status") or "active") == "inactive":
             continue
+        if wanted is not None:
+            aliases = {
+                str(entry.get(key) or "").strip()
+                for key in ("paper_id", "canonical_paper_key", "paper_key")
+                if str(entry.get(key) or "").strip()
+            }
+            aliases.update(
+                str(item).strip()
+                for item in (entry.get("aliases") or ())
+                if str(item).strip()
+            )
+            if not aliases.intersection(wanted):
+                continue
         canonical = CitationCatalogEntry(
             index=index,
             paper_id=str(entry.get("paper_id") or entry.get("canonical_paper_key") or ""),
@@ -362,106 +388,35 @@ def references_from_catalog_payload(catalog: Mapping[str, Any]) -> list[str]:
             journal=str(entry.get("journal") or ""),
             doi=str(entry.get("doi") or ""),
             aliases=[str(item) for item in (entry.get("aliases") or ()) if str(item)],
+            creators=normalize_creators(entry.get("creators") or entry.get("authors")),
+            container_title=str(
+                entry.get("container_title")
+                or entry.get("journal")
+                or entry.get("publication_title")
+                or ""
+            ),
+            volume=str(entry.get("volume") or ""),
+            issue=str(entry.get("issue") or ""),
+            pages=str(entry.get("pages") or ""),
+            article_number=str(entry.get("article_number") or ""),
+            publisher=str(entry.get("publisher") or ""),
+            url=str(entry.get("url") or ""),
+            year_suffix=str(entry.get("year_suffix") or ""),
         )
-        text = format_reference_entry(canonical)
-        if text:
-            references.append(text)
-    return references
+        selected.append(canonical)
+    engine = CitationStyleEngine()
+    suffixes = engine.disambiguation_suffixes(selected)
+    references = [
+        engine.format_reference(
+            replace(item, year_suffix=suffixes.get(item.paper_id, ""))
+        ).text
+        for item in sorted(selected, key=engine.sort_key)
+    ]
+    return [text for text in references if text]
 
 
 def format_reference_entry(entry: CitationCatalogEntry) -> str:
-    # Clean metadata fields
-    def clean_field(value: Any) -> str:
-        if not value:
-            return ""
-        text = str(value).strip()
-        # Remove placeholder values
-        placeholders = ['未知年份', '未知期刊', '无标题', 'n.d.']
-        for placeholder in placeholders:
-            if text == placeholder:
-                return ""
-        # Remove common noise patterns
-        noise_patterns = [
-            "Contents lists available at ScienceDirect",
-            "RESEARCH ARTICLE",
-            "Article",
-            "Abstract",
-            "摘要",
-            "Introduction",
-            "引言",
-            "Keywords",
-            "关键词",
-            "References",
-            "参考文献",
-            "Copyright",
-            "版权",
-            "©",
-            "Published by",
-            "Elsevier",
-            "Springer",
-            "Taylor & Francis",
-            "Wiley",
-            "Oxford University Press",
-            "Cambridge University Press",
-            "American Psychological Association",
-            "APA",
-            "IEEE",
-            "ACM",
-            "SpringerLink",
-            "ScienceDirect",
-            "PubMed",
-            "Google Scholar",
-            "DOI:",
-            "doi:",
-        ]
-        for pattern in noise_patterns:
-            text = text.replace(pattern, "").strip()
-        # Remove excessive whitespace
-        text = ' '.join(text.split())
-        return text
-
-    def clean_doi(value: Any) -> str:
-        if not value:
-            return ""
-        text = str(value).strip()
-        # Extract only the DOI part (10.xxxx/xxxx)
-        import re
-        doi_match = re.search(r'10\.\d{4,}/[^\s]+', text)
-        if doi_match:
-            return doi_match.group(0)
-        # Remove any non-DOI content
-        text = text.replace("https://doi.org/", "").strip()
-        # Keep only alphanumeric, dots, slashes, hyphens, and underscores
-        text = re.sub(r'[^a-zA-Z0-9./\-_]', '', text)
-        return text
-
-    # Clean authors
-    cleaned_authors = [clean_field(author) for author in (entry.authors or []) if clean_field(author)]
-    if cleaned_authors:
-        if len(cleaned_authors) <= 7:
-            author_text = ", ".join(cleaned_authors)
-        else:
-            author_text = ", ".join(cleaned_authors[:6]) + ", ..., " + cleaned_authors[-1]
-    else:
-        author_text = "Anonymous"
-
-    # Clean other fields
-    cleaned_year = clean_field(entry.year)
-    cleaned_title = clean_field(entry.title)
-    cleaned_journal = clean_field(entry.journal)
-    cleaned_doi = clean_doi(entry.doi)
-
-    parts = [author_text, f"({cleaned_year or 'n.d.'}).", f"{cleaned_title or 'Untitled.'}"]
-    if cleaned_journal:
-        parts.append(f"*{cleaned_journal}*")
-    if cleaned_doi:
-        parts.append(f"https://doi.org/{cleaned_doi}")
-    
-    reference = " ".join(part for part in parts if part).strip()
-    # Skip references that are just placeholders
-    if reference and not reference.strip() == "Anonymous (n.d.). Untitled.":
-        return reference
-    return ""
+    return CitationStyleEngine().format_reference(entry, year_suffix=entry.year_suffix).text
 
 
 def build_citation_catalog(
@@ -525,8 +480,27 @@ def build_citation_catalog(
             decision_threshold=normalized_metadata.decision_threshold,
             decision_source=normalized_metadata.decision_source,
             source_fields=dict(normalized_metadata.source_fields),
+            creators=list(normalized_metadata.creators),
+            container_title=normalized_metadata.container_title,
+            volume=normalized_metadata.volume,
+            issue=normalized_metadata.issue,
+            pages=normalized_metadata.pages,
+            article_number=normalized_metadata.article_number,
+            publisher=normalized_metadata.publisher,
+            url=normalized_metadata.url,
         )
         entries.append(entry)
+
+    # APA same-author/same-year letters are assigned from the deterministic
+    # title order, then persisted on the catalog entries used by every
+    # downstream renderer.
+    style_engine = CitationStyleEngine()
+    suffixes = style_engine.disambiguation_suffixes(entries)
+    entries = [
+        replace(entry, year_suffix=suffixes.get(entry.paper_id, ""))
+        for entry in entries
+    ]
+    for entry in entries:
         for alias in entry.aliases:
             alias_map[normalize_alias(alias)] = entry
 
@@ -570,6 +544,20 @@ def build_citation_catalog_from_manifest(
             decision_threshold=float(entry_data.get("decision_threshold") or 0.85),
             decision_source=str(entry_data.get("decision_source") or "rule"),
             source_fields=dict(entry_data.get("source_fields") or {}),
+            creators=normalize_creators(entry_data.get("creators") or entry_data.get("authors")),
+            container_title=str(
+                entry_data.get("container_title")
+                or entry_data.get("journal")
+                or entry_data.get("publication_title")
+                or ""
+            ),
+            volume=str(entry_data.get("volume") or ""),
+            issue=str(entry_data.get("issue") or ""),
+            pages=str(entry_data.get("pages") or ""),
+            article_number=str(entry_data.get("article_number") or ""),
+            publisher=str(entry_data.get("publisher") or ""),
+            url=str(entry_data.get("url") or ""),
+            year_suffix=str(entry_data.get("year_suffix") or ""),
         )
         for alias in entry.aliases:
             alias_map[normalize_alias(alias)] = entry

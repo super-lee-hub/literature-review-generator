@@ -8,7 +8,7 @@ from one current schema.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, MutableMapping
+from typing import Any, Dict, Iterable, Mapping, MutableMapping
 
 from services.config_values import normalize_stage1_config_sections
 from services.model_capabilities import resolve_model_capability
@@ -33,6 +33,7 @@ _MIGRATION_ONLY_STAGE1_KEYS = frozenset(
 # keys are rejected instead of being silently ignored.
 STAGE1_CONFIG_OWNERSHIP: Dict[str, Dict[str, str]] = {
     "Stage1_Input": {
+        "primary_reader_only": "ACTIVE",
         "mode": "INVARIANT",
         "send_extracted_text": "ACTIVE",
         "send_selected_visuals": "ACTIVE",
@@ -239,12 +240,16 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "retain_diagnostics",
             "enable_local_rag",
             "rag_backend",
+            "local_rag_allow_model_download",
+            "local_rag_retain_recent_identities",
+            "source_pdf_max_bytes",
         }
     ),
     "Styling": frozenset({"font_name", "font_size_body", "font_size_heading1", "font_size_heading2"}),
     "GUI": frozenset({"language"}),
     "Stage1_Input": frozenset(
         {
+            "primary_reader_only",
             "mode",
             "send_extracted_text",
             "send_selected_visuals",
@@ -658,7 +663,11 @@ class ApplicationSettings:
             "arbitrator_model": self.arbitrator_model(),
         }
 
-    def validate_outline_config(self) -> list[str]:
+    def validate_outline_config(
+        self,
+        *,
+        enabled_role_keys: Iterable[str] | None = None,
+    ) -> list[str]:
         """Errors only. Non-fatal routing observations come from
         :meth:`outline_routing_diagnostics` so a deliberate single-model setup
         stays legal while still being reported.
@@ -671,7 +680,14 @@ class ApplicationSettings:
         if count > 12:
             errors.append("Outline.candidate_count must not exceed 12")
 
+        enabled = (
+            set(str(item) for item in enabled_role_keys)
+            if enabled_role_keys is not None
+            else set(self.outline_role_sections())
+        )
         for role_key, section_name in self.outline_role_sections().items():
+            if role_key not in enabled:
+                continue
             if not section_name:
                 errors.append(f"OutlineModels.{role_key} is not configured")
                 continue
@@ -691,7 +707,11 @@ class ApplicationSettings:
                 )
         return errors
 
-    def outline_routing_diagnostics(self) -> list[str]:
+    def outline_routing_diagnostics(
+        self,
+        *,
+        enabled_role_keys: Iterable[str] | None = None,
+    ) -> list[str]:
         """Report review relationships that carry no independent judgement."""
 
         roles = self.outline_role_sections()
@@ -702,7 +722,14 @@ class ApplicationSettings:
             return diagnostics
 
         generator_identity = _route_identity(generator)
+        enabled = (
+            set(str(item) for item in enabled_role_keys)
+            if enabled_role_keys is not None
+            else set(self.outline_role_sections())
+        )
         for role_key in ("structure_critic_model", "coverage_critic_model", "evidence_critic_model"):
+            if role_key not in enabled:
+                continue
             section_name = roles.get(role_key) or ""
             section = self.sections.get(section_name)
             if section is None or not section_name:

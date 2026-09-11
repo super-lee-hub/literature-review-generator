@@ -11,6 +11,7 @@ from ai_interface import _call_ai_api
 from free_mode.profile_manager import normalize_profile, save_profile
 from models import APIConfig
 from runtime.provider_runtime import ProviderBudgetV1, ProviderBudgetExceeded, ProviderRuntime, ProviderRuntimeLedger
+from services.job_workspace import validate_path_component
 from services.model_selection import get_free_mode_api_config, has_complete_api_route
 from services.prompt_registry import PromptRegistry
 
@@ -89,7 +90,10 @@ def _new_free_mode_provider_runtime(
     resolved_output_dir = str(output_dir or "").strip()
     if not resolved_output_dir:
         return None
-    safe_project = str(project_name or "free_mode").strip() or "free_mode"
+    safe_project = validate_path_component(
+        str(project_name or "free_mode").strip() or "free_mode",
+        field_name="free_mode project_name",
+    )
     ledger_path = Path(resolved_output_dir).expanduser().resolve() / f"{safe_project}_free_mode_provider_receipts.jsonl"
     try:
         retry_limit = max(0, int(str((config or {}).get("Runtime", {}).get("node_retry_limit", 2)).strip()))
@@ -131,7 +135,10 @@ def _complete_injected_free_mode_runtime(
         "error_kind": None if isinstance(response, dict) else "invalid_response",
     }
     try:
-        admission = provider_runtime.admit(estimated_tokens=max(1, len(prompt) // 4))
+        admission = provider_runtime.admit(
+            estimated_tokens=max(1, len(prompt) // 4),
+            requested_output_tokens=max(0, int(api_config.get("max_output_tokens") or 0)),
+        )
         provider_runtime.complete(
             admission=admission,
             prompt=prompt,

@@ -211,6 +211,8 @@ class OutlineV3Executor:
         provider: Provider | Any | None = None,
         provider_profile: ProviderContextProfile | None = None,
         provider_router: OutlineProviderRouter | None = None,
+        enabled_semantic_roles: Iterable[str] | None = None,
+        reachable_provider_route_plan: Mapping[str, Any] | None = None,
         candidate_count: int = 5,
         review_intent: Mapping[str, Any] | None = None,
         quality_gate: OutlineQualityGate | Mapping[str, Any] | None = None,
@@ -295,6 +297,16 @@ class OutlineV3Executor:
         # working, but when it is supplied every node must resolve through it.
         self.router = provider_router
         self.routing_diagnostics: tuple[str, ...] = tuple(provider_router.diagnostics) if provider_router else ()
+        self.enabled_semantic_roles = (
+            frozenset(str(item).strip() for item in enabled_semantic_roles if str(item).strip())
+            if enabled_semantic_roles is not None
+            else None
+        )
+        self.reachable_provider_route_plan = (
+            dict(reachable_provider_route_plan)
+            if reachable_provider_route_plan is not None
+            else None
+        )
         self.candidate_count = min(12, int(candidate_count))
         self.stability_mode = normalized_stability_mode
         self.max_provider_calls = int(max_provider_calls) if max_provider_calls is not None else None
@@ -476,14 +488,21 @@ class OutlineV3Executor:
         return self._path(f"outline_v3/artifacts/{safe}.json")
 
     def _provider_node_ids(self) -> tuple[str, ...]:
-        return (
-            "relation_adjudication",
-            *(f"candidate_{index}_provider_generation" for index in range(1, self.candidate_count + 1)),
-            "structure_critique",
-            "coverage_critique",
-            "evidence_critique",
-            "arbitration",
-        )
+        roles = self.enabled_semantic_roles
+        node_ids: list[str] = []
+        if roles is None or "relation_adjudication" in roles:
+            node_ids.append("relation_adjudication")
+        if roles is None or "candidate_provider_generation" in roles:
+            node_ids.extend(
+                f"candidate_{index}_provider_generation"
+                for index in range(1, self.candidate_count + 1)
+            )
+        for role in ("structure_critique", "coverage_critique", "evidence_critique"):
+            if roles is None or role in roles:
+                node_ids.append(role)
+        if roles is None or "arbitration" in roles:
+            node_ids.append("arbitration")
+        return tuple(node_ids)
 
     def _role_route(self, node_id: str) -> OutlineRoleRoute:
         """Resolve the provider route that must serve one concrete node.
@@ -939,6 +958,7 @@ class OutlineV3Executor:
             "pricing_version": self.pricing_version,
             "pricing_effective_date": self.pricing_effective_date,
             "provider_configured": self._provider_configured(),
+            "reachable_provider_route_plan": self.reachable_provider_route_plan,
             "preflight_status": "accepted",
         }
         preflight_path = self._path(
@@ -2509,7 +2529,10 @@ class OutlineV3Executor:
                 f"replay stale for {node_id}: {','.join(replay_lookup.stale_reasons)}"
             )
         runtime = ProviderRuntime(
-            budget=ProviderBudgetV1(max_calls=1, max_retries_per_call=0),
+            budget=ProviderBudgetV1(
+                max_calls=1,
+                max_retries_per_call=max(0, int(api_config.get("transport_retries") or 0)),
+            ),
             ledger=self._receipt_ledger,
             job_id=self.job_id,
             attempt_id=call_id,
@@ -2529,7 +2552,13 @@ class OutlineV3Executor:
             receipt = runtime.blocked_receipt(prompt=json.dumps(request, sort_keys=True, ensure_ascii=False), input_payload=request, api_config=api_config, message="provider input exceeds verified context budget")
             self.receipts.append(receipt.receipt_id)
             raise OutlineV3ExecutionError(f"provider budget blocked node {node_id}")
-        admission = runtime.admit(estimated_tokens=int(budget["estimated_input_tokens"]))
+        requested_attempts = max(1, int(api_config.get("transport_retries") or 1))
+        effective_attempts = runtime.max_attempts_for_call(requested_attempts)
+        admission = runtime.admit(
+            estimated_tokens=int(budget["estimated_input_tokens"]),
+            requested_output_tokens=int(profile.max_output_tokens),
+            requested_retry_attempts=max(0, effective_attempts - 1),
+        )
         if self.max_provider_calls is not None and self._provider_call_count >= self.max_provider_calls:
             raise OutlineV3ExecutionError(
                 f"outline provider call budget exhausted before {node_id}"
@@ -2544,6 +2573,7 @@ class OutlineV3Executor:
             raw = self._fixture_response(node_id, request)
         else:
             self._transport_call_count += 1
+            runtime.mark_transport_started(admission)
             provider_node_id = str(transport_node_id or node_id)
             raw = (
                 transport(provider_node_id, request)
@@ -2569,6 +2599,8 @@ class OutlineV3Executor:
             metadata={
                 "node_id": node_id,
                 "semantic_node_id": semantic_node_id,
+                "config_section": route.config_section,
+                "route_fingerprint": route.safe_config_fingerprint(),
                 "closure_epoch_id": self.closure_epoch_id,
                 "estimation": budget,
                 "replay_status": replay_lookup.status,
@@ -3309,16 +3341,40 @@ class OutlineV3Executor:
                 },
             }
             relation_deps = {"relation_candidates": _hash_payload(candidate_map), "outline_evidence_views": _hash_payload(evidence)}
-            adjudication = self._run_node(
-                "relation_adjudication",
-                lambda: self._run_provider_node(
-                    "relation_adjudication", relation_request, RelationAdjudicationResult, relation_deps,
-                ),
-                expected_binding=self._provider_binding(
-                    "relation_adjudication", relation_request, expect_json=True,
-                    input_artifact_hashes=tuple(relation_deps.values()),
-                ),
-            )
+            if (
+                self.enabled_semantic_roles is not None
+                and "relation_adjudication" not in self.enabled_semantic_roles
+            ):
+                adjudication = self._run_node(
+                    "relation_adjudication",
+                    lambda: (
+                        self._artifact(
+                            RelationAdjudicationResult,
+                            {
+                                "confirmed_relation_ids": [
+                                    item["relation_id"] for item in relation_candidates
+                                ],
+                                "rejected_relations": [],
+                                "disabled_by_route_plan": True,
+                            },
+                            relation_deps,
+                        ),
+                        ("relation_candidates",),
+                        "deterministic",
+                        "local",
+                    ),
+                )
+            else:
+                adjudication = self._run_node(
+                    "relation_adjudication",
+                    lambda: self._run_provider_node(
+                        "relation_adjudication", relation_request, RelationAdjudicationResult, relation_deps,
+                    ),
+                    expected_binding=self._provider_binding(
+                        "relation_adjudication", relation_request, expect_json=True,
+                        input_artifact_hashes=tuple(relation_deps.values()),
+                    ),
+                )
             candidate_by_id = {str(item["relation_id"]): item for item in relation_candidates}
             if not isinstance(adjudication.get("confirmed_relation_ids"), list) or not isinstance(adjudication.get("rejected_relations"), list):
                 raise OutlineV3ExecutionError("relation adjudication must return explicit confirmed and rejected lists")
@@ -3531,7 +3587,7 @@ class OutlineV3Executor:
                             self._publish_repair_failure(candidate_id, repair_failure)
                             raise
                     generation_route = self._node_route(generation_node_id)
-                    generation = self._persist(
+                    self._persist(
                         generation_node_id,
                         self._artifact(OutlineCandidate, content, generation_deps),
                         depends_on=tuple(generation_deps.values()),
@@ -3628,13 +3684,38 @@ class OutlineV3Executor:
             for node_id, cls in (("structure_critique", StructureCritique), ("coverage_critique", CoverageCritique), ("evidence_critique", EvidenceCritique)):
                 request = critique_requests[node_id]
                 critique_deps = {"candidate_generations": _hash_payload(generation_binding_hashes), "coverage_contract": _hash_payload(contract)}
-                critiques[node_id] = self._run_node(
-                    node_id,
-                    lambda request=request, cls=cls, node_id=node_id, critique_deps=critique_deps: self._run_provider_node(node_id, request, cls, critique_deps),
-                    expected_binding=self._provider_binding(
-                        node_id, request, expect_json=True, input_artifact_hashes=tuple(critique_deps.values()),
-                    ),
-                )
+                if (
+                    self.enabled_semantic_roles is not None
+                    and node_id not in self.enabled_semantic_roles
+                ):
+                    critiques[node_id] = self._run_node(
+                        node_id,
+                        lambda cls=cls, node_id=node_id, critique_deps=critique_deps: (
+                            self._artifact(
+                                cls,
+                                {
+                                    "node_id": node_id,
+                                    "disabled_by_route_plan": True,
+                                    "blocking_diagnostics": [],
+                                    "coverage_metrics": {},
+                                    "evidence_metrics": {},
+                                    "structure_metrics": {},
+                                },
+                                critique_deps,
+                            ),
+                            ("candidate_generations",),
+                            "deterministic",
+                            "local",
+                        ),
+                    )
+                else:
+                    critiques[node_id] = self._run_node(
+                        node_id,
+                        lambda request=request, cls=cls, node_id=node_id, critique_deps=critique_deps: self._run_provider_node(node_id, request, cls, critique_deps),
+                        expected_binding=self._provider_binding(
+                            node_id, request, expect_json=True, input_artifact_hashes=tuple(critique_deps.values()),
+                        ),
+                    )
 
             # Only candidates that no critic explicitly flagged are eligible
             # for arbitration.  This is a deterministic prefilter, not a gate

@@ -13,6 +13,10 @@ jobs:
   test:
     runs-on: windows-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
     env:
       AUTO_GENERATE_OFFLINE_TESTS: "1"
       AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP: "1"
@@ -21,17 +25,18 @@ jobs:
       AUTO_GENERATE_RUN_HEAVY_OCR: "0"
       PYTHONUTF8: "1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 2
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
           cache: pip
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --prefer-binary -r requirements-dev.txt
+          python -m pip install --prefer-binary --require-hashes -r requirements-py311-windows-dev.lock
+          python -m pip check
       - name: Compile check
         run: python -m compileall -q .
       - name: Collect tests
@@ -42,6 +47,9 @@ jobs:
           python -m reviewctl plan --help
           python -m reviewctl run --help
           python -m reviewctl doctor --help
+          python -m reviewctl preflight --help
+          python -m reviewctl micro-probe --help
+          python -m reviewctl acceptance-run --help
           python -m reviewctl status --help
           python -m reviewctl inspect --help
           python -m reviewctl next-action --help
@@ -52,12 +60,160 @@ jobs:
           python -m reviewctl queue-add --help
           python -m reviewctl queue-run --help
       - name: Strict-offline test suite
-        run: >-
-          python -m pytest -q --strict-markers
-          -m "not live_api and not playwright and not heavy_ocr"
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $allTestFiles = @(
+            Get-ChildItem -LiteralPath tests -Filter "test_*.py" -File -Recurse |
+              Sort-Object -Property FullName
+          )
+          $shard = [int]"${{ matrix.shard }}"
+          $shardCount = 3
+          if ($shard -eq 4) {
+            $selectedTestFiles = @(
+              (Join-Path (Get-Location) "tests/test_review_batch.py")
+            )
+          } elseif ($shard -eq 5) {
+            $selectedTestFiles = @(
+              (Join-Path (Get-Location) "tests/test_runtime_lifecycle_parity.py")
+            )
+          } else {
+            $selectedTestFiles = @(
+              if ($shard -eq 3) {
+                (Join-Path (Get-Location) "tests/test_repository_hygiene.py")
+              }
+              for ($index = 0; $index -lt $allTestFiles.Count; $index++) {
+                if (
+                  (($index % $shardCount) -eq ($shard - 1)) -and
+                  ($allTestFiles[$index].Name -notin @(
+                    "test_repository_hygiene.py",
+                    "test_review_batch.py",
+                    "test_runtime_lifecycle_parity.py",
+                    "test_gui_playwright.py",
+                    "test_deepseek_vision_smoke.py",
+                    "test_runtime_bridge_helpers.py"
+                  ))
+                ) {
+                  $allTestFiles[$index].FullName
+                }
+              }
+            )
+          }
+          if ($selectedTestFiles.Count -eq 0) {
+            throw "No test files selected for shard $shard/$shardCount"
+          }
+          Write-Host "Running $($selectedTestFiles.Count) test files in shard $shard/$shardCount"
+          foreach ($testFile in $selectedTestFiles) {
+            if ((Split-Path -Leaf $testFile) -eq "test_release_hardening.py") {
+              $collectionOutput = @(
+                & python -m pytest --collect-only -q --strict-markers `
+                  -m "not live_api and not playwright and not heavy_ocr" `
+                  $testFile 2>&1
+              )
+              $collectionExitCode = $LASTEXITCODE
+              $testNodes = @(
+                $collectionOutput |
+                  Where-Object { $_ -match "::" } |
+                  ForEach-Object { [string]$_ }
+              )
+              Write-Host "Collected $($testNodes.Count) selected nodes for $testFile (pytest exit code $collectionExitCode)"
+              if ($collectionExitCode -ne 0) {
+                throw "pytest node collection failed for $testFile with exit code $collectionExitCode"
+              }
+              if ($testNodes.Count -eq 0) {
+                throw "No selected test nodes found for $testFile"
+              }
+              foreach ($testNode in $testNodes) {
+                Write-Host "Running isolated pytest process for $testNode"
+                $stdoutPath = Join-Path $env:RUNNER_TEMP ("pytest-" + [guid]::NewGuid().ToString("N") + ".stdout")
+                $stderrPath = Join-Path $env:RUNNER_TEMP ("pytest-" + [guid]::NewGuid().ToString("N") + ".stderr")
+                try {
+                  $testProcess = Start-Process -FilePath "python" -ArgumentList @(
+                    "-m", "pytest", "-vv", "-rs", "--strict-markers", $testNode
+                  ) -WorkingDirectory (Get-Location).Path `
+                    -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+                    -Wait -PassThru -ErrorAction Stop
+                  $testExitCode = [int]$testProcess.ExitCode
+                } finally {
+                  if (Test-Path -LiteralPath $stdoutPath) {
+                    Get-Content -LiteralPath $stdoutPath | ForEach-Object { Write-Host $_ }
+                  }
+                  if (Test-Path -LiteralPath $stderrPath) {
+                    Get-Content -LiteralPath $stderrPath | ForEach-Object { Write-Host $_ }
+                  }
+                  Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
+                }
+                Write-Host "pytest exit code for $testNode = $testExitCode"
+                if ($testExitCode -ne 0) {
+                  throw "pytest failed for $testNode with exit code $testExitCode"
+                }
+              }
+            } else {
+              Write-Host "Running isolated pytest process for $testFile"
+              & python -m pytest -vv -rs --strict-markers `
+                -m "not live_api and not playwright and not heavy_ocr" `
+                $testFile
+              $testExitCode = [int]$LASTEXITCODE
+              Write-Host "pytest exit code for $testFile = $testExitCode"
+              if ($testExitCode -ne 0) {
+                throw "pytest failed for $testFile with exit code $testExitCode"
+              }
+            }
+          }
+          exit 0
       - name: Type check
         run: python -m pyright
+      - name: Fatal Ruff checks
+        run: python -m ruff check . --select E9,F821,F841
+      - name: Dependency vulnerability audit
+        run: >-
+          python -m pip_audit -r requirements-py311-windows-prod.lock --strict
+          --no-deps --disable-pip --require-hashes
       - name: Doctor
         run: python -m reviewctl doctor --config config.ini.example
       - name: Committed-range whitespace check
         run: git diff --check HEAD~1 HEAD
+
+  same-process-core:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      AUTO_GENERATE_OFFLINE_TESTS: "1"
+      AUTO_GENERATE_FAIL_ON_UNEXPECTED_SKIP: "1"
+      AUTO_GENERATE_RUN_LIVE_API: "0"
+      AUTO_GENERATE_RUN_PLAYWRIGHT: "0"
+      AUTO_GENERATE_RUN_HEAVY_OCR: "0"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install development lock
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --prefer-binary --require-hashes -r requirements-py311-windows-dev.lock
+          python -m pip check
+      - name: Collect core suite
+        run: >-
+          python -m pytest --collect-only -q --strict-markers
+          tests/test_current_stage1_generation.py
+          tests/test_stage1_selective_architecture.py
+          tests/test_stage1_graph_identity_refresh.py
+          tests/test_docx_writer.py
+          tests/test_docx_citation_renderer.py
+          tests/test_preprocess_service.py
+          tests/test_local_rag.py
+      - name: Execute core suite in one process
+        run: >-
+          python -m pytest -q --strict-markers
+          tests/test_current_stage1_generation.py
+          tests/test_stage1_selective_architecture.py
+          tests/test_stage1_graph_identity_refresh.py
+          tests/test_docx_writer.py
+          tests/test_docx_citation_renderer.py
+          tests/test_preprocess_service.py
+          tests/test_local_rag.py

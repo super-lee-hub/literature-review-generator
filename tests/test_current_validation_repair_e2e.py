@@ -263,7 +263,7 @@ def test_current_control_plane_revalidates_and_promotes_quarantined_repair(
             "source": {"source_pdf": str(pdf_dir / "paper.pdf")},
         },
     )
-    paper_record = registry.register_file(
+    registry.register_file(
         artifact_id="paper_artifact:paper_1",
         artifact_role="paper_artifact",
         artifact_type="paper_artifact",

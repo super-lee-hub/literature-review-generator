@@ -132,7 +132,7 @@ def test_published_graph_hash_matches_recomputed_final_call_shapes(tmp_path: Pat
             },
         },
     )
-    result = service.run(bundle)
+    service.run(bundle)
 
     assert len(calls) == 5  # 4 visual extracts + 1 synthesis
     graph = _published_graph_payload(service)

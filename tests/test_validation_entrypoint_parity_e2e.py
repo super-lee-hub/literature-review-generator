@@ -80,9 +80,10 @@ def _patch_reader(monkeypatch: pytest.MonkeyPatch, papers: list[tuple[str, str, 
         built_input: Any,
         primary_config: Mapping[str, Any],
         backup_config: Mapping[str, Any],
+        stage1_input_settings: Mapping[str, Any],
         runtime: Any,
     ) -> Mapping[str, Any]:
-        del built_input, primary_config, backup_config, runtime
+        del built_input, primary_config, backup_config, stage1_input_settings, runtime
         key = str(item.canonical_paper_key)
         title = str(item.paper_info.get("title") or "")
         expected_title, finding = by_key.get(key, (title, "bounded evidence"))
@@ -157,6 +158,48 @@ def _run_all_signature(workspace_path: str, completion: Mapping[str, Any], expor
     current_set = registry.resolve_current_artifact_set()
     assert current_set is not None
     stage_map = resolve_current_stage_closure_map(registry)
+    draft_record = registry.get("review_draft")
+    manifest_record = registry.get("citation_manifest_v3")
+    docx_record = registry.get("review_docx")
+    assert draft_record is not None and manifest_record is not None and docx_record is not None
+    draft = json.loads(Path(draft_record.path).read_text(encoding="utf-8"))
+    manifest = json.loads(Path(manifest_record.path).read_text(encoding="utf-8"))
+    cited_bibliography = [
+        str(entry.get("citation_text") or "").strip()
+        for entry in manifest.get("bibliography", [])
+        if isinstance(entry, Mapping) and entry.get("is_cited", True)
+    ]
+    assert draft.get("content", {}).get("references") == cited_bibliography
+    cited_keys = {
+        str(entry.get("paper_key") or entry.get("paper_id") or "").strip()
+        for entry in manifest.get("bibliography", [])
+        if isinstance(entry, Mapping) and entry.get("is_cited", True)
+    }
+    occurrence_keys = {
+        str(entry.get("paper_key") or entry.get("paper_id") or "").strip()
+        for entry in manifest.get("occurrences", [])
+        if isinstance(entry, Mapping) and str(entry.get("paper_id") or "") != "unknown"
+    }
+    assert occurrence_keys == cited_keys
+    from docx import Document
+    from docx_writer import scan_docx_for_unresolved_citation_tokens
+
+    docx = Document(str(docx_record.path))
+    paragraphs = [paragraph.text for paragraph in docx.paragraphs]
+    references_index = paragraphs.index("References")
+    assert paragraphs[references_index + 1 :] == cited_bibliography
+    assert scan_docx_for_unresolved_citation_tokens(str(docx_record.path), manifest)[
+        "passed"
+    ] is True
+    validation_record = registry.get(current_set.validation_run_result_artifact_id)
+    assert validation_record is not None
+    from validation.run_result import ValidationRunResultV1
+
+    validation = ValidationRunResultV1.from_dict(
+        json.loads(Path(validation_record.path).read_text(encoding="utf-8"))
+    )
+    assert validation.input_artifacts.validation_source_authority_hash
+    assert validation.input_artifacts.validation_source_authority_fingerprint
     return {
         "stage_plan": persisted_spec["metadata"]["stage_plan"],
         "readiness_policy_snapshot": outcome.to_dict()["readiness_policy_snapshot"],

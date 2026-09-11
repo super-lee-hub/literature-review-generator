@@ -318,7 +318,6 @@ def _base_role(
     *,
     parent_identity_trusted: bool,
 ) -> tuple[str, list[str], bool]:
-    reasons: list[str] = []
     evidence_text = _candidate_evidence_text(candidate, quality)
     identity_verdict = _text(candidate.get("identity_verdict")).casefold()
     identity_reasons = {

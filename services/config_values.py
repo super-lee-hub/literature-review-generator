@@ -111,6 +111,7 @@ def parse_bounded_float(
 
 _STAGE1_INPUT_BOOL_KEYS = frozenset(
     {
+        "primary_reader_only",
         "send_extracted_text",
         "send_selected_visuals",
         "force_pdf_file_input_for_provider",

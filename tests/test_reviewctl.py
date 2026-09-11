@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import time
 
 from reviewctl import main as reviewctl_main
 from runtime.control_plane import FORBIDDEN_ACTIONS, ReviewControlPlane
@@ -44,6 +46,28 @@ def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> 
     doctor = json.loads(capsys.readouterr().out)
     assert doctor["status"] == "fail"
     assert "dummy" not in json.dumps(doctor)
+
+
+def test_doctor_does_not_call_unlocked_persistent_lock_stale(tmp_path: Path) -> None:
+    lock_path = tmp_path / "queue.json.lock"
+    lock_path.write_text("persistent queue lock\n", encoding="utf-8")
+    old = time.time() - 24 * 60 * 60
+    os.utime(lock_path, (old, old))
+
+    control = ReviewControlPlane(repo_root=tmp_path, workspace_roots=[tmp_path])
+
+    assert control._stale_locks(tmp_path) == []
+
+
+def test_doctor_excludes_dependency_lock_from_runtime_lock_diagnostics(tmp_path: Path) -> None:
+    lock_path = tmp_path / "requirements-py311-windows.lock"
+    lock_path.write_text("package==1.0\n", encoding="utf-8")
+    old = time.time() - 24 * 60 * 60
+    os.utime(lock_path, (old, old))
+
+    control = ReviewControlPlane(repo_root=tmp_path, workspace_roots=[tmp_path])
+
+    assert control._stale_locks(tmp_path) == []
 
 
 def test_control_plane_retry_node_uses_persisted_outline_v3_scope(tmp_path: Path) -> None:

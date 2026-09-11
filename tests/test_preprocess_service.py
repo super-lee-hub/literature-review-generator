@@ -1,5 +1,7 @@
 import io
 import json
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -77,7 +79,7 @@ def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monk
     manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
     stage1_manifest = json.loads(Path(result.stage1_input_manifest_path).read_text(encoding="utf-8"))
     quality_report = json.loads(Path(result.stage1_quality_report_path).read_text(encoding="utf-8"))
-    chunks = json.loads((Path(result.cache_dir) / "chunks.json").read_text(encoding="utf-8"))
+    chunks = json.loads(Path(result.chunks_path).read_text(encoding="utf-8"))
     assert diagnostics["extractor_used"] in {"fitz", "pymupdf4llm", "legacy_pdf_extractor"}
     assert diagnostics["mineru_token_present"] is False
     assert manifest["artifacts"]["normalized_md"] == result.markdown_path
@@ -87,6 +89,433 @@ def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monk
     assert quality_report["candidate_reports"]
     assert chunks
     assert {chunk["chunk_source"] for chunk in chunks} == {"selected_stage1_input"}
+
+
+def test_preprocess_pinned_generation_survives_cache_gc(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "pinned.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "true",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    first = manager.prepare_pdf(str(pdf_path), pin_id="job-a:paper-a")
+    second = manager.prepare_pdf(str(pdf_path), pin_id="job-a:paper-a")
+    assert first is not None and second is not None
+    assert first.manifest_path != second.manifest_path
+
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert Path(first.manifest_path).is_file()
+    assert Path(second.manifest_path).is_file()
+    pins = list((Path(first.cache_dir) / "generation_pins").glob("*.json"))
+    assert len(pins) >= 2
+
+
+def test_preprocess_short_lived_pin_can_be_released_after_snapshot(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "lease.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "false",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    result = manager.prepare_pdf(str(pdf_path), pin_id="short-lived:paper")
+    assert result is not None
+    pin_dir = Path(result.cache_dir) / "generation_pins"
+    assert list(pin_dir.glob("*.json"))
+
+    assert manager.release_pin(result.cache_dir, pin_id="short-lived:paper") == 1
+    assert not list(pin_dir.glob("*.json"))
+
+
+def test_preprocess_generation_lease_survives_gc_until_released(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "leased.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "true",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    first = manager.prepare_pdf(
+        str(pdf_path),
+        lease_id="lease-a",
+        lease_job_id="job-a",
+        lease_paper_key="paper-a",
+    )
+    second = manager.prepare_pdf(str(pdf_path))
+    assert first is not None and second is not None
+    assert first.manifest_path != second.manifest_path
+
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert Path(first.manifest_path).is_file()
+    assert Path(second.manifest_path).is_file()
+    lease_paths = list((Path(first.cache_dir) / "generation_leases").glob("*.json"))
+    assert len(lease_paths) == 1
+    lease = json.loads(lease_paths[0].read_text(encoding="utf-8"))
+    assert lease["schema_version"] == "preprocess-generation-lease-v1"
+    assert lease["lease_id"] == "lease-a"
+    assert lease["job_id"] == "job-a"
+    assert lease["paper_key"] == "paper-a"
+    assert lease["generation_id"] == Path(first.manifest_path).parent.name
+    assert lease["lifecycle_state"] == "active"
+    assert lease["created_at"] < lease["expires_at"]
+
+    assert (
+        manager.release_generation_lease(
+            first.cache_dir,
+            lease_id="lease-a",
+            generation_id=Path(first.manifest_path).parent.name,
+        )
+        == 1
+    )
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert not Path(first.manifest_path).exists()
+    assert Path(second.manifest_path).is_file()
+
+
+def test_preprocess_stale_generation_is_not_leased(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "stale.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "force_rebuild": "false",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+
+    first = manager.prepare_pdf(str(pdf_path))
+    assert first is not None
+    first_generation = Path(first.manifest_path).parent.name
+    manager.processing_fingerprint = "f" * 64
+
+    second = manager.prepare_pdf(
+        str(pdf_path),
+        lease_id="fresh-only",
+        lease_job_id="job-b",
+        lease_paper_key="paper-b",
+    )
+    assert second is not None
+    second_generation = Path(second.manifest_path).parent.name
+    assert second_generation != first_generation
+
+    leases = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (Path(second.cache_dir) / "generation_leases").glob("*.json")
+    ]
+    assert [item["generation_id"] for item in leases] == [second_generation]
+    manager._gc_generations(second.cache_dir, keep_generations=1)
+    assert not Path(first.manifest_path).exists()
+
+
+def test_preprocess_expired_generation_lease_is_collected(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "expired.pdf"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "ocr_mode": "off",
+                "force_rebuild": "true",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    first = manager.prepare_pdf(
+        str(pdf_path),
+        lease_id="expired-lease",
+        lease_job_id="job-expired",
+        lease_paper_key="paper-expired",
+    )
+    second = manager.prepare_pdf(str(pdf_path))
+    assert first is not None and second is not None
+    lease_path = next((Path(first.cache_dir) / "generation_leases").glob("*.json"))
+    lease = json.loads(lease_path.read_text(encoding="utf-8"))
+    lease["created_at"] = "2020-01-01T00:00:00Z"
+    lease["expires_at"] = "2020-01-01T01:00:00Z"
+    lease_path.write_text(json.dumps(lease), encoding="utf-8")
+
+    manager._gc_generations(first.cache_dir, keep_generations=1)
+
+    assert not lease_path.exists()
+    assert not Path(first.manifest_path).exists()
+    assert Path(second.manifest_path).is_file()
+
+
+def test_preprocess_generation_lease_rejects_invalid_generation_name(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    manager = PreprocessManager(
+        config={"Preprocess": {"enabled": "true", "cache_dir": str(cache_dir)}},
+        logger=None,
+    )
+
+    with pytest.raises(ValueError, match="finalized generation"):
+        manager.acquire_generation_lease(
+            str(cache_dir),
+            generation_id="../generation-outside",
+            lease_id="unsafe",
+            job_id="job-invalid",
+            paper_key="paper-invalid",
+        )
+
+
+def test_preprocess_generation_lease_rejects_reparse_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "reparse.pdf"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "ocr_mode": "off",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    result = manager.prepare_pdf(str(pdf_path))
+    assert result is not None
+    generation_root = Path(result.manifest_path).parent
+    from preprocess import service as preprocess_service
+
+    original_is_reparse_path = preprocess_service.is_reparse_path
+    monkeypatch.setattr(
+        preprocess_service,
+        "is_reparse_path",
+        lambda path: Path(path) == generation_root or original_is_reparse_path(path),
+    )
+
+    with pytest.raises(RuntimeError, match="reparse"):
+        manager.acquire_generation_lease(
+            result.cache_dir,
+            generation_id=generation_root.name,
+            lease_id="unsafe",
+            job_id="job-c",
+            paper_key="paper-c",
+        )
+
+
+def test_preprocess_generation_lease_rejects_reparse_lease_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf_path = tmp_path / "lease-dir.pdf"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "ocr_mode": "off",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    result = manager.prepare_pdf(str(pdf_path))
+    assert result is not None
+    lease_dir = Path(result.cache_dir) / "generation_leases"
+    lease_dir.mkdir()
+    from preprocess import service as preprocess_service
+
+    original_is_reparse_path = preprocess_service.is_reparse_path
+    monkeypatch.setattr(
+        preprocess_service,
+        "is_reparse_path",
+        lambda path: Path(path) == lease_dir or original_is_reparse_path(path),
+    )
+
+    with pytest.raises(RuntimeError, match="lease directory is unsafe"):
+        manager.acquire_generation_lease(
+            result.cache_dir,
+            generation_id=Path(result.manifest_path).parent.name,
+            lease_id="unsafe-dir",
+            job_id="job-dir",
+            paper_key="paper-dir",
+        )
+
+
+def test_preprocess_forwards_local_rag_retention_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from rag.local_rag import LocalRAGIndex
+
+    observed: dict[str, object] = {}
+
+    def fake_build(
+        _index: LocalRAGIndex,
+        collection_name: str,
+        chunks: list[dict[str, object]],
+        **kwargs: object,
+    ) -> bool:
+        observed.update(
+            {
+                "collection_name": collection_name,
+                "chunks": chunks,
+                **kwargs,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(LocalRAGIndex, "build_from_chunks", fake_build)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(tmp_path / "cache"),
+                "enable_local_rag": "true",
+                "rag_backend": "chroma",
+                "local_rag_retain_recent_identities": "1",
+            },
+        },
+        logger=None,
+    )
+
+    assert manager._maybe_build_local_rag(
+        "paper-cache-key",
+        [{"chunk_id": "chunk-1", "text": "evidence"}],
+        source_pdf_sha256="a" * 64,
+        processing_fingerprint="b" * 64,
+    )
+    assert observed["retain_recent_identities"] == 1
+
+
+def test_preprocess_failure_cleans_staging_generation(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "failed.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    manager = PreprocessManager(
+        config={
+            "Paths": {"output_path": str(tmp_path)},
+            "Preprocess": {
+                "enabled": "true",
+                "cache_dir": str(cache_dir),
+                "ocr_mode": "off",
+                "extractor_profile": "fitz",
+            },
+        },
+        logger=None,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_extract_preferred_content",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("synthetic extraction failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic extraction failure"):
+        manager.prepare_pdf(str(pdf_path))
+
+    assert not list(cache_dir.glob("**/.generation.tmp-*"))
+
+
+def test_preprocess_same_cache_key_serializes_independent_processes(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "concurrent.pdf"
+    cache_dir = tmp_path / "cache"
+    _make_text_pdf(pdf_path)
+    worker_code = (
+        "import json,sys; "
+        "from preprocess.service import PreprocessManager; "
+        "cfg=json.loads(sys.argv[1]); "
+        "result=PreprocessManager(config=cfg).prepare_pdf(cfg['pdf'], pin_id=cfg['pin_id']); "
+        "json.dump({'manifest_path': result.manifest_path if result else ''}, open(cfg['result'],'w'), sort_keys=True)"
+    )
+    processes: list[subprocess.Popen[bytes]] = []
+    result_paths: list[Path] = []
+    try:
+        for index in range(2):
+            result_path = tmp_path / f"worker-{index}.json"
+            result_paths.append(result_path)
+            config = {
+                "Paths": {"output_path": str(tmp_path)},
+                "Preprocess": {
+                    "enabled": "true",
+                    "cache_dir": str(cache_dir),
+                    "ocr_mode": "off",
+                    "force_rebuild": "true",
+                    "extractor_profile": "fitz",
+                },
+                "pdf": str(pdf_path),
+                "pin_id": f"concurrent-job-{index}",
+                "result": str(result_path),
+            }
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", worker_code, json.dumps(config)],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        assert [process.wait(timeout=60) for process in processes] == [0, 0]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+
+    manifests = [
+        Path(json.loads(path.read_text(encoding="utf-8"))["manifest_path"])
+        for path in result_paths
+    ]
+    assert all(path.is_file() for path in manifests)
+    assert len({path.parent.name for path in manifests}) >= 1
+    assert all(json.loads(path.read_text(encoding="utf-8"))["generation_id"] == path.parent.name for path in manifests)
 
 
 def test_preprocess_manager_defaults_to_local_even_with_ambient_mineru_token(tmp_path: Path, monkeypatch) -> None:
@@ -162,7 +591,7 @@ def test_preprocess_manager_records_hybrid_skip_reason_without_losing_token_stat
     assert manifest["mineru_remote_enabled"] is False
 
 
-def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path, monkeypatch) -> None:
+def test_preprocess_manager_rebuilds_when_required_cache_artifact_is_missing(tmp_path: Path) -> None:
     pdf_path = tmp_path / "sample.pdf"
     cache_dir = tmp_path / "cache"
     _make_text_pdf(pdf_path)
@@ -187,22 +616,17 @@ def test_preprocess_manager_reuses_fresh_cache(tmp_path: Path, monkeypatch) -> N
     ]:
         Path(path).unlink()
 
-    monkeypatch.setattr(
-        manager,
-        "_extract_preferred_content",
-        lambda _path: (_ for _ in ()).throw(AssertionError("fresh cache should not re-run parser")),
-    )
     second = manager.prepare_pdf(str(pdf_path))
 
     assert second is not None
     assert first.cache_dir == second.cache_dir
-    assert first.manifest_path == second.manifest_path
-    assert first.page_index_path == second.page_index_path
+    assert first.manifest_path != second.manifest_path
+    assert first.page_index_path != second.page_index_path
     assert Path(second.stage1_input_path).exists()
     assert Path(second.stage1_input_manifest_path).exists()
     assert Path(second.stage1_quality_report_path).exists()
     assert second.stage1_input_text
-    chunks = json.loads((Path(second.cache_dir) / "chunks.json").read_text(encoding="utf-8"))
+    chunks = json.loads(Path(second.chunks_path).read_text(encoding="utf-8"))
     assert chunks
     assert {chunk["chunk_source"] for chunk in chunks} == {"selected_stage1_input"}
 
@@ -402,6 +826,49 @@ def test_mineru_normalizer_does_not_treat_baseline_as_success_when_zip_download_
     )
 
     assert normalized is None
+
+
+def test_mineru_zip_text_members_are_bounded(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_text_max_bytes = 8
+    raw_zip = io.BytesIO()
+    with zipfile.ZipFile(raw_zip, "w") as archive:
+        archive.writestr("normalized.md", b"0123456789")
+
+    with pytest.raises(RuntimeError, match="markdown member exceeds"):
+        manager._artifacts_from_zip_bytes(raw_zip.getvalue())
+
+
+def test_mineru_streaming_binary_response_is_bounded(monkeypatch) -> None:
+    manager = PreprocessManager(config={"Preprocess": {"enabled": "true"}}, logger=None)
+    manager.mineru_api_token = "token"
+    manager.mineru_allowed_url_hosts = {"cdn.example"}
+    manager.mineru_response_max_bytes = 4
+
+    class FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def iter_content(self, *, chunk_size: int):
+            del chunk_size
+            return [b"123", b"45"]
+
+    class FakeSession:
+        trust_env = True
+
+        def get(self, _url: str, **_kwargs):
+            return FakeResponse()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("preprocess.service.requests.Session", FakeSession)
+
+    with pytest.raises(RuntimeError, match="response exceeded"):
+        manager._request_binary("https://cdn.example/result.zip")
 
 
 def test_mineru_binary_download_bypasses_environment_proxy(monkeypatch) -> None:

@@ -3,25 +3,20 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Any, Dict, List, Tuple
 
-import requests  # type: ignore
-
 from services.model_capabilities import (
-    DEFAULT_ANTHROPIC_VERSION,
     resolve_anthropic_effort,
-    resolve_anthropic_messages_url,
     resolve_model_capability,
 )
-from services.proxy_policy import should_bypass_environment_proxy
 from services.repair_policy import parse_repair_policy
 from services.config_values import (
     StrictConfigValueError,
     normalize_stage1_config_sections,
 )
+from services.credential_provenance import is_template_credential
 from services.settings import ApplicationSettings, validate_config_keys
 
 
@@ -41,6 +36,14 @@ _ANTHROPIC_EFFORT_VALUES = frozenset({
 
 def _normalize_config_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _probe_provider_connection(api_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Late-bound bridge to the canonical instrumented provider probe."""
+
+    from ai_interface import probe_provider_connection
+
+    return probe_provider_connection(api_config)
 
 
 def _validate_api_transport_combo(section_name: str, section: Dict[str, Any]) -> Tuple[List[str], List[str]]:
@@ -160,12 +163,19 @@ def validate_output_path(path: str, allow_empty: bool = False) -> Tuple[bool, st
         return False, f"无法创建或写入目录: {exc}"
 
 
-def validate_api_key(api_key: str, allow_empty: bool = False) -> Tuple[bool, str]:
+def validate_api_key(
+    api_key: str,
+    allow_empty: bool = False,
+    *,
+    allow_template: bool = False,
+) -> Tuple[bool, str]:
     if not api_key:
         return (True, "") if allow_empty else (False, "API Key不能为空")
     value = api_key.strip()
-    if value in {"loaded_from_.env_file", "YOUR_PRIMARY_READER_API_KEY_HERE", "YOUR_BACKUP_READER_API_KEY_HERE", "YOUR_WRITER_API_KEY_HERE", "YOUR_VALIDATOR_API_KEY_HERE"}:
-        return True, ""
+    if is_template_credential(value):
+        if allow_template:
+            return True, ""
+        return False, "API Key仍是模板占位符，生产运行拒绝发送请求"
     if len(value) < 8:
         return False, "API Key长度似乎过短，请确认是否正确"
     return True, ""
@@ -214,7 +224,13 @@ def validate_config_section(config_dict: Dict[str, Any], section_name: str, requ
     return True, ""
 
 
-def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def validate_all_config(
+    config_dict: Dict[str, Any],
+    *,
+    required_provider_sections: List[str] | Tuple[str, ...] | None = None,
+    allow_template_credentials: bool = False,
+    reachable_stages: Tuple[str, ...] | List[str] | None = None,
+) -> Tuple[bool, List[str]]:
     """Validate current settings and return ``(valid, messages)``."""
 
     schema_errors = validate_config_keys(config_dict)
@@ -230,22 +246,41 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         return False, ["配置项[Paths]output_path不能为空"]
 
     messages: List[str] = []
-    for section_name in ("Primary_Reader_API", "Backup_Reader_API", "Writer_API"):
+    required_sections = (
+        ("Primary_Reader_API", "Backup_Reader_API", "Writer_API")
+        if required_provider_sections is None
+        else tuple(dict.fromkeys(str(item) for item in required_provider_sections))
+    )
+    for section_name in required_sections:
         valid, error = validate_config_section(config_dict, section_name, ["api_key", "model", "api_base"])
         if not valid:
             return False, [error]
-        valid, error = validate_api_key(str(config_dict[section_name]["api_key"]), allow_empty=True)
+        valid, error = validate_api_key(
+            str(config_dict[section_name]["api_key"]),
+            allow_empty=False,
+            allow_template=allow_template_credentials,
+        )
         if not valid:
-            messages.append(f"[{section_name}] {error}")
+            return False, [f"[{section_name}] {error}"]
         combo_errors, combo_warnings = _validate_api_transport_combo(section_name, config_dict[section_name])
         if combo_errors:
             return False, combo_errors
         messages.extend(combo_warnings)
         valid, error = validate_url(str(config_dict[section_name]["api_base"]), allow_empty=True)
         if not valid:
-            messages.append(f"[{section_name}] {error}")
+            return False, [f"[{section_name}] {error}"]
 
-    for section_name in ("Outline_API", "Free_Mode_API", "Validator_API"):
+    optional_sections = (
+        "Primary_Reader_API",
+        "Backup_Reader_API",
+        "Writer_API",
+        "Outline_API",
+        "Free_Mode_API",
+        "Validator_API",
+    )
+    for section_name in optional_sections:
+        if section_name in required_sections:
+            continue
         if section_name not in config_dict:
             continue
         section = config_dict[section_name]
@@ -254,13 +289,20 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         valid, error = validate_config_section(config_dict, section_name, ["api_key", "model", "api_base"])
         if not valid:
             return False, [error]
+        valid, error = validate_api_key(
+            str(section.get("api_key") or ""),
+            allow_empty=True,
+            allow_template=True,
+        )
+        if not valid:
+            messages.append(f"[{section_name}] {error}")
         combo_errors, combo_warnings = _validate_api_transport_combo(section_name, section)
         if combo_errors:
             return False, combo_errors
         messages.extend(combo_warnings)
         valid, error = validate_url(str(section["api_base"]), allow_empty=True)
         if not valid:
-            messages.append(f"[{section_name}] {error}")
+            return False, [f"[{section_name}] {error}"]
 
     runtime = config_dict.get("Runtime", {})
     for key, minimum, maximum in (("max_workers", 1, 64), ("transport_retries", 0, 10), ("node_retry_limit", 0, 1000), ("total_job_deadline_seconds", 0, 1000000)):
@@ -325,7 +367,7 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
             return False, [
                 "[Stage1_Visual] selection_mode must be selective or adaptive_page_scan"
             ]
-        render_all = _normalize_config_text(stage1_visual.get("render_all_nonblank_pages"))
+        _normalize_config_text(stage1_visual.get("render_all_nonblank_pages"))
         for key in ("page_format", "crop_format"):
             if key in stage1_visual:
                 image_format = _normalize_config_text(stage1_visual[key]).casefold()
@@ -366,15 +408,53 @@ def validate_all_config(config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         parse_repair_policy(config_dict.get("Validation", {}).get("repair_policy"))
     except (TypeError, ValueError) as exc:
         return False, [str(exc)]
-    outline_errors = settings.validate_outline_config()
-    if outline_errors:
-        return False, outline_errors
-    # A critique that shares the generator's identity is legal but must never be
-    # invisible, so it is surfaced as a warning rather than silently accepted.
-    messages.extend(settings.outline_routing_diagnostics())
+    if reachable_stages is None or "outline" in reachable_stages:
+        from runtime.provider_routes import OUTLINE_ROLE_TO_SETTING, build_reachable_provider_route_plan
+
+        try:
+            outline_route_plan = build_reachable_provider_route_plan(
+                config_dict,
+                action="generate_outline",
+                requested_stages=("outline",),
+            )
+        except (TypeError, ValueError) as exc:
+            return False, [f"unable to build reachable provider route plan: {exc}"]
+        enabled_outline_roles = {
+            OUTLINE_ROLE_TO_SETTING[role]
+            for role in outline_route_plan.semantic_roles
+            if role in OUTLINE_ROLE_TO_SETTING
+        }
+        outline_errors = settings.validate_outline_config(
+            enabled_role_keys=enabled_outline_roles
+        )
+        if outline_errors:
+            return False, outline_errors
+        # A critique that shares the generator's identity is legal but must never be
+        # invisible, so it is surfaced as a warning rather than silently accepted.
+        messages.extend(
+            settings.outline_routing_diagnostics(
+                enabled_role_keys=enabled_outline_roles
+            )
+        )
     preprocess = config_dict.get("Preprocess", {})
     if str(preprocess.get("ocr_mode", "auto")).lower() not in {"auto", "off", "always"}:
         return False, ["[Preprocess] ocr_mode 应为 auto/off/always 之一"]
+    if "local_rag_retain_recent_identities" in preprocess:
+        valid, error = validate_numeric_range(
+            str(preprocess["local_rag_retain_recent_identities"]),
+            0,
+            1000,
+        )
+        if not valid:
+            return False, [f"[Preprocess] local_rag_retain_recent_identities {error}"]
+    if "source_pdf_max_bytes" in preprocess:
+        valid, error = validate_numeric_range(
+            str(preprocess["source_pdf_max_bytes"]),
+            1,
+            10_000_000_000,
+        )
+        if not valid:
+            return False, [f"[Preprocess] source_pdf_max_bytes {error}"]
     return True, messages
 
 
@@ -389,83 +469,34 @@ def test_api_connection(
     anthropic_path: str = "",
     anthropic_version: str = "",
 ) -> Tuple[bool, str]:
-    """Probe the configured wire protocol without exposing credentials.
+    """Delegate the GUI connection test to the canonical provider transport."""
 
-    OpenAI-compatible providers expose a model-list endpoint. Native Anthropic
-    Messages providers are probed with a one-token request instead: the native
-    endpoint is the meaningful connectivity check, and it must use
-    ``x-api-key`` plus ``anthropic-version`` rather than an OpenAI Bearer
-    header.
-    """
-
-    base = api_base.rstrip("/")
-    normalized_endpoint = _normalize_config_text(endpoint_type).replace("-", "_").casefold()
-    normalized_family = _normalize_config_text(provider_family).replace("-", "_").casefold()
-
-    if normalized_endpoint == "anthropic" or normalized_family == "anthropic":
-        # Same resolver the runtime uses. A probe that builds its own URL can
-        # pass while the real request 400s on a duplicated /v1, which is the
-        # most misleading failure this validator could produce.
-        url = resolve_anthropic_messages_url(base, _normalize_config_text(anthropic_path))
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": _normalize_config_text(anthropic_version) or DEFAULT_ANTHROPIC_VERSION,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "ping"}],
-        }
-        try:
-            if should_bypass_environment_proxy({"proxy_mode": proxy_mode}):
-                with requests.Session() as session:
-                    session.trust_env = False
-                    response = session.post(url, headers=headers, json=payload, timeout=10)
-            else:
-                response = requests.post(url, headers=headers, json=payload, timeout=10)
-            if response.status_code == 200:
-                return True, f"Anthropic API 连通成功，模型'{model}'可用"
-            return False, f"Anthropic API请求失败：HTTP {response.status_code}"
-        except requests.exceptions.Timeout:
-            return False, "连接超时：API服务器响应时间过长"
-        except requests.exceptions.RequestException:
-            # Do not echo the exception: a malformed endpoint may contain
-            # userinfo/query material, and request libraries include the URL in
-            # their error text. Credentials must never reach UI/log output.
-            return False, "请求异常：无法连接 Anthropic API 服务器"
-
-    base = re.sub(r"/chat/completions/?$", "", base, flags=re.IGNORECASE)
-    base = re.sub(r"/v1/chat/completions/?$", "/v1", base, flags=re.IGNORECASE)
-    base = re.sub(r"/models/?$", "", base, flags=re.IGNORECASE)
-    if not re.search(r"/v\d+$", base, flags=re.IGNORECASE):
-        base = f"{base}/v1"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
-        if should_bypass_environment_proxy({"proxy_mode": proxy_mode}):
-            with requests.Session() as session:
-                session.trust_env = False
-                response = session.get(f"{base}/models", headers=headers, timeout=10)
-        else:
-            response = requests.get(f"{base}/models", headers=headers, timeout=10)
-        if response.status_code != 200:
-            return False, f"API请求失败：HTTP {response.status_code}"
-        try:
-            model_ids = [str(item.get("id", "")) for item in response.json().get("data", [])]
-        except (AttributeError, json.JSONDecodeError, TypeError):
-            return False, "API响应格式异常：无法解析模型列表"
-        if model in model_ids:
-            return True, f"API连通成功，模型'{model}'可用"
-        for model_id in model_ids:
-            if model.lower() in model_id.lower() or model_id.lower() in model.lower():
-                return True, f"API连通成功，找到匹配模型'{model_id}'"
-        return False, f"模型不可用：指定模型'{model}'不存在或无权访问"
-    except requests.exceptions.Timeout:
-        return False, "连接超时：API服务器响应时间过长"
-    except requests.exceptions.RequestException:
-        # Keep provider errors safe even when an endpoint was entered with
-        # credential-shaped URL material.
+        result = _probe_provider_connection(
+            {
+                "api_key": api_key,
+                "api_base": api_base,
+                "model": model,
+                "proxy_mode": proxy_mode,
+                "provider_family": provider_family,
+                "endpoint_type": endpoint_type,
+                "anthropic_path": anthropic_path,
+                "anthropic_version": anthropic_version,
+            }
+        )
+    except (OSError, TypeError, ValueError, RuntimeError):
         return False, "请求异常：无法连接 API 服务器"
+    if str(result.get("status") or "") == "success":
+        family = _normalize_config_text(provider_family) or "provider"
+        return True, f"{family} API 连通成功，模型'{model}'可用"
+    error_kind = _normalize_config_text(result.get("error_kind"))
+    if error_kind == "quota_exhausted":
+        return False, "请求失败：Provider 配额不足"
+    if error_kind == "fatal_config_or_auth":
+        return False, "请求失败：Provider 配置或认证无效"
+    if error_kind == "budget_exhausted":
+        return False, "请求失败：Provider 预算已耗尽"
+    return False, "请求异常：无法连接 API 服务器"
 
 
 def validate_zotero_library_path(library_path: str) -> Tuple[bool, str]:

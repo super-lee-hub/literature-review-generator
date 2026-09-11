@@ -79,6 +79,38 @@ class TestPDFExtractor:
         finally:
             os.unlink(tmp_path)
 
+    @patch('pdf_extractor.pdfplumber')
+    @patch('os.path.getsize')
+    def test_partial_pdfplumber_failure_does_not_duplicate_pages(self, mock_getsize, mock_pdfplumber):
+        mock_getsize.return_value = 1024 * 1024
+        from unittest.mock import MagicMock
+
+        first_page = MagicMock()
+        first_page.extract_text.return_value = "from plumber page one"
+        second_page = MagicMock()
+        second_page.extract_text.side_effect = RuntimeError("page two failed")
+        plumber_doc = MagicMock()
+        plumber_doc.pages = [first_page, second_page]
+        mock_pdfplumber.open.return_value = plumber_doc
+
+        fitz_pages = [MagicMock(), MagicMock()]
+        fitz_pages[0].get_text.return_value = "from fitz page one"
+        fitz_pages[1].get_text.return_value = "from fitz page two"
+        fitz_doc = MagicMock()
+        fitz_doc.page_count = 2
+        fitz_doc.load_page.side_effect = fitz_pages
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with patch('pdf_extractor.fitz.open', return_value=fitz_doc):
+                result = self.pdf_extractor.extract_text_from_pdf(tmp_path)
+            assert result.count("from plumber page one") == 0
+            assert result.count("from fitz page one") == 1
+            assert result.count("from fitz page two") == 1
+        finally:
+            os.unlink(tmp_path)
+
     @patch('pdf_extractor.fitz')
     @patch('pdf_extractor.pdfplumber')
     @patch('os.path.getsize')

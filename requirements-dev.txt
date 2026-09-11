@@ -1,3 +1,5 @@
+# Source requirements for release verification and development. The generated
+# Windows/Python 3.11 lock is requirements-py311-windows-dev.lock.
 -r requirements.txt
 
 # Testing and development
@@ -7,3 +9,5 @@ pyright==1.1.411
 
 # Optional GUI end-to-end tests
 playwright
+pip-audit
+ruff

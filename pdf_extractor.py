@@ -81,6 +81,10 @@ def extract_text_from_pdf(pdf_path: str) -> Optional[str]:
             
     except Exception as e:
         logging.warning(f"pdfplumber提取失败: {e}")
+        # A partial parser result is not a valid prefix of the fallback
+        # result. Reset it before PyMuPDF runs, otherwise every page that
+        # pdfplumber emitted before the failure is duplicated.
+        text_content = ""
     
     # 尝试使用PyMuPDF提取文本
     try:

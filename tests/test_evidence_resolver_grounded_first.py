@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from validation.evidence_resolver import EvidenceCandidate, EvidenceResolver, EvidenceResolverContext
+from validation.evidence_resolver import (
+    SOURCE_GROUNDED_RESOLVER_TIERS,
+    EvidenceCandidate,
+    EvidenceResolver,
+    EvidenceResolverContext,
+)
 
 
 def _candidate(
@@ -123,4 +128,59 @@ def test_grounded_windows_ranked_higher_than_hints() -> None:
     tiers = [item.resolver_tier for item in result]
     assert tiers.count("preprocess_chunks") == 1
     assert tiers.count("normalized_text") == 1
+    assert tiers.count("ai_summary") <= 2
+
+
+def _resolve_with_counts(
+    *,
+    grounded_count: int,
+    hint_count: int,
+    max_windows: int,
+) -> List[EvidenceCandidate]:
+    grounded = [
+        _candidate(
+            tier="normalized_text" if index % 2 == 0 else "preprocess_chunks",
+            reason="grounded",
+            rank=index,
+            confidence=0.8 - index / 100,
+        )
+        for index in range(grounded_count)
+    ]
+    hints = [
+        _candidate(tier="ai_summary", reason="hint", rank=index, confidence=0.99)
+        for index in range(hint_count)
+    ]
+    return _FakeResolver(hints, grounded).resolve_evidence(
+        "span", max_windows=max_windows
+    )
+
+
+def test_max_windows_one_keeps_one_grounded_candidate() -> None:
+    result = _resolve_with_counts(grounded_count=1, hint_count=10, max_windows=1)
+    assert [item.resolver_tier for item in result] == ["normalized_text"]
+
+
+def test_max_windows_two_keeps_two_grounded_candidates() -> None:
+    result = _resolve_with_counts(grounded_count=2, hint_count=10, max_windows=2)
+    assert all(item.resolver_tier in SOURCE_GROUNDED_RESOLVER_TIERS for item in result)
+    assert len(result) == 2
+
+
+def test_max_windows_two_uses_only_leftover_hint_capacity() -> None:
+    result = _resolve_with_counts(grounded_count=1, hint_count=10, max_windows=2)
+    tiers = [item.resolver_tier for item in result]
+    assert tiers.count("normalized_text") == 1
+    assert tiers.count("ai_summary") == 1
+
+
+def test_max_windows_eight_keeps_all_eight_grounded_candidates() -> None:
+    result = _resolve_with_counts(grounded_count=8, hint_count=10, max_windows=8)
+    assert len(result) == 8
+    assert all(item.resolver_tier in SOURCE_GROUNDED_RESOLVER_TIERS for item in result)
+
+
+def test_max_windows_eight_allows_at_most_two_hints_after_grounded_candidates() -> None:
+    result = _resolve_with_counts(grounded_count=6, hint_count=10, max_windows=8)
+    tiers = [item.resolver_tier for item in result]
+    assert tiers.count("normalized_text") + tiers.count("preprocess_chunks") == 6
     assert tiers.count("ai_summary") <= 2

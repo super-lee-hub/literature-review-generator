@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -22,11 +23,14 @@ from services.artifact_registry import (
     PublicationFenceRejected,
     RegistryError,
 )
+from services.durable_io import AtomicReplaceTimeoutError, atomic_replace_with_retry
 
 T = TypeVar("T")
 
 _QUEUE_PROCESS_LOCKS_GUARD = threading.Lock()
 _QUEUE_PROCESS_LOCKS: dict[str, threading.RLock] = {}
+DEFAULT_QUEUE_LOCK_TIMEOUT_SECONDS = 5.0
+DEFAULT_QUEUE_LOCK_RETRY_INTERVAL_MS = 50
 
 
 def _queue_process_lock(path: Path) -> threading.RLock:
@@ -37,6 +41,30 @@ def _queue_process_lock(path: Path) -> threading.RLock:
 
 class JobCancelledError(RuntimeError):
     pass
+
+
+class QueueError(RuntimeError):
+    """Base class for durable queue failures."""
+
+
+class QueueCorruption(QueueError):
+    """Raised when the canonical queue cannot be decoded safely."""
+
+    def __init__(self, queue_path: str | Path, quarantine_path: str | Path | None, reason: str) -> None:
+        self.queue_path = str(queue_path)
+        self.quarantine_path = str(quarantine_path or "")
+        detail = f"persistent queue is corrupt: {self.queue_path}: {reason}"
+        if self.quarantine_path:
+            detail += f"; preserved copy: {self.quarantine_path}"
+        super().__init__(detail)
+
+
+class QueueLockTimeout(QueueError):
+    """Raised when a queue file lock cannot be acquired before the deadline."""
+
+
+class QueueAtomicReplaceTimeout(QueueError):
+    """Raised when the queue file remains blocked during atomic publication."""
 
 
 class QueuePublicationRejected(PublicationFenceRejected):
@@ -77,6 +105,37 @@ def _safe_publication_component(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "")).strip("._") or "publication"
 
 
+def _quarantine_queue_bytes(queue_path: Path, raw_bytes: bytes, error: BaseException) -> Path | None:
+    """Preserve corrupt queue bytes without replacing the canonical file."""
+
+    quarantine_path: Path | None = None
+    try:
+        quarantine_path = queue_path.with_name(
+            f"{queue_path.name}.corrupt-{uuid.uuid4().hex}.bin"
+        )
+        with quarantine_path.open("wb") as handle:
+            handle.write(raw_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        diagnostic_path = quarantine_path.with_suffix(quarantine_path.suffix + ".json")
+        diagnostic_path.write_text(
+            json.dumps(
+                {
+                    "queue_path": str(queue_path),
+                    "quarantine_path": str(quarantine_path),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
+    return quarantine_path
+
+
 def _write_staged_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -85,7 +144,7 @@ def _write_staged_bytes(path: Path, payload: bytes) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp_path, path)
+        atomic_replace_with_retry(temp_path, path, timeout_seconds=5.0)
     finally:
         if os.path.exists(temp_path):
             try:
@@ -314,9 +373,17 @@ class InProcessQueueService:
             handle.status = "running"
             try:
                 token.check_cancelled()
+                accepts_cancel_token = True
                 try:
+                    signature = inspect.signature(func)
+                    signature.bind_partial(*args, cancel_token=token, **kwargs)
+                except (TypeError, ValueError):
+                    accepts_cancel_token = False
+                if accepts_cancel_token:
+                    # Do not catch TypeError here: it may come from inside the
+                    # callable and must never cause a second side-effecting run.
                     handle.result = func(*args, cancel_token=token, **kwargs)
-                except TypeError:
+                else:
                     handle.result = func(*args, **kwargs)
                 handle.status = "completed"
             except JobCancelledError as exc:
@@ -329,7 +396,14 @@ class InProcessQueueService:
 
 
 class PersistentQueueService:
-    def __init__(self, queue_file_path: str | Path) -> None:
+    def __init__(
+        self,
+        queue_file_path: str | Path,
+        *,
+        lock_timeout_seconds: float = DEFAULT_QUEUE_LOCK_TIMEOUT_SECONDS,
+        lock_retry_interval_ms: int = DEFAULT_QUEUE_LOCK_RETRY_INTERVAL_MS,
+        atomic_replace_timeout_seconds: float | None = None,
+    ) -> None:
         self.queue_file_path = Path(queue_file_path).expanduser().resolve()
         queue_parent = self.queue_file_path.parent
         self._canonical_output_root = (
@@ -342,6 +416,16 @@ class PersistentQueueService:
         self._runtimes: Dict[str, QueueJobRuntime] = {}
         self._revision = 0
         self._lock_path = self.queue_file_path.with_name(self.queue_file_path.name + ".lock")
+        self.lock_timeout_seconds = max(0.0, float(lock_timeout_seconds))
+        self.lock_retry_interval_ms = max(1, int(lock_retry_interval_ms))
+        self.atomic_replace_timeout_seconds = max(
+            0.0,
+            float(
+                self.lock_timeout_seconds
+                if atomic_replace_timeout_seconds is None
+                else atomic_replace_timeout_seconds
+            ),
+        )
         self._load()
 
     @contextmanager
@@ -349,8 +433,14 @@ class PersistentQueueService:
         """Hold the process and OS lock for one read/modify/write transaction."""
 
         self.queue_file_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            with _queue_process_lock(self._lock_path):
+        process_lock = _queue_process_lock(self._lock_path)
+        if not process_lock.acquire(timeout=self.lock_timeout_seconds):
+            raise QueueLockTimeout(
+                f"timed out acquiring in-process queue lock after {self.lock_timeout_seconds:.3f}s: "
+                f"{self._lock_path}"
+            )
+        try:
+            with self._lock:
                 with self._lock_path.open("a+b") as handle:
                     handle.seek(0, os.SEEK_END)
                     if handle.tell() == 0:
@@ -358,33 +448,52 @@ class PersistentQueueService:
                         handle.flush()
                         os.fsync(handle.fileno())
                     handle.seek(0)
+                    acquired_os_lock = False
+                    deadline = time.monotonic() + self.lock_timeout_seconds
                     if os.name == "nt":
                         import msvcrt
 
-                        acquired = False
-                        while not acquired:
+                        while not acquired_os_lock:
                             try:
                                 msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                                acquired = True
-                            except OSError:
-                                time.sleep(0.01)
+                                acquired_os_lock = True
+                            except OSError as exc:
+                                if time.monotonic() >= deadline:
+                                    raise QueueLockTimeout(
+                                        f"timed out acquiring queue lock after {self.lock_timeout_seconds:.3f}s: "
+                                        f"{self._lock_path}"
+                                    ) from exc
+                                time.sleep(self.lock_retry_interval_ms / 1000.0)
                     else:
                         import fcntl
 
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                        while not acquired_os_lock:
+                            try:
+                                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                acquired_os_lock = True
+                            except (BlockingIOError, OSError) as exc:
+                                if time.monotonic() >= deadline:
+                                    raise QueueLockTimeout(
+                                        f"timed out acquiring queue lock after {self.lock_timeout_seconds:.3f}s: "
+                                        f"{self._lock_path}"
+                                    ) from exc
+                                time.sleep(self.lock_retry_interval_ms / 1000.0)
                     try:
                         self._load_unlocked()
                         yield
                     finally:
-                        handle.seek(0)
-                        if os.name == "nt":
-                            import msvcrt
+                        if acquired_os_lock:
+                            handle.seek(0)
+                            if os.name == "nt":
+                                import msvcrt
 
-                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                        else:
-                            import fcntl
+                                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                            else:
+                                import fcntl
 
-                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            process_lock.release()
 
     def _load(self) -> None:
         with self._store_lock():
@@ -392,8 +501,15 @@ class PersistentQueueService:
 
     def _load_unlocked(self) -> None:
         if self.queue_file_path.exists():
+            raw_bytes = self.queue_file_path.read_bytes()
             try:
-                data = json.loads(self.queue_file_path.read_text(encoding="utf-8"))
+                data = json.loads(raw_bytes.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise TypeError("queue root must be an object")
+                if not isinstance(data.get("jobs", {}), dict) or not isinstance(
+                    data.get("runtimes", {}), dict
+                ):
+                    raise TypeError("queue jobs/runtimes must be objects")
                 self._jobs = {
                     job_id: QueueJobSpec.from_dict(job_data)
                     for job_id, job_data in data.get("jobs", {}).items()
@@ -404,10 +520,9 @@ class PersistentQueueService:
                 }
                 self._revision = max(0, int(data.get("revision") or 0))
                 self._normalize_loaded_jobs()
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                self._jobs = {}
-                self._runtimes = {}
-                self._revision = 0
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+                quarantine_path = _quarantine_queue_bytes(self.queue_file_path, raw_bytes, exc)
+                raise QueueCorruption(self.queue_file_path, quarantine_path, str(exc)) from exc
         else:
             self._jobs = {}
             self._runtimes = {}
@@ -500,9 +615,30 @@ class PersistentQueueService:
             "revision": self._revision,
             "last_updated": self._utc_now(),
         }
-        temp_path = self.queue_file_path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        temp_path.replace(self.queue_file_path)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.queue_file_path.name}.",
+            suffix=".tmp",
+            dir=str(self.queue_file_path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                atomic_replace_with_retry(
+                    temp_name,
+                    self.queue_file_path,
+                    timeout_seconds=self.atomic_replace_timeout_seconds,
+                )
+            except AtomicReplaceTimeoutError as exc:
+                raise QueueAtomicReplaceTimeout(str(exc)) from exc
+        finally:
+            if os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
 
     @staticmethod
     def _now_datetime() -> datetime:
@@ -1175,18 +1311,42 @@ class PersistentQueueService:
                 "runtimes": {job_id: runtime.to_dict() for job_id, runtime in self._runtimes.items()},
                 "last_updated": self._utc_now(),
             }
-            temp_path = save_path.with_suffix(".tmp")
-            temp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            temp_path.replace(save_path)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{save_path.name}.", suffix=".tmp", dir=str(save_path.parent)
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    json.dump(data, handle, indent=2, ensure_ascii=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    atomic_replace_with_retry(
+                        temp_name,
+                        save_path,
+                        timeout_seconds=self.atomic_replace_timeout_seconds,
+                    )
+                except AtomicReplaceTimeoutError as exc:
+                    raise QueueAtomicReplaceTimeout(str(exc)) from exc
+            finally:
+                if os.path.exists(temp_name):
+                    try:
+                        os.unlink(temp_name)
+                    except OSError:
+                        pass
 
     def load_queue(self, file_path: str | Path) -> None:
         """从文件加载队列"""
         load_path = Path(file_path)
         if load_path.exists():
+            raw_bytes = load_path.read_bytes()
             try:
-                data = json.loads(load_path.read_text(encoding="utf-8"))
+                data = json.loads(raw_bytes.decode("utf-8"))
                 if not isinstance(data, dict):
                     raise ValueError("queue export must be an object")
+                if not isinstance(data.get("jobs", {}), dict) or not isinstance(
+                    data.get("runtimes", {}), dict
+                ):
+                    raise ValueError("queue export jobs/runtimes must be objects")
                 with self._store_lock():
                     # 加载任务
                     for job_id, job_data in data.get("jobs", {}).items():
@@ -1197,8 +1357,9 @@ class PersistentQueueService:
                     self._normalize_loaded_jobs()
                     # 保存到当前队列文件
                     self._save()
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                pass
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+                quarantine_path = _quarantine_queue_bytes(load_path, raw_bytes, exc)
+                raise QueueCorruption(load_path, quarantine_path, str(exc)) from exc
 
     def reorder_jobs(self, job_ids: List[str]) -> None:
         """重排任务顺序"""
@@ -1499,7 +1660,14 @@ class QueuePublicationContext:
                 )
             manifest_staging.unlink(missing_ok=True)
         else:
-            os.replace(str(manifest_staging), str(manifest_final))
+            try:
+                atomic_replace_with_retry(
+                    manifest_staging,
+                    manifest_final,
+                    timeout_seconds=self.queue_service.atomic_replace_timeout_seconds,
+                )
+            except AtomicReplaceTimeoutError as exc:
+                raise QueuePublicationRejected(str(exc)) from exc
         return manifest_final, {
             "artifact_role": "lease_publication_manifest",
             "artifact_type": "lease_publication_manifest",
@@ -1560,7 +1728,14 @@ class QueuePublicationContext:
                 # publication-boundary-implementation: this is the one
                 # immutable byte move inside QueuePublicationContext; its
                 # target and lease evidence are registered atomically below.
-                os.replace(str(staging), str(final_path))
+                try:
+                    atomic_replace_with_retry(
+                        staging,
+                        final_path,
+                        timeout_seconds=self.queue_service.atomic_replace_timeout_seconds,
+                    )
+                except AtomicReplaceTimeoutError as exc:
+                    raise QueuePublicationRejected(str(exc)) from exc
             artifact = None
             if register_kwargs is not None:
                 if registry is None:

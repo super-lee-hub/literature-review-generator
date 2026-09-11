@@ -8,6 +8,7 @@ API连接测试脚本
 import sys
 import os
 import json
+import argparse
 import requests
 import time
 from typing import Dict, Any, Optional
@@ -33,7 +34,7 @@ def load_config():
         print(f"❌ 配置文件加载失败: {e}")
         return None
 
-def check_api_connection(name: str, api_config: Dict[str, str], test_message: str = "你好，请回复'连接正常'"):
+def check_api_connection(name: str, api_config: Dict[str, str], test_message: str = "你好，请回复'连接正常'", *, allow_network: bool = False):
     """测试单个API连接"""
     print(f"\n🔍 测试 {name} API连接...")
     
@@ -44,6 +45,9 @@ def check_api_connection(name: str, api_config: Dict[str, str], test_message: st
         
         if not all([api_key, model, api_base]):
             print(f"❌ {name}: 配置不完整")
+            return False
+        if not allow_network:
+            print(f"⏭️  {name}: 网络诊断默认关闭；使用 --allow-network 才会发送请求")
             return False
         
         # 构造请求
@@ -104,6 +108,9 @@ def check_api_connection(name: str, api_config: Dict[str, str], test_message: st
 
 def main():
     """主测试函数"""
+    parser = argparse.ArgumentParser(description="Legacy API diagnostic; network is disabled by default.")
+    parser.add_argument("--allow-network", action="store_true")
+    args = parser.parse_args()
     print("🚀 开始API连接测试...")
     print("=" * 60)
     
@@ -117,19 +124,19 @@ def main():
     
     # 主引擎
     if 'Primary_Reader_API' in config:
-        test_results['Primary_Reader_API'] = check_api_connection("主引擎", config['Primary_Reader_API'])
+        test_results['Primary_Reader_API'] = check_api_connection("主引擎", config['Primary_Reader_API'], allow_network=args.allow_network)
     
     # 备用引擎
     if 'Backup_Reader_API' in config:
-        test_results['Backup_Reader_API'] = check_api_connection("备用引擎", config['Backup_Reader_API'])
+        test_results['Backup_Reader_API'] = check_api_connection("备用引擎", config['Backup_Reader_API'], allow_network=args.allow_network)
     
     # 写作引擎
     if 'Writer_API' in config:
-        test_results['Writer_API'] = check_api_connection("写作引擎", config['Writer_API'])
+        test_results['Writer_API'] = check_api_connection("写作引擎", config['Writer_API'], allow_network=args.allow_network)
     
     # 验证引擎
     if 'Validator_API' in config:
-        test_results['Validator_API'] = check_api_connection("验证引擎", config['Validator_API'])
+        test_results['Validator_API'] = check_api_connection("验证引擎", config['Validator_API'], allow_network=args.allow_network)
     
     # 总结结果
     print("\n" + "=" * 60)

@@ -4,8 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping
 
+from services.citation_style import creator_display_name, normalize_creators
 from services.paper_identity import normalize_doi
-from summary_schema import get_paper_metadata
 
 
 _NOISE_PHRASES = [
@@ -61,6 +61,14 @@ class NormalizedPaperMetadata:
     year: str
     journal: str
     doi: str
+    creators: List[Dict[str, str]]
+    container_title: str
+    volume: str
+    issue: str
+    pages: str
+    article_number: str
+    publisher: str
+    url: str
     status: str
     reasons: List[str]
     confidence_score: float
@@ -73,7 +81,7 @@ def _contains_cjk(text: str) -> bool:
     return any("\u4e00" <= char <= "\u9fff" for char in text)
 
 
-def _normalize_space(text: str) -> str:
+def _normalize_space(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip())
 
 
@@ -102,14 +110,19 @@ def normalize_title(value: Any) -> str:
     return candidate
 
 
-def _split_authors(value: Any) -> List[str]:
-    if isinstance(value, list):
-        raw_items = [str(item or "").strip() for item in value]
+def _split_authors(value: Any) -> List[Any]:
+    if isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    elif isinstance(value, Mapping):
+        raw_items = [value]
     elif value in (None, ""):
         raw_items = []
     else:
-        raw_items = [segment.strip() for segment in re.split(r";|,|&| and ", str(value))]
-    return [item for item in raw_items if item]
+        # A comma is part of a valid ``Last, First`` creator.  Multiple
+        # creators in Zotero exports are represented as a list; only split
+        # scalar report values on separators that cannot be name punctuation.
+        raw_items = [segment.strip() for segment in re.split(r";|\r?\n", str(value))]
+    return [item for item in raw_items if str(item or "").strip()]
 
 
 def _clean_author(author: str) -> str:
@@ -150,7 +163,11 @@ def _is_valid_author(author: str) -> bool:
 def normalize_authors(value: Any) -> List[str]:
     authors: List[str] = []
     for raw_author in _split_authors(value):
-        cleaned = _clean_author(raw_author)
+        if isinstance(raw_author, Mapping):
+            candidate = creator_display_name(raw_author)
+        else:
+            candidate = str(raw_author or "")
+        cleaned = _clean_author(candidate)
         if cleaned and _is_valid_author(cleaned) and cleaned not in authors:
             authors.append(cleaned)
     return authors
@@ -174,15 +191,32 @@ def normalize_journal(value: Any) -> str:
 
 
 def sanitize_metadata_fields(metadata: Mapping[str, Any]) -> Dict[str, Any]:
+    creators = normalize_creators(metadata.get("creators") or metadata.get("authors"))
     return {
         "title": normalize_title(metadata.get("title")),
-        "authors": normalize_authors(metadata.get("authors")),
+        "authors": normalize_authors(metadata.get("authors") or metadata.get("creators")),
+        "creators": creators,
         "year": normalize_year(metadata.get("year") or metadata.get("date")),
         "journal": normalize_journal(
             metadata.get("journal")
             or metadata.get("出版物")
             or metadata.get("刊名简称")
         ),
+        "container_title": normalize_journal(
+            metadata.get("container_title")
+            or metadata.get("publication_title")
+            or metadata.get("journal")
+            or metadata.get("出版物")
+            or metadata.get("刊名简称")
+        ),
+        "volume": _normalize_space(metadata.get("volume")),
+        "issue": _normalize_space(metadata.get("issue")),
+        "pages": _normalize_space(metadata.get("pages") or metadata.get("page")),
+        "article_number": _normalize_space(
+            metadata.get("article_number") or metadata.get("article-number")
+        ),
+        "publisher": _normalize_space(metadata.get("publisher")),
+        "url": _normalize_space(metadata.get("url")),
         "doi": normalize_doi(metadata.get("doi")),
     }
 
@@ -198,7 +232,11 @@ def normalize_summary_paper_metadata(summary: Mapping[str, Any]) -> NormalizedPa
     paper_info_raw = summary.get("paper_info", {})
     paper_info = paper_info_raw if isinstance(paper_info_raw, Mapping) else {}
     ai_summary = summary.get("ai_summary", {})
-    ai_metadata_raw = get_paper_metadata(ai_summary) if ai_summary else {}
+    ai_metadata_raw = (
+        ai_summary.get("paper_metadata", {})
+        if isinstance(ai_summary, Mapping)
+        else {}
+    )
     ai_metadata = ai_metadata_raw if isinstance(ai_metadata_raw, Mapping) else {}
 
     paper_fields = sanitize_metadata_fields(paper_info)
@@ -228,13 +266,21 @@ def normalize_summary_paper_metadata(summary: Mapping[str, Any]) -> NormalizedPa
             ("ai_summary.paper_metadata.title", ai_fields["title"]),
         ]
     )
-    authors_source, authors_value = _first_nonempty(
+    authors_source, _authors_value = _first_nonempty(
         [
             ("paper_info.authors", "__AUTHORS__" if paper_fields["authors"] else ""),
             ("ai_summary.paper_metadata.authors", "__AUTHORS__" if ai_fields["authors"] else ""),
         ]
     )
     authors = paper_fields["authors"] if authors_source == "paper_info.authors" else ai_fields["authors"]
+    creators_source, _creators_value = _first_nonempty(
+        [
+            ("paper_info.creators", "__CREATORS__" if paper_fields["creators"] else ""),
+            ("paper_info.authors", "__CREATORS__" if paper_fields["creators"] else ""),
+            ("ai_summary.paper_metadata.creators", "__CREATORS__" if ai_fields["creators"] else ""),
+        ]
+    )
+    creators = paper_fields["creators"] if creators_source.startswith("paper_info") else ai_fields["creators"]
     year_source, year = _first_nonempty(
         [
             ("paper_info.year", paper_fields["year"]),
@@ -255,6 +301,39 @@ def normalize_summary_paper_metadata(summary: Mapping[str, Any]) -> NormalizedPa
             ("ai_summary.paper_metadata.doi", ai_fields["doi"]),
         ]
     )
+
+    def select_field(field_name: str, *source_names: str) -> tuple[str, str]:
+        candidates: list[tuple[str, str]] = []
+        for source_name in source_names:
+            fields = paper_fields if source_name.startswith("paper_info") else ai_fields
+            candidates.append((source_name, str(fields.get(field_name) or "")))
+        return _first_nonempty(candidates)
+
+    container_source, container_title = select_field(
+        "container_title",
+        "paper_info.container_title",
+        "paper_info.publication_title",
+        "paper_info.journal",
+        "ai_summary.paper_metadata.container_title",
+    )
+    volume_source, volume = select_field(
+        "volume", "paper_info.volume", "ai_summary.paper_metadata.volume"
+    )
+    issue_source, issue = select_field(
+        "issue", "paper_info.issue", "ai_summary.paper_metadata.issue"
+    )
+    pages_source, pages = select_field(
+        "pages", "paper_info.pages", "ai_summary.paper_metadata.pages"
+    )
+    article_number_source, article_number = select_field(
+        "article_number",
+        "paper_info.article_number",
+        "ai_summary.paper_metadata.article_number",
+    )
+    publisher_source, publisher = select_field(
+        "publisher", "paper_info.publisher", "ai_summary.paper_metadata.publisher"
+    )
+    url_source, url = select_field("url", "paper_info.url", "ai_summary.paper_metadata.url")
 
     confidence = 1.0
     if not title:
@@ -294,6 +373,14 @@ def normalize_summary_paper_metadata(summary: Mapping[str, Any]) -> NormalizedPa
         year=year,
         journal=journal,
         doi=doi,
+        creators=creators,
+        container_title=container_title or journal,
+        volume=volume,
+        issue=issue,
+        pages=pages,
+        article_number=article_number,
+        publisher=publisher,
+        url=url,
         status=status,
         reasons=deduped_reasons,
         confidence_score=confidence,
@@ -302,8 +389,16 @@ def normalize_summary_paper_metadata(summary: Mapping[str, Any]) -> NormalizedPa
         source_fields={
             "title": title_source,
             "authors": authors_source,
+            "creators": creators_source,
             "year": year_source,
             "journal": journal_source,
             "doi": doi_source,
+            "container_title": container_source,
+            "volume": volume_source,
+            "issue": issue_source,
+            "pages": pages_source,
+            "article_number": article_number_source,
+            "publisher": publisher_source,
+            "url": url_source,
         },
     )

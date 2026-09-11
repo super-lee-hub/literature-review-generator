@@ -60,3 +60,36 @@ def test_validation_execution_service_satisfies_run_review_validation_contract(t
     assert callable(service.bind_provider_output)
     assert callable(service.finalize_provider_receipts)
     assert callable(service.run_review_validation)
+
+
+def test_validation_source_authority_binding_changes_execution_identity(tmp_path: Path) -> None:
+    pdf_dir = tmp_path / "papers"
+    pdf_dir.mkdir()
+    (pdf_dir / "alpha.pdf").write_bytes(b"%PDF-1.4\n%alpha\n")
+    queue_file = tmp_path / "output" / "_queue" / "queue.json"
+    queue_file.parent.mkdir(parents=True)
+    bridge = AgentRuntimeBridge(
+        RuntimeJobSpec(
+            project_name="authority-identity",
+            source=RuntimeSourceSpec(mode="direct", pdf_folder=str(pdf_dir)),
+            action="validate_review",
+            config=str(current_config(tmp_path)),
+            queue_file=str(queue_file),
+        )
+    )
+    session = bridge.bootstrap()
+    service = bridge.build_validation_service(session)
+    before_epoch = service.closure_epoch_id
+
+    service.bind_validation_source_authority(
+        {
+            "artifact_type": "validation_source_authority_fingerprint",
+            "artifact_version": "v1",
+            "papers": [],
+        },
+        "a" * 64,
+    )
+
+    assert service.validation_source_authority_hash == "a" * 64
+    assert service._input_dependency_hashes["validation_source_authority"] == "a" * 64
+    assert service.closure_epoch_id != before_epoch

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -389,6 +390,9 @@ class AgentRuntimeRunner:
         cancel_token: CancelToken | None = None,
         publication_context: Any | None = None,
     ) -> None:
+        from runtime.provider_runtime import provider_budget_controller_from_environment
+
+        provider_budget_controller_from_environment()
         resolved = job_spec.resolved_from(origin_dir) if origin_dir is not None else job_spec
         self._require_explicit_path_origins(resolved)
         resolved.validate()
@@ -434,7 +438,17 @@ class AgentRuntimeRunner:
         from runtime.stage_planning import StagePlanError, build_stage_plan
 
         try:
-            settings = ApplicationSettings.from_config(load_config(self.job_spec.config))
+            settings = ApplicationSettings.from_config(
+                load_config(
+                    self.job_spec.config,
+                    action=self.job_spec.action,
+                    requested_stages=requested_stages,
+                    free_mode_enabled=bool(
+                        self.job_spec.free_mode_profile or self.job_spec.free_mode_idea
+                    ),
+                    allow_template_credentials=os.getenv("AUTO_GENERATE_OFFLINE_TESTS", "0") == "1",
+                )
+            )
             plan = build_stage_plan(
                 action=self.job_spec.action,
                 requested_stages=requested_stages,
@@ -995,6 +1009,24 @@ class AgentRuntimeRunner:
             except AttemptAlreadyRunningError as exc:
                 raise RuntimeRunnerError(f"run rejected: {exc}") from exc
         try:
+            from runtime.provider_runtime import (
+                current_acceptance_execution_context,
+                provider_budget_controller_from_environment,
+            )
+
+            acceptance_budget = provider_budget_controller_from_environment()
+            if acceptance_budget is not None:
+                active_acceptance_context = current_acceptance_execution_context()
+                acceptance_state_path = (
+                    Path(active_acceptance_context.provider_budget_state_path)
+                    if active_acceptance_context is not None
+                    else session.context.workspace.log_path(
+                        "acceptance_budget_state_v1.json"
+                    )
+                )
+                acceptance_budget.bind_state_path(
+                    acceptance_state_path
+                )
             return self._execute_with_lease(
                 session=session,
                 spec=spec,
