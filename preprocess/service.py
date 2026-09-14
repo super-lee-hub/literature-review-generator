@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, cast
@@ -242,6 +242,7 @@ class PreprocessResult:
     mineru_base_url: str
     selected_text_source: str
     stage1_quality_level: str
+    stage1_quality_reasons: List[str] = field(default_factory=list)
 
 
 class PreprocessManager:
@@ -317,12 +318,17 @@ class PreprocessManager:
             ),
         )
 
-        self.mineru_base_url = str(os.getenv("MINERU_BASE_URL", "https://mineru.net/api/v4")).strip().rstrip("/")
-        self.mineru_api_token = str(os.getenv("MINERU_API_TOKEN", "")).strip()
-        self.mineru_model_version = str(os.getenv("MINERU_MODEL_VERSION", "vlm")).strip() or "vlm"
-        self.mineru_upload_endpoint = str(os.getenv("MINERU_UPLOAD_ENDPOINT", "/file-urls/batch")).strip() or "/file-urls/batch"
-        templates_raw = os.getenv(
-            "MINERU_POLL_ENDPOINT_TEMPLATES",
+        def setting(key: str, env_name: str, default: str) -> str:
+            process_value = str(os.environ.get(env_name) or "").strip()
+            if process_value:
+                return process_value
+            return str(preprocess_section.get(key, default)).strip()
+
+        self.mineru_base_url = setting("mineru_base_url", "MINERU_BASE_URL", "https://mineru.net/api/v4").rstrip("/")
+        self.mineru_api_token = setting("mineru_api_token", "MINERU_API_TOKEN", "")
+        self.mineru_model_version = setting("mineru_model_version", "MINERU_MODEL_VERSION", "vlm") or "vlm"
+        self.mineru_upload_endpoint = setting("mineru_upload_endpoint", "MINERU_UPLOAD_ENDPOINT", "/file-urls/batch") or "/file-urls/batch"
+        templates_raw = setting("mineru_poll_endpoint_templates", "MINERU_POLL_ENDPOINT_TEMPLATES",
             "/extract-results/batch/{batch_id},/extract-results/{batch_id},/extract/task/{batch_id}",
         )
         self.mineru_poll_endpoint_templates = [
@@ -330,68 +336,62 @@ class PreprocessManager:
             for item in str(templates_raw).split(",")
             if item.strip()
         ]
-        self.mineru_poll_interval_seconds = _as_float(os.getenv("MINERU_POLL_INTERVAL_SECONDS", "3"), 3.0)
-        self.mineru_poll_timeout_seconds = _as_float(os.getenv("MINERU_POLL_TIMEOUT_SECONDS", "900"), 900.0)
-        self.mineru_request_max_retries = _as_int(os.getenv("MINERU_REQUEST_MAX_RETRIES", "2"), 2)
-        self.mineru_retry_backoff_seconds = _as_float(os.getenv("MINERU_RETRY_BACKOFF_SECONDS", "1.5"), 1.5)
+        self.mineru_poll_interval_seconds = _as_float(setting("mineru_poll_interval_seconds", "MINERU_POLL_INTERVAL_SECONDS", "3"), 3.0)
+        self.mineru_poll_timeout_seconds = _as_float(setting("mineru_poll_timeout_seconds", "MINERU_POLL_TIMEOUT_SECONDS", "900"), 900.0)
+        self.mineru_request_max_retries = _as_int(setting("mineru_request_max_retries", "MINERU_REQUEST_MAX_RETRIES", "2"), 2)
+        self.mineru_retry_backoff_seconds = _as_float(setting("mineru_retry_backoff_seconds", "MINERU_RETRY_BACKOFF_SECONDS", "1.5"), 1.5)
         self.mineru_response_max_bytes = max(
             1,
             _as_int(
-                os.getenv("MINERU_RESPONSE_MAX_BYTES", str(DEFAULT_MINERU_RESPONSE_MAX_BYTES)),
+                setting("mineru_response_max_bytes", "MINERU_RESPONSE_MAX_BYTES", str(DEFAULT_MINERU_RESPONSE_MAX_BYTES)),
                 DEFAULT_MINERU_RESPONSE_MAX_BYTES,
             ),
         )
         self.mineru_zip_max_entries = max(
             1,
             _as_int(
-                os.getenv("MINERU_ZIP_MAX_ENTRIES", str(DEFAULT_MINERU_ZIP_MAX_ENTRIES)),
+                setting("mineru_zip_max_entries", "MINERU_ZIP_MAX_ENTRIES", str(DEFAULT_MINERU_ZIP_MAX_ENTRIES)),
                 DEFAULT_MINERU_ZIP_MAX_ENTRIES,
             ),
         )
         self.mineru_zip_max_uncompressed_bytes = max(
             1,
             _as_int(
-                os.getenv(
-                    "MINERU_ZIP_MAX_UNCOMPRESSED_BYTES",
-                    str(DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES),
-                ),
+                setting("mineru_zip_max_uncompressed_bytes", "MINERU_ZIP_MAX_UNCOMPRESSED_BYTES", str(DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES)),
                 DEFAULT_MINERU_ZIP_MAX_UNCOMPRESSED_BYTES,
             ),
         )
         self.mineru_zip_max_entry_bytes = max(
             1,
             _as_int(
-                os.getenv("MINERU_ZIP_MAX_ENTRY_BYTES", str(DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES)),
+                setting("mineru_zip_max_entry_bytes", "MINERU_ZIP_MAX_ENTRY_BYTES", str(DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES)),
                 DEFAULT_MINERU_ZIP_MAX_ENTRY_BYTES,
             ),
         )
         self.mineru_zip_max_compression_ratio = max(
             1.0,
             _as_float(
-                os.getenv(
-                    "MINERU_ZIP_MAX_COMPRESSION_RATIO",
-                    str(DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO),
-                ),
+                    setting("mineru_zip_max_compression_ratio", "MINERU_ZIP_MAX_COMPRESSION_RATIO", str(DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO)),
                 DEFAULT_MINERU_ZIP_MAX_COMPRESSION_RATIO,
             ),
         )
         self.mineru_json_max_bytes = max(
             1,
             _as_int(
-                os.getenv("MINERU_JSON_MAX_BYTES", str(DEFAULT_MINERU_JSON_MAX_BYTES)),
+                setting("mineru_json_max_bytes", "MINERU_JSON_MAX_BYTES", str(DEFAULT_MINERU_JSON_MAX_BYTES)),
                 DEFAULT_MINERU_JSON_MAX_BYTES,
             ),
         )
         self.mineru_text_max_bytes = max(
             1,
             _as_int(
-                os.getenv("MINERU_TEXT_MAX_BYTES", str(DEFAULT_MINERU_TEXT_MAX_BYTES)),
+                setting("mineru_text_max_bytes", "MINERU_TEXT_MAX_BYTES", str(DEFAULT_MINERU_TEXT_MAX_BYTES)),
                 DEFAULT_MINERU_TEXT_MAX_BYTES,
             ),
         )
         configured_allowed_hosts = {
             item.strip().lower()
-            for item in str(os.getenv("MINERU_ALLOWED_URL_HOSTS", "")).split(",")
+            for item in setting("mineru_allowed_url_hosts", "MINERU_ALLOWED_URL_HOSTS", "").split(",")
             if item.strip()
         }
         self.mineru_invalid_allowed_url_hosts = {
@@ -405,7 +405,7 @@ class PreprocessManager:
             for item in configured_allowed_hosts
             if item not in self.mineru_invalid_allowed_url_hosts
         )
-        self.allow_local_parse_fallback = _as_bool(os.getenv("ALLOW_LOCAL_PARSE_FALLBACK", "true"), default=True)
+        self.allow_local_parse_fallback = _as_bool(setting("allow_local_parse_fallback", "ALLOW_LOCAL_PARSE_FALLBACK", "true"), default=True)
         self.docling_timeout_seconds = _as_float(
             preprocess_section.get("docling_timeout_seconds", os.getenv("DOCLING_TIMEOUT_SECONDS", "300")),
             300.0,
@@ -608,6 +608,7 @@ class PreprocessManager:
             markdown_text=markdown_text,
             plain_text=plain_text,
             page_index=page_index,
+            text_layer_complete=self._has_complete_native_text_layer(page_index),
         )
         chunks = self._build_chunks(stage1_selection.selected_text, page_index)
         stage1_manifest_payload, stage1_quality_report_payload = self._stage1_selection_payloads(
@@ -876,6 +877,7 @@ class PreprocessManager:
             mineru_base_url=self.mineru_base_url,
             selected_text_source=stage1_selection.selected_source,
             stage1_quality_level=stage1_selection.quality_level,
+            stage1_quality_reasons=list(stage1_selection.stage1_quality_reasons),
         )
 
     def _artifact_paths(self, cache_dir: str) -> Dict[str, str]:
@@ -2676,12 +2678,36 @@ class PreprocessManager:
         plain_text: str,
         page_index: List[Dict[str, Any]],
         allow_reprocess: bool = True,
+        text_layer_complete: bool | None = None,
     ) -> Stage1InputSelection:
+        if text_layer_complete is None:
+            text_layer_complete = self._has_complete_native_text_layer(page_index)
         return select_stage1_input(
             markdown_text=markdown_text,
             plain_text=plain_text,
             page_index=page_index,
             allow_reprocess=allow_reprocess,
+            text_layer_complete=bool(text_layer_complete),
+        )
+
+    @staticmethod
+    def _has_complete_native_text_layer(page_index: List[Dict[str, Any]]) -> bool:
+        """Recognize a fully populated native text layer as explicit lineage.
+
+        This is only true when every indexed page has substantive extracted
+        text and none is classified as scanned/low-quality. It does not make
+        an arbitrary short string safe; the page diagnostics must prove the
+        source was covered end to end.
+        """
+
+        pages = [item for item in page_index if isinstance(item, Mapping)]
+        if not pages:
+            return False
+        return all(
+            int(item.get("text_length") or len(str(item.get("text") or "").strip())) >= 80
+            and not bool(item.get("scanned_candidate"))
+            and not bool(item.get("low_quality"))
+            for item in pages
         )
 
     def _write_stage1_selection_artifacts(
@@ -3072,6 +3098,7 @@ class PreprocessManager:
                 mineru_base_url=str(manifest.get("mineru_base_url", self.mineru_base_url)),
                 selected_text_source=selected_text_source,
                 stage1_quality_level=stage1_quality_level,
+                stage1_quality_reasons=list(stage1_quality_reasons),
             )
         except Exception as exc:
             self._log(f"Failed to load preprocess cache for {pdf_path}: {exc}", level="warning")

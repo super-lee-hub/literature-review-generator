@@ -27,6 +27,57 @@ from runtime.release_acceptance import (
 )
 
 
+def test_acceptance_checkout_rejects_dirty_worktree_before_sha_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.control_plane import ControlPlaneError, ReviewControlPlane
+
+    monkeypatch.setattr(
+        "runtime.control_plane.subprocess.run",
+        lambda *args, **kwargs: type("Result", (), {"returncode": 0, "stdout": " M runtime/control_plane.py\n"})(),
+    )
+    with pytest.raises(ControlPlaneError, match="clean checkout"):
+        ReviewControlPlane._acceptance_checkout_sha(tmp_path, require_clean=True)
+
+
+@pytest.mark.optional
+def test_evidence_paths_reject_original_symlink_before_resolve(tmp_path: Path) -> None:
+    from runtime.release_acceptance import GateEvidenceProducer, GateEvidenceVerifier, ReleaseAcceptanceSpecError
+
+    source = tmp_path / "source.json"
+    source.write_text("{}", encoding="utf-8")
+    link = tmp_path / "evidence-link.json"
+    try:
+        link.symlink_to(source)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlink capability unavailable: {type(exc).__name__}")
+    with pytest.raises(ReleaseAcceptanceSpecError, match="symlink or reparse"):
+        GateEvidenceProducer(final_sha="a" * 40).reference(link, role="stage_terminal")
+    with pytest.raises(ReleaseAcceptanceSpecError, match="symlink or reparse"):
+        GateEvidenceVerifier._resolve_path(str(link), origin_dir=None)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows handle semantics")
+def test_windows_bounded_evidence_read_does_not_reopen_with_path_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.release_acceptance import _bounded_read
+
+    source = tmp_path / "evidence.json"
+    source.write_bytes(b'{"verified":true}')
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Windows evidence read must use the opened handle")
+        ),
+    )
+
+    assert _bounded_read(source, max_bytes=1024) == b'{"verified":true}'
+
+
 def _child(gate: str, runtime_spec: str) -> dict[str, object]:
     return {
         "scenario_id": gate,
@@ -69,6 +120,22 @@ def test_parent_plan_requires_independent_child_specs_for_incompatible_gates() -
             {
                 "runtime_spec": "one-runtime.json",
                 "gates": ["C", "D", "Q"],
+            }
+        )
+
+
+def test_single_acceptance_spec_preserves_and_validates_executable_sha() -> None:
+    spec = ReleaseAcceptanceSpec.from_mapping(
+        {"final_executable_sha": "a" * 40, "gates": ["C"]}
+    )
+    assert spec.final_executable_sha == "a" * 40
+
+    with pytest.raises(ReleaseAcceptanceSpecError, match="aliases disagree"):
+        ReleaseAcceptanceSpec.from_mapping(
+            {
+                "final_executable_sha": "a" * 40,
+                "executable_sha": "b" * 40,
+                "gates": ["C"],
             }
         )
 
@@ -191,6 +258,39 @@ def test_parent_result_cannot_turn_offline_executor_receipt_into_live_ready() ->
     assert result.to_dict()["terminal_status"] != "READY_TO_MERGE"
 
 
+def test_parent_result_marks_partial_profile_as_scoped_even_when_live_children_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runtime.release_acceptance._receipt_has_live_authority", lambda receipt: True)
+    result = ParentAcceptanceResultV2.from_child_results(
+        parent_acceptance_run_id="parent-acceptance-1",
+        final_executable_sha="a" * 40,
+        child_results={"C": {"status": "PASS", "receipt": _receipt_payload()}},
+        required_scenarios=("C",),
+    )
+    assert result.status == "SCOPED_PASS"
+    assert result.ready_to_merge is False
+
+
+def test_parent_result_allows_offline_k_alongside_verified_live_children(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("runtime.release_acceptance._receipt_has_live_authority", lambda receipt: True)
+    result = ParentAcceptanceResultV2.from_child_results(
+        parent_acceptance_run_id="parent-acceptance-1",
+        final_executable_sha="a" * 40,
+        child_results={
+            "C": {"status": "PASS", "receipt": _receipt_payload()},
+            "K": {"status": "PASS_OFFLINE", "receipt": _receipt_payload(
+                scenario_id="K", gate="K", action_type="offline-contention", budget_domain="offline-k"
+            )},
+        },
+        required_scenarios=("C", "K"),
+    )
+    assert result.status == "SCOPED_PASS"
+    assert result.ready_to_merge is False
+
+
 def test_parent_result_rejects_cross_input_child_receipt() -> None:
     result = ParentAcceptanceResultV2.from_child_results(
         parent_acceptance_run_id="parent-acceptance-1",
@@ -274,6 +374,7 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
         )
     calls: list[str] = []
     control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
 
     def fake_run(runtime_spec: str | Path) -> dict[str, object]:
         calls.append(str(runtime_spec))
@@ -304,6 +405,77 @@ def test_parent_acceptance_plan_dispatches_each_runtime_child_independently(
         "D": "BLOCKED",
         "Q": "NOT_VERIFIED",
     }
+
+
+def test_parent_acceptance_resumes_child_with_durable_workspace_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.control_plane import ReviewControlPlane
+
+    monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    workspace = tmp_path / "workspace-c"
+    workspace.mkdir()
+    (workspace / "artifact_registry.json").write_text("{}", encoding="utf-8")
+    runtime_path = tmp_path / "c-runtime.json"
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "project_name": "acceptance-c",
+                "job_id": "job-c",
+                "workspace_path": str(workspace),
+                "source": {"mode": "direct", "pdf_folder": str(tmp_path / "papers")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan_path = tmp_path / "acceptance-plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "release-acceptance-plan-v2",
+                "parent_run_id": "parent-resume",
+                "state_path": "state.json",
+                "scenarios": {
+                    "C": {
+                        "scenario_id": "C",
+                        "gate": "C",
+                        "runtime_spec": "c-runtime.json",
+                        "workspace": str(workspace),
+                        "job_id": "job-c",
+                        "execution_mode": "runtime",
+                        "budget_domain": "live",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    control = ReviewControlPlane(repo_root=Path.cwd())
+    calls: list[str] = []
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(
+        control,
+        "resume",
+        lambda **_kwargs: calls.append("resume")
+        or {
+            "status": "complete",
+            "job_status": "completed",
+            "completion_status": "complete",
+            "job_id": "job-c",
+            "workspace_path": str(workspace),
+        },
+    )
+    monkeypatch.setattr(
+        control,
+        "run",
+        lambda *_args, **_kwargs: calls.append("run")
+        or {"status": "complete", "job_id": "job-c", "workspace_path": str(workspace)},
+    )
+
+    control.acceptance_run(plan_path)
+
+    assert calls == ["resume"]
 
 
 def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
@@ -354,6 +526,7 @@ def test_gate_d_plan_carries_production_modality_refs_into_child_evidence(
     plan_path = tmp_path / "acceptance-plan.json"
     plan_path.write_text(json.dumps(payload), encoding="utf-8")
     control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
     final_sha = control._acceptance_checkout_sha(control.repo_root)
     modality_path = tmp_path / "modality-profile.json"
     modality_path.write_text("{}", encoding="utf-8")
@@ -473,6 +646,7 @@ def test_runtime_child_rejects_plan_to_runtime_identity_mismatch_before_executio
     )
     calls: list[str] = []
     control = ReviewControlPlane(repo_root=Path.cwd())
+    monkeypatch.setattr(control, "_acceptance_checkout_sha", lambda *_args, **_kwargs: "a" * 40)
     monkeypatch.setattr(
         control,
         "run",
@@ -666,6 +840,66 @@ def test_stage1_preprocess_releases_generation_lease_on_exit(
     assert len(release_calls) == 1
     assert release_calls[0]["generation_id"] == generation_root.name
     assert release_calls[0]["lease_id"]
+
+
+def test_stage1_preprocess_blocks_quality_reprocess_before_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.job_workspace import JobWorkspace
+    from services.stage1_analysis_service import Stage1AnalysisService
+
+    generation_root = tmp_path / "cache" / "generation-quality-block"
+    generation_root.mkdir(parents=True)
+    (generation_root / "prepare_manifest.json").write_text("{}", encoding="utf-8")
+    preprocess_result = SimpleNamespace(
+        cache_dir=str(tmp_path / "cache"),
+        manifest_path=str(generation_root / "prepare_manifest.json"),
+        stage1_quality_reasons=["incomplete_by_page_count"],
+        stage1_quality_level="REPROCESS",
+        stage1_input_text="",
+        plain_text="",
+        markdown_text="",
+        page_index=[{"page_number": 1}],
+    )
+    release_calls: list[dict[str, str]] = []
+
+    class FakePreprocessManager:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def prepare_pdf(self, _source_pdf: str, **_kwargs: str) -> object:
+            return preprocess_result
+
+        def release_generation_lease(self, _cache_dir: str, **kwargs: str) -> int:
+            release_calls.append(dict(kwargs))
+            return 1
+
+    service = object.__new__(Stage1AnalysisService)
+    service.job_id = "job-quality"
+    service.attempt_id = "attempt-quality"
+    service.config = {}
+    service.logger = None
+    service.workspace = JobWorkspace.create(
+        str(tmp_path / "output"), "quality-project", "job-quality"
+    )
+    monkeypatch.setattr(
+        "services.stage1_analysis_service.PreprocessManager", FakePreprocessManager
+    )
+    snapshot_called = False
+
+    def snapshot(_result: object, *, paper_key: str) -> object:
+        nonlocal snapshot_called
+        snapshot_called = True
+        return _result
+
+    monkeypatch.setattr(service, "_snapshot_preprocess_authority", snapshot)
+    with pytest.raises(RuntimeError, match="preprocessing is incomplete"):
+        with service._preprocess("paper.pdf", paper_key="paper-quality"):
+            raise AssertionError("quality-blocked preprocessing must not yield")
+
+    assert snapshot_called is False
+    assert release_calls
 
 
 @pytest.mark.parametrize(

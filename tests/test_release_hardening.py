@@ -16,6 +16,7 @@ import fitz  # type: ignore
 from config_loader import load_config
 from free_mode.profile_manager import get_profile_path, save_profile
 from runtime.job_spec import RuntimeJobSpec
+from runtime.runner import _acceptance_budget_state_path
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
     ProviderAggregateBudgetV1,
@@ -38,6 +39,7 @@ from runtime.release_acceptance import (
     gate_evidence_roles,
     scenario_for_gate,
     validate_gate_evidence,
+    _receipt_has_live_authority,
 )
 from runtime.provider_routes import build_reachable_provider_route_plan
 from runtime.zotero_attachment_resolver import (
@@ -560,6 +562,83 @@ def test_gate_k_scenario_executes_real_dual_process_contention(tmp_path: Path) -
     assert verified["derived_facts"]["no_lost_update"] is True
     assert not Path(context.provider_budget_state_path).is_file()
     assert Path(context.evidence_root, "K", "offline_contention_budget_state.json").is_file()
+
+
+def test_local_provider_receipt_cannot_supply_live_acceptance_authority(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "local-provider.jsonl"
+    runtime = ProviderRuntime(
+        ledger=ProviderRuntimeLedger(ledger_path),
+        job_id="job-local",
+        attempt_id="attempt-local",
+        stage_name="analyze",
+        route="Primary_Reader_API",
+        node_id="paper-local",
+        call_id="call-local",
+        endpoint_type="chat_completions",
+    )
+    admission = runtime.admit(requested_output_tokens=4)
+    runtime.complete(
+        admission=admission,
+        prompt="local provider test",
+        input_payload={"source": "fixture"},
+        api_config={
+            "provider_family": "generic",
+            "model": "local-model",
+            "api_base": "http://127.0.0.1:18181/v1",
+            "endpoint_type": "chat_completions",
+        },
+        result={"status": "success", "content": {"ok": True}, "output_tokens": 1},
+        metadata={
+            "transport_config": {
+                "provider_family": "generic",
+                "model": "local-model",
+                "api_base": "http://127.0.0.1:18181/v1",
+                "endpoint_type": "chat_completions",
+            }
+        },
+    )
+    ref = GateEvidenceProducer(final_sha="a" * 40).reference(
+        ledger_path,
+        role="provider_receipt_ledger",
+        artifact_type="provider_receipt_ledger",
+        artifact_version="v1",
+        job_id="job-local",
+    )
+    scenario = SimpleNamespace(
+        budget_domain="live",
+        produced_evidence_refs=(ref,),
+        job_id="job-local",
+    )
+
+    assert _receipt_has_live_authority(scenario) is False
+
+
+def test_runner_uses_serialized_acceptance_budget_path_in_a_child_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from runtime.provider_runtime import acceptance_context_environment
+
+    context = AcceptanceExecutionContextV1(
+        acceptance_run_id="child-budget-context",
+        final_executable_sha="a" * 40,
+        absolute_deadline_epoch=time.time() + 60,
+        provider_budget=ProviderAggregateBudgetV1(max_provider_calls_total=2),
+        provider_budget_state_path=str(tmp_path / "parent-budget.json"),
+        evidence_root=str(tmp_path / "evidence"),
+        process_event_log=str(tmp_path / "events.jsonl"),
+        scenario_state_path=str(tmp_path / "state.json"),
+        owner_authorized=True,
+    )
+    for key, value in acceptance_context_environment(context, base_environment={}).items():
+        monkeypatch.setenv(key, value)
+    workspace = SimpleNamespace(
+        log_path=lambda _name: str(tmp_path / "wrong-job-local-budget.json")
+    )
+
+    assert _acceptance_budget_state_path(workspace) == Path(
+        context.provider_budget_state_path
+    )
 
 
 def test_live_gate_rejects_provider_receipt_missing_authoritative_job_binding(tmp_path: Path) -> None:
@@ -1108,6 +1187,28 @@ def test_public_acceptance_run_persists_blocked_state_without_owner_inputs(tmp_p
     assert state["final_sha"]
 
 
+def test_acceptance_live_execution_rejects_dirty_checkout(monkeypatch, tmp_path: Path) -> None:
+    from runtime.control_plane import ControlPlaneError, ReviewControlPlane
+
+    status = subprocess.CompletedProcess(
+        args=["git", "status"],
+        returncode=0,
+        stdout=" M runtime/control_plane.py\n",
+        stderr="",
+    )
+    rev = subprocess.CompletedProcess(
+        args=["git", "rev-parse"],
+        returncode=0,
+        stdout="a" * 40 + "\n",
+        stderr="",
+    )
+    calls = iter([status, rev])
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: next(calls))
+
+    with pytest.raises(ControlPlaneError, match="clean checkout"):
+        ReviewControlPlane._acceptance_checkout_sha(tmp_path, require_clean=True)
+
+
 @pytest.mark.parametrize("gate", ("C", "D", "E", "F", "G", "H", "I", "J", "Q"))
 def test_acceptance_scenarios_do_not_ready_from_inventory_when_execution_is_blocked(
     gate: str,
@@ -1483,6 +1584,13 @@ def test_acceptance_run_binds_spec_budget_to_runtime_context(tmp_path: Path, mon
         repo_root=Path.cwd()
     )
     monkeypatch.setenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "1")
+    # This unit test isolates budget binding; the dedicated dirty-check test
+    # covers the production admission rule separately.
+    monkeypatch.setattr(
+        control,
+        "_acceptance_checkout_sha",
+        lambda *_args, **_kwargs: "a" * 40,
+    )
     monkeypatch.setattr(control, "provider_preflight", lambda **_kwargs: {"route_plan": {}})
     seen: dict[str, object] = {}
 

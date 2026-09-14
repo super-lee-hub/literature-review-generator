@@ -116,6 +116,9 @@ class CitationCatalogEntry:
     publisher: str = ""
     url: str = ""
     year_suffix: str = ""
+    in_text_author_count: int = 0
+    in_text_include_initials: bool = False
+    in_text_include_full_names: bool = False
 
 
 def _author_surname(author: str) -> str:
@@ -336,6 +339,8 @@ def format_in_text_citation(
         mode=mode,
         locator=locator,
         year_suffix=entry.year_suffix,
+        author_count=entry.in_text_author_count,
+        author_initials=entry.in_text_include_initials,
     )
 
 
@@ -496,8 +501,17 @@ def build_citation_catalog(
     # downstream renderer.
     style_engine = CitationStyleEngine()
     suffixes = style_engine.disambiguation_suffixes(entries)
+    counts = style_engine.disambiguation_author_counts(entries)
+    initials = style_engine.disambiguation_author_initials(entries)
+    full_names = style_engine.disambiguation_author_full_names(entries)
     entries = [
-        replace(entry, year_suffix=suffixes.get(entry.paper_id, ""))
+        replace(
+            entry,
+            year_suffix=suffixes.get(entry.paper_id, ""),
+            in_text_author_count=counts.get(entry.paper_id, 0),
+            in_text_include_initials=entry.paper_id in initials,
+            in_text_include_full_names=entry.paper_id in full_names,
+        )
         for entry in entries
     ]
     for entry in entries:
@@ -511,6 +525,7 @@ def build_citation_catalog_from_manifest(
     citation_manifest: Mapping[str, Any],
 ) -> Dict[str, CitationCatalogEntry]:
     alias_map: Dict[str, CitationCatalogEntry] = {}
+    entries: list[CitationCatalogEntry] = []
     for index, entry_data in enumerate(citation_manifest.get("paper_entries", []), start=1):
         alias_values: set[str] = set()
         for item in (entry_data.get("aliases") or []):
@@ -558,6 +573,20 @@ def build_citation_catalog_from_manifest(
             publisher=str(entry_data.get("publisher") or ""),
             url=str(entry_data.get("url") or ""),
             year_suffix=str(entry_data.get("year_suffix") or ""),
+        )
+        entries.append(entry)
+    style_engine = CitationStyleEngine()
+    suffixes = style_engine.disambiguation_suffixes(entries)
+    counts = style_engine.disambiguation_author_counts(entries)
+    initials = style_engine.disambiguation_author_initials(entries)
+    full_names = style_engine.disambiguation_author_full_names(entries)
+    for entry in entries:
+        entry = replace(
+            entry,
+            year_suffix=entry.year_suffix or suffixes.get(entry.paper_id, ""),
+            in_text_author_count=counts.get(entry.paper_id, 0),
+            in_text_include_initials=entry.in_text_include_initials or entry.paper_id in initials,
+            in_text_include_full_names=entry.in_text_include_full_names or entry.paper_id in full_names,
         )
         for alias in entry.aliases:
             alias_map[normalize_alias(alias)] = entry

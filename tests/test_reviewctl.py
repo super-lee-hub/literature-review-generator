@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import time
+from dataclasses import replace
 
 from reviewctl import main as reviewctl_main
 from runtime.control_plane import FORBIDDEN_ACTIONS, ReviewControlPlane
@@ -48,6 +49,20 @@ def test_reviewctl_plan_and_doctor_emit_machine_json(tmp_path: Path, capsys) -> 
     assert "dummy" not in json.dumps(doctor)
 
 
+def test_reviewctl_run_domain_failure_is_machine_json(tmp_path: Path, capsys) -> None:
+    spec = _spec(tmp_path)
+    spec = replace(spec, config=str(tmp_path / "missing.ini"))
+    spec_path = tmp_path / "missing-config-spec.json"
+    spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
+
+    assert reviewctl_main(["run", "--spec", str(spec_path)]) == 2
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "RuntimeRunnerError"
+    assert "Traceback" not in output
+
+
 def test_doctor_does_not_call_unlocked_persistent_lock_stale(tmp_path: Path) -> None:
     lock_path = tmp_path / "queue.json.lock"
     lock_path.write_text("persistent queue lock\n", encoding="utf-8")
@@ -68,6 +83,27 @@ def test_doctor_excludes_dependency_lock_from_runtime_lock_diagnostics(tmp_path:
     control = ReviewControlPlane(repo_root=tmp_path, workspace_roots=[tmp_path])
 
     assert control._stale_locks(tmp_path) == []
+
+
+def test_doctor_fails_for_configured_missing_certificate(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (Path(__file__).resolve().parents[1] / "config.ini.example").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    missing_certificate = tmp_path / "missing-ca.pem"
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(missing_certificate))
+
+    result = ReviewControlPlane(repo_root=tmp_path).doctor(config_path=config_path)
+
+    certificate = next(
+        check for check in result["checks"] if check["name"] == "certificate_paths"
+    )
+    assert certificate["status"] == "fail"
+    assert certificate["details"]["valid"] is False
+    assert result["ok"] is False
 
 
 def test_control_plane_retry_node_uses_persisted_outline_v3_scope(tmp_path: Path) -> None:

@@ -1723,11 +1723,14 @@ def _call_ai_api_detailed_uninstrumented(
     retry_attempts: Optional[int] = None,
     timeout_seconds: Optional[int] = None,
     max_retries_per_call: int = 0,
+    attempt_limit: Optional[int] = None,
     max_single_image_bytes: Optional[int] = None,
     max_request_image_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Call a configured AI API transport and retain failure details."""
     attempts_used = 0
+    usage_totals: Dict[str, int] = {}
+    usage_reported = False
     removed_compat_params: Set[Any] = set()
 
     def mutation_label(value: Any) -> str:
@@ -1775,6 +1778,8 @@ def _call_ai_api_detailed_uninstrumented(
         )
         if max_retries_per_call:
             max_retries = min(max_retries, max(1, int(max_retries_per_call)) + 1)
+        if attempt_limit is not None:
+            max_retries = max(1, int(attempt_limit))
         if capability.endpoint_type == "anthropic":
             api_url, headers = anthropic_request_target(api_base, api_config, api_key)
         else:
@@ -1835,7 +1840,7 @@ def _call_ai_api_detailed_uninstrumented(
         response = None
         last_failure = _api_result(status="failed", error_kind="invalid_response", message="API call did not run")
         attempt = 0
-        strict_retry_budget = bool(max_retries_per_call)
+        strict_retry_budget = attempt_limit is not None or bool(max_retries_per_call)
 
         def can_start_attempt() -> bool:
             if strict_retry_budget:
@@ -1859,6 +1864,7 @@ def _call_ai_api_detailed_uninstrumented(
                 )
                 response.raise_for_status()
 
+                response_data: Any = None
                 try:
                     response_data = response.json()
                     content, finish_reason = response_parser(response_data)
@@ -1866,14 +1872,15 @@ def _call_ai_api_detailed_uninstrumented(
                     message = f"Malformed API response: {exc}"
                     if logger:
                         logger.error(message)
-                    return finish(_api_result(
+                    formatted = _api_result(
                         status="failed",
                         error_kind="invalid_response",
                         http_status=getattr(response, "status_code", None),
                         message=message,
-                    ))
+                    )
+                else:
+                    formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
 
-                formatted = _format_success_result(content, response_format, response, finish_reason, logger=logger)
                 if isinstance(response_data, dict):
                     provider_model = str(response_data.get("model") or "").strip()
                     usage = response_data.get("usage")
@@ -1885,6 +1892,7 @@ def _call_ai_api_detailed_uninstrumented(
                             "output_tokens": ("completion_tokens", "output_tokens"),
                             "total_tokens": ("total_tokens",),
                         }
+                        attempt_usage = {}
                         for result_key, candidates in usage_keys.items():
                             for usage_key in candidates:
                                 raw_value = usage.get(usage_key)
@@ -1897,9 +1905,16 @@ def _call_ai_api_detailed_uninstrumented(
                                 except (TypeError, ValueError, OverflowError):
                                     continue
                                 if parsed_value >= 0:
-                                    formatted[result_key] = parsed_value
+                                    attempt_usage[result_key] = parsed_value
                                     break
-                        formatted["usage_status"] = "reported"
+                        if attempt_usage:
+                            usage_reported = True
+                            for result_key, parsed_value in attempt_usage.items():
+                                usage_totals[result_key] = usage_totals.get(result_key, 0) + parsed_value
+                            formatted.update(usage_totals)
+                            formatted["usage_status"] = "reported"
+                if usage_reported:
+                    formatted.update(usage_totals)
                 if (
                     formatted.get("status") == "failed"
                     and formatted.get("error_kind") == "invalid_response"
@@ -2157,7 +2172,7 @@ def _call_ai_api_detailed(
     try:
         admission = provider_runtime.admit(
             estimated_tokens=estimated_tokens,
-            requested_output_tokens=max(0, int(max_tokens)),
+            requested_output_tokens=max(0, int(max_tokens)) * max(1, effective_attempts),
             requested_retry_attempts=max(0, effective_attempts - 1),
         )
     except ProviderBudgetExceeded as exc:
@@ -2197,6 +2212,7 @@ def _call_ai_api_detailed(
         retry_attempts=effective_attempts,
         timeout_seconds=timeout_seconds,
         max_retries_per_call=max(0, effective_attempts - 1),
+        attempt_limit=effective_attempts,
         max_single_image_bytes=max_single_image_bytes,
         max_request_image_bytes=max_request_image_bytes,
     )

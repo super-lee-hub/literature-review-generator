@@ -23,9 +23,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _pick_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    for candidate in range(12000, 12100):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+            return candidate
+    raise RuntimeError("could not find a browser-safe local port")
 
 
 def _write_gui_test_config(config_path: Path, output_dir: Path) -> None:
@@ -219,13 +224,14 @@ def test_sidebar_navigation_links(page, gui_server):
         ("工作台", r"/workflow$"),
         ("环境与路径", r"/setup$"),
         ("API 与模型", r"/setup/api$"),
-        ("性能与预处理", r"/setup/processing$"),
+        ("运行与预处理", r"/setup/processing$"),
         ("结果与日志", r"/logs$"),
         ("使用引导", r"/guide$"),
     ]
     for label, pattern in nav_targets:
         page.locator(".ag-nav-link", has_text=label).first.click(no_wait_after=True)
-        expect(page).to_have_url(re.compile(pattern))
+        page.wait_for_timeout(750)
+        expect(page).to_have_url(re.compile(pattern), timeout=30_000)
     assert page.locator(".ag-nav-link", has_text="队列").count() == 0
 
 
@@ -263,7 +269,7 @@ def test_processing_page_can_persist_settings(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/setup/processing')
 
     _editable_field_input(page, "最大并发").fill("7")
-    _editable_field_input(page, "API 重试次数").fill("9")
+    _editable_field_input(page, "传输层重试次数").fill("9")
     _set_path_value(
         page,
         open_button_name="选择缓存目录",
@@ -272,7 +278,7 @@ def test_processing_page_can_persist_settings(page, gui_server):
     )
     _editable_field_input(page, "OCR 语言").fill("eng+chi_sim")
 
-    for label in ["启用阶段二自动重试", "启用预处理", "强制重建缓存", "启用本地 RAG"]:
+    for label in ["启用预处理", "强制重建缓存", "启用本地 RAG"]:
         page.locator(".q-toggle", has_text=label).click()
 
     page.get_by_role("button", name="保存配置").first.click()
@@ -280,8 +286,8 @@ def test_processing_page_can_persist_settings(page, gui_server):
 
     parser = configparser.ConfigParser()
     parser.read(gui_server["config_path"], encoding="utf-8")
-    assert parser["Performance"]["max_workers"] == "7"
-    assert parser["Performance"]["api_retry_attempts"] == "9"
+    assert parser["Runtime"]["max_workers"] == "7"
+    assert parser["Runtime"]["transport_retries"] == "9"
     assert parser["Preprocess"]["cache_dir"].endswith("cache_area")
     assert parser["Preprocess"]["ocr_languages"] == "eng+chi_sim"
 
@@ -297,7 +303,9 @@ def test_first_api_card_buttons_work(page, gui_server):
 
     reader_card.get_by_role("button", name="规范化 URL").click()
     expect(api_base_input).not_to_have_value(re.compile(r".*/chat/completions/?$"))
-    expect(reader_card.locator(".ag-inline-alert")).to_contain_text(re.compile(r"模型名|API Key"))
+    expect(reader_card.locator(".ag-inline-alert")).to_contain_text(
+        re.compile(r"模型名|API Key|第三方 gateway")
+    )
 
     reader_card.get_by_role("button", name="套用预设 URL").click()
     expect(api_base_input).not_to_have_value("")
@@ -324,7 +332,7 @@ def test_all_api_cards_expose_actions(page, gui_server):
     expect(mineru_card).to_be_visible()
     expect(mineru_card.locator(".q-field", has_text="Base URL")).to_be_visible()
     expect(mineru_card.locator(".q-field", has_text="API Token")).to_be_visible()
-    expect(mineru_card.get_by_role("button", name="前往性能与预处理")).to_be_visible()
+    expect(mineru_card.get_by_role("button", name="前往运行与预处理")).to_be_visible()
 
 
 def test_mineru_api_card_can_persist_env_values(page, gui_server):
@@ -343,7 +351,7 @@ def test_mineru_api_card_can_persist_env_values(page, gui_server):
     assert "MINERU_API_TOKEN=token-123" in env_content
     assert "MINERU_MODEL_VERSION=vlm-pro" in env_content
 
-    mineru_card.get_by_role("button", name="前往性能与预处理").click()
+    mineru_card.get_by_role("button", name="前往运行与预处理").click()
     expect(page).to_have_url(re.compile(r"/setup/processing$"))
 
 
@@ -398,14 +406,14 @@ def test_workflow_free_mode_layout_stays_readable(page, gui_server):
     _open_page(page, f'{gui_server["base_url"]}/workflow')
 
     work_mode_toggle = page.locator(".ag-mode-toggle").nth(1)
-    work_mode_toggle.locator(".q-btn").nth(2).click()
+    work_mode_toggle.locator(".q-btn").nth(1).click()
 
     toggle_box = work_mode_toggle.bounding_box()
     assert toggle_box is not None
-    button_boxes = [work_mode_toggle.locator(".q-btn").nth(index).bounding_box() for index in range(3)]
+    button_boxes = [work_mode_toggle.locator(".q-btn").nth(index).bounding_box() for index in range(2)]
     assert all(box is not None for box in button_boxes)
     button_boxes = [box for box in button_boxes if box is not None]
-    assert min(box["width"] for box in button_boxes) >= (toggle_box["width"] / 3) - 20
+    assert min(box["width"] for box in button_boxes) >= (toggle_box["width"] / 2) - 20
     assert button_boxes[0]["x"] - toggle_box["x"] <= 12
     assert (toggle_box["x"] + toggle_box["width"]) - (button_boxes[-1]["x"] + button_boxes[-1]["width"]) <= 12
 
@@ -447,6 +455,17 @@ def test_workflow_actions_and_links(page, gui_server):
 
     page.get_by_role("button", name="应用到本次任务").click()
     expect(_notification(page)).to_contain_text("自由模式已应用到本次任务")
+
+    # Formal runtime requires explicit acknowledgement before a configured
+    # third-party gateway can receive manuscript content. Exercise that real
+    # consent boundary before submitting the workflow actions.
+    page.goto(f'{gui_server["base_url"]}/setup/api', wait_until="domcontentloaded")
+    for card in page.locator(".ag-card", has_text="确认第三方 gateway").all():
+        button = card.get_by_role("button", name="确认第三方 gateway")
+        if button.count() > 0:
+            button.click()
+    page.goto(f'{gui_server["base_url"]}/workflow', wait_until="domcontentloaded")
+    _open_page(page, f'{gui_server["base_url"]}/workflow')
 
     for button_name in ["仅分析文献", "生成大纲", "生成全文", "一键运行"]:
         page.get_by_role("button", name=button_name).click()

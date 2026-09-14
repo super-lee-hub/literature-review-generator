@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from services.citation_catalog import (
@@ -78,6 +79,85 @@ def test_same_author_year_gets_deterministic_title_ordered_suffixes() -> None:
     assert suffixes["alpha"] == "a"
     assert suffixes["zeta"] == "b"
     assert engine.format_in_text(earlier, year_suffix=suffixes["alpha"]) == "(Smith, 2024a)"
+
+
+def test_same_author_year_suffixes_use_document_level_multi_author_identity() -> None:
+    engine = CitationStyleEngine()
+    first = _entry(title="Alpha", paper_id="first", authors=["Smith, John", "Jones, Ann"])
+    second = _entry(title="Beta", paper_id="second", authors=["Smith, John", "Jones, Ann"])
+    suffixes = engine.disambiguation_suffixes([second, first])
+    assert suffixes == {"first": "a", "second": "b"}
+
+
+def test_distinct_multi_author_same_first_author_gets_unique_in_text_prefix() -> None:
+    engine = CitationStyleEngine()
+    first = _entry(
+        title="Alpha",
+        paper_id="first",
+        authors=["Smith, John", "Jones, Ann", "Brown, Bob"],
+    )
+    second = _entry(
+        title="Beta",
+        paper_id="second",
+        authors=["Smith, John", "Taylor, Ann", "Wilson, Bob"],
+    )
+    counts = engine.disambiguation_author_counts([first, second])
+    assert counts == {"first": 2, "second": 2}
+    assert engine.format_in_text(
+        replace(first, in_text_author_count=counts["first"])
+    ) == "(Smith, Jones, et al., 2024)"
+    assert engine.format_in_text(
+        replace(second, in_text_author_count=counts["second"])
+    ) == "(Smith, Taylor, et al., 2024)"
+
+
+def test_same_family_prefix_with_ambiguous_initials_uses_full_given_names() -> None:
+    engine = CitationStyleEngine()
+    first = _entry(
+        title="Alpha",
+        paper_id="first",
+        authors=["Smith, John", "Jones, Ann", "Brown, Bob"],
+    )
+    second = _entry(
+        title="Beta",
+        paper_id="second",
+        authors=["Smith, Jane", "Jones, Ann", "Brown, Bob"],
+    )
+    counts = engine.disambiguation_author_counts([first, second])
+    full_names = engine.disambiguation_author_full_names([first, second])
+    assert full_names == {"first", "second"}
+    assert engine.format_in_text(
+        replace(
+            first,
+            in_text_author_count=counts["first"],
+            in_text_include_initials=True,
+            in_text_include_full_names=True,
+        )
+    ) == "(Smith, John, Jones, Ann, et al., 2024)"
+    assert engine.format_in_text(
+        replace(
+            second,
+            in_text_author_count=counts["second"],
+            in_text_include_initials=True,
+            in_text_include_full_names=True,
+        )
+    ) == "(Smith, Jane, Jones, Ann, et al., 2024)"
+
+
+def test_author_initials_are_not_added_when_coauthor_prefix_already_disambiguates() -> None:
+    engine = CitationStyleEngine()
+    first = _entry(
+        title="Alpha",
+        paper_id="first",
+        authors=["Smith, John", "Jones, Ann", "Brown, Bob"],
+    )
+    second = _entry(
+        title="Beta",
+        paper_id="second",
+        authors=["Smith, Jane", "Taylor, Ann", "Wilson, Bob"],
+    )
+    assert engine.disambiguation_author_initials([first, second]) == set()
+    assert engine.disambiguation_author_full_names([first, second]) == set()
 
 
 def test_rich_apa_reference_has_real_metadata_and_no_markdown() -> None:

@@ -252,3 +252,241 @@ def test_docx_scanner_rejects_ref_without_valid_manifest_occurrence(tmp_path) ->
 
     assert "R999" in report["unresolved_tokens"]
     assert report["passed"] is False
+
+
+def test_real_docx_roundtrip_keeps_cross_section_occurrence_locators(tmp_path) -> None:
+    from docx import Document
+
+    manifest = _manifest()
+    manifest["occurrences"] = [
+        {"ref_id": "R001", "paper_id": "paper_1", "section_number": 1, "locator": "p. 3"},
+        {"ref_id": "R001", "paper_id": "paper_1", "section_number": 2, "locator": "p. 77"},
+    ]
+    output = tmp_path / "roundtrip.docx"
+    assert append_section_to_word_document(
+        MockGenerator(), 1, "First", "Claim [[cite_ref:R001]].", str(output), citation_manifest=manifest
+    )
+    assert append_section_to_word_document(
+        MockGenerator(), 2, "Second", "Claim [[cite_ref:R001]].", str(output), citation_manifest=manifest
+    )
+    paragraphs = [paragraph.text for paragraph in Document(str(output)).paragraphs]
+    assert any("(Smith, 2024, p. 3)" in text for text in paragraphs)
+    assert any("(Smith, 2024, p. 77)" in text for text in paragraphs)
+
+
+def test_real_docx_roundtrip_disambiguates_distinct_same_author_year_papers(tmp_path) -> None:
+    from docx import Document
+
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "paper_alpha",
+                "paper_key": "paper_alpha",
+                "title": "Alpha Study",
+                "authors": ["Smith, John", "Jones, Ann", "Brown, Bob"],
+                "year": "2024",
+            },
+            {
+                "paper_id": "paper_beta",
+                "paper_key": "paper_beta",
+                "title": "Beta Study",
+                "authors": ["Smith, John", "Taylor, Ann", "Wilson, Bob"],
+                "year": "2024",
+            },
+        ],
+        "occurrences": [
+            {"ref_id": "R011", "paper_id": "paper_alpha", "section_number": 1},
+            {"ref_id": "R012", "paper_id": "paper_beta", "section_number": 1},
+        ],
+        "bibliography": [
+            {
+                "entry_id": "bib_alpha",
+                "paper_id": "paper_alpha",
+                "paper_key": "paper_alpha",
+                "citation_text": "Smith, J., Jones, A., & Brown, B. (2024). Alpha Study.",
+                "is_cited": True,
+            },
+            {
+                "entry_id": "bib_beta",
+                "paper_id": "paper_beta",
+                "paper_key": "paper_beta",
+                "citation_text": "Smith, J., Taylor, A., & Wilson, B. (2024). Beta Study.",
+                "is_cited": True,
+            },
+        ],
+    }
+    output = tmp_path / "same-author-year.docx"
+    rebuild_review_docx_from_structured_artifacts(
+        MockGenerator(),
+        {
+            "content": {
+                "sections": [
+                    {
+                        "section_number": 1,
+                        "section_title": "Synthesis",
+                        "blocks": [
+                            {
+                                "text": (
+                                    "Alpha finding [[cite_ref:R011]]; "
+                                    "beta finding [[cite_ref:R012]]."
+                                )
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        manifest,
+        str(output),
+    )
+
+    paragraphs = [paragraph.text for paragraph in Document(str(output)).paragraphs]
+    body = "\n".join(paragraphs)
+    assert "(Smith, Jones, et al., 2024)" in body
+    assert "(Smith, Taylor, et al., 2024)" in body
+    assert "(Smith et al., 2024)" not in body
+
+
+def test_real_docx_roundtrip_uses_full_given_names_when_initials_collide(tmp_path) -> None:
+    from docx import Document
+
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "paper_john",
+                "paper_key": "paper_john",
+                "title": "John Study",
+                "authors": ["Smith, John", "Jones, Ann", "Brown, Bob"],
+                "year": "2024",
+            },
+            {
+                "paper_id": "paper_jane",
+                "paper_key": "paper_jane",
+                "title": "Jane Study",
+                "authors": ["Smith, Jane", "Jones, Ann", "Brown, Bob"],
+                "year": "2024",
+            },
+        ],
+        "occurrences": [
+            {"ref_id": "R013", "paper_id": "paper_john", "section_number": 1},
+            {"ref_id": "R014", "paper_id": "paper_jane", "section_number": 1},
+        ],
+        "bibliography": [
+            {
+                "entry_id": "bib_john",
+                "paper_id": "paper_john",
+                "paper_key": "paper_john",
+                "citation_text": "Smith, J., Jones, A., & Brown, B. (2024). John Study.",
+                "is_cited": True,
+            },
+            {
+                "entry_id": "bib_jane",
+                "paper_id": "paper_jane",
+                "paper_key": "paper_jane",
+                "citation_text": "Smith, J., Jones, A., & Brown, B. (2024). Jane Study.",
+                "is_cited": True,
+            },
+        ],
+    }
+    output = tmp_path / "same-initial.docx"
+    rebuild_review_docx_from_structured_artifacts(
+        MockGenerator(),
+        {
+            "content": {
+                "sections": [
+                    {
+                        "section_number": 1,
+                        "section_title": "Synthesis",
+                        "blocks": [
+                            {
+                                "text": (
+                                    "John finding [[cite_ref:R013]]; "
+                                    "Jane finding [[cite_ref:R014]]."
+                                )
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        manifest,
+        str(output),
+    )
+    body = "\n".join(paragraph.text for paragraph in Document(str(output)).paragraphs)
+    assert "(Smith, John, Jones, Ann, et al., 2024)" in body
+    assert "(Smith, Jane, Jones, Ann, et al., 2024)" in body
+
+
+def test_real_docx_roundtrip_keeps_year_suffix_in_body_and_references(tmp_path) -> None:
+    from docx import Document
+
+    manifest = {
+        "paper_entries": [
+            {
+                "paper_id": "paper_a",
+                "paper_key": "paper_a",
+                "title": "Alpha Study",
+                "authors": ["Smith, John"],
+                "year": "2024",
+                "journal": "Journal A",
+            },
+            {
+                "paper_id": "paper_b",
+                "paper_key": "paper_b",
+                "title": "Beta Study",
+                "authors": ["Smith, John"],
+                "year": "2024",
+                "journal": "Journal B",
+            },
+        ],
+        "occurrences": [
+            {"ref_id": "R015", "paper_id": "paper_a", "section_number": 1},
+            {"ref_id": "R016", "paper_id": "paper_b", "section_number": 1},
+        ],
+        "bibliography": [
+            {
+                "entry_id": "bib_a",
+                "paper_id": "paper_a",
+                "paper_key": "paper_a",
+                "citation_text": "Smith, J. (2024). Alpha Study. Journal A.",
+                "is_cited": True,
+            },
+            {
+                "entry_id": "bib_b",
+                "paper_id": "paper_b",
+                "paper_key": "paper_b",
+                "citation_text": "Smith, J. (2024). Beta Study. Journal B.",
+                "is_cited": True,
+            },
+        ],
+    }
+    output = tmp_path / "same-author-suffix.docx"
+    rebuild_review_docx_from_structured_artifacts(
+        MockGenerator(),
+        {
+            "content": {
+                "sections": [
+                    {
+                        "section_number": 1,
+                        "section_title": "Synthesis",
+                        "blocks": [
+                            {
+                                "text": (
+                                    "Alpha [[cite_ref:R015]]; "
+                                    "beta [[cite_ref:R016]]."
+                                )
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        manifest,
+        str(output),
+    )
+    paragraphs = [paragraph.text for paragraph in Document(str(output)).paragraphs]
+    body = "\n".join(paragraphs)
+    assert "(Smith, 2024a)" in body
+    assert "(Smith, 2024b)" in body
+    assert any("(2024a)" in paragraph for paragraph in paragraphs)
+    assert any("(2024b)" in paragraph for paragraph in paragraphs)

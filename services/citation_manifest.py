@@ -223,6 +223,9 @@ class CitationPaperEntry:
     publisher: str = ""
     url: str = ""
     year_suffix: str = ""
+    in_text_author_count: int = 0
+    in_text_include_initials: bool = False
+    in_text_include_full_names: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -254,6 +257,9 @@ class CitationPaperEntry:
             publisher=str(data.get("publisher") or ""),
             url=str(data.get("url") or ""),
             year_suffix=str(data.get("year_suffix") or ""),
+            in_text_author_count=int(data.get("in_text_author_count") or 0),
+            in_text_include_initials=bool(data.get("in_text_include_initials", False)),
+            in_text_include_full_names=bool(data.get("in_text_include_full_names", False)),
         )
 
 
@@ -966,6 +972,9 @@ def build_citation_manifest_from_review_draft(
             publisher=entry.publisher,
             url=entry.url,
             year_suffix=entry.year_suffix,
+            in_text_author_count=entry.in_text_author_count,
+            in_text_include_initials=entry.in_text_include_initials,
+            in_text_include_full_names=entry.in_text_include_full_names,
         )
         paper_entries.append(paper_entry)
     return CitationManifestV3(

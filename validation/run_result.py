@@ -155,14 +155,61 @@ def claim_verdict_for_result(value: Any) -> ClaimVerdict:
     ).strip().lower()
     conclusion = _conclusion_text(value).strip().upper()
     low_confidence = bool(_field(value, "low_confidence", False))
+    # A manual-review marker or low-confidence result cannot be promoted by a
+    # supported status.  Treat confidence as present when either the result
+    # or its structured evidence carries a numeric confidence value; legacy
+    # alignment confidence is also a valid source of this evidence.
     claim_unit_results = details.get("claim_unit_results") or []
+    raw_confidence = _field(value, "confidence", None)
+    if raw_confidence is None:
+        ai_validation = details.get("ai_validation")
+        if isinstance(ai_validation, Mapping):
+            raw_confidence = ai_validation.get("confidence")
+    if raw_confidence is None and claim_unit_results:
+        raw_confidence = claim_unit_results[0].get("alignment_confidence")
+    has_confidence = raw_confidence is not None
+    # Older locally-produced results predate the Validator response envelope
+    # and legitimately have no confidence field.  Missing confidence is a
+    # review blocker when an adjudicator response was actually supplied (the
+    # dangerous case found in the audit), while preserving compatibility for
+    # pre-envelope legacy records that carry no such claim.
+    confidence_required = isinstance(details.get("ai_validation"), Mapping)
+    support_like = status in {"supported", "clean_supported"} or (
+        not status and conclusion == "SUPPORTED"
+    )
+    missing_confidence_requires_review = (
+        support_like
+        and not has_confidence
+        and (
+            confidence_required
+            or not claim_unit_results
+        )
+    )
+    evidence_gap_requires_review = (
+        status == "evidence_gap"
+        and (
+            low_confidence
+            or disposition in {"manual_review", "needs_review"}
+            or conclusion == "UNSUPPORTED"
+        )
+    )
     ambiguous_alignment = any(
         isinstance(item, Mapping)
         and str(item.get("reason") or "") == "ambiguous_claim_paper_alignment"
         for item in claim_unit_results
     )
 
-    if ambiguous_alignment or status in {"needs_review", "low_confidence", "uncertain"}:
+    if (
+        ambiguous_alignment
+        or low_confidence
+        or (
+            support_like
+            and disposition in {"manual_review", "needs_review"}
+        )
+        or missing_confidence_requires_review
+        or evidence_gap_requires_review
+        or status in {"needs_review", "low_confidence", "uncertain"}
+    ):
         return ClaimVerdict.NEEDS_REVIEW
     if status in {"wrong_source", "mapping_error"} or conclusion == "WRONG_SOURCE":
         return ClaimVerdict.WRONG_SOURCE

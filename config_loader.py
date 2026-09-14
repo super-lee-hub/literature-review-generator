@@ -4,7 +4,7 @@ import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from config_validator import validate_all_config
-from dotenv import load_dotenv  # type: ignore  # compatibility for legacy callers/tests
+from dotenv import dotenv_values, load_dotenv  # type: ignore  # compatibility for legacy callers/tests
 from services.credential_provenance import (
     CredentialProvenance,
     resolve_credentials,
@@ -13,6 +13,20 @@ from services.settings import ApplicationSettings, validate_config_keys
 
 
 logger = logging.getLogger(__name__)
+
+_PREPROCESS_ENV_KEYS = {
+    "MINERU_BASE_URL": "mineru_base_url", "MINERU_API_TOKEN": "mineru_api_token",
+    "MINERU_MODEL_VERSION": "mineru_model_version", "MINERU_UPLOAD_ENDPOINT": "mineru_upload_endpoint",
+    "MINERU_POLL_ENDPOINT_TEMPLATES": "mineru_poll_endpoint_templates",
+    "MINERU_POLL_INTERVAL_SECONDS": "mineru_poll_interval_seconds", "MINERU_POLL_TIMEOUT_SECONDS": "mineru_poll_timeout_seconds",
+    "MINERU_REQUEST_MAX_RETRIES": "mineru_request_max_retries", "MINERU_RETRY_BACKOFF_SECONDS": "mineru_retry_backoff_seconds",
+    "MINERU_RESPONSE_MAX_BYTES": "mineru_response_max_bytes", "MINERU_ZIP_MAX_ENTRIES": "mineru_zip_max_entries",
+    "MINERU_ZIP_MAX_UNCOMPRESSED_BYTES": "mineru_zip_max_uncompressed_bytes", "MINERU_ZIP_MAX_ENTRY_BYTES": "mineru_zip_max_entry_bytes",
+    "MINERU_ZIP_MAX_COMPRESSION_RATIO": "mineru_zip_max_compression_ratio", "MINERU_JSON_MAX_BYTES": "mineru_json_max_bytes",
+    "MINERU_TEXT_MAX_BYTES": "mineru_text_max_bytes", "MINERU_SOURCE_PDF_MAX_BYTES": "source_pdf_max_bytes",
+    "MINERU_ALLOWED_URL_HOSTS": "mineru_allowed_url_hosts", "ALLOW_LOCAL_PARSE_FALLBACK": "allow_local_parse_fallback",
+    "DOCLING_TIMEOUT_SECONDS": "docling_timeout_seconds", "OCR_TIMEOUT_SECONDS": "ocr_timeout_seconds",
+}
 
 
 class ConfigDict(dict[str, Dict[str, str]]):
@@ -112,6 +126,29 @@ def load_config(
         if not value or os.path.isabs(value):
             continue
         config_dict["Paths"][key] = os.path.abspath(os.path.join(config_origin, value))
+
+    # All filesystem-bearing configuration sections use the config file as
+    # their origin.  Leaving these two relative values unresolved makes a
+    # non-repository launch split the preprocess cache or queue from the
+    # output root used by the control plane.
+    for section_name, key in (("Preprocess", "cache_dir"), ("Queue", "queue_file_path")):
+        value = str(config_dict.get(section_name, {}).get(key) or "").strip()
+        if value and not os.path.isabs(value):
+            config_dict.setdefault(section_name, {})[key] = os.path.abspath(
+                os.path.join(config_origin, value)
+            )
+
+    # Resolve preprocessing settings from the same config origin as credentials.
+    preprocess = config_dict.setdefault("Preprocess", {})
+    dotenv_path = os.path.join(config_origin, ".env")
+    dotenv = dotenv_values(dotenv_path) if os.path.isfile(dotenv_path) else {}
+    for env_name, config_key in _PREPROCESS_ENV_KEYS.items():
+        process_value = str(os.environ.get(env_name) or "").strip()
+        dotenv_value = str(dotenv.get(env_name) or "").strip()
+        if process_value:
+            preprocess[config_key] = process_value
+        elif dotenv_value:
+            preprocess[config_key] = dotenv_value
 
     schema_errors = validate_config_keys(config_dict)
     if schema_errors:

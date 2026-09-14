@@ -243,6 +243,12 @@ CONFIG_KEYS: Dict[str, frozenset[str]] = {
             "local_rag_allow_model_download",
             "local_rag_retain_recent_identities",
             "source_pdf_max_bytes",
+            "mineru_base_url", "mineru_api_token", "mineru_model_version", "mineru_upload_endpoint",
+            "mineru_poll_endpoint_templates", "mineru_poll_interval_seconds", "mineru_poll_timeout_seconds",
+            "mineru_request_max_retries", "mineru_retry_backoff_seconds", "mineru_response_max_bytes",
+            "mineru_zip_max_entries", "mineru_zip_max_uncompressed_bytes", "mineru_zip_max_entry_bytes",
+            "mineru_zip_max_compression_ratio", "mineru_json_max_bytes", "mineru_text_max_bytes",
+            "mineru_allowed_url_hosts", "allow_local_parse_fallback", "docling_timeout_seconds", "ocr_timeout_seconds",
         }
     ),
     "Styling": frozenset({"font_name", "font_size_body", "font_size_heading1", "font_size_heading2"}),

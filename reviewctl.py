@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.control_plane import ControlPlaneError, ReviewControlPlane
+from runtime.runner import RuntimeRunnerError
 from services.console_io import configure_utf8_stdio, write_ascii_json_line
 from services.queue_service import (
     PersistentQueueService,
@@ -318,10 +319,10 @@ def main(argv: list[str] | None = None) -> int:
     # not merely the first ProviderRuntime construction.
     from runtime.provider_runtime import provider_budget_controller_from_environment
 
-    provider_budget_controller_from_environment()
-    repo_root = args.repo_root or getattr(args, "doctor_repo_root", "")
-    control = ReviewControlPlane(repo_root=repo_root or None)
     try:
+        provider_budget_controller_from_environment()
+        repo_root = args.repo_root or getattr(args, "doctor_repo_root", "")
+        control = ReviewControlPlane(repo_root=repo_root or None)
         if args.command.startswith("queue-"):
             payload = _queue_command(args)
         elif args.command == "doctor":
@@ -426,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
             payload = control.attest(job_id=args.job or None, workspace=args.workspace or None)
         else:  # pragma: no cover
             raise ControlPlaneError(f"unsupported command: {args.command}")
-    except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
+    except (ControlPlaneError, RuntimeRunnerError, OSError, ValueError, TypeError) as exc:
         payload = {
             "control_plane_version": "reviewctl-v1",
             "status": "error",

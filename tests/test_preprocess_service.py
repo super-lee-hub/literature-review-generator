@@ -85,6 +85,7 @@ def test_preprocess_manager_generates_new_artifact_contract(tmp_path: Path, monk
     assert manifest["artifacts"]["normalized_md"] == result.markdown_path
     assert manifest["artifacts"]["stage1_input"] == result.stage1_input_path
     assert stage1_manifest["selected_text_source"] == result.selected_text_source
+    assert result.stage1_quality_reasons == stage1_manifest["stage1_quality_reasons"]
     assert stage1_manifest["artifacts"]["stage1_input"] == result.stage1_input_path
     assert quality_report["candidate_reports"]
     assert chunks

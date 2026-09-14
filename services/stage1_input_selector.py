@@ -33,6 +33,7 @@ def select_stage1_input(
     expected_language: Optional[str] = None,
     title: Optional[str] = None,
     allow_reprocess: bool = True,
+    text_layer_complete: bool = False,
 ) -> Stage1InputSelection:
     """Choose the final text that is allowed to enter stage-one model analysis."""
 
@@ -59,6 +60,7 @@ def select_stage1_input(
             text=text,
             page_count=page_count,
             candidate_lengths=candidate_lengths,
+            text_layer_complete=text_layer_complete,
         )
         combined_reasons = sorted(
             set(result.reasons + list(completeness_metrics.get("reasons") or []))

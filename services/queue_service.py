@@ -829,6 +829,26 @@ class PersistentQueueService:
             self._save()
         return True
 
+    def fail_job(self, job_id: str, error_message: str) -> bool:
+        """Atomically transition a non-running job to FAILED with its cause."""
+        with self._store_lock():
+            runtime = self._runtimes.get(job_id)
+            if runtime is None or runtime.state not in {QueueState.PENDING, QueueState.CANCEL_REQUESTED}:
+                return False
+            if runtime.state == QueueState.CANCEL_REQUESTED or runtime.cancel_requested:
+                return False
+            runtime.state = QueueState.FAILED
+            runtime.error_message = str(error_message or "job failed")
+            runtime.completed_at = self._utc_now()
+            runtime.lease_id = ""
+            runtime.worker_id = ""
+            runtime.lease_expires_at = None
+            runtime.heartbeat_at = None
+            runtime.fence_token = ""
+            runtime.revision += 1
+            self._save()
+            return True
+
     def claim_job(
         self,
         job_id: str,
@@ -901,7 +921,14 @@ class PersistentQueueService:
 
         with self._store_lock():
             runtime = self._runtimes.get(job_id)
-            if runtime is None or runtime.state != QueueState.RUNNING:
+            # A cancellation request keeps the same owner's lease alive until
+            # that owner reaches its cooperative checkpoint. Treating this
+            # state as lease loss strands long-running jobs in
+            # CANCEL_REQUESTED even though the worker is still alive.
+            if runtime is None or runtime.state not in {
+                QueueState.RUNNING,
+                QueueState.CANCEL_REQUESTED,
+            }:
                 return False
             if runtime.lease_id != str(lease_id) or runtime.worker_id != str(worker_id):
                 return False
@@ -1149,15 +1176,20 @@ class PersistentQueueService:
             return True
 
     def recover_expired_leases(self) -> list[str]:
-        """Move crashed workers' expired RUNNING jobs back to PENDING."""
+        """Recover expired work, or finalize a cancellation with no worker left."""
 
         recovered: list[str] = []
         with self._store_lock():
             for job_id, runtime in self._runtimes.items():
-                if runtime.state != QueueState.RUNNING or not self._lease_is_expired(runtime.lease_expires_at):
+                if runtime.state not in {QueueState.RUNNING, QueueState.CANCEL_REQUESTED} or not self._lease_is_expired(runtime.lease_expires_at):
                     continue
-                runtime.state = QueueState.PENDING
-                runtime.error_message = "worker lease expired; job available for recovery"
+                if runtime.state == QueueState.CANCEL_REQUESTED or runtime.cancel_requested:
+                    runtime.state = QueueState.CANCELLED
+                    runtime.error_message = runtime.error_message or "cancellation finalized after worker lease expired"
+                else:
+                    runtime.state = QueueState.PENDING
+                    runtime.error_message = "worker lease expired; job available for recovery"
+                runtime.completed_at = self._utc_now() if runtime.state == QueueState.CANCELLED else None
                 runtime.lease_id = ""
                 runtime.worker_id = ""
                 runtime.lease_expires_at = None
@@ -2113,13 +2145,11 @@ class QueueRunner:
                 dep_runtime = self.queue_service.get_job_runtime(dep_job_id)
                 # Missing dependency
                 if not dep_runtime:
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                    self.queue_service.set_job_error(job_spec.job_id, f"Dependency job {dep_job_id} not found")
+                    self.queue_service.fail_job(job_spec.job_id, f"Dependency job {dep_job_id} not found")
                     return
                 # Failed dependency → propagate failure
                 if dep_runtime.state == QueueState.FAILED:
-                    self.queue_service.update_job_state(job_spec.job_id, QueueState.FAILED)
-                    self.queue_service.set_job_error(
+                    self.queue_service.fail_job(
                         job_spec.job_id,
                         f"Dependency job {dep_job_id} failed: {dep_runtime.error_message or 'no error details'}",
                     )

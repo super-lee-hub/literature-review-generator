@@ -257,6 +257,11 @@ class ZoteroAttachmentIndex:
             "SELECT a.itemID, a.parentItemID, ai.key, ai.dateAdded, a.linkMode, a.contentType, a.path "
             "FROM itemAttachments a JOIN items ai ON ai.itemID=a.itemID"
         ):
+            # Standalone Zotero attachments have no parent item.  They are not
+            # candidates for parent-paper matching and must not invalidate the
+            # valid parent/attachment relations in the same database.
+            if parent_id is None:
+                continue
             raw = str(raw_path or "")
             source_type = "managed_storage" if self._is_managed_path(raw) and int(link_mode or 0) != 2 else "linked_file"
             external_to_library = False

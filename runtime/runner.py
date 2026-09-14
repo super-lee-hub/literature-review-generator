@@ -330,6 +330,23 @@ def _stage1_status_projection(registry: ArtifactRegistry) -> dict[str, bool]:
     }
 
 
+def _acceptance_budget_state_path(workspace: Any) -> Path:
+    """Resolve the parent budget path in-process or from a child environment."""
+
+    from runtime.provider_runtime import (
+        acceptance_execution_context_from_environment,
+        current_acceptance_execution_context,
+    )
+
+    context = (
+        current_acceptance_execution_context()
+        or acceptance_execution_context_from_environment()
+    )
+    if context is not None:
+        return Path(context.provider_budget_state_path)
+    return Path(workspace.log_path("acceptance_budget_state_v1.json"))
+
+
 class AgentRuntimeRunner:
     """Single AI-native state machine layered on the internal stage registry."""
 
@@ -1009,20 +1026,12 @@ class AgentRuntimeRunner:
             except AttemptAlreadyRunningError as exc:
                 raise RuntimeRunnerError(f"run rejected: {exc}") from exc
         try:
-            from runtime.provider_runtime import (
-                current_acceptance_execution_context,
-                provider_budget_controller_from_environment,
-            )
+            from runtime.provider_runtime import provider_budget_controller_from_environment
 
             acceptance_budget = provider_budget_controller_from_environment()
             if acceptance_budget is not None:
-                active_acceptance_context = current_acceptance_execution_context()
-                acceptance_state_path = (
-                    Path(active_acceptance_context.provider_budget_state_path)
-                    if active_acceptance_context is not None
-                    else session.context.workspace.log_path(
-                        "acceptance_budget_state_v1.json"
-                    )
+                acceptance_state_path = _acceptance_budget_state_path(
+                    session.context.workspace
                 )
                 acceptance_budget.bind_state_path(
                     acceptance_state_path

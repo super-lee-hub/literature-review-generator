@@ -15,13 +15,16 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 from typing import Any, Iterable, Mapping, cast
+from urllib.parse import urlsplit
 import zipfile
 
 from runtime.provider_runtime import (
     AcceptanceExecutionContextV1,
+    acceptance_context_environment,
     ProviderAggregateBudgetV1,
     ProviderBudgetController,
     ProviderReceiptConflict,
@@ -184,6 +187,33 @@ def _resolve_acceptance_path(
     if origin_dir is not None and not path.is_absolute():
         path = Path(origin_dir).expanduser().resolve() / path
     return str(path.resolve())
+
+
+def _absolute_unresolved(path: str | Path) -> Path:
+    """Normalize a path lexically while preserving symlink/reparse components."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _assert_no_reparse_components(path: str | Path, *, allow_missing_final: bool = False) -> Path:
+    """Reject symlink/reparse components before any resolving or file access."""
+    target = _absolute_unresolved(path)
+    current = Path(target.anchor) if target.anchor else Path.cwd()
+    parts = target.parts[1:] if target.anchor else target.parts
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            if allow_missing_final and index == len(parts) - 1:
+                break
+            raise ReleaseAcceptanceSpecError(f"evidence path component is missing: {current}") from None
+        except OSError as exc:
+            raise ReleaseAcceptanceSpecError(f"evidence path component is unreadable: {current}") from exc
+        attributes = int(getattr(info, "st_file_attributes", 0) or 0)
+        reparse_point = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0)
+        if os.path.islink(current) or (reparse_point and attributes & reparse_point):
+            raise ReleaseAcceptanceSpecError(f"evidence path contains a symlink or reparse point: {current}")
+    return target
 
 
 def _reject_unknown(payload: Mapping[str, Any], allowed: frozenset[str], label: str) -> None:
@@ -567,10 +597,21 @@ class ReleaseAcceptancePlanV2:
         raw_hosts = payload.get("third_party_hosts", [])
         if not isinstance(raw_hosts, (list, tuple)) or any(not isinstance(item, str) for item in raw_hosts):
             raise ReleaseAcceptanceSpecError("third_party_hosts must be an array of strings")
-        raw_sha = payload.get("final_executable_sha", payload.get("executable_sha", "")) or ""
-        if not isinstance(raw_sha, str):
-            raise ReleaseAcceptanceSpecError("final_executable_sha must be a JSON string")
-        final_sha = raw_sha.strip().lower()
+        sha_values: list[str] = []
+        for field_name in ("final_executable_sha", "executable_sha"):
+            if field_name not in payload:
+                continue
+            raw_sha = payload[field_name]
+            if not isinstance(raw_sha, str):
+                raise ReleaseAcceptanceSpecError("final_executable_sha must be a JSON string")
+            normalized_sha = raw_sha.strip().lower()
+            if normalized_sha:
+                sha_values.append(normalized_sha)
+        if len(set(sha_values)) > 1:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance plan executable SHA aliases disagree"
+            )
+        final_sha = sha_values[0] if sha_values else ""
         if final_sha and (len(final_sha) not in {40, 64} or any(char not in "0123456789abcdef" for char in final_sha)):
             raise ReleaseAcceptanceSpecError("final_executable_sha must be a lowercase checkout SHA")
         return cls(
@@ -791,6 +832,8 @@ class ParentAcceptanceResultV2:
         expected_child_bindings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> "ParentAcceptanceResultV2":
         required = tuple(str(item).strip().upper() for item in required_scenarios)
+        full_release_profile = frozenset({"C", "D", "E", "F", "G", "H", "I", "J", "K", "Q"})
+        scoped = frozenset(required) != full_release_profile
         normalized: dict[str, Mapping[str, Any]] = {}
         issues: list[str] = []
         statuses: list[str] = []
@@ -836,6 +879,11 @@ class ParentAcceptanceResultV2:
             statuses.append(status)
             if status in {"PASS", "PASS_OFFLINE", "PASS_OFFLINE_HOSTED"} and receipt.status != "PASSED":
                 issues.append(f"child status/receipt terminal mismatch {scenario_id}")
+            if scenario_id == "K" and status in {"PASS", "PASS_OFFLINE", "PASS_OFFLINE_HOSTED"}:
+                if receipt.budget_domain != "offline-k":
+                    issues.append("Gate K success must use the offline-k budget domain")
+            elif scenario_id != "K" and status in {"PASS_OFFLINE", "PASS_OFFLINE_HOSTED"}:
+                issues.append(f"offline acceptance status is reserved for Gate K: {scenario_id}")
             normalized[scenario_id] = {
                 **dict(raw),
                 "receipt": receipt.to_dict(),
@@ -846,33 +894,39 @@ class ParentAcceptanceResultV2:
             if bool(contract.get("required_live")):
                 required_live_scenarios = True
                 live_authority = live_authority and _receipt_has_live_authority(receipt)
+        status = "NOT_VERIFIED"
+        reason = "child statuses or live authority receipts are incomplete"
         if issues:
             status = "NOT_VERIFIED"
             reason = "; ".join(issues)
         elif any(item in {"BLOCKED", "NOT_RUN", "NOT_VERIFIED", "FAILED", "CANCELLED"} for item in statuses):
             status = "BLOCKED" if any(item == "BLOCKED" for item in statuses) else "NOT_VERIFIED"
             reason = "one or more required child scenarios did not pass"
-        elif statuses and all(item in {"PASS_OFFLINE", "PASS_OFFLINE_HOSTED"} for item in statuses):
-            status = "PASS_OFFLINE"
-            reason = "all children are offline evidence; live acceptance remains unproven"
-        elif (
-            statuses
-            and all(item == "PASS" for item in statuses)
-            and required_live_scenarios
-            and live_authority
-        ):
-            status = "READY_TO_MERGE"
-            reason = "all required children have independently verified live authority receipts"
-        elif statuses and all(item == "PASS" for item in statuses):
-            if required_live_scenarios:
-                status = "NOT_VERIFIED"
-                reason = "live-required children passed without live provider authority"
-            else:
+        elif statuses:
+            offline_statuses = {"PASS_OFFLINE", "PASS_OFFLINE_HOSTED"}
+            offline_only = all(item in offline_statuses for item in statuses)
+            live_statuses = [item for item in statuses if item not in offline_statuses]
+            live_children_pass = all(item == "PASS" for item in live_statuses)
+            if offline_only:
                 status = "PASS_OFFLINE"
-                reason = "children passed, but no required live provider authority was requested"
-        else:
-            status = "NOT_VERIFIED"
-            reason = "child statuses or live authority receipts are incomplete"
+                reason = "all children are offline evidence; live acceptance remains unproven"
+            elif live_children_pass and required_live_scenarios and live_authority:
+                status = "SCOPED_PASS" if scoped else "READY_TO_MERGE"
+                reason = (
+                    "scoped children have independently verified live authority receipts"
+                    if scoped
+                    else "all required children have independently verified live authority receipts"
+                )
+            elif all(item == "PASS" for item in statuses):
+                if required_live_scenarios:
+                    status = "NOT_VERIFIED"
+                    reason = "live-required children passed without live provider authority"
+                else:
+                    status = "SCOPED_PASS_OFFLINE" if scoped else "PASS_OFFLINE"
+                    reason = "children passed, but no required live provider authority was requested"
+            else:
+                status = "NOT_VERIFIED"
+                reason = "child statuses or live authority receipts are incomplete"
         live_pass = status == "READY_TO_MERGE"
         ready_to_merge = live_pass
         return cls(
@@ -917,21 +971,42 @@ def _receipt_has_live_authority(receipt: ScenarioExecutionReceiptV1) -> bool:
             continue
         if not receipts or any(item.test_only for item in receipts):
             continue
-        if any(
-            item.status == "success"
-            or (
-                isinstance(item.metadata, Mapping)
-                and bool(item.metadata.get("transport_config"))
-            )
-            for item in receipts
-        ):
+        if any(_is_nonlocal_provider_receipt(item) for item in receipts):
             return True
     return False
+
+
+def _is_nonlocal_provider_receipt(receipt: Any) -> bool:
+    """Return whether a physical provider receipt reached a non-local host."""
+
+    if bool(getattr(receipt, "test_only", False)):
+        return False
+    metadata = getattr(receipt, "metadata", {})
+    attempted = (
+        str(getattr(receipt, "status", "") or "") == "success"
+        or (
+            isinstance(metadata, Mapping)
+            and isinstance(metadata.get("transport_config"), Mapping)
+        )
+    )
+    if not attempted:
+        return False
+    endpoint = str(getattr(receipt, "endpoint", "") or "").strip()
+    if not endpoint and isinstance(metadata, Mapping):
+        transport = metadata.get("transport_config")
+        if isinstance(transport, Mapping):
+            endpoint = str(transport.get("api_base") or "").strip()
+    try:
+        host = str(urlsplit(endpoint).hostname or "").casefold()
+    except ValueError:
+        return False
+    return bool(host) and host not in {"localhost", "127.0.0.1", "::1"}
 
 
 @dataclass(frozen=True)
 class ReleaseAcceptanceSpec:
     budget: ReleaseAcceptanceBudget = field(default_factory=ReleaseAcceptanceBudget)
+    final_executable_sha: str = ""
     evidence_manifest: str = ""
     runtime_spec: str = ""
     state_path: str = ""
@@ -980,6 +1055,32 @@ class ReleaseAcceptanceSpec:
             budget = budget_values[0] if budget_values else ReleaseAcceptanceBudget.from_mapping(
                 {}, defaults=defaults
             )
+        sha_values: list[str] = []
+        for field_name in ("final_executable_sha", "executable_sha"):
+            if field_name not in payload:
+                continue
+            raw_sha = payload[field_name]
+            if not isinstance(raw_sha, str):
+                raise ReleaseAcceptanceSpecError("final_executable_sha must be a JSON string")
+            normalized_sha = raw_sha.strip().lower()
+            if normalized_sha:
+                sha_values.append(normalized_sha)
+        if len(set(sha_values)) > 1:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance executable SHA aliases disagree"
+            )
+        final_sha = sha_values[0] if sha_values else ""
+        if final_sha and not _valid_checkout_sha(final_sha):
+            raise ReleaseAcceptanceSpecError(
+                "final_executable_sha must be a lowercase checkout SHA"
+            )
+        if plan is not None and final_sha and plan.final_executable_sha and final_sha != plan.final_executable_sha:
+            raise ReleaseAcceptanceSpecError(
+                "acceptance executable SHA does not match its plan"
+            )
+        if plan is not None:
+            final_sha = plan.final_executable_sha
+
         evidence = payload.get("evidence_manifest", "")
         if evidence is None:
             evidence = ""
@@ -1039,6 +1140,7 @@ class ReleaseAcceptanceSpec:
             )
         return cls(
             budget=budget,
+            final_executable_sha=final_sha,
             evidence_manifest=str(evidence_path) if evidence_path is not None else "",
             runtime_spec=str(runtime_path) if runtime_path is not None else "",
             state_path=str(state_file) if state_file is not None else "",
@@ -1155,6 +1257,7 @@ class AcceptanceScenarioContextV1:
     input_identity_sha256: str = ""
     budget_domain: str = "live"
     input_manifest_path: str = ""
+    absolute_deadline_epoch: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1524,6 +1627,23 @@ class GateHScenario(AcceptanceScenario):
     scenario_action = "inject, detect, repair, and revalidate one controlled defect"
 
 
+def _scenario_context_environment(context: AcceptanceScenarioContextV1) -> dict[str, str]:
+    """Bridge child-scenario authority into a GUI subprocess environment."""
+
+    execution_context = AcceptanceExecutionContextV1(
+        acceptance_run_id=context.acceptance_run_id,
+        final_executable_sha=context.final_executable_sha,
+        absolute_deadline_epoch=float(context.absolute_deadline_epoch or 0.0),
+        provider_budget=ProviderAggregateBudgetV1.from_mapping(context.provider_budget),
+        provider_budget_state_path=context.provider_budget_state_path,
+        evidence_root=context.evidence_root,
+        process_event_log=context.process_event_log,
+        scenario_state_path=context.scenario_execution_receipt_path or context.evidence_root,
+        owner_authorized=context.owner_authorized,
+    )
+    return acceptance_context_environment(execution_context)
+
+
 class GateIScenario(AcceptanceScenario):
     gate = "I"
     scenario_action = "execute the documented Playwright flow against localhost"
@@ -1545,6 +1665,8 @@ class GateIScenario(AcceptanceScenario):
                 "playwright_trace",
                 "browser_evidence",
                 "playwright_screenshot_manifest",
+                "runtime_spec",
+                "job_outcome",
                 "scenario_execution_receipt",
             }
         ):
@@ -1577,19 +1699,220 @@ class GateIScenario(AcceptanceScenario):
             from runtime.playwright_evidence import (
                 PlaywrightEvidenceCollector,
                 PlaywrightEvidenceError,
+                PlaywrightProductionScenarioInputV2,
                 PlaywrightScenarioInputV1,
             )
+
+            if str(payload.get("artifact_version") or "") == "v2":
+                if not context.owner_authorized:
+                    return self._blocked_execution(
+                        "Gate I production flow requires live acceptance authorization"
+                    )
+                resolved_payload = dict(payload)
+                for field_name in (
+                    "config_path",
+                    "repo_root",
+                    "output_root",
+                    "pdf_folder",
+                    "zotero_report",
+                    "library_path",
+                ):
+                    raw_value = str(resolved_payload.get(field_name) or "").strip()
+                    if raw_value and not Path(raw_value).expanduser().is_absolute():
+                        resolved_payload[field_name] = str(
+                            (input_path.parent / raw_value).resolve()
+                        )
+                production_input = PlaywrightProductionScenarioInputV2.from_mapping(resolved_payload)
+                collector = PlaywrightEvidenceCollector(
+                    production_input,
+                    acceptance_run_id=context.acceptance_run_id,
+                    scenario_id="I",
+                    final_executable_sha=context.final_executable_sha,
+                    environment=_scenario_context_environment(context),
+                )
+                result = collector.run()
+                job_id = result.submitted_job_id
+                attempt_path = result.attempt_path
+                if (
+                    not job_id
+                    or result.runtime_spec_path is None
+                    or result.job_outcome_path is None
+                    or result.provider_ledger_path is None
+                    or attempt_path is None
+                ):
+                    raise PlaywrightEvidenceError(
+                        "Gate I production collector did not return the submitted job and canonical artifacts"
+                    )
+                producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
+                browser_ref = producer.reference(
+                    result.browser_evidence_path,
+                    role="browser_evidence",
+                    artifact_type="playwright_run_evidence",
+                    artifact_version="v1",
+                    schema_version="playwright-run-evidence-v1",
+                    job_id=job_id,
+                )
+                trace_ref = producer.reference(
+                    result.trace_path,
+                    role="playwright_trace",
+                    artifact_type="playwright_trace",
+                    artifact_version="v1",
+                    schema_version="playwright-trace-v1",
+                    job_id=job_id,
+                )
+                screenshot_manifest_ref = producer.reference(
+                    result.screenshot_manifest_path,
+                    role="playwright_screenshot_manifest",
+                    artifact_type="playwright_screenshot_manifest",
+                    artifact_version="v1",
+                    schema_version="playwright-screenshot-manifest-v1",
+                    job_id=job_id,
+                )
+                runtime_spec_ref = producer.reference(
+                    result.runtime_spec_path,
+                    role="runtime_spec",
+                    artifact_type="runtime_job_spec",
+                    artifact_version="v1",
+                    job_id=job_id,
+                )
+                job_outcome_ref = producer.reference(
+                    result.job_outcome_path,
+                    role="job_outcome",
+                    artifact_type="job_outcome",
+                    artifact_version="v1",
+                    job_id=job_id,
+                )
+                attempt_ref = producer.reference(
+                    attempt_path,
+                    role="attempt",
+                    artifact_type="job_attempt",
+                    artifact_version="v1",
+                    job_id=job_id,
+                )
+                provider_ledger_ref = producer.reference(
+                    result.provider_ledger_path,
+                    role="provider_receipt_ledger",
+                    artifact_type="provider_receipt_ledger",
+                    artifact_version="v1",
+                    schema_version="provider-receipt-ledger-v1",
+                    job_id=job_id,
+                )
+                receipt_path = Path(
+                    context.scenario_execution_receipt_path
+                    or Path(context.evidence_root) / "I" / "scenario_execution_receipt.json"
+                ).expanduser().resolve()
+                executor_identity = process_identity_for_pid(os.getpid())
+                workspace = str(result.job_workspace_path or production_input.output_root)
+                runtime_spec_bytes = result.runtime_spec_path.read_bytes()
+                runtime_spec_sha256 = hashlib.sha256(runtime_spec_bytes).hexdigest()
+                actual_attempt_id = f"{context.acceptance_run_id}:I:{executor_identity.pid}"
+                try:
+                    attempt_payload = json.loads(attempt_path.read_text(encoding="utf-8"))
+                    if isinstance(attempt_payload, Mapping) and str(attempt_payload.get("attempt_id") or "").strip():
+                        actual_attempt_id = str(attempt_payload["attempt_id"]).strip()
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                    pass
+                workspace_identity = hashlib.sha256(
+                    json.dumps(
+                        {"workspace": workspace, "job_id": job_id},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                receipt = ScenarioExecutionReceiptV1(
+                    parent_acceptance_run_id=context.acceptance_run_id,
+                    scenario_id="I",
+                    gate="I",
+                    final_executable_sha=context.final_executable_sha,
+                    plan_sha256=context.plan_sha256 or hashlib.sha256(b"gate-i-v2").hexdigest(),
+                    runtime_spec_sha256=runtime_spec_sha256,
+                    input_identity_sha256=context.input_identity_sha256 or hashlib.sha256(raw).hexdigest(),
+                    workspace_identity_sha256=workspace_identity,
+                    executor_pid=executor_identity.pid,
+                    executor_process_creation_identity=str(executor_identity.creation_time or "unknown"),
+                    executor_host_id=executor_identity.host_id,
+                    started_at=_scenario_now(),
+                    completed_at=_scenario_now(),
+                    action_type="playwright-gui-production-flow",
+                    workspace=workspace,
+                    job_id=job_id,
+                    attempt_id=actual_attempt_id,
+                    budget_domain=context.budget_domain,
+                    status="PASSED",
+                    exit_status=0,
+                    produced_evidence_refs=(
+                        browser_ref,
+                        trace_ref,
+                        screenshot_manifest_ref,
+                        runtime_spec_ref,
+                        job_outcome_ref,
+                        attempt_ref,
+                        provider_ledger_ref,
+                    ),
+                )
+                from services.job_workspace import atomic_write_json
+
+                atomic_write_json(str(receipt_path), receipt.to_dict())
+                receipt_ref = producer.reference(
+                    receipt_path,
+                    role="scenario_execution_receipt",
+                    artifact_type="scenario_execution_receipt",
+                    artifact_version="v1",
+                    schema_version="scenario-execution-receipt-v1",
+                    job_id=job_id,
+                )
+                return AcceptanceScenarioResultV1(
+                    gate="I",
+                    scenario_id="I",
+                    status="READY_FOR_SEMANTIC_VERIFICATION",
+                    reason="real GUI submission produced a canonical job outcome and typed evidence",
+                    evidence_refs=(
+                        browser_ref,
+                        trace_ref,
+                        screenshot_manifest_ref,
+                        runtime_spec_ref,
+                        job_outcome_ref,
+                        attempt_ref,
+                        provider_ledger_ref,
+                        receipt_ref,
+                    ),
+                )
+
+            if not context.runtime_spec_path:
+                return self._blocked_execution(
+                    "Gate I requires a production RuntimeJobSpec, not a page-only smoke input"
+                )
 
             scenario_input = PlaywrightScenarioInputV1.from_mapping(resolved_payload)
             if context.job_id and context.job_id != scenario_input.resulting_job_id:
                 raise PlaywrightEvidenceError(
                     "Gate I resulting job ID does not match the child context"
                 )
+            runtime_spec_path = Path(context.runtime_spec_path).expanduser().resolve()
+            runtime_payload = json.loads(runtime_spec_path.read_text(encoding="utf-8"))
+            from runtime.job_spec import RuntimeJobSpec
+
+            runtime_spec = RuntimeJobSpec.from_dict(runtime_payload).resolved_from(
+                runtime_spec_path.parent
+            )
+            if runtime_spec.job_id != scenario_input.resulting_job_id:
+                raise PlaywrightEvidenceError(
+                    "Gate I RuntimeJobSpec job ID does not match the GUI input"
+                )
+            if (
+                not runtime_spec.workspace_path
+                or Path(runtime_spec.workspace_path).resolve()
+                != Path(scenario_input.workspace).resolve()
+            ):
+                raise PlaywrightEvidenceError(
+                    "Gate I RuntimeJobSpec workspace does not match the GUI input"
+                )
             collector = PlaywrightEvidenceCollector(
                 scenario_input,
                 acceptance_run_id=context.acceptance_run_id,
                 scenario_id="I",
                 final_executable_sha=context.final_executable_sha,
+                environment=_scenario_context_environment(context),
             )
             result = collector.run()
             producer = GateEvidenceProducer(final_sha=context.final_executable_sha)
@@ -1618,6 +1941,32 @@ class GateIScenario(AcceptanceScenario):
                 job_id=context.job_id or scenario_input.resulting_job_id,
             )
             job_id = scenario_input.resulting_job_id
+            from services.artifact_registry import ArtifactRegistry
+            from services.job_outcome import load_canonical_job_outcome
+
+            registry = ArtifactRegistry(
+                Path(scenario_input.workspace) / "artifact_registry.json",
+                job_id,
+            )
+            outcome, outcome_record = load_canonical_job_outcome(registry)
+            if outcome.job_status != "completed" or not outcome.canonical_ready:
+                raise PlaywrightEvidenceError(
+                    "Gate I GUI flow did not produce a completed canonical runtime outcome"
+                )
+            runtime_spec_ref = producer.reference(
+                runtime_spec_path,
+                role="runtime_spec",
+                artifact_type="runtime_job_spec",
+                artifact_version="v1",
+                job_id=job_id,
+            )
+            job_outcome_ref = producer.reference(
+                outcome_record.path,
+                role="job_outcome",
+                artifact_type="job_outcome",
+                artifact_version="v1",
+                job_id=job_id,
+            )
             receipt_path = Path(
                 context.scenario_execution_receipt_path
                 or Path(context.evidence_root) / "I" / "scenario_execution_receipt.json"
@@ -1651,7 +2000,13 @@ class GateIScenario(AcceptanceScenario):
                 budget_domain=context.budget_domain,
                 status="PASSED",
                 exit_status=0,
-                produced_evidence_refs=(browser_ref, trace_ref, screenshot_manifest_ref),
+                produced_evidence_refs=(
+                    browser_ref,
+                    trace_ref,
+                    screenshot_manifest_ref,
+                    runtime_spec_ref,
+                    job_outcome_ref,
+                ),
             )
             from services.job_workspace import atomic_write_json
 
@@ -1669,7 +2024,14 @@ class GateIScenario(AcceptanceScenario):
                 scenario_id="I",
                 status="READY_FOR_SEMANTIC_VERIFICATION",
                 reason="real localhost GUI and Playwright collector produced typed evidence",
-                evidence_refs=(browser_ref, trace_ref, screenshot_manifest_ref, receipt_ref),
+                evidence_refs=(
+                    browser_ref,
+                    trace_ref,
+                    screenshot_manifest_ref,
+                    runtime_spec_ref,
+                    job_outcome_ref,
+                    receipt_ref,
+                ),
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, RuntimeError) as exc:
             return self._blocked_execution(
@@ -2150,8 +2512,16 @@ GATE_CONTRACTS: dict[str, dict[str, Any]] = {
         "purpose": "real GUI browser flow",
         "prerequisites": ["running local GUI", "browser automation"],
         "actual_action": "execute the documented Playwright flow against localhost",
-        "required_live": False,
-        "evidence_required": ["playwright", "browser_evidence", "trace_archive", "flow_completed"],
+        "required_live": True,
+        "evidence_required": [
+            "playwright",
+            "browser_evidence",
+            "trace_archive",
+            "flow_completed",
+            "production_runtime_spec",
+            "completed_job_outcome",
+            "attempt",
+        ],
     },
     "J": {
         "purpose": "real heavy OCR path",
@@ -2247,6 +2617,10 @@ _GATE_REF_ROLES: dict[str, frozenset[str]] = {
         "playwright_trace",
         "browser_evidence",
         "playwright_screenshot_manifest",
+        "runtime_spec",
+        "job_outcome",
+        "attempt",
+        "provider_receipt_ledger",
         "scenario_execution_receipt",
     }),
     "J": frozenset({"source_pdf", "ocr_diagnostics", "ocr_artifact", "canonical_stage1", "registry", "scenario_execution_receipt"}),
@@ -2303,6 +2677,7 @@ _ROLE_ARTIFACT_TYPES: dict[str, frozenset[str]] = {
     "playwright_trace": frozenset({"playwright_trace"}),
     "browser_evidence": frozenset({"playwright_run_evidence"}),
     "playwright_screenshot_manifest": frozenset({"playwright_screenshot_manifest"}),
+    "runtime_spec": frozenset({"runtime_job_spec"}),
     "scenario_execution_receipt": frozenset({"scenario_execution_receipt"}),
 }
 
@@ -2318,8 +2693,9 @@ def _valid_checkout_sha(value: Any) -> bool:
 
 
 def _bounded_read(path: Path, *, max_bytes: int) -> bytes:
-    if path.is_symlink():
-        raise ReleaseAcceptanceSpecError(f"evidence reference is a symlink: {path}")
+    _assert_no_reparse_components(path)
+    if os.name == "nt":
+        return _bounded_read_windows_no_reparse(path, max_bytes=max_bytes)
     try:
         size_before = path.stat().st_size
         if size_before > max_bytes:
@@ -2340,6 +2716,201 @@ def _bounded_read(path: Path, *, max_bytes: int) -> bytes:
         raise ReleaseAcceptanceSpecError(
             f"evidence reference is unreadable: {path.name}"
         ) from exc
+
+
+def _bounded_read_windows_no_reparse(path: Path, *, max_bytes: int) -> bytes:
+    """Read an evidence file through one Windows no-reparse handle.
+
+    ``lstat`` protects the path as it exists before opening. The handle checks
+    below ensure the subsequent byte read remains bound to a non-reparse file,
+    and that its final DOS path still equals the lexical target we approved.
+    """
+
+    import ctypes
+    from ctypes import wintypes
+
+    target = _absolute_unresolved(path)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_sequential_scan = 0x08000000
+    file_attribute_reparse_point = 0x00000400
+    file_attribute_tag_info = 9
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        ]
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.ReadFile.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    kernel32.ReadFile.restype = wintypes.BOOL
+
+    handle = kernel32.CreateFileW(
+        str(target),
+        generic_read,
+        file_share_read,
+        None,
+        open_existing,
+        file_flag_open_reparse_point | file_flag_sequential_scan,
+        None,
+    )
+    if handle == invalid_handle:
+        error = ctypes.get_last_error()
+        raise ReleaseAcceptanceSpecError(
+            f"evidence reference is unreadable: {target.name} (WinError {error})"
+        )
+    try:
+        tag_info = _FileAttributeTagInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            handle,
+            file_attribute_tag_info,
+            ctypes.byref(tag_info),
+            ctypes.sizeof(tag_info),
+        ):
+            error = ctypes.get_last_error()
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference attribute query failed: {target.name} (WinError {error})"
+            )
+        if int(tag_info.file_attributes) & file_attribute_reparse_point:
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference is a reparse point: {target.name}"
+            )
+        required = kernel32.GetFinalPathNameByHandleW(handle, None, 0, 0)
+        if not required:
+            error = ctypes.get_last_error()
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference final path query failed: {target.name} (WinError {error})"
+            )
+        final_buffer = ctypes.create_unicode_buffer(required + 1)
+        if not kernel32.GetFinalPathNameByHandleW(
+            handle,
+            final_buffer,
+            len(final_buffer),
+            0,
+        ):
+            error = ctypes.get_last_error()
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference final path query failed: {target.name} (WinError {error})"
+            )
+        final_path = _normalize_windows_handle_path(final_buffer.value)
+        expected_path = _normalize_windows_handle_path(str(target))
+        if final_path != expected_path:
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference changed or resolved through a reparse point: {target.name}"
+            )
+        before = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(before)):
+            error = ctypes.get_last_error()
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference size query failed: {target.name} (WinError {error})"
+            )
+        size_before = (int(before.file_size_high) << 32) | int(before.file_size_low)
+        if size_before > max_bytes:
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference exceeds bounded read size: {target.name}"
+            )
+        chunks: list[bytes] = []
+        remaining = size_before
+        while remaining:
+            chunk_size = min(1024 * 1024, remaining)
+            chunk = ctypes.create_string_buffer(chunk_size)
+            read = wintypes.DWORD()
+            if not kernel32.ReadFile(
+                handle,
+                chunk,
+                chunk_size,
+                ctypes.byref(read),
+                None,
+            ):
+                error = ctypes.get_last_error()
+                raise ReleaseAcceptanceSpecError(
+                    f"evidence reference is unreadable: {target.name} (WinError {error})"
+                )
+            if not read.value:
+                raise ReleaseAcceptanceSpecError(
+                    f"evidence reference changed during read: {target.name}"
+                )
+            chunks.append(chunk.raw[: read.value])
+            remaining -= int(read.value)
+        after = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(after)):
+            error = ctypes.get_last_error()
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference size query failed: {target.name} (WinError {error})"
+            )
+        size_after = (int(after.file_size_high) << 32) | int(after.file_size_low)
+        raw = b"".join(chunks)
+        if size_before != size_after or len(raw) != size_after:
+            raise ReleaseAcceptanceSpecError(
+                f"evidence reference changed or exceeds bounded read size: {target.name}"
+            )
+        return raw
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _normalize_windows_handle_path(value: str) -> str:
+    path = str(value or "")
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.normpath(path))
 
 
 @dataclass(frozen=True)
@@ -2790,7 +3361,8 @@ class GateEvidenceProducer:
         artifact_id: str = "",
         modality: str = "",
     ) -> dict[str, Any]:
-        target = Path(path).expanduser().resolve()
+        unresolved = _assert_no_reparse_components(path)
+        target = unresolved.resolve()
         raw = _bounded_read(target, max_bytes=self.max_bytes)
         ref = DurableEvidenceRefV1(
             ref_id=f"{role}:{hashlib.sha256(str(target).encode('utf-8')).hexdigest()[:16]}",
@@ -2838,7 +3410,8 @@ class GateEvidenceProducer:
         scenario_id: str = "",
         job_id: str = "",
     ) -> Path:
-        target = Path(path).expanduser().resolve()
+        unresolved = _assert_no_reparse_components(path, allow_missing_final=True)
+        target = unresolved.resolve()
         previous_raw = b""
         previous_revision = 0
         if target.is_file():
@@ -2934,6 +3507,7 @@ class GateEvidenceVerifier:
         path = Path(raw).expanduser()
         if not path.is_absolute() and origin_dir is not None:
             path = Path(origin_dir).expanduser() / path
+        _assert_no_reparse_components(path)
         return path.resolve()
 
     @staticmethod
@@ -2959,6 +3533,7 @@ class GateEvidenceVerifier:
             "source_count": len({ref.sha256 for ref in refs if ref.role in {"source_pdf", "f1_corpus"}}),
             "canonical_stage1_count": len({ref.sha256 for ref in refs if ref.role == "canonical_stage1"}),
             "actual_transport_calls": 0,
+            "nonlocal_transport_calls": 0,
             "semantic_roles": set(),
             "receipt_routes": set(),
             "candidate_count": 0,
@@ -2978,6 +3553,8 @@ class GateEvidenceVerifier:
             "browser_evidence": False,
             "flow_completed": False,
             "trace_archive": False,
+            "production_runtime_spec": False,
+            "completed_job_outcome": False,
             "ocr_actually_used": False,
             "lineage": False,
             "page_identity": False,
@@ -3045,9 +3622,21 @@ class GateEvidenceVerifier:
                     )
                     if attempted:
                         try:
-                            facts["actual_transport_calls"] += max(1, int(row.get("attempts") or 1))
+                            attempts = max(1, int(row.get("attempts") or 1))
                         except (TypeError, ValueError):
-                            facts["actual_transport_calls"] += 1
+                            attempts = 1
+                        facts["actual_transport_calls"] += attempts
+                        endpoint = str(row.get("endpoint") or "").strip()
+                        if not endpoint and isinstance(metadata, Mapping):
+                            transport = metadata.get("transport_config")
+                            if isinstance(transport, Mapping):
+                                endpoint = str(transport.get("api_base") or "").strip()
+                        try:
+                            host = str(urlsplit(endpoint).hostname or "").casefold()
+                        except ValueError:
+                            host = ""
+                        if host and host not in {"localhost", "127.0.0.1", "::1"}:
+                            facts["nonlocal_transport_calls"] += attempts
                     node_id = str(row.get("node_id") or row.get("route") or "")
                     if node_id:
                         facts["semantic_roles"].add(node_id)
@@ -3079,9 +3668,15 @@ class GateEvidenceVerifier:
                     if isinstance(route_plan, Mapping) and isinstance(route_plan.get("routes"), list):
                         facts["route_plan_present"] = True
                 if ref.role == "job_outcome":
-                    facts["closure_complete"] = facts["closure_complete"] or (
+                    outcome_ok = (
                         str(row.get("job_status") or "").casefold() == "completed"
                         and bool(row.get("canonical_ready", False))
+                    )
+                    facts["completed_job_outcome"] = facts["completed_job_outcome"] or outcome_ok
+                    facts["closure_complete"] = facts["closure_complete"] or outcome_ok
+                if ref.role == "runtime_spec":
+                    facts["production_runtime_spec"] = facts["production_runtime_spec"] or bool(
+                        str(row.get("job_id") or "").strip()
                     )
                 if ref.role == "process_events":
                     process_id = str(row.get("process_id") or row.get("pid") or "")
@@ -3222,14 +3817,21 @@ class GateEvidenceVerifier:
             trace_refs = by_role.get("playwright_trace", [])
             browser_refs = by_role.get("browser_evidence", [])
             screenshot_manifest_refs = by_role.get("playwright_screenshot_manifest", [])
+            runtime_refs = by_role.get("runtime_spec", [])
+            outcome_refs = by_role.get("job_outcome", [])
+            attempt_refs = by_role.get("attempt", [])
             if (
                 len(trace_refs) != 1
                 or len(browser_refs) != 1
                 or len(screenshot_manifest_refs) != 1
+                or len(runtime_refs) != 1
+                or len(outcome_refs) != 1
+                or len(attempt_refs) != 1
             ):
                 return {}, (
                     "Playwright evidence requires one trace archive, one run metadata "
-                    "artifact, and one screenshot manifest"
+                    "artifact, one screenshot manifest, one RuntimeJobSpec, and one "
+                    "completed job outcome and terminal attempt"
                 )
             trace_ref = trace_refs[0]
             trace_path = self._resolve_path(trace_ref.path, origin_dir=origin_dir)
@@ -3251,6 +3853,8 @@ class GateEvidenceVerifier:
                 return {}, "Playwright run metadata artifact type is invalid"
             if browser_payload.get("schema_version") != "playwright-run-evidence-v1":
                 return {}, "Playwright run metadata schema is invalid"
+            if str(browser_payload.get("execution_kind") or "").casefold() != "production":
+                return {}, "Gate I requires production GUI evidence; page smoke cannot pass"
             for field_name in ("run_id", "session_id", "url", "resulting_job_id", "trace_sha256"):
                 if not str(browser_payload.get(field_name) or "").strip():
                     return {}, f"Playwright run metadata requires {field_name}"
@@ -3277,6 +3881,20 @@ class GateEvidenceVerifier:
                 for item in assertions
             ):
                 return {}, "Playwright flow assertions are incomplete or failed"
+            assertion_names = {
+                str(item.get("name") or "")
+                for item in assertions
+                if isinstance(item, Mapping)
+            }
+            required_assertions = {
+                "workflow_request_filled",
+                "job_submitted",
+                "submitted_job_visible",
+                "same_job_terminal_visible",
+                "canonical_outcome_verified",
+            }
+            if not required_assertions.issubset(assertion_names):
+                return {}, "Gate I production evidence lacks GUI submission and same-job terminal assertions"
             console_errors = browser_payload.get("console_errors")
             page_errors = browser_payload.get("page_errors", [])
             if not isinstance(console_errors, list) or not isinstance(page_errors, list):
@@ -3311,6 +3929,36 @@ class GateEvidenceVerifier:
                 for item in screenshots
             ):
                 return {}, "Playwright screenshot manifest has no valid screenshot records"
+            runtime_payload = payloads.get(runtime_refs[0].ref_id)
+            if not isinstance(runtime_payload, Mapping):
+                return {}, "Playwright RuntimeJobSpec evidence is not a JSON object"
+            if runtime_refs[0].artifact_type != "runtime_job_spec":
+                return {}, "Playwright RuntimeJobSpec evidence type is invalid"
+            runtime_job_id = str(runtime_payload.get("job_id") or "").strip()
+            if runtime_job_id and runtime_job_id != str(browser_payload.get("resulting_job_id") or ""):
+                return {}, "Playwright RuntimeJobSpec job identity does not match the submitted GUI job"
+            outcome_payload = payloads.get(outcome_refs[0].ref_id)
+            outcome_rows = self._rows(outcome_payload)
+            outcome_ok = any(
+                isinstance(row, Mapping)
+                and str(row.get("job_status") or "").casefold() == "completed"
+                and row.get("canonical_ready") is True
+                and str(row.get("job_id") or "") == str(
+                    browser_payload.get("resulting_job_id") or ""
+                )
+                for row in outcome_rows
+            )
+            if not outcome_ok:
+                return {}, "Playwright GUI flow lacks a completed canonical job outcome"
+            attempt_rows = self._rows(payloads.get(attempt_refs[0].ref_id))
+            attempt_ok = any(
+                str(row.get("job_id") or "") == str(browser_payload.get("resulting_job_id") or "")
+                and str(row.get("status") or "").casefold() in {"succeeded", "completed"}
+                and str(row.get("attempt_id") or "").strip()
+                for row in attempt_rows
+            )
+            if not attempt_ok:
+                return {}, "Playwright GUI flow lacks a terminal attempt bound to the submitted job"
             return {
                 "playwright": True,
                 "browser_evidence": True,
@@ -4565,7 +5213,14 @@ class GateEvidenceVerifier:
             "F": ("closure_complete",),
             "G": ("free_mode_route_only", "profile_durable"),
             "H": ("defect_injected", "defect_detected", "repair_applied", "revalidated_clean"),
-            "I": ("playwright", "browser_evidence", "trace_archive", "flow_completed"),
+            "I": (
+                "playwright",
+                "browser_evidence",
+                "trace_archive",
+                "flow_completed",
+                "production_runtime_spec",
+                "completed_job_outcome",
+            ),
             "J": ("ocr_actually_used", "page_identity", "evidence_artifact", "stage1_consumed", "lineage"),
             "K": ("bounded_wait", "no_corrupt_json", "no_lost_update"),
             "Q": ("outline_complete", "docx_complete", "validation_complete"),
@@ -4607,6 +5262,14 @@ class GateEvidenceVerifier:
                 "status": "FAIL",
                 "reason": "resume gate re-executed a completed provider call",
                 "derived_facts": facts,
+                "contract": contract,
+            }
+        if contract["required_live"] and int(facts.get("nonlocal_transport_calls") or 0) <= 0:
+            return {
+                "status": "PASS_OFFLINE",
+                "reason": "gate action completed, but all provider transport receipts target localhost",
+                "derived_facts": facts,
+                "verified_refs": [ref.to_dict() for ref in refs],
                 "contract": contract,
             }
         return {

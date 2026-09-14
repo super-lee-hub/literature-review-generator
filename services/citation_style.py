@@ -148,6 +148,24 @@ def _initials(given: str) -> str:
     return " ".join(initials)
 
 
+def _citation_creator_name(
+    creator: Mapping[str, str],
+    *,
+    include_initial: bool = False,
+    include_full_name: bool = False,
+) -> str:
+    family = creator_family(creator)
+    if include_full_name and not creator.get("literal"):
+        given = _clean_text(creator.get("given", ""))
+        if given:
+            return f"{family}, {given}"
+    if include_initial and not creator.get("literal"):
+        initials = _initials(creator.get("given", ""))
+        if initials:
+            return f"{family}, {initials}"
+    return family
+
+
 def _reference_creator(creator: Mapping[str, str]) -> str:
     literal = _clean_text(creator.get("literal"))
     if literal:
@@ -197,6 +215,30 @@ def _title_key(record: Any) -> str:
     return _record_value(record, "title") or "untitled"
 
 
+def _record_int(record: Any, key: str, default: int = 0) -> int:
+    raw: Any
+    if isinstance(record, Mapping):
+        raw = record.get(key, default)
+    else:
+        raw = getattr(record, key, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def _record_bool(record: Any, key: str, default: bool = False) -> bool:
+    raw: Any
+    if isinstance(record, Mapping):
+        raw = record.get(key, default)
+    else:
+        raw = getattr(record, key, default)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
 class CitationStyleEngine:
     """Deterministic APA 7 renderer over CSL-like records."""
 
@@ -209,11 +251,48 @@ class CitationStyleEngine:
             raise ValueError(f"unsupported citation style: {style}")
 
     @staticmethod
-    def _author_text(record: Any, *, narrative: bool = False) -> str:
+    def _author_text(
+        record: Any,
+        *,
+        narrative: bool = False,
+        author_count: int | None = None,
+        author_initials: bool | None = None,
+    ) -> str:
         creators = record_creators(record)
         if not creators:
             return "Anonymous"
-        families = [creator_family(creator) for creator in creators]
+        include_initials = (
+            _record_bool(record, "in_text_include_initials")
+            if author_initials is None
+            else bool(author_initials)
+        )
+        include_full_names = bool(
+            record.get("in_text_include_full_names", False)
+            if isinstance(record, Mapping)
+            else getattr(record, "in_text_include_full_names", False)
+        )
+        families = [
+            _citation_creator_name(
+                creator,
+                include_initial=include_initials,
+                include_full_name=include_full_names,
+            )
+            for creator in creators
+        ]
+        requested_count = (
+            _record_int(record, "in_text_author_count")
+            if author_count is None
+            else max(0, int(author_count))
+        )
+        if len(families) > 2 and requested_count > 0:
+            visible = families[: min(requested_count, len(families))]
+            if len(visible) < len(families):
+                return ", ".join(visible) + ", et al."
+            if len(visible) == 1:
+                return visible[0]
+            if len(visible) == 2:
+                return f"{visible[0]} {'and' if narrative else '&'} {visible[1]}"
+            return ", ".join(visible[:-1]) + f", {'and' if narrative else '&'} {visible[-1]}"
         if len(families) == 1:
             return families[0]
         if len(families) == 2:
@@ -227,11 +306,18 @@ class CitationStyleEngine:
         mode: str = "parenthetical",
         locator: str | None = None,
         year_suffix: str = "",
+        author_count: int | None = None,
+        author_initials: bool | None = None,
     ) -> str:
         normalized_mode = str(mode or "parenthetical").strip().lower()
         if normalized_mode not in {"parenthetical", "narrative"}:
             raise ValueError(f"unsupported citation mode: {mode}")
-        author = self._author_text(record, narrative=normalized_mode == "narrative")
+        author = self._author_text(
+            record,
+            narrative=normalized_mode == "narrative",
+            author_count=author_count,
+            author_initials=author_initials,
+        )
         year = _year(record, year_suffix)
         locator_text = f", {_clean_text(locator)}" if _clean_text(locator) else ""
         if normalized_mode == "narrative":
@@ -311,6 +397,130 @@ class CitationStyleEngine:
             for index, record in enumerate(ordered):
                 suffixes[record_identifier(record)] = chr(ord("a") + index)
         return suffixes
+
+    def disambiguation_author_counts(self, records: Iterable[Any]) -> dict[str, int]:
+        """Return the smallest author prefix that makes short citations unique.
+
+        APA-style ``First et al.`` labels collide when different multi-author
+        papers share a first author and year. The document renderer stores this
+        count on each entry so body citations remain resolvable after structured
+        tokens are removed, while identical full author lists continue to use
+        deterministic year suffixes.
+        """
+
+        materialized = list(records)
+        groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
+        for record in materialized:
+            creators = record_creators(record)
+            year = _year(record)
+            if len(creators) <= 2 or year == "n.d.":
+                continue
+            first_family = creator_family(creators[0]).casefold()
+            groups[(first_family, year)].append(record)
+
+        counts: dict[str, int] = {}
+        for group_records in groups.values():
+            signatures = {
+                record_identifier(item): tuple(
+                    creator_display_name(creator).casefold()
+                    for creator in record_creators(item)
+                )
+                for item in group_records
+            }
+            if len(set(signatures.values())) <= 1:
+                continue
+            for record in group_records:
+                identifier = record_identifier(record)
+                signature = signatures[identifier]
+                required = 1
+                for other_identifier, other_signature in signatures.items():
+                    if other_identifier == identifier or other_signature == signature:
+                        continue
+                    common = 0
+                    for left, right in zip(signature, other_signature):
+                        if left != right:
+                            break
+                        common += 1
+                    required = max(required, common + 1)
+                counts[identifier] = min(max(2, required), len(signature))
+        return counts
+
+    def disambiguation_author_initials(self, records: Iterable[Any]) -> set[str]:
+        """Return records whose initials are needed to distinguish body labels."""
+
+        materialized = list(records)
+        groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
+        for record in materialized:
+            creators = record_creators(record)
+            year = _year(record)
+            if len(creators) <= 1 or year == "n.d.":
+                continue
+            groups[(creator_family(creators[0]).casefold(), year)].append(record)
+
+        result: set[str] = set()
+        for group_records in groups.values():
+            counts = self.disambiguation_author_counts(group_records)
+            labels: dict[str, str] = {}
+            for item in group_records:
+                identifier = record_identifier(item)
+                creators = record_creators(item)
+                count = counts.get(identifier, 0)
+                visible = creators[: min(count, len(creators))] if count > 0 else creators[:1]
+                labels[identifier] = "|".join(
+                    creator_family(value).casefold() for value in visible
+                )
+            by_label: dict[str, list[str]] = defaultdict(list)
+            for identifier, label in labels.items():
+                by_label[label].append(identifier)
+            for identifiers in by_label.values():
+                if len(identifiers) > 1:
+                    result.update(identifiers)
+        return result
+
+    def disambiguation_author_full_names(self, records: Iterable[Any]) -> set[str]:
+        """Return entries whose visible given names must be rendered in full.
+
+        Initials are useful for the common ``Smith, J.`` collision, but they
+        are not unique for names such as John and Jane.  When the selected
+        family prefix still collides after initials, retain full given names
+        in the in-text label so the citation remains resolvable.
+        """
+
+        materialized = list(records)
+        groups: dict[tuple[str, str], list[Any]] = defaultdict(list)
+        for record in materialized:
+            creators = record_creators(record)
+            year = _year(record)
+            if not creators or year == "n.d.":
+                continue
+            groups[(creator_family(creators[0]).casefold(), year)].append(record)
+
+        full_names: set[str] = set()
+        for group_records in groups.values():
+            signatures = {
+                record_identifier(item): tuple(
+                    creator_display_name(creator).casefold()
+                    for creator in record_creators(item)
+                )
+                for item in group_records
+            }
+            if len(set(signatures.values())) <= 1:
+                continue
+            counts = self.disambiguation_author_counts(group_records)
+            labels: dict[str, str] = {}
+            for item in group_records:
+                identifier = record_identifier(item)
+                creators = record_creators(item)
+                count = counts.get(identifier, 0)
+                visible = creators[: min(count, len(creators))] if count > 0 else creators[:1]
+                labels[identifier] = "|".join(creator_family(value).casefold() for value in visible)
+            by_label: dict[str, list[str]] = defaultdict(list)
+            for identifier, label in labels.items():
+                by_label[label].append(identifier)
+            for identifiers in by_label.values():
+                if len(identifiers) > 1:
+                    full_names.update(identifiers)
+        return full_names
 
     @staticmethod
     def sort_key(record: Any) -> tuple[str, str, str]:

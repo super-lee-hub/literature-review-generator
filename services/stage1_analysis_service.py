@@ -5119,7 +5119,8 @@ class Stage1AnalysisService:
             generation_id = Path(str(result.manifest_path)).parent.name
             reasons = list(getattr(result, "stage1_quality_reasons", []) or [])
             scanned_primary = str(source_role or "").strip() == "SCANNED_PRIMARY"
-            if has_blocking_stage1_reason(reasons) and not scanned_primary:
+            visual_scan_planned = self._full_visual_scan_planned()
+            if has_blocking_stage1_reason(reasons) and not scanned_primary and not visual_scan_planned:
                 raise RuntimeError(
                     f"Stage 1 preprocessing is incomplete for {source_pdf}: {', '.join(reasons)}"
                 )
@@ -5170,6 +5171,55 @@ class Stage1AnalysisService:
                     lease_id=lease_id,
                     generation_id=generation_id,
                 )
+
+    def _full_visual_scan_planned(self) -> bool:
+        """Allow short text only when the configured visual gate will verify it.
+
+        Adaptive all-page scanning is a downstream completeness authority: the
+        visual executor must still prove full coverage before synthesis closes.
+        Other visual modes do not justify bypassing the text completeness gate.
+        """
+
+        settings_obj = getattr(self, "settings", None)
+        if settings_obj is not None and hasattr(settings_obj, "section"):
+            settings = settings_obj.section("Stage1_Visual")
+            input_settings = settings_obj.section("Stage1_Input")
+            primary_settings = settings_obj.section("Primary_Reader_API")
+        else:
+            raw_config = getattr(self, "config", {})
+            raw_settings = raw_config.get("Stage1_Visual", {}) if isinstance(raw_config, Mapping) else {}
+            settings = raw_settings if isinstance(raw_settings, Mapping) else {}
+            raw_input_settings = raw_config.get("Stage1_Input", {}) if isinstance(raw_config, Mapping) else {}
+            input_settings = raw_input_settings if isinstance(raw_input_settings, Mapping) else {}
+            raw_primary_settings = raw_config.get("Primary_Reader_API", {}) if isinstance(raw_config, Mapping) else {}
+            primary_settings = raw_primary_settings if isinstance(raw_primary_settings, Mapping) else {}
+        enabled = str(settings.get("enabled", "false")).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        selection_mode = str(settings.get("selection_mode") or "").strip().casefold()
+        render_all = str(settings.get("render_all_nonblank_pages") or "false").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        send_visuals = str(input_settings.get("send_selected_visuals", "true")).strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        supports_visuals = detect_multimodal_capability(primary_settings).supports_image_input
+        return (
+            enabled
+            and selection_mode == "adaptive_page_scan"
+            and render_all
+            and send_visuals
+            and supports_visuals
+        )
 
     @staticmethod
     def _release_generation_lease(

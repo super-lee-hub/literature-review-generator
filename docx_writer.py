@@ -58,9 +58,32 @@ def _entry_lookup(manifest: Mapping[str, Any]) -> dict[str, CitationCatalogEntry
             publisher=str(raw.get("publisher") or ""),
             url=str(raw.get("url") or ""),
             year_suffix=str(raw.get("year_suffix") or ""),
+            in_text_author_count=int(raw.get("in_text_author_count") or 0),
+            in_text_include_initials=bool(raw.get("in_text_include_initials", False)),
+            in_text_include_full_names=bool(raw.get("in_text_include_full_names", False)),
         )
         entries[paper_id] = entry
         entries[paper_key] = entry
+    unique_entries = {entry.paper_id: entry for entry in entries.values()}
+    style_engine = CitationStyleEngine()
+    suffixes = style_engine.disambiguation_suffixes(unique_entries.values())
+    author_counts = style_engine.disambiguation_author_counts(unique_entries.values())
+    author_initials = style_engine.disambiguation_author_initials(unique_entries.values())
+    author_full_names = style_engine.disambiguation_author_full_names(unique_entries.values())
+    entries = {
+        key: replace(
+            entry,
+            year_suffix=entry.year_suffix or suffixes.get(entry.paper_id, ""),
+            in_text_author_count=author_counts.get(entry.paper_id, 0),
+            in_text_include_initials=(
+                entry.in_text_include_initials or entry.paper_id in author_initials
+            ),
+            in_text_include_full_names=(
+                entry.in_text_include_full_names or entry.paper_id in author_full_names
+            ),
+        )
+        for key, entry in entries.items()
+    }
     by_ref: dict[str, CitationCatalogEntry] = {}
     for occurrence in manifest.get("occurrences", []):
         if not isinstance(occurrence, Mapping):
@@ -99,6 +122,8 @@ def render_structured_citations(
     text: str,
     generator_instance: Any,
     citation_manifest: Mapping[str, Any],
+    *,
+    section_number: int | None = None,
 ) -> tuple[str, List[str]]:
     del generator_instance
     lookup = _entry_lookup(citation_manifest)
@@ -111,32 +136,16 @@ def render_structured_citations(
             continue
         ref_id = str(occurrence.get("ref_id") or "").strip()
         if ref_id:
-            occurrence_modes.setdefault(ref_id, []).append(
-                (
-                    str(occurrence.get("mode") or "parenthetical"),
-                    str(occurrence.get("locator")) if occurrence.get("locator") else None,
+            if section_number is None or int(occurrence.get("section_number") or 0) == section_number:
+                occurrence_modes.setdefault(ref_id, []).append(
+                    (
+                        str(occurrence.get("mode") or "parenthetical"),
+                        str(occurrence.get("locator")) if occurrence.get("locator") else None,
+                    )
                 )
-            )
     occurrence_positions: dict[str, int] = {}
 
-    # --- Group adjacent citation tokens into one multi-id group -----------
-    # Writer emission often produces consecutive single-ref tokens, e.g.
-    #   [[cite_ref:R006]][[cite_ref:R009]]
-    # which would otherwise render as "(A)(B)".  Merge a maximal run of
-    # adjacent tokens into a single token with comma-separated ref ids:
-    #   [[cite_ref:R006, R009]] -> "(A; B)"
-    def _group_adjacent(run_match: re.Match[str]) -> str:
-        run = run_match.group(0)
-        ids: list[str] = []
-        for token in re.findall(r"\[\[cite_ref:[^\]]+\]\]", run):
-            for ref_id in extract_ref_ids_from_token(token):
-                if ref_id not in ids:
-                    ids.append(ref_id)
-        if len(ids) <= 1:
-            return run
-        return f"[[cite_ref:{', '.join(ids)}]]"
-
-    rendered_text = re.sub(r"(?:\[\[cite_ref:[^\]]+\]\])+", _group_adjacent, raw)
+    rendered_text = raw
 
     # --- Normalize missing space before a citation group ------------------
     # "text[[cite_ref:R008]]" -> "text [[cite_ref:R008]]"; the renderer never
@@ -145,42 +154,38 @@ def render_structured_citations(
         return f"{match.group(1)} {match.group(2)}"
 
     rendered_text = re.sub(
-        r"([^\s(,，.。])(\[\[cite_ref:)", _ensure_space_before, rendered_text
+        r"([^\s(,，.。\]])(\[\[cite_ref:)", _ensure_space_before, rendered_text
     )
 
     def replace(match: re.Match[str]) -> str:
-        token = match.group(0)
-        ref_ids = extract_ref_ids_from_token(token)
-        if not ref_ids:
-            unresolved.append(token)
-            return token
-        options = _citation_token_options(token)
         rendered: list[str] = []
         modes: list[str] = []
-        for ref_id in ref_ids:
-            entry = lookup.get(ref_id)
-            if entry is None:
-                unresolved.append(ref_id)
-                continue
-            position = occurrence_positions.get(ref_id, 0)
-            occurrence_positions[ref_id] = position + 1
-            occurrence_mode, occurrence_locator = (
-                occurrence_modes.get(ref_id, [("parenthetical", None)])[position]
-                if position < len(occurrence_modes.get(ref_id, []))
-                else ("parenthetical", None)
-            )
-            mode = options.get("mode") or occurrence_mode
-            locator = options.get("locator") or occurrence_locator
-            value = style_engine.format_in_text(
-                entry,
-                mode=mode,
-                locator=locator,
-                year_suffix=entry.year_suffix,
-            )
-            modes.append(mode)
-            rendered.append(value)
-        if len(rendered) != len(ref_ids):
-            return token
+        expected = 0
+        for token in re.findall(r"\[\[cite_ref:[^\]]+\]\]", match.group(0)):
+            ref_ids = extract_ref_ids_from_token(token)
+            if not ref_ids:
+                unresolved.append(token)
+                return match.group(0)
+            expected += len(ref_ids)
+            options = _citation_token_options(token)
+            for ref_id in ref_ids:
+                entry = lookup.get(ref_id)
+                if entry is None:
+                    unresolved.append(ref_id)
+                    continue
+                position = occurrence_positions.get(ref_id, 0)
+                occurrence_positions[ref_id] = position + 1
+                occurrence_mode, occurrence_locator = (
+                    occurrence_modes.get(ref_id, [("parenthetical", None)])[position]
+                    if position < len(occurrence_modes.get(ref_id, []))
+                    else ("parenthetical", None)
+                )
+                mode = options.get("mode") or occurrence_mode
+                locator = options.get("locator") or occurrence_locator
+                rendered.append(style_engine.format_in_text(entry, mode=mode, locator=locator, year_suffix=entry.year_suffix))
+                modes.append(mode)
+        if len(rendered) != expected:
+            return match.group(0)
         if len(rendered) == 1 and modes == ["narrative"]:
             return rendered[0]
         if all(mode == "parenthetical" for mode in modes):
@@ -193,7 +198,7 @@ def render_structured_citations(
         return token
 
     rendered = re.sub(r"\[\[cite:(?!ref:)[^\]]+\]\]", record_legacy, rendered_text)
-    rendered = re.sub(r"\[\[cite_ref:[^\]]+\]\]", replace, rendered)
+    rendered = re.sub(r"(?:\[\[cite_ref:[^\]]+\]\])+", replace, rendered)
     return rendered.replace("`", ""), unresolved
 
 
@@ -257,6 +262,7 @@ def append_section_to_word_document(
             section_text,
             generator_instance,
             citation_manifest,
+            section_number=section_number,
         )
         if unresolved:
             raise ValueError("unresolved citation references: " + ", ".join(sorted(set(unresolved))))
@@ -389,6 +395,13 @@ def _manifest_reference_segments(
     if not formatted.text:
         return _legacy_reference_segments(fallback)
     if not fallback or fallback == formatted.text:
+        return formatted.segments
+
+    # A legacy manifest may contain an older reference string without the
+    # document-level author-year suffix. Once the structured catalog proves a
+    # suffix is required, the bibliography must use the same text as body
+    # citations instead of preserving the ambiguous legacy string.
+    if entry.year_suffix:
         return formatted.segments
 
     # Manifest citation_text is the canonical JSON/DOCX text contract. Keep

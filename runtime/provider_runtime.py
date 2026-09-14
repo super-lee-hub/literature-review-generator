@@ -2231,6 +2231,8 @@ class ProviderRuntime:
         self._reserved_tokens = 0
         self._aggregate_reservations: dict[int, ProviderAggregateReservationV1] = {}
         self._receipts: list[ProviderCallReceiptV1] = []
+        self._completion_lock = threading.RLock()
+        self._completed_receipts: dict[int, ProviderCallReceiptV1] = {}
 
     @property
     def calls(self) -> int:
@@ -2320,6 +2322,37 @@ class ProviderRuntime:
         metadata: Mapping[str, Any] | None = None,
         route: str | None = None,
     ) -> ProviderCallReceiptV1:
+        """Complete an admission exactly once, including concurrent duplicates."""
+
+        with self._completion_lock:
+            cached = self._completed_receipts.get(admission.sequence)
+            if cached is not None:
+                return cached
+            receipt = self._complete_once(
+                admission=admission,
+                prompt=prompt,
+                input_payload=input_payload,
+                api_config=api_config,
+                result=result,
+                schema_hash=schema_hash,
+                metadata=metadata,
+                route=route,
+            )
+            self._completed_receipts[admission.sequence] = receipt
+            return receipt
+
+    def _complete_once(
+        self,
+        *,
+        admission: ProviderCallAdmissionV1,
+        prompt: str,
+        input_payload: Any,
+        api_config: Mapping[str, Any],
+        result: Mapping[str, Any],
+        schema_hash: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        route: str | None = None,
+    ) -> ProviderCallReceiptV1:
         provider = str(api_config.get("provider_family") or api_config.get("provider") or "generic")
         model = str(api_config.get("model") or "")
         endpoint = str(api_config.get("api_base") or "")
@@ -2327,9 +2360,12 @@ class ProviderRuntime:
         aggregate_reservation = None
         aggregate_snapshot: dict[str, Any] | None = None
         with self._lock:
-            aggregate_reservation = self._aggregate_reservations.pop(admission.sequence, None)
+            aggregate_reservation = self._aggregate_reservations.get(admission.sequence)
         if self.aggregate_budget is not None and aggregate_reservation is not None:
             aggregate_snapshot = self.aggregate_budget.complete(aggregate_reservation, result)
+        with self._lock:
+            if aggregate_reservation is not None:
+                self._aggregate_reservations.pop(admission.sequence, None)
         receipt_metadata = dict(metadata or {})
         if aggregate_snapshot is not None:
             receipt_metadata["aggregate_budget"] = aggregate_snapshot

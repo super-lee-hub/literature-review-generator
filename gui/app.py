@@ -27,6 +27,10 @@ from services.configuration_service import (
     save_config_and_env,
     test_api_endpoint,
 )
+from services.credential_provenance import (
+    CredentialConflictError,
+    resolve_credentials,
+)
 from services.settings import ApplicationSettings
 from services.environment_service import (
     RuntimeEnvironment,
@@ -963,11 +967,11 @@ def _open_path(path: str, language: str = "zh-CN") -> None:
         ui.notify(translate(language, "路径为空。"), color="warning")
         return
     target = os.path.abspath(path)
-    if not os.path.exists(target):
-        ui.notify(translate(language, "路径不存在：{target}").format(target=target), color="warning")
-        return
     if os.environ.get("AUTO_GENERATE_GUI_TEST_MODE", "").lower() in {"1", "true", "yes"}:
         ui.notify(translate(language, "测试模式：已模拟打开路径 {target}").format(target=target), color="info")
+        return
+    if not os.path.exists(target):
+        ui.notify(translate(language, "路径不存在：{target}").format(target=target), color="warning")
         return
     os.startfile(target)  # type: ignore[attr-defined]
 
@@ -1096,6 +1100,7 @@ class UiBindings:
     log_path_labels: list[Any] = field(default_factory=list)
     log_views: list[Any] = field(default_factory=list)
     action_buttons: list[Any] = field(default_factory=list)
+    workflow_submission_labels: list[Any] = field(default_factory=list)
     free_mode_send_buttons: list[Any] = field(default_factory=list)
     free_mode_apply_buttons: list[Any] = field(default_factory=list)
     free_mode_reset_buttons: list[Any] = field(default_factory=list)
@@ -1119,23 +1124,59 @@ class UiBindings:
 
 class WorkspaceController:
     def __init__(self, config_path: str) -> None:
-        self.config_path = config_path
-        self.env_path = os.environ.get("AUTO_GENERATE_ENV_PATH", str(REPO_ROOT / ".env"))
+        self.config_path = str(Path(config_path).expanduser().resolve())
+        configured_env_path = os.environ.get("AUTO_GENERATE_ENV_PATH", "").strip()
+        self.env_path = configured_env_path or str(
+            Path(self.config_path).parent / ".env"
+        )
         self.test_mode = os.environ.get("AUTO_GENERATE_GUI_TEST_MODE", "").lower() in {"1", "true", "yes"}
         self.runtime_environment = detect_runtime_environment()
         self.client: Any | None = None
         self._registered_disconnect_clients: set[int] = set()
-        self.sections = _read_existing_config(config_path)
+        self.sections = _read_existing_config(self.config_path)
         self.env_values = read_env_file(self.env_path)
+        self.effective_env_values = dict(self.env_values)
+        for env_key in MINERU_ENV_KEYS:
+            process_value = str(os.environ.get(env_key) or "").strip()
+            if process_value:
+                self.effective_env_values[env_key] = process_value
+        self.credential_error = ""
+        try:
+            self.resolved_sections, credential_provenance = resolve_credentials(
+                self.sections,
+                config_path=self.config_path,
+                environ=os.environ,
+                dotenv_path=self.env_path,
+            )
+            self.credential_provenance = {
+                item.section: item.selected_source
+                for item in credential_provenance
+            }
+        except CredentialConflictError as exc:
+            # Keep the editable values visible, but remember the same
+            # fail-closed conflict that the formal loader will report.
+            self.resolved_sections = self.sections
+            self.credential_provenance = {}
+            self.credential_error = str(exc)
         self.language = self.sections.get("GUI", {}).get("language", "zh-CN")
         if self.language not in LANGUAGE_OPTIONS:
             self.language = "zh-CN"
+        config_origin = Path(self.config_path).parent
+
+        def resolve_config_path(raw_value: Any, *, default: str = "") -> str:
+            raw = str(raw_value or default).strip()
+            if not raw:
+                return ""
+            path = Path(raw).expanduser()
+            return str(path.resolve() if path.is_absolute() else (config_origin / path).resolve())
+
         self.bindings = UiBindings()
         self.search_query = ""
         self.latest_log_path, self.latest_log_excerpt = _latest_log_excerpt(self.language)
         self.progress_tracker: Optional[ProgressTracker] = None
         self.progress_snapshot: Dict[str, Any] = ProgressTracker().snapshot()
         self.workflow_running = False
+        self.last_submitted_job_id = ""
         self.queue_processor_running = False
         self._queue_processor_task: asyncio.Task[Any] | None = None
         self.free_mode_chat_input = ""
@@ -1151,17 +1192,20 @@ class WorkspaceController:
         self.lifecycle_busy = False
         self.status_message = self.t("工作台已就绪。先完成设置，再按“输入来源 → 运行方式 → 主流程”开始第一轮。")
         current_settings = ApplicationSettings.from_config(self.sections)
-        mineru_base_url = self.env_values.get("MINERU_BASE_URL", DEFAULT_MINERU_BASE_URL)
-        mineru_model_version = self.env_values.get("MINERU_MODEL_VERSION", "vlm") or "vlm"
+        mineru_base_url = self.effective_env_values.get("MINERU_BASE_URL", DEFAULT_MINERU_BASE_URL)
+        mineru_model_version = self.effective_env_values.get("MINERU_MODEL_VERSION", "vlm") or "vlm"
         allow_local_parse_fallback = str(
-            self.env_values.get("ALLOW_LOCAL_PARSE_FALLBACK", "true")
+            self.effective_env_values.get("ALLOW_LOCAL_PARSE_FALLBACK", "true")
         ).strip().lower() not in {"0", "false", "no", "off"}
         default_input_mode = "zotero" if self.sections["Paths"].get("zotero_report", "").strip() else "pdf"
         self.state: Dict[str, Any] = {
             "paths": {
-                "zotero_report": self.sections["Paths"].get("zotero_report", ""),
-                "library_path": self.sections["Paths"].get("library_path", ""),
-                "output_path": self.sections["Paths"].get("output_path", "./output"),
+                "zotero_report": resolve_config_path(self.sections["Paths"].get("zotero_report", "")),
+                "library_path": resolve_config_path(self.sections["Paths"].get("library_path", "")),
+                "output_path": resolve_config_path(
+                    self.sections["Paths"].get("output_path", "./output"),
+                    default="./output",
+                ),
             },
             "runtime": {
                 "max_workers": self.sections["Runtime"].get("max_workers", "3"),
@@ -1190,7 +1234,7 @@ class WorkspaceController:
             },
             "mineru": {
                 "base_url": mineru_base_url,
-                "api_token": self.env_values.get("MINERU_API_TOKEN", ""),
+                "api_token": self.effective_env_values.get("MINERU_API_TOKEN", ""),
                 "model_version": mineru_model_version,
                 "allow_local_parse_fallback": allow_local_parse_fallback,
             },
@@ -1208,10 +1252,16 @@ class WorkspaceController:
                 "section_number": "1",
             },
         }
+        self._initial_mineru_state = dict(self.state["mineru"])
+        self._mineru_process_env_keys = {
+            key
+            for key in MINERU_ENV_KEYS
+            if str(os.environ.get(key) or "").strip()
+        }
         self.api_cards: Dict[str, Dict[str, str]] = {}
         self.third_party_gateway_acknowledged: Dict[str, str] = {}
         for section_name in API_ENV_MAPPING:
-            section = self.sections.get(section_name, {})
+            section = self.resolved_sections.get(section_name, {})
             api_base = section.get("api_base", "")
             configured_family = str(section.get("provider_family", "") or "").strip()
             provider = configured_family if configured_family in PROVIDER_PRESETS else _guess_provider(api_base)
@@ -1229,6 +1279,14 @@ class WorkspaceController:
                 "anthropic_path": section.get("anthropic_path", "/v1/messages") or "/v1/messages",
                 "anthropic_version": section.get("anthropic_version", "2023-06-01") or "2023-06-01",
             }
+            if section_name in self.resolved_sections:
+                self.api_cards[section_name]["api_key"] = str(
+                    self.resolved_sections[section_name].get("api_key") or ""
+                )
+        self._initial_api_card_keys = {
+            name: str(card.get("api_key") or "")
+            for name, card in self.api_cards.items()
+        }
         
         # 初始化队列服务
         self._queue_service: Optional[Any] = None
@@ -1711,6 +1769,20 @@ class WorkspaceController:
         if self.workflow_running:
             self._safe_apply(button, lambda element: element.disable())
 
+    def register_workflow_submission_label(self, label: Any) -> None:
+        self._prune_stale_bindings()
+        self.bindings.workflow_submission_labels.append(label)
+        self._safe_apply(
+            label,
+            lambda element: element.set_text(self.last_submitted_job_id),
+        )
+
+    def _update_workflow_submission_labels(self) -> None:
+        self._safe_update_bound_list(
+            self.bindings.workflow_submission_labels,
+            lambda element: element.set_text(self.last_submitted_job_id),
+        )
+
     def register_free_mode_widgets(
         self,
         *,
@@ -1879,21 +1951,30 @@ class WorkspaceController:
 
     def _collect_extra_env_values(self) -> Dict[str, str]:
         mineru_state = self.state["mineru"]
+        token = str(mineru_state["api_token"] or "").strip()
+        initial_token = str(self._initial_mineru_state.get("api_token") or "").strip()
+        if (
+            "MINERU_API_TOKEN" in self._mineru_process_env_keys
+            and token == initial_token
+        ):
+            # A process-environment-only token is usable for this runtime but
+            # must not be copied into the selected dotenv file by an unrelated
+            # GUI save.  Keep the existing dotenv value (or blank) instead.
+            token = str(self.env_values.get("MINERU_API_TOKEN") or "").strip()
         return {
             "MINERU_BASE_URL": str(mineru_state["base_url"] or DEFAULT_MINERU_BASE_URL).strip().rstrip("/") or DEFAULT_MINERU_BASE_URL,
-            "MINERU_API_TOKEN": str(mineru_state["api_token"] or "").strip(),
+            "MINERU_API_TOKEN": token,
             "MINERU_MODEL_VERSION": str(mineru_state["model_version"] or "vlm").strip() or "vlm",
             "ALLOW_LOCAL_PARSE_FALLBACK": "true" if mineru_state["allow_local_parse_fallback"] else "false",
         }
 
     def _sync_env_values_from_disk(self) -> None:
         self.env_values = read_env_file(self.env_path)
-        for env_key in [*API_ENV_MAPPING.values(), *MINERU_ENV_KEYS]:
-            value = str(self.env_values.get(env_key, ""))
-            if value:
-                os.environ[env_key] = value
-            else:
-                os.environ.pop(env_key, None)
+        self.effective_env_values = dict(self.env_values)
+        for env_key in MINERU_ENV_KEYS:
+            process_value = str(os.environ.get(env_key) or "").strip()
+            if process_value:
+                self.effective_env_values[env_key] = process_value
 
     def _free_mode_status_text(self) -> str:
         if self.free_mode_busy:
@@ -1947,7 +2028,11 @@ class WorkspaceController:
             lambda element: element.enable() if can_apply else element.disable(),
         )
 
-    def _collect_config_payload(self) -> tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, str]]:
+    def _collect_config_payload(
+        self,
+        *,
+        for_runtime: bool = False,
+    ) -> tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, str]]:
         updated_sections = ensure_config_sections(self.sections)
         updated_sections["Paths"].update(
             {
@@ -2017,13 +2102,27 @@ class WorkspaceController:
             else:
                 updated_sections[section_name].pop("anthropic_path", None)
                 updated_sections[section_name].pop("anthropic_version", None)
-            api_keys[section_name] = card["api_key"]
+            env_key = API_ENV_MAPPING[section_name]
+            card_key = str(card.get("api_key") or "")
+            # Runtime calls must receive the already-resolved credential,
+            # including a process-environment-only secret. Persistence keeps
+            # that secret out of the selected dotenv file when the user did
+            # not explicitly edit the card value.
+            if for_runtime:
+                api_keys[section_name] = card_key
+            elif (
+                self.credential_provenance.get(section_name) == "process_env"
+                and card_key == self._initial_api_card_keys.get(section_name, "")
+            ):
+                api_keys[section_name] = str(self.env_values.get(env_key) or "")
+            else:
+                api_keys[section_name] = card_key
 
         extra_env_values = self._collect_extra_env_values()
         return updated_sections, api_keys, extra_env_values
 
     def build_runtime_config(self) -> Dict[str, Dict[str, str]]:
-        runtime_sections, api_keys, _extra_env_values = self._collect_config_payload()
+        runtime_sections, api_keys, _extra_env_values = self._collect_config_payload(for_runtime=True)
         normalize_for_save(runtime_sections)
         runtime_config = ensure_config_sections(runtime_sections)
         for section_name, api_key in api_keys.items():
@@ -2064,35 +2163,38 @@ class WorkspaceController:
         self.free_mode_profile_path = ""
         self.free_mode_ready_to_apply = False
         self.update_free_mode_widgets()
+        try:
+            if self.test_mode:
+                response = self._mock_free_mode_response(message)
+            else:
+                free_mode_output_dir = str(self.state["paths"].get("output_path") or "./output")
+                free_mode_project_name = str(
+                    self.state["workflow"].get("project_name") or "free_mode"
+                ).strip() or "free_mode"
+                response = await asyncio.to_thread(
+                    plan_free_mode_chat_turn,
+                    messages=list(self.free_mode_messages),
+                    config=self.build_runtime_config(),
+                    output_dir=free_mode_output_dir,
+                    project_name=free_mode_project_name,
+                )
 
-        if self.test_mode:
-            response = self._mock_free_mode_response(message)
-        else:
-            free_mode_output_dir = str(self.state["paths"].get("output_path") or "./output")
-            free_mode_project_name = str(
-                self.state["workflow"].get("project_name") or "free_mode"
-            ).strip() or "free_mode"
-            response = await asyncio.to_thread(
-                plan_free_mode_chat_turn,
-                messages=list(self.free_mode_messages),
-                config=self.build_runtime_config(),
-                output_dir=free_mode_output_dir,
-                project_name=free_mode_project_name,
-            )
+            if not response:
+                self.set_status(self.t("自由模式本轮规划失败，请检查 Free_Mode_API / Outline_API 配置后重试。"))
+                self.notify(self.status_message, color="negative", multi_line=True)
+                return
 
-        self.free_mode_busy = False
-        if not response:
-            self.set_status(self.t("自由模式本轮规划失败，请检查 Free_Mode_API / Outline_API 配置后重试。"))
+            self.free_mode_messages.append({"role": "assistant", "content": str(response.get("assistant_message", "")).strip()})
+            self.free_mode_profile_draft = normalize_profile(response.get("profile"))
+            self.free_mode_missing_information = [str(item).strip() for item in response.get("missing_information", []) if str(item).strip()]
+            self.free_mode_ready_to_apply = bool(response.get("ready_to_apply"))
+            self.set_status(self.t("自由模式规划已更新，你可以继续追问，或把当前规划应用到本次任务。"))
+        except Exception as exc:
+            self.set_status(self.tf("自由模式本轮规划失败：{error}", error=str(exc)))
             self.notify(self.status_message, color="negative", multi_line=True)
+        finally:
+            self.free_mode_busy = False
             self.update_free_mode_widgets()
-            return
-
-        self.free_mode_messages.append({"role": "assistant", "content": str(response.get("assistant_message", "")).strip()})
-        self.free_mode_profile_draft = normalize_profile(response.get("profile"))
-        self.free_mode_missing_information = [str(item).strip() for item in response.get("missing_information", []) if str(item).strip()]
-        self.free_mode_ready_to_apply = bool(response.get("ready_to_apply"))
-        self.set_status(self.t("自由模式规划已更新，你可以继续追问，或把当前规划应用到本次任务。"))
-        self.update_free_mode_widgets()
 
     def clear_free_mode_planner(self) -> None:
         if self.free_mode_busy:
@@ -2121,33 +2223,36 @@ class WorkspaceController:
 
         self.free_mode_busy = True
         self.update_free_mode_widgets()
+        try:
+            output_dir = str(self.state["paths"]["output_path"] or "./output")
+            if self.test_mode:
+                profile = normalize_profile(self.free_mode_profile_draft)
+            else:
+                profile = await asyncio.to_thread(
+                    generate_free_mode_profile,
+                    user_idea="",
+                    config=self.build_runtime_config(),
+                    output_dir=output_dir,
+                    project_name=project_name,
+                    conversation_messages=list(self.free_mode_messages),
+                )
 
-        output_dir = str(self.state["paths"]["output_path"] or "./output")
-        if self.test_mode:
-            profile = normalize_profile(self.free_mode_profile_draft)
-        else:
-            profile = await asyncio.to_thread(
-                generate_free_mode_profile,
-                user_idea="",
-                config=self.build_runtime_config(),
-                output_dir=output_dir,
-                project_name=project_name,
-                conversation_messages=list(self.free_mode_messages),
-            )
+            if not profile:
+                self.set_status(self.t("自由模式 profile 应用失败，请检查 Free_Mode_API / Outline_API 配置后重试。"))
+                self.notify(self.status_message, color="negative", multi_line=True)
+                return
 
-        self.free_mode_busy = False
-        if not profile:
-            self.set_status(self.t("自由模式 profile 应用失败，请检查 Free_Mode_API / Outline_API 配置后重试。"))
+            self.free_mode_profile_draft = normalize_profile(profile)
+            self.free_mode_profile_path = get_profile_path(output_dir, project_name)
+            self.free_mode_ready_to_apply = True
+            self.set_status(self.tf("自由模式已应用到本次任务：{target}", target=self.free_mode_profile_path))
+            self.notify(self.status_message, color="positive", multi_line=True)
+        except Exception as exc:
+            self.set_status(self.tf("自由模式 profile 应用失败：{error}", error=str(exc)))
             self.notify(self.status_message, color="negative", multi_line=True)
+        finally:
+            self.free_mode_busy = False
             self.update_free_mode_widgets()
-            return
-
-        self.free_mode_profile_draft = normalize_profile(profile)
-        self.free_mode_profile_path = get_profile_path(output_dir, project_name)
-        self.free_mode_ready_to_apply = True
-        self.set_status(self.tf("自由模式已应用到本次任务：{target}", target=self.free_mode_profile_path))
-        self.notify(self.status_message, color="positive", multi_line=True)
-        self.update_free_mode_widgets()
 
     @staticmethod
     def _format_elapsed(seconds: float) -> str:
@@ -2296,7 +2401,9 @@ class WorkspaceController:
             )
 
         states: list[str] = []
-        job_status = str((inspection.get("status") or {}).get("job_status") or "").strip().lower()
+        raw_status = inspection.get("status")
+        status_payload = raw_status if isinstance(raw_status, dict) else {}
+        job_status = str(status_payload.get("job_status") or "").strip().lower()
         if job_status == "cancel_requested":
             states.append("cancel_requested")
         elif job_status == "cancelled" or has_ready_type("cancellation_acknowledgement"):
@@ -2823,6 +2930,8 @@ class WorkspaceController:
 
         self.persist_config(notify_user=False)
         action_label_text = self.action_label(action)
+        self.last_submitted_job_id = ""
+        self._update_workflow_submission_labels()
         self.set_status(self.tf("正在提交 {action_label} 到后台队列……", action_label=action_label_text))
         self.progress_tracker = ProgressTracker()
         self.progress_tracker.reset(task_type=action_label_text, stage="queue", message=self.status_message, indeterminate=True)
@@ -2838,6 +2947,9 @@ class WorkspaceController:
             if not job_id:
                 self.progress_tracker.finish(success=False, message=self.t("任务入队失败，请检查当前输入后重试。"))
                 return
+
+            self.last_submitted_job_id = str(job_id)
+            self._update_workflow_submission_labels()
 
             position = self._queue_position(job_id)
             if self.test_mode:
@@ -3162,10 +3274,11 @@ def _render_workflow_input_card(controller: WorkspaceController) -> None:
         with ui.grid(columns=2).classes("w-full gap-4 q-mt-md"):
             with ui.column().classes("gap-2"):
                 ui.label(t("输入来源")).classes("ag-subtle")
-                ui.toggle(
+                input_mode_toggle = ui.toggle(
                     {"pdf": t("PDF 文件夹模式"), "zotero": t("Zotero 报告模式")},
                     value=controller.state["workflow"]["input_mode"],
                 ).bind_value(controller.state["workflow"], "input_mode").classes("ag-mode-toggle ag-mode-toggle-2 w-full")
+                input_mode_toggle.props("data-testid=workflow-input-mode")
                 with ui.element("div").classes("ag-toggle-ledger ag-toggle-ledger-2"):
                     with ui.element("div").classes("ag-toggle-note"):
                         ui.label(t("PDF 文件夹模式")).classes("text-body1")
@@ -3174,7 +3287,8 @@ def _render_workflow_input_card(controller: WorkspaceController) -> None:
                         ui.label(t("Zotero 报告模式")).classes("text-body1")
                         ui.label(t("适合你已经有 Zotero report 和 library，希望沿着已有文献整理结果继续。")).classes("ag-subtle ag-wrap-note")
             with ui.column().classes("gap-2"):
-                ui.input(t("项目名"), value=controller.state["workflow"]["project_name"]).bind_value(controller.state["workflow"], "project_name").classes("w-full")
+                project_input = ui.input(t("项目名"), value=controller.state["workflow"]["project_name"]).bind_value(controller.state["workflow"], "project_name").classes("w-full")
+                project_input.props("data-testid=workflow-project-name")
                 ui.checkbox(
                     t("Auto reuse historical stage-1 summaries"),
                     value=controller.state["workflow"]["reuse_stage1"],
@@ -3191,6 +3305,7 @@ def _render_workflow_input_card(controller: WorkspaceController) -> None:
                 key="pdf_folder",
                 pick="directory",
                 title=t("Select PDF folder"),
+                test_id="workflow-pdf-folder",
             )
             with ui.row().classes("gap-2 flex-wrap"):
                 ui.button(t("Open PDF folder"), on_click=lambda: _open_path(controller.state["workflow"]["pdf_folder"], controller.language)).props("outline")
@@ -3204,6 +3319,7 @@ def _render_workflow_input_card(controller: WorkspaceController) -> None:
                 pick="file",
                 title="选择 Zotero 报告文件",
                 filetypes=[("Report Files", "*.html *.htm *.txt *.md *.csv *.json"), ("All Files", "*.*")],
+                test_id="workflow-zotero-report",
             )
             _render_path_field(
                 controller,
@@ -3212,6 +3328,7 @@ def _render_workflow_input_card(controller: WorkspaceController) -> None:
                 key="library_path",
                 pick="directory",
                 title="选择 Zotero 库目录",
+                test_id="workflow-library-path",
             )
             ui.label(t("Zotero 模式需要 report 和 library 两个路径；如果没配好，先去“环境与路径”页面补齐。")).classes("ag-subtle")
             with ui.row().classes("gap-2 flex-wrap"):
@@ -3225,13 +3342,14 @@ def _render_workflow_mode_card(controller: WorkspaceController) -> None:
     with ui.card().classes("ag-card p-6 w-full"):
         ui.label(t("运行方式")).classes("ag-section-title")
         ui.label(t("先用普通模式跑通第一轮；自由模式可在写综述前先和规划助手聊清目标。")).classes("ag-subtle")
-        ui.toggle(
+        work_mode_toggle = ui.toggle(
             {
                 "normal": t("普通模式"),
                 "free": t("自由模式"),
             },
             value=controller.state["workflow"]["work_mode"],
         ).bind_value(controller.state["workflow"], "work_mode").classes("ag-mode-toggle ag-mode-toggle-2 w-full q-mt-md")
+        work_mode_toggle.props("data-testid=workflow-work-mode")
         with ui.element("div").classes("ag-toggle-ledger ag-toggle-ledger-2"):
             with ui.element("div").classes("ag-toggle-note"):
                 ui.label(t("普通模式")).classes("text-body1")
@@ -3319,7 +3437,11 @@ def _render_workflow_actions_card(controller: WorkspaceController) -> None:
                         t(label_key),
                         on_click=lambda event=None, current_action=action: asyncio.create_task(controller.run_workflow(current_action)),
                     ).props(button_props).classes("w-full")
+                    button.props(f"data-testid=workflow-action-{action}")
                     controller.register_action_button(button)
+        submission_label = ui.label("").classes("ag-subtle q-mt-md")
+        submission_label.props("data-testid=workflow-submitted-job-id")
+        controller.register_workflow_submission_label(submission_label)
 
 
 def _render_workflow_summary_reuse_card(controller: WorkspaceController) -> None:
@@ -3432,15 +3554,20 @@ def _render_path_field(
     pick: str,
     title: str,
     filetypes: Iterable[tuple[str, str]] | None = None,
+    test_id: str | None = None,
 ) -> None:
     value_binding = controller.state[section]
     with ui.column().classes("w-full gap-2"):
         display_input = ui.input(controller.t(label), value=value_binding[key]).bind_value(value_binding, key).props("readonly").classes("w-full")
+        if test_id:
+            display_input.props(f"data-testid={test_id}")
         with ui.dialog() as dialog, ui.card().classes("ag-card p-5 min-w-[560px] max-w-[760px] w-full"):
             ui.label(f"{controller.t('配置路径')} · {controller.t(label)}").classes("ag-section-title")
             ui.label(controller.t("手动输入或用选择按钮更新路径。")).classes("ag-subtle")
             temp_state = {"value": str(value_binding[key] or "")}
             edit_input = ui.input(controller.t(label), value=temp_state["value"]).bind_value(temp_state, "value").classes("w-full")
+            if test_id:
+                edit_input.props(f"data-testid={test_id}-edit")
 
             async def choose_for_dialog() -> None:
                 chosen = await controller.browse_path(
@@ -3461,9 +3588,13 @@ def _render_path_field(
             with ui.row().classes("gap-2 q-mt-md"):
                 ui.button(controller.t("浏览并选择"), on_click=lambda: asyncio.create_task(choose_for_dialog())).props("outline")
                 ui.button(controller.t("取消"), on_click=dialog.close).props("flat")
-                ui.button(controller.t("保存路径设置"), on_click=save_dialog_value).props("unelevated")
+                save_button = ui.button(controller.t("保存路径设置"), on_click=save_dialog_value).props("unelevated")
+                if test_id:
+                    save_button.props(f"data-testid={test_id}-save")
 
-        ui.button(controller.t(title), on_click=dialog.open).props("outline size=sm")
+        open_button = ui.button(controller.t(title), on_click=dialog.open).props("outline size=sm")
+        if test_id:
+            open_button.props(f"data-testid={test_id}-open")
 
 
 def _nav_groups() -> Iterable[Dict[str, Any]]:

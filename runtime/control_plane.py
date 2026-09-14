@@ -585,22 +585,15 @@ class ReviewControlPlane:
                 acceptance_spec,
             )
 
-        current_sha = ""
-        try:
-            completed = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(self.repo_root),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=10,
+        execution_context_owner_authorized = os.getenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "0") == "1"
+        current_sha = self._acceptance_checkout_sha(
+            self.repo_root,
+            require_clean=execution_context_owner_authorized,
+        )
+        if acceptance_spec.final_executable_sha and acceptance_spec.final_executable_sha != current_sha:
+            raise ControlPlaneError(
+                "acceptance specification executable SHA does not match the current checkout"
             )
-            if completed.returncode == 0:
-                current_sha = str(completed.stdout or "").strip().splitlines()[-1]
-        except (OSError, subprocess.SubprocessError):
-            current_sha = ""
-        if not current_sha:
-            raise ControlPlaneError("acceptance run cannot bind to the current checkout SHA")
 
         state_path = Path(
             acceptance_spec.state_path
@@ -662,12 +655,27 @@ class ReviewControlPlane:
                     updated_at=self._utc_now(),
                 )
             run_dir = state_path.parent / state.run_id
+            if not execution_context_owner_authorized and state.provider_budget_state_path:
+                budget_path = Path(state.provider_budget_state_path)
+                budget_started = False
+                try:
+                    budget_payload = json.loads(budget_path.read_text(encoding="utf-8"))
+                    budget_started = any(
+                        int(budget_payload.get(field) or 0) > 0
+                        for field in ("calls_used", "output_tokens_used", "retry_attempts_used")
+                    ) or bool(budget_payload.get("reservations"))
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                    budget_started = False
+                if not budget_started and budget_path.parent == run_dir.resolve():
+                    budget_path.unlink(missing_ok=True)
+                    state = replace(state, provider_budget_state_path="")
             run_dir.mkdir(parents=True, exist_ok=True)
             state = replace(
                 state,
                 provider_budget_state_path=(
                     state.provider_budget_state_path
-                    or str(run_dir / "provider_budget_state_v1.json")
+                    or (str(run_dir / "provider_budget_state_v1.json")
+                        if execution_context_owner_authorized else "")
                 ),
                 evidence_root=state.evidence_root or str(run_dir / "evidence"),
                 process_event_log=(
@@ -699,20 +707,29 @@ class ReviewControlPlane:
         budget_controller = ProviderBudgetController(
             acceptance_spec.budget.to_provider_budget()
         )
-        budget_controller.bind_state_path(state.provider_budget_state_path)
+        if execution_context_owner_authorized:
+            budget_controller.bind_state_path(state.provider_budget_state_path)
         budget_snapshot = budget_controller.snapshot()
         execution_context = AcceptanceExecutionContextV1(
             acceptance_run_id=state.run_id,
             final_executable_sha=current_sha,
-            absolute_deadline_epoch=float(
-                budget_snapshot.get("absolute_deadline_epoch") or 0.0
+            # Authorization is the admission boundary for live wall-clock
+            # accounting.  An inspection/blocked call must not spend the
+            # live deadline merely by constructing its context.
+            absolute_deadline_epoch=(
+                float(budget_snapshot.get("absolute_deadline_epoch") or 0.0)
+                if execution_context_owner_authorized
+                else 0.0
             ),
             provider_budget=acceptance_spec.budget.to_provider_budget(),
-            provider_budget_state_path=state.provider_budget_state_path,
+            provider_budget_state_path=(
+                state.provider_budget_state_path
+                or str(Path(state.evidence_root).expanduser().resolve().parent / "provider_budget_state_v1.json")
+            ),
             evidence_root=state.evidence_root,
             process_event_log=state.process_event_log,
             scenario_state_path=str(state_path),
-            owner_authorized=os.getenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "0") == "1",
+            owner_authorized=execution_context_owner_authorized,
         )
 
         route_plan: dict[str, Any] | None = None
@@ -966,7 +983,27 @@ class ReviewControlPlane:
         }
 
     @staticmethod
-    def _acceptance_checkout_sha(repo_root: Path) -> str:
+    def _acceptance_checkout_sha(repo_root: Path, *, require_clean: bool = False) -> str:
+        if require_clean:
+            try:
+                status = subprocess.run(
+                    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                    cwd=str(repo_root),
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ControlPlaneError(
+                    f"acceptance cannot verify checkout cleanliness: {type(exc).__name__}"
+                ) from exc
+            if status.returncode != 0:
+                raise ControlPlaneError("acceptance cannot verify checkout cleanliness")
+            if str(status.stdout or "").strip():
+                raise ControlPlaneError(
+                    "acceptance requires a clean checkout; commit or isolate all worktree changes first"
+                )
         try:
             completed = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -1024,13 +1061,14 @@ class ReviewControlPlane:
         input_manifest = str(getattr(child, "input_manifest", "") or "").strip()
         if input_manifest:
             return ReviewControlPlane._acceptance_file_hash(input_manifest)
+        raw_identity = {
+            "runtime_spec_sha256": runtime_spec_hash,
+            "scenario_id": str(getattr(child, "scenario_id", "")),
+            "gate": str(getattr(child, "gate", "")),
+        }
         return hashlib.sha256(
             json.dumps(
-                {
-                    "runtime_spec_sha256": runtime_spec_hash,
-                    "scenario_id": str(getattr(child, "scenario_id", "")),
-                    "gate": str(getattr(child, "gate", "")),
-                },
+                raw_identity,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -2176,7 +2214,11 @@ class ReviewControlPlane:
         plan = acceptance_spec.plan
         if plan is None:
             raise ControlPlaneError("acceptance plan is missing")
-        current_sha = self._acceptance_checkout_sha(self.repo_root)
+        execution_context_owner_authorized = os.getenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "0") == "1"
+        current_sha = self._acceptance_checkout_sha(
+            self.repo_root,
+            require_clean=execution_context_owner_authorized,
+        )
         if plan.final_executable_sha and plan.final_executable_sha != current_sha:
             raise ControlPlaneError(
                 "acceptance plan executable SHA does not match the current checkout"
@@ -2227,6 +2269,29 @@ class ReviewControlPlane:
                 )
             if state is None:
                 raise ControlPlaneError("acceptance plan state could not be initialized")
+            # An unauthorised inspection must not start or inherit a live
+            # deadline.  If an older blocked state left an empty budget file,
+            # discard that unstarted deadline on the next authorised attempt;
+            # a state with actual usage/reservations remains resumable.
+            if not execution_context_owner_authorized and state.provider_budget_state_path:
+                budget_started = False
+                budget_path = Path(state.provider_budget_state_path)
+                try:
+                    budget_payload = json.loads(budget_path.read_text(encoding="utf-8"))
+                    budget_started = any(
+                        int(budget_payload.get(field) or 0) > 0
+                        for field in ("calls_used", "output_tokens_used", "retry_attempts_used")
+                    ) or bool(budget_payload.get("reservations"))
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                    budget_started = False
+                if not budget_started:
+                    # This is an unstarted, run-owned budget snapshot. Remove
+                    # only that exact file so an older blocked attempt cannot
+                    # inject its expired wall-clock deadline into the first
+                    # authorised execution.
+                    if budget_path.parent == (state_path.parent / state.run_id).resolve():
+                        budget_path.unlink(missing_ok=True)
+                    state = replace(state, provider_budget_state_path="")
             run_dir = state_path.parent / state.run_id
             run_dir.mkdir(parents=True, exist_ok=True)
             state = replace(
@@ -2235,7 +2300,8 @@ class ReviewControlPlane:
                 evidence_root=state.evidence_root or str(run_dir / "evidence"),
                 provider_budget_state_path=(
                     state.provider_budget_state_path
-                    or str(run_dir / "provider_budget_state_v1.json")
+                    or (str(run_dir / "provider_budget_state_v1.json")
+                        if execution_context_owner_authorized else "")
                 ),
                 process_event_log=state.process_event_log or str(run_dir / "process_events.jsonl"),
             )
@@ -2244,18 +2310,26 @@ class ReviewControlPlane:
         if state is None:
             raise ControlPlaneError("acceptance plan state could not be initialized")
         budget_controller = ProviderBudgetController(plan.budget.to_provider_budget())
-        budget_controller.bind_state_path(state.provider_budget_state_path)
+        if execution_context_owner_authorized:
+            budget_controller.bind_state_path(state.provider_budget_state_path)
         budget_snapshot = budget_controller.snapshot()
         execution_context = AcceptanceExecutionContextV1(
             acceptance_run_id=state.run_id,
             final_executable_sha=current_sha,
-            absolute_deadline_epoch=float(budget_snapshot.get("absolute_deadline_epoch") or 0.0),
+            absolute_deadline_epoch=(
+                float(budget_snapshot.get("absolute_deadline_epoch") or 0.0)
+                if execution_context_owner_authorized
+                else 0.0
+            ),
             provider_budget=plan.budget.to_provider_budget(),
-            provider_budget_state_path=state.provider_budget_state_path,
+            provider_budget_state_path=(
+                state.provider_budget_state_path
+                or str(Path(state.evidence_root).expanduser().resolve().parent / "provider_budget_state_v1.json")
+            ),
             evidence_root=state.evidence_root,
             process_event_log=state.process_event_log,
             scenario_state_path=str(state_path),
-            owner_authorized=os.getenv("AUTO_GENERATE_RUN_LIVE_ACCEPTANCE", "0") == "1",
+            owner_authorized=execution_context_owner_authorized,
         )
         child_states = dict(state.child_states)
         child_results: dict[str, dict[str, Any]] = {}
@@ -2265,6 +2339,13 @@ class ReviewControlPlane:
                 child.runtime_spec,
                 allow_missing=True,
             )
+            prior_child_state = child_states.get(gate)
+            if (
+                not child_runtime_hash
+                and isinstance(prior_child_state, Mapping)
+                and str(prior_child_state.get("runtime_spec_sha256") or "").strip()
+            ):
+                child_runtime_hash = str(prior_child_state["runtime_spec_sha256"]).strip().lower()
             input_identity = self._acceptance_input_identity(
                 child,
                 runtime_spec_hash=child_runtime_hash,
@@ -2321,6 +2402,7 @@ class ReviewControlPlane:
                 input_identity_sha256=input_identity,
                 budget_domain=child.budget_domain,
                 input_manifest_path=child.input_manifest,
+                absolute_deadline_epoch=execution_context.absolute_deadline_epoch,
             )
             started_at = self._utc_now()
             runtime_result: dict[str, Any] | None = None
@@ -2349,8 +2431,53 @@ class ReviewControlPlane:
                             child,
                             runtime_job_spec,
                         )
+                        # A claimed child workspace is durable execution state.
+                        # Starting a fresh run against it would either reject
+                        # the workspace or duplicate completed work. Resume
+                        # only after the RuntimeJobSpec binding above has
+                        # verified the exact workspace and job identity.
+                        workspace_exists = declared_workspace.is_dir()
+                        resume_marker = any(
+                            (declared_workspace / marker).is_file()
+                            for marker in (
+                                "artifact_registry.json",
+                                "artifacts/runtime_job_spec_v1.json",
+                                "job_outcome_v1.json",
+                            )
+                        )
+                        if workspace_exists and not resume_marker:
+                            try:
+                                has_unrecognized_state = any(
+                                    declared_workspace.iterdir()
+                                )
+                            except OSError as exc:
+                                raise ControlPlaneError(
+                                    "cannot inspect existing runtime child workspace"
+                                ) from exc
+                            prior_child_attempt = bool(child_states.get(gate)) or receipt_path.is_file()
+                            if prior_child_attempt:
+                                raise ControlPlaneError(
+                                    "runtime child workspace exists without a durable "
+                                    "resume marker after a prior attempt; refusing to "
+                                    "start a second run"
+                                )
+                            elif not has_unrecognized_state:
+                                # A directory claimed before the first durable
+                                # artifact is not resumable state. It is safe
+                                # to remove this empty, run-owned shell and
+                                # let the normal new-run path claim it.
+                                declared_workspace.rmdir()
+                                workspace_exists = False
+                        resume_existing = workspace_exists and resume_marker
                         with bind_acceptance_execution_context(execution_context, budget_controller):
-                            runtime_result = self.run(child.runtime_spec)
+                            runtime_result = (
+                                self.resume(
+                                    workspace=declared_workspace,
+                                    job_id=declared_job_id,
+                                )
+                                if resume_existing
+                                else self.run(child.runtime_spec)
+                            )
                         job_value = str(runtime_result.get("job_id") or declared_job_id)
                         if job_value != declared_job_id:
                             raise ControlPlaneError(
@@ -2457,23 +2584,90 @@ class ReviewControlPlane:
                             raise ControlPlaneError(
                                 f"Gate I input manifest is unreadable: {type(exc).__name__}"
                             ) from exc
+                        is_production_v2 = (
+                            isinstance(input_payload, Mapping)
+                            and input_payload.get("artifact_version") == "v2"
+                        )
                         resulting_job_id = str(
                             input_payload.get("resulting_job_id") or ""
                         ).strip() if isinstance(input_payload, Mapping) else ""
-                        if not resulting_job_id:
+                        if not is_production_v2 and not resulting_job_id:
                             raise ControlPlaneError(
                                 "Gate I input manifest must bind a resulting job ID"
                             )
-                        child_context = replace(
-                            child_context,
-                            job_id=resulting_job_id,
-                        )
+                        if not child.runtime_spec and not is_production_v2:
+                            raise ControlPlaneError(
+                                "Gate I requires an explicit production RuntimeJobSpec"
+                            )
+                        if is_production_v2:
+                            child_context = replace(
+                                child_context,
+                                runtime_spec_path="",
+                            )
+                        else:
+                            gui_runtime_spec = load_runtime_job_spec(child.runtime_spec)
+                            gui_workspace, gui_job_id = self._acceptance_runtime_child_binding(
+                                child,
+                                gui_runtime_spec,
+                            )
+                            input_workspace = Path(
+                                str(input_payload.get("workspace") or "")
+                            ).expanduser().resolve() if isinstance(input_payload, Mapping) else None
+                            if input_workspace != gui_workspace or resulting_job_id != gui_job_id:
+                                raise ControlPlaneError(
+                                    "Gate I input manifest must match the production RuntimeJobSpec workspace and job_id"
+                                )
+                            child_context = replace(
+                                child_context,
+                                job_id=resulting_job_id,
+                                workspace_path=str(gui_workspace),
+                                runtime_spec_path=child.runtime_spec,
+                            )
                         scenario_result = scenario.execute(
                             child_context,
                             (),
                             runtime_result=None,
                         )
                         refs = [dict(item) for item in scenario_result.evidence_refs]
+                        if is_production_v2 and scenario_result.status == "READY_FOR_SEMANTIC_VERIFICATION":
+                            browser_ref = next(
+                                (
+                                    item
+                                    for item in refs
+                                    if str(item.get("role") or "") == "browser_evidence"
+                                ),
+                                None,
+                            )
+                            runtime_ref = next(
+                                (
+                                    item
+                                    for item in refs
+                                    if str(item.get("role") or "") == "runtime_spec"
+                                ),
+                                None,
+                            )
+                            if not browser_ref or not runtime_ref:
+                                raise ControlPlaneError(
+                                    "Gate I production evidence is missing the actual job/spec binding"
+                                )
+                            browser_payload = _json_object(Path(str(browser_ref.get("path") or "")))
+                            runtime_payload = _json_object(Path(str(runtime_ref.get("path") or "")))
+                            actual_job_id = str(
+                                browser_payload.get("resulting_job_id") if browser_payload else ""
+                            ).strip()
+                            actual_workspace = str(
+                                runtime_payload.get("workspace_path") if runtime_payload else ""
+                            ).strip()
+                            if not actual_job_id or not actual_workspace:
+                                raise ControlPlaneError(
+                                    "Gate I production evidence lacks actual job or workspace identity"
+                                )
+                            child_context = replace(
+                                child_context,
+                                job_id=actual_job_id,
+                                workspace_path=actual_workspace,
+                                runtime_spec_path=str(runtime_ref.get("path") or ""),
+                            )
                         if scenario_result.status != "READY_FOR_SEMANTIC_VERIFICATION":
                             blocked_reason = scenario_result.reason
                 elif child.execution_mode == "offline-k":
@@ -2714,6 +2908,10 @@ class ReviewControlPlane:
                         child_results[gate].get("receipt", {}).get("job_id")
                         or child_job_id
                     ),
+                    "runtime_spec_sha256": str(
+                        child_results[gate].get("receipt", {}).get("runtime_spec_sha256")
+                        or child_runtime_hash
+                    ),
                     "receipt_path": child_results[gate]["receipt_path"],
                     "evidence_manifest": child_results[gate].get("evidence_manifest", ""),
                     "updated_at": self._utc_now(),
@@ -2725,8 +2923,12 @@ class ReviewControlPlane:
                 "status": child_results[gate]["status"],
                 "receipt_path": child_results[gate]["receipt_path"],
                 "evidence_manifest": child_results[gate].get("evidence_manifest", ""),
-                "job_id": str(child_results[gate].get("receipt", {}).get("job_id") or child_job_id),
-                "state_path": str(child_state_path),
+                    "job_id": str(child_results[gate].get("receipt", {}).get("job_id") or child_job_id),
+                    "runtime_spec_sha256": str(
+                        child_results[gate].get("receipt", {}).get("runtime_spec_sha256")
+                        or child_runtime_hash
+                    ),
+                    "state_path": str(child_state_path),
             }
             state = replace(
                 state,
@@ -4096,9 +4298,19 @@ class ReviewControlPlane:
             "pass" if os.access(self.repo_root, os.R_OK | os.W_OK) else "fail",
             {"repo_root": str(self.repo_root), "readable": os.access(self.repo_root, os.R_OK), "writable": os.access(self.repo_root, os.W_OK)},
         )
-        add("dependencies", "pass", self._dependency_check())
+        dependency_check = self._dependency_check()
+        add(
+            "dependencies",
+            "fail" if dependency_check.get("missing") else "pass",
+            dependency_check,
+        )
         add("tokenizer", "pass" if any(importlib.util.find_spec(name) for name in _OPTIONAL_TOKENIZER_MODULES) else "warn", {"available": [name for name in _OPTIONAL_TOKENIZER_MODULES if importlib.util.find_spec(name)]})
-        add("certificate_paths", "pass", self._certificate_check())
+        certificate_check = self._certificate_check()
+        add(
+            "certificate_paths",
+            "fail" if not certificate_check.get("valid", True) else "pass",
+            certificate_check,
+        )
         add("stale_locks", "warn" if self._stale_locks(workspace) else "pass", {"locks": self._stale_locks(workspace)})
         add("git", "pass", self._git_check())
         add("project_root_pollution", "pass", {"checked": False, "reason": "no project-specific output was modified by doctor"})
@@ -4409,7 +4621,12 @@ class ReviewControlPlane:
                 paths.append({"variable": variable, "configured": True, "exists": target.is_file()})
             else:
                 paths.append({"variable": variable, "configured": False, "exists": None})
-        return {"paths": paths}
+        invalid = [
+            item["variable"]
+            for item in paths
+            if item.get("configured") is True and item.get("exists") is not True
+        ]
+        return {"paths": paths, "valid": not invalid, "invalid_configured": invalid}
 
     def _stale_locks(self, workspace: str | Path | None) -> list[dict[str, Any]]:
         roots = [Path(workspace).expanduser().resolve()] if workspace else [self.repo_root]

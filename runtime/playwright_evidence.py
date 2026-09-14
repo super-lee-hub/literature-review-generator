@@ -9,7 +9,10 @@ bound resulting runtime job.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import configparser
+import shutil
 import subprocess
 import sys
 import time
@@ -40,6 +43,41 @@ _INPUT_FIELDS = frozenset(
         "startup_timeout_seconds",
     }
 )
+
+_PRODUCTION_INPUT_FIELDS = frozenset(
+    {
+        "artifact_type",
+        "artifact_version",
+        "schema_version",
+        "execution_kind",
+        "base_url",
+        "config_path",
+        "repo_root",
+        "output_root",
+        "input_mode",
+        "pdf_folder",
+        "zotero_report",
+        "library_path",
+        "project_name",
+        "work_mode",
+        "action",
+        "port",
+        "startup_timeout_seconds",
+        "completion_timeout_seconds",
+    }
+)
+
+
+def _runtime_source_mode_for_gui_input(input_mode: str) -> str:
+    """Map GUI vocabulary to the canonical RuntimeSourceSpec vocabulary."""
+
+    normalized = str(input_mode or "").strip().casefold()
+    try:
+        return {"pdf": "direct", "zotero": "zotero"}[normalized]
+    except KeyError as exc:
+        raise PlaywrightEvidenceError(
+            f"unsupported GUI production input mode: {input_mode}"
+        ) from exc
 
 
 def _now() -> str:
@@ -86,8 +124,15 @@ class PlaywrightScenarioInputV1:
             parsed = urlsplit(base_url)
         except ValueError as exc:
             raise PlaywrightEvidenceError("Playwright scenario input URL is invalid") from exc
+        raw_port = payload.get("port")
+        if isinstance(raw_port, bool) or not isinstance(raw_port, int) or not (1 <= raw_port <= 65535):
+            raise PlaywrightEvidenceError("Playwright scenario input port is invalid")
         if parsed.hostname not in {"localhost", "127.0.0.1", "::1"} or parsed.username or parsed.password:
             raise PlaywrightEvidenceError("Playwright scenario input URL must target localhost")
+        if parsed.port != raw_port:
+            raise PlaywrightEvidenceError(
+                "Playwright scenario input URL port must match the launcher port"
+            )
         config_path = str(payload.get("config_path") or "").strip()
         workspace = str(payload.get("workspace") or "").strip()
         resulting_job_id = str(payload.get("resulting_job_id") or "").strip()
@@ -100,9 +145,6 @@ class PlaywrightScenarioInputV1:
             raise PlaywrightEvidenceError("Playwright scenario input resulting_job_id is required")
         if not repo_root:
             raise PlaywrightEvidenceError("Playwright scenario input repo_root is required")
-        raw_port = payload.get("port")
-        if isinstance(raw_port, bool) or not isinstance(raw_port, int) or not (1 <= raw_port <= 65535):
-            raise PlaywrightEvidenceError("Playwright scenario input port is invalid")
         try:
             timeout = float(payload.get("startup_timeout_seconds", 30.0))
         except (TypeError, ValueError) as exc:
@@ -121,10 +163,121 @@ class PlaywrightScenarioInputV1:
 
 
 @dataclass(frozen=True)
+class PlaywrightProductionScenarioInputV2:
+    """A request for a GUI-created production job.
+
+    Unlike the page-smoke v1 input, this contract deliberately contains no
+    workspace or resulting job ID.  The browser must create the queue job and
+    the collector binds evidence to the ID returned by that real submission.
+    """
+
+    base_url: str
+    config_path: str
+    repo_root: str
+    output_root: str
+    input_mode: str
+    pdf_folder: str
+    zotero_report: str
+    library_path: str
+    project_name: str
+    work_mode: str
+    action: str
+    port: int
+    startup_timeout_seconds: float = 30.0
+    completion_timeout_seconds: float = 900.0
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "PlaywrightProductionScenarioInputV2":
+        if not isinstance(payload, Mapping):
+            raise PlaywrightEvidenceError("Playwright production input must be a JSON object")
+        unknown = sorted(str(key) for key in payload if str(key) not in _PRODUCTION_INPUT_FIELDS)
+        if unknown:
+            raise PlaywrightEvidenceError(
+                "Playwright production input contains unknown fields: " + ", ".join(unknown)
+            )
+        if payload.get("artifact_type") != "acceptance_gui_input":
+            raise PlaywrightEvidenceError("Playwright production input artifact type is invalid")
+        if payload.get("artifact_version") != "v2" or payload.get("schema_version") != "acceptance-gui-input-v2":
+            raise PlaywrightEvidenceError("Playwright production input schema is invalid")
+        if str(payload.get("execution_kind") or "").strip().casefold() != "production":
+            raise PlaywrightEvidenceError("Playwright production input execution_kind must be production")
+        base_url = str(payload.get("base_url") or "").strip()
+        if not base_url.startswith("http://"):
+            raise PlaywrightEvidenceError("Playwright production input must use an http localhost URL")
+        from urllib.parse import urlsplit
+
+        try:
+            parsed = urlsplit(base_url)
+        except ValueError as exc:
+            raise PlaywrightEvidenceError("Playwright production input URL is invalid") from exc
+        raw_port = payload.get("port")
+        if isinstance(raw_port, bool) or not isinstance(raw_port, int) or not (1 <= raw_port <= 65535):
+            raise PlaywrightEvidenceError("Playwright production input port is invalid")
+        if parsed.hostname not in {"localhost", "127.0.0.1", "::1"} or parsed.username or parsed.password:
+            raise PlaywrightEvidenceError("Playwright production input URL must target localhost")
+        if parsed.port != raw_port:
+            raise PlaywrightEvidenceError("Playwright production input URL port must match the launcher port")
+        values = {
+            name: str(payload.get(name) or "").strip()
+            for name in ("config_path", "repo_root", "output_root", "project_name", "action")
+        }
+        if any(not values[name] for name in values):
+            missing = ", ".join(name for name, value in values.items() if not value)
+            raise PlaywrightEvidenceError("Playwright production input is missing: " + missing)
+        input_mode = str(payload.get("input_mode") or "pdf").strip().casefold()
+        if input_mode not in {"pdf", "zotero"}:
+            raise PlaywrightEvidenceError("Playwright production input input_mode is invalid")
+        action = values["action"].casefold()
+        if action not in {"analyze", "outline", "review", "run_all"}:
+            raise PlaywrightEvidenceError("Playwright production input action is invalid")
+        if input_mode == "pdf" and not str(payload.get("pdf_folder") or "").strip():
+            raise PlaywrightEvidenceError("Playwright production input pdf_folder is required")
+        if input_mode == "zotero" and (
+            not str(payload.get("zotero_report") or "").strip()
+            or not str(payload.get("library_path") or "").strip()
+        ):
+            raise PlaywrightEvidenceError("Playwright production input Zotero paths are required")
+        work_mode = str(payload.get("work_mode") or "normal").strip().casefold()
+        if work_mode != "normal":
+            raise PlaywrightEvidenceError(
+                "Playwright production input currently requires normal work_mode"
+            )
+        try:
+            startup_timeout = float(payload.get("startup_timeout_seconds", 30.0))
+            completion_timeout = float(payload.get("completion_timeout_seconds", 900.0))
+        except (TypeError, ValueError) as exc:
+            raise PlaywrightEvidenceError("Playwright production input timeout is invalid") from exc
+        if startup_timeout <= 0 or completion_timeout <= 0:
+            raise PlaywrightEvidenceError("Playwright production input timeout must be positive")
+        return cls(
+            base_url=base_url,
+            config_path=values["config_path"],
+            repo_root=values["repo_root"],
+            output_root=values["output_root"],
+            input_mode=input_mode,
+            pdf_folder=str(payload.get("pdf_folder") or "").strip(),
+            zotero_report=str(payload.get("zotero_report") or "").strip(),
+            library_path=str(payload.get("library_path") or "").strip(),
+            project_name=values["project_name"],
+            work_mode=work_mode,
+            action=action,
+            port=raw_port,
+            startup_timeout_seconds=startup_timeout,
+            completion_timeout_seconds=completion_timeout,
+        )
+
+
+@dataclass(frozen=True)
 class PlaywrightEvidenceResultV1:
     browser_evidence_path: Path
     trace_path: Path
     screenshot_manifest_path: Path
+    submitted_job_id: str = ""
+    job_workspace_path: Path | None = None
+    runtime_spec_path: Path | None = None
+    job_outcome_path: Path | None = None
+    attempt_path: Path | None = None
+    provider_ledger_path: Path | None = None
 
     def paths(self) -> tuple[Path, Path, Path]:
         return (self.browser_evidence_path, self.trace_path, self.screenshot_manifest_path)
@@ -135,7 +288,7 @@ class PlaywrightEvidenceCollector:
 
     def __init__(
         self,
-        scenario_input: PlaywrightScenarioInputV1,
+        scenario_input: PlaywrightScenarioInputV1 | PlaywrightProductionScenarioInputV2,
         *,
         acceptance_run_id: str,
         scenario_id: str,
@@ -158,22 +311,36 @@ class PlaywrightEvidenceCollector:
         except ImportError as exc:
             raise PlaywrightEvidenceError("Playwright runtime is not installed") from exc
 
+        production_input = isinstance(self.input, PlaywrightProductionScenarioInputV2)
         config_path = Path(self.input.config_path).expanduser().resolve()
-        workspace = Path(self.input.workspace).expanduser().resolve()
+        if isinstance(self.input, PlaywrightProductionScenarioInputV2):
+            workspace = Path(self.input.output_root).expanduser().resolve()
+        else:
+            workspace = Path(self.input.workspace).expanduser().resolve()
         repo_root = Path(self.input.repo_root).expanduser().resolve()
         if not config_path.is_file() or config_path.is_symlink():
             raise PlaywrightEvidenceError("Playwright GUI config is missing or unsafe")
         if not repo_root.is_dir() or repo_root.is_symlink():
             raise PlaywrightEvidenceError("Playwright GUI repo root is missing or unsafe")
+        if production_input:
+            self._validate_production_paths(config_path)
         workspace.mkdir(parents=True, exist_ok=True)
-        evidence_root = workspace / "acceptance_gui"
+        if production_input:
+            staging_id = hashlib.sha256(self.acceptance_run_id.encode("utf-8")).hexdigest()[:24]
+            evidence_root = workspace / "acceptance_gui_staging" / staging_id
+        else:
+            evidence_root = workspace / "acceptance_gui"
         evidence_root.mkdir(parents=True, exist_ok=True)
         trace_path = evidence_root / "trace.zip"
         browser_path = evidence_root / "playwright_run_evidence.json"
         screenshot_path = evidence_root / "dashboard.png"
         screenshot_manifest_path = evidence_root / "screenshot_manifest.json"
         process_env = dict(self.environment)
-        process_env["AUTO_GENERATE_GUI_TEST_MODE"] = "1"
+        # Gate I is a production workflow check. Existing page-only GUI tests
+        # set AUTO_GENERATE_GUI_TEST_MODE themselves; the acceptance collector
+        # must never turn it on and thereby replace queue/provider execution
+        # with mocks.
+        process_env["AUTO_GENERATE_GUI_TEST_MODE"] = "0"
         process_env["NICEGUI_SCREEN_TEST_PORT"] = str(self.input.port)
         gui_process = subprocess.Popen(
             [
@@ -182,6 +349,7 @@ class PlaywrightEvidenceCollector:
                 "--no-show",
                 "--port",
                 str(self.input.port),
+                "--strict-port",
                 "--config",
                 str(config_path),
             ],
@@ -196,6 +364,14 @@ class PlaywrightEvidenceCollector:
         page_errors: list[str] = []
         assertions: list[dict[str, Any]] = []
         screenshots: list[dict[str, Any]] = []
+        submitted_job_id = ""
+        if isinstance(self.input, PlaywrightScenarioInputV1):
+            submitted_job_id = self.input.resulting_job_id
+        job_workspace_path: Path | None = None
+        runtime_spec_path: Path | None = None
+        job_outcome_path: Path | None = None
+        attempt_path: Path | None = None
+        provider_ledger_path: Path | None = None
         trace_stopped = False
         try:
             self._wait_for_server(gui_process)
@@ -210,14 +386,25 @@ class PlaywrightEvidenceCollector:
                     page.goto(self.input.base_url, wait_until="domcontentloaded")
                     self._assert_visible(page, ".ag-fixedbar-shell", "dashboard_shell_visible", assertions)
                     self._assert_text(page, ".ag-topbar-title", "auto-generate", "dashboard_title", assertions)
-                    page.screenshot(path=str(screenshot_path), full_page=True)
-                    screenshots.append({"name": "dashboard", "path": str(screenshot_path)})
                     button = page.get_by_role("button", name="进入工作台").first
                     if button.count() > 0:
                         button.click()
                         self._assert_url_suffix(page, "/workflow", "workflow_navigation", assertions)
                     else:
                         assertions.append({"name": "workflow_navigation", "passed": False, "detail": "documented button missing"})
+                    if production_input:
+                        submitted_job_id = self._submit_production_job(page, assertions)
+                        (
+                            job_workspace_path,
+                            runtime_spec_path,
+                            job_outcome_path,
+                            attempt_path,
+                            provider_ledger_path,
+                        ) = self._wait_for_production_job(submitted_job_id)
+                        assertions.append({"name": "canonical_outcome_verified", "passed": True})
+                        assertions.append({"name": "same_job_terminal_visible", "passed": True})
+                    page.screenshot(path=str(screenshot_path), full_page=True)
+                    screenshots.append({"name": "dashboard", "path": str(screenshot_path)})
                 finally:
                     page.close()
                     context.tracing.stop(path=str(trace_path))
@@ -226,6 +413,24 @@ class PlaywrightEvidenceCollector:
                     browser.close()
             if not trace_path.is_file() or not zipfile.is_zipfile(trace_path):
                 raise PlaywrightEvidenceError("Playwright did not produce a valid trace archive")
+            if production_input:
+                if job_workspace_path is None:
+                    raise PlaywrightEvidenceError(
+                        "production GUI evidence has no resulting job workspace"
+                    )
+                (
+                    browser_path,
+                    trace_path,
+                    screenshot_manifest_path,
+                    screenshot_path,
+                ) = self._relocate_production_artifacts(
+                    staging_trace_path=trace_path,
+                    staging_screenshot_path=screenshot_path,
+                    job_workspace=job_workspace_path,
+                )
+                for screenshot in screenshots:
+                    if screenshot.get("name") == "dashboard":
+                        screenshot["path"] = str(screenshot_path)
             trace_sha = _sha256(trace_path)
             atomic_write_json(
                 str(screenshot_manifest_path),
@@ -235,7 +440,7 @@ class PlaywrightEvidenceCollector:
                     "schema_version": "playwright-screenshot-manifest-v1",
                     "acceptance_run_id": self.acceptance_run_id,
                     "scenario_id": self.scenario_id,
-                    "job_id": self.input.resulting_job_id,
+                    "job_id": submitted_job_id,
                     "screenshots": screenshots,
                 },
             )
@@ -248,7 +453,8 @@ class PlaywrightEvidenceCollector:
                     "run_id": self.acceptance_run_id,
                     "session_id": session_id,
                     "url": self.input.base_url,
-                    "resulting_job_id": self.input.resulting_job_id,
+                    "resulting_job_id": submitted_job_id,
+                    "execution_kind": "production" if production_input else "page_smoke",
                     "trace_sha256": trace_sha,
                     "flow_assertions": assertions,
                     "console_errors": console_errors,
@@ -266,11 +472,19 @@ class PlaywrightEvidenceCollector:
                 trace_path=trace_path,
                 screenshot_manifest_path=screenshot_manifest_path,
                 screenshot_path=screenshot_path,
+                workspace=job_workspace_path or workspace,
+                job_id=submitted_job_id,
             )
             return PlaywrightEvidenceResultV1(
                 browser_evidence_path=browser_path,
                 trace_path=trace_path,
                 screenshot_manifest_path=screenshot_manifest_path,
+                submitted_job_id=submitted_job_id,
+                job_workspace_path=job_workspace_path,
+                runtime_spec_path=runtime_spec_path,
+                job_outcome_path=job_outcome_path,
+                attempt_path=attempt_path,
+                provider_ledger_path=provider_ledger_path,
             )
         except BaseException:
             if trace_path.is_file() and not trace_stopped:
@@ -285,9 +499,49 @@ class PlaywrightEvidenceCollector:
                 gui_process.terminate()
                 try:
                     gui_process.wait(timeout=10)
+
                 except subprocess.TimeoutExpired:
                     gui_process.kill()
                     gui_process.wait(timeout=10)
+
+    @staticmethod
+    def _relocate_production_artifacts(
+        *,
+        staging_trace_path: Path,
+        staging_screenshot_path: Path,
+        job_workspace: Path,
+    ) -> tuple[Path, Path, Path, Path]:
+        """Move browser outputs under the job workspace before registration."""
+
+        destination_root = Path(job_workspace).expanduser().resolve() / "acceptance_gui"
+        if destination_root.exists() and destination_root.is_symlink():
+            raise PlaywrightEvidenceError("job acceptance evidence directory is a symlink")
+        destination_root.mkdir(parents=True, exist_ok=True)
+        destination_paths = {
+            staging_trace_path: destination_root / "trace.zip",
+            staging_screenshot_path: destination_root / "dashboard.png",
+        }
+        for source, destination in destination_paths.items():
+            if not source.is_file() or source.is_symlink():
+                raise PlaywrightEvidenceError(
+                    f"staged Playwright artifact is missing or unsafe: {source.name}"
+                )
+            if destination.exists() or destination.is_symlink():
+                raise PlaywrightEvidenceError(
+                    f"job acceptance artifact already exists: {destination.name}"
+                )
+            try:
+                shutil.move(str(source), str(destination))
+            except OSError as exc:
+                raise PlaywrightEvidenceError(
+                    f"could not move Playwright artifact into job workspace: {source.name}"
+                ) from exc
+        return (
+            destination_root / "playwright_run_evidence.json",
+            destination_root / "trace.zip",
+            destination_root / "screenshot_manifest.json",
+            destination_root / "dashboard.png",
+        )
 
     def _register_artifacts(
         self,
@@ -296,13 +550,24 @@ class PlaywrightEvidenceCollector:
         trace_path: Path,
         screenshot_manifest_path: Path,
         screenshot_path: Path,
+        workspace: Path | None = None,
+        job_id: str = "",
     ) -> None:
         """Publish browser outputs to the resulting job's current Registry."""
 
         from services.artifact_registry import ArtifactRegistry, RegistryError
 
-        registry_path = Path(self.input.workspace).expanduser().resolve() / "artifact_registry.json"
-        registry = ArtifactRegistry(registry_path, self.input.resulting_job_id)
+        if workspace is None:
+            if isinstance(self.input, PlaywrightProductionScenarioInputV2):
+                workspace = Path(self.input.output_root).expanduser().resolve()
+            else:
+                workspace = Path(self.input.workspace).expanduser().resolve()
+        if not job_id:
+            job_id = self.input.resulting_job_id if isinstance(self.input, PlaywrightScenarioInputV1) else ""
+        if not job_id:
+            raise PlaywrightEvidenceError("Playwright artifact registration requires a job ID")
+        registry_path = workspace / "artifact_registry.json"
+        registry = ArtifactRegistry(registry_path, job_id)
         files = (
             ("playwright_run_evidence", "playwright_run_evidence", browser_path),
             ("playwright_trace", "playwright_trace", trace_path),
@@ -327,7 +592,7 @@ class PlaywrightEvidenceCollector:
                     "artifact_version": "v1",
                     "path": str(path),
                     "producer": "runtime.playwright_evidence.PlaywrightEvidenceCollector",
-                    "job_id": self.input.resulting_job_id,
+                    "job_id": job_id,
                 }
             )
         try:
@@ -336,6 +601,167 @@ class PlaywrightEvidenceCollector:
             raise PlaywrightEvidenceError(
                 f"Playwright artifact Registry publication failed: {type(exc).__name__}"
             ) from exc
+
+    def _submit_production_job(self, page: Any, assertions: list[dict[str, Any]]) -> str:
+        request = self.input
+        if not isinstance(request, PlaywrightProductionScenarioInputV2):
+            raise PlaywrightEvidenceError("production submission requires v2 input")
+        page.get_by_test_id("workflow-project-name").fill(request.project_name)
+        mode_toggle = page.get_by_test_id("workflow-input-mode")
+        mode_index = 0 if request.input_mode == "pdf" else 1
+        mode_toggle.get_by_role("button").nth(mode_index).click()
+        work_toggle = page.get_by_test_id("workflow-work-mode")
+        work_toggle.get_by_role("button").nth(0).click()
+        if request.input_mode == "pdf":
+            page.get_by_test_id("workflow-pdf-folder-open").click()
+            page.get_by_test_id("workflow-pdf-folder-edit").fill(request.pdf_folder)
+            page.get_by_test_id("workflow-pdf-folder-save").click()
+        else:
+            page.get_by_test_id("workflow-zotero-report-open").click()
+            page.get_by_test_id("workflow-zotero-report-edit").fill(request.zotero_report)
+            page.get_by_test_id("workflow-zotero-report-save").click()
+            page.get_by_test_id("workflow-library-path-open").click()
+            page.get_by_test_id("workflow-library-path-edit").fill(request.library_path)
+            page.get_by_test_id("workflow-library-path-save").click()
+        assertions.append({"name": "workflow_request_filled", "passed": True})
+        page.get_by_test_id(f"workflow-action-{request.action}").click()
+        assertions.append({"name": "job_submitted", "passed": True})
+        label = page.get_by_test_id("workflow-submitted-job-id")
+        label.wait_for(state="visible", timeout=30_000)
+        deadline = time.time() + 30.0
+        while time.time() < deadline:
+            job_id = str(label.inner_text() or "").strip()
+            if job_id:
+                assertions.append({"name": "submitted_job_visible", "passed": True})
+                return job_id
+            time.sleep(0.25)
+        raise PlaywrightEvidenceError("GUI did not expose the submitted queue job ID")
+
+    def _validate_production_paths(self, config_path: Path) -> None:
+        request = self.input
+        if not isinstance(request, PlaywrightProductionScenarioInputV2):
+            return
+        parser = configparser.ConfigParser()
+        try:
+            with config_path.open("r", encoding="utf-8") as handle:
+                parser.read_file(handle)
+        except (OSError, UnicodeError, configparser.Error) as exc:
+            raise PlaywrightEvidenceError("production GUI config is unreadable") from exc
+        configured_output = str(parser.get("Paths", "output_path", fallback="")).strip()
+        if not configured_output:
+            raise PlaywrightEvidenceError("production GUI config lacks Paths.output_path")
+        output_path = Path(configured_output).expanduser()
+        if not output_path.is_absolute():
+            output_path = config_path.parent / output_path
+        if output_path.resolve() != Path(request.output_root).expanduser().resolve():
+            raise PlaywrightEvidenceError(
+                "production GUI output_root does not match the configured Paths.output_path"
+            )
+        if request.input_mode == "pdf" and not Path(request.pdf_folder).expanduser().is_dir():
+            raise PlaywrightEvidenceError("production GUI PDF folder does not exist")
+        if request.input_mode == "zotero":
+            if not Path(request.zotero_report).expanduser().is_file():
+                raise PlaywrightEvidenceError("production GUI Zotero report does not exist")
+            if not Path(request.library_path).expanduser().is_dir():
+                raise PlaywrightEvidenceError("production GUI Zotero library does not exist")
+
+    def _wait_for_production_job(self, job_id: str) -> tuple[Path, Path, Path, Path | None, Path]:
+        request = self.input
+        if not isinstance(request, PlaywrightProductionScenarioInputV2):
+            raise PlaywrightEvidenceError("production job wait requires v2 input")
+        from services.artifact_registry import ArtifactRegistry
+        from services.job_outcome import load_canonical_job_outcome
+        from services.queue_service import PersistentQueueService, QueueState
+
+        queue_path = Path(request.output_root).expanduser().resolve() / "_queue" / "queue.json"
+        queue = PersistentQueueService(queue_path)
+        deadline = time.time() + request.completion_timeout_seconds
+        while time.time() < deadline:
+            runtime = queue.get_job_runtime(job_id)
+            if runtime is None:
+                time.sleep(0.5)
+                continue
+            if runtime.state in {QueueState.FAILED, QueueState.CANCELLED}:
+                raise PlaywrightEvidenceError(
+                    f"GUI-submitted job {job_id} ended in {runtime.state.value}: {runtime.error_message or ''}"
+                )
+            if runtime.state != QueueState.COMPLETED or not runtime.workspace_path:
+                time.sleep(0.5)
+                continue
+            workspace = Path(runtime.workspace_path).expanduser().resolve()
+            registry = ArtifactRegistry(workspace / "artifact_registry.json", job_id)
+            outcome, outcome_record = load_canonical_job_outcome(registry)
+            if outcome.job_status != "completed" or not outcome.canonical_ready:
+                raise PlaywrightEvidenceError(
+                    "GUI-submitted job reached queue completion without a canonical outcome"
+                )
+            spec_record = registry.get("runtime_job_spec")
+            if spec_record is None or spec_record.status != "ready":
+                raise PlaywrightEvidenceError("GUI-submitted job lacks a Registry-bound RuntimeJobSpec")
+            from runtime.job_spec import RuntimeJobSpec
+
+            spec_payload = json.loads(Path(spec_record.path).read_text(encoding="utf-8"))
+            runtime_spec = RuntimeJobSpec.from_dict(spec_payload).resolved_from(Path(spec_record.path).parent)
+            runtime_spec.validate()
+            expected_action = {
+                "analyze": "analyze",
+                "outline": "generate_outline",
+                "review": "generate_review",
+                "run_all": "run_all",
+            }[request.action]
+            if runtime_spec.job_id != job_id or runtime_spec.project_name != request.project_name:
+                raise PlaywrightEvidenceError("GUI-submitted RuntimeJobSpec identity does not match the request")
+            if runtime_spec.action != expected_action:
+                raise PlaywrightEvidenceError("GUI-submitted RuntimeJobSpec action does not match the request")
+            if runtime_spec.config != str(Path(request.config_path).expanduser().resolve()):
+                raise PlaywrightEvidenceError("GUI-submitted RuntimeJobSpec config does not match the request")
+            expected_source_mode = _runtime_source_mode_for_gui_input(request.input_mode)
+            if runtime_spec.source.mode != expected_source_mode:
+                raise PlaywrightEvidenceError("GUI-submitted RuntimeJobSpec source mode does not match the request")
+            if request.input_mode == "pdf":
+                if runtime_spec.source.pdf_folder != str(Path(request.pdf_folder).expanduser().resolve()):
+                    raise PlaywrightEvidenceError("GUI-submitted RuntimeJobSpec PDF folder does not match the request")
+            elif (
+                runtime_spec.source.zotero_report != str(Path(request.zotero_report).expanduser().resolve())
+                or runtime_spec.source.library_path != str(Path(request.library_path).expanduser().resolve())
+            ):
+                raise PlaywrightEvidenceError("GUI-submitted RuntimeJobSpec Zotero paths do not match the request")
+            if Path(runtime_spec.workspace_path).expanduser().resolve().parent != Path(request.output_root).expanduser().resolve():
+                raise PlaywrightEvidenceError("GUI-submitted RuntimeJobSpec workspace is outside the requested output root")
+            attempt_records = [
+                record
+                for record in registry.list_records()
+                if record.status == "ready" and record.artifact_type == "job_attempt"
+            ]
+            attempt_record = max(
+                attempt_records,
+                key=lambda record: int(record.metadata.get("snapshot_sequence") or 0),
+                default=None,
+            )
+            if attempt_record is None:
+                raise PlaywrightEvidenceError("GUI-submitted job lacks a durable terminal attempt")
+            ledger_records = [
+                record
+                for record in registry.list_records()
+                if record.status == "ready" and record.artifact_type == "provider_receipt_ledger"
+            ]
+            ledger_record = max(
+                ledger_records,
+                key=lambda record: record.created_at,
+                default=None,
+            )
+            if ledger_record is None:
+                raise PlaywrightEvidenceError("GUI-submitted job lacks a provider receipt ledger")
+            return (
+                workspace,
+                Path(spec_record.path),
+                Path(outcome_record.path),
+                Path(attempt_record.path),
+                Path(ledger_record.path),
+            )
+        raise PlaywrightEvidenceError(
+            f"GUI-submitted job {job_id} did not reach a canonical terminal outcome before timeout"
+        )
 
     def _wait_for_server(self, process: subprocess.Popen[Any]) -> None:
         from urllib.request import urlopen
@@ -394,5 +820,6 @@ __all__ = [
     "PlaywrightEvidenceCollector",
     "PlaywrightEvidenceError",
     "PlaywrightEvidenceResultV1",
+    "PlaywrightProductionScenarioInputV2",
     "PlaywrightScenarioInputV1",
 ]

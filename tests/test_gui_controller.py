@@ -947,7 +947,134 @@ def test_persist_config_writes_and_applies_mineru_settings(gui_app_module, monke
     assert "ALLOW_LOCAL_PARSE_FALLBACK=false" in env_content
 
     assert controller.env_values["MINERU_API_TOKEN"] == "token-123"
-    assert os.environ["MINERU_API_TOKEN"] == "token-123"
+    # GUI persistence reads the selected dotenv file without mutating the
+    # caller's process environment. Runtime loading applies the same file
+    # explicitly, so unrelated tasks cannot inherit this token.
+    assert os.environ["MINERU_API_TOKEN"] == ""
+
+
+def test_gui_external_config_uses_adjacent_dotenv_and_process_credentials(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text(
+        "LLM_FREE_MODE_API=process-free-key\nMINERU_API_TOKEN=dotenv-mineru-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("AUTO_GENERATE_ENV_PATH", raising=False)
+    monkeypatch.setenv("LLM_FREE_MODE_API", "process-free-key")
+    monkeypatch.delenv("MINERU_API_TOKEN", raising=False)
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+
+    assert Path(controller.env_path) == tmp_path / ".env"
+    assert controller.api_cards["Free_Mode_API"]["api_key"] == "process-free-key"
+    assert controller.state["mineru"]["api_token"] == "dotenv-mineru-token"
+
+
+def test_gui_resolves_relative_paths_from_config_origin_not_process_cwd(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_dir = tmp_path / "config-root"
+    config_dir.mkdir()
+    config_path = config_dir / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    parser["Paths"]["output_path"] = "./relative-output"
+    parser["Paths"]["zotero_report"] = "./references.txt"
+    parser["Paths"]["library_path"] = "./library"
+    with config_path.open("w", encoding="utf-8") as handle:
+        parser.write(handle)
+    other_cwd = tmp_path / "other-cwd"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+
+    assert controller.state["paths"]["output_path"] == str((config_dir / "relative-output").resolve())
+    assert controller.state["paths"]["zotero_report"] == str((config_dir / "references.txt").resolve())
+    assert controller.state["paths"]["library_path"] == str((config_dir / "library").resolve())
+    assert controller._queue_file_path() == (config_dir / "relative-output" / "_queue" / "queue.json").resolve()
+
+
+def test_gui_save_preserves_unedited_mineru_env_values(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "MINERU_UPLOAD_ENDPOINT=/custom/upload\n"
+        "MINERU_POLL_INTERVAL_SECONDS=9\n"
+        "MINERU_ZIP_MAX_ENTRIES=77\n"
+        "CUSTOM_EXISTING=value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    controller.persist_config(notify_user=False)
+
+    saved = env_path.read_text(encoding="utf-8")
+    assert "MINERU_UPLOAD_ENDPOINT=/custom/upload" in saved
+    assert "MINERU_POLL_INTERVAL_SECONDS=9" in saved
+    assert "MINERU_ZIP_MAX_ENTRIES=77" in saved
+    assert "CUSTOM_EXISTING=value" in saved
+
+
+def test_gui_save_does_not_persist_process_only_mineru_token(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text("MINERU_API_TOKEN=dotenv-token\n", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+    monkeypatch.setenv("MINERU_API_TOKEN", "process-only-token")
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+    assert controller.state["mineru"]["api_token"] == "process-only-token"
+    controller.persist_config(notify_user=False)
+
+    saved = env_path.read_text(encoding="utf-8")
+    assert "MINERU_API_TOKEN=dotenv-token" in saved
+    assert "process-only-token" not in saved
+
+
+def test_gui_runtime_config_keeps_process_only_secret_without_persisting_it(
+    gui_app_module, monkeypatch, tmp_path
+) -> None:
+    config_path = tmp_path / "config.ini"
+    config_path.write_text(
+        (REPO_ROOT / "config.ini.example").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("AUTO_GENERATE_ENV_PATH", str(env_path))
+    monkeypatch.setenv("LLM_FREE_MODE_API", "process-only-free-key")
+
+    controller = gui_app_module.WorkspaceController(str(config_path))
+
+    runtime_config = controller.build_runtime_config()
+
+    assert runtime_config["Free_Mode_API"]["api_key"] == "process-only-free-key"
+    controller.persist_config(notify_user=False)
+    assert "process-only-free-key" not in env_path.read_text(encoding="utf-8")
 
 
 def test_persist_config_writes_none_fallback(gui_app_module, monkeypatch, tmp_path) -> None:
@@ -967,3 +1094,28 @@ def test_persist_config_writes_none_fallback(gui_app_module, monkeypatch, tmp_pa
     parser = configparser.ConfigParser()
     parser.read(config_path, encoding="utf-8")
     assert parser["Preprocess"]["fallback_parser"] == "none"
+
+
+def test_free_mode_handlers_clear_busy_after_runtime_error(gui_app_module, monkeypatch) -> None:
+    controller = gui_app_module.WorkspaceController(str(REPO_ROOT / "config.ini.example"))
+    controller.test_mode = False
+    controller.free_mode_chat_input = "a bounded test idea"
+    controller.update_free_mode_widgets = lambda: None
+    controller.notify = lambda *_args, **_kwargs: None
+    monkeypatch.setattr(
+        gui_app_module,
+        "plan_free_mode_chat_turn",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("transport failed")),
+    )
+
+    asyncio.run(controller.send_free_mode_message())
+
+    assert controller.free_mode_busy is False
+
+
+def test_canonical_lifecycle_states_tolerate_blocked_string_status(gui_app_module) -> None:
+    states = gui_app_module.WorkspaceController._canonical_lifecycle_states(
+        {"status": "blocked", "artifacts": []},
+        {"status": "blocked"},
+    )
+    assert "validation_not_run" in states
